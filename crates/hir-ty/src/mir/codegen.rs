@@ -14,29 +14,36 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
-    AdtId, FunctionId, HasModule, VariantId,
+    AdtId, DefWithBodyId, FunctionId, HasModule, StaticId, VariantId,
     attrs::AttrFlags,
+    expr_store::Body,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::FunctionSignature,
 };
 use la_arena::ArenaMap;
 use rustc_abi::{Integer, Size};
+use rustc_ast_ir::Mutability;
+use rustc_index::Idx;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use triomphe::Arc;
 
 use crate::{
-    CallableDefId, InferBodyId, MemoryMap, ParamEnvAndCrate,
-    method_resolution::is_dyn_method,
+    CallableDefId, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
+    consteval::try_const_usize,
+    db::GeneralConstId,
+    infer::PointerCast,
+    utils::detect_variant_from_bytes,
+    method_resolution::{is_dyn_method, lookup_impl_const},
     db::HirDatabase,
     drop::{DropGlue, has_drop_glue},
     layout::{Layout, RustcEnumVariantIdx},
     next_solver::{
-        AllocationData, ConstKind, DbInterner, GenericArgs, StoredGenericArgs, Ty, TyKind,
-        TypingMode,
+        Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region,
+        StoredGenericArgs, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -76,12 +83,13 @@ macro_rules! unsupported {
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
-    /// `core::panicking::panic_const::panic_const_{add,sub,mul,...}_overflow`
-    fn overflow_panic(&self, op: OverflowOp) -> Option<String>;
+    fn static_(&self, id: StaticId) -> Option<String>;
+    /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
+    fn path(&self, path: &str) -> Option<String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OverflowOp {
+enum OverflowOp {
     Add,
     Sub,
     Mul,
@@ -192,6 +200,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let mut flags = settings::builder();
         flags.set("is_pic", "true").map_err(|e| backend(&e))?;
         flags.set("opt_level", "none").map_err(|e| backend(&e))?;
+        flags.set("enable_llvm_abi_extensions", "true").map_err(|e| backend(&e))?;
         let isa = isa::lookup_by_name("x86_64-unknown-linux-gnu")
             .map_err(|e| backend(&e))?
             .finish(settings::Flags::new(flags))
@@ -340,6 +349,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(id)
     }
 
+    fn define_const(&mut self, blob: ConstBlob) -> Result<DataId> {
+        let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
+        let n = self.location_counter;
+        self.location_counter += 1;
+        let id = self
+            .module
+            .declare_data(&format!(".Lrustd.const.{n}"), Linkage::Local, false, false)
+            .map_err(backend)?;
+        let mut data = DataDescription::new();
+        data.define(blob.bytes.into_boxed_slice());
+        data.set_align(blob.align);
+        for (offset, target) in blob.relocs {
+            let target = self.module.declare_data_in_data(target, &mut data);
+            data.write_data_addr(offset, target, 0);
+        }
+        self.module.define_data(id, &data).map_err(backend)?;
+        Ok(id)
+    }
+
     fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
         if let Some(&id) = self.imports.get(symbol) {
             return Ok(id);
@@ -361,6 +389,29 @@ enum Intrinsic {
     Diverges,
     /// Not known here; call it like a normal function.
     Unknown,
+}
+
+/// Read-only data whose pointers refer to other data objects.
+struct ConstBlob {
+    bytes: Vec<u8>,
+    relocs: Vec<(u32, DataId)>,
+    align: u64,
+}
+
+impl ConstBlob {
+    fn usize_at(&self, offset: usize) -> Option<usize> {
+        let bytes = self.bytes.get(offset..offset + 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?) as usize)
+    }
+}
+
+/// A place in memory. `meta` is the slice length (or vtable) when the place came from a fat
+/// pointer.
+#[derive(Clone, Copy)]
+struct PlaceRef<'db> {
+    addr: Value,
+    meta: Option<Value>,
+    ty: PlaceTy<'db>,
 }
 
 #[derive(Clone, Copy)]
@@ -427,7 +478,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 PassMode::Pair(self.scalar(a)?, self.scalar(b)?, offset)
             }
             BackendRepr::Memory { sized: true } => {
-                let max = if is_ret { 16 } else { 8 };
+                let max = 8;
                 match layout.size.bytes() {
                     size if size > max => PassMode::Indirect,
                     1 => PassMode::Cast(types::I8),
@@ -557,18 +608,29 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn place(&mut self, place: &StoredPlace) -> Result<(Value, PlaceTy<'db>)> {
+        let place = self.place_ref(place)?;
+        Ok((place.addr, place.ty))
+    }
+
+    fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
         let mut addr = self.locals[place.local].addr;
+        let mut meta = None;
         let mut ty = PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
         for proj in place.projection.as_slice() {
             let prev = ty;
             ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
             match proj {
-                ProjectionElem::Deref => {
-                    if !matches!(self.layout(prev.ty)?.backend_repr, BackendRepr::Scalar(_)) {
-                        unsupported!("deref of fat pointer {:?}", prev.ty);
+                ProjectionElem::Deref => match self.layout(prev.ty)?.backend_repr {
+                    BackendRepr::Scalar(_) => {
+                        addr = self.builder.ins().load(PTR, MEM, addr, 0);
+                        meta = None;
                     }
-                    addr = self.builder.ins().load(PTR, MEM, addr, 0);
-                }
+                    BackendRepr::ScalarPair(..) => {
+                        meta = Some(self.builder.ins().load(PTR, MEM, addr, 8));
+                        addr = self.builder.ins().load(PTR, MEM, addr, 0);
+                    }
+                    _ => unsupported!("deref of {:?}", prev.ty),
+                },
                 ProjectionElem::Field(field) => {
                     let layout = self.layout(prev.ty)?;
                     let offset = match &layout.variants {
@@ -587,12 +649,102 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     addr = self.builder.ins().iadd_imm(addr, offset.bytes() as i64);
                 }
                 ProjectionElem::Downcast(_) => (),
-                ProjectionElem::Index(_)
-                | ProjectionElem::ConstantIndex { .. }
-                | ProjectionElem::Subslice { .. } => unsupported!("projection {proj:?}"),
+                ProjectionElem::Index(local) => {
+                    let index = self.builder.ins().load(PTR, MEM, self.locals[*local].addr, 0);
+                    addr = self.element(addr, meta, prev.ty, index)?;
+                    meta = None;
+                }
+                ProjectionElem::ConstantIndex { offset, from_end } => {
+                    let index = if *from_end {
+                        let len = self.len(prev.ty, meta)?;
+                        self.builder.ins().iadd_imm(len, -(*offset as i64))
+                    } else {
+                        self.builder.ins().iconst(PTR, *offset as i64)
+                    };
+                    addr = self.element(addr, meta, prev.ty, index)?;
+                    meta = None;
+                }
+                ProjectionElem::Subslice { from, to } => {
+                    let size = self.element_size(prev.ty)?;
+                    // FIXME: rustc checks `from + to <= len` when matching the pattern.
+                    addr = self.builder.ins().iadd_imm(addr, (*from * size) as i64);
+                    meta = match meta {
+                        Some(len) => Some(self.builder.ins().iadd_imm(len, -((*from + *to) as i64))),
+                        None => None,
+                    };
+                }
             }
         }
-        Ok((addr, ty))
+        Ok(PlaceRef { addr, meta, ty })
+    }
+
+    fn element_size(&self, container: Ty<'db>) -> Result<u64> {
+        match container.kind() {
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => Ok(self.layout(elem)?.size.bytes()),
+            _ => unsupported!("indexing into {container:?}"),
+        }
+    }
+
+    /// Number of elements of an array, slice or `str` place.
+    fn len(&mut self, container: Ty<'db>, meta: Option<Value>) -> Result<Value> {
+        match (container.kind(), meta) {
+            (TyKind::Array(_, len), _) => {
+                let Some(len) = try_const_usize(self.cg.db, len) else {
+                    unsupported!("array with unevaluated length");
+                };
+                Ok(self.builder.ins().iconst(PTR, len as i64))
+            }
+            (TyKind::Slice(_) | TyKind::Str, Some(len)) => Ok(len),
+            _ => unsupported!("length of {container:?}"),
+        }
+    }
+
+    /// Address of `container[index]`, after a bounds check.
+    fn element(
+        &mut self,
+        addr: Value,
+        meta: Option<Value>,
+        container: Ty<'db>,
+        index: Value,
+    ) -> Result<Value> {
+        let size = self.element_size(container)?;
+        let len = self.len(container, meta)?;
+        let out_of_bounds =
+            self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+        self.bounds_panic_if(out_of_bounds, index, len)?;
+        let offset = self.builder.ins().imul_imm(index, size as i64);
+        Ok(self.builder.ins().iadd(addr, offset))
+    }
+
+    /// Branches to `core::panicking::panic_bounds_check(index, len, location)` when `cond` is set.
+    fn bounds_panic_if(&mut self, cond: Value, index: Value, len: Value) -> Result<()> {
+        let Some(symbol) = self.cg.symbols.path("core::panicking::panic_bounds_check") else {
+            self.builder.ins().trapnz(cond, TrapCode::HEAP_OUT_OF_BOUNDS);
+            return Ok(());
+        };
+        let panic_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder.set_cold_block(panic_block);
+        self.builder.ins().brif(cond, panic_block, &[], ok_block, &[]);
+
+        self.builder.switch_to_block(panic_block);
+        let location = self.caller_location()?;
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.extend([AbiParam::new(PTR); 3]);
+        let callee = self.cg.import(&symbol, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &[index, len, location]);
+        self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
+
+        self.builder.switch_to_block(ok_block);
+        Ok(())
+    }
+
+    fn static_ty(&self, id: StaticId) -> Ty<'db> {
+        let db = self.cg.db;
+        let ty = InferenceResult::of(db, DefWithBodyId::from(id))
+            .expr_ty(Body::of(db, id.into()).root_expr());
+        Ty::new_ref(self.interner, Region::new_erased(self.interner), ty, Mutability::Not)
     }
 
     fn operand_ty(&mut self, operand: &Operand) -> Result<Ty<'db>> {
@@ -600,11 +752,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             OperandKind::Copy(place) | OperandKind::Move(place) => self.place(place)?.1.ty,
             OperandKind::Constant { ty, .. } => ty.as_ref(),
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-            OperandKind::Static(_) => unsupported!("statics"),
+            OperandKind::Static(id) => self.static_ty(*id),
         })
     }
 
-    /// Address of memory holding the operand's value.
+    /// Address of memory holding the operand's value. Constants live in read-only data, so the
+    /// memory must not be written through.
     fn operand(&mut self, operand: &Operand) -> Result<(Value, Ty<'db>)> {
         match &operand.kind {
             OperandKind::Copy(place) | OperandKind::Move(place) => {
@@ -613,45 +766,241 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             OperandKind::Constant { konst, ty } => {
                 let ty = ty.as_ref();
-                let ConstKind::Value(value) = konst.as_ref().kind() else {
-                    unsupported!("unevaluated const");
-                };
-                let layout = self.layout(ty)?;
-                let scalar = self.scalar_of(ty)?;
-                let bits = match ty.kind() {
-                    TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
-                        value.value.inner().to_leaf().to_bits(layout.size)
+                let blob = match konst.as_ref().kind() {
+                    ConstKind::Value(value) => {
+                        let is_int =
+                            matches!(ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_));
+                        if is_int {
+                            let layout = self.layout(ty)?;
+                            let scalar = self.scalar_of(ty)?;
+                            let bits = value.value.inner().to_leaf().to_bits(layout.size);
+                            let addr = self.stack_slot(&layout);
+                            let value = self.iconst(scalar.ty, bits);
+                            self.builder.ins().store(MEM, value, addr, 0);
+                            return Ok((addr, ty));
+                        }
+                        self.valtree_blob(ty, value.value)?
                     }
-                    _ => unsupported!("constant of type {ty:?}"),
+                    ConstKind::Unevaluated(unevaluated) => {
+                        let allocation = self.eval_const(unevaluated)?;
+                        self.allocation_blob(allocation)?
+                    }
+                    kind => unsupported!("constant {kind:?}"),
                 };
-                let addr = self.stack_slot(&layout);
-                let value = self.iconst(scalar.ty, bits);
-                self.builder.ins().store(MEM, value, addr, 0);
-                Ok((addr, ty))
+                Ok((self.blob_addr(blob)?, ty))
             }
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
-                let AllocationData { ty, memory, memory_map } = &*allocation;
-                let ty = *ty;
-                if !matches!(memory_map, MemoryMap::Empty) {
-                    unsupported!("constant with relocations");
-                }
+                let ty = allocation.ty;
+                let blob = self.allocation_blob(allocation)?;
+                Ok((self.blob_addr(blob)?, ty))
+            }
+            OperandKind::Static(id) => {
+                let Some(symbol) = self.cg.symbols.static_(*id) else {
+                    unsupported!("static without a rustc symbol");
+                };
+                let data = self
+                    .cg
+                    .module
+                    .declare_data(&symbol, Linkage::Import, false, false)
+                    .map_err(|e| CodegenError::Backend(e.to_string()))?;
+                let data = self.cg.module.declare_data_in_func(data, self.builder.func);
+                let value = self.builder.ins().symbol_value(PTR, data);
+                let ty = self.static_ty(*id);
                 let layout = self.layout(ty)?;
-                if layout.size.bytes_usize() != memory.len() {
-                    unsupported!("constant whose size differs from its layout");
-                }
                 let addr = self.stack_slot(&layout);
-                for (offset, byte) in memory.iter().enumerate() {
-                    let byte = self.builder.ins().iconst(types::I8, i64::from(*byte));
-                    self.builder.ins().store(MEM, byte, addr, offset as i32);
-                }
+                self.builder.ins().store(MEM, value, addr, 0);
                 Ok((addr, ty))
             }
-            OperandKind::Static(_) => unsupported!("statics"),
         }
     }
 
+    fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
+        let db = self.cg.db;
+        let UnevaluatedConst { def, args } = unevaluated;
+        let frontend = |e| CodegenError::Frontend(format!("const eval: {e:?}"));
+        match def.0 {
+            GeneralConstId::ConstId(id) => {
+                let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
+                db.const_eval(id, args, Some(self.env)).map_err(frontend)
+            }
+            GeneralConstId::StaticId(id) => db.const_eval_static(id).map_err(frontend),
+            GeneralConstId::AnonConstId(id) => {
+                db.anon_const_eval(id, args, Some(self.env)).map_err(frontend)
+            }
+        }
+    }
+
+    fn blob_addr(&mut self, blob: ConstBlob) -> Result<Value> {
+        let data = self.cg.define_const(blob)?;
+        let data = self.cg.module.declare_data_in_func(data, self.builder.func);
+        Ok(self.builder.ins().symbol_value(PTR, data))
+    }
+
+    fn valtree_blob(&mut self, ty: Ty<'db>, valtree: ValTree<'db>) -> Result<ConstBlob> {
+        let layout = self.layout(ty)?;
+        let align = layout.align.abi.bytes();
+        let pointee = match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::RawPtr(..) => {
+                let bits = valtree.inner().to_leaf().to_bits(layout.size);
+                let bytes = bits.to_le_bytes()[..layout.size.bytes_usize()].to_vec();
+                return Ok(ConstBlob { bytes, relocs: Vec::new(), align });
+            }
+            TyKind::Ref(_, pointee, _) => pointee,
+            _ => unsupported!("constant of type {ty:?}"),
+        };
+        let mut bytes = vec![0; layout.size.bytes_usize()];
+        let target = match pointee.kind() {
+            TyKind::Str | TyKind::Slice(_) => {
+                let mut target = ConstBlob { bytes: Vec::new(), relocs: Vec::new(), align: 1 };
+                let items = valtree.inner().to_branch();
+                for item in items.iter() {
+                    let ConstKind::Value(item) = item.kind() else {
+                        unsupported!("unevaluated const in a slice constant");
+                    };
+                    let item = self.valtree_blob(item.ty, item.value)?;
+                    if !item.relocs.is_empty() {
+                        unsupported!("slice constant of pointers");
+                    }
+                    target.align = target.align.max(item.align);
+                    target.bytes.extend(item.bytes);
+                }
+                bytes[8..16].copy_from_slice(&(items.len() as u64).to_le_bytes());
+                target
+            }
+            TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
+            _ => self.valtree_blob(pointee, valtree)?,
+        };
+        let target = self.cg.define_const(target)?;
+        Ok(ConstBlob { bytes, relocs: vec![(0, target)], align })
+    }
+
+    fn allocation_blob(&mut self, allocation: Allocation<'db>) -> Result<ConstBlob> {
+        let AllocationData { ty, memory, memory_map } = &*allocation;
+        let layout = self.layout(*ty)?;
+        let size = layout.size.bytes_usize();
+        let mut bytes = memory.to_vec();
+        match (bytes.len(), size) {
+            (len, size) if len == size => (),
+            // Const eval stores some scalars as 16 bytes.
+            (16, size) if size < 16 => bytes.truncate(size),
+            (len, 16) if len < 16 => bytes.resize(16, 0),
+            _ => unsupported!("constant whose size differs from its layout"),
+        }
+        let mut blob = ConstBlob { bytes, relocs: Vec::new(), align: layout.align.abi.bytes() };
+        self.relocate(&mut blob, 0, *ty, memory_map)?;
+        Ok(blob)
+    }
+
+    /// Const eval gives pointers as keys into `map`. Emits each target as its own data object
+    /// and records a relocation for the pointer, walking `ty` to find them.
+    fn relocate(
+        &mut self,
+        blob: &mut ConstBlob,
+        offset: usize,
+        ty: Ty<'db>,
+        map: &MemoryMap<'db>,
+    ) -> Result<()> {
+        if let MemoryMap::Empty = map {
+            return Ok(());
+        }
+        let db = self.cg.db;
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) => {
+                let Some(addr) = blob.usize_at(offset) else {
+                    unsupported!("constant pointer out of bounds");
+                };
+                let target = match map {
+                    MemoryMap::Simple(memory) if addr == 0 => Some(&**memory),
+                    MemoryMap::Complex(complex) => complex.memory.get(&addr).map(|it| &**it),
+                    _ => None,
+                };
+                let Some(target) = target else { return Ok(()) };
+                let mut target = ConstBlob { bytes: target.to_vec(), relocs: Vec::new(), align: 16 };
+                match pointee.kind() {
+                    TyKind::Str => (),
+                    TyKind::Slice(elem) => {
+                        let Some(len) = blob.usize_at(offset + 8) else {
+                            unsupported!("constant slice length out of bounds");
+                        };
+                        let size = self.layout(elem)?.size.bytes_usize();
+                        for i in 0..len {
+                            self.relocate(&mut target, i * size, elem, map)?;
+                        }
+                    }
+                    TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
+                    _ => self.relocate(&mut target, 0, pointee, map)?,
+                }
+                let target = self.cg.define_const(target)?;
+                blob.bytes[offset..offset + 8].fill(0);
+                blob.relocs.push((offset as u32, target));
+            }
+            TyKind::FnPtr(..) => unsupported!("fn pointer in a constant"),
+            TyKind::Adt(def, args) => {
+                let layout = self.layout(ty)?;
+                let (variant, offsets): (VariantId, Vec<usize>) = match def.def_id() {
+                    AdtId::StructId(id) => (
+                        id.into(),
+                        (0..layout.fields.count())
+                            .map(|i| layout.fields.offset(i).bytes_usize())
+                            .collect(),
+                    ),
+                    AdtId::UnionId(_) => return Ok(()),
+                    AdtId::EnumId(id) => {
+                        let Some(bytes) = blob.bytes.get(offset..offset + layout.size.bytes_usize())
+                        else {
+                            unsupported!("constant enum out of bounds");
+                        };
+                        let Some((variant, layout)) =
+                            detect_variant_from_bytes(&layout, db, self.dl(), bytes, id)
+                        else {
+                            return Ok(());
+                        };
+                        (
+                            variant.into(),
+                            (0..layout.fields.count())
+                                .map(|i| layout.fields.offset(i).bytes_usize())
+                                .collect(),
+                        )
+                    }
+                };
+                for ((_, field), field_offset) in db.field_types(variant).iter().zip(offsets) {
+                    let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    self.relocate(blob, offset + field_offset, field, map)?;
+                }
+            }
+            TyKind::Tuple(tys) => {
+                let layout = self.layout(ty)?;
+                for (i, field) in tys.iter().enumerate() {
+                    let field_offset = layout.fields.offset(i).bytes_usize();
+                    self.relocate(blob, offset + field_offset, field, map)?;
+                }
+            }
+            TyKind::Array(elem, len) => {
+                let Some(len) = try_const_usize(db, len) else {
+                    unsupported!("array with unevaluated length");
+                };
+                let size = self.layout(elem)?.size.bytes_usize();
+                for i in 0..len as usize {
+                    self.relocate(blob, offset + i * size, elem, map)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
     fn iconst(&mut self, ty: Type, bits: u128) -> Value {
+        if ty.bits() < 64 {
+            // Cranelift wants narrow immediates without stray high bits.
+            let bits = bits as u64 & ((1 << ty.bits()) - 1);
+            return self.builder.ins().iconst(ty, bits as i64);
+        }
         if ty == types::I128 {
             let lo = self.builder.ins().iconst(types::I64, bits as u64 as i64);
             let hi = self.builder.ins().iconst(types::I64, (bits >> 64) as u64 as i64);
@@ -691,12 +1040,45 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let size = self.layout(ty)?.size;
                 self.copy(dst, src, size);
             }
+            Rvalue::CopyForDeref(place) => {
+                let (src, ty) = self.place(place)?;
+                let size = self.layout(ty.ty)?.size;
+                self.copy(dst, src, size);
+            }
             Rvalue::Ref(_, place) => {
-                let (addr, ty) = self.place(place)?;
-                if self.layout(ty.ty)?.is_unsized() {
-                    unsupported!("reference to unsized place");
+                let place = self.place_ref(place)?;
+                store(self, place.addr);
+                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty.ty)?.backend_repr {
+                    let Some(meta) = place.meta else {
+                        unsupported!("fat reference to a place without metadata");
+                    };
+                    self.builder.ins().store(MEM, meta, dst, 8);
                 }
-                store(self, addr);
+            }
+            Rvalue::Len(place) => {
+                let place = self.place_ref(place)?;
+                let len = self.len(place.ty.ty, place.meta)?;
+                store(self, len);
+            }
+            Rvalue::Discriminant(place) => {
+                let (addr, ty) = self.place(place)?;
+                let to = self.scalar_of(dst_ty.ty)?;
+                let value = self.discriminant(addr, ty.ty, to)?;
+                store(self, value);
+            }
+            Rvalue::Repeat(operand, len) => {
+                let Some(len) = try_const_usize(self.cg.db, len.as_ref()) else {
+                    unsupported!("repeat with unevaluated length");
+                };
+                let (src, ty) = self.operand(operand)?;
+                let size = self.layout(ty)?.size;
+                if len > 64 {
+                    unsupported!("repeat of {len} elements");
+                }
+                for i in 0..len as u64 {
+                    let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
+                    self.copy(element, src, size);
+                }
             }
             Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
                 let value = self.binary_op(op, lhs, rhs)?;
@@ -712,34 +1094,141 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 };
                 store(self, value);
             }
-            Rvalue::Cast(kind, operand, target) => {
-                let to = self.scalar_of(target.as_ref())?;
-                let (value, from) = self.load_scalar(operand)?;
-                let value = match kind {
-                    CastKind::IntToInt
-                    | CastKind::PtrToPtr
-                    | CastKind::PointerExposeAddress
-                    | CastKind::PointerFromExposedAddress => {
-                        self.int_cast(value, from, to)
+            Rvalue::Cast(kind, operand, target) => self.cast(kind, operand, target.as_ref(), dst)?,
+            Rvalue::Aggregate(kind, operands) => match kind {
+                AggregateKind::Tuple(ty) => {
+                    let layout = self.layout(ty.as_ref())?;
+                    self.write_fields(dst, &layout, operands)?;
+                }
+                AggregateKind::Adt(variant, args) => {
+                    let layout = self.variant_layout(dst, *variant, args.as_ref())?;
+                    self.write_fields(dst, &layout, operands)?;
+                }
+                AggregateKind::Array(elem) => {
+                    let size = self.layout(elem.as_ref())?.size;
+                    for (i, operand) in operands.iter().enumerate() {
+                        let (src, _) = self.operand(operand)?;
+                        let element =
+                            self.builder.ins().iadd_imm(dst, (i as u64 * size.bytes()) as i64);
+                        self.copy(element, src, size);
                     }
-                    _ => unsupported!("cast {kind:?}"),
-                };
-                store(self, value);
-            }
-            Rvalue::Aggregate(kind, operands) => {
-                let layout = match kind {
-                    AggregateKind::Tuple(ty) => self.layout(ty.as_ref())?,
-                    AggregateKind::Adt(variant, args) => {
-                        self.variant_layout(dst, *variant, args.as_ref())?
-                    }
-                    _ => unsupported!("aggregate {kind:?}"),
-                };
-                self.write_fields(dst, &layout, operands)?;
-            }
+                }
+                AggregateKind::Union(..) => {
+                    let [operand] = &**operands else {
+                        unsupported!("union aggregate without exactly one field");
+                    };
+                    let (src, ty) = self.operand(operand)?;
+                    let size = self.layout(ty)?.size;
+                    self.copy(dst, src, size);
+                }
+                AggregateKind::Closure(_) => unsupported!("closure aggregate"),
+            },
             _ => unsupported!("rvalue {rvalue:?}"),
         }
-        let _ = dst_ty;
         Ok(())
+    }
+
+    fn cast(&mut self, kind: &CastKind, operand: &Operand, to_ty: Ty<'db>, dst: Value) -> Result<()> {
+        let (src, from_ty) = self.operand(operand)?;
+        let from = self.layout(from_ty)?;
+        let to = self.layout(to_ty)?;
+        match kind {
+            CastKind::PointerCoercion(PointerCast::Unsize) => {
+                let pointees = from_ty.builtin_deref(true).zip(to_ty.builtin_deref(true));
+                let Some((from_pointee, to_pointee)) = pointees else {
+                    unsupported!("unsizing {from_ty:?}");
+                };
+                let (TyKind::Array(_, len), TyKind::Slice(_)) =
+                    (from_pointee.kind(), to_pointee.kind())
+                else {
+                    unsupported!("unsizing {from_pointee:?} to {to_pointee:?}");
+                };
+                let Some(len) = try_const_usize(self.cg.db, len) else {
+                    unsupported!("array with unevaluated length");
+                };
+                let ptr = self.builder.ins().load(PTR, MEM, src, 0);
+                let len = self.builder.ins().iconst(PTR, len as i64);
+                self.builder.ins().store(MEM, ptr, dst, 0);
+                self.builder.ins().store(MEM, len, dst, 8);
+            }
+            CastKind::PointerCoercion(
+                PointerCast::MutToConstPointer
+                | PointerCast::ArrayToPointer
+                | PointerCast::UnsafeFnPointer,
+            ) => self.copy(dst, src, to.size),
+            CastKind::IntToInt
+            | CastKind::PtrToPtr
+            | CastKind::PointerExposeAddress
+            | CastKind::PointerFromExposedAddress
+            | CastKind::FnPtrToPtr => match (from.backend_repr, to.backend_repr) {
+                (BackendRepr::Scalar(from), BackendRepr::Scalar(to)) => {
+                    let (from, to) = (self.scalar(from)?, self.scalar(to)?);
+                    let value = self.builder.ins().load(from.ty, MEM, src, 0);
+                    let value = self.int_cast(value, from, to);
+                    self.builder.ins().store(MEM, value, dst, 0);
+                }
+                // Fat to fat keeps the metadata, fat to thin drops it.
+                (BackendRepr::ScalarPair(..), BackendRepr::ScalarPair(..) | BackendRepr::Scalar(_)) => {
+                    self.copy(dst, src, to.size)
+                }
+                _ => unsupported!("cast from {from_ty:?} to {to_ty:?}"),
+            },
+            _ => unsupported!("cast {kind:?}"),
+        }
+        Ok(())
+    }
+
+    /// The discriminant of the enum at `addr`, as a `to`.
+    fn discriminant(&mut self, addr: Value, ty: Ty<'db>, to: AbiScalar) -> Result<Value> {
+        let db = self.cg.db;
+        let TyKind::Adt(def, _) = ty.kind() else {
+            return Ok(self.iconst(to.ty, 0));
+        };
+        let AdtId::EnumId(id) = def.def_id() else {
+            return Ok(self.iconst(to.ty, 0));
+        };
+        let layout = self.layout(ty)?;
+        let enum_variants = id.enum_variants(db);
+        let discr_of = |index: usize| {
+            db.const_eval_discriminant(enum_variants.variants[index].0)
+                .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))
+        };
+        match &layout.variants {
+            Variants::Empty => unsupported!("discriminant of an uninhabited enum"),
+            Variants::Single { index } => {
+                let discr = discr_of(index.0)?;
+                Ok(self.iconst(to.ty, discr as u128))
+            }
+            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                let tag = self.scalar(*tag)?;
+                let offset = layout.fields.offset(tag_field.index()).bytes() as i32;
+                let value = self.builder.ins().load(tag.ty, MEM, addr, offset);
+                match tag_encoding {
+                    TagEncoding::Direct => Ok(self.int_cast(value, tag, to)),
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                        for (index, _) in variants.iter_enumerated() {
+                            if discr_of(index.0)? != index.0 as i128 {
+                                unsupported!("niche enum with explicit discriminants");
+                            }
+                        }
+                        let first = niche_variants.start().0;
+                        let count = niche_variants.end().0 - first;
+                        let start = self.iconst(tag.ty, *niche_start);
+                        let relative = self.builder.ins().isub(value, start);
+                        let is_niche = self.builder.ins().icmp_imm(
+                            IntCC::UnsignedLessThanOrEqual,
+                            relative,
+                            count as i64,
+                        );
+                        let relative =
+                            self.int_cast(relative, AbiScalar { signed: false, ..tag }, to);
+                        let niche = self.builder.ins().iadd_imm(relative, first as i64);
+                        let untagged = self.iconst(to.ty, untagged_variant.0 as u128);
+                        Ok(self.builder.ins().select(is_niche, niche, untagged))
+                    }
+                }
+            }
+        }
     }
 
     /// Layout whose `fields` describe `variant`. Writes the tag for multi-variant enums.
@@ -749,24 +1238,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         variant: VariantId,
         args: GenericArgs<'db>,
     ) -> Result<Arc<Layout>> {
-        let adt: AdtId = variant.adt_id(self.cg.db);
+        let db = self.cg.db;
+        let adt: AdtId = variant.adt_id(db);
         let layout = self.layout(Ty::new_adt(self.interner, adt, args))?;
-        match &layout.variants {
-            Variants::Single { .. } | Variants::Empty => Ok(layout),
-            Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, variants, .. } => {
-                let VariantId::EnumVariantId(variant) = variant else {
-                    unsupported!("multi-variant non-enum");
-                };
-                let index = variant.index(self.cg.db);
-                // FIXME: explicit discriminants need const eval; the spike assumes `index == discr`.
-                let tag_ty = self.scalar(*tag)?.ty;
-                let value = self.iconst(tag_ty, index as u128);
-                let offset = layout.fields.offset(0).bytes() as i32;
-                self.builder.ins().store(MEM, value, dst, offset);
-                Ok(Arc::new(variants[RustcEnumVariantIdx(index)].clone()))
+        let Variants::Multiple { tag, tag_encoding, tag_field, variants } = &layout.variants else {
+            return Ok(layout);
+        };
+        let VariantId::EnumVariantId(variant) = variant else {
+            unsupported!("multi-variant non-enum");
+        };
+        let index = variant.index(db);
+        let tag_ty = self.scalar(*tag)?.ty;
+        let offset = layout.fields.offset(tag_field.index()).bytes() as i32;
+        let tag_value = match tag_encoding {
+            TagEncoding::Direct => {
+                let discr = db
+                    .const_eval_discriminant(variant)
+                    .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
+                Some(discr as u128)
             }
-            Variants::Multiple { .. } => unsupported!("niche-encoded enum construction"),
+            TagEncoding::Niche { untagged_variant, .. } if untagged_variant.0 == index => None,
+            TagEncoding::Niche { niche_variants, niche_start, .. } => {
+                Some(((index - niche_variants.start().0) as u128).wrapping_add(*niche_start))
+            }
+        };
+        if let Some(tag_value) = tag_value {
+            let value = self.iconst(tag_ty, tag_value);
+            self.builder.ins().store(MEM, value, dst, offset);
         }
+        Ok(Arc::new(variants[RustcEnumVariantIdx(index)].clone()))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
@@ -864,7 +1364,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// Branches to a call of rustc's `panic_const_*` when `cond` is set.
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
-        let Some(symbol) = self.cg.symbols.overflow_panic(op) else {
+        let name = match op {
+            OverflowOp::Add => "add",
+            OverflowOp::Sub => "sub",
+            OverflowOp::Mul => "mul",
+            OverflowOp::Div => "div",
+            OverflowOp::Rem => "rem",
+            OverflowOp::Neg => "neg",
+            OverflowOp::Shl => "shl",
+            OverflowOp::Shr => "shr",
+        };
+        let path = format!("core::panicking::panic_const::panic_const_{name}_overflow");
+        let Some(symbol) = self.cg.symbols.path(&path) else {
             self.builder.ins().trapnz(cond, TrapCode::INTEGER_OVERFLOW);
             return Ok(());
         };
@@ -1236,6 +1747,77 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             ("unreachable" | "abort" | "breakpoint", _) => {
                 self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code"));
                 return Ok(Intrinsic::Diverges);
+            }
+            ("raw_eq" | "compare_bytes", [a, b, ..]) => {
+                let (a, _) = self.load_scalar(a)?;
+                let (b, _) = self.load_scalar(b)?;
+                let len = match args {
+                    [_, _, len] => self.load_scalar(len)?.0,
+                    _ => {
+                        let size = self.layout(generic_args.type_at(0))?.size.bytes();
+                        self.builder.ins().iconst(PTR, size as i64)
+                    }
+                };
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.extend([AbiParam::new(PTR); 3]);
+                sig.returns.push(AbiParam::new(types::I32));
+                let memcmp = self.cg.import("memcmp", &sig)?;
+                let memcmp = self.cg.module.declare_func_in_func(memcmp, self.builder.func);
+                let call = self.builder.ins().call(memcmp, &[a, b, len]);
+                let mut value = self.builder.inst_results(call)[0];
+                if name == "raw_eq" {
+                    value = self.builder.ins().icmp_imm(IntCC::Equal, value, 0);
+                }
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("discriminant_value", [arg]) => {
+                let (ptr, _) = self.load_scalar(arg)?;
+                let to = self.scalar_of(dst_ty)?;
+                let value = self.discriminant(ptr, generic_args.type_at(0), to)?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("ptr_metadata", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                if let BackendRepr::ScalarPair(..) = self.layout(ty)?.backend_repr {
+                    let meta = self.builder.ins().load(PTR, MEM, src, 8);
+                    self.builder.ins().store(MEM, meta, dst, 0);
+                }
+            }
+            ("aggregate_raw_ptr", [data, meta]) => {
+                let (data, _) = self.operand(data)?;
+                let data = self.builder.ins().load(PTR, MEM, data, 0);
+                self.builder.ins().store(MEM, data, dst, 0);
+                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty)?.backend_repr {
+                    let (meta, _) = self.load_scalar(meta)?;
+                    self.builder.ins().store(MEM, meta, dst, 8);
+                }
+            }
+            ("slice_get_unchecked", [slice, index]) => {
+                let size = self.layout(generic_args.type_at(2))?.size.bytes() as i64;
+                let (slice, _) = self.operand(slice)?;
+                let ptr = self.builder.ins().load(PTR, MEM, slice, 0);
+                let (index, _) = self.load_scalar(index)?;
+                let offset = self.builder.ins().imul_imm(index, size);
+                let value = self.builder.ins().iadd(ptr, offset);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("size_of_val", [arg]) => {
+                let (src, _) = self.operand(arg)?;
+                let ty = generic_args.type_at(0);
+                let value = match ty.kind() {
+                    TyKind::Str => self.builder.ins().load(PTR, MEM, src, 8),
+                    TyKind::Slice(elem) => {
+                        let size = self.layout(elem)?.size.bytes() as i64;
+                        let len = self.builder.ins().load(PTR, MEM, src, 8);
+                        self.builder.ins().imul_imm(len, size)
+                    }
+                    TyKind::Dynamic(..) => unsupported!("size_of_val of `dyn`"),
+                    _ => {
+                        let size = self.layout(ty)?.size.bytes() as i64;
+                        self.builder.ins().iconst(PTR, size)
+                    }
+                };
+                self.builder.ins().store(MEM, value, dst, 0);
             }
             ("caller_location", []) => {
                 let value = self.caller_location()?;

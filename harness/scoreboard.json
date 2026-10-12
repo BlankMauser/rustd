@@ -1,0 +1,104 @@
+{
+ "corpus": {
+  "crates": {
+   "cases": {
+    "codegen_ms": 2736.657,
+    "compiled": 62,
+    "instances": 49,
+    "not_roots": 4,
+    "roots": 80,
+    "skipped": {
+     "ReifyFnPointer cast": 1,
+     "call through a vtable": 1,
+     "closure aggregate": 3,
+     "drop glue": 3,
+     "indirect call": 1,
+     "intrinsic `const_eval_select`": 5,
+     "mir: NotSupported": 1,
+     "odd-sized aggregate in a register": 2,
+     "unsizing": 1
+    }
+   }
+  },
+  "fixture": "runner",
+  "match": true
+ },
+ "small-deps": {
+  "crates": {
+   "heck": {
+    "codegen_ms": 3010.604,
+    "compiled": 0,
+    "instances": 0,
+    "not_roots": 20,
+    "roots": 3,
+    "skipped": {
+     "intrinsic `const_eval_select`": 3
+    }
+   },
+   "hex": {
+    "codegen_ms": 3932.731,
+    "compiled": 1,
+    "instances": 2,
+    "not_roots": 170,
+    "roots": 6,
+    "skipped": {
+     "ReifyFnPointer cast": 1,
+     "intrinsic `const_eval_select`": 4
+    }
+   },
+   "httparse": {
+    "codegen_ms": 2817.283,
+    "compiled": 12,
+    "instances": 1,
+    "not_roots": 67,
+    "roots": 25,
+    "skipped": {
+     "call through a vtable": 3,
+     "call to builtin derive method": 3,
+     "intrinsic `const_eval_select`": 2,
+     "odd-sized aggregate in a register": 4,
+     "static without a rustc symbol": 1
+    }
+   },
+   "itoa": {
+    "codegen_ms": 3562.108,
+    "compiled": 1,
+    "instances": 14,
+    "not_roots": 25,
+    "roots": 1,
+    "skipped": {}
+   },
+   "semver": {
+    "codegen_ms": 2820.39,
+    "compiled": 15,
+    "instances": 16,
+    "not_roots": 36,
+    "roots": 43,
+    "skipped": {
+     "ReifyFnPointer cast": 2,
+     "call through a vtable": 9,
+     "call to builtin derive method": 2,
+     "closure aggregate": 2,
+     "drop glue": 9,
+     "unsizing": 4
+    }
+   }
+  },
+  "fixture": "real",
+  "match": true
+ },
+ "toy": {
+  "crates": {
+   "hot": {
+    "codegen_ms": 2734.215,
+    "compiled": 5,
+    "instances": 2,
+    "not_roots": 0,
+    "roots": 5,
+    "skipped": {}
+   }
+  },
+  "fixture": "app",
+  "match": true
+ }
+}

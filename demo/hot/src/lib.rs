@@ -34,7 +34,7 @@ pub fn score(p: &Point, pair: Pair, n: u32) -> u64 {
 }
 
 pub fn make_point(a: i64) -> Point {
-    Point { x: a, y: a * 2, z: a - 5 }
+    Point { x: a, y: a * 2, z: a - 8 }
 }
 
 pub fn shift(p: Point, by: i64) -> Point {

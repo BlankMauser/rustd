@@ -11,8 +11,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
-use hir_def::{FunctionId, ModuleDefId};
-use hir_ty::mir::codegen::{CodegenError, CodegenUnit, OverflowOp, SymbolResolver};
+use hir_def::{FunctionId, ModuleDefId, StaticId};
+use hir_ty::mir::codegen::{CodegenError, CodegenUnit, SymbolResolver};
 use rustc_hash::FxHashMap;
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -28,6 +28,12 @@ struct Args {
     symbol_files: Vec<PathBuf>,
     watch: bool,
     link_cmd: Option<String>,
+    /// Tab-separated per-function outcome, for the harness.
+    report: Option<PathBuf>,
+    /// File of function paths to leave to rustc, for bisecting miscompiles.
+    deny: Option<PathBuf>,
+    /// Directory that gets one object per compiled function, for testing each in isolation.
+    isolate: Option<PathBuf>,
 }
 
 impl Args {
@@ -39,6 +45,9 @@ impl Args {
         let mut symbol_files = Vec::new();
         let mut watch = false;
         let mut link_cmd = None;
+        let mut report = None;
+        let mut deny = None;
+        let mut isolate = None;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -46,6 +55,9 @@ impl Args {
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
                 "--link-cmd" => link_cmd = Some(value()?),
+                "--report" => report = Some(PathBuf::from(value()?)),
+                "--deny" => deny = Some(PathBuf::from(value()?)),
+                "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
@@ -58,6 +70,9 @@ impl Args {
             symbol_files,
             watch,
             link_cmd,
+            report,
+            deny,
+            isolate,
         })
     }
 }
@@ -116,19 +131,16 @@ impl SymbolResolver for Resolver<'_> {
         self.table.get(&self.path(func)?).map(str::to_owned)
     }
 
-    fn overflow_panic(&self, op: OverflowOp) -> Option<String> {
-        let name = match op {
-            OverflowOp::Add => "add",
-            OverflowOp::Sub => "sub",
-            OverflowOp::Mul => "mul",
-            OverflowOp::Div => "div",
-            OverflowOp::Rem => "rem",
-            OverflowOp::Neg => "neg",
-            OverflowOp::Shl => "shl",
-            OverflowOp::Shr => "shr",
+    fn static_(&self, id: StaticId) -> Option<String> {
+        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
+            return None;
         };
-        let path = format!("core::panicking::panic_const::panic_const_{name}_overflow");
+        let path = self.item_path(it.module(self.db), it.name(self.db).as_str())?;
         self.table.get(&path).map(str::to_owned)
+    }
+
+    fn path(&self, path: &str) -> Option<String> {
+        self.table.get(path).map(str::to_owned)
     }
 }
 
@@ -171,21 +183,57 @@ fn build(db: &RootDatabase, table: &SymbolTable, args: &Args) -> anyhow::Result<
     let start = Instant::now();
     let resolver = Resolver { db, table };
     let hir_db: &dyn HirDatabase = db;
-    let roots = functions_of(db, &args.krate)?;
+    let mut roots = functions_of(db, &args.krate)?;
+    if let Some(deny) = &args.deny {
+        let deny = std::fs::read_to_string(deny)?;
+        let deny: rustc_hash::FxHashSet<&str> = deny.lines().collect();
+        roots.retain(|&func| resolver.path(func).is_none_or(|path| !deny.contains(path.as_str())));
+    }
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let unit = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots))
         .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     let start = Instant::now();
-    std::fs::write(&args.out, unit.object)?;
-    Ok(Build {
+    std::fs::write(&args.out, &unit.object)?;
+    let build = Build {
         compiled: unit.compiled.iter().map(|&(func, _)| name(func)).collect(),
         skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
-    })
+    };
+    if let Some(path) = &args.report {
+        build.write_report(path)?;
+    }
+    if let Some(dir) = &args.isolate {
+        std::fs::create_dir_all(dir)?;
+        let mut index = String::new();
+        for (i, &(func, _)) in unit.compiled.iter().enumerate() {
+            let single = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func]))
+                .map_err(anyhow::Error::msg)?;
+            std::fs::write(dir.join(format!("{i}.o")), single.object)?;
+            index.push_str(&format!("{i}\t{}\n", name(func)));
+        }
+        std::fs::write(dir.join("index.tsv"), index)?;
+    }
+    Ok(build)
+}
+
+impl Build {
+    fn write_report(&self, path: &Path) -> anyhow::Result<()> {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "#\tinstances\t{}\tcodegen_us\t{}", self.instances, self.codegen.as_micros())?;
+        for name in &self.compiled {
+            writeln!(out, "compiled\t{name}\t")?;
+        }
+        for (name, error) in &self.skipped {
+            let error = error.to_string().replace(['\t', '\n'], " ");
+            writeln!(out, "skipped\t{name}\t{error}")?;
+        }
+        Ok(std::fs::write(path, out)?)
+    }
 }
 
 fn report(build: &Build) {

@@ -1,0 +1,5 @@
+{
+  "corpus": {"workspace": "corpus", "bin": "runner", "crates": ["cases"]},
+  "toy": {"workspace": "../demo", "bin": "app", "crates": ["hot"]},
+  "small-deps": {"workspace": "../demo/real", "bin": "real", "crates": ["semver", "itoa", "hex", "httparse", "heck"]}
+}
