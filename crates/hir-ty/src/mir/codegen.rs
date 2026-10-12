@@ -18,21 +18,25 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
     AdtId, FunctionId, HasModule, VariantId,
+    attrs::AttrFlags,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
+    signatures::FunctionSignature,
 };
 use la_arena::ArenaMap;
 use rustc_abi::{Integer, Size};
 use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::{IntoKind, SliceLike};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use triomphe::Arc;
 
 use crate::{
     CallableDefId, InferBodyId, MemoryMap, ParamEnvAndCrate,
+    method_resolution::is_dyn_method,
     db::HirDatabase,
     drop::{DropGlue, has_drop_glue},
     layout::{Layout, RustcEnumVariantIdx},
     next_solver::{
-        AllocationData, ConstKind, DbInterner, GenericArgs, Ty, TyKind, TypingMode,
+        AllocationData, ConstKind, DbInterner, GenericArgs, StoredGenericArgs, Ty, TyKind,
+        TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -116,17 +120,74 @@ impl AbiScalar {
     }
 }
 
-pub struct ObjectCodegen<'a, 'db> {
+/// The result of compiling a set of root functions into one object file.
+pub struct CodegenUnit {
+    pub object: Vec<u8>,
+    /// Roots that were compiled, with their exported symbol.
+    pub compiled: Vec<(FunctionId, String)>,
+    /// Roots that have to come from rustc.
+    pub skipped: Vec<(FunctionId, CodegenError)>,
+    /// Callees without a rustc symbol (generic or inlined) that were compiled as local functions.
+    pub instances: usize,
+}
+
+impl CodegenUnit {
+    /// Compiles every root it can, together with the instances those roots call.
+    ///
+    /// A callee that can't be compiled poisons its callers, so codegen restarts with that callee
+    /// rejected up front until a round finishes without a new rejection.
+    pub fn compile(
+        db: &dyn HirDatabase,
+        symbols: &dyn SymbolResolver,
+        roots: &[FunctionId],
+    ) -> Result<CodegenUnit> {
+        let mut rejected = FxHashMap::default();
+        loop {
+            let mut cg = ObjectCodegen::new(db, symbols, &rejected)?;
+            let mut compiled = Vec::new();
+            let mut skipped = Vec::new();
+            for &root in roots {
+                match cg.define_function(root) {
+                    Ok(symbol) => compiled.push((root, symbol)),
+                    Err(e) => skipped.push((root, e)),
+                }
+            }
+            let failed = cg.define_instances();
+            if failed.is_empty() {
+                let instances = cg.instances.len();
+                return Ok(CodegenUnit { object: cg.finish()?, compiled, skipped, instances });
+            }
+            rejected.extend(failed);
+        }
+    }
+}
+
+/// A function with concrete generic arguments that we compile ourselves.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Instance {
+    func: FunctionId,
+    args: StoredGenericArgs,
+}
+
+struct ObjectCodegen<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     imports: FxHashMap<String, FuncId>,
+    instances: FxHashMap<Instance, FuncId>,
+    pending: Vec<(Instance, ParamEnvAndCrate<'db>, FuncId)>,
+    /// Instances that failed in an earlier round, with the reason.
+    rejected: &'a FxHashMap<Instance, String>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
 }
 
 impl<'a, 'db> ObjectCodegen<'a, 'db> {
-    pub fn new(db: &'db dyn HirDatabase, symbols: &'a dyn SymbolResolver) -> Result<Self> {
+    fn new(
+        db: &'db dyn HirDatabase,
+        symbols: &'a dyn SymbolResolver,
+        rejected: &'a FxHashMap<Instance, String>,
+    ) -> Result<Self> {
         let backend = |e: &dyn fmt::Display| CodegenError::Backend(e.to_string());
         let mut flags = settings::builder();
         flags.set("is_pic", "true").map_err(|e| backend(&e))?;
@@ -142,17 +203,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             symbols,
             module: ObjectModule::new(builder),
             imports: FxHashMap::default(),
+            instances: FxHashMap::default(),
+            pending: Vec::new(),
+            rejected,
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
         })
     }
 
-    pub fn finish(self) -> Result<Vec<u8>> {
+    fn finish(self) -> Result<Vec<u8>> {
         self.module.finish().emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
     /// Compiles a non-generic function and exports it under its rustc symbol name.
-    pub fn define_function(&mut self, func: FunctionId) -> Result<String> {
+    fn define_function(&mut self, func: FunctionId) -> Result<String> {
         let db = self.db;
         let owner: InferBodyId<'db> = func.into();
         let body =
@@ -161,11 +225,59 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unsupported!("no rustc symbol for function");
         };
         let krate = owner.module(db).krate(db);
-        let interner = DbInterner::new_with(db, krate);
         let env = ParamEnvAndCrate {
             param_env: db.trait_environment(owner.generic_def(db)),
             krate,
         };
+        let mut ctx = self.compile_body(body, env)?;
+        let id = self
+            .module
+            .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
+            .map_err(|e| CodegenError::Backend(e.to_string()))?;
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| CodegenError::Backend(format!("{e:?}")))?;
+        Ok(symbol)
+    }
+
+    /// Compiles the instances requested by calls. Returns the ones that failed.
+    fn define_instances(&mut self) -> Vec<(Instance, String)> {
+        let mut failed = Vec::new();
+        while let Some((instance, env, id)) = self.pending.pop() {
+            if let Err(e) = self.define_instance(&instance, env, id) {
+                failed.push((instance, e.to_string()));
+            }
+        }
+        failed
+    }
+
+    fn define_instance(
+        &mut self,
+        instance: &Instance,
+        env: ParamEnvAndCrate<'db>,
+        id: FuncId,
+    ) -> Result<()> {
+        let body = self
+            .db
+            .monomorphized_mir_body(instance.func.into(), instance.args.clone(), env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let mut ctx = self.compile_body(body, env)?;
+        // The call site declared the instance with the signature it computed from its operands.
+        if self.module.declarations().get_function_decl(id).signature != ctx.func.signature {
+            unsupported!("call site and body disagree on the signature");
+        }
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| CodegenError::Backend(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    fn compile_body(
+        &mut self,
+        body: &'db MirBody<'db>,
+        env: ParamEnvAndCrate<'db>,
+    ) -> Result<cranelift_codegen::Context> {
+        let interner = DbInterner::new_with(self.db, env.krate);
         let mut ctx = self.module.make_context();
         let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
         let result = {
@@ -189,14 +301,43 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // A failed function leaves the builder context dirty.
         self.builder_ctx = if result.is_ok() { builder_ctx } else { FunctionBuilderContext::new() };
         result?;
+        Ok(ctx)
+    }
+
+    /// The function to call for `func` instantiated with `args`: the rustc-compiled one when it
+    /// has a symbol we can link against, otherwise an instance compiled into this object.
+    fn callee(
+        &mut self,
+        func: FunctionId,
+        args: GenericArgs<'db>,
+        env: ParamEnvAndCrate<'db>,
+        sig: &Signature,
+    ) -> Result<FuncId> {
+        if args.is_empty()
+            && let Some(symbol) = self.symbols.function(func)
+        {
+            return self.import(&symbol, sig);
+        }
+        let instance = Instance { func, args: args.store() };
+        let signature = FunctionSignature::of(self.db, func);
+        let name = signature.name.as_str();
+        if let Some(reason) = self.rejected.get(&instance) {
+            unsupported!("callee `{name}`: {reason}");
+        }
+        if let Some(&id) = self.instances.get(&instance) {
+            return Ok(id);
+        }
+        if !signature.has_body() {
+            unsupported!("call to `{name}`, which has no body and no rustc symbol");
+        }
+        let symbol = format!("rustd::{name}::{}", self.instances.len());
         let id = self
             .module
-            .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
+            .declare_function(&symbol, Linkage::Local, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.module
-            .define_function(id, &mut ctx)
-            .map_err(|e| CodegenError::Backend(format!("{e:?}")))?;
-        Ok(symbol)
+        self.instances.insert(instance.clone(), id);
+        self.pending.push((instance, env, id));
+        Ok(id)
     }
 
     fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
@@ -210,6 +351,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.imports.insert(symbol.to_owned(), id);
         Ok(id)
     }
+}
+
+/// What a call to an intrinsic turned into.
+enum Intrinsic {
+    /// Lowered inline; continue at the call's target.
+    Inline,
+    /// Lowered to a trap; the block is already terminated.
+    Diverges,
+    /// Not known here; call it like a normal function.
+    Unknown,
 }
 
 #[derive(Clone, Copy)]
@@ -569,15 +720,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     | CastKind::PtrToPtr
                     | CastKind::PointerExposeAddress
                     | CastKind::PointerFromExposedAddress => {
-                        if to.ty.bits() < from.ty.bits() {
-                            self.builder.ins().ireduce(to.ty, value)
-                        } else if to.ty.bits() == from.ty.bits() {
-                            value
-                        } else if from.signed {
-                            self.builder.ins().sextend(to.ty, value)
-                        } else {
-                            self.builder.ins().uextend(to.ty, value)
-                        }
+                        self.int_cast(value, from, to)
                     }
                     _ => unsupported!("cast {kind:?}"),
                 };
@@ -848,16 +991,27 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 return self.jump_after_call(target);
             }
         };
-        let (callee, callee_args) = self.cg.db.lookup_impl_method(self.env, func, generic_args);
+        let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func) {
+            match self.intrinsic(func, generic_args, args, dst, dst_ty.ty)? {
+                Intrinsic::Inline => return self.jump_after_call(target),
+                Intrinsic::Diverges => return Ok(()),
+                Intrinsic::Unknown => {
+                    let overridden = AttrFlags::query(db, func.into())
+                        .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN);
+                    let signature = FunctionSignature::of(db, func);
+                    if overridden || !signature.has_body() {
+                        unsupported!("intrinsic `{}`", signature.name.as_str());
+                    }
+                }
+            }
+        }
+        if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
+            unsupported!("call through a vtable");
+        }
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
         let either::Either::Left(callee) = callee else {
             unsupported!("call to builtin derive method");
-        };
-        if !callee_args.is_empty() {
-            // Needs a mono collector and v0 mangling of generic instances.
-            unsupported!("call to generic function");
-        }
-        let Some(symbol) = self.cg.symbols.function(callee) else {
-            unsupported!("call to function without a rustc symbol");
         };
 
         let ret_layout = self.layout(dst_ty.ty)?;
@@ -890,7 +1044,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         }
         let sig = self.signature(&arg_modes, ret_mode);
-        let callee = self.cg.import(&symbol, &sig)?;
+        let callee = self.cg.callee(callee, callee_args, self.env, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
         let call = self.builder.ins().call(callee, &values);
         let results = self.builder.inst_results(call).to_vec();
@@ -910,6 +1064,221 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         }
         self.jump_after_call(target)
+    }
+
+    fn intrinsic(
+        &mut self,
+        func: FunctionId,
+        generic_args: GenericArgs<'db>,
+        args: &[Operand],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<Intrinsic> {
+        let name = FunctionSignature::of(self.cg.db, func).name.as_str();
+        match (name, args) {
+            (
+                "wrapping_add" | "unchecked_add" | "wrapping_sub" | "unchecked_sub"
+                | "wrapping_mul" | "unchecked_mul" | "unchecked_div" | "exact_div"
+                | "unchecked_rem" | "unchecked_shl" | "unchecked_shr" | "rotate_left"
+                | "rotate_right" | "saturating_add" | "saturating_sub" | "three_way_compare",
+                [lhs, rhs],
+            ) => {
+                let (l, scalar) = self.load_scalar(lhs)?;
+                let (r, r_scalar) = self.load_scalar(rhs)?;
+                let signed = scalar.signed;
+                let value = match name {
+                    "wrapping_add" | "unchecked_add" => self.builder.ins().iadd(l, r),
+                    "wrapping_sub" | "unchecked_sub" => self.builder.ins().isub(l, r),
+                    "wrapping_mul" | "unchecked_mul" => self.builder.ins().imul(l, r),
+                    "unchecked_div" | "exact_div" if signed => self.builder.ins().sdiv(l, r),
+                    "unchecked_div" | "exact_div" => self.builder.ins().udiv(l, r),
+                    "unchecked_rem" if signed => self.builder.ins().srem(l, r),
+                    "unchecked_rem" => self.builder.ins().urem(l, r),
+                    "unchecked_shl" => self.builder.ins().ishl(l, r),
+                    "unchecked_shr" if signed => self.builder.ins().sshr(l, r),
+                    "unchecked_shr" => self.builder.ins().ushr(l, r),
+                    "rotate_left" => self.builder.ins().rotl(l, r),
+                    "rotate_right" => self.builder.ins().rotr(l, r),
+                    "three_way_compare" => {
+                        let (gt, lt) = if signed {
+                            (IntCC::SignedGreaterThan, IntCC::SignedLessThan)
+                        } else {
+                            (IntCC::UnsignedGreaterThan, IntCC::UnsignedLessThan)
+                        };
+                        let gt = self.builder.ins().icmp(gt, l, r);
+                        let lt = self.builder.ins().icmp(lt, l, r);
+                        self.builder.ins().isub(gt, lt)
+                    }
+                    _ => self.saturating(name == "saturating_add", l, r, scalar),
+                };
+                let _ = r_scalar;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("add_with_overflow" | "sub_with_overflow" | "mul_with_overflow", [lhs, rhs]) => {
+                let (l, scalar) = self.load_scalar(lhs)?;
+                let (r, _) = self.load_scalar(rhs)?;
+                let ins = self.builder.ins();
+                let (value, overflow) = match (name, scalar.signed) {
+                    ("add_with_overflow", true) => ins.sadd_overflow(l, r),
+                    ("add_with_overflow", false) => ins.uadd_overflow(l, r),
+                    ("sub_with_overflow", true) => ins.ssub_overflow(l, r),
+                    ("sub_with_overflow", false) => ins.usub_overflow(l, r),
+                    (_, true) => ins.smul_overflow(l, r),
+                    (_, false) => ins.umul_overflow(l, r),
+                };
+                let layout = self.layout(dst_ty)?;
+                self.builder.ins().store(MEM, value, dst, layout.fields.offset(0).bytes() as i32);
+                self.builder.ins().store(
+                    MEM,
+                    overflow,
+                    dst,
+                    layout.fields.offset(1).bytes() as i32,
+                );
+            }
+            (
+                "ctpop" | "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" | "bswap"
+                | "bitreverse",
+                [arg],
+            ) => {
+                let (value, from) = self.load_scalar(arg)?;
+                let value = match name {
+                    "ctpop" => self.builder.ins().popcnt(value),
+                    "ctlz" | "ctlz_nonzero" => self.builder.ins().clz(value),
+                    "cttz" | "cttz_nonzero" => self.builder.ins().ctz(value),
+                    "bswap" if from.ty == types::I8 => value,
+                    "bswap" => self.builder.ins().bswap(value),
+                    _ => self.builder.ins().bitrev(value),
+                };
+                let to = self.scalar_of(dst_ty)?;
+                let value = self.int_cast(value, AbiScalar { signed: false, ..from }, to);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("size_of" | "align_of" | "min_align_of" | "pref_align_of", []) => {
+                let layout = self.layout(generic_args.type_at(0))?;
+                let bytes =
+                    if name == "size_of" { layout.size.bytes() } else { layout.align.abi.bytes() };
+                let value = self.builder.ins().iconst(PTR, bytes as i64);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("needs_drop", []) => {
+                let ty = generic_args.type_at(0);
+                let needs = has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None;
+                let value = self.builder.ins().iconst(types::I8, i64::from(needs));
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("ub_checks" | "contract_checks" | "is_val_statically_known", _) => {
+                let value = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("overflow_checks", []) => {
+                let value = self.builder.ins().iconst(types::I8, 1);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("transmute" | "transmute_unchecked" | "black_box" | "likely" | "unlikely", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let size = self.layout(ty)?.size;
+                if size != self.layout(dst_ty)?.size {
+                    unsupported!("transmute between differently sized types");
+                }
+                self.copy(dst, src, size);
+            }
+            ("read_via_copy" | "volatile_load" | "unaligned_volatile_load", [ptr]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let size = self.layout(dst_ty)?.size;
+                self.copy(dst, ptr, size);
+            }
+            ("write_via_move" | "volatile_store" | "unaligned_volatile_store", [ptr, value]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (src, ty) = self.operand(value)?;
+                let size = self.layout(ty)?.size;
+                self.copy(ptr, src, size);
+            }
+            ("offset" | "arith_offset", [ptr, count]) => {
+                let Some(pointee) = self.operand_ty(ptr)?.builtin_deref(true) else {
+                    unsupported!("offset of a non-pointer");
+                };
+                let size = self.layout(pointee)?.size.bytes() as i64;
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (count, _) = self.load_scalar(count)?;
+                let bytes = self.builder.ins().imul_imm(count, size);
+                let value = self.builder.ins().iadd(ptr, bytes);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("ptr_offset_from" | "ptr_offset_from_unsigned", [a, b]) => {
+                let size = self.layout(generic_args.type_at(0))?.size.bytes() as i64;
+                let (a, _) = self.load_scalar(a)?;
+                let (b, _) = self.load_scalar(b)?;
+                let bytes = self.builder.ins().isub(a, b);
+                let size = self.builder.ins().iconst(PTR, size);
+                let value = self.builder.ins().sdiv(bytes, size);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("copy" | "copy_nonoverlapping" | "write_bytes", [a, b, count]) => {
+                let size = self.layout(generic_args.type_at(0))?.size.bytes() as i64;
+                let (a, _) = self.load_scalar(a)?;
+                let (b, _) = self.load_scalar(b)?;
+                let (count, _) = self.load_scalar(count)?;
+                let bytes = self.builder.ins().imul_imm(count, size);
+                let config = self.cg.module.target_config();
+                match name {
+                    // `copy(src, dst, count)`
+                    "copy" => self.builder.call_memmove(config, b, a, bytes),
+                    "copy_nonoverlapping" => self.builder.call_memcpy(config, b, a, bytes),
+                    // `write_bytes(dst, value, count)`
+                    _ => self.builder.call_memset(config, a, b, bytes),
+                }
+            }
+            (
+                "assume" | "cold_path" | "forget" | "assert_inhabited" | "assert_zero_valid"
+                | "assert_mem_uninitialized_valid",
+                _,
+            ) => (),
+            ("unreachable" | "abort" | "breakpoint", _) => {
+                self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code"));
+                return Ok(Intrinsic::Diverges);
+            }
+            ("caller_location", []) => {
+                let value = self.caller_location()?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            _ => return Ok(Intrinsic::Unknown),
+        }
+        Ok(Intrinsic::Inline)
+    }
+
+    fn saturating(&mut self, add: bool, l: Value, r: Value, scalar: AbiScalar) -> Value {
+        let bits = scalar.ty.bits();
+        let ins = self.builder.ins();
+        let (value, overflow) = match (add, scalar.signed) {
+            (true, true) => ins.sadd_overflow(l, r),
+            (true, false) => ins.uadd_overflow(l, r),
+            (false, true) => ins.ssub_overflow(l, r),
+            (false, false) => ins.usub_overflow(l, r),
+        };
+        let limit = if scalar.signed {
+            // Overflow went past MAX when the left operand is non-negative, past MIN otherwise.
+            let min = self.iconst(scalar.ty, 1u128 << (bits - 1));
+            let max = self.iconst(scalar.ty, (1u128 << (bits - 1)) - 1);
+            let negative = self.builder.ins().icmp_imm(IntCC::SignedLessThan, l, 0);
+            self.builder.ins().select(negative, min, max)
+        } else if add {
+            self.iconst(scalar.ty, u128::MAX >> (128 - bits))
+        } else {
+            self.iconst(scalar.ty, 0)
+        };
+        self.builder.ins().select(overflow, limit, value)
+    }
+
+    fn int_cast(&mut self, value: Value, from: AbiScalar, to: AbiScalar) -> Value {
+        if to.ty.bits() < from.ty.bits() {
+            self.builder.ins().ireduce(to.ty, value)
+        } else if to.ty.bits() == from.ty.bits() {
+            value
+        } else if from.signed {
+            self.builder.ins().sextend(to.ty, value)
+        } else {
+            self.builder.ins().uextend(to.ty, value)
+        }
     }
 
     fn jump_after_call(&mut self, target: Option<BasicBlockId>) -> Result<()> {

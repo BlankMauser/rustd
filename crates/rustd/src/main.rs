@@ -10,9 +10,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use hir::{AsAssocItem, Crate, Module, ModuleDef, db::HirDatabase};
+use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
 use hir_def::{FunctionId, ModuleDefId};
-use hir_ty::mir::codegen::{CodegenError, ObjectCodegen, OverflowOp, SymbolResolver};
+use hir_ty::mir::codegen::{CodegenError, CodegenUnit, OverflowOp, SymbolResolver};
+use rustc_hash::FxHashMap;
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
@@ -67,15 +68,28 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
+    /// The function's path as `rustc-demangle` prints its v0 symbol.
     fn path(&self, func: FunctionId) -> Option<String> {
         let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
             return None;
         };
-        // Associated functions need `<Type>::name` / `<Type as Trait>::name` paths.
-        if func.as_assoc_item(self.db).is_some() {
-            return None;
+        let name = func.name(self.db);
+        let Some(assoc) = func.as_assoc_item(self.db) else {
+            return self.item_path(func.module(self.db), name.as_str());
+        };
+        let AssocItemContainer::Impl(imp) = assoc.container(self.db) else { return None };
+        let self_ty = self.type_path(&imp.self_ty(self.db))?;
+        match imp.trait_(self.db) {
+            Some(trait_) => {
+                let trait_ =
+                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                Some(format!("<{self_ty} as {trait_}>::{}", name.as_str()))
+            }
+            None => Some(format!("<{self_ty}>::{}", name.as_str())),
         }
-        let module = func.module(self.db);
+    }
+
+    fn item_path(&self, module: Module, name: &str) -> Option<String> {
         let krate = module.krate(self.db).display_name(self.db)?;
         let mut path = krate.crate_name().to_string();
         for segment in module.path_segments(self.db) {
@@ -83,8 +97,17 @@ impl Resolver<'_> {
             path.push_str(segment.as_str());
         }
         path.push_str("::");
-        path.push_str(func.name(self.db).as_str());
+        path.push_str(name);
         Some(path)
+    }
+
+    /// Only non-generic ADTs for now; anything else has no symbol we can name.
+    fn type_path(&self, ty: &hir::Type<'_>) -> Option<String> {
+        let adt = ty.as_adt()?;
+        if ty.type_arguments().next().is_some() {
+            return None;
+        }
+        self.item_path(adt.module(self.db), adt.name(self.db).as_str())
     }
 }
 
@@ -123,6 +146,15 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
                 functions.push(id);
             }
         }
+        for imp in module.impl_defs(db) {
+            for item in imp.items(db) {
+                if let AssocItem::Function(func) = item
+                    && let Ok(func) = FunctionId::try_from(func)
+                {
+                    functions.push(func);
+                }
+            }
+        }
     }
     Ok(functions)
 }
@@ -130,6 +162,7 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
 struct Build {
     compiled: Vec<String>,
     skipped: Vec<(String, CodegenError)>,
+    instances: usize,
     codegen: Duration,
     emit: Duration,
 }
@@ -138,35 +171,51 @@ fn build(db: &RootDatabase, table: &SymbolTable, args: &Args) -> anyhow::Result<
     let start = Instant::now();
     let resolver = Resolver { db, table };
     let hir_db: &dyn HirDatabase = db;
-    let mut build =
-        Build { compiled: vec![], skipped: vec![], codegen: Duration::ZERO, emit: Duration::ZERO };
-    let mut codegen = ObjectCodegen::new(hir_db, &resolver).map_err(anyhow::Error::msg)?;
-    for func in functions_of(db, &args.krate)? {
-        let name = resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
-        // Salsa attaches the database for the duration of the closure; the solver needs it.
-        match hir::attach_db(db, || codegen.define_function(func)) {
-            Ok(_) => build.compiled.push(name),
-            Err(e) => build.skipped.push((name, e)),
-        }
-    }
-    build.codegen = start.elapsed();
+    let roots = functions_of(db, &args.krate)?;
+    // Salsa attaches the database for the duration of the closure; the solver needs it.
+    let unit = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots))
+        .map_err(anyhow::Error::msg)?;
+    let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
+    let codegen = start.elapsed();
     let start = Instant::now();
-    let object = codegen.finish().map_err(anyhow::Error::msg)?;
-    std::fs::write(&args.out, object)?;
-    build.emit = start.elapsed();
-    Ok(build)
+    std::fs::write(&args.out, unit.object)?;
+    Ok(Build {
+        compiled: unit.compiled.iter().map(|&(func, _)| name(func)).collect(),
+        skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
+        instances: unit.instances,
+        codegen,
+        emit: start.elapsed(),
+    })
 }
 
 fn report(build: &Build) {
     eprintln!(
-        "compiled {} fns in {:.1?} (+{:.1?} emit): {}",
+        "compiled {} of {} fns (+{} instances) in {:.1?} (+{:.1?} emit)",
         build.compiled.len(),
+        build.compiled.len() + build.skipped.len(),
+        build.instances,
         build.codegen,
         build.emit,
-        build.compiled.join(", ")
     );
+    if build.skipped.len() <= 8 {
+        for (name, error) in &build.skipped {
+            eprintln!("  left to rustc: {name}: {error}");
+        }
+        return;
+    }
+    // Bucket by the innermost reason, without the payload.
+    let mut reasons: FxHashMap<String, (usize, &str)> = FxHashMap::default();
     for (name, error) in &build.skipped {
-        eprintln!("  left to rustc: {name}: {error}");
+        let error = error.to_string();
+        let reason = error.rsplit("`: ").next().unwrap_or(&error);
+        let reason = reason.split(['(', '{']).next().unwrap_or(reason).trim();
+        let entry = reasons.entry(reason.to_owned()).or_insert((0, name));
+        entry.0 += 1;
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+    for (reason, (count, example)) in reasons {
+        eprintln!("  {count:>5}  {reason}  (e.g. {example})");
     }
 }
 
