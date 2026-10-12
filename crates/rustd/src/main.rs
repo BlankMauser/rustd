@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, bail};
 use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
 use hir_def::{FunctionId, ModuleDefId, StaticId};
-use hir_ty::mir::codegen::{CodegenError, CodegenUnit, SymbolResolver};
+use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
 use rustc_hash::FxHashMap;
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -179,7 +179,12 @@ struct Build {
     emit: Duration,
 }
 
-fn build(db: &RootDatabase, table: &SymbolTable, args: &Args) -> anyhow::Result<Build> {
+fn build(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    known: &mut Rejections,
+) -> anyhow::Result<Build> {
     let start = Instant::now();
     let resolver = Resolver { db, table };
     let hir_db: &dyn HirDatabase = db;
@@ -190,7 +195,7 @@ fn build(db: &RootDatabase, table: &SymbolTable, args: &Args) -> anyhow::Result<
         roots.retain(|&func| resolver.path(func).is_none_or(|path| !deny.contains(path.as_str())));
     }
     // Salsa attaches the database for the duration of the closure; the solver needs it.
-    let unit = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots))
+    let unit = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots, known))
         .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
@@ -210,7 +215,7 @@ fn build(db: &RootDatabase, table: &SymbolTable, args: &Args) -> anyhow::Result<
         std::fs::create_dir_all(dir)?;
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
-            let single = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func]))
+            let single = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func], known))
                 .map_err(anyhow::Error::msg)?;
             std::fs::write(dir.join(format!("{i}.o")), single.object)?;
             index.push_str(&format!("{i}\t{}\n", name(func)));
@@ -308,7 +313,8 @@ fn main() -> anyhow::Result<()> {
         load_workspace_at(&args.project, &cargo_config, &load_config, &|_| {})?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
-    let cold = build(&db, &table, &args)?;
+    let mut known = Rejections::default();
+    let cold = build(&db, &table, &args, &mut known)?;
     eprint!("cold: ");
     report(&cold);
     link(&args)?;
@@ -337,7 +343,7 @@ fn main() -> anyhow::Result<()> {
         let start = Instant::now();
         db.apply_change(change);
         let apply = start.elapsed();
-        let warm = build(&db, &table, &args)?;
+        let warm = build(&db, &table, &args, &mut known)?;
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         link(&args)?;

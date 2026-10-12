@@ -148,10 +148,16 @@ impl CodegenUnit {
         db: &dyn HirDatabase,
         symbols: &dyn SymbolResolver,
         roots: &[FunctionId],
+        known: &mut Rejections,
     ) -> Result<CodegenUnit> {
-        let mut rejected = FxHashMap::default();
+        // Rejections of the edited crate's own functions may be out of date.
+        if let Some(&root) = roots.first() {
+            let krate = root.krate(db);
+            known.rejected.retain(|instance, _| instance.func.krate(db) != krate);
+        }
+        let rejected = &mut known.rejected;
         loop {
-            let mut cg = ObjectCodegen::new(db, symbols, &rejected)?;
+            let mut cg = ObjectCodegen::new(db, symbols, rejected)?;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
@@ -168,6 +174,13 @@ impl CodegenUnit {
             rejected.extend(failed);
         }
     }
+}
+
+/// Instances already found impossible to compile, kept between builds so a warm build does
+/// not rediscover them one restart at a time.
+#[derive(Default)]
+pub struct Rejections {
+    rejected: FxHashMap<Instance, String>,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.
