@@ -1532,6 +1532,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         };
         let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func)
+            && FunctionSignature::of(db, func).name.as_str() == "const_eval_select"
+        {
+            // `const_eval_select((a, b), const_fn, runtime_fn)` is `runtime_fn(a, b)` at run time.
+            let [tuple, _, runtime] = args else {
+                unsupported!("const_eval_select with {} arguments", args.len());
+            };
+            let TyKind::FnDef(runtime, runtime_args) = self.operand_ty(runtime)?.kind() else {
+                unsupported!("const_eval_select with a non-fn-item runtime function");
+            };
+            let CallableDefId::FunctionId(runtime) = runtime.0 else {
+                unsupported!("const_eval_select with a constructor");
+            };
+            let (tuple_addr, tuple_ty) = self.operand(tuple)?;
+            let TyKind::Tuple(fields) = tuple_ty.kind() else {
+                unsupported!("const_eval_select with non-tuple arguments");
+            };
+            let layout = self.layout(tuple_ty)?;
+            let mut values = Vec::new();
+            for (i, ty) in fields.iter().enumerate() {
+                let offset = layout.fields.offset(i).bytes() as i64;
+                values.push((self.builder.ins().iadd_imm(tuple_addr, offset), ty));
+            }
+            self.call_direct(runtime, runtime_args, &values, dst, dst_ty.ty)?;
+            return self.jump_after_call(target);
+        }
         if FunctionSignature::is_intrinsic(db, func) {
             match self.intrinsic(func, generic_args, args, dst, dst_ty.ty)? {
                 Intrinsic::Inline => return self.jump_after_call(target),
@@ -1546,6 +1572,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
             }
         }
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.operand(arg)?);
+        }
+        self.call_direct(func, generic_args, &values, dst, dst_ty.ty)?;
+        self.jump_after_call(target)
+    }
+
+    /// Calls `func` with arguments that live at the given addresses.
+    fn call_direct(
+        &mut self,
+        func: FunctionId,
+        generic_args: GenericArgs<'db>,
+        args: &[(Value, Ty<'db>)],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
+        let db = self.cg.db;
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
             unsupported!("call through a vtable");
         }
@@ -1554,15 +1598,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             unsupported!("call to builtin derive method");
         };
 
-        let ret_layout = self.layout(dst_ty.ty)?;
+        let ret_layout = self.layout(dst_ty)?;
         let ret_mode = self.pass_mode(&ret_layout, true)?;
         let mut arg_modes = Vec::with_capacity(args.len());
         let mut values = Vec::new();
         if let PassMode::Indirect = ret_mode {
             values.push(dst);
         }
-        for arg in args {
-            let (addr, ty) = self.operand(arg)?;
+        for &(addr, ty) in args {
             let layout = self.layout(ty)?;
             let mode = self.pass_mode(&layout, false)?;
             arg_modes.push(mode);
@@ -1603,7 +1646,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 );
             }
         }
-        self.jump_after_call(target)
+        Ok(())
     }
 
     fn intrinsic(
