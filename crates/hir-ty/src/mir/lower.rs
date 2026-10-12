@@ -971,7 +971,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     // for binary operator, and use without adjust to simplify our conditions.
                     let lhs_ty = self.expr_ty_without_adjust(*lhs);
                     let rhs_ty = self.expr_ty_without_adjust(*rhs);
-                    if matches!(op, BinaryOp::CmpOp(syntax::ast::CmpOp::Eq { .. }))
+                    // Every comparison of raw pointers is builtin. Treating `<` as a method call
+                    // makes core's `impl PartialOrd for *const T` call itself.
+                    if matches!(op, BinaryOp::CmpOp(_))
                         && matches!(lhs_ty.kind(), TyKind::RawPtr(..))
                         && matches!(rhs_ty.kind(), TyKind::RawPtr(..))
                     {

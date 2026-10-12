@@ -2,18 +2,18 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 2736.657,
-    "compiled": 62,
+    "codegen_ms": 2891.856,
+    "compiled": 65,
     "instances": 49,
     "not_roots": 4,
-    "roots": 80,
+    "roots": 84,
     "skipped": {
      "ReifyFnPointer cast": 1,
      "call through a vtable": 1,
      "closure aggregate": 3,
      "drop glue": 3,
      "indirect call": 1,
-     "intrinsic `const_eval_select`": 5,
+     "intrinsic `const_eval_select`": 6,
      "mir: NotSupported": 1,
      "odd-sized aggregate in a register": 2,
      "unsizing": 1
@@ -23,10 +23,74 @@
   "fixture": "runner",
   "match": true
  },
+ "httparse-tests": {
+  "crates": {
+   "httparse": {
+    "codegen_ms": 5067.944,
+    "compiled": 17,
+    "instances": 7,
+    "not_roots": 45,
+    "roots": 47,
+    "skipped": {
+     "call through a vtable": 3,
+     "call to builtin derive method": 3,
+     "intrinsic `const_eval_select`": 16,
+     "odd-sized aggregate in a register": 4,
+     "static without a rustc symbol": 4
+    }
+   }
+  },
+  "culprits": [],
+  "fixture": "httparse",
+  "match": true,
+  "tests_run": 263
+ },
+ "itoa-tests": {
+  "crates": {
+   "itoa": {
+    "codegen_ms": 4161.601,
+    "compiled": 2,
+    "instances": 14,
+    "not_roots": 23,
+    "roots": 3,
+    "skipped": {
+     "Compilation": 1
+    }
+   }
+  },
+  "culprits": [],
+  "fixture": "itoa",
+  "match": true,
+  "tests_run": 11
+ },
+ "semver-tests": {
+  "crates": {
+   "semver": {
+    "codegen_ms": 6715.107,
+    "compiled": 26,
+    "instances": 35,
+    "not_roots": 18,
+    "roots": 61,
+    "skipped": {
+     "ReifyFnPointer cast": 2,
+     "call through a vtable": 9,
+     "call to builtin derive method": 3,
+     "closure aggregate": 2,
+     "drop glue": 5,
+     "intrinsic `const_eval_select`": 9,
+     "unsizing": 5
+    }
+   }
+  },
+  "culprits": [],
+  "fixture": "semver",
+  "match": true,
+  "tests_run": 34
+ },
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 3010.604,
+    "codegen_ms": 2823.735,
     "compiled": 0,
     "instances": 0,
     "not_roots": 20,
@@ -36,7 +100,7 @@
     }
    },
    "hex": {
-    "codegen_ms": 3932.731,
+    "codegen_ms": 2711.131,
     "compiled": 1,
     "instances": 2,
     "not_roots": 170,
@@ -47,7 +111,7 @@
     }
    },
    "httparse": {
-    "codegen_ms": 2817.283,
+    "codegen_ms": 2777.35,
     "compiled": 12,
     "instances": 1,
     "not_roots": 67,
@@ -61,7 +125,7 @@
     }
    },
    "itoa": {
-    "codegen_ms": 3562.108,
+    "codegen_ms": 2742.57,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -69,7 +133,7 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 2820.39,
+    "codegen_ms": 2954.037,
     "compiled": 15,
     "instances": 16,
     "not_roots": 36,
@@ -90,7 +154,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 2734.215,
+    "codegen_ms": 2603.107,
     "compiled": 5,
     "instances": 2,
     "not_roots": 0,

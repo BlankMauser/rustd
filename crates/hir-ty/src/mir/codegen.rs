@@ -243,9 +243,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .module
             .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.module
-            .define_function(id, &mut ctx)
-            .map_err(|e| CodegenError::Backend(format!("{e:?}")))?;
+        self.emit(id, &mut ctx)?;
         Ok(symbol)
     }
 
@@ -275,10 +273,28 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if self.module.declarations().get_function_decl(id).signature != ctx.func.signature {
             unsupported!("call site and body disagree on the signature");
         }
-        self.module
-            .define_function(id, &mut ctx)
-            .map_err(|e| CodegenError::Backend(format!("{e:?}")))?;
-        Ok(())
+        self.emit(id, &mut ctx)
+    }
+
+    /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
+    /// (i128 corners, for one); that must cost us one function, not the process.
+    fn emit(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
+        let module = &mut self.module;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            module.define_function(id, ctx)
+        }));
+        match outcome {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(CodegenError::Backend(format!("{e:?}"))),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown");
+                Err(CodegenError::Backend(format!("backend panic: {message}")))
+            }
+        }
     }
 
     fn compile_body(

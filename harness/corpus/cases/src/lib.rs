@@ -240,6 +240,29 @@ pub mod slices {
     }
 }
 
+pub mod pointers {
+    pub struct Cursor { pub start: *const u8, pub end: *const u8 }
+
+    /// Ordering on raw pointers: RA used to lower this to a self-recursive `PartialOrd::lt`.
+    pub fn peek(c: &Cursor) -> Option<u8> {
+        if c.start < c.end { Some(unsafe { *c.start }) } else { None }
+    }
+    pub fn compare(a: *const u32, b: *const u32) -> (bool, bool, bool, bool) {
+        (a < b, a >= b, a == b, a != b)
+    }
+    pub fn advance(c: &mut Cursor, n: usize) -> usize {
+        c.start = unsafe { c.start.add(n) };
+        unsafe { c.end.offset_from(c.start) as usize }
+    }
+    pub fn write(p: *mut u64, v: u64) -> u64 {
+        unsafe {
+            let old = *p;
+            *p = v;
+            old
+        }
+    }
+}
+
 pub mod consts {
     pub const LIMIT: u32 = 40 + 2;
     pub static TABLE: [u8; 8] = [1, 1, 2, 3, 5, 8, 13, 21];

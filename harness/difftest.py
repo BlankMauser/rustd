@@ -20,21 +20,26 @@ def sysroot_rlibs():
 
 
 class Fixture:
-    def __init__(self, workspace, bin_pkg, crates):
-        self.ws, self.bin, self.crates = os.path.abspath(workspace), bin_pkg, crates
+    def __init__(self, workspace, crates, target, touch=None):
+        """`target` selects what cargo links: ["-p", "app"] or ["--test", "name"]."""
+        self.ws, self.crates, self.target_args = os.path.abspath(workspace), crates, target
         self.work = tempfile.mkdtemp(prefix="rustd-diff-")
-        meta = json.loads(subprocess.check_output(
-            ["cargo", "metadata", "--format-version", "1"], cwd=self.ws))
-        self.target = meta["target_directory"]
-        self.main = next(t["src_path"] for p in meta["packages"] if p["name"] == bin_pkg
+        self.run_args = []
+        if touch is None:
+            meta = json.loads(subprocess.check_output(
+                ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=self.ws))
+            touch = next(t["src_path"] for p in meta["packages"] if p["name"] == target[1]
                          for t in p["targets"] if "bin" in t["kind"])
+        self.touch = touch
 
     def rustc_build(self):
         """Builds with cargo and captures the linker line so rustd objects can be spliced in."""
-        os.utime(self.main)
+        os.utime(self.touch)
         out = subprocess.run(
-            ["cargo", "rustc", "-p", self.bin, "--", "--print", "link-args", "-C", "save-temps"],
-            cwd=self.ws, capture_output=True, text=True, check=True)
+            ["cargo", "rustc", *self.target_args, "--", "--print", "link-args", "-C", "save-temps"],
+            cwd=self.ws, capture_output=True, text=True)
+        if out.returncode != 0:
+            raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
         line = next(l for l in (out.stdout + out.stderr).splitlines() if '"cc"' in l)
         args = shlex.split(line)
         self.link_args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
@@ -69,13 +74,15 @@ class Fixture:
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]
 
-    @staticmethod
-    def behaviour(binary):
+    def behaviour(self, binary):
         try:
-            run = subprocess.run([binary], capture_output=True, timeout=20)
-            return run.returncode, run.stdout, run.stderr
+            run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=120)
+            return run.returncode, self.normalize(run.stdout), run.stderr
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""
+
+    def normalize(self, stdout):
+        return stdout
 
     def matches(self, expected):
         return self.behaviour(self.binary) == expected
@@ -116,21 +123,12 @@ def bucket(error):
     return re.split(r"[({]", reason)[0].strip()[:60]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("workspace")
-    ap.add_argument("--bin", required=True)
-    ap.add_argument("--crate", action="append", required=True)
-    ap.add_argument("--bisect", action="store_true")
-    ap.add_argument("--json")
-    a = ap.parse_args()
-
-    fx = Fixture(a.workspace, a.bin, a.crate)
+def compare(fx, name, do_bisect):
     fx.rustc_build()
     expected = fx.behaviour(fx.reference)
     fx.rustd_build()
     ok = fx.matches(expected)
-    result = {"fixture": a.bin, "match": ok, "crates": {}}
+    result = {"fixture": name, "match": ok, "crates": {}}
     for crate, rows in fx.reports.items():
         n = sum(r[0] == "compiled" for r in rows)
         total = sum(r[0] in ("compiled", "skipped") for r in rows)
@@ -149,13 +147,27 @@ def main():
         got = fx.behaviour(fx.binary)
         print(f"  rustc: status {expected[0]}\n{expected[1].decode(errors='replace')}")
         print(f"  rustd: status {got[0]}\n{got[1].decode(errors='replace')}{got[2].decode(errors='replace')[-600:]}")
-        if a.bisect:
+        if do_bisect:
             result["culprits"] = isolate(fx, expected)
             for c in result["culprits"]:
                 print(f"  MISCOMPILED {c['function']}: {c['symptom']}")
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workspace")
+    ap.add_argument("--bin", required=True)
+    ap.add_argument("--crate", action="append", required=True)
+    ap.add_argument("--bisect", action="store_true")
+    ap.add_argument("--json")
+    a = ap.parse_args()
+
+    fx = Fixture(a.workspace, a.crate, ["-p", a.bin])
+    result = compare(fx, a.bin, a.bisect)
     if a.json:
         json.dump(result, open(a.json, "w"), indent=1)
-    sys.exit(0 if ok else 1)
+    sys.exit(0 if result["match"] else 1)
 
 
 if __name__ == "__main__":

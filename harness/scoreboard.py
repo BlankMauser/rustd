@@ -12,10 +12,15 @@ BOARD = os.path.join(HERE, "scoreboard.json")
 
 def run(name, target):
     out = tempfile.mktemp(suffix=".json")
-    cmd = [sys.executable, os.path.join(HERE, "difftest.py"), os.path.join(HERE, target["workspace"]),
-           "--bin", target["bin"], "--bisect", "--json", out]
-    for crate in target["crates"]:
-        cmd += ["--crate", crate]
+    if "tests" in target:
+        subprocess.run([os.path.join(HERE, "vendor.sh"), target["tests"]], check=True)
+        directory = os.path.join(HERE, "vendor", target["tests"].rsplit("-", 1)[0])
+        cmd = [sys.executable, os.path.join(HERE, "cratetest.py"), directory, "--bisect", "--json", out]
+    else:
+        cmd = [sys.executable, os.path.join(HERE, "difftest.py"), os.path.join(HERE, target["workspace"]),
+               "--bin", target["bin"], "--bisect", "--json", out]
+        for crate in target["crates"]:
+            cmd += ["--crate", crate]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if not os.path.exists(out):
         return {"match": False, "crash": proc.stdout[-500:] + proc.stderr[-500:], "crates": {}}
@@ -29,6 +34,8 @@ def markdown(board):
     reasons = {}
     for name, result in board.items():
         verdict = "yes" if result["match"] else "**NO**"
+        if result["match"] and "tests_run" in result:
+            verdict = f"yes ({result['tests_run']} tests)"
         for crate, c in result["crates"].items():
             share = f"{c['compiled']} / {c['roots']}" + (f" ({100 * c['compiled'] // c['roots']}%)" if c["roots"] else "")
             lines.append(f"| {name} | {crate} | {verdict} | {share} | {c['instances']} | {c['codegen_ms']:.0f} ms |")

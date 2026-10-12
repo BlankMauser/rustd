@@ -44,6 +44,15 @@ fn main() {
     case!(slices::array_slice(&[1, 2, 3, 4, 5, 6]), slices::get(&[7, 8], 1), slices::get(&[7, 8], 2));
     case!(slices::is_ascii_digit_run(b"123ab"));
 
+    let bytes = *b"xyz";
+    let mut cursor = pointers::Cursor { start: bytes.as_ptr(), end: unsafe { bytes.as_ptr().add(3) } };
+    case!(pointers::peek(&cursor), pointers::advance(&mut cursor, 2), pointers::peek(&cursor));
+    case!(pointers::advance(&mut cursor, 1), pointers::peek(&cursor));
+    let words = [1u32, 2];
+    case!(pointers::compare(&words[0], &words[1]), pointers::compare(&words[1], &words[1]));
+    let mut slot = 5u64;
+    case!(pointers::write(&mut slot, 6), slot);
+
     case!(consts::limit(50), consts::limit(5), consts::table(6), consts::name(1), consts::config(3));
     case!(consts::local_array(4), consts::repeat(9));
 
