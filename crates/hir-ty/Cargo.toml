@@ -54,6 +54,12 @@ syntax.workspace = true
 span.workspace = true
 thin-vec = "0.2.16"
 
+# rustd spike: native codegen from MIR
+cranelift-codegen = "0.136"
+cranelift-frontend = "0.136"
+cranelift-module = "0.136"
+cranelift-object = "0.136"
+
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]
 

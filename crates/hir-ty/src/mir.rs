@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+pub mod codegen;
 mod eval;
 mod lower;
 mod monomorphization;
