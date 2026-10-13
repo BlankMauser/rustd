@@ -8,6 +8,10 @@ literal in a function body is flipped back and forth N times, and the daemon's o
 collected. Then the same edits are timed against cargo. Results go to bench.json and BENCH.md.
 """
 import json, os, re, shlex, statistics, subprocess, sys, time
+
+# rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
+# has to come from the rustc that copy was taken from.
+os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
 from difftest import Fixture, RUSTD, sysroot_rlibs
 
 HERE = os.path.dirname(os.path.abspath(__file__))

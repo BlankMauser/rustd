@@ -101,10 +101,16 @@ fn enable_builtin_derive_fast_path() -> bool {
     ENABLE_BUILTIN_DERIVE_FAST_PATH.get()
 }
 
-#[inline(always)]
+/// Whether builtin derives are recorded instead of expanded. A code generator needs the bodies
+/// of the derived methods, so it turns this off before anything is analysed.
+#[cfg(not(test))]
+pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
 #[cfg(not(test))]
 fn enable_builtin_derive_fast_path() -> bool {
-    true
+    !EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const PREDEFINED_TOOLS: &[SmolStr] = &[

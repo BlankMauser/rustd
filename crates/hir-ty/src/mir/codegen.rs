@@ -21,7 +21,7 @@ use hir_def::{
     attrs::AttrFlags,
     expr_store::Body,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
-    signatures::{FunctionSignature, StructFlags, StructSignature},
+    signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
 use la_arena::ArenaMap;
 use rustc_abi::{Integer, Size};
@@ -972,7 +972,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             OperandKind::Static(id) => {
                 let Some(symbol) = self.cg.symbols.static_(*id) else {
-                    unsupported!("static without a rustc symbol");
+                    return self.private_static(*id);
                 };
                 let data = self
                     .cg
@@ -987,6 +987,70 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().store(MEM, value, addr, 0);
                 Ok((addr, ty))
             }
+        }
+    }
+
+    /// A static nothing exports gets a copy of its value. Nobody can tell the copy from the
+    /// original as long as it cannot be written to.
+    // FIXME: the copy has its own address, which pointer comparisons can observe.
+    fn private_static(&mut self, id: StaticId) -> Result<(Value, Ty<'db>)> {
+        let db = self.cg.db;
+        let ty = self.static_ty(id);
+        let flags = StaticSignature::of(db, id).flags;
+        if flags.intersects(StaticFlags::MUTABLE | StaticFlags::EXTERN) {
+            unsupported!("mutable or extern static without a rustc symbol");
+        }
+        let allocation = db
+            .const_eval_static(id)
+            .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
+        if !self.is_freeze(allocation.ty) {
+            unsupported!("static with interior mutability and no rustc symbol");
+        }
+        let blob = self.allocation_blob(allocation)?;
+        let value = self.blob_addr(blob)?;
+        let addr = self.scratch();
+        self.builder.ins().store(MEM, value, addr, 0);
+        Ok((addr, ty))
+    }
+
+    /// Whether `ty` is known to have no `UnsafeCell` outside of indirections.
+    fn is_freeze(&self, ty: Ty<'db>) -> bool {
+        let db = self.cg.db;
+        match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Str
+            | TyKind::Never
+            | TyKind::Ref(..)
+            | TyKind::RawPtr(..)
+            | TyKind::FnPtr(..)
+            | TyKind::FnDef(..) => true,
+            TyKind::Array(element, _) | TyKind::Slice(element) => self.is_freeze(element),
+            TyKind::Tuple(fields) => fields.iter().all(|field| self.is_freeze(field)),
+            TyKind::Adt(def, args) => {
+                let variants: Vec<VariantId> = match def.def_id() {
+                    AdtId::StructId(id) => {
+                        if Some(id) == self.interner.lang_items().UnsafeCell {
+                            return false;
+                        }
+                        vec![id.into()]
+                    }
+                    AdtId::EnumId(id) => {
+                        id.enum_variants(db).variants.iter().map(|(_, it)| it.0.into()).collect()
+                    }
+                    AdtId::UnionId(_) => return false,
+                };
+                variants.into_iter().all(|variant| {
+                    db.field_types(variant).iter().all(|(_, field)| {
+                        let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                        self.is_freeze(ty)
+                    })
+                })
+            }
+            _ => false,
         }
     }
 

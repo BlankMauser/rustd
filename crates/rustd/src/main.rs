@@ -295,6 +295,7 @@ fn source_files(vfs: &Vfs, root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTime
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
+    hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
     let table = SymbolTable::load(&args.symbol_files)?;
     eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());

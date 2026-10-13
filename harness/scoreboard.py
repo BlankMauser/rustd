@@ -6,6 +6,10 @@ below the committed scoreboard (pass --update to accept the new numbers).
 """
 import json, os, subprocess, sys, tempfile
 
+# rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
+# has to come from the rustc that copy was taken from.
+os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOARD = os.path.join(HERE, "scoreboard.json")
 

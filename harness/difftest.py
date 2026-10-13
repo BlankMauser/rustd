@@ -8,6 +8,10 @@ also linked in on its own to name the ones that change behaviour.
 """
 import argparse, glob, json, os, shlex, subprocess, sys, tempfile
 
+# rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
+# has to come from the rustc that copy was taken from.
+os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.path.join(ROOT, "target/release/rustd")
 
