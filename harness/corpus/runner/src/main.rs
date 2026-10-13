@@ -211,4 +211,5 @@ fn main() {
     println!("type_ids {:?}", cases::type_ids::run());
     println!("unwind_drops {:?}", cases::unwind_drops::run());
     println!("async_drops {:?}", cases::async_drops::run());
+    println!("promoted_assoc_const {:?}", cases::promoted_assoc_const::run());
 }

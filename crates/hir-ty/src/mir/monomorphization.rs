@@ -308,6 +308,21 @@ pub fn monomorphized_mir_body_query<'db>(
     Ok(body)
 }
 
+/// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
+#[salsa::tracked(returns(as_ref))]
+pub fn monomorphized_promoted_mir_body_query<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    expr: hir_def::hir::ExprId,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    let mut body = super::promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?.clone();
+    filler.fill_body(&mut body)?;
+    Ok(body)
+}
+
 fn monomorphized_mir_body_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,

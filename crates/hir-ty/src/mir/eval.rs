@@ -2280,6 +2280,16 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 }
             }
             match ty.kind() {
+                // Nothing to find in these, and a large array of them is slow to walk.
+                TyKind::Array(inner, _) | TyKind::Slice(inner)
+                    if matches!(
+                        inner.kind(),
+                        TyKind::Bool
+                            | TyKind::Char
+                            | TyKind::Int(_)
+                            | TyKind::Uint(_)
+                            | TyKind::Float(_)
+                    ) => {}
                 TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..size_of::<usize>()) else { return Ok(()) };
@@ -2329,7 +2339,19 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             let addr = Address::from_bytes(addr)?;
                             let b = this.read_memory(addr, size)?;
                             mm.insert(addr.to_usize(), b.into());
-                            if let Some(ty) = check_inner {
+                            let scalars = check_inner.is_some_and(|ty| {
+                                matches!(
+                                    ty.kind(),
+                                    TyKind::Bool
+                                        | TyKind::Char
+                                        | TyKind::Int(_)
+                                        | TyKind::Uint(_)
+                                        | TyKind::Float(_)
+                                )
+                            });
+                            if let Some(ty) = check_inner
+                                && !scalars
+                            {
                                 for i in 0..count {
                                     let offset = element_size * i;
                                     rec(
@@ -2351,6 +2373,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         None => not_supported!("non evaluatable array len in patching addresses"),
                     };
                     let size = this.size_of_sized(inner, locals, "inner of array")?;
+                    // There may be `usize::MAX` elements when they take no room.
+                    let len = if size == 0 { 0 } else { len };
                     for i in 0..len {
                         let offset = i * size;
                         rec(

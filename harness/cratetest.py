@@ -11,12 +11,26 @@ from difftest import Fixture, compare
 
 
 class TestFixture(Fixture):
-    def __init__(self, crate_dir, crate, test):
+    def __init__(self, crate_dir, crate, test, shared):
         path = os.path.join(crate_dir, "tests", f"{test}.rs")
-        super().__init__(crate_dir, [crate], ["--test", test], touch=path)
+        super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
         self.run_args = ["--test-threads=1"]
+        self.shared = shared
+
+    def rustd_build(self, deny=()):
+        # The crate's objects are the same whichever test binary they are linked into.
+        # rustd links to what the rlibs already hold, so that only goes for the same rlibs.
+        key = tuple(self.rlibs)
+        if deny or key not in self.shared:
+            super().rustd_build(deny)
+            if not deny:
+                self.shared[key] = (self.objects, self.reports)
+        else:
+            objects, self.reports = self.shared[key]
+            self.link(objects)
 
     def normalize(self, stdout):
+        stdout = re.sub(rb"' \(\d+\) panicked", b"' panicked", stdout)
         return re.sub(rb"finished in [0-9.]+s", b"finished", stdout)
 
 
@@ -29,11 +43,21 @@ def main():
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
     tests = sorted(f[:-3] for f in os.listdir(os.path.join(a.crate_dir, "tests")) if f.endswith(".rs"))
-    results = []
+    results, shared = [], {}
     for test in tests:
-        print(f"--- {test}")
-        fx = TestFixture(a.crate_dir, crate, test)
-        result = compare(fx, test, a.bisect)
+        print(f"--- {test}", flush=True)
+        fx = TestFixture(a.crate_dir, crate, test, shared)
+        try:
+            result = compare(fx, test, a.bisect)
+        except SystemExit as e:
+            # One test target that does not build or link must not hide the others.
+            # rustd sees the crate with its default features, so only those are tested.
+            if "requires the features" in str(e):
+                print("left out: needs features that are off by default")
+                continue
+            print(f"ERROR: {str(e)[:1500]}")
+            results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {}})
+            continue
         expected = fx.behaviour(fx.reference)[1]
         result["tests_run"] = len(re.findall(rb"^test .* \.\.\. ", expected, re.M))
         results.append(result)

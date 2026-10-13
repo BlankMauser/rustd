@@ -15,5 +15,8 @@ fi
 cp -r "$src" "$dest"
 chmod -R u+w "$dest"
 rm -f "$dest/Cargo.lock"
-[ -f "$dest/Cargo.toml.orig" ] && mv "$dest/Cargo.toml.orig" "$dest/Cargo.toml"
-printf '\n[workspace]\n' >> "$dest/Cargo.toml"
+# The manifest cargo published is self-contained; the original may lean on a workspace.
+grep -q '^\[workspace\]' "$dest/Cargo.toml" || printf '\n[workspace]\n' >> "$dest/Cargo.toml"
+# A crate's own profiles (LTO, optimization) change what there is to link against.
+awk '/^\[/ { skip = /^\[profile\./ } !skip' "$dest/Cargo.toml" > "$dest/Cargo.toml.new"
+mv "$dest/Cargo.toml.new" "$dest/Cargo.toml"

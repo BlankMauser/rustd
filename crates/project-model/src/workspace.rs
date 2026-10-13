@@ -1330,7 +1330,14 @@ fn cargo_to_crate_graph(
                 cargo,
                 pkg_data,
                 build_data.zip(Some(build_scripts.error().is_some())),
-                cfg_options.clone(),
+                {
+                    // Cargo builds a test target, and nothing else of the package, as a test.
+                    let mut cfg_options = cfg_options.clone();
+                    if sysroot_as_built() && matches!(kind, TargetKind::Test) {
+                        cfg_options.insert_atom(sym::test);
+                    }
+                    cfg_options
+                },
                 file_id,
                 name,
                 kind,

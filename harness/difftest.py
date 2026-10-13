@@ -51,7 +51,8 @@ class Fixture:
         args = shlex.split(line)
         self.link_args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
         self.reference = self.link_args[self.link_args.index("-o") + 1]
-        self.rlibs = [a for a in self.link_args if a.endswith(".rlib")]
+        # The target's own objects too: a crate rustd rebuilds may be the one being linked.
+        self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
 
     def rustd_build(self, deny=()):
         """Compiles each crate with rustd and links the objects ahead of rustc's rlibs."""
@@ -74,11 +75,12 @@ class Fixture:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")
             objects.append(obj)
             self.reports[crate] = [l.rstrip("\n").split("\t") for l in open(report)]
+        self.objects = objects
         self.link(objects)
 
     def link(self, objects):
         args = list(self.link_args)
-        first = next(i for i, a in enumerate(args) if a.endswith(".rlib"))
+        first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
         args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
@@ -181,12 +183,23 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
         print(f"{crate}: {n}/{total - no_symbol} functions from rustd")
         for r in rows:
             if r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function":
-                print(f"  skipped {r[1]}: {r[2][:200]}")
+                why = r[2] if len(r[2]) < 400 else r[2][:100] + " ... " + r[2][-300:]
+                print(f"  skipped {r[1]}: {why}")
     print("MATCH" if ok else "MISMATCH")
     if not ok:
         got = fx.behaviour(fx.binary)
-        print(f"  rustc: status {expected[0]}\n{expected[1].decode(errors='replace')}")
-        print(f"  rustd: status {got[0]}\n{got[1].decode(errors='replace')}{got[2].decode(errors='replace')[-600:]}")
+        import difflib
+        want, have = (x[1].decode(errors='replace').splitlines() for x in (expected, got))
+        if len(want) + len(have) > 40:
+            # Long output: only where the two part ways.
+            diff = list(difflib.unified_diff(want, have, "rustc", "rustd", lineterm="", n=1))
+            print(f"  rustc: status {expected[0]}, rustd: status {got[0]}")
+            print("\n".join("  " + l[:300] for l in diff[:60]))
+        else:
+            print(f"  rustc: status {expected[0]}\n{expected[1].decode(errors='replace')}")
+            print(f"  rustd: status {got[0]}\n{got[1].decode(errors='replace')}")
+        stderr = got[2].decode(errors='replace')
+        print(stderr if len(stderr) < 1500 else stderr[:700] + "\n  ...\n" + stderr[-700:])
         do_memcheck = True
         if do_bisect:
             result["culprits"] = isolate(fx, expected)

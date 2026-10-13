@@ -66,7 +66,7 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
     PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
-    eval::interpret_mir, promoted_mir_body_query, return_slot,
+    eval::interpret_mir, monomorphized_promoted_mir_body_query, return_slot,
 };
 
 mod unwind;
@@ -540,7 +540,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             dump_mir(body);
         }
         let abi = FunctionSignature::of(db, func).abi;
-        let mut ctx = self.compile_body(body, env, track_caller(db, func), abi)?;
+        let mut ctx = self.compile_body(
+            body,
+            env,
+            track_caller(db, func),
+            abi,
+            GenericArgs::new_from_slice(&[]).store(),
+        )?;
         let id = self
             .module
             .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
@@ -636,7 +642,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim => (false, ExternAbi::Rust),
         };
-        let mut ctx = self.compile_body(body, env, tracked, abi)?;
+        let mut ctx = self.compile_body(body, env, tracked, abi, instance.args.clone())?;
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         if *declared != ctx.func.signature {
@@ -703,9 +709,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: ParamEnvAndCrate<'db>,
         tracked: bool,
         abi: ExternAbi,
+        args: StoredGenericArgs,
     ) -> Result<cranelift_codegen::Context> {
         self.build(env, Some(body), tracked, |fx| {
             fx.abi = abi;
+            fx.args = Some(args);
             fx.codegen()
         })
     }
@@ -745,6 +753,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 location: None,
                 span: MirSpan::Unknown,
                 constant_locals: Vec::new(),
+                args: None,
                 suspended: None,
                 suspended_drop: None,
             };
@@ -1193,6 +1202,8 @@ struct FunctionCx<'cx, 'a, 'db> {
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
+    /// What the body's generic parameters stand for, when it is the body of an instance.
+    args: Option<StoredGenericArgs>,
     /// While compiling an `async` body: the address of the word that says where it left off,
     /// and the blocks it can be resumed in.
     suspended: Option<(Value, Vec<BasicBlockId>)>,
@@ -1765,7 +1776,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if self.mentions_location(body, expr) {
             return None;
         }
-        let constant = promoted_mir_body_query(db, body.owner, expr).ok()?;
+        let constant = monomorphized_promoted_mir_body_query(
+            db,
+            body.owner,
+            expr,
+            self.args.clone()?,
+            self.env.store(),
+        )
+        .ok()?;
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
         let blob = self.allocation_blob(allocation, false).ok()?;
         if blob.bytes.len() != size {

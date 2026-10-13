@@ -222,7 +222,11 @@ fn assert_expand(
 
     let dollar_crate = dollar_crate(span);
     let panic_args = rest.iter();
-    let mac = if use_panic_2021(db, span) {
+    let mac = if rest.is_empty() {
+        // Without a message of its own, the assertion reports the condition.
+        let message = format!("assertion failed: {}", ::tt::stringify(cond.value));
+        quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
+    } else if use_panic_2021(db, span) {
         quote! {call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args) }
     } else {
         quote! {call_site_span => #dollar_crate::panic!(# #panic_args) }

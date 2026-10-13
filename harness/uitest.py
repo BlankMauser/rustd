@@ -145,7 +145,12 @@ def run_chunk(index, paths, root, base):
         # that prints something else each time (an address, say) has no behaviour to compare.
         if expected[0] != 0 or behaviour(reference) != expected:
             result["outcome"] = "unbuildable"
-        elif got != expected:
+        elif got == expected:
+            pass
+        # A rare difference between runs (the order of a hash map) takes a few more to show.
+        elif any(behaviour(reference) != expected for _ in range(6)):
+            result["outcome"] = "unbuildable"
+        else:
             result.update(outcome="mismatch", detail=difftest.symptom(expected, got),
                           stderr=got[2].decode(errors="replace")[-300:], package=f"{ws}/crates/{name}")
 

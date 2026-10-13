@@ -1836,6 +1836,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         match &self.store[expr] {
             Expr::Literal(_) => true,
             Expr::Path(path) => {
+                // `Type::CONST` is resolved by inference, not by name.
+                if let Some((CandidateId::ConstId(_), _)) =
+                    self.infer.assoc_resolutions_for_expr(expr)
+                {
+                    return true;
+                }
                 let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
                 let hygiene = self.store.expr_path_hygiene(expr);
                 let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);

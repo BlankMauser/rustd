@@ -2603,3 +2603,34 @@ pub mod async_drops {
         out
     }
 }
+
+pub mod promoted_assoc_const {
+    use std::marker::PhantomData;
+
+    struct Vtable {
+        align: fn() -> usize,
+        size: fn() -> usize,
+    }
+    struct Owned<T>(PhantomData<T>);
+    fn size_of_it<T>() -> usize {
+        std::mem::size_of::<T>()
+    }
+    fn align_of_it<T>() -> usize {
+        std::mem::align_of::<T>()
+    }
+    impl<T> Owned<T> {
+        const VTABLE: Vtable = Vtable { align: align_of_it::<T>, size: size_of_it::<T> };
+    }
+    struct Handle {
+        vtable: &'static Vtable,
+    }
+    // The borrow outlives the call, so the constant has to be a static.
+    fn make<T>(_: T) -> Handle {
+        Handle { vtable: &Owned::<T>::VTABLE }
+    }
+
+    pub fn run() -> Vec<usize> {
+        let (a, b) = (make(1u8), make([0u32; 5]));
+        vec![(a.vtable.size)(), (b.vtable.size)(), (a.vtable.align)(), (b.vtable.align)()]
+    }
+}
