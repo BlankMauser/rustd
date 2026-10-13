@@ -2223,6 +2223,61 @@ pub mod async_more {
         })
     }
 
+    struct Counting(std::sync::atomic::AtomicU32);
+
+    impl std::task::Wake for Counting {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct WakeTwice(u32);
+
+    impl Future for WakeTwice {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 == 2 {
+                return Poll::Ready(());
+            }
+            self.0 += 1;
+            cx.waker().clone().wake();
+            Poll::Pending
+        }
+    }
+
+    /// A waker is a pointer to a promoted table of functions.
+    fn wakes() -> u32 {
+        let counting = std::sync::Arc::new(Counting(Default::default()));
+        let waker = Waker::from(counting.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut future = pin!(async { WakeTwice(0).await });
+        while future.as_mut().poll(&mut cx).is_pending() {}
+        counting.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    trait Greets {
+        async fn name() -> String {
+            "default".to_owned()
+        }
+
+        async fn greet() -> String {
+            format!("hello {}", Self::name().await)
+        }
+    }
+
+    struct Plain;
+    struct Custom;
+
+    impl Greets for Plain {}
+
+    impl Greets for Custom {
+        async fn name() -> String {
+            Yield(false).await;
+            "custom".to_owned()
+        }
+    }
+
     async fn join(log: Log) -> (usize, usize) {
         let a = generic(7u8, log.clone());
         let b = generic("xyz", log.clone());
@@ -2244,6 +2299,9 @@ pub mod async_more {
         out.push(format!("{}", caught.is_err()));
         let closure = |x: u32| async move { x + 1 };
         out.push(format!("{}", block_on(closure(4))));
+        out.push(format!("{}", wakes()));
+        out.push(block_on(Plain::greet()));
+        out.push(block_on(Custom::greet()));
         out.extend(log.borrow().iter().cloned());
         out
     }

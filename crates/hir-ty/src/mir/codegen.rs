@@ -34,7 +34,7 @@ use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnL
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
 use rustc_type_ir::UintTy;
 use rustc_type_ir::inherent::{
@@ -202,12 +202,19 @@ impl CodegenUnit {
         (code.hits, code.misses) = (0, 0);
         let track = std::env::var_os("RUSTD_STATS").is_some();
         let mut own_statics = roots.first().map(|root| root.krate(db));
+        // Roots given up on because a function left to rustc handles the same future.
+        let mut left = FxHashSet::default();
         loop {
             let mut cg = ObjectCodegen::new(db, symbols, rejected, code, own_statics)?;
             cg.track = track;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
+                if left.contains(&root) {
+                    let reason = "shares an `async` block with a function left to rustc";
+                    skipped.push((root, CodegenError::Unsupported(reason.to_owned())));
+                    continue;
+                }
                 match cg.define_function(root) {
                     Ok(symbol) => compiled.push((root, symbol)),
                     Err(e) => skipped.push((root, e)),
@@ -221,6 +228,29 @@ impl CodegenUnit {
                 own_statics = None;
                 rejected.extend(failed);
                 continue;
+            }
+            if failed.is_empty() && from_rustc {
+                let mut theirs = Some(FxHashSet::default());
+                for (root, e) in &skipped {
+                    if !matches!(e, CodegenError::NoSymbol) {
+                        let blocks = ObjectCodegen::async_blocks(db, *root);
+                        theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
+                            all.extend(blocks);
+                            all
+                        });
+                    }
+                }
+                let before = left.len();
+                left.extend(compiled.iter().map(|it| it.0).filter(|&root| {
+                    match (ObjectCodegen::async_blocks(db, root), &theirs) {
+                        (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
+                        (Some(ours), None) => !ours.is_empty(),
+                        (None, _) => true,
+                    }
+                }));
+                if left.len() != before {
+                    continue;
+                }
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
@@ -415,20 +445,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
-    /// Compiles a non-generic function and exports it under its rustc symbol name.
-    fn define_function(&mut self, func: FunctionId) -> Result<String> {
-        let db = self.db;
+    /// The body of a non-generic function, with the types it only knows as `impl Trait`
+    /// resolved.
+    fn root_body(
+        db: &'db dyn HirDatabase,
+        func: FunctionId,
+    ) -> Result<(&'db MirBody<'db>, ParamEnvAndCrate<'db>)> {
         let owner: InferBodyId<'db> = func.into();
-        let start = std::time::Instant::now();
         let body = db.mir_body(owner);
-        self.mir_time += start.elapsed();
         let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let root =
-            Instance { def: InstanceDef::Fn(func), args: GenericArgs::new_from_slice(&[]).store() };
-        self.fingerprint(root, body);
-        let Some(symbol) = self.symbols.function(func) else {
-            return Err(CodegenError::NoSymbol);
-        };
         let krate = owner.module(db).krate(db);
         let env =
             ParamEnvAndCrate { param_env: db.trait_environment(owner.generic_def(db)), krate };
@@ -445,6 +470,68 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         } else {
             body
         };
+        Ok((body, env))
+    }
+
+    /// The `async` blocks whose futures the body of `func` holds, or `None` when the body
+    /// can't be read. rustc lays a future out differently, so every function that touches one
+    /// has to come from the same compiler.
+    fn async_blocks(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
+        struct Collector<'db>(Vec<Ty<'db>>);
+        impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
+            type Result = ();
+
+            fn visit_ty(&mut self, ty: Ty<'db>) {
+                if let TyKind::Coroutine(..) | TyKind::Closure(..) = ty.kind() {
+                    self.0.push(ty);
+                }
+                rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
+            }
+        }
+        let (body, env) = Self::root_body(db, func).ok()?;
+        let (mut found, mut seen) = (FxHashSet::default(), FxHashSet::default());
+        let mut bodies = vec![body];
+        while let Some(body) = bodies.pop() {
+            let mut collector = Collector(Vec::new());
+            for (_, local) in body.locals.iter() {
+                rustc_type_ir::TypeVisitable::visit_with(&local.ty.as_ref(), &mut collector);
+            }
+            for ty in collector.0 {
+                if !seen.insert(ty) {
+                    continue;
+                }
+                let body = match ty.kind() {
+                    TyKind::Coroutine(id, args) => {
+                        found.insert(id.0.as_id());
+                        let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+                        db.monomorphized_mir_body_for_coroutine(id.0, parent.store(), env.store())
+                    }
+                    TyKind::Closure(id, args) => {
+                        let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                        db.monomorphized_mir_body_for_closure(id.0, parent.store(), env.store())
+                    }
+                    _ => continue,
+                };
+                bodies.push(body.ok()?);
+            }
+        }
+        Some(found)
+    }
+
+    /// Compiles a non-generic function and exports it under its rustc symbol name.
+    fn define_function(&mut self, func: FunctionId) -> Result<String> {
+        let db = self.db;
+        let start = std::time::Instant::now();
+        let body = db.mir_body(func.into());
+        self.mir_time += start.elapsed();
+        let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let root =
+            Instance { def: InstanceDef::Fn(func), args: GenericArgs::new_from_slice(&[]).store() };
+        self.fingerprint(root, body);
+        let Some(symbol) = self.symbols.function(func) else {
+            return Err(CodegenError::NoSymbol);
+        };
+        let (body, env) = Self::root_body(db, func)?;
         if std::env::var("RUSTD_DUMP_MIR")
             .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
         {

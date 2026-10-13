@@ -229,6 +229,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rustc_paren_sugar" => attr_flags.insert(AttrFlags::RUSTC_PAREN_SUGAR),
                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
+                    "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
@@ -358,6 +359,7 @@ bitflags::bitflags! {
 
         const TRACK_CALLER = 1 << 53;
         const THREAD_LOCAL = 1 << 54;
+        const RUSTC_PROMOTABLE = 1 << 55;
     }
 }
 

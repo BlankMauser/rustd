@@ -7,7 +7,7 @@
 //!
 //! So the monomorphization should be called even if the substitution is empty.
 
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use rustc_type_ir::{
     FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt,
 };
@@ -21,9 +21,9 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 use crate::{
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    db::{HirDatabase, InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
     next_solver::{
-        DbInterner, GenericArgs, Ty, TyKind, TypingMode,
+        AliasTy, AliasTyKind, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         references_non_lt_error,
@@ -54,6 +54,7 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
             TyKind::Alias(..) => {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
+                let ty = self.impl_opaque(ty);
 
                 let mut ocx = ObligationCtxt::new(&self.infcx);
                 let ty = ocx
@@ -112,6 +113,39 @@ impl<'db> Filler<'db> {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         Self { infcx, trait_env: env, subst }
+    }
+
+    /// The `impl Trait` a trait method returns is the one of the impl's method once the
+    /// implementing type is known.
+    fn impl_opaque(&self, ty: Ty<'db>) -> Ty<'db> {
+        let TyKind::Alias(alias) = ty.kind() else { return ty };
+        let AliasTyKind::Opaque { def_id } = alias.kind else { return ty };
+        let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return ty };
+        let db = self.infcx.interner.db;
+        let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else {
+            return ty;
+        };
+        if alias.args.has_type_flags(TypeFlags::HAS_PARAM | TypeFlags::HAS_ERROR) {
+            return ty;
+        }
+        let (either::Either::Left(implemented), args) =
+            db.lookup_impl_method(self.trait_env, func, alias.args)
+        else {
+            return ty;
+        };
+        if implemented == func {
+            return ty;
+        }
+        let opaque =
+            InternedOpaqueTyId::new(db, crate::ImplTraitId::ReturnTypeImplTrait(implemented, idx));
+        Ty::new_alias(
+            self.infcx.interner,
+            AliasTy::new_from_args(
+                self.infcx.interner,
+                AliasTyKind::Opaque { def_id: opaque.into() },
+                args,
+            ),
+        )
     }
 
     fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {

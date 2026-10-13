@@ -1813,10 +1813,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             // Indexing an array is built in, whatever adjustments inference left on it.
             return self.is_promotable_unadjusted(base);
         }
-        if self.infer.expr_adjustments.get(&expr).is_some_and(|it| !it.is_empty()) {
-            return false;
+        let is_fn = matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
+        match self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it) {
+            [] => self.is_promotable_unadjusted(expr),
+            // A function's address is a constant.
+            [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }] => {
+                is_fn && matches!(self.store[expr], Expr::Path(_))
+            }
+            _ => false,
         }
-        self.is_promotable_unadjusted(expr)
     }
 
     fn is_promotable_unadjusted(&mut self, expr: ExprId) -> bool {
@@ -1848,6 +1853,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 fields.clone().iter().all(|it| self.is_promotable(it.expr))
             }
             &Expr::Field { expr, .. } => self.is_promotable(expr),
+            Expr::Call { callee, args } => {
+                let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(*callee).kind() else {
+                    return false;
+                };
+                let CallableDefId::FunctionId(func) = def.0 else { return false };
+                hir_def::attrs::AttrFlags::query(self.db, func.into())
+                    .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
+                    && args.clone().iter().all(|&it| self.is_promotable(it))
+            }
             &Expr::Ref { expr, mutability, .. } => {
                 mutability.is_shared() && self.is_promotable(expr)
             }
