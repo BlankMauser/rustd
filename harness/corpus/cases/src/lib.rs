@@ -1147,3 +1147,30 @@ pub mod unit_drops {
         seen
     }
 }
+
+/// Operands are read when they are evaluated, not when the operation runs.
+pub fn operand_order() -> (i32, i32) {
+    let x = &mut 1;
+    let sum = *x + {
+        *x = 2;
+        1
+    };
+    let mut boxed: Box<i32> = Box::new(3);
+    #[allow(clippy::self_assignment)]
+    {
+        boxed = boxed;
+    }
+    (sum, *boxed)
+}
+
+/// A temporary in a format argument lives until the end of the statement that prints it.
+pub fn format_temporaries(x: i32) -> String {
+    fn boxed(x: i32) -> Option<Box<i32>> {
+        Some(Box::new(x))
+    }
+    format!("{} {:?}", boxed(x).unwrap(), vec![x + 1])
+}
+
+pub fn exclusive_ranges(x: u32) -> [bool; 3] {
+    [matches!(x, 6..7), matches!(x, 6..=7), matches!(x, ..7)]
+}

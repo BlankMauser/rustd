@@ -168,4 +168,7 @@ fn main() {
     case!(shapes::SetBits { it: bits.iter().enumerate() }.collect::<Vec<_>>());
     case!(shapes::wide_pointers(b"abc", b"abd"));
     case!(unit_drops::count());
+    println!("operand_order {:?}", cases::operand_order());
+    println!("format_temporaries {}", cases::format_temporaries(4));
+    println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
 }

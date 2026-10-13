@@ -275,13 +275,41 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             let ty = self.expr_ty_without_adjust(expr_id);
             return Ok(Some((self.lower_literal_to_operand(ty, l)?, current)));
         }
-        let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
+        let Some((p, current)) = self.lower_expr_to_fresh_place(expr_id, current)? else {
             return Ok(None);
         };
         Ok(Some((
             Operand { kind: OperandKind::Copy(p.store()), span: Some(expr_id.into()) },
             current,
         )))
+    }
+
+    /// The value of an expression in a place nothing else can write to. A place expression is
+    /// read now, into a temporary: in `x + { x = 2; 1 }` and `x = x` the value is the one `x`
+    /// had when the operand was evaluated.
+    fn lower_expr_to_fresh_place(
+        &mut self,
+        expr_id: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
+        let locals = self.result.locals.len();
+        let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
+            return Ok(None);
+        };
+        let fresh =
+            p.projection.as_slice().is_empty() && p.local.into_raw().into_u32() as usize >= locals;
+        if fresh {
+            return Ok(Some((p, current)));
+        }
+        let temp: Place<'db> =
+            self.temp(self.expr_ty_after_adjustments(expr_id), current, expr_id.into())?.into();
+        self.push_assignment(
+            current,
+            temp,
+            Operand { kind: OperandKind::Copy(p.store()), span: None }.into(),
+            expr_id.into(),
+        );
+        Ok(Some((temp, current)))
     }
 
     fn lower_expr_to_place_with_adjust(
@@ -1166,7 +1194,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             &Expr::Assignment { target, value } => {
-                let Some((value, mut current)) = self.lower_expr_as_place(current, value, true)?
+                let Some((value, mut current)) = self.lower_expr_to_fresh_place(value, current)?
                 else {
                     return Ok(None);
                 };
@@ -1820,6 +1848,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
     }
 
+    fn is_super_let_block(&self, statements: &[hir_def::hir::Statement]) -> bool {
+        !statements.is_empty()
+            && statements.iter().all(|statement| match statement {
+                hir_def::hir::Statement::Let { pat, initializer: Some(_), .. } => {
+                    matches!(self.store[*pat], Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
+                }
+                _ => false,
+            })
+    }
+
     fn lower_block_to_place(
         &mut self,
         statements: &[hir_def::hir::Statement],
@@ -1828,6 +1866,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         span: MirSpan,
     ) -> Result<'db, Option<Idx<BasicBlock>>> {
+        if self.is_super_let_block(statements)
+            && let Some(tail) = tail
+        {
+            // `format_args!` expands to a block of `super let`s: what they bind, and every
+            // temporary of their initializers, lives as long as the block's own value does.
+            for statement in statements {
+                let hir_def::hir::Statement::Let { pat, initializer: Some(initializer), .. } =
+                    statement
+                else {
+                    continue;
+                };
+                self.extend_temporaries(*initializer, *pat);
+                let Some((init_place, c)) =
+                    self.lower_expr_as_place(current, *initializer, true)?
+                else {
+                    return Ok(None);
+                };
+                let resolver_guard =
+                    self.resolver.update_to_inner_scope(self.db, self.store_owner, *initializer);
+                (current, _) = self.pattern_match(c, None, init_place, *pat)?;
+                self.resolver.reset_to_guard(resolver_guard);
+            }
+            return self.lower_expr_to_place(tail, place, current);
+        }
         let scope = self.push_drop_scope();
         for statement in statements.iter() {
             match statement {

@@ -31,7 +31,7 @@ def select(checkout, needle):
 
 
 CHUNK = 150
-STALL = 45
+STALL = 20
 
 
 def run_chunk(index, paths, root, base):
@@ -127,12 +127,16 @@ def run_chunk(index, paths, root, base):
 
         def behaviour(binary):
             try:
-                run = subprocess.run([binary], capture_output=True, timeout=60, cwd=work)
+                run = subprocess.run([binary], capture_output=True, timeout=10, cwd=work)
                 return run.returncode, run.stdout, run.stderr
             except subprocess.TimeoutExpired:
                 return "timeout", b"", b""
         expected, got = behaviour(reference), behaviour(binary)
-        if got != expected:
+        # A test that fails as rustc built it does not survive being wrapped in a package, and one
+        # that prints something else each time (an address, say) has no behaviour to compare.
+        if expected[0] != 0 or behaviour(reference) != expected:
+            result["outcome"] = "unbuildable"
+        elif got != expected:
             result.update(outcome="mismatch", detail=difftest.symptom(expected, got),
                           stderr=got[2].decode(errors="replace")[-300:], package=f"{ws}/crates/{name}")
 

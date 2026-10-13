@@ -205,7 +205,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     mode,
                 )?
             }
-            Pat::Range { start, end, range_type: _ } => {
+            Pat::Range { start, end, range_type } => {
                 let mut add_check = |l: &ExprId, binop| -> Result<'db, ()> {
                     let lv =
                         self.lower_literal_or_const_to_operand(self.infer.pat_ty(pattern), l)?;
@@ -240,7 +240,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         add_check(start, BinOp::Le)?;
                     }
                     if let Some(end) = end {
-                        add_check(end, BinOp::Ge)?;
+                        let op = match range_type {
+                            syntax::ast::RangeOp::Exclusive => BinOp::Gt,
+                            syntax::ast::RangeOp::Inclusive => BinOp::Ge,
+                        };
+                        add_check(end, op)?;
                     }
                 }
                 (current, current_else)

@@ -410,7 +410,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if std::env::var("RUSTD_DUMP_MIR")
             .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
         {
-            eprintln!("{:#?}", body.basic_blocks);
+            dump_mir(body);
         }
         let abi = FunctionSignature::of(db, func).abi;
         let mut ctx = self.compile_body(body, env, track_caller(db, func), abi)?;
@@ -484,12 +484,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let (Ok(want), InstanceDef::Fn(func)) = (std::env::var("RUSTD_DUMP_MIR"), instance.def)
             && FunctionSignature::of(self.db, func).name.as_str() == want
         {
-            eprintln!("{:#?}", body.basic_blocks);
+            dump_mir(body);
         }
         if matches!(instance.def, InstanceDef::Closure(_))
             && std::env::var("RUSTD_DUMP_MIR").is_ok_and(|want| want == "{closure}")
         {
-            eprintln!("{:#?}", body.basic_blocks);
+            dump_mir(body);
         }
         let (tracked, abi) = match instance.def {
             InstanceDef::Fn(func) => {
@@ -4402,5 +4402,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             None => self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code")),
         };
         Ok(())
+    }
+}
+
+/// Prints a body one statement a line, for debugging with `RUSTD_DUMP_MIR`.
+fn dump_mir(body: &MirBody<'_>) {
+    let compact = |text: String| {
+        let mut text = text
+            .replace("Idx::<Local>(", "_(")
+            .replace("Idx::<BasicBlock>(", "bb(")
+            .replace(", projection: [] }", " }")
+            .replace("StoredPlace { local: ", "{ ")
+            .replace(", span: None }", " }")
+            .replace("Operand { kind: ", "{ ");
+        while let Some(start) = text.find(", span: Some(") {
+            let end = text[start..].find("))").map_or(text.len(), |end| start + end + 2);
+            text.replace_range(start..end, "");
+        }
+        text
+    };
+    for (local, data) in body.locals.iter() {
+        eprintln!("  let {}: {:?}", compact(format!("{local:?}")), data.ty);
+    }
+    for (id, block) in body.basic_blocks.iter() {
+        eprintln!("{}:", compact(format!("{id:?}")));
+        for statement in &block.statements {
+            eprintln!("    {}", compact(format!("{:?}", statement.kind)));
+        }
+        if let Some(terminator) = &block.terminator {
+            eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
+        }
     }
 }
