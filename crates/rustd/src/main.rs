@@ -292,7 +292,7 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
         .into_iter()
         .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
         // A dependency may be another version of the crate being built.
-        .max_by_key(|it| it.origin(db).is_local())
+        .min_by_key(|it| !it.origin(db).is_local())
         .with_context(|| format!("crate {krate} not found in workspace"))?;
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
