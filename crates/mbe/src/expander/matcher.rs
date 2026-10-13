@@ -539,7 +539,8 @@ fn match_loop_inner<'t>(
             }
             OpDelimited::Op(Op::Ident(lhs)) => {
                 if let Ok(rhs) = src.clone().expect_leaf() {
-                    if matches!(&rhs, tt::Leaf::Ident(it) if it.sym == lhs.sym && it.is_raw == lhs.is_raw) {
+                    if matches!(&rhs, tt::Leaf::Ident(it) if it.sym == lhs.sym && it.is_raw == lhs.is_raw)
+                    {
                         item.dot.next();
                     } else {
                         res.add_err(ExpandError::new(

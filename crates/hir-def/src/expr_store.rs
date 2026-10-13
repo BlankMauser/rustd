@@ -701,7 +701,7 @@ impl ExpressionStore {
             Expr::Block { statements, tail, id: _, label: _, unsafe_: _ } => {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let { initializer, else_branch, pat, type_ref } => {
+                        Statement::Let { initializer, else_branch, pat, type_ref, is_super: _ } => {
                             visitor.on_expr_opt(*initializer);
                             visitor.on_expr_opt(*else_branch);
                             visitor.on_pat(*pat);

@@ -21,7 +21,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 use crate::{
-    db::{HirDatabase, InternedClosureId},
+    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     next_solver::{
         DbInterner, GenericArgs, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -68,14 +68,22 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 let ty = ty.replace_infer_with_error(self.infcx.interner);
                 ty.try_super_fold_with(self)
             }
-            TyKind::Param(param) => Ok(self
-                .subst
-                .as_slice()
-                .get(param.index as usize)
-                .and_then(|arg| arg.ty())
-                .ok_or_else(|| {
+            TyKind::Param(param) => {
+                let ty = self
+                    .subst
+                    .as_slice()
+                    .get(param.index as usize)
+                    .and_then(|arg| arg.ty())
+                    .ok_or_else(|| {
                     MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store())
-                })?),
+                })?;
+                // An argument can be the `impl Future` of an `async fn`, which the body of
+                // the caller only knows by that name.
+                if ty.has_type_flags(TypeFlags::HAS_TY_OPAQUE) {
+                    return self.try_fold_ty(ty);
+                }
+                Ok(ty)
+            }
             _ => ty.try_super_fold_with(self),
         }
     }
@@ -294,6 +302,30 @@ fn monomorphized_mir_body_for_closure_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
     _: InternedClosureId<'db>,
+    _: StoredGenericArgs,
+    _: StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    Err(MirLowerError::Loop)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
+pub fn monomorphized_mir_body_for_coroutine_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    let body = db.mir_body_for_coroutine(coroutine)?;
+    let mut body = (*body).clone();
+    filler.fill_body(&mut body)?;
+    Ok(body)
+}
+
+fn monomorphized_mir_body_for_coroutine_cycle_result<'db>(
+    _db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: InternedCoroutineId<'db>,
     _: StoredGenericArgs,
     _: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {

@@ -681,6 +681,8 @@ pub enum Statement {
         type_ref: Option<TypeRefId>,
         initializer: Option<ExprId>,
         else_branch: Option<ExprId>,
+        /// `super let`: the binding lives as long as the value of the block it is in.
+        is_super: bool,
     },
     Expr {
         expr: ExprId,

@@ -2018,3 +2018,233 @@ pub mod union_pointer {
         (unsafe { COPIED.assume_init().read() }, direct.0, *direct.1)
     }
 }
+
+pub mod async_basic {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    struct Noisy(&'static str, Log);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    /// Pending the given number of times, then ready.
+    struct Countdown(u32);
+
+    impl Future for Countdown {
+        type Output = u32;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            if self.0 == 0 {
+                return Poll::Ready(7);
+            }
+            self.0 -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> (F::Output, u32) {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut polls = 1;
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return (value, polls);
+            }
+            polls += 1;
+        }
+    }
+
+    async fn add(a: u32, b: u32) -> u32 {
+        a + Countdown(b).await
+    }
+
+    async fn sum(values: &[u32], log: Log) -> u32 {
+        let _whole = Noisy("sum", log.clone());
+        let mut total = 0;
+        for &value in values {
+            let _each = Noisy("step", log.clone());
+            total = add(total, value).await;
+        }
+        total
+    }
+
+    pub fn run() -> (u32, u32, (u32, u32), (u32, u32), Vec<&'static str>, Vec<&'static str>) {
+        let (plain, _) = block_on(async { 5 });
+        let captured = String::from("abc");
+        let (moved, _) = block_on(async move { captured.len() as u32 + Countdown(2).await });
+        let log = Log::default();
+        let summed = block_on(sum(&[1, 2, 0], log.clone()));
+        let boxed: Pin<Box<dyn Future<Output = u32>>> = Box::pin(add(1, 3));
+        let dynamic = block_on(boxed);
+
+        // Dropped before it ran, and dropped while it waits.
+        let dropped = Log::default();
+        let never = sum(&[1], dropped.clone());
+        let guard = Noisy("captured", dropped.clone());
+        let unresumed = async move {
+            let _guard = guard;
+        };
+        drop(unresumed);
+        {
+            let mut waiting = pin!(never);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            dropped.borrow_mut().push("polled");
+        }
+        dropped.borrow_mut().push("end");
+        let first = log.borrow().clone();
+        let second = dropped.borrow().clone();
+        (plain, moved, summed, dynamic, first, second)
+    }
+}
+
+pub mod async_more {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::{Pin, pin};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    struct Noisy(&'static str, Log);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0.to_string());
+        }
+    }
+
+    struct Yield(bool);
+
+    impl Future for Yield {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                return Poll::Ready(());
+            }
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    trait Named {
+        fn name(&self) -> String;
+    }
+
+    impl Named for u8 {
+        fn name(&self) -> String {
+            format!("u8:{self}")
+        }
+    }
+
+    impl Named for &str {
+        fn name(&self) -> String {
+            format!("str:{self}")
+        }
+    }
+
+    async fn generic<T: Named>(value: T, log: Log) -> usize {
+        let name = value.name();
+        Yield(false).await;
+        log.borrow_mut().push(name.clone());
+        name.len()
+    }
+
+    async fn borrows(text: &mut String) -> &str {
+        text.push('!');
+        Yield(false).await;
+        text.push('?');
+        &text[1..]
+    }
+
+    async fn branches(n: u32, log: Log) -> Result<u32, String> {
+        let _guard = Noisy("branches", log.clone());
+        let mut seen = 0;
+        loop {
+            if seen == n {
+                break;
+            }
+            let _step = Noisy("iter", log.clone());
+            Yield(false).await;
+            seen += 1;
+            if seen == 3 {
+                return Err(format!("stopped at {seen}"));
+            }
+        }
+        match seen {
+            0 => Ok(0),
+            other => {
+                let doubled = async { other * 2 }.await;
+                Ok(doubled)
+            }
+        }
+    }
+
+    async fn panics(log: Log) -> u32 {
+        let _outer = Noisy("panic-outer", log.clone());
+        Yield(false).await;
+        let _inner = Noisy("panic-inner", log.clone());
+        if log.borrow().len() < 100 {
+            panic!("in poll");
+        }
+        1
+    }
+
+    fn boxed(depth: u32) -> Pin<Box<dyn Future<Output = u32>>> {
+        Box::pin(async move {
+            if depth == 0 {
+                return 1;
+            }
+            Yield(false).await;
+            boxed(depth - 1).await + depth
+        })
+    }
+
+    async fn join(log: Log) -> (usize, usize) {
+        let a = generic(7u8, log.clone());
+        let b = generic("xyz", log.clone());
+        let second = b.await;
+        (a.await, second)
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = Log::default();
+        let mut out = Vec::new();
+        out.push(format!("{:?}", block_on(join(log.clone()))));
+        let mut text = String::from("ab");
+        out.push(block_on(borrows(&mut text)).to_string());
+        out.push(format!("{:?}", block_on(branches(0, log.clone()))));
+        out.push(format!("{:?}", block_on(branches(2, log.clone()))));
+        out.push(format!("{:?}", block_on(branches(5, log.clone()))));
+        out.push(format!("{}", block_on(boxed(4))));
+        let caught = catch_unwind(AssertUnwindSafe(|| block_on(panics(log.clone()))));
+        out.push(format!("{}", caught.is_err()));
+        let closure = |x: u32| async move { x + 1 };
+        out.push(format!("{}", block_on(closure(4))));
+        out.extend(log.borrow().iter().cloned());
+        out
+    }
+}

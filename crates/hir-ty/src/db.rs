@@ -90,6 +90,25 @@ pub trait HirDatabase: SourceDatabase + 'static {
             .map_err(|err| err.clone())
     }
 
+    fn mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::mir_body_for_coroutine_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn monomorphized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_mir_body_for_coroutine_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
     fn const_eval<'db>(
         &'db self,
         def: ConstId,

@@ -9,8 +9,8 @@ use hir_def::{
     ItemContainerId, LocalFieldId, Lookup, TraitId,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
-        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ClosureKind, ExprId, ExprOrPatId,
-        LabelId, Literal, MatchArm, Pat, PatId, RecordLitField, RecordSpread,
+        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ClosureKind, CoroutineKind, ExprId,
+        ExprOrPatId, LabelId, Literal, MatchArm, Pat, PatId, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -29,7 +29,7 @@ use span::Edition;
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
     consteval::ConstEvalError,
-    db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId},
+    db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     generics::generics,
     infer::{
         CaptureSourceStack, CapturedPlace, UpvarCapture,
@@ -42,11 +42,11 @@ use crate::{
     layout::LayoutError,
     method_resolution::CandidateId,
     mir::{
-        AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind, Expr,
-        FieldIndex, GenericArgs, Idx, InferenceResult, Local, LocalId, MemoryMap, MirBody, MirSpan,
-        Mutability, Operand, PlaceElem, PointerCast, Projection, ProjectionElem, Rvalue, Statement,
-        StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind, Ty, UnOp, VariantId,
-        return_slot,
+        AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
+        CoroutineLocals, Expr, FieldIndex, GenericArgs, Idx, InferenceResult, Local, LocalId,
+        MemoryMap, MirBody, MirSpan, Mutability, Operand, PlaceElem, PointerCast, Projection,
+        ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator,
+        TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
         Const, DbInterner, ParamConst, ParamEnv, Region, StoredGenericArgs, StoredTy, TyKind,
@@ -94,6 +94,8 @@ struct MirLowerCtx<'a, 'db> {
     /// Expressions whose temporary lives as long as the `let` they initialize, with the index of
     /// the scope that `let` is in.
     extended_temporaries: FxHashMap<ExprId, usize>,
+    /// The scope that owns what the `super let` being lowered binds.
+    super_let: Option<usize>,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -225,6 +227,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             promoted_locals: vec![],
             owner,
             closures: vec![],
+            coroutine: None,
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -247,6 +250,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
+            super_let: None,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -1041,7 +1045,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                 }
             }
-            Expr::Await { .. } => not_supported!("await"),
+            &Expr::Await { expr } => self.lower_await(expr, expr_id, place, current),
             Expr::Yeet { .. } => not_supported!("yeet"),
             &Expr::Const(id) => {
                 // Inline const blocks (`const { .. }`) are stored with their inner expression in
@@ -1375,13 +1379,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.resolver.reset_to_guard(resolver_guard);
                 Ok(Some(current))
             }
-            Expr::Closure { closure_kind: ClosureKind::Closure, .. } => {
+            Expr::Closure {
+                closure_kind:
+                    ClosureKind::Closure | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. },
+                ..
+            } => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let TyKind::Closure(id, _) = ty.kind() else {
-                    not_supported!("closure with non closure type");
+                match ty.kind() {
+                    TyKind::Closure(id, _) => self.result.closures.push(id.0),
+                    TyKind::Coroutine(..) => (),
+                    _ => not_supported!("closure with non closure type"),
+                }
+                let Some(closure_data) = self.infer.closures_data.get(&expr_id) else {
+                    not_supported!("closure without capture analysis");
                 };
-                self.result.closures.push(id.0);
-                let closure_data = &self.infer.closures_data[&id.0.loc(self.db).expr];
 
                 let span = |sources: &[CaptureSourceStack]| match sources
                     .first()
@@ -2018,7 +2029,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     ) -> Result<'db, ()> {
         let scope = match span {
             MirSpan::ExprId(expr) => self.extended_temporaries.get(&expr).copied(),
-            MirSpan::BindingId(_) => self.drop_scopes.iter().rposition(|it| !it.temporaries),
+            MirSpan::BindingId(_) => {
+                self.super_let.or_else(|| self.drop_scopes.iter().rposition(|it| !it.temporaries))
+            }
             _ => None,
         };
         let scope = match scope.and_then(|it| self.drop_scopes.get_mut(it)) {
@@ -2096,8 +2109,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn is_super_let_block(&self, statements: &[hir_def::hir::Statement]) -> bool {
         !statements.is_empty()
             && statements.iter().all(|statement| match statement {
-                hir_def::hir::Statement::Let { pat, initializer: Some(_), .. } => {
-                    matches!(self.store[*pat], Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
+                hir_def::hir::Statement::Let { pat, initializer: Some(_), is_super, .. } => {
+                    *is_super
+                        || matches!(self.store[*pat], Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
                 }
                 _ => false,
             })
@@ -2135,10 +2149,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             return self.lower_expr_to_place(tail, place, current);
         }
+        let enclosing = self.drop_scopes.iter().rposition(|it| !it.temporaries);
         let scope = self.push_drop_scope();
         for statement in statements.iter() {
             match statement {
-                hir_def::hir::Statement::Let { pat, initializer, else_branch, type_ref: _ } => {
+                hir_def::hir::Statement::Let {
+                    pat, initializer, else_branch, is_super, ..
+                } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
                         self.extend_temporaries(*expr_id, *pat);
@@ -2160,8 +2177,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             self.store_owner,
                             *expr_id,
                         );
-                        (current, else_block) =
-                            self.pattern_match(current, None, init_place, *pat)?;
+                        self.super_let = enclosing.filter(|_| *is_super);
+                        let matched = self.pattern_match(current, None, init_place, *pat);
+                        self.super_let = None;
+                        (current, else_block) = matched?;
                         self.resolver.reset_to_guard(resolver_guard);
                         match (else_block, else_branch) {
                             (None, _) => (),
@@ -2352,6 +2371,164 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn edition(&self) -> Edition {
         self.krate().data(self.db).edition
+    }
+
+    /// `Poll::Ready` or `Poll::Pending` of the `async` body being lowered.
+    fn poll_variant(&self, ready: bool) -> Result<'db, AggregateKind> {
+        let lang_items = self.lang_items();
+        let variant = if ready { lang_items.PollReady } else { lang_items.PollPending };
+        let variant = variant.ok_or(MirLowerError::LangItemNotFound)?;
+        let output = self.result.locals[return_slot()].ty.as_ref();
+        let args = GenericArgs::new_from_slice(&[output.into()]);
+        Ok(AggregateKind::Adt(variant.into(), args.store()))
+    }
+
+    /// `expr.await`: turns `expr` into a future and polls it until it is ready, handing
+    /// `Poll::Pending` to whoever polled this body each time it is not.
+    fn lower_await(
+        &mut self,
+        awaitee: ExprId,
+        expr_id: ExprId,
+        place: Place<'db>,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let Some(CoroutineLocals { poll, context }) = self.result.coroutine else {
+            not_supported!("await outside of an async block");
+        };
+        let lang_items = self.lang_items();
+        let (Some(into_future), Some(future_poll), Some(pin), Some(poll_enum), Some(trait_)) = (
+            lang_items.IntoFutureIntoFuture,
+            lang_items.FuturePoll,
+            lang_items.Pin,
+            lang_items.Poll,
+            lang_items.IntoFuture,
+        ) else {
+            return Err(MirLowerError::LangItemNotFound);
+        };
+        let Some(future_alias) = trait_
+            .trait_items(self.db)
+            .associated_type_by_name(&Name::new_symbol_root(intern::sym::IntoFuture))
+        else {
+            return Err(MirLowerError::LangItemNotFound);
+        };
+        let interner = self.interner();
+        let span = MirSpan::from(expr_id);
+        let Some((awaitee_value, current)) = self.lower_expr_to_some_operand(awaitee, current)?
+        else {
+            return Ok(None);
+        };
+        let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
+        let future_ty = Ty::new_projection(interner, future_alias.into(), [awaitee_ty]);
+        let output_ty = self.expr_ty_without_adjust(expr_id);
+        let erased = Region::new_erased(interner);
+        let future_ref_ty = Ty::new_ref(interner, erased, future_ty, Mutability::Mut);
+        let pin_args = GenericArgs::new_from_slice(&[future_ref_ty.into()]);
+        let pin_ty = Ty::new_adt(interner, AdtId::StructId(pin), pin_args);
+        let poll_ty = Ty::new_adt(
+            interner,
+            AdtId::EnumId(poll_enum),
+            GenericArgs::new_from_slice(&[output_ty.into()]),
+        );
+        let fn_operand = |func, self_ty: Ty<'db>| {
+            Operand::const_zst(Ty::new_fn_def(
+                interner,
+                CallableDefId::FunctionId(func).into(),
+                GenericArgs::new_from_slice(&[self_ty.into()]),
+            ))
+        };
+        let moved =
+            |place: Place<'db>| Operand { kind: OperandKind::Move(place.store()), span: None };
+        let mutable = BorrowKind::Mut { kind: super::MutBorrowKind::Default };
+
+        // The future is dropped as soon as it is ready, before the rest of the statement runs.
+        let scope = self.push_drop_scope();
+        let future: Place<'db> = self.temp(future_ty, current, MirSpan::Unknown)?.into();
+        let Some(current) = self.lower_call(
+            fn_operand(into_future, awaitee_ty),
+            Box::new([awaitee_value]),
+            future,
+            current,
+            false,
+            span,
+        )?
+        else {
+            scope.pop_assume_dropped(self);
+            return Ok(None);
+        };
+        let again = self.new_basic_block();
+        self.set_goto(current, again, span);
+
+        let future_ref: Place<'db> = self.temp(future_ref_ty, again, MirSpan::Unknown)?.into();
+        self.push_assignment(again, future_ref, Rvalue::Ref(mutable, future.store()), span);
+        let pinned: Place<'db> = self.temp(pin_ty, again, MirSpan::Unknown)?.into();
+        self.push_assignment(
+            again,
+            pinned,
+            Rvalue::Aggregate(
+                AggregateKind::Adt(pin.into(), pin_args.store()),
+                Box::new([moved(future_ref)]),
+            ),
+            span,
+        );
+        let context_ty = self.result.locals[context].ty.as_ref();
+        let reborrowed: Place<'db> = self.temp(context_ty, again, MirSpan::Unknown)?.into();
+        self.push_assignment(
+            again,
+            reborrowed,
+            Rvalue::Ref(mutable, Place::from(context).project(ProjectionElem::Deref).store()),
+            span,
+        );
+        let polled: Place<'db> = self.temp(poll_ty, again, MirSpan::Unknown)?.into();
+        let Some(current) = self.lower_call(
+            fn_operand(future_poll, future_ty),
+            Box::new([moved(pinned), moved(reborrowed)]),
+            polled,
+            again,
+            false,
+            span,
+        )?
+        else {
+            scope.pop_assume_dropped(self);
+            return Ok(None);
+        };
+        let discriminant = self.discr_temp_place(current);
+        self.push_assignment(current, discriminant, Rvalue::Discriminant(polled.store()), span);
+        let (ready, pending) = (self.new_basic_block(), self.new_basic_block());
+        self.set_terminator(
+            current,
+            TerminatorKind::SwitchInt {
+                discr: Operand { kind: OperandKind::Copy(discriminant.store()), span: None },
+                targets: SwitchTargets::static_if(0, ready, pending),
+            },
+            span,
+        );
+
+        let poll = Place::from(poll);
+        self.push_assignment(
+            pending,
+            poll,
+            Rvalue::Aggregate(self.poll_variant(false)?, Box::new([])),
+            span,
+        );
+        self.set_terminator(
+            pending,
+            TerminatorKind::Yield {
+                value: Operand { kind: OperandKind::Copy(poll.store()), span: None },
+                resume: again,
+                resume_arg: Place::from(context).store(),
+                drop: None,
+            },
+            span,
+        );
+
+        let Some(ready_variant) = lang_items.PollReady else {
+            return Err(MirLowerError::LangItemNotFound);
+        };
+        let value = polled
+            .project(ProjectionElem::Downcast(ready_variant.into()))
+            .project(ProjectionElem::Field(FieldIndex(0)));
+        self.push_assignment(ready, place, moved(value).into(), span);
+        Ok(Some(scope.pop_and_drop(self, ready, span)))
     }
 
     fn krate(&self) -> Crate {
@@ -2552,62 +2729,121 @@ pub fn mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    let InternedClosure { owner: body_owner, expr, .. } = closure.loc(db);
+    lower_closure_body(db, closure.loc(db))
+}
+
+/// The body of an `async` block, as the `Future::poll` of the block's type.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+pub fn mir_body_for_coroutine_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+) -> Result<'db, MirBody<'db>> {
+    lower_closure_body(db, coroutine.loc(db))
+}
+
+fn mir_body_for_coroutine_cycle_result<'db>(
+    _db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _def: InternedCoroutineId<'db>,
+) -> Result<'db, MirBody<'db>> {
+    Err(MirLowerError::Loop)
+}
+
+/// How the body of a closure gets at what the closure captured.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Receiver {
+    /// The closure is consumed by the call.
+    Owned,
+    /// The closure is called again, so a capture it owns has to be used in place.
+    Borrowed,
+    /// An `async` body is entered once per `poll` through a reference, and takes its captures
+    /// out of the future the first time.
+    Coroutine,
+}
+
+fn lower_closure_body<'db>(
+    db: &'db dyn HirDatabase,
+    InternedClosure { owner: body_owner, expr, .. }: InternedClosure<'db>,
+) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
     let Expr::Closure { args, body: root, .. } = &store[expr] else {
         implementation_error!("closure expression is not closure");
     };
-    let crate::next_solver::TyKind::Closure(_, substs) = infer.expr_ty(expr).kind() else {
-        implementation_error!("closure expression is not closure");
+    let Some(closure_data) = infer.closures_data.get(&expr) else {
+        not_supported!("closure without capture analysis");
     };
-    let kind = substs.as_closure().kind();
-    let captures = infer.closures_data[&expr].min_captures.values().flatten();
+    let captures = closure_data.min_captures.values().flatten();
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
+    let interner = ctx.interner();
+    let by_ref = |mutability| {
+        Ty::new_ref(interner, Region::new_erased(interner), infer.expr_ty(expr), mutability)
+    };
 
     // 0 is return local
-    // The body's own type can still be waiting for a coercion to the declared return type.
-    let sig = infer.closures_data[&expr].liberated_sig.get();
-    ctx.result.locals.alloc(Local { ty: sig.output().store() });
-    let closure_local = ctx.result.locals.alloc(Local {
-        ty: match kind {
-            rustc_type_ir::ClosureKind::FnOnce => infer.expr_ty(expr),
-            rustc_type_ir::ClosureKind::FnMut => Ty::new_ref(
-                ctx.interner(),
-                Region::error(ctx.interner()),
-                infer.expr_ty(expr),
-                Mutability::Mut,
-            ),
-            rustc_type_ir::ClosureKind::Fn => Ty::new_ref(
-                ctx.interner(),
-                Region::error(ctx.interner()),
-                infer.expr_ty(expr),
-                Mutability::Not,
-            ),
+    let (receiver, receiver_ty, inputs) = match infer.expr_ty(expr).kind() {
+        crate::next_solver::TyKind::Closure(_, substs) => {
+            // The body's own type can still be waiting for a coercion to the declared return
+            // type.
+            let sig = closure_data.liberated_sig.get();
+            ctx.result.locals.alloc(Local { ty: sig.output().store() });
+            let (receiver, ty) = match substs.as_closure().kind() {
+                rustc_type_ir::ClosureKind::FnOnce => (Receiver::Owned, infer.expr_ty(expr)),
+                rustc_type_ir::ClosureKind::FnMut => (Receiver::Borrowed, by_ref(Mutability::Mut)),
+                rustc_type_ir::ClosureKind::Fn => (Receiver::Borrowed, by_ref(Mutability::Not)),
+            };
+            (receiver, ty, sig.inputs())
         }
-        .store(),
-    });
+        crate::next_solver::TyKind::Coroutine(_, substs) => {
+            ctx.result.locals.alloc(Local { ty: substs.as_coroutine().return_ty().store() });
+            (Receiver::Coroutine, by_ref(Mutability::Mut), Default::default())
+        }
+        _ => implementation_error!("closure expression is not closure"),
+    };
+    let closure_local = ctx.result.locals.alloc(Local { ty: receiver_ty.store() });
     ctx.result.param_locals.push(closure_local);
+    if receiver == Receiver::Coroutine {
+        let lang_items = ctx.lang_items();
+        let (Some(context), Some(poll)) = (lang_items.Context, lang_items.Poll) else {
+            return Err(MirLowerError::LangItemNotFound);
+        };
+        let erased = Region::new_erased(interner);
+        let context = Ty::new_adt(
+            interner,
+            AdtId::StructId(context),
+            GenericArgs::new_from_slice(&[erased.into()]),
+        );
+        let context = ctx
+            .result
+            .locals
+            .alloc(Local { ty: Ty::new_ref(interner, erased, context, Mutability::Mut).store() });
+        ctx.result.param_locals.push(context);
+        let output = ctx.result.locals[return_slot()].ty.as_ref();
+        let poll = Ty::new_adt(
+            interner,
+            AdtId::EnumId(poll),
+            GenericArgs::new_from_slice(&[output.into()]),
+        );
+        let poll = ctx.result.locals.alloc(Local { ty: poll.store() });
+        ctx.result.coroutine = Some(CoroutineLocals { poll, context });
+    }
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
     let current = ctx.lower_params_and_bindings(
-        args.iter().zip(sig.inputs().iter()).map(|(it, y)| (*it, *y)),
+        args.iter().zip(inputs.iter()).map(|(it, y)| (*it, *y)),
         None,
         |_| true,
     )?;
 
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
-    let is_by_ref_closure = match kind {
-        rustc_type_ir::ClosureKind::Fn | rustc_type_ir::ClosureKind::FnMut => true,
-        rustc_type_ir::ClosureKind::FnOnce => false,
-    };
+    let is_by_ref_closure = receiver == Receiver::Borrowed;
     let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
         FxHashMap::default();
     for (capture_idx, capture) in captures.enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
-        let mut projections = Vec::with_capacity(usize::from(is_by_ref_closure) + 1);
-        if is_by_ref_closure {
+        let mut projections = Vec::with_capacity(2);
+        if receiver != Receiver::Owned {
             projections.push(ProjectionElem::Deref);
         }
         projections.push(ProjectionElem::Field(FieldIndex(capture_idx as u32)));
@@ -2647,6 +2883,24 @@ pub fn mir_body_for_closure_query<'db>(
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
+    }
+    if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
+        let ready = ctx.poll_variant(true)?;
+        for (_, block) in ctx.result.basic_blocks.iter_mut() {
+            if let Some(Terminator { kind: TerminatorKind::Return, span }) = &block.terminator {
+                let output = Operand {
+                    kind: OperandKind::Move(Place::from(return_slot()).store()),
+                    span: None,
+                };
+                block.statements.push(
+                    StatementKind::Assign(
+                        Place::from(poll).store(),
+                        Rvalue::Aggregate(ready.clone(), Box::new([output])),
+                    )
+                    .with_span(*span),
+                );
+            }
+        }
     }
     let mut err = None;
     ctx.result.walk_places(|mir_place| {

@@ -1041,7 +1041,7 @@ impl Printer<'_> {
 
     fn print_stmt(&mut self, stmt: &Statement) {
         match stmt {
-            Statement::Let { pat, type_ref, initializer, else_branch } => {
+            Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                 w!(self, "let ");
                 self.print_pat(*pat);
                 if let Some(ty) = type_ref {

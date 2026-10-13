@@ -339,8 +339,51 @@ pub fn layout_of_ty_query(
         TyKind::Closure(_, args) => {
             return db.layout_of_ty(args.as_closure().tupled_upvars_ty().store(), trait_env);
         }
-        TyKind::Coroutine(_, args) => {
-            return db.layout_of_ty(args.as_coroutine().tupled_upvars_ty().store(), trait_env);
+        TyKind::Coroutine(id, args) => {
+            // What was captured, then everything `CoroutineFrame` describes. A local only
+            // holds a value some of the time, so nothing here is a niche.
+            let args = args.as_coroutine();
+            let parent_args = GenericArgs::new_from_slice(args.parent_args());
+            let body = db
+                .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), trait_env.clone())
+                .map_err(|_| LayoutError::Unknown)?;
+            let opaque = |size, align| {
+                let mut layout = LayoutData::unit(dl, true);
+                layout.size = size;
+                layout.align = align;
+                layout
+            };
+            let word = Size::from_bytes(8);
+            let word =
+                opaque(word, rustc_abi::AbiAlign::new(rustc_abi::Align::from_bytes(8).unwrap()));
+            let mut fields = Vec::new();
+            for ty in rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty()) {
+                let layout = db.layout_of_ty(ty.store(), trait_env.clone())?;
+                fields.push(opaque(layout.size, layout.align));
+            }
+            // The body declares a local for every binding of the function around it.
+            let mut used = rustc_hash::FxHashSet::default();
+            let mut places = body.clone();
+            places.walk_places(|place| {
+                used.insert(place.local);
+            });
+            for (id, local) in body.locals.iter() {
+                if !used.contains(&id) {
+                    fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
+                    continue;
+                }
+                let layout = db.layout_of_ty(local.ty.clone(), trait_env.clone())?;
+                fields.push(opaque(layout.size, layout.align));
+            }
+            fields.extend(body.locals.iter().map(|_| word.clone()));
+            fields.push(word);
+            let fields = fields.iter().collect::<Vec<_>>();
+            let fields = fields.iter().collect::<IndexVec<_, _>>();
+            let mut layout =
+                cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?;
+            layout.largest_niche = None;
+            layout.backend_repr = BackendRepr::Memory { sized: true };
+            layout
         }
         TyKind::CoroutineClosure(_, args) => {
             return db
@@ -575,4 +618,27 @@ fn field_ty<'a>(
 
 fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
     Scalar::Initialized { value, valid_range: WrappingRange::full(value.size(dl)) }
+}
+
+/// Where an `async` block keeps what has to survive from one `poll` to the next, as fields of
+/// its layout that follow the captures: every local of its body, a word of drop flags for each
+/// of those, and a word saying where the body left off.
+#[derive(Debug, Clone, Copy)]
+pub struct CoroutineFrame {
+    pub upvars: usize,
+    pub locals: usize,
+}
+
+impl CoroutineFrame {
+    pub fn local(self, index: usize) -> usize {
+        self.upvars + index
+    }
+
+    pub fn drop_flag(self, index: usize) -> usize {
+        self.upvars + self.locals + index
+    }
+
+    pub fn state(self) -> usize {
+        self.upvars + 2 * self.locals
+    }
 }

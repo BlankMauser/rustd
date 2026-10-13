@@ -1147,6 +1147,7 @@ impl<'db> ExprCollector<'db> {
                 type_ref: None,
                 initializer: Some(expr),
                 else_branch: None,
+                is_super: false,
             });
             self_param.user_written = child_binding_id;
         }
@@ -1191,6 +1192,7 @@ impl<'db> ExprCollector<'db> {
                     type_ref: None,
                     initializer: Some(expr),
                     else_branch: None,
+                    is_super: false,
                 });
             }
             let expr = self.alloc_expr_desugared(Expr::Path(name.clone().into()));
@@ -1202,6 +1204,7 @@ impl<'db> ExprCollector<'db> {
                 type_ref: None,
                 initializer: Some(expr),
                 else_branch: None,
+                is_super: false,
             });
 
             let parent_binding_id = self.alloc_binding(name, BindingAnnotation::Mutable, hygiene);
@@ -2357,6 +2360,7 @@ impl<'db> ExprCollector<'db> {
                             type_ref: Some(type_ref),
                             initializer: Some(expr_id),
                             else_branch: None,
+                            is_super: false,
                         }]),
                         tail: Some(tail_expr),
                         label: None,
@@ -2729,7 +2733,14 @@ impl<'db> ExprCollector<'db> {
                     .let_else()
                     .and_then(|let_else| let_else.block_expr())
                     .map(|block| self.collect_block(block));
-                statements.push(Statement::Let { pat, type_ref, initializer, else_branch });
+                let is_super = stmt.super_token().is_some();
+                statements.push(Statement::Let {
+                    pat,
+                    type_ref,
+                    initializer,
+                    else_branch,
+                    is_super,
+                });
             }
             ast::Stmt::ExprStmt(stmt) => {
                 let expr = stmt.expr();

@@ -131,9 +131,8 @@ fn has_drop_glue_impl<'db>(
         TyKind::Closure(_, args) => {
             has_drop_glue_impl(infcx, args.as_closure().tupled_upvars_ty(), env, visited)
         }
-        TyKind::Coroutine(_, args) => {
-            has_drop_glue_impl(infcx, args.as_coroutine().tupled_upvars_ty(), env, visited)
-        }
+        // What is suspended inside it is not visible from here.
+        TyKind::Coroutine(..) => DropGlue::HasDropGlue,
         TyKind::CoroutineClosure(_, args) => {
             has_drop_glue_impl(infcx, args.as_coroutine_closure().tupled_upvars_ty(), env, visited)
         }

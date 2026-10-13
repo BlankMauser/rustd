@@ -202,4 +202,6 @@ fn main() {
     println!("unwind_owned {:?}", cases::unwind_owned::run());
     println!("derive_copy_packed {:?}", cases::derive_copy_packed::run());
     println!("union_pointer {:?}", cases::union_pointer::run());
+    println!("async_basic {:?}", cases::async_basic::run());
+    println!("async_more {:?}", cases::async_more::run());
 }

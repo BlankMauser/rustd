@@ -48,10 +48,10 @@ use crate::{
     CallableDefId, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::try_const_usize,
     db::HirDatabase,
-    db::{GeneralConstId, InternedClosureId},
+    db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
-    layout::{Layout, RustcEnumVariantIdx},
+    layout::{CoroutineFrame, Layout, RustcEnumVariantIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
@@ -314,6 +314,9 @@ enum InstanceDef {
     Fn(FunctionId),
     /// An `InternedClosureId`, stored without its database lifetime.
     Closure(salsa::Id),
+    /// An `InternedCoroutineId`: the `Future::poll` of an `async` block. Polled with a null
+    /// context, it drops whatever the block holds instead.
+    Coroutine(salsa::Id),
     /// `drop_in_place` for the type that is the instance's only generic argument.
     DropGlue,
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
@@ -429,6 +432,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let krate = owner.module(db).krate(db);
         let env =
             ParamEnvAndCrate { param_env: db.trait_environment(owner.generic_def(db)), krate };
+        // The future an `async fn` returns is `impl Future` to the body that calls it.
+        let opaque = body.locals.iter().any(|(_, local)| {
+            rustc_type_ir::TypeVisitableExt::has_type_flags(
+                &local.ty.as_ref(),
+                rustc_type_ir::TypeFlags::HAS_TY_OPAQUE,
+            )
+        });
+        let body = if opaque {
+            db.monomorphized_mir_body(owner, GenericArgs::new_from_slice(&[]).store(), env.store())
+                .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
+        } else {
+            body
+        };
         if std::env::var("RUSTD_DUMP_MIR")
             .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
         {
@@ -499,6 +515,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 instance.args.clone(),
                 env.store(),
             ),
+            InstanceDef::Coroutine(id) => self.db.monomorphized_mir_body_for_coroutine(
+                InternedCoroutineId::from_id(id),
+                instance.args.clone(),
+                env.store(),
+            ),
         };
         self.mir_time += start.elapsed();
         let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
@@ -508,7 +529,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             dump_mir(body);
         }
-        if matches!(instance.def, InstanceDef::Closure(_))
+        if matches!(instance.def, InstanceDef::Closure(_) | InstanceDef::Coroutine(_))
             && std::env::var("RUSTD_DUMP_MIR").is_ok_and(|want| want == "{closure}")
         {
             dump_mir(body);
@@ -518,6 +539,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 (track_caller(self.db, func), FunctionSignature::of(self.db, func).abi)
             }
             InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim => (false, ExternAbi::Rust),
@@ -630,6 +652,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 location: None,
                 span: MirSpan::Unknown,
                 constant_locals: Vec::new(),
+                suspended: None,
             };
             fill(&mut fx).map(|()| {
                 fx.builder.seal_all_blocks();
@@ -669,6 +692,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
             InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim => None,
@@ -676,6 +700,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = match def {
             InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
             InstanceDef::Closure(_) => "{closure}",
+            InstanceDef::Coroutine(_) => "{async}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
@@ -906,6 +931,9 @@ struct FunctionCx<'cx, 'a, 'db> {
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
+    /// While compiling an `async` body: the address of the word that says where it left off,
+    /// and the blocks it can be resumed in.
+    suspended: Option<(Value, Vec<BasicBlockId>)>,
 }
 
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
@@ -927,6 +955,19 @@ fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
 }
 
 const PTR: Type = types::I64;
+
+/// Where an `async` body left off: before its first statement, after its last, part of the way
+/// through unwinding, or at the await with the index that is added to `SUSPENDED`.
+const UNRESUMED: i64 = 0;
+const RETURNED: i64 = 1;
+const PANICKED: i64 = 2;
+const SUSPENDED: i64 = 3;
+
+/// The local a body's caller gets the value of. An `async` body computes the value of its
+/// block in the return slot, and hands back a `Poll` of it.
+fn returned_local(body: &MirBody<'_>) -> LocalId {
+    body.coroutine.map_or(return_slot(), |it| it.poll)
+}
 /// Field accesses can be unaligned (packed structs, chunked copies).
 const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 
@@ -1494,7 +1535,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     fn body_abi(&self, body: &MirBody<'db>, abi: ExternAbi) -> Result<FnAbi> {
         self.fn_abi(
             abi,
-            body.locals[return_slot()].ty.as_ref(),
+            body.locals[returned_local(body)].ty.as_ref(),
             body.param_locals.iter().map(|&local| body.locals[local].ty.as_ref()),
         )
     }
@@ -1530,7 +1571,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
         if let PassMode::Indirect = self.ret_mode {
             let addr = incoming.next().expect("sret param");
-            self.locals.insert(return_slot(), LocalSlot { addr });
+            self.locals.insert(returned_local(body), LocalSlot { addr });
         }
         for ((&local, layout), mode) in
             body.param_locals.iter().zip(&param_layouts).zip(param_modes)
@@ -1547,11 +1588,39 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if self.tracked {
             self.location = incoming.next();
         }
+        // An `async` body keeps its locals in the future, where they survive a return.
+        let frame = match body.coroutine {
+            Some(_) => {
+                let receiver = body.param_locals[0];
+                let Some(ty) = body.locals[receiver].ty.as_ref().builtin_deref(true) else {
+                    unsupported!("async body without a reference to its future");
+                };
+                let TyKind::Coroutine(_, args) = ty.kind() else {
+                    unsupported!("async body of {ty:?}");
+                };
+                let upvars = args.as_coroutine().tupled_upvars_ty().tuple_fields().len();
+                let frame = CoroutineFrame { upvars, locals: body.locals.len() };
+                let addr = self.builder.ins().load(PTR, MEM, self.locals[receiver].addr, 0);
+                Some((frame, self.layout(ty)?, addr, ty))
+            }
+            None => None,
+        };
+        let in_frame = |this: &mut Self, field: usize| {
+            let (_, layout, addr, _) = frame.as_ref().expect("frame");
+            this.builder.ins().iadd_imm(*addr, layout.fields.offset(field).bytes() as i64)
+        };
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local) {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
+            if let Some((frame, ..)) = &frame
+                && Some(local) != body.coroutine.map(|it| it.poll)
+            {
+                let addr = in_frame(self, frame.local(local.into_raw().into_u32() as usize));
+                self.locals.insert(local, LocalSlot { addr });
+                continue;
+            }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
             let addr = if let Some(&(_, expr)) = promoted
                 && self.is_freeze(data.ty.as_ref())
@@ -1570,29 +1639,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             };
             self.locals.insert(local, LocalSlot { addr });
         }
+        let mut frame_flags = Vec::new();
         for (local, data) in body.locals.iter() {
             let ty = data.ty.as_ref();
-            if local == return_slot()
+            if local == returned_local(body)
                 || has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
             {
                 continue;
             }
-            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-            let flag = self.builder.ins().stack_addr(PTR, slot, 0);
-            let live =
-                self.builder.ins().iconst(types::I64, body.param_locals.contains(&local) as i64);
-            self.builder.ins().store(MEM, live, flag, 0);
+            let is_param = body.param_locals.contains(&local);
+            let flag = match &frame {
+                Some((frame, ..)) if !is_param => {
+                    let flag =
+                        in_frame(self, frame.drop_flag(local.into_raw().into_u32() as usize));
+                    frame_flags.push(flag);
+                    flag
+                }
+                _ => {
+                    let flag = self.scratch();
+                    let live = self.builder.ins().iconst(types::I64, is_param as i64);
+                    self.builder.ins().store(MEM, live, flag, 0);
+                    flag
+                }
+            };
             self.drop_flags.insert(local, flag);
         }
         for (id, _) in body.basic_blocks.iter() {
             let block = self.builder.create_block();
             self.blocks.insert(id, block);
         }
-        self.builder.ins().jump(self.blocks[body.start_block], &[]);
 
         // Only blocks that can run are compiled: `if cfg!(miri) { .. }` calls functions that do
         // not exist.
@@ -1618,7 +1693,27 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     | TerminatorKind::FalseUnwind { real_target: target, .. },
                 ) => worklist.push(*target),
                 Some(TerminatorKind::Call { target, .. }) => worklist.extend(*target),
+                Some(TerminatorKind::Yield { resume, .. }) => worklist.push(*resume),
                 _ => (),
+            }
+        }
+        let state = frame.as_ref().map(|(frame, ..)| frame.state()).map(|it| in_frame(self, it));
+        match (frame, state) {
+            (Some((_, layout, addr, ty)), Some(state)) => {
+                let resumes: Vec<BasicBlockId> = body
+                    .basic_blocks
+                    .iter()
+                    .filter(|(id, _)| reachable.contains(id))
+                    .filter_map(|(_, block)| match block.terminator.as_ref()?.kind {
+                        TerminatorKind::Yield { resume, .. } => Some(resume),
+                        _ => None,
+                    })
+                    .collect();
+                self.enter_coroutine(body, state, &resumes, &frame_flags, addr, ty, &layout)?;
+                self.suspended = Some((state, resumes));
+            }
+            _ => {
+                self.builder.ins().jump(self.blocks[body.start_block], &[]);
             }
         }
         self.drop_order = drop_order(body, &reachable);
@@ -2763,6 +2858,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 AggregateKind::Closure(ty) => {
                     let layout = self.layout(ty.as_ref())?;
                     self.write_fields(dst, &layout, operands)?;
+                    if let TyKind::Coroutine(..) = ty.as_ref().kind() {
+                        // The last field says where the body left off.
+                        let state = layout.fields.offset(layout.fields.count() - 1).bytes();
+                        let state = self.builder.ins().iadd_imm(dst, state as i64);
+                        self.store_state(state, UNRESUMED);
+                    }
                 }
             },
             _ => unsupported!("rvalue {rvalue:?}"),
@@ -3502,14 +3603,20 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 switch.emit(&mut self.builder, value, self.blocks[targets.otherwise()]);
             }
             TerminatorKind::Return => {
-                let addr = self.locals[return_slot()].addr;
-                let mut values = Vec::new();
-                if !matches!(self.ret_mode, PassMode::Indirect) {
-                    let layout = self
-                        .layout(self.body.expect("MIR body").locals[return_slot()].ty.as_ref())?;
-                    self.pass(self.ret_mode, addr, &layout, &mut values);
+                if let Some((state, _)) = self.suspended {
+                    self.store_state(state, RETURNED);
                 }
-                self.builder.ins().return_(&values);
+                self.return_()?;
+            }
+            TerminatorKind::Yield { resume, .. } => {
+                let Some((state, resumes)) = &self.suspended else {
+                    unsupported!("yield outside of an async body");
+                };
+                let Some(index) = resumes.iter().position(|it| it == resume) else {
+                    unsupported!("yield to a block that is not resumed in");
+                };
+                self.store_state(*state, SUSPENDED + index as i64);
+                self.return_()?;
             }
             TerminatorKind::Unreachable => {
                 self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code"));
@@ -3994,6 +4101,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if fn_methods.contains(&Some(func)) {
             return self.vtable_fn_method(self_ty, Some(func) == lang_items.FnOnce_call_once);
         }
+        if Some(func) == lang_items.FuturePoll
+            && let TyKind::Coroutine(id, args) = self_ty.kind()
+        {
+            let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+            let body = db
+                .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), self.env.store())
+                .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+            let sig = self.body_signature(body, false)?;
+            let def = InstanceDef::Coroutine(id.0.as_id());
+            return self.cg.callee(def, parent_args, self.env, &sig);
+        }
         // Only lifetimes can be generic in a method that is in a vtable.
         let mut generic = false;
         let args =
@@ -4163,6 +4281,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         let db = self.cg.db;
+        if Some(func) == self.interner.lang_items().FuturePoll
+            && let Some(callee) = self.coroutine_callee(self.normalize(generic_args.type_at(0)))
+        {
+            return self.emit_call(callee, args, dst, dst_ty);
+        }
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
             let Some((&(receiver, receiver_ty), rest)) = args.split_first() else {
                 unsupported!("vtable call without a receiver");
@@ -5098,6 +5221,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
+        self.drop_live_locals()?;
+        if let Some((state, _)) = self.suspended {
+            self.store_state(state, PANICKED);
+        }
+        self.resume_unwinding(exception)
+    }
+
+    /// Drops every local that holds a value.
+    fn drop_live_locals(&mut self) -> Result<()> {
         // Locals the body never drops come first, last declared first. The rest go in the
         // order the body drops them when nothing unwinds, which is innermost scope first.
         let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
@@ -5113,7 +5245,133 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
-        self.resume_unwinding(exception)
+        Ok(())
+    }
+
+    fn store_state(&mut self, state: Value, value: i64) {
+        let value = self.builder.ins().iconst(types::I64, value);
+        self.builder.ins().store(MEM, value, state, 0);
+    }
+
+    /// Returns what is in the local that holds the function's result.
+    fn return_(&mut self) -> Result<()> {
+        let body = self.body.expect("MIR body");
+        let local = returned_local(body);
+        let mut values = Vec::new();
+        if !matches!(self.ret_mode, PassMode::Indirect) {
+            let layout = self.layout(body.locals[local].ty.as_ref())?;
+            self.pass(self.ret_mode, self.locals[local].addr, &layout, &mut values);
+        }
+        self.builder.ins().return_(&values);
+        Ok(())
+    }
+
+    /// The way into an `async` body. `poll` carries on from where the body last returned
+    /// `Poll::Pending`. A null context instead asks for the future to be dropped: what it
+    /// captured if it never ran, and what its locals hold if it is suspended.
+    #[allow(clippy::too_many_arguments)]
+    fn enter_coroutine(
+        &mut self,
+        body: &MirBody<'db>,
+        state: Value,
+        resumes: &[BasicBlockId],
+        flags: &[Value],
+        addr: Value,
+        ty: Ty<'db>,
+        layout: &Layout,
+    ) -> Result<()> {
+        let Some(crate::mir::CoroutineLocals { context, .. }) = body.coroutine else {
+            unsupported!("async body without a context");
+        };
+        let context = self.builder.ins().load(PTR, MEM, self.locals[context].addr, 0);
+        let at = self.builder.ins().load(types::I64, MEM, state, 0);
+        let (poll, drop) = (self.builder.create_block(), self.builder.create_block());
+        self.builder.ins().brif(context, poll, &[], drop, &[]);
+
+        let (first, finished) = (self.builder.create_block(), self.builder.create_block());
+        self.builder.switch_to_block(poll);
+        let mut switch = Switch::new();
+        switch.set_entry(UNRESUMED as u128, first);
+        for (index, resume) in resumes.iter().enumerate() {
+            switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[*resume]);
+        }
+        switch.emit(&mut self.builder, at, finished);
+        self.builder.switch_to_block(first);
+        let dead = self.builder.ins().iconst(types::I64, 0);
+        for &flag in flags {
+            self.builder.ins().store(MEM, dead, flag, 0);
+        }
+        self.builder.ins().jump(self.blocks[body.start_block], &[]);
+        // FIXME: rustc panics with "`async fn` resumed after completion".
+        self.builder.switch_to_block(finished);
+        self.builder.ins().trap(TrapCode::user(3).expect("non-zero trap code"));
+
+        let (unresumed, resumed, suspended, done) = (
+            self.builder.create_block(),
+            self.builder.create_block(),
+            self.builder.create_block(),
+            self.builder.create_block(),
+        );
+        self.builder.switch_to_block(drop);
+        self.store_state(state, RETURNED);
+        self.builder.ins().brif(at, resumed, &[], unresumed, &[]);
+        self.builder.switch_to_block(resumed);
+        let is_suspended =
+            self.builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, at, SUSPENDED);
+        self.builder.ins().brif(is_suspended, suspended, &[], done, &[]);
+        self.in_cleanup = true;
+        self.builder.switch_to_block(unresumed);
+        let TyKind::Coroutine(_, args) = ty.kind() else {
+            unsupported!("async body of {ty:?}");
+        };
+        for (i, field) in args.as_coroutine().tupled_upvars_ty().tuple_fields().iter().enumerate() {
+            let field_addr =
+                self.builder.ins().iadd_imm(addr, layout.fields.offset(i).bytes() as i64);
+            self.drop_value(field_addr, None, field)?;
+        }
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(suspended);
+        self.drop_live_locals()?;
+        self.builder.ins().jump(done, &[]);
+        self.in_cleanup = false;
+        self.builder.switch_to_block(done);
+        self.return_()
+    }
+
+    /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
+    /// it. `args` are the pinned reference and the context.
+    fn coroutine_callee(&mut self, ty: Ty<'db>) -> Option<Callee<'db>> {
+        let TyKind::Coroutine(id, args) = ty.kind() else { return None };
+        let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+        Some(Callee::Instance(InstanceDef::Coroutine(id.0.as_id()), parent_args))
+    }
+
+    /// Drops the `async` block at `addr`, by polling it with no context.
+    fn drop_coroutine(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
+        let TyKind::Coroutine(id, args) = ty.kind() else {
+            unsupported!("drop glue for {ty:?}");
+        };
+        let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+        let body = self
+            .cg
+            .db
+            .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let Some(crate::mir::CoroutineLocals { poll, .. }) = body.coroutine else {
+            unsupported!("async block whose body is not one");
+        };
+        let mut values = Vec::new();
+        for (&param, value) in body.param_locals.iter().zip([Some(addr), None]) {
+            let slot = self.scratch();
+            let value = value.unwrap_or_else(|| self.builder.ins().iconst(PTR, 0));
+            self.builder.ins().store(MEM, value, slot, 0);
+            values.push((slot, body.locals[param].ty.as_ref()));
+        }
+        let poll_ty = body.locals[poll].ty.as_ref();
+        let layout = self.layout(poll_ty)?;
+        let ignored = self.stack_slot(&layout);
+        let callee = Callee::Instance(InstanceDef::Coroutine(id.0.as_id()), parent_args);
+        self.emit_call(callee, &values, ignored, poll_ty)
     }
 
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
@@ -5295,6 +5553,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     fn drop_contents(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let db = self.cg.db;
+        // The future an `async fn` returns is still `impl Future` in its signature.
+        let ty = self.normalize(ty);
         match ty.kind() {
             TyKind::Adt(adt_def, subst) => {
                 if adt_def.is_box() {
@@ -5330,6 +5590,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     self.drop_value(field_addr, None, field)?;
                 }
             }
+            TyKind::Coroutine(..) => self.drop_coroutine(addr, ty)?,
             TyKind::Array(element, len) => {
                 let Some(len) = try_const_usize(db, len) else {
                     unsupported!("array with unevaluated length");
@@ -5485,6 +5746,7 @@ fn drop_order(body: &MirBody, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -
                 | TerminatorKind::FalseUnwind { real_target: target, .. },
             ) => vec![*target],
             Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
+            Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
             _ => Vec::new(),
         }
     };

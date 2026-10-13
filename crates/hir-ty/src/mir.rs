@@ -42,10 +42,11 @@ pub use eval::{
 };
 pub use lower::{
     MirLowerError, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,
-    mir_body_query, promoted_mir_body_query,
+    mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query,
 };
 pub use monomorphization::{
-    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_query,
+    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_query,
+    monomorphized_mir_body_query,
 };
 
 pub type BasicBlockId = Idx<BasicBlock>;
@@ -1028,6 +1029,18 @@ pub struct MirBody<'db> {
     /// This field stores the closures directly owned by this body. It is used
     /// in traversing every mir body.
     pub closures: Vec<InternedClosureId<'db>>,
+    /// Set for the body of an `async` block, which is compiled as its `Future::poll`.
+    pub coroutine: Option<CoroutineLocals>,
+}
+
+/// The locals an `async` body has on top of the ones it declares. Its parameters are a
+/// reference to the future and the `&mut Context` of the current `poll`, and the return slot
+/// has the type of the block's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, salsa::SalsaValue)]
+pub struct CoroutineLocals {
+    /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
+    pub poll: LocalId,
+    pub context: LocalId,
 }
 
 impl MirBody<'_> {
@@ -1035,7 +1048,7 @@ impl MirBody<'_> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
+    pub(crate) fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
         fn for_operand(op: &mut Operand, f: &mut impl FnMut(&mut StoredPlace)) {
             match &mut op.kind {
                 OperandKind::Copy(p) | OperandKind::Move(p) => {
@@ -1128,6 +1141,7 @@ impl MirBody<'_> {
             param_locals,
             promoted_locals,
             closures,
+            coroutine: _,
         } = self;
         promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
@@ -1226,7 +1240,10 @@ impl<'db> PlaceTy<'db> {
                 TyKind::Closure(_, args) => {
                     args.as_closure().tupled_upvars_ty().tuple_fields()[f.0 as usize]
                 }
-                // FIXME TyKind::Coroutine / TyKind::CoroutineClosure...
+                TyKind::Coroutine(_, args) => {
+                    args.as_coroutine().tupled_upvars_ty().tuple_fields()[f.0 as usize]
+                }
+                // FIXME TyKind::CoroutineClosure...
                 TyKind::Tuple(tys) => tys
                     .get(f.0 as usize)
                     .cloned()

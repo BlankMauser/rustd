@@ -311,7 +311,7 @@ impl ExprScopeVisitor<'_> {
 
             for stmt in statements {
                 match stmt {
-                    Statement::Let { pat, initializer, else_branch, type_ref } => {
+                    Statement::Let { pat, initializer, else_branch, type_ref, .. } => {
                         this.on_type_opt(*type_ref);
                         this.on_expr_opt(*initializer);
                         this.on_expr_opt(*else_branch);
