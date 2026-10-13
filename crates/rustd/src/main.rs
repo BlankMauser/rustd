@@ -49,6 +49,15 @@ struct Args {
 }
 
 impl Args {
+    /// The directory of the project, which cargo runs rustc in.
+    fn root(&self) -> anyhow::Result<PathBuf> {
+        let mut root = std::fs::canonicalize(&self.project)?;
+        if root.is_file() {
+            root.pop();
+        }
+        Ok(root)
+    }
+
     fn parse() -> anyhow::Result<Args> {
         let mut args = std::env::args().skip(1);
         let mut project = None;
@@ -146,9 +155,19 @@ impl Resolver<'_> {
         }
     }
 
+    /// The file the crate's source starts at.
+    fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
+        let file = krate.root_file(self.db);
+        let source_root = self.db.file_source_root(file).source_root_id(self.db);
+        let source_root = self.db.source_root(source_root).source_root(self.db);
+        Some(PathBuf::from(source_root.path_for_file(&file)?.as_path()?.to_string()))
+    }
+
     fn item_path(&self, module: Module, name: &str) -> Option<String> {
-        let krate = module.krate(self.db).display_name(self.db)?;
-        let mut path = krate.crate_name().to_string();
+        let krate = module.krate(self.db);
+        let krate_name = krate.display_name(self.db)?;
+        let mut path =
+            self.table.crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
         for segment in module.path_segments(self.db) {
             path.push_str("::");
             path.push_str(segment.as_str());
@@ -211,8 +230,9 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        let name = Crate::from(krate).display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str())
+        let krate = Crate::from(krate);
+        let name = krate.display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
     }
 
     fn static_(&self, id: StaticId) -> Option<String> {
@@ -270,7 +290,9 @@ impl SymbolResolver for Resolver<'_> {
 fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {
     let krate = Crate::all(db)
         .into_iter()
-        .find(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
+        .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
+        // A dependency may be another version of the crate being built.
+        .max_by_key(|it| it.origin(db).is_local())
         .with_context(|| format!("crate {krate} not found in workspace"))?;
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
@@ -312,10 +334,7 @@ fn build(
     known: &mut Rejections,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
-    let mut root = std::fs::canonicalize(&args.project)?;
-    if root.is_file() {
-        root.pop();
-    }
+    let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
     let mut roots = functions_of(db, &args.krate)?;
@@ -453,7 +472,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             .filter(|file| rlib_of(file).is_none_or(|owner| owner == krate))
             .cloned()
             .collect();
-        let table = &SymbolTable::load(&symbol_files)?;
+        let table = &SymbolTable::load(&symbol_files, &args.root()?)?;
         let args = Args {
             project: args.project.clone(),
             krate: krate.clone(),
@@ -492,7 +511,7 @@ fn main() -> anyhow::Result<()> {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
-    let table = SymbolTable::load(&args.symbol_files)?;
+    let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
     eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
 
     let start = Instant::now();

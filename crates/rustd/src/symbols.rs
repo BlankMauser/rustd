@@ -1,6 +1,6 @@
 //! Maps Rust paths to the mangled names rustc gave them, read from rlibs and objects.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
@@ -14,29 +14,79 @@ pub(crate) struct SymbolTable {
     /// several symbols share such a path.
     nested: FxHashMap<String, Option<String>>,
     /// rustc's `StableCrateId` of each crate named in a symbol. `None` when two crates share
-    /// the name.
+    /// the name, two versions of one package say.
     crates: FxHashMap<String, Option<u64>>,
+    /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
+    /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
+    by_root: FxHashMap<PathBuf, u64>,
+}
+
+/// A linkable symbol: its mangled name and its path with and without crate ids.
+struct Symbol {
+    name: String,
+    with_ids: String,
+    path: String,
 }
 
 impl SymbolTable {
-    pub(crate) fn load(files: &[PathBuf]) -> anyhow::Result<SymbolTable> {
+    /// `root` is what the paths in cargo's dep-info files are relative to.
+    pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
         let mut table = SymbolTable::default();
+        let mut symbols = Vec::new();
+        let mut owners = Vec::new();
         for file in files {
             let data =
                 std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let first = symbols.len();
             match ArchiveFile::parse(&*data) {
                 Ok(archive) => {
                     for member in archive.members() {
-                        table.add_object(member?.data(&*data)?);
+                        table.add_object(member?.data(&*data)?, &mut symbols);
                     }
                 }
-                Err(_) => table.add_object(&data),
+                Err(_) => table.add_object(&data, &mut symbols),
             }
+            if let Some((name, source)) = crate_root(file, root) {
+                owners.push((name, source, first..symbols.len()));
+            }
+        }
+        for (name, source, range) in owners {
+            if table.crates.get(&name) != Some(&None) {
+                continue;
+            }
+            // Nothing a crate defines mentions the other crate of its name.
+            let id = symbols[range].iter().find_map(|symbol| {
+                crate_ids(&symbol.with_ids).find(|it| it.0 == name).map(|it| it.1)
+            });
+            if let Some(id) = id {
+                table.by_root.insert(source, id);
+            }
+        }
+        for Symbol { name, with_ids, path } in symbols {
+            let shared = |krate: &str| table.crates.get(krate) == Some(&None);
+            let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
+                without_ids(&with_ids, |krate| !shared(krate))
+            } else {
+                path
+            };
+            if path.contains("::{") {
+                let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
+                table
+                    .nested
+                    .entry(named.join("::"))
+                    .and_modify(|it| {
+                        if it.as_deref() != Some(&*name) {
+                            *it = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(name.clone()));
+            }
+            table.by_path.entry(path).or_insert(name);
         }
         Ok(table)
     }
 
-    fn add_object(&mut self, data: &[u8]) {
+    fn add_object(&mut self, data: &[u8], symbols: &mut Vec<Symbol>) {
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
         for symbol in object.symbols() {
@@ -47,49 +97,39 @@ impl SymbolTable {
             }
             let Ok(name) = symbol.name() else { continue };
             let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
-            self.add_crates(&demangled.to_string());
-            // `{:#}` drops the crate disambiguator hashes.
-            let path = format!("{demangled:#}");
-            if path.contains("::{") {
-                let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
-                self.nested
-                    .entry(named.join("::"))
-                    .and_modify(|it| {
-                        if it.as_deref() != Some(name) {
-                            *it = None;
-                        }
-                    })
-                    .or_insert_with(|| Some(name.to_owned()));
-            }
-            self.by_path.entry(path).or_insert_with(|| name.to_owned());
-        }
-    }
-
-    /// Reads the `name[id]` a demangled v0 symbol prints for each crate in it.
-    fn add_crates(&mut self, demangled: &str) {
-        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-        let mut rest = demangled;
-        while let Some((before, after)) = rest.split_once('[') {
-            rest = after;
-            let Some((id, _)) = after.split_once(']') else { break };
-            let name_len = before.chars().rev().take_while(|&c| is_ident(c)).count();
-            let name = &before[before.len() - name_len..];
-            let Ok(id) = u64::from_str_radix(id, 16) else { continue };
-            if name.is_empty() {
-                continue;
-            }
-            match self.crates.get_mut(name) {
-                Some(known) if *known != Some(id) => *known = None,
-                Some(_) => {}
-                None => {
-                    self.crates.insert(name.to_owned(), Some(id));
+            let with_ids = demangled.to_string();
+            for (krate, id) in crate_ids(&with_ids) {
+                match self.crates.get_mut(krate) {
+                    Some(known) if *known != Some(id) => *known = None,
+                    Some(_) => {}
+                    None => {
+                        self.crates.insert(krate.to_owned(), Some(id));
+                    }
                 }
             }
+            // `{:#}` drops the crate disambiguator hashes.
+            symbols.push(Symbol {
+                name: name.to_owned(),
+                with_ids,
+                path: format!("{demangled:#}"),
+            });
         }
     }
 
-    pub(crate) fn stable_crate_id(&self, name: &str) -> Option<u64> {
-        *self.crates.get(name)?
+    /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
+    /// another crate has the name too.
+    pub(crate) fn crate_path(&self, name: &str, root: &Path) -> Option<String> {
+        match self.crates.get(name) {
+            Some(None) => Some(format!("{name}[{:x}]", self.by_root.get(root)?)),
+            _ => Some(name.to_owned()),
+        }
+    }
+
+    pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
+        match *self.crates.get(name)? {
+            Some(id) => Some(id),
+            None => self.by_root.get(root).copied(),
+        }
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<&str> {
@@ -104,4 +144,64 @@ impl SymbolTable {
     pub(crate) fn len(&self) -> usize {
         self.by_path.len()
     }
+}
+
+/// The name of the crate in `libname-hash.rlib` and the file its source starts at, which the
+/// dep-info file cargo leaves next to the rlib lists first.
+fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
+    let stem = rlib.file_stem()?.to_str()?.strip_prefix("lib")?;
+    let (name, _) = stem.rsplit_once('-')?;
+    let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
+    let (_, sources) = dep_info.lines().next()?.split_once(": ")?;
+    // FIXME: a path with a space in it is escaped.
+    let source = sources.split(' ').next()?;
+    Some((name.to_owned(), root.join(source)))
+}
+
+/// The `name[id]` a demangled v0 symbol prints for each crate in it.
+fn crate_ids(demangled: &str) -> impl Iterator<Item = (&str, u64)> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut rest = demangled;
+    std::iter::from_fn(move || {
+        loop {
+            let (before, after) = rest.split_once('[')?;
+            rest = after;
+            let Some((id, _)) = after.split_once(']') else { continue };
+            let name_len = before.chars().rev().take_while(|&c| is_ident(c)).count();
+            let name = &before[before.len() - name_len..];
+            let Ok(id) = u64::from_str_radix(id, 16) else { continue };
+            if !name.is_empty() {
+                return Some((name, id));
+            }
+        }
+    })
+}
+
+/// The demangled symbol without the ids of the crates `drop` picks.
+fn without_ids(demangled: &str, drop: impl Fn(&str) -> bool) -> String {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut path = String::with_capacity(demangled.len());
+    let mut rest = demangled;
+    while let Some(open) = rest.find('[') {
+        let (before, after) = rest.split_at(open);
+        path.push_str(before);
+        let name_len = before.chars().rev().take_while(|&c| is_ident(c)).count();
+        let name = &before[before.len() - name_len..];
+        match after.find(']') {
+            Some(close)
+                if !name.is_empty() && u64::from_str_radix(&after[1..close], 16).is_ok() =>
+            {
+                if !drop(name) {
+                    path.push_str(&after[..=close]);
+                }
+                rest = &after[close + 1..];
+            }
+            _ => {
+                path.push('[');
+                rest = &after[1..];
+            }
+        }
+    }
+    path.push_str(rest);
+    path
 }
