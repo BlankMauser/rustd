@@ -201,4 +201,5 @@ fn main() {
     println!("division_panics {:?}", cases::division_panics::run());
     println!("unwind_owned {:?}", cases::unwind_owned::run());
     println!("derive_copy_packed {:?}", cases::derive_copy_packed::run());
+    println!("union_pointer {:?}", cases::union_pointer::run());
 }

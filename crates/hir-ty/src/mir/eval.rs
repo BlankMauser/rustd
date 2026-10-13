@@ -2428,7 +2428,18 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             }
                         }
                     }
-                    AdtId::UnionId(_) => (),
+                    // Nothing says which bytes of a union are a pointer, so every word that is
+                    // the address of something is taken to be one.
+                    AdtId::UnionId(_) => {
+                        let layout = this.layout(ty)?;
+                        if layout.align.abi.bytes_usize().is_multiple_of(size_of::<usize>()) {
+                            let pointer =
+                                Ty::new_imm_ptr(this.interner(), Ty::new_unit(this.interner()));
+                            for word in bytes.chunks_exact(size_of::<usize>()) {
+                                rec(this, word, pointer, locals, mm, stack_depth_limit - 1)?;
+                            }
+                        }
+                    }
                 },
                 TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
                     let mut ocx = ObligationCtxt::new(&this.infcx);

@@ -74,9 +74,8 @@ impl BuiltinDeriveExpander {
 fn derives_copy(adt: &ast::Adt) -> bool {
     adt.attrs().any(|attr| {
         let text = attr.syntax().text().to_string();
-        let mut words = text
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|word| !word.is_empty());
+        let mut words =
+            text.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|word| !word.is_empty());
         words.next() == Some("derive") && words.any(|word| word == "Copy")
     })
 }
@@ -434,7 +433,14 @@ fn parse_adt_from_syntax(
             .filter(|word| !word.is_empty() && *word != "r");
         words.next() == Some("repr") && words.any(|word| word == "packed")
     });
-    Ok(BasicAdtInfo { name: name_token, shape, param_types, where_clause, associated_types, packed })
+    Ok(BasicAdtInfo {
+        name: name_token,
+        shape,
+        param_types,
+        where_clause,
+        associated_types,
+        packed,
+    })
 }
 
 fn to_adt_syntax(
@@ -762,7 +768,11 @@ fn clone_expand_with(
         }
         let name = &adt.name;
         let patterns = adt.shape.as_pattern(span, name);
-        let exprs = adt.shape.as_pattern_map(name, |it| quote! {span => #krate::clone::Clone::clone(#it) }, span);
+        let exprs = adt.shape.as_pattern_map(
+            name,
+            |it| quote! {span => #krate::clone::Clone::clone(#it) },
+            span,
+        );
         let arms = patterns.into_iter().zip(exprs).map(|(pat, expr)| {
             let fat_arrow = fat_arrow(span);
             quote! {span =>
@@ -1026,12 +1036,20 @@ fn partial_eq_expand(
                             let t1 = tt::Ident::new(&format!("{}_self", it.sym), it.span);
                             let t2 = tt::Ident::new(&format!("{}_other", it.sym), it.span);
                             let and_and = and_and(span);
-                            quote!(span =>#and_and #t1 .eq( #t2 ))
+                            if adt.packed {
+                                quote!(span =>#and_and #t1 .eq( & #t2 ))
+                            } else {
+                                quote!(span =>#and_and #t1 .eq( #t2 ))
+                            }
                         });
                         let first = {
                             let t1 = tt::Ident::new(&format!("{}_self", first.sym), first.span);
                             let t2 = tt::Ident::new(&format!("{}_other", first.sym), first.span);
-                            quote!(span =>#t1 .eq( #t2 ))
+                            if adt.packed {
+                                quote!(span =>#t1 .eq( & #t2 ))
+                            } else {
+                                quote!(span =>#t1 .eq( #t2 ))
+                            }
                         };
                         quote!(span =>#first # #rest)
                     }

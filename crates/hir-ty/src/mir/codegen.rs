@@ -30,15 +30,13 @@ use hir_def::{
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
-use hir_expand::{
-    FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander,
-};
-use rustc_type_ir::UintTy;
+use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_index::Idx;
+use rustc_type_ir::UintTy;
 use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
@@ -2484,30 +2482,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         fn_ty
                     }
                     _ if let TyKind::RawPtr(_, mutability) = ty.kind() => {
-                        if let Some((id, at)) = map.map.static_at(id) {
-                            let target = self.static_data(id)?;
-                            blob.point_to(offset, target, at);
-                            return Ok(());
-                        }
-                        // Const eval keeps the whole allocation a raw pointer points into.
-                        // FIXME: pointers inside that allocation are not relocated.
-                        let Some((start, memory)) = map.map.memory_at(id) else { return Ok(()) };
-                        let target = match map.defined.get(&start) {
-                            Some(&target) => target,
-                            None => {
-                                let target = ConstBlob {
-                                    bytes: memory.to_vec(),
-                                    relocs: Vec::new(),
-                                    fn_relocs: Vec::new(),
-                                    align: 16,
-                                };
-                                let writable = map.in_static && mutability == Mutability::Mut;
-                                let target = self.cg.define_data(target, writable)?;
-                                map.defined.insert(start, target);
-                                target
-                            }
-                        };
-                        blob.point_to(offset, target, id - start);
+                        self.relocate_data_pointer(blob, offset, id, mutability, map)?;
                         return Ok(());
                     }
                     _ if id == 0 => return Ok(()),
@@ -2526,7 +2501,20 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             .map(|i| layout.fields.offset(i).bytes_usize())
                             .collect(),
                     ),
-                    AdtId::UnionId(_) => return Ok(()),
+                    // Const eval does not say which bytes of a union are a pointer, so every
+                    // word that is the address of something it kept is taken to be one.
+                    AdtId::UnionId(_) => {
+                        let align = layout.align.abi.bytes_usize();
+                        if align.is_multiple_of(8) {
+                            for word in 0..layout.size.bytes_usize() / 8 {
+                                let at = offset + word * 8;
+                                if let Some(id) = blob.usize_at(at) {
+                                    self.relocate_data_pointer(blob, at, id, Mutability::Not, map)?;
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     AdtId::EnumId(id) => {
                         let Some(bytes) =
                             blob.bytes.get(offset..offset + layout.size.bytes_usize())
@@ -2582,6 +2570,43 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             _ => (),
         }
+        Ok(())
+    }
+
+    /// Points the word at `offset`, which const eval left holding address `addr`, at the static
+    /// or the allocation that address is in.
+    fn relocate_data_pointer(
+        &mut self,
+        blob: &mut ConstBlob,
+        offset: usize,
+        addr: usize,
+        mutability: Mutability,
+        map: &mut Relocations<'_, 'db>,
+    ) -> Result<()> {
+        if let Some((id, at)) = map.map.static_at(addr) {
+            let target = self.static_data(id)?;
+            blob.point_to(offset, target, at);
+            return Ok(());
+        }
+        // Const eval keeps the whole allocation a raw pointer points into.
+        // FIXME: pointers inside that allocation are not relocated.
+        let Some((start, memory)) = map.map.memory_at(addr) else { return Ok(()) };
+        let target = match map.defined.get(&start) {
+            Some(&target) => target,
+            None => {
+                let target = ConstBlob {
+                    bytes: memory.to_vec(),
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 16,
+                };
+                let writable = map.in_static && mutability == Mutability::Mut;
+                let target = self.cg.define_data(target, writable)?;
+                map.defined.insert(start, target);
+                target
+            }
+        };
+        blob.point_to(offset, target, addr - start);
         Ok(())
     }
 
@@ -3103,7 +3128,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             BinOp::Div | BinOp::Rem => {
                 let div = matches!(op, BinOp::Div);
                 let zero = self.builder.ins().icmp_imm(IntCC::Equal, r, 0);
-                self.panic_if(zero, if div { OverflowOp::DivByZero } else { OverflowOp::RemByZero })?;
+                self.panic_if(
+                    zero,
+                    if div { OverflowOp::DivByZero } else { OverflowOp::RemByZero },
+                )?;
                 if signed {
                     let ty = scalar.ty;
                     let min = if ty == types::I128 {
@@ -3118,13 +3146,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let overflow = self.builder.ins().band(is_min, minus_one);
                     self.panic_if(overflow, if div { OverflowOp::Div } else { OverflowOp::Rem })?;
                 }
-                let ins = self.builder.ins();
-                match (div, signed) {
-                    (true, true) => ins.sdiv(l, r),
-                    (true, false) => ins.udiv(l, r),
-                    (false, true) => ins.srem(l, r),
-                    (false, false) => ins.urem(l, r),
-                }
+                self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
                 let bits = self.builder.ins().iconst(r_scalar.ty, i64::from(scalar.ty.bits()));
@@ -4313,10 +4335,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     "wrapping_add" | "unchecked_add" => self.builder.ins().iadd(l, r),
                     "wrapping_sub" | "unchecked_sub" => self.builder.ins().isub(l, r),
                     "wrapping_mul" | "unchecked_mul" => self.builder.ins().imul(l, r),
-                    "unchecked_div" | "exact_div" if signed => self.builder.ins().sdiv(l, r),
-                    "unchecked_div" | "exact_div" => self.builder.ins().udiv(l, r),
-                    "unchecked_rem" if signed => self.builder.ins().srem(l, r),
-                    "unchecked_rem" => self.builder.ins().urem(l, r),
+                    "unchecked_div" | "exact_div" => self.divide(l, r, true, signed)?,
+                    "unchecked_rem" => self.divide(l, r, false, signed)?,
                     "unchecked_shl" => self.builder.ins().ishl(l, r),
                     "unchecked_shr" if signed => self.builder.ins().sshr(l, r),
                     "unchecked_shr" => self.builder.ins().ushr(l, r),
@@ -4912,6 +4932,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             BackendRepr::SimdVector { element, count } => Ok((self.scalar(element)?, count)),
             _ => unsupported!("vector operation on {ty:?}"),
         }
+    }
+
+    /// The quotient of two integers, or the remainder. Cranelift has neither for 128 bits, so
+    /// those call compiler-builtins.
+    fn divide(&mut self, l: Value, r: Value, div: bool, signed: bool) -> Result<Value> {
+        if self.builder.func.dfg.value_type(l) == types::I128 {
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
+            sig.returns.push(AbiParam::new(types::I128));
+            let name = match (div, signed) {
+                (true, true) => "__divti3",
+                (true, false) => "__udivti3",
+                (false, true) => "__modti3",
+                (false, false) => "__umodti3",
+            };
+            let callee = self.cg.import(name, &sig)?;
+            let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+            return Ok(self.invoke(callee, &[l, r])[0]);
+        }
+        let ins = self.builder.ins();
+        Ok(match (div, signed) {
+            (true, true) => ins.sdiv(l, r),
+            (true, false) => ins.udiv(l, r),
+            (false, true) => ins.srem(l, r),
+            (false, false) => ins.urem(l, r),
+        })
     }
 
     /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in

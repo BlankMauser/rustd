@@ -1933,8 +1933,8 @@ pub mod unwind_owned {
 pub mod derive_copy_packed {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    static CLONED: AtomicU32 = AtomicU32::new(0);
-    static MISALIGNED: AtomicU32 = AtomicU32::new(0);
+    pub static CLONED: AtomicU32 = AtomicU32::new(0);
+    pub static MISALIGNED: AtomicU32 = AtomicU32::new(0);
 
     #[derive(Copy)]
     pub struct Liar;
@@ -1988,5 +1988,33 @@ pub mod derive_copy_packed {
             format!("{:?}", b.1),
             MISALIGNED.load(Ordering::SeqCst),
         )
+    }
+}
+
+/// A constant whose pointer sits in a union, where its type does not show it.
+pub mod union_pointer {
+    use std::mem::MaybeUninit;
+
+    type Byte = MaybeUninit<u8>;
+
+    const unsafe fn memcpy(dst: *mut Byte, src: *const Byte, n: usize) {
+        let mut i = 0;
+        while i < n {
+            unsafe { *dst.add(i) = *src.add(i) };
+            i += 1;
+        }
+    }
+
+    const COPIED: MaybeUninit<*const i32> = unsafe {
+        let ptr = &42;
+        let mut ptr2 = MaybeUninit::new(std::ptr::null::<i32>());
+        memcpy(&mut ptr2 as *mut _ as *mut _, &ptr as *const _ as *const _, size_of::<&i32>());
+        ptr2
+    };
+    const DIRECT: MaybeUninit<(u64, &'static u8)> = MaybeUninit::new((7, &9));
+
+    pub fn run() -> (i32, u64, u8) {
+        let direct = unsafe { DIRECT.assume_init() };
+        (unsafe { COPIED.assume_init().read() }, direct.0, *direct.1)
     }
 }
