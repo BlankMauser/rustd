@@ -3137,6 +3137,19 @@ pub fn lower_to_mir_with_store<'db>(
     self_param: Option<(BindingId, Ty<'db>)>,
 ) -> Result<'db, MirBody<'db>> {
     if infer.has_type_mismatches() || infer.is_erroneous() {
+        if std::env::var_os("RUSTD_DUMP_ERRORS").is_some() {
+            for (expr, data) in store.exprs() {
+                if infer.expr_has_type_mismatch(expr) {
+                    eprintln!("mismatch at {data:?}: {:?}", infer.expr_ty(expr));
+                }
+            }
+            for (pat, data) in store.pats() {
+                if infer.pat_has_type_mismatch(pat) {
+                    eprintln!("mismatch at {data:?}: {:?}", infer.pat_ty(pat));
+                }
+            }
+            eprintln!("diagnostics: {:?}", infer.diagnostics());
+        }
         return Err(MirLowerError::HasErrors);
     }
     let mut ctx = MirLowerCtx::new(db, owner, store, infer);

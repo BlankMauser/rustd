@@ -65,7 +65,7 @@ def run_chunk(index, paths, root, base):
         args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
         binary = args[args.index("-o") + 1]
         links[os.path.basename(binary).rsplit("-", 1)[0]] = args
-    results = {name: {"test": os.path.relpath(path, root), "outcome": "unbuildable", "skipped": {},
+    results = {name: {"test": os.path.relpath(path, root), "outcome": "unbuildable", "skipped": {}, "reasons": {},
                       "compiled": 0, "roots": 0} for name, path in names.items()}
     built = sorted(links)
     if not built:
@@ -119,6 +119,8 @@ def run_chunk(index, paths, root, base):
             if row[0] == "skipped" and "no rustc symbol for function" not in row[2]:
                 key = difftest.bucket(row[2])
                 result["skipped"][key] = result["skipped"].get(key, 0) + 1
+                full = re.sub(r"Id\(\w+\)", "Id", row[2])[:160]
+                result["reasons"][full] = result["reasons"].get(full, 0) + 1
         result["compiled"] = sum(r[0] == "compiled" for r in rows)
         result["roots"] = result["compiled"] + sum(result["skipped"].values())
         reference = args[args.index("-o") + 1]

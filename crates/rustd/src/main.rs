@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
-use hir_def::{FunctionId, ModuleDefId, StaticId};
+use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
 use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -267,7 +267,10 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
     while let Some(module) = modules.pop() {
         modules.extend(module.children(db));
         for def in module.declarations(db) {
-            if let Ok(ModuleDefId::FunctionId(id)) = ModuleDefId::try_from(def) {
+            // A function declared in an `extern` block has no body to compile.
+            if let Ok(ModuleDefId::FunctionId(id)) = ModuleDefId::try_from(def)
+                && !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_))
+            {
                 functions.push(id);
             }
         }
