@@ -1457,6 +1457,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         size: usize,
     ) -> Option<Value> {
         let db = self.cg.db;
+        if self.mentions_location(body, expr) {
+            return None;
+        }
         let constant = promoted_mir_body_query(db, body.owner, expr).ok()?;
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
         let blob = self.allocation_blob(allocation, false).ok()?;
@@ -3292,28 +3295,54 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Some((self.cg.symbols.source_path(file_id)?, line as u32, col as u32))
     }
 
+    /// Whether `expr` is what `line!()`, `column!()` or `file!()` expanded to, and the
+    /// expansion it is in.
+    fn location_macro(
+        &self,
+        body: &MirBody<'db>,
+        expr: ExprId,
+    ) -> Option<(BuiltinFnLikeExpander, HirFileId)> {
+        let db = self.cg.db;
+        let InferBodyId::DefWithBodyId(owner) = body.owner else { return None };
+        let (body, source_map) = Body::with_source_map(db, owner);
+        if !matches!(body[expr], hir_def::hir::Expr::Literal(_)) {
+            return None;
+        }
+        let file_id = source_map.expr_syntax(expr).ok()?.file_id;
+        let MacroDefKind::BuiltIn(_, expander) = file_id.macro_file()?.loc(db).def.kind else {
+            return None;
+        };
+        matches!(
+            expander,
+            BuiltinFnLikeExpander::Line
+                | BuiltinFnLikeExpander::Column
+                | BuiltinFnLikeExpander::File
+        )
+        .then_some((expander, file_id))
+    }
+
+    /// Whether a promoted expression takes its value from where it is in the source.
+    fn mentions_location(&self, body: &MirBody<'db>, expr: ExprId) -> bool {
+        let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
+        if self.location_macro(body, expr).is_some() {
+            return true;
+        }
+        let mut found = false;
+        Body::of(self.cg.db, owner)
+            .walk_child_exprs(expr, |child| found |= self.mentions_location(body, child));
+        found
+    }
+
     /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
     /// rust-analyzer expands them to placeholders, since a real value would make every body
     /// below an edit change.
     fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
         let db = self.cg.db;
-        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
+        let Some((expander, file_id)) = self.body.and_then(|it| self.location_macro(it, expr))
+        else {
             return Ok(None);
         };
-        let Ok(source) = Body::with_source_map(db, owner).1.expr_syntax(expr) else {
-            return Ok(None);
-        };
-        let Some(call) = source.file_id.macro_file() else { return Ok(None) };
-        let MacroDefKind::BuiltIn(_, expander) = call.loc(db).def.kind else { return Ok(None) };
-        if !matches!(
-            expander,
-            BuiltinFnLikeExpander::Line
-                | BuiltinFnLikeExpander::Column
-                | BuiltinFnLikeExpander::File
-        ) {
-            return Ok(None);
-        }
-        let Some(site) = source.file_id.original_call_node(db) else { return Ok(None) };
+        let Some(site) = file_id.original_call_node(db) else { return Ok(None) };
         let Some((file, line, col)) = self.location_of(site.file_id.into(), site.value.text_range())
         else {
             return Ok(None);

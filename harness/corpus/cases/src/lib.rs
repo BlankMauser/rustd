@@ -1672,6 +1672,7 @@ pub mod builtin_location {
     pub fn run() -> ((u32, u32, &'static str), (u32, u32, &'static str), u32) {
         let direct = (line!(), column!(), file!());
         let nested = here!();
+        assert_eq!(nested.0, line!() - 1, "in {}", file!());
         (direct, nested, line!() + 1)
     }
 }
