@@ -959,6 +959,11 @@ impl<'db> InferenceContext<'db> {
         };
         self.write_variant_resolution(expr.into(), variant);
 
+        // The ADT's where clauses are what a closure in a field gets its signature from.
+        if let TyKind::Adt(adt, args) = adt_ty.kind() {
+            self.add_required_obligations_for_value_path(expr.into(), adt.def_id().into(), args);
+        }
+
         // Prohibit struct expressions when non-exhaustive flag is set.
         if self.has_applicable_non_exhaustive(variant.into()) {
             self.push_diagnostic(InferenceDiagnostic::NonExhaustiveRecordExpr { expr });

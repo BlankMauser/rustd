@@ -257,4 +257,5 @@ fn main() {
         println!("stringified {it:?}");
     }
     println!("fn_pointers {:?}", cases::fn_pointers::run());
+    println!("closure_in_bounded_field {:?}", cases::closure_in_bounded_field::run());
 }

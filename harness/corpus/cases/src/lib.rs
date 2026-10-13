@@ -4077,3 +4077,51 @@ pub mod fn_pointers {
         )
     }
 }
+
+/// A closure whose parameter types are only known from the bound on the field it is put in.
+pub mod closure_in_bounded_field {
+    struct Guard<T, Data, F>
+    where
+        F: FnMut(&Data, &mut T),
+    {
+        value: T,
+        data: Data,
+        f: F,
+    }
+
+    impl<T, Data, F> Drop for Guard<T, Data, F>
+    where
+        F: FnMut(&Data, &mut T),
+    {
+        fn drop(&mut self) {
+            (self.f)(&self.data, &mut self.value)
+        }
+    }
+
+    fn fill<I: IntoIterator<Item = u8>, const CHECK: bool>(len: &mut u32, items: I) -> u8 {
+        let start = *len as usize;
+        let mut guard = Guard {
+            value: len,
+            data: start,
+            f: move |&count, len| {
+                **len = count as u32;
+            },
+        };
+        let mut sum = 0;
+        for item in items {
+            if guard.data == 4 && CHECK {
+                break;
+            }
+            sum += item;
+            guard.data += 1;
+        }
+        sum
+    }
+
+    pub fn run() -> (u32, u8, u32, u8) {
+        let (mut a, mut b) = (1, 0);
+        let x = fill::<_, true>(&mut a, [1, 2, 3, 4, 5].iter().cloned());
+        let y = fill::<_, false>(&mut b, 1..=5);
+        (a, x, b, y)
+    }
+}

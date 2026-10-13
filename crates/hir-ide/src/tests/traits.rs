@@ -5406,3 +5406,24 @@ fn foo<T: Foo>(v: T::Assoc) {
     "#,
     );
 }
+
+#[test]
+fn closure_signature_from_struct_where_clause() {
+    check_types(
+        r#"
+//- minicore: fn
+struct Guard<T, F>
+where
+    F: FnMut(&T),
+{
+    value: T,
+    f: F,
+}
+
+fn test() {
+    Guard { value: 1u8, f: |value| { value; } };
+                                   //^^^^^ &'? u8
+}
+"#,
+    );
+}
