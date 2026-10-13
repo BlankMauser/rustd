@@ -148,4 +148,15 @@ fn main() {
     case!(misc::keyword("alpha"), misc::keyword("beta"), misc::keyword("gamma"), misc::keyword(""), misc::keyword("alphabet"), misc::keyword("alphx"), misc::keyword("delta"));
     case!(misc::barrier(14), misc::fn_item_cast(41), misc::float_math(-2.5, -7.75), misc::float_math(16.0, 0.3), misc::float_math(0.5, 1.0));
     case!(misc::fn_statics(5), misc::fn_statics(7));
+    let big = foreign::make_big(7);
+    case!(big.a, big.b, big.c, foreign::big(foreign::Big { a: 1, b: 2, c: 3 }, 4));
+    let mixed = foreign::mixed(foreign::Mixed { a: 1.5, b: 3 }, foreign::Mixed { a: 2.25, b: 5 });
+    let small = foreign::small(foreign::Small { a: 1, b: 2, c: 3 }, true, -1);
+    case!(mixed.a, mixed.b, small.a, small.b, small.c);
+    case!(foreign::wide(1 << 100, -3), foreign::call_c(b"hello\0"));
+    let floats = foreign::floats(foreign::Floats { a: 1.5, b: [2.5, 3.5] }, 2.0);
+    let nested = foreign::nested(foreign::Nested { tag: 7, inner: (300, 9.0) });
+    case!(floats.a, floats.b[0], floats.b[1], nested.tag, nested.inner.0, nested.inner.1);
+    let two = foreign::spill(1, 2, 3, 4, 5, foreign::Two { a: 6, b: 7 }, 8);
+    case!(two.a, two.b, foreign::through_pointer(foreign::floats, foreign::make_big));
 }

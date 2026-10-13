@@ -945,3 +945,105 @@ pub mod misc {
         (TABLE[0](x) + TABLE[1](x), first(x), second(x))
     }
 }
+
+/// Functions with the C calling convention, called from the rustc-built runner.
+pub mod foreign {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Big {
+        pub a: u64,
+        pub b: u64,
+        pub c: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Mixed {
+        pub a: f64,
+        pub b: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Small {
+        pub a: u8,
+        pub b: u8,
+        pub c: u8,
+    }
+
+    pub extern "C" fn big(x: Big, n: u64) -> u64 {
+        x.a + 2 * x.b + 3 * x.c + n
+    }
+
+    pub extern "C" fn make_big(n: u64) -> Big {
+        Big { a: n, b: n + 1, c: n + 2 }
+    }
+
+    pub extern "C" fn mixed(x: Mixed, y: Mixed) -> Mixed {
+        Mixed { a: x.a + y.a, b: x.b * y.b }
+    }
+
+    pub extern "C" fn small(x: Small, flag: bool, y: i8) -> Small {
+        Small { a: x.c, b: x.b + flag as u8, c: x.a.wrapping_add(y as u8) }
+    }
+
+    pub extern "C" fn wide(x: u128, y: i16) -> i128 {
+        x as i128 - y as i128
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Floats {
+        pub a: f32,
+        pub b: [f32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Nested {
+        pub tag: u8,
+        pub inner: (u16, f64),
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Two {
+        pub a: u64,
+        pub b: u64,
+    }
+
+    pub extern "C" fn floats(x: Floats, scale: f32) -> Floats {
+        Floats { a: x.b[1] * scale, b: [x.a, x.b[0] + scale] }
+    }
+
+    pub extern "C" fn nested(x: Nested) -> Nested {
+        Nested { tag: x.tag + 1, inner: (x.inner.0 * 2, x.inner.1 / 2.0) }
+    }
+
+    /// `two` no longer fits the integer registers and goes to the stack whole; `last` still
+    /// gets the one that is left.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn spill(a: u64, b: u64, c: u64, d: u64, e: u64, two: Two, last: u64) -> Two {
+        Two { a: a + b + c + d + e + two.a, b: two.b * last }
+    }
+
+    pub fn through_pointer(f: extern "C" fn(Floats, f32) -> Floats, g: extern "C" fn(u64) -> Big) -> f32 {
+        let x = f(Floats { a: 1.0, b: [2.0, 3.0] }, 0.5);
+        x.a + x.b[0] + x.b[1] + g(3).c as f32
+    }
+
+    pub fn call_c(text: &[u8]) -> usize {
+        unsafe extern "C" {
+            fn strlen(s: *const u8) -> usize;
+            fn div(a: i32, b: i32) -> Div;
+        }
+        #[repr(C)]
+        struct Div {
+            quot: i32,
+            rem: i32,
+        }
+        let d = unsafe { div(47, 5) };
+        let len = unsafe { strlen(text.as_ptr()) };
+        len + (d.quot * 10 + d.rem) as usize
+    }
+}

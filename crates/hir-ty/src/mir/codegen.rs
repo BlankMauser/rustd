@@ -30,7 +30,7 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
 use la_arena::ArenaMap;
-use rustc_abi::{Integer, Size};
+use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_index::Idx;
@@ -124,7 +124,26 @@ enum PassMode {
     Pair(AbiScalar, AbiScalar, Size),
     /// Small aggregate passed as one integer register.
     Cast(Type),
+    /// Aggregate the C ABI splits over two registers, the second holding what lies eight
+    /// bytes in.
+    CastPair(Type, Type),
     Indirect,
+    /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
+    /// outgoing arguments, which Cranelift does given a pointer.
+    OnStack(u32),
+}
+
+/// How every value of a call crosses the boundary.
+struct FnAbi {
+    ret: PassMode,
+    args: Vec<PassMode>,
+}
+
+/// What the System V x86-64 ABI calls the class of an eightbyte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RegClass {
+    Int,
+    Sse,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -298,7 +317,7 @@ enum InstanceDef {
 /// What a call transfers control to.
 enum Callee<'db> {
     Instance(InstanceDef, GenericArgs<'db>),
-    Pointer(Value),
+    Pointer(Value, ExternAbi),
 }
 
 struct ObjectCodegen<'a, 'db> {
@@ -393,7 +412,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             eprintln!("{:#?}", body.basic_blocks);
         }
-        let mut ctx = self.compile_body(body, env, track_caller(db, func))?;
+        let abi = FunctionSignature::of(db, func).abi;
+        let mut ctx = self.compile_body(body, env, track_caller(db, func), abi)?;
         let id = self
             .module
             .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
@@ -471,14 +491,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             eprintln!("{:#?}", body.basic_blocks);
         }
-        let tracked = match instance.def {
-            InstanceDef::Fn(func) => track_caller(self.db, func),
+        let (tracked, abi) = match instance.def {
+            InstanceDef::Fn(func) => {
+                (track_caller(self.db, func), FunctionSignature::of(self.db, func).abi)
+            }
             InstanceDef::Closure(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
-            | InstanceDef::FnPointerShim => false,
+            | InstanceDef::FnPointerShim => (false, ExternAbi::Rust),
         };
-        let mut ctx = self.compile_body(body, env, tracked)?;
+        let mut ctx = self.compile_body(body, env, tracked, abi)?;
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         if *declared != ctx.func.signature {
@@ -543,8 +565,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         body: &'db MirBody<'db>,
         env: ParamEnvAndCrate<'db>,
         tracked: bool,
+        abi: ExternAbi,
     ) -> Result<cranelift_codegen::Context> {
-        self.build(env, Some(body), tracked, |fx| fx.codegen())
+        self.build(env, Some(body), tracked, |fx| {
+            fx.abi = abi;
+            fx.codegen()
+        })
     }
 
     fn build(
@@ -572,6 +598,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 deferred_drops: Vec::new(),
                 ret_mode: PassMode::Ignore,
                 tracked,
+                abi: ExternAbi::Rust,
                 location: None,
             };
             fill(&mut fx).map(|()| {
@@ -766,6 +793,8 @@ struct FunctionCx<'cx, 'a, 'db> {
     /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
     /// hidden argument.
     tracked: bool,
+    /// The calling convention of the function being built.
+    abi: ExternAbi,
     location: Option<Value>,
 }
 
@@ -868,6 +897,169 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         })
     }
 
+    /// How a call with these types passes its values. Mirrors rustc: `adjust_for_rust_abi`
+    /// for Rust's own conventions, and `callconv/x86_64.rs` for C's.
+    fn fn_abi(
+        &self,
+        abi: ExternAbi,
+        ret: Ty<'db>,
+        args: impl IntoIterator<Item = Ty<'db>>,
+    ) -> Result<FnAbi> {
+        if abi.is_rustic_abi() {
+            let ret = self.pass_mode(&*self.layout(ret)?, true)?;
+            let args = args
+                .into_iter()
+                .map(|ty| self.pass_mode(&*self.layout(ty)?, false))
+                .collect::<Result<_>>()?;
+            return Ok(FnAbi { ret, args });
+        }
+        if !matches!(abi, ExternAbi::C { .. } | ExternAbi::System { .. } | ExternAbi::SysV64 { .. })
+        {
+            unsupported!("calling convention {abi:?}");
+        }
+        let (mut int_regs, mut sse_regs) = (6usize, 8usize);
+        let ret = match self.c_pass_mode(ret)? {
+            PassMode::OnStack(_) => {
+                // The pointer to the return value takes the first integer register.
+                int_regs -= 1;
+                PassMode::Indirect
+            }
+            mode => mode,
+        };
+        let mut modes = Vec::new();
+        for ty in args {
+            let mode = self.c_pass_mode(ty)?;
+            let (ints, sses) = match mode {
+                PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (0, 0),
+                PassMode::Direct(s) => self.count_regs(&[s.ty]),
+                PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
+                PassMode::Cast(ty) => self.count_regs(&[ty]),
+                PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
+            };
+            let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
+            modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
+                (Some(int_left), Some(sse_left)) => {
+                    (int_regs, sse_regs) = (int_left, sse_left);
+                    mode
+                }
+                // Out of registers: an aggregate goes to memory whole. Cranelift moves
+                // anything else to the stack by itself.
+                _ if aggregate => PassMode::OnStack(self.layout(ty)?.size.bytes() as u32),
+                _ => mode,
+            });
+        }
+        Ok(FnAbi { ret, args: modes })
+    }
+
+    fn count_regs(&self, types: &[Type]) -> (usize, usize) {
+        let floats = types.iter().filter(|ty| ty.is_float()).count();
+        let ints = types.iter().filter(|ty| !ty.is_float()).map(|ty| ty.bytes().div_ceil(8));
+        (ints.sum::<u32>() as usize, floats)
+    }
+
+    /// How the C ABI passes one value when registers are left for it.
+    fn c_pass_mode(&self, ty: Ty<'db>) -> Result<PassMode> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(PassMode::Ignore);
+        }
+        let size = layout.size.bytes();
+        let on_stack = PassMode::OnStack(size.next_multiple_of(8) as u32);
+        match layout.backend_repr {
+            BackendRepr::Scalar(scalar) => return Ok(PassMode::Direct(self.scalar(scalar)?)),
+            BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
+            _ => (),
+        }
+        if size > 16 {
+            return Ok(on_stack);
+        }
+        let mut classes = [None; 2];
+        if !self.classify(ty, 0, &mut classes)? {
+            return Ok(on_stack);
+        }
+        let reg = |class: Option<RegClass>, bytes: u64| match (class, bytes) {
+            (Some(RegClass::Sse), 4) => types::F32,
+            (Some(RegClass::Sse), _) => types::F64,
+            (_, 1) => types::I8,
+            (_, 2) => types::I16,
+            (_, 3 | 4) => types::I32,
+            _ => types::I64,
+        };
+        Ok(if size <= 8 {
+            PassMode::Cast(reg(classes[0], size))
+        } else {
+            PassMode::CastPair(reg(classes[0], 8), reg(classes[1], size - 8))
+        })
+    }
+
+    /// Classifies the eightbytes of a value of at most sixteen bytes at `offset`; false if it
+    /// has to go in memory.
+    fn classify(
+        &self,
+        ty: Ty<'db>,
+        offset: u64,
+        classes: &mut [Option<RegClass>; 2],
+    ) -> Result<bool> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(true);
+        }
+        if offset % layout.align.abi.bytes() != 0 {
+            return Ok(false);
+        }
+        let mut scalar = |scalar: Scalar, offset: u64| {
+            let class = match scalar.primitive() {
+                Primitive::Float(_) => RegClass::Sse,
+                Primitive::Int(..) | Primitive::Pointer(_) => RegClass::Int,
+            };
+            let last = (offset + scalar.size(self.dl()).bytes() - 1) / 8;
+            for slot in &mut classes[(offset / 8) as usize..=last as usize] {
+                *slot = Some(slot.map_or(class, |old: RegClass| old.min(class)));
+            }
+        };
+        match layout.backend_repr {
+            BackendRepr::Scalar(a) => scalar(a, offset),
+            BackendRepr::ScalarPair(a, b) => {
+                scalar(a, offset);
+                scalar(b, offset + a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes());
+            }
+            BackendRepr::Memory { sized: true } => match ty.kind() {
+                TyKind::Tuple(tys) => {
+                    for (i, ty) in tys.iter().enumerate() {
+                        if !self.classify(ty, offset + layout.fields.offset(i).bytes(), classes)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                TyKind::Array(element, _) => {
+                    let stride = self.layout(element)?.size.bytes();
+                    for i in 0..layout.fields.count() as u64 {
+                        if !self.classify(element, offset + i * stride, classes)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                TyKind::Adt(def, subst) => {
+                    let variant: VariantId = match def.def_id() {
+                        AdtId::StructId(id) => id.into(),
+                        AdtId::UnionId(id) => id.into(),
+                        AdtId::EnumId(_) => unsupported!("enum {ty:?} in the C ABI"),
+                    };
+                    for (field, ty) in self.cg.db.field_types(variant).iter() {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
+                        if !self.classify(ty, offset + field.bytes(), classes)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => unsupported!("{ty:?} in the C ABI"),
+            },
+            _ => unsupported!("{ty:?} in the C ABI"),
+        }
+        Ok(true)
+    }
+
     fn dl(&self) -> &'db rustc_abi::TargetDataLayout {
         self.cg.db.target_data_layout_or_default(self.env.krate)
     }
@@ -878,7 +1070,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             PassMode::Direct(s) => params.push(s.param()),
             PassMode::Pair(a, b, _) => params.extend([a.param(), b.param()]),
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
+            PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
             PassMode::Indirect => params.push(AbiParam::new(PTR)),
+            PassMode::OnStack(size) => {
+                params.push(AbiParam::special(PTR, ArgumentPurpose::StructArgument(size)))
+            }
         }
     }
 
@@ -917,6 +1113,64 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.copy(addr, tmp, size);
     }
 
+    /// The values that carry the argument at `addr` to a callee.
+    fn pass(&mut self, mode: PassMode, addr: Value, layout: &Layout, values: &mut Vec<Value>) {
+        match mode {
+            PassMode::Ignore => (),
+            PassMode::Direct(s) => values.push(self.builder.ins().load(s.ty, MEM, addr, 0)),
+            PassMode::Pair(a, b, offset) => {
+                values.push(self.builder.ins().load(a.ty, MEM, addr, 0));
+                values.push(self.builder.ins().load(b.ty, MEM, addr, offset.bytes() as i32));
+            }
+            PassMode::Cast(ty) => values.push(self.load_cast(ty, addr, layout.size)),
+            PassMode::CastPair(a, b) => {
+                values.push(self.builder.ins().load(a, MEM, addr, 0));
+                let rest = self.builder.ins().iadd_imm(addr, 8);
+                values.push(self.load_cast(b, rest, layout.size - Size::from_bytes(8)));
+            }
+            PassMode::Indirect => {
+                // The callee owns the memory it is handed.
+                let copy = self.stack_slot(layout);
+                self.copy(copy, addr, layout.size);
+                values.push(copy);
+            }
+            PassMode::OnStack(_) => values.push(addr),
+        }
+    }
+
+    /// Stores what `pass` or a return sent, taking the values off the front of `values`.
+    fn receive(
+        &mut self,
+        mode: PassMode,
+        values: &mut impl Iterator<Item = Value>,
+        addr: Value,
+        layout: &Layout,
+    ) {
+        let mut next = || values.next().expect("a value for every abi parameter");
+        match mode {
+            PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (),
+            PassMode::Direct(_) => {
+                let value = next();
+                self.builder.ins().store(MEM, value, addr, 0);
+            }
+            PassMode::Pair(_, _, offset) => {
+                let (a, b) = (next(), next());
+                self.builder.ins().store(MEM, a, addr, 0);
+                self.builder.ins().store(MEM, b, addr, offset.bytes() as i32);
+            }
+            PassMode::Cast(_) => {
+                let value = next();
+                self.store_cast(value, addr, layout.size);
+            }
+            PassMode::CastPair(..) => {
+                let (a, b) = (next(), next());
+                self.builder.ins().store(MEM, a, addr, 0);
+                let rest = self.builder.ins().iadd_imm(addr, 8);
+                self.store_cast(b, rest, layout.size - Size::from_bytes(8));
+            }
+        }
+    }
+
     /// Eight bytes of stack.
     fn scratch(&mut self) -> Value {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -949,15 +1203,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     /// The signature a MIR body is compiled with.
+    fn body_abi(&self, body: &MirBody<'db>, abi: ExternAbi) -> Result<FnAbi> {
+        self.fn_abi(
+            abi,
+            body.locals[return_slot()].ty.as_ref(),
+            body.param_locals.iter().map(|&local| body.locals[local].ty.as_ref()),
+        )
+    }
+
     fn body_signature(&self, body: &MirBody<'db>, tracked: bool) -> Result<Signature> {
-        let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
-        let ret_mode = self.pass_mode(&ret_layout, true)?;
-        let mut param_modes = Vec::with_capacity(body.param_locals.len());
-        for &local in &body.param_locals {
-            let layout = self.layout(body.locals[local].ty.as_ref())?;
-            param_modes.push(self.pass_mode(&layout, false)?);
-        }
-        let mut sig = self.signature(&param_modes, ret_mode);
+        let abi = self.body_abi(body, ExternAbi::Rust)?;
+        let mut sig = self.signature(&abi.args, abi.ret);
         if tracked {
             sig.params.push(AbiParam::new(PTR));
         }
@@ -966,16 +1222,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     fn codegen(&mut self) -> Result<()> {
         let body = self.body.expect("MIR body");
-        let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
-        self.ret_mode = self.pass_mode(&ret_layout, true)?;
+        let FnAbi { ret, args: param_modes } = self.body_abi(body, self.abi)?;
+        self.ret_mode = ret;
         let param_layouts = body
             .param_locals
             .iter()
             .map(|&l| self.layout(body.locals[l].ty.as_ref()))
             .collect::<Result<Vec<_>>>()?;
-        let param_modes =
-            param_layouts.iter().map(|l| self.pass_mode(l, false)).collect::<Result<Vec<_>>>()?;
-        self.builder.func.signature = self.body_signature(body, self.tracked)?;
+        let mut sig = self.signature(&param_modes, ret);
+        if self.tracked {
+            sig.params.push(AbiParam::new(PTR));
+        }
+        self.builder.func.signature = sig;
 
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
@@ -990,26 +1248,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             body.param_locals.iter().zip(&param_layouts).zip(param_modes)
         {
             let addr = match mode {
-                PassMode::Indirect => incoming.next().expect("indirect param"),
+                PassMode::Indirect | PassMode::OnStack(_) => {
+                    incoming.next().expect("indirect param")
+                }
                 _ => self.stack_slot(layout),
             };
-            match mode {
-                PassMode::Ignore | PassMode::Indirect => (),
-                PassMode::Direct(_) => {
-                    let value = incoming.next().expect("direct param");
-                    self.builder.ins().store(MEM, value, addr, 0);
-                }
-                PassMode::Cast(_) => {
-                    let value = incoming.next().expect("cast param");
-                    self.store_cast(value, addr, layout.size);
-                }
-                PassMode::Pair(_, _, offset) => {
-                    let a = incoming.next().expect("pair param");
-                    let b = incoming.next().expect("pair param");
-                    self.builder.ins().store(MEM, a, addr, 0);
-                    self.builder.ins().store(MEM, b, addr, offset.bytes() as i32);
-                }
-            }
+            self.receive(mode, &mut incoming, addr, layout);
             self.locals.insert(local, LocalSlot { addr });
         }
         if self.tracked {
@@ -2072,17 +2316,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             unsupported!("fn pointer to a builtin derive method");
         };
         let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
-        let ret_layout = self.layout(sig.output())?;
-        let ret_mode = self.pass_mode(&ret_layout, true)?;
-        let mut arg_modes = Vec::new();
-        for ty in sig.inputs().iter() {
-            let layout = self.layout(*ty)?;
-            arg_modes.push(self.pass_mode(&layout, false)?);
-        }
+        let abi = self.fn_abi(sig.abi(), sig.output(), sig.inputs().iter().copied())?;
         if track_caller(db, callee) {
             unsupported!("pointer to a `#[track_caller]` function");
         }
-        let sig = self.signature(&arg_modes, ret_mode);
+        let sig = self.signature(&abi.args, abi.ret);
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
 
@@ -2236,6 +2474,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 equal
             } else {
                 self.builder.ins().bxor_imm(equal, 1)
+            });
+        }
+        if matches!(ty.kind(), TyKind::RawPtr(..))
+            && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair(..))
+        {
+            // Wide pointers compare by address, then by metadata.
+            let cc = match op {
+                BinOp::Eq => IntCC::Equal,
+                BinOp::Ne => IntCC::NotEqual,
+                BinOp::Lt => IntCC::UnsignedLessThan,
+                BinOp::Le => IntCC::UnsignedLessThanOrEqual,
+                BinOp::Gt => IntCC::UnsignedGreaterThan,
+                BinOp::Ge => IntCC::UnsignedGreaterThanOrEqual,
+                _ => unsupported!("{op:?} on wide pointers"),
+            };
+            let [l_ptr, r_ptr] =
+                [l_addr, r_addr].map(|it| self.builder.ins().load(PTR, MEM, it, 0));
+            let [l_meta, r_meta] =
+                [l_addr, r_addr].map(|it| self.builder.ins().load(PTR, MEM, it, 8));
+            let same_ptr = self.builder.ins().icmp(IntCC::Equal, l_ptr, r_ptr);
+            let by_meta = self.builder.ins().icmp(cc, l_meta, r_meta);
+            let by_ptr = self.builder.ins().icmp(cc, l_ptr, r_ptr);
+            return Ok(match op {
+                BinOp::Eq => self.builder.ins().band(same_ptr, by_meta),
+                BinOp::Ne => self.builder.ins().bor(by_ptr, by_meta),
+                _ => self.builder.ins().select(same_ptr, by_meta, by_ptr),
             });
         }
         let scalar = self.scalar_of(ty)?;
@@ -2498,22 +2762,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             TerminatorKind::Return => {
                 let addr = self.locals[return_slot()].addr;
-                if let PassMode::Cast(ty) = self.ret_mode {
-                    let size = self
-                        .layout(self.body.expect("MIR body").locals[return_slot()].ty.as_ref())?
-                        .size;
-                    let value = self.load_cast(ty, addr, size);
-                    self.builder.ins().return_(&[value]);
-                    return Ok(());
+                let mut values = Vec::new();
+                if !matches!(self.ret_mode, PassMode::Indirect) {
+                    let layout = self
+                        .layout(self.body.expect("MIR body").locals[return_slot()].ty.as_ref())?;
+                    self.pass(self.ret_mode, addr, &layout, &mut values);
                 }
-                let mut load = |ty, offset| self.builder.ins().load(ty, MEM, addr, offset);
-                let values = match self.ret_mode {
-                    PassMode::Ignore | PassMode::Indirect | PassMode::Cast(_) => vec![],
-                    PassMode::Direct(s) => vec![load(s.ty, 0)],
-                    PassMode::Pair(a, b, offset) => {
-                        vec![load(a.ty, 0), load(b.ty, offset.bytes() as i32)]
-                    }
-                };
                 self.builder.ins().return_(&values);
             }
             TerminatorKind::Unreachable => {
@@ -2545,7 +2799,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let (addr, _) = self.operand(func)?;
             let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
             let values = self.operands(args)?;
-            self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty.ty)?;
+            let abi = fn_ty.fn_sig(self.interner).abi();
+            self.emit_call(Callee::Pointer(pointer, abi), &values, dst, dst_ty.ty)?;
             return self.finish_call(destination, target);
         }
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
@@ -2707,7 +2962,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             TyKind::FnPtr(..) => {
                 let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
-                self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty)
+                let abi = ty.fn_sig(self.interner).abi();
+                self.emit_call(Callee::Pointer(pointer, abi), &values, dst, dst_ty)
             }
             TyKind::Closure(id, generic_args) => {
                 let parent_args =
@@ -2796,7 +3052,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
         let mut values = vec![(thin, thin_ty)];
         values.extend_from_slice(rest);
-        self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty)
+        self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust), &values, dst, dst_ty)
     }
 
     /// The principal trait of `dyn_ty`, as implemented by `self_ty`.
@@ -3162,34 +3418,22 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         let ret_layout = self.layout(dst_ty)?;
-        let ret_mode = self.pass_mode(&ret_layout, true)?;
-        let mut arg_modes = Vec::with_capacity(args.len());
+        let abi = match callee {
+            Callee::Instance(InstanceDef::Fn(func), _) => {
+                FunctionSignature::of(self.cg.db, func).abi
+            }
+            Callee::Instance(..) => ExternAbi::Rust,
+            Callee::Pointer(_, abi) => abi,
+        };
+        let FnAbi { ret: ret_mode, args: arg_modes } =
+            self.fn_abi(abi, dst_ty, args.iter().map(|&(_, ty)| ty))?;
         let mut values = Vec::new();
         if let PassMode::Indirect = ret_mode {
             values.push(dst);
         }
-        for &(addr, ty) in args {
+        for (&(addr, ty), &mode) in args.iter().zip(&arg_modes) {
             let layout = self.layout(ty)?;
-            let mode = self.pass_mode(&layout, false)?;
-            arg_modes.push(mode);
-            if let PassMode::Cast(ty) = mode {
-                values.push(self.load_cast(ty, addr, layout.size));
-                continue;
-            }
-            let mut load = |ty, offset| self.builder.ins().load(ty, MEM, addr, offset);
-            match mode {
-                PassMode::Ignore | PassMode::Cast(_) => (),
-                PassMode::Direct(s) => values.push(load(s.ty, 0)),
-                PassMode::Pair(a, b, offset) => {
-                    values.extend([load(a.ty, 0), load(b.ty, offset.bytes() as i32)])
-                }
-                PassMode::Indirect => {
-                    // The callee owns the memory it is handed.
-                    let copy = self.stack_slot(&layout);
-                    self.copy(copy, addr, layout.size);
-                    values.push(copy);
-                }
-            }
+            self.pass(mode, addr, &layout, &mut values);
         }
         let mut sig = self.signature(&arg_modes, ret_mode);
         if let Callee::Instance(InstanceDef::Fn(func), _) = callee
@@ -3204,23 +3448,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
                 self.builder.ins().call(callee, &values)
             }
-            Callee::Pointer(pointer) => {
+            Callee::Pointer(pointer, _) => {
                 let sig = self.builder.import_signature(sig);
                 self.builder.ins().call_indirect(sig, pointer, &values)
             }
         };
         let results = self.builder.inst_results(call).to_vec();
-        match ret_mode {
-            PassMode::Ignore | PassMode::Indirect => (),
-            PassMode::Direct(_) => {
-                self.builder.ins().store(MEM, results[0], dst, 0);
-            }
-            PassMode::Cast(_) => self.store_cast(results[0], dst, ret_layout.size),
-            PassMode::Pair(_, _, offset) => {
-                self.builder.ins().store(MEM, results[0], dst, 0);
-                self.builder.ins().store(MEM, results[1], dst, offset.bytes() as i32);
-            }
-        }
+        self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
     }
 
