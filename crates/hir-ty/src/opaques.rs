@@ -1,7 +1,9 @@
 //! Handling of opaque types, detection of defining scope and hidden type.
 
+use base_db::Crate;
 use hir_def::{
-    AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ItemContainerId, TypeAliasId,
+    AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ItemContainerId, ModuleDefId,
+    TypeAliasId, attrs::AttrFlags, nameres::crate_def_map, resolver::HasResolver,
     signatures::ImplSignature,
 };
 use hir_expand::name::Name;
@@ -77,7 +79,16 @@ pub(crate) fn opaque_types_defined_by<'db>(
         | InferBodyId::AnonConstId(_) => {}
     }
 
-    // FIXME: Collect opaques from `#[define_opaque]`.
+    if let Some(func) = def_id.as_function() {
+        for type_alias in defined_type_aliases(db, func) {
+            extend_with_opaques(
+                db,
+                SelfAndAssocBounds::type_alias_impl_traits(db, type_alias),
+                |opaque_idx| ImplTraitId::TypeAliasImplTrait(type_alias, opaque_idx),
+                result,
+            );
+        }
+    }
 
     fn extend_with_opaques<'db>(
         db: &'db dyn HirDatabase,
@@ -210,6 +221,50 @@ fn tait_defining_bodies(
         _ => {}
     }
 
-    // FIXME: Support general TAITs, or decisively decide not to.
-    Vec::new()
+    define_opaque_functions(db, loc.module(db).krate(db))
+        .iter()
+        .filter(|&&func| defined_type_aliases(db, func).any(|alias| alias.loc(db) == loc))
+        .map(|&func| func.into())
+        .collect()
+}
+
+/// The type aliases `func` names in its `#[define_opaque(..)]`.
+fn defined_type_aliases(
+    db: &dyn HirDatabase,
+    func: FunctionId,
+) -> impl Iterator<Item = TypeAliasId> {
+    let paths = AttrFlags::define_opaque(db, func);
+    let resolver = (!paths.is_empty()).then(|| func.resolver(db));
+    paths.iter().filter_map(move |path| {
+        match resolver.as_ref()?.resolve_module_path_in_items(db, path).take_types()? {
+            ModuleDefId::TypeAliasId(it) => Some(it),
+            _ => None,
+        }
+    })
+}
+
+/// Every function of the crate with a `#[define_opaque(..)]`.
+#[salsa::tracked(returns(deref))]
+fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionId]> {
+    let mut result = Vec::new();
+    let mut add = |func: FunctionId| {
+        if !AttrFlags::define_opaque(db, func).is_empty() {
+            result.push(func);
+        }
+    };
+    for (_, module) in crate_def_map(db, krate).modules() {
+        for def in module.scope.declarations() {
+            if let ModuleDefId::FunctionId(func) = def {
+                add(func);
+            }
+        }
+        for impl_id in module.scope.impls() {
+            for &(_, item) in &impl_id.impl_items(db).items {
+                if let AssocItemId::FunctionId(func) = item {
+                    add(func);
+                }
+            }
+        }
+    }
+    result.into_boxed_slice()
 }

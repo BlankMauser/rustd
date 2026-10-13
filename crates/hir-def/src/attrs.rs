@@ -23,6 +23,7 @@ use either::Either;
 use hir_expand::{
     InFile, Lookup,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
+    mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
@@ -32,7 +33,7 @@ use rustc_abi::ReprOptions;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, T,
+    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
     ast::{self, HasAttrs, TokenTreeChildren},
 };
 use tt::TextSize;
@@ -189,6 +190,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rust_analyzer" => match &*second_segment {
                         "completions" => extract_ra_completions(attr_flags, tt),
                         "macro_style" => extract_ra_macro_style(attr_flags, tt),
+                        "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
                         _ => {}
                     },
                     _ => {}
@@ -360,6 +362,7 @@ bitflags::bitflags! {
         const TRACK_CALLER = 1 << 53;
         const THREAD_LOCAL = 1 << 54;
         const RUSTC_PROMOTABLE = 1 << 55;
+        const HAS_DEFINE_OPAQUE = 1 << 56;
     }
 }
 
@@ -1241,6 +1244,57 @@ impl AttrFlags {
                 }
                 ControlFlow::Continue(())
             })
+        }
+    }
+
+    /// The type aliases a function names in `#[define_opaque(..)]`, which has expanded to
+    /// `#[rust_analyzer::define_opaque(..)]` by now.
+    pub fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> &[ModPath] {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_DEFINE_OPAQUE) {
+            return &[];
+        }
+        return define_opaque(db, owner);
+
+        #[salsa::tracked(returns(deref))]
+        fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> Box<[ModPath]> {
+            let mut result = Vec::new();
+            collect_attrs::<Infallible>(db, owner.into(), |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && attr
+                        .path()
+                        .as_up_to_two_segment()
+                        .is_some_and(|(_, tool)| tool.is_some_and(|it| it == "define_opaque"))
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let tokens = TokenTreeChildren::new(&tt)
+                        .filter_map(NodeOrToken::into_token)
+                        .collect_vec();
+                    for path in tokens.split(|it| it.kind() == T![,]) {
+                        let mut kind = PathKind::Plain;
+                        let mut segments = Vec::new();
+                        for token in path {
+                            match token.kind() {
+                                T![crate] => kind = PathKind::Crate,
+                                T![self] => kind = PathKind::SELF,
+                                T![super] => {
+                                    kind = match kind {
+                                        PathKind::Super(n) => PathKind::Super(n + 1),
+                                        _ => PathKind::Super(1),
+                                    }
+                                }
+                                SyntaxKind::IDENT => segments
+                                    .push(Name::new_symbol_root(Symbol::intern(token.text()))),
+                                _ => {}
+                            }
+                        }
+                        if !segments.is_empty() {
+                            result.push(ModPath::from_segments(kind, segments));
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+            result.into_boxed_slice()
         }
     }
 

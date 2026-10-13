@@ -39,10 +39,12 @@ def main():
     ap.add_argument("crate_dir")
     ap.add_argument("--crate")
     ap.add_argument("--bisect", action="store_true")
+    ap.add_argument("--test", action="append", help="only these test binaries")
     ap.add_argument("--json")
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
     tests = sorted(f[:-3] for f in os.listdir(os.path.join(a.crate_dir, "tests")) if f.endswith(".rs"))
+    tests = [t for t in tests if not a.test or t in a.test]
     results, shared = [], {}
     for test in tests:
         print(f"--- {test}", flush=True)
@@ -54,6 +56,10 @@ def main():
             # rustd sees the crate with its default features, so only those are tested.
             if "requires the features" in str(e):
                 print("left out: needs features that are off by default")
+                continue
+            # rustc could not build it either: a dev-dependency the published crate lacks, say.
+            if str(e).startswith("cargo failed"):
+                print(f"left out: rustc does not build it: {str(e)[-300:]}")
                 continue
             print(f"ERROR: {str(e)[:1500]}")
             results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {}})

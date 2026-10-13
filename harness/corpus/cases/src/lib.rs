@@ -2634,3 +2634,124 @@ pub mod promoted_assoc_const {
         vec![(a.vtable.size)(), (b.vtable.size)(), (a.vtable.align)(), (b.vtable.align)()]
     }
 }
+
+pub mod offsets {
+    use std::mem::offset_of;
+
+    #[repr(C)]
+    struct Outer {
+        a: u8,
+        b: u32,
+        c: (u16, u64),
+        d: Inner,
+    }
+    #[repr(C)]
+    struct Inner {
+        x: u8,
+        y: [u16; 3],
+    }
+    struct Generic<T> {
+        _a: u8,
+        t: T,
+        z: u16,
+    }
+    fn generic<T>() -> (usize, usize) {
+        (offset_of!(Generic<T>, t), offset_of!(Generic<T>, z))
+    }
+    const NESTED: usize = offset_of!(Outer, d.y);
+
+    pub fn run() -> Vec<usize> {
+        let (wide, narrow) = (generic::<u64>(), generic::<[u8; 3]>());
+        vec![
+            offset_of!(Outer, a),
+            offset_of!(Outer, b),
+            offset_of!(Outer, c.1),
+            offset_of!(Outer, d.x),
+            NESTED,
+            wide.0,
+            wide.1,
+            narrow.0,
+            narrow.1,
+            offset_of!((u8, u64, u16), 2),
+        ]
+    }
+}
+
+pub mod backtraces {
+    use std::backtrace::{Backtrace, BacktraceStatus};
+
+    struct Report {
+        code: u32,
+        // Its layout hangs on a type alias for an `impl Trait` inside std.
+        backtrace: Option<Backtrace>,
+    }
+
+    fn report(code: u32) -> Report {
+        Report { code, backtrace: (code > 1).then(Backtrace::disabled) }
+    }
+
+    pub fn run() -> Vec<usize> {
+        let (a, b) = (report(1), report(2));
+        let disabled =
+            b.backtrace.as_ref().is_some_and(|it| it.status() == BacktraceStatus::Disabled);
+        vec![
+            std::mem::size_of::<Report>(),
+            a.code as usize,
+            a.backtrace.is_none() as usize,
+            b.code as usize,
+            disabled as usize,
+        ]
+    }
+}
+
+// An inline `const { .. }` block declares bindings of its own.
+pub mod inline_const_bindings {
+    trait Swizzle<const N: usize> {
+        const INDEX: [usize; N];
+
+        fn indices() -> [u32; N] {
+            const {
+                let mut output = [0; N];
+                let mut i = 0;
+                while i < N {
+                    let index = Self::INDEX[i];
+                    assert!(index < 100);
+                    output[i] = index as u32;
+                    i += 1;
+                }
+                struct Indices<const LEN: usize>([u32; LEN]);
+                Indices(output)
+            }
+            .0
+        }
+    }
+
+    struct Reverse;
+    impl Swizzle<3> for Reverse {
+        const INDEX: [usize; 3] = [2, 1, 0];
+    }
+
+    pub fn run() -> Vec<u32> {
+        let nested = std::mem::offset_of!(((u8, (u8, u16)), (u8, u32, u16)), 0.1.1);
+        let mut out = Reverse::indices().to_vec();
+        out.push(nested as u32);
+        out
+    }
+}
+
+// A closure is `Clone` when what it captured is, and clones capture by capture.
+pub mod closure_clone {
+    fn twice<F: Fn(i32) -> String + Clone>(f: F) -> (String, String) {
+        let g = f.clone();
+        (f(1), g(2))
+    }
+
+    pub fn run() -> Vec<(String, String)> {
+        let s = String::from("hi");
+        let v = vec![1, 2, 3];
+        let r = &v;
+        let captures = move |x: i32| format!("{s} {x} {}", r.len());
+        let plain = |x: i32| x.to_string();
+        vec![twice(captures.clone()), twice(captures), twice(plain)]
+    }
+}

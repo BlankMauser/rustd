@@ -271,6 +271,14 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         //     builtin#offset_of(Foo, (bar.baz.0));
         // }
         while !p.at(EOF) && !p.at(T![')']) {
+            // `0.1` is lexed as a float; whoever reads the name splits it.
+            if p.at(FLOAT_NUMBER) {
+                let m = p.start();
+                p.bump_any();
+                m.complete(p, NAME_REF);
+                p.eat(T![.]);
+                continue;
+            }
             name_ref_mod_path_or_index(p);
             if !p.at(T![')']) {
                 p.expect(T![.]);

@@ -67,7 +67,7 @@ register_builtin! {
     (global_allocator, GlobalAllocator) => dummy_attr_expand,
     (test, Test) => dummy_gate_test_expand,
     (test_case, TestCase) => dummy_gate_test_expand,
-    (define_opaque, DefineOpaque) => dummy_attr_expand,
+    (define_opaque, DefineOpaque) => define_opaque_expand,
 }
 
 pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
@@ -81,6 +81,25 @@ fn dummy_attr_expand(
     _span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     ExpandResult::ok(tt.clone())
+}
+
+/// The item keeps the list as a tool attribute, which type inference reads and name resolution
+/// does not expand again.
+fn define_opaque_expand(
+    db: &dyn SourceDatabase,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let MacroCallKind::Attr { attr_args: Some(args), .. } = &id.loc(db).kind else {
+        return ExpandResult::ok(tt.clone());
+    };
+    let args = &**args;
+    let result = quote::quote! { span=>
+        #[rust_analyzer::define_opaque(#args)]
+        #tt
+    };
+    ExpandResult::ok(result)
 }
 
 fn dummy_gate_test_expand(

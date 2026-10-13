@@ -1924,7 +1924,19 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::AsmExpr(e) => self.lower_inline_asm(e, syntax_ptr),
             ast::Expr::OffsetOfExpr(e) => {
                 let container = self.lower_type_ref_opt_disallow_impl_trait(e.ty());
-                let fields = e.fields().map(|it| it.as_name()).collect();
+                // A float token is two tuple indices: `0.1`.
+                let fields = e
+                    .fields()
+                    .flat_map(|it| match it.syntax().first_token() {
+                        Some(token) if token.kind() == syntax::SyntaxKind::FLOAT_NUMBER => token
+                            .text()
+                            .split('.')
+                            .filter_map(|index| index.parse().ok())
+                            .map(Name::new_tuple_field)
+                            .collect(),
+                        _ => vec![it.as_name()],
+                    })
+                    .collect();
                 self.alloc_expr(Expr::OffsetOf(OffsetOf { container, fields }), syntax_ptr)
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),

@@ -4777,8 +4777,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let args = GenericArgs::new_from_slice(&[part.into()]);
             this.call_direct(clone, args, &[(slot, reference)], dst, part)
         };
+        // A closure clones as the tuple of what it captured.
+        let fields = match ty.kind() {
+            TyKind::Tuple(fields) => Some(fields),
+            TyKind::Closure(_, args) => match args.as_closure().tupled_upvars_ty().kind() {
+                TyKind::Tuple(fields) => Some(fields),
+                _ => unsupported!("builtin `Clone` of a closure without tupled upvars"),
+            },
+            _ => None,
+        };
         match ty.kind() {
-            TyKind::Tuple(fields) => {
+            _ if let Some(fields) = fields => {
                 for (i, field) in fields.iter().enumerate() {
                     let offset = layout.fields.offset(i).bytes() as i64;
                     let src = self.builder.ins().iadd_imm(src, offset);

@@ -770,7 +770,12 @@ impl<'db> InferenceContext<'db> {
                 });
                 expected
             }
-            Expr::OffsetOf(_) => self.types.types.usize,
+            Expr::OffsetOf(offset) => {
+                // MIR lowering needs the type whose fields these are.
+                let container = self.make_ty(offset.container);
+                self.result.type_of_type_placeholder.insert(offset.container, container.store());
+                self.types.types.usize
+            }
             Expr::InlineAsm(asm) => {
                 let check_expr_asm_operand = |this: &mut Self, expr, is_input: bool| {
                     let ty = this.infer_expr_no_expect(expr, ExprIsRead::Yes);

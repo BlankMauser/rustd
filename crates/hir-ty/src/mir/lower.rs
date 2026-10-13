@@ -434,8 +434,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         mut current: BasicBlockId,
     ) -> Result<'db, Option<BasicBlockId>> {
         match &self.store[expr_id] {
-            Expr::OffsetOf(_) => {
-                not_supported!("builtin#offset_of")
+            Expr::OffsetOf(offset) => {
+                let field = self.offset_of_place(offset, current, expr_id.into())?;
+                // The field of a value at address 0 is at its offset.
+                self.push_assignment(
+                    current,
+                    place,
+                    Rvalue::Ref(BorrowKind::Shared, field.store()),
+                    expr_id.into(),
+                );
+                Ok(Some(current))
             }
             Expr::InlineAsm(asm) if asm.comment_only => Ok(Some(current)),
             Expr::InlineAsm(_) => {
@@ -1052,6 +1060,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // the same body (see inference, which infers the inner expression directly), so we
                 // lower that expression in place. Const-ness is irrelevant here: MIR evaluation
                 // already runs in a const context.
+                // The block owns its bindings, so the enclosing body gave them no locals.
+                for (binding, _) in self.store.bindings() {
+                    if self.store.binding_owner(binding) == Some(expr_id)
+                        && !self.result.binding_locals.contains_idx(binding)
+                    {
+                        let ty = self.infer.binding_ty(binding).store();
+                        let local = self.result.locals.alloc(Local { ty });
+                        self.result.binding_locals.insert(binding, local);
+                    }
+                }
                 self.lower_expr_to_place(id, place, current)
             }
             Expr::Cast { expr, type_ref: _ } => {
@@ -1534,6 +1552,60 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Underscore => Ok(Some(current)),
             Expr::IncludeBytes => not_supported!("include_bytes!()"),
         }
+    }
+
+    /// The field `offset_of!` names, of a value at address 0.
+    fn offset_of_place(
+        &mut self,
+        offset: &hir_def::hir::OffsetOf,
+        current: BasicBlockId,
+        span: MirSpan,
+    ) -> Result<'db, Place<'db>> {
+        let interner = self.interner();
+        let mut ty = self
+            .infer
+            .type_of_type_placeholder(offset.container)
+            .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
+        let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
+        let null = Operand::from_bytes(
+            Box::new(0usize.to_le_bytes()),
+            self.result.locals[base].ty.as_ref(),
+        );
+        self.push_assignment(current, base.into(), null.into(), span);
+        let mut place = Place::from(base).project(ProjectionElem::Deref);
+        let mut variant = None;
+        for name in &offset.fields {
+            let no_field = MirLowerError::TypeError("no such field in offset_of");
+            let (field, field_ty) = match ty.kind() {
+                TyKind::Tuple(tys) => {
+                    let index = name.as_tuple_index().ok_or(no_field.clone())?;
+                    (FieldIndex(index as u32), *tys.get(index).ok_or(no_field)?)
+                }
+                TyKind::Adt(adt, args) => {
+                    let of = match (adt.def_id(), variant.take()) {
+                        (_, Some(variant)) => VariantId::EnumVariantId(variant),
+                        (AdtId::EnumId(it), None) => {
+                            let id = it.enum_variants(self.db).variant(name).ok_or(no_field)?;
+                            place = place.project(ProjectionElem::Downcast(id.into()));
+                            variant = Some(id);
+                            continue;
+                        }
+                        (AdtId::StructId(it), None) => it.into(),
+                        (AdtId::UnionId(it), None) => it.into(),
+                    };
+                    let field = of.fields(self.db).field(name).ok_or(no_field)?;
+                    let field_ty = self.db.field_types(of)[field]
+                        .ty()
+                        .instantiate(interner, args)
+                        .skip_norm_wip();
+                    (FieldIndex::from(field), field_ty)
+                }
+                _ => return Err(no_field),
+            };
+            place = place.project(ProjectionElem::Field(field));
+            ty = field_ty;
+        }
+        Ok(place)
     }
 
     fn push_field_projection(
