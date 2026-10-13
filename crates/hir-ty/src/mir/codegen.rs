@@ -125,6 +125,8 @@ enum OverflowOp {
     Neg,
     Shl,
     Shr,
+    DivByZero,
+    RemByZero,
 }
 
 /// How a value crosses a call boundary in rustc's Rust ABI.
@@ -3099,12 +3101,29 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 value
             }
             BinOp::Div | BinOp::Rem => {
-                // FIXME: rustc panics on a zero divisor and on MIN / -1; this traps.
-                match (op, signed) {
-                    (BinOp::Div, true) => ins.sdiv(l, r),
-                    (BinOp::Div, false) => ins.udiv(l, r),
-                    (_, true) => ins.srem(l, r),
-                    (_, false) => ins.urem(l, r),
+                let div = matches!(op, BinOp::Div);
+                let zero = self.builder.ins().icmp_imm(IntCC::Equal, r, 0);
+                self.panic_if(zero, if div { OverflowOp::DivByZero } else { OverflowOp::RemByZero })?;
+                if signed {
+                    let ty = scalar.ty;
+                    let min = if ty == types::I128 {
+                        let low = self.builder.ins().iconst(types::I64, 0);
+                        let high = self.builder.ins().iconst(types::I64, i64::MIN);
+                        self.builder.ins().iconcat(low, high)
+                    } else {
+                        self.builder.ins().iconst(ty, i64::MIN >> (64 - ty.bits()))
+                    };
+                    let is_min = self.builder.ins().icmp(IntCC::Equal, l, min);
+                    let minus_one = self.builder.ins().icmp_imm(IntCC::Equal, r, -1);
+                    let overflow = self.builder.ins().band(is_min, minus_one);
+                    self.panic_if(overflow, if div { OverflowOp::Div } else { OverflowOp::Rem })?;
+                }
+                let ins = self.builder.ins();
+                match (div, signed) {
+                    (true, true) => ins.sdiv(l, r),
+                    (true, false) => ins.udiv(l, r),
+                    (false, true) => ins.srem(l, r),
+                    (false, false) => ins.urem(l, r),
                 }
             }
             BinOp::Shl | BinOp::Shr => {
@@ -3210,16 +3229,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     /// Branches to a call of rustc's `panic_const_*` when `cond` is set.
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
         let name = match op {
-            OverflowOp::Add => "add",
-            OverflowOp::Sub => "sub",
-            OverflowOp::Mul => "mul",
-            OverflowOp::Div => "div",
-            OverflowOp::Rem => "rem",
-            OverflowOp::Neg => "neg",
-            OverflowOp::Shl => "shl",
-            OverflowOp::Shr => "shr",
+            OverflowOp::Add => "add_overflow",
+            OverflowOp::Sub => "sub_overflow",
+            OverflowOp::Mul => "mul_overflow",
+            OverflowOp::Div => "div_overflow",
+            OverflowOp::Rem => "rem_overflow",
+            OverflowOp::Neg => "neg_overflow",
+            OverflowOp::Shl => "shl_overflow",
+            OverflowOp::Shr => "shr_overflow",
+            OverflowOp::DivByZero => "div_by_zero",
+            OverflowOp::RemByZero => "rem_by_zero",
         };
-        let path = format!("core::panicking::panic_const::panic_const_{name}_overflow");
+        let path = format!("core::panicking::panic_const::panic_const_{name}");
         let Some(symbol) = self.cg.symbols.path(&path) else {
             self.builder.ins().trapnz(cond, TrapCode::INTEGER_OVERFLOW);
             return Ok(());
@@ -3706,7 +3727,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 };
                 values.insert(0, self_arg);
                 let def = InstanceDef::Closure(id.0.as_id());
-                self.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
+                let call = |this: &mut Self| {
+                    this.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
+                };
+                // A closure that is passed by value to a body that only borrows it is the
+                // caller's to drop, whether the body returns or unwinds.
+                if by_ref.is_none() && self_ty.as_reference().is_some() {
+                    self.guarded(call, |this| this.drop_value(addr, None, ty))?;
+                    self.drop_value(addr, None, ty)
+                } else {
+                    call(self)
+                }
             }
             // A type with its own `Fn` impls, which take the arguments as a tuple.
             TyKind::Adt(..) => {
@@ -4143,7 +4174,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         ty: Ty<'db>,
     ) -> Result<()> {
         let layout = self.layout(ty)?;
-        let mut clone_part = |this: &mut Self, src: Value, dst: Value, part: Ty<'db>| {
+        let clone_part = |this: &mut Self, src: Value, dst: Value, part: Ty<'db>| {
             let reference = Ty::new_ref(
                 this.interner,
                 Region::new_erased(this.interner),
@@ -4160,8 +4191,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 for (i, field) in fields.iter().enumerate() {
                     let offset = layout.fields.offset(i).bytes() as i64;
                     let src = self.builder.ins().iadd_imm(src, offset);
-                    let dst = self.builder.ins().iadd_imm(dst, offset);
-                    clone_part(self, src, dst, field)?;
+                    let part = self.builder.ins().iadd_imm(dst, offset);
+                    self.guarded(
+                        |this| clone_part(this, src, part, field),
+                        |this| {
+                            for (done, field) in fields.iter().enumerate().take(i) {
+                                let offset = layout.fields.offset(done).bytes() as i64;
+                                let done = this.builder.ins().iadd_imm(dst, offset);
+                                this.drop_value(done, None, field)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
                 }
             }
             TyKind::Array(element, _) => {
@@ -4180,8 +4221,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.switch_to_block(body);
                 let offset = self.builder.ins().imul_imm(index, size);
                 let src = self.builder.ins().iadd(src, offset);
-                let dst = self.builder.ins().iadd(dst, offset);
-                clone_part(self, src, dst, element)?;
+                let part = self.builder.ins().iadd(dst, offset);
+                self.guarded(
+                    |this| clone_part(this, src, part, element),
+                    |this| this.drop_elements(dst, index, element),
+                )?;
                 let next = self.builder.ins().iadd_imm(index, 1);
                 self.builder.ins().jump(header, &[next.into()]);
                 self.builder.switch_to_block(done);
@@ -5048,26 +5092,38 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         meta: Option<Value>,
         ty: Ty<'db>,
     ) -> Result<()> {
+        self.guarded(
+            |this| this.call_drop_impl(addr, ty),
+            |this| this.drop_adt_fields(addr, meta, ty),
+        )
+    }
+
+    /// Runs `body`, and `cleanup` on the way out if a call that `body` makes unwinds.
+    fn guarded(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<()>,
+        cleanup: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         if self.in_cleanup {
-            return self.call_drop_impl(addr, ty);
+            return body(self);
         }
         let outer = self.landing_pad_for_call();
         let pad = self.builder.create_block();
         self.builder.append_block_param(pad, PTR);
         self.builder.set_cold_block(pad);
         let enclosing = self.inner_pad.replace(pad);
-        let called = self.call_drop_impl(addr, ty);
+        let done = body(self);
         self.inner_pad = enclosing;
-        called?;
+        done?;
         let Some(after) = self.builder.current_block() else {
-            unsupported!("drop impl call without a block to return to");
+            unsupported!("guarded call without a block to return to");
         };
         self.builder.switch_to_block(pad);
         let exception = self.builder.block_params(pad)[0];
         self.in_cleanup = true;
-        let dropped = self.drop_adt_fields(addr, meta, ty);
+        let cleaned = cleanup(self);
         self.in_cleanup = false;
-        dropped?;
+        cleaned?;
         match outer {
             Some(outer) => {
                 self.builder.ins().jump(outer, &[exception.into()]);

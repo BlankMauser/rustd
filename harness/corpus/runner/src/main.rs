@@ -198,4 +198,7 @@ fn main() {
     println!("derive_ufcs {:?}", cases::derive_ufcs::run());
     println!("builtin_clone {:?}", cases::builtin_clone::run());
     println!("guard_moves {:?}", cases::guard_moves::run());
+    println!("division_panics {:?}", cases::division_panics::run());
+    println!("unwind_owned {:?}", cases::unwind_owned::run());
+    println!("derive_copy_packed {:?}", cases::derive_copy_packed::run());
 }

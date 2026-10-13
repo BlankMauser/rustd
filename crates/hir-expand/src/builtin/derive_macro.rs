@@ -12,7 +12,7 @@ use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
 
 use crate::{
-    ExpandError, ExpandResult, MacroCallId,
+    ExpandError, ExpandResult, MacroCallId, MacroCallKind,
     builtin::quote::dollar_crate,
     hygiene::span_with_def_site_ctxt,
     name::{self, AsName, Name},
@@ -60,8 +60,25 @@ impl BuiltinDeriveExpander {
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+        if let BuiltinDeriveExpander::Clone = self
+            && let MacroCallKind::Derive { ast_id, .. } = &id.loc(db).kind
+            && derives_copy(&ast_id.to_node(db))
+        {
+            return clone_expand_with(db, span, tt, true);
+        }
         self.expander()(db, span, tt)
     }
+}
+
+/// Whether one of the item's `#[derive]`s lists `Copy`.
+fn derives_copy(adt: &ast::Adt) -> bool {
+    adt.attrs().any(|attr| {
+        let text = attr.syntax().text().to_string();
+        let mut words = text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|word| !word.is_empty());
+        words.next() == Some("derive") && words.any(|word| word == "Copy")
+    })
 }
 
 register_builtin! {
@@ -218,6 +235,31 @@ struct BasicAdtInfo {
     param_types: Vec<AdtParam>,
     where_clause: Vec<tt::TopSubtree>,
     associated_types: Vec<tt::TopSubtree>,
+    /// Whether the fields can be misaligned, and so have to be copied out to be used.
+    packed: bool,
+}
+
+impl BasicAdtInfo {
+    /// What a method of the derived trait matches on to get at the fields of `self`.
+    fn this(&self, span: Span) -> tt::TopSubtree {
+        if self.packed {
+            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
+            quote! {span => #star self }
+        } else {
+            quote! {span => self }
+        }
+    }
+
+    /// Like [`Self::this`], for a method that takes `other` too.
+    fn both(&self, span: Span) -> tt::TopSubtree {
+        if self.packed {
+            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
+            let star2 = star.clone();
+            quote! {span => (#star self, #star2 other) }
+        } else {
+            quote! {span => (self, other) }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -385,7 +427,14 @@ fn parse_adt_from_syntax(
         })
         .collect();
     let name_token = name_to_token(call_site, tm, name)?;
-    Ok(BasicAdtInfo { name: name_token, shape, param_types, where_clause, associated_types })
+    let packed = adt.attrs().any(|attr| {
+        let text = attr.syntax().text().to_string();
+        let mut words = text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|word| !word.is_empty() && *word != "r");
+        words.next() == Some("repr") && words.any(|word| word == "packed")
+    });
+    Ok(BasicAdtInfo { name: name_token, shape, param_types, where_clause, associated_types, packed })
 }
 
 fn to_adt_syntax(
@@ -681,9 +730,21 @@ fn clone_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
+    clone_expand_with(db, span, tt, false)
+}
+
+/// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
+/// that has no type parameters.
+fn clone_expand_with(
+    db: &dyn SourceDatabase,
+    span: Span,
+    tt: &tt::TopSubtree,
+    copy: bool,
+) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, true, |adt| {
-        if matches!(adt.shape, AdtShape::Union) {
+        let copy = copy && adt.param_types.iter().all(|param| param.const_ty.is_some());
+        if copy || matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
                 fn clone(&self) -> Self {
@@ -803,6 +864,7 @@ fn debug_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, false, |adt| {
+        let this = adt.this(span);
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
                 // Spelled out in full, as rustc does: a method of the same name on some other
@@ -867,7 +929,7 @@ fn debug_expand(
         };
         quote! {span =>
             fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result {
-                match self {
+                match #this {
                     # #arms
                 }
             }
@@ -882,6 +944,7 @@ fn hash_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::hash::Hash }, false, |adt| {
+        let this = adt.this(span);
         if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
@@ -916,7 +979,7 @@ fn hash_expand(
         quote! {span =>
             fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
                 #check_discriminant
-                match self {
+                match #this {
                     # #arms
                 }
             }
@@ -947,6 +1010,7 @@ fn partial_eq_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialEq }, false, |adt| {
+        let both = adt.both(span);
         let name = &adt.name;
 
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
@@ -979,7 +1043,7 @@ fn partial_eq_expand(
         let fat_arrow = fat_arrow(span);
         quote! {span =>
             fn eq(&self, other: &Self) -> bool {
-                match (self, other) {
+                match #both {
                     # #arms
                     _unused #fat_arrow false
                 }
@@ -1019,6 +1083,7 @@ fn ord_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Ord }, false, |adt| {
+        let both = adt.both(span);
         fn compare(
             krate: &tt::Ident,
             left: tt::TopSubtree,
@@ -1052,7 +1117,7 @@ fn ord_expand(
         );
         let fat_arrow = fat_arrow(span);
         let mut body = quote! {span =>
-            match (self, other) {
+            match #both {
                 # #arms
                 _unused #fat_arrow #krate::cmp::Ordering::Equal
             }
@@ -1077,6 +1142,7 @@ fn partial_ord_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialOrd }, false, |adt| {
+        let both = adt.both(span);
         fn compare(
             krate: &tt::Ident,
             left: tt::TopSubtree,
@@ -1118,7 +1184,7 @@ fn partial_ord_expand(
             left,
             right,
             quote! {span =>
-                match (self, other) {
+                match #both {
                     # #arms
                     _unused #fat_arrow #krate::option::Option::Some(#krate::cmp::Ordering::Equal)
                 }

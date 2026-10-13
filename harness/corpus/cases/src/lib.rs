@@ -1852,3 +1852,141 @@ pub mod guard_moves {
         (a, b, log.into_inner())
     }
 }
+
+/// Dividing by zero and `MIN / -1` panic and unwind.
+pub mod division_panics {
+    use std::hint::black_box;
+    use std::panic;
+
+    pub fn run() -> (Vec<bool>, i128, u8, i64) {
+        let caught = vec![
+            panic::catch_unwind(|| black_box(1i32) / black_box(0)).is_err(),
+            panic::catch_unwind(|| black_box(1u8) % black_box(0)).is_err(),
+            panic::catch_unwind(|| black_box(i8::MIN) / black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i64::MIN) % black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i128::MIN) / black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i16::MIN) / black_box(1)).is_err(),
+        ];
+        (caught, black_box(i128::MIN + 1) / black_box(-1), black_box(7u8) % black_box(4), black_box(-7i64) / 2)
+    }
+}
+
+/// What a panic unwinds through is dropped: the captures of a closure called by value, and the
+/// part of a tuple or an array that was already cloned.
+pub mod unwind_owned {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::rc::Rc;
+
+    struct Flag<'a>(&'a mut bool);
+
+    impl Drop for Flag<'_> {
+        fn drop(&mut self) {
+            *self.0 = true;
+        }
+    }
+
+    fn call<T: FnOnce()>(t: T) {
+        t()
+    }
+
+    struct Seventh(Rc<()>);
+
+    impl Clone for Seventh {
+        fn clone(&self) -> Self {
+            if Rc::strong_count(&self.0) == 7 {
+                panic!("oops");
+            }
+            Seventh(self.0.clone())
+        }
+    }
+
+    pub fn run() -> (bool, bool, usize, usize) {
+        let mut dropped = false;
+        let caught = {
+            let flag = Flag(&mut dropped);
+            panic::catch_unwind(AssertUnwindSafe(move || {
+                let inner = move || {
+                    let _flag = &flag;
+                    panic!()
+                };
+                call(inner);
+            }))
+            .is_err()
+        };
+
+        let counter = Rc::new(());
+        let c = counter.clone();
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _ = (Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)).clone();
+        }));
+        let tuple = Rc::strong_count(&counter);
+        let c = counter.clone();
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _ = [Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)].clone();
+        }));
+        (caught, dropped, tuple, Rc::strong_count(&counter))
+    }
+}
+
+/// Derives on a `Copy` type copy it, and on a packed type they copy the fields out before
+/// calling anything on them.
+pub mod derive_copy_packed {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CLONED: AtomicU32 = AtomicU32::new(0);
+    static MISALIGNED: AtomicU32 = AtomicU32::new(0);
+
+    #[derive(Copy)]
+    pub struct Liar;
+
+    impl Clone for Liar {
+        fn clone(&self) -> Self {
+            CLONED.fetch_add(1, Ordering::SeqCst);
+            *self
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct Innocent(pub Liar);
+
+    #[derive(Clone)]
+    pub struct Honest(pub Liar);
+
+    #[derive(Copy, Clone, Debug, Hash, PartialOrd)]
+    pub struct Aligned(pub usize);
+
+    impl PartialEq for Aligned {
+        fn eq(&self, other: &Self) -> bool {
+            for it in [self, other] {
+                if it as *const Aligned as usize % std::mem::align_of::<Aligned>() != 0 {
+                    MISALIGNED.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.0 == other.0
+        }
+    }
+
+    #[repr(packed)]
+    #[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Hash)]
+    pub struct Packed(pub Aligned, pub Aligned);
+
+    #[derive(PartialEq)]
+    #[repr(C)]
+    pub struct Dealigned<T>(pub u8, pub T);
+
+    pub fn run() -> (u32, u32, bool, bool, String, u32) {
+        let _ = Innocent(Liar).clone();
+        let copied = CLONED.load(Ordering::SeqCst);
+        let _ = Honest(Liar).clone();
+        let a = Dealigned(0, Packed(Aligned(1), Aligned(2)));
+        let b = Dealigned(0, Packed(Aligned(1), Aligned(3)));
+        (
+            copied,
+            CLONED.load(Ordering::SeqCst),
+            a == a,
+            a.1 < b.1,
+            format!("{:?}", b.1),
+            MISALIGNED.load(Ordering::SeqCst),
+        )
+    }
+}
