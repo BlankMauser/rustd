@@ -386,6 +386,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     ) = (mode, &pr)
                     {
                         let local = self.binding_local(*binding)?;
+                        let ty = self.result.locals[local].ty.as_ref();
+                        current = self.drop_assigned(local.into(), ty, current, pattern.into());
                         self.push_match_assignment(
                             current,
                             local,
@@ -504,6 +506,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 else {
                     return Ok((current, current_else));
                 };
+                let ty = self.expr_ty_without_adjust(expr);
+                let current = self.drop_assigned(lhs_place, ty, current, expr.into());
                 self.push_assignment(
                     current,
                     lhs_place,

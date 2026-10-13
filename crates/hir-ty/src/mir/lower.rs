@@ -73,6 +73,9 @@ struct LoopBlocks {
 struct DropScope {
     /// locals, in order of definition (so we should run drop glues in reverse order)
     locals: Vec<LocalId>,
+    /// Whether this scope only holds the temporaries of a `let` initializer. The bindings the
+    /// `let` declares outlive it.
+    temporaries: bool,
 }
 
 struct MirLowerCtx<'a, 'db> {
@@ -88,6 +91,9 @@ struct MirLowerCtx<'a, 'db> {
     types: &'db crate::next_solver::DefaultAny<'db>,
     resolver: Resolver<'db>,
     drop_scopes: Vec<DropScope>,
+    /// Expressions whose temporary lives as long as the `let` they initialize, with the index of
+    /// the scope that `let` is in.
+    extended_temporaries: FxHashMap<ExprId, usize>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -233,6 +239,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             labeled_loop_blocks: Default::default(),
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
+            extended_temporaries: FxHashMap::default(),
             env,
             infcx,
         }
@@ -494,10 +501,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
             }
             Expr::If { condition, then_branch, else_branch } => {
-                let Some((discr, current)) =
-                    self.lower_expr_to_some_operand(*condition, current)?
-                else {
-                    return Ok(None);
+                // A literal condition, as in `if cfg!(..)`, stays a constant operand so that a
+                // backend can leave out the branch that cannot run.
+                let plain = self.has_let(*condition)
+                    || matches!(self.store[*condition], Expr::Literal(_));
+                let (discr, current) = if plain {
+                    let Some(it) = self.lower_expr_to_some_operand(*condition, current)? else {
+                        return Ok(None);
+                    };
+                    it
+                } else {
+                    // The condition's temporaries are dropped before either branch runs.
+                    let ty = Ty::new_bool(self.interner());
+                    let result: Place<'db> = self.temp(ty, current, MirSpan::Unknown)?.into();
+                    let scope = self.push_drop_scope();
+                    let Some(c) = self.lower_expr_to_place(*condition, result, current)? else {
+                        scope.pop_assume_dropped(self);
+                        return Ok(None);
+                    };
+                    let current = scope.pop_and_drop(self, c, (*condition).into());
+                    let discr = Operand {
+                        kind: OperandKind::Copy(result.store()),
+                        span: Some((*condition).into()),
+                    };
+                    (discr, current)
                 };
                 let start_of_then = self.new_basic_block();
                 let end_of_then = self.lower_expr_to_place(*then_branch, place, start_of_then)?;
@@ -1704,9 +1731,81 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current: BasicBlockId,
         span: MirSpan,
     ) -> Result<'db, ()> {
-        self.drop_scopes.last_mut().unwrap().locals.push(l);
+        let scope = match span {
+            MirSpan::ExprId(expr) => self.extended_temporaries.get(&expr).copied(),
+            MirSpan::BindingId(_) => self.drop_scopes.iter().rposition(|it| !it.temporaries),
+            _ => None,
+        };
+        let scope = match scope.and_then(|it| self.drop_scopes.get_mut(it)) {
+            Some(scope) => scope,
+            None => self.drop_scopes.last_mut().unwrap(),
+        };
+        scope.locals.push(l);
         self.push_statement(current, StatementKind::StorageLive(l).with_span(span));
         Ok(())
+    }
+
+    /// Records which temporaries of a `let` initializer live to the end of the enclosing block
+    /// rather than to the end of the statement.
+    fn extend_temporaries(&mut self, initializer: ExprId, pat: PatId) {
+        let mut by_ref = false;
+        self.store.walk_bindings_in_pat(pat, |b| {
+            by_ref |= matches!(
+                self.store[b].mode,
+                BindingAnnotation::Ref | BindingAnnotation::RefMut
+            );
+        });
+        if by_ref {
+            self.extend_operand(initializer);
+        }
+        self.extend_in(initializer);
+    }
+
+    fn extend_in(&mut self, expr: ExprId) {
+        match &self.store[expr] {
+            &Expr::Ref { expr, .. } => {
+                self.extend_operand(expr);
+                self.extend_in(expr);
+            }
+            &Expr::Cast { expr, .. } => self.extend_in(expr),
+            Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
+                exprs.iter().for_each(|&it| self.extend_in(it))
+            }
+            Expr::RecordLit { fields, .. } => fields.iter().for_each(|it| self.extend_in(it.expr)),
+            &Expr::Block { tail: Some(tail), .. } => self.extend_in(tail),
+            &Expr::If { then_branch, else_branch, .. } => {
+                self.extend_in(then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.extend_in(else_branch);
+                }
+            }
+            Expr::Match { arms, .. } => arms.iter().for_each(|it| self.extend_in(it.expr)),
+            _ => (),
+        }
+    }
+
+    fn extend_operand(&mut self, mut expr: ExprId) {
+        let scope = self.drop_scopes.len() - 1;
+        loop {
+            self.extended_temporaries.insert(expr, scope);
+            expr = match &self.store[expr] {
+                &Expr::Ref { expr, .. }
+                | &Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref }
+                | &Expr::Field { expr, .. } => expr,
+                &Expr::Index { base, .. } => base,
+                _ => return,
+            };
+        }
+    }
+
+    /// Whether an `if` condition binds names, in which case its temporaries are needed in the
+    /// branches.
+    fn has_let(&self, expr: ExprId) -> bool {
+        match &self.store[expr] {
+            Expr::Let { .. } => true,
+            &Expr::BinaryOp { lhs, rhs, .. } => self.has_let(lhs) || self.has_let(rhs),
+            _ => false,
+        }
     }
 
     fn lower_block_to_place(
@@ -1723,9 +1822,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 hir_def::hir::Statement::Let { pat, initializer, else_branch, type_ref: _ } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
+                        self.extend_temporaries(*expr_id, *pat);
+                        let temporaries = self.push_drop_scope();
+                        self.drop_scopes.last_mut().unwrap().temporaries = true;
                         let Some((init_place, c)) =
                             self.lower_expr_as_place(current, *expr_id, true)?
                         else {
+                            temporaries.pop_assume_dropped(self);
                             scope.pop_assume_dropped(self);
                             return Ok(None);
                         };
@@ -1754,6 +1857,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 }
                             }
                         }
+                        current = temporaries.pop_and_drop(self, current, span);
                     } else {
                         let mut err = None;
                         self.store.walk_bindings_in_pat(*pat, |b| {
@@ -1948,6 +2052,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             implementation_error!("Mismatched count between drop scope push and pops");
         }
         Ok(current)
+    }
+
+    /// Drops the value an assignment is about to overwrite.
+    fn drop_assigned(
+        &mut self,
+        place: Place<'db>,
+        ty: Ty<'db>,
+        current: BasicBlockId,
+        span: MirSpan,
+    ) -> BasicBlockId {
+        if self.infcx.type_is_copy_modulo_regions(self.env, ty) {
+            return current;
+        }
+        let next = self.new_basic_block();
+        self.set_terminator(
+            current,
+            TerminatorKind::Drop { place: place.store(), target: next, unwind: None },
+            span,
+        );
+        next
     }
 
     fn emit_drop_and_storage_dead_for_scope(

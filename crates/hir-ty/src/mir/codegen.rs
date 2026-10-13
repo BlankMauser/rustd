@@ -366,7 +366,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             eprintln!("{:#?}", body.basic_blocks);
         }
-        let mut ctx = self.compile_body(body, env)?;
+        let mut ctx = self.compile_body(body, env, track_caller(db, func))?;
         let id = self
             .module
             .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
@@ -404,12 +404,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     ) -> Result<()> {
         if let InstanceDef::DropGlue = instance.def {
             let ty = instance.args.as_ref().type_at(0);
-            let mut ctx = self.build(env, None, |fx| fx.drop_glue(ty))?;
+            let mut ctx = self.build(env, None, false, |fx| fx.drop_glue(ty))?;
             return self.emit(id, &mut ctx);
         }
         if let InstanceDef::CallOnceShim = instance.def {
             let ty = instance.args.as_ref().type_at(0);
-            let mut ctx = self.build(env, None, |fx| fx.call_once_shim(ty))?;
+            let mut ctx = self.build(env, None, false, |fx| fx.call_once_shim(ty))?;
             return self.emit(id, &mut ctx);
         }
         let start = std::time::Instant::now();
@@ -432,7 +432,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             eprintln!("{:#?}", body.basic_blocks);
         }
-        let mut ctx = self.compile_body(body, env)?;
+        let tracked = match instance.def {
+            InstanceDef::Fn(func) => track_caller(self.db, func),
+            InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => false,
+        };
+        let mut ctx = self.compile_body(body, env, tracked)?;
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         if *declared != ctx.func.signature {
@@ -496,14 +500,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         &mut self,
         body: &'db MirBody<'db>,
         env: ParamEnvAndCrate<'db>,
+        tracked: bool,
     ) -> Result<cranelift_codegen::Context> {
-        self.build(env, Some(body), |fx| fx.codegen())
+        self.build(env, Some(body), tracked, |fx| fx.codegen())
     }
 
     fn build(
         &mut self,
         env: ParamEnvAndCrate<'db>,
         body: Option<&'db MirBody<'db>>,
+        tracked: bool,
         fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'a, 'db>) -> Result<()>,
     ) -> Result<cranelift_codegen::Context> {
         let interner = DbInterner::new_with(self.db, env.krate);
@@ -520,7 +526,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 locals: ArenaMap::new(),
                 blocks: ArenaMap::new(),
                 drop_flags: ArenaMap::new(),
+                moved_paths: Vec::new(),
+                deferred_drops: Vec::new(),
                 ret_mode: PassMode::Ignore,
+                tracked,
+                location: None,
             };
             fill(&mut fx).map(|()| {
                 fx.builder.seal_all_blocks();
@@ -676,6 +686,13 @@ struct PlaceRef<'db> {
     ty: PlaceTy<'db>,
 }
 
+/// A field that some statement moves out of a local, as the field indices leading to it.
+struct MovedPath {
+    local: LocalId,
+    path: Vec<u32>,
+    bit: u32,
+}
+
 #[derive(Clone, Copy)]
 struct LocalSlot {
     addr: Value,
@@ -693,8 +710,36 @@ struct FunctionCx<'cx, 'a, 'db> {
     blocks: ArenaMap<BasicBlockId, ir::Block>,
     /// One byte per local with drop glue: whether it currently holds a value. RA's MIR has no
     /// drop elaboration, so `Drop` terminators are conditional on these.
+    /// Address of a word per local that needs dropping. Bit 0 says the local holds a value, and
+    /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, Value>,
+    moved_paths: Vec<MovedPath>,
+    /// The block to generate each `Drop` terminator in, with its place and target.
+    deferred_drops: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
+    /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
+    /// hidden argument.
+    tracked: bool,
+    location: Option<Value>,
+}
+
+/// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
+/// impl inherits the attribute from the trait's declaration.
+fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    let has = |func: FunctionId| {
+        AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER)
+    };
+    if has(func) {
+        return true;
+    }
+    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
+        return false;
+    };
+    let Some(trait_ref) = db.impl_trait(impl_id) else {
+        return false;
+    };
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }
 
 fn is_unsized(ty: Ty<'_>) -> bool {
@@ -854,7 +899,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     /// The signature a MIR body is compiled with.
-    fn body_signature(&self, body: &MirBody<'db>) -> Result<Signature> {
+    fn body_signature(&self, body: &MirBody<'db>, tracked: bool) -> Result<Signature> {
         let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
         let ret_mode = self.pass_mode(&ret_layout, true)?;
         let mut param_modes = Vec::with_capacity(body.param_locals.len());
@@ -862,7 +907,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let layout = self.layout(body.locals[local].ty.as_ref())?;
             param_modes.push(self.pass_mode(&layout, false)?);
         }
-        Ok(self.signature(&param_modes, ret_mode))
+        let mut sig = self.signature(&param_modes, ret_mode);
+        if tracked {
+            sig.params.push(AbiParam::new(PTR));
+        }
+        Ok(sig)
     }
 
     fn codegen(&mut self) -> Result<()> {
@@ -876,7 +925,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .collect::<Result<Vec<_>>>()?;
         let param_modes =
             param_layouts.iter().map(|l| self.pass_mode(l, false)).collect::<Result<Vec<_>>>()?;
-        self.builder.func.signature = self.body_signature(body)?;
+        self.builder.func.signature = self.body_signature(body, self.tracked)?;
 
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
@@ -913,6 +962,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             self.locals.insert(local, LocalSlot { addr });
         }
+        if self.tracked {
+            self.location = incoming.next();
+        }
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local) {
                 continue;
@@ -930,12 +982,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                1,
-                0,
+                8,
+                3,
             ));
             let flag = self.builder.ins().stack_addr(PTR, slot, 0);
             let live =
-                self.builder.ins().iconst(types::I8, body.param_locals.contains(&local) as i64);
+                self.builder.ins().iconst(types::I64, body.param_locals.contains(&local) as i64);
             self.builder.ins().store(MEM, live, flag, 0);
             self.drop_flags.insert(local, flag);
         }
@@ -993,7 +1045,142 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             };
             self.terminator(&terminator.kind)?;
         }
+        // Drops are generated last, when every field that gets moved out of a local is known.
+        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+            self.builder.switch_to_block(block);
+            self.drop_place(&place, target)?;
+        }
         Ok(())
+    }
+
+    /// The fields a place selects in its local, if it is nothing but fields of structs, tuples
+    /// and closures. Those are the places that can be moved out of on their own.
+    fn field_path(&self, place: &StoredPlace) -> Option<Vec<u32>> {
+        let mut ty = PlaceTy::from_ty(self.body?.locals[place.local].ty.as_ref());
+        let mut path = Vec::new();
+        for proj in place.projection.as_slice() {
+            let ProjectionElem::Field(field) = proj else { return None };
+            match ty.ty.kind() {
+                TyKind::Tuple(_) | TyKind::Closure(..) => (),
+                TyKind::Adt(adt_def, _)
+                    if matches!(adt_def.def_id(), AdtId::StructId(_)) && !adt_def.is_box() => {}
+                _ => return None,
+            }
+            path.push(field.0 as u32);
+            ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
+        }
+        Some(path)
+    }
+
+    /// The bit in a local's drop flag that says one of its fields has been moved out.
+    fn moved_bit(&mut self, local: LocalId, path: Vec<u32>) -> Option<u32> {
+        let known = self.moved_paths.iter().find(|it| it.local == local && it.path == path);
+        if let Some(known) = known {
+            return Some(known.bit);
+        }
+        let bit = 1 + self.moved_paths.iter().filter(|it| it.local == local).count() as u32;
+        if bit >= 64 {
+            return None;
+        }
+        self.moved_paths.push(MovedPath { local, path, bit });
+        Some(bit)
+    }
+
+    /// Drops what is left of a place, which is nothing if its local holds no value.
+    fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
+        let flag = self.drop_flags.get(place.local).copied();
+        let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
+            let place = self.place_ref(place)?;
+            self.drop_value(place.addr, place.meta, place.ty.ty)?;
+            self.builder.ins().jump(target, &[]);
+            return Ok(());
+        };
+        let state = self.builder.ins().load(types::I64, MEM, flag, 0);
+        let live = self.builder.ins().band_imm(state, 1);
+        let drop = self.builder.create_block();
+        self.builder.ins().brif(live, drop, &[], target, &[]);
+        self.builder.switch_to_block(drop);
+        if path.is_empty() {
+            let dead = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().store(MEM, dead, flag, 0);
+        }
+        let local = place.local;
+        let place = self.place_ref(place)?;
+        self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        self.builder.ins().jump(target, &[]);
+        Ok(())
+    }
+
+    /// Drops the value at `path` in `local`, except for the fields that `state` says are moved
+    /// out.
+    fn drop_unmoved(
+        &mut self,
+        addr: Value,
+        meta: Option<Value>,
+        ty: Ty<'db>,
+        local: LocalId,
+        path: &mut Vec<u32>,
+        state: Value,
+    ) -> Result<()> {
+        let within = |it: &&MovedPath| it.local == local && it.path.starts_with(path);
+        let exact = self.moved_paths.iter().filter(within).find(|it| it.path.len() == path.len());
+        let exact = exact.map(|it| it.bit);
+        let nested = self.moved_paths.iter().filter(within).any(|it| it.path.len() > path.len());
+        if exact.is_none() && !nested {
+            return self.drop_value(addr, meta, ty);
+        }
+        let done = self.builder.create_block();
+        if let Some(bit) = exact {
+            let moved = self.builder.ins().band_imm(state, 1i64 << bit);
+            let present = self.builder.create_block();
+            self.builder.ins().brif(moved, done, &[], present, &[]);
+            self.builder.switch_to_block(present);
+        }
+        if nested {
+            let ty = self.normalize(ty);
+            let fields: Vec<Ty<'db>> = match ty.kind() {
+                TyKind::Tuple(tys) => tys.iter().collect(),
+                TyKind::Closure(_, args) => match args.as_closure().tupled_upvars_ty().kind() {
+                    TyKind::Tuple(tys) => tys.iter().collect(),
+                    _ => unsupported!("partial move out of a closure without tupled upvars"),
+                },
+                TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
+                    AdtId::StructId(id) => self
+                        .cg
+                        .db
+                        .field_types(id.into())
+                        .iter()
+                        .map(|(_, ty)| ty.ty().instantiate(self.interner, subst).skip_norm_wip())
+                        .collect(),
+                    _ => unsupported!("partial move out of {ty:?}"),
+                },
+                _ => unsupported!("partial move out of {ty:?}"),
+            };
+            let layout = self.layout(ty)?;
+            for (i, field) in fields.into_iter().enumerate() {
+                let offset = layout.fields.offset(i).bytes() as i64;
+                let field_addr = self.builder.ins().iadd_imm(addr, offset);
+                path.push(i as u32);
+                self.drop_unmoved(field_addr, None, field, local, path, state)?;
+                path.pop();
+            }
+        } else {
+            self.drop_value(addr, meta, ty)?;
+        }
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        Ok(())
+    }
+
+    /// Field types can still be projections such as `<str as ToOwned>::Owned`.
+    fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+        crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .structurally_normalize_ty(
+                &crate::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                ty,
+            )
+            .unwrap_or(ty)
     }
 
     /// The value of an integer, `bool` or `char` literal operand.
@@ -1170,9 +1357,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 if self.drop_flags.contains_idx(place.local)
                     && has_drop_glue(&self.infcx, ty.ty, self.env.param_env) != DropGlue::None
                 {
-                    // FIXME: a partial move forgets the rest of the local, which leaks it.
-                    let dead = self.builder.ins().iconst(types::I8, 0);
-                    self.builder.ins().store(MEM, dead, self.drop_flags[place.local], 0);
+                    let flag = self.drop_flags[place.local];
+                    let path = self.field_path(place).filter(|it| !it.is_empty());
+                    let state = match path.and_then(|it| self.moved_bit(place.local, it)) {
+                        Some(bit) => {
+                            let state = self.builder.ins().load(types::I64, MEM, flag, 0);
+                            self.builder.ins().bor_imm(state, 1i64 << bit)
+                        }
+                        // FIXME: a move out of an enum or a box forgets the rest of the local,
+                        // which leaks it.
+                        None => self.builder.ins().iconst(types::I64, 0),
+                    };
+                    self.builder.ins().store(MEM, state, flag, 0);
                 }
                 Ok((addr, ty.ty))
             }
@@ -1778,6 +1974,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let layout = self.layout(*ty)?;
             arg_modes.push(self.pass_mode(&layout, false)?);
         }
+        if track_caller(db, callee) {
+            unsupported!("pointer to a `#[track_caller]` function");
+        }
         let sig = self.signature(&arg_modes, ret_mode);
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
@@ -2137,6 +2336,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
     fn caller_location(&mut self) -> Result<Value> {
+        if let Some(location) = self.location {
+            return Ok(location);
+        }
         // FIXME: real spans; the layout of `Location` should come from `layout_of_ty`.
         let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
         let n = self.cg.location_counter;
@@ -2213,22 +2415,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code"));
             }
             TerminatorKind::Drop { place, target, .. } => {
-                let target = self.blocks[*target];
-                let flag = match place.projection.as_slice() {
-                    [] => self.drop_flags.get(place.local).copied(),
-                    _ => None,
-                };
-                if let Some(flag) = flag {
-                    let live = self.builder.ins().load(types::I8, MEM, flag, 0);
-                    let drop = self.builder.create_block();
-                    self.builder.ins().brif(live, drop, &[], target, &[]);
-                    self.builder.switch_to_block(drop);
-                    let dead = self.builder.ins().iconst(types::I8, 0);
-                    self.builder.ins().store(MEM, dead, flag, 0);
-                }
-                let place = self.place_ref(place)?;
-                self.drop_value(place.addr, place.meta, place.ty.ty)?;
-                self.builder.ins().jump(target, &[]);
+                let block = self.builder.create_block();
+                self.builder.ins().jump(block, &[]);
+                self.deferred_drops.push((block, place.clone(), self.blocks[*target]));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -2705,7 +2894,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if !thin {
             unsupported!("vtable method taking `self` by value");
         }
-        let sig = self.body_signature(body)?;
+        if track_caller(db, callee) {
+            // FIXME: rustc puts a shim in the vtable that supplies the location.
+            unsupported!("`#[track_caller]` method in a vtable");
+        }
+        let sig = self.body_signature(body, false)?;
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
 
@@ -2720,7 +2913,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .db
             .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let sig = self.body_signature(body)?;
+        let sig = self.body_signature(body, false)?;
         let Some(&receiver) = body.param_locals.first() else {
             unsupported!("closure without a receiver");
         };
@@ -2754,7 +2947,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .db
             .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let sig = self.body_signature(body)?;
+        let sig = self.body_signature(body, false)?;
         self.builder.func.signature = sig.clone();
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
@@ -2837,7 +3030,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
             }
         }
-        let sig = self.signature(&arg_modes, ret_mode);
+        let mut sig = self.signature(&arg_modes, ret_mode);
+        if let Callee::Instance(InstanceDef::Fn(func), _) = callee
+            && track_caller(self.cg.db, func)
+        {
+            sig.params.push(AbiParam::new(PTR));
+            values.push(self.caller_location()?);
+        }
         let call = match callee {
             Callee::Instance(def, generic_args) => {
                 let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
@@ -3527,21 +3726,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             return;
         }
         if let Some(&flag) = self.drop_flags.get(place.local) {
-            let live = self.builder.ins().iconst(types::I8, live as i64);
+            let live = self.builder.ins().iconst(types::I64, live as i64);
             self.builder.ins().store(MEM, live, flag, 0);
         }
     }
 
     /// Drops the value at `addr` in place.
     fn drop_value(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
-        // Field types can still be projections such as `<str as ToOwned>::Owned`.
-        let ty = crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
-            .structurally_normalize_ty(
-                &crate::next_solver::infer::traits::ObligationCause::dummy(),
-                self.env.param_env,
-                ty,
-            )
-            .unwrap_or(ty);
+        let ty = self.normalize(ty);
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }

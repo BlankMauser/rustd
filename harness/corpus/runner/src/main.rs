@@ -103,8 +103,17 @@ fn main() {
     case!(logged(&|l| drops::fields(l)), logged(&|l| drops::variants(l, 0)), logged(&|l| drops::variants(l, 1)), logged(&|l| drops::variants(l, 2)));
     case!(logged(&|l| drops::arrays(l)), logged(&|l| drops::boxes(l)), logged(&|l| drops::param(drops::Noisy(l, 5), l)));
     case!(logged(&|l| drops::looped(l, 4)), drops::strings(3));
+    case!(logged(&|l| drop(drops::statement_temps(l))), drops::statement_temps(&std::cell::Cell::new(0)));
+    case!(logged(&|l| drop(drops::tail_temp(l))), drops::tail_temp(&std::cell::Cell::new(0)), drops::tail_temp_block(&std::cell::Cell::new(0)));
+    case!(drops::tail_temp_call(&std::cell::RefCell::new(Vec::new()), 3));
+    case!(drops::condition_temp(&std::cell::Cell::new(0)), drops::match_temp(&std::cell::Cell::new(0)));
+    case!(logged(&|l| drops::reassigned(l)), logged(&|l| drop(drops::partial_move(l))));
+    case!(locations::tracked(), locations::unwraps(Some(1), Ok(2)), locations::borrows(&std::cell::RefCell::new(4)));
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
+    case!(heap::clears(3));
+    let (cell, lock) = (std::cell::RefCell::new([3u64; 14]), std::sync::Mutex::new((1u128, 2u8)));
+    case!(heap::unsizable_tail(&cell, &lock), cell.borrow()[13], *lock.lock().unwrap());
 
     let long = "the quick brown fox jumps over the lazy dog, twice over and then some more";
     case!(simd::ascii(long), simd::ascii("caf\u{e9} au lait, s'il vous pla\u{ee}t, merci beaucoup"), simd::ascii(""));

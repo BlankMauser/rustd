@@ -594,6 +594,60 @@ pub mod drops {
             let _x = Noisy(log, i + 1);
         }
     }
+    fn make(log: &Cell<u64>, n: u64) -> Noisy<'_> {
+        Noisy(log, n)
+    }
+    /// Temporaries die at the end of their statement, before the next one runs.
+    pub fn statement_temps(log: &Cell<u64>) -> u64 {
+        let a = make(log, 1).1;
+        let seen = log.get();
+        make(log, 2).1;
+        let _keep = make(log, 3);
+        a + seen * 100 + log.get() * 10000
+    }
+    /// A temporary in the tail expression dies as the function returns.
+    pub fn tail_temp(log: &Cell<u64>) -> u64 {
+        make(log, 4).1 + log.get()
+    }
+    pub fn tail_temp_block(log: &Cell<u64>) -> u64 {
+        let n = { make(log, 5).1 };
+        n + log.get() * 10
+    }
+    pub fn tail_temp_call(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+        fn add(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+            let id = cell.borrow().len();
+            cell.borrow_mut().push(n);
+            id
+        }
+        fn add2(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+            cell.borrow_mut().len() + n as usize
+        }
+        add(cell, n) + add(cell, n + 1) + add2(cell, n) + add2(cell, n)
+    }
+    pub fn condition_temp(log: &Cell<u64>) -> u64 {
+        if make(log, 6).1 == 6 {
+            log.get() + 1
+        } else {
+            0
+        }
+    }
+    pub fn match_temp(log: &Cell<u64>) -> u64 {
+        match make(log, 7).1 {
+            7 => log.get() + 1,
+            _ => 0,
+        }
+    }
+    pub fn reassigned(log: &Cell<u64>) {
+        let mut a = make(log, 1);
+        a = make(log, 2);
+        let _b = make(log, 3);
+        a.1 += 0;
+    }
+    pub fn partial_move(log: &Cell<u64>) -> Noisy<'_> {
+        let p = Pair { a: make(log, 4), b: make(log, 5) };
+        let _late = make(log, 6);
+        p.a
+    }
     pub fn strings(n: usize) -> usize {
         let s = "ab".repeat(n);
         let t = s.clone();
@@ -622,6 +676,20 @@ pub mod heap {
     }
     pub fn consume(v: Vec<u32>) -> usize {
         v.len()
+    }
+    pub fn clears(n: usize) -> usize {
+        let mut empty: Vec<Vec<Option<std::sync::Arc<str>>>> = Vec::new();
+        empty.clear();
+        let mut full = vec![vec![Some(std::sync::Arc::<str>::from("a")), None]; n];
+        full.clear();
+        full.push(vec![]);
+        empty.len() + full.len()
+    }
+    /// A `?Sized` last field stays last, even where sorting by size would move it first.
+    pub fn unsizable_tail(cell: &std::cell::RefCell<[u64; 14]>, lock: &std::sync::Mutex<(u128, u8)>) -> u64 {
+        *lock.lock().unwrap() = (7, 1);
+        cell.borrow_mut()[13] += 1;
+        cell.borrow()[0] + cell.borrow()[13]
     }
     pub fn format(a: u32, b: &str) -> String {
         format!("{a}-{b}")
@@ -750,6 +818,31 @@ pub mod floats {
             total += *v;
         }
         total
+    }
+}
+
+pub mod locations {
+    use std::panic::Location;
+
+    #[track_caller]
+    fn here() -> &'static Location<'static> {
+        Location::caller()
+    }
+    #[track_caller]
+    fn through() -> &'static Location<'static> {
+        here()
+    }
+    /// The same location reaches both, however deep the tracked chain is.
+    pub fn tracked() -> bool {
+        let (a, b) = (here(), through());
+        a.file() == b.file() && !a.file().is_empty()
+    }
+    pub fn unwraps(x: Option<u8>, y: Result<u8, u8>) -> u8 {
+        x.unwrap() + y.unwrap() + x.expect("some")
+    }
+    pub fn borrows(cell: &std::cell::RefCell<u8>) -> u8 {
+        *cell.borrow_mut() += 1;
+        *cell.borrow()
     }
 }
 

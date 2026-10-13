@@ -15,7 +15,7 @@ use triomphe::Arc;
 use crate::{
     db::HirDatabase,
     layout::{Layout, LayoutCx, LayoutError, field_ty},
-    next_solver::StoredGenericArgs,
+    next_solver::{DbInterner, StoredGenericArgs, TypingMode, infer::DbInternerInferExt},
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
 };
@@ -71,6 +71,17 @@ pub fn layout_of_adt_query(
             (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
         }
     };
+    // A struct whose last field may be unsized for some generic arguments keeps that field last
+    // for all of them, so that unsizing the struct does not move it.
+    let maybe_unsized = match def {
+        AdtId::StructId(s) => s.fields(db).fields().iter().last().is_some_and(|(fd, _)| {
+            let interner = DbInterner::new_with(db, krate);
+            let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+            let ty = db.field_types(s.into())[fd].ty().instantiate_identity().skip_norm_wip();
+            !infcx.type_is_sized_modulo_regions(db.trait_environment(def.into()), ty)
+        }),
+        AdtId::UnionId(_) | AdtId::EnumId(_) => false,
+    };
     let variants = variants
         .iter()
         .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
@@ -90,12 +101,7 @@ pub fn layout_of_adt_query(
                 let d = db.const_eval_discriminant(e.enum_variants(db).variants[id.0].0).ok()?;
                 Some((id, d))
             }),
-            !matches!(def, AdtId::EnumId(..))
-                && variants
-                    .iter()
-                    .next()
-                    .and_then(|it| it.iter().last().map(|it| !it.is_unsized()))
-                    .unwrap_or(true),
+            !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
     Ok(Arc::new(result))
