@@ -73,5 +73,12 @@ fn main() {
 
     case!(dynamic::call(&dynamic::Dog(4)), dynamic::call(&dynamic::Cat), dynamic::make(true), dynamic::make(false));
 
+    let log = std::cell::Cell::new(0u64);
+    let mut logged = |f: &dyn Fn(&std::cell::Cell<u64>)| { log.set(0); f(&log); log.get() };
+    case!(logged(&|l| drops::scope(l)), logged(&|l| drop(drops::moved(l, true))), logged(&|l| drop(drops::moved(l, false))));
+    case!(logged(&|l| drops::fields(l)), logged(&|l| drops::variants(l, 0)), logged(&|l| drops::variants(l, 1)), logged(&|l| drops::variants(l, 2)));
+    case!(logged(&|l| drops::arrays(l)), logged(&|l| drops::boxes(l)), logged(&|l| drops::param(drops::Noisy(l, 5), l)));
+    case!(logged(&|l| drops::looped(l, 4)), drops::strings(3));
+
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
 }

@@ -436,6 +436,65 @@ pub mod dynamic {
     }
 }
 
+pub mod drops {
+    use std::cell::Cell;
+
+    /// Appends its digit to the log when dropped.
+    pub struct Noisy<'a>(pub &'a Cell<u64>, pub u64);
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() * 10 + self.1);
+        }
+    }
+    pub struct Pair<'a> { a: Noisy<'a>, b: Noisy<'a> }
+    pub enum Either<'a> { Left(Noisy<'a>), Right(Noisy<'a>, Noisy<'a>), Neither }
+
+    pub fn scope(log: &Cell<u64>) {
+        let _a = Noisy(log, 1);
+        let _b = Noisy(log, 2);
+        {
+            let _c = Noisy(log, 3);
+        }
+    }
+    pub fn moved(log: &Cell<u64>, keep: bool) -> Option<Noisy<'_>> {
+        let a = Noisy(log, 1);
+        let b = Noisy(log, 2);
+        if keep { Some(a) } else { drop(b); None }
+    }
+    pub fn fields(log: &Cell<u64>) {
+        let _p = Pair { a: Noisy(log, 4), b: Noisy(log, 5) };
+        let _t = (Noisy(log, 6), 0u8, Noisy(log, 7));
+    }
+    pub fn variants(log: &Cell<u64>, which: u8) {
+        let _e = match which {
+            0 => Either::Left(Noisy(log, 1)),
+            1 => Either::Right(Noisy(log, 2), Noisy(log, 3)),
+            _ => Either::Neither,
+        };
+    }
+    pub fn arrays(log: &Cell<u64>) {
+        let _xs = [Noisy(log, 1), Noisy(log, 2), Noisy(log, 3)];
+    }
+    pub fn boxes(log: &Cell<u64>) {
+        let _b = Box::new(Noisy(log, 8));
+        let _v = vec![Noisy(log, 1), Noisy(log, 2)];
+    }
+    pub fn param(_n: Noisy<'_>, log: &Cell<u64>) {
+        let _late = Noisy(log, 9);
+    }
+    pub fn looped(log: &Cell<u64>, n: u64) {
+        for i in 0..n {
+            let _x = Noisy(log, i + 1);
+        }
+    }
+    pub fn strings(n: usize) -> usize {
+        let s = "ab".repeat(n);
+        let t = s.clone();
+        let v: Vec<String> = vec![s, t];
+        v.len() + v[0].len()
+    }
+}
+
 pub mod heap {
     pub fn boxed(n: u64) -> Box<u64> {
         Box::new(n + 1)

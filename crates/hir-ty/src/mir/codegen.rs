@@ -21,7 +21,7 @@ use hir_def::{
     attrs::AttrFlags,
     expr_store::Body,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
-    signatures::FunctionSignature,
+    signatures::{FunctionSignature, StructFlags, StructSignature},
 };
 use la_arena::ArenaMap;
 use rustc_abi::{Integer, Size};
@@ -29,7 +29,7 @@ use rustc_ast_ir::Mutability;
 use rustc_index::Idx;
 use rustc_hash::FxHashMap;
 use salsa::plumbing::{AsId, FromId};
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
+use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use triomphe::Arc;
 
 use crate::{
@@ -156,7 +156,7 @@ impl CodegenUnit {
             let krate = root.krate(db);
             known.rejected.retain(|instance, _| match instance.def {
                 InstanceDef::Fn(func) => func.krate(db) != krate,
-                InstanceDef::Closure(_) => false,
+                InstanceDef::Closure(_) | InstanceDef::DropGlue => false,
             });
         }
         let rejected = &mut known.rejected;
@@ -199,6 +199,8 @@ enum InstanceDef {
     Fn(FunctionId),
     /// An `InternedClosureId`, stored without its database lifetime.
     Closure(salsa::Id),
+    /// `drop_in_place` for the type that is the instance's only generic argument.
+    DropGlue,
 }
 
 /// What a call transfers control to.
@@ -294,7 +296,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: ParamEnvAndCrate<'db>,
         id: FuncId,
     ) -> Result<()> {
+        if let InstanceDef::DropGlue = instance.def {
+            let ty = instance.args.as_ref().type_at(0);
+            let mut ctx = self.build(env, None, |fx| fx.drop_glue(ty))?;
+            return self.emit(id, &mut ctx);
+        }
         let body = match instance.def {
+            InstanceDef::DropGlue => unreachable!(),
             InstanceDef::Fn(func) => {
                 self.db.monomorphized_mir_body(func.into(), instance.args.clone(), env.store())
             }
@@ -339,6 +347,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         body: &'db MirBody<'db>,
         env: ParamEnvAndCrate<'db>,
     ) -> Result<cranelift_codegen::Context> {
+        self.build(env, Some(body), |fx| fx.codegen())
+    }
+
+    fn build(
+        &mut self,
+        env: ParamEnvAndCrate<'db>,
+        body: Option<&'db MirBody<'db>>,
+        fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'a, 'db>) -> Result<()>,
+    ) -> Result<cranelift_codegen::Context> {
         let interner = DbInterner::new_with(self.db, env.krate);
         let mut ctx = self.module.make_context();
         let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
@@ -352,9 +369,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
                 locals: ArenaMap::new(),
                 blocks: ArenaMap::new(),
+                drop_flags: ArenaMap::new(),
                 ret_mode: PassMode::Ignore,
             };
-            fx.codegen().map(|()| {
+            fill(&mut fx).map(|()| {
                 fx.builder.seal_all_blocks();
                 let config = fx.cg.module.target_config();
                 fx.builder.finalize(config);
@@ -384,9 +402,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let instance = Instance { def, args: args.store() };
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
-            InstanceDef::Closure(_) => None,
+            InstanceDef::Closure(_) | InstanceDef::DropGlue => None,
         };
-        let name = signature.map_or("{closure}", |it| it.name.as_str());
+        let name = match def {
+            InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
+            InstanceDef::Closure(_) => "{closure}",
+            InstanceDef::DropGlue => "drop_in_place",
+        };
         if let Some(reason) = self.rejected.get(&instance) {
             unsupported!("callee `{name}`: {reason}");
         }
@@ -478,14 +500,22 @@ struct LocalSlot {
 
 struct FunctionCx<'cx, 'a, 'db> {
     cg: &'cx mut ObjectCodegen<'a, 'db>,
-    body: &'db MirBody<'db>,
+    /// `None` while generating a shim that has no MIR.
+    body: Option<&'db MirBody<'db>>,
     env: ParamEnvAndCrate<'db>,
     infcx: InferCtxt<'db>,
     interner: DbInterner<'db>,
     builder: FunctionBuilder<'cx>,
     locals: ArenaMap<LocalId, LocalSlot>,
     blocks: ArenaMap<BasicBlockId, ir::Block>,
+    /// One byte per local with drop glue: whether it currently holds a value. RA's MIR has no
+    /// drop elaboration, so `Drop` terminators are conditional on these.
+    drop_flags: ArenaMap<LocalId, Value>,
     ret_mode: PassMode,
+}
+
+fn is_unsized(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..))
 }
 
 const PTR: Type = types::I64;
@@ -616,7 +646,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn codegen(&mut self) -> Result<()> {
-        let body = self.body;
+        let body = self.body.expect("MIR body");
         let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
         self.ret_mode = self.pass_mode(&ret_layout, true)?;
         let param_layouts = body
@@ -670,6 +700,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let addr = self.stack_slot(&layout);
             self.locals.insert(local, LocalSlot { addr });
         }
+        for (local, data) in body.locals.iter() {
+            let ty = data.ty.as_ref();
+            if local == return_slot()
+                || has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
+            {
+                continue;
+            }
+            let slot = self
+                .builder
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+            let flag = self.builder.ins().stack_addr(PTR, slot, 0);
+            let live = self.builder.ins().iconst(types::I8, body.param_locals.contains(&local) as i64);
+            self.builder.ins().store(MEM, live, flag, 0);
+            self.drop_flags.insert(local, flag);
+        }
         for (id, _) in body.basic_blocks.iter() {
             let block = self.builder.create_block();
             self.blocks.insert(id, block);
@@ -680,7 +725,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.builder.switch_to_block(self.blocks[id]);
             for statement in &block.statements {
                 match &statement.kind {
-                    StatementKind::Assign(place, rvalue) => self.assign(place, rvalue)?,
+                    StatementKind::Assign(place, rvalue) => {
+                        self.assign(place, rvalue)?;
+                        self.set_drop_flag(place, true);
+                    }
                     StatementKind::Deinit(_) => unsupported!("deinit"),
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
@@ -704,7 +752,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
         let mut addr = self.locals[place.local].addr;
         let mut meta = None;
-        let mut ty = PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
+        let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
         for proj in place.projection.as_slice() {
             let prev = ty;
             ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
@@ -852,6 +900,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         match &operand.kind {
             OperandKind::Copy(place) | OperandKind::Move(place) => {
                 let (addr, ty) = self.place(place)?;
+                // RA's lowering says `Copy` for moves too; a use of a value that needs dropping
+                // can only be a move.
+                if self.drop_flags.contains_idx(place.local)
+                    && has_drop_glue(&self.infcx, ty.ty, self.env.param_env) != DropGlue::None
+                {
+                    // FIXME: a partial move forgets the rest of the local, which leaks it.
+                    let dead = self.builder.ins().iconst(types::I8, 0);
+                    self.builder.ins().store(MEM, dead, self.drop_flags[place.local], 0);
+                }
                 Ok((addr, ty.ty))
             }
             OperandKind::Constant { konst, ty } => {
@@ -1578,7 +1635,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             TerminatorKind::Return => {
                 let addr = self.locals[return_slot()].addr;
                 if let PassMode::Cast(ty) = self.ret_mode {
-                    let size = self.layout(self.body.locals[return_slot()].ty.as_ref())?.size;
+                    let size = self.layout(self.body.expect("MIR body").locals[return_slot()].ty.as_ref())?.size;
                     let value = self.load_cast(ty, addr, size);
                     self.builder.ins().return_(&[value]);
                     return Ok(());
@@ -1598,11 +1655,22 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code"));
             }
             TerminatorKind::Drop { place, target, .. } => {
-                let ty = self.place(place)?.1.ty;
-                if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
-                    unsupported!("drop glue for {ty:?}");
+                let target = self.blocks[*target];
+                let flag = match place.projection.as_slice() {
+                    [] => self.drop_flags.get(place.local).copied(),
+                    _ => None,
+                };
+                if let Some(flag) = flag {
+                    let live = self.builder.ins().load(types::I8, MEM, flag, 0);
+                    let drop = self.builder.create_block();
+                    self.builder.ins().brif(live, drop, &[], target, &[]);
+                    self.builder.switch_to_block(drop);
+                    let dead = self.builder.ins().iconst(types::I8, 0);
+                    self.builder.ins().store(MEM, dead, flag, 0);
                 }
-                self.builder.ins().jump(self.blocks[*target], &[]);
+                let place = self.place_ref(place)?;
+                self.drop_value(place.addr, place.meta, place.ty.ty)?;
+                self.builder.ins().jump(target, &[]);
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -1626,7 +1694,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
             let values = self.operands(args)?;
             self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty.ty)?;
-            return self.jump_after_call(target);
+            return self.finish_call(destination, target);
         }
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
             unsupported!("call of {fn_ty:?}");
@@ -1636,12 +1704,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             CallableDefId::StructId(id) => {
                 let layout = self.variant_layout(dst, id.into(), generic_args)?;
                 self.write_fields(dst, &layout, args)?;
-                return self.jump_after_call(target);
+                return self.finish_call(destination, target);
             }
             CallableDefId::EnumVariantId(id) => {
                 let layout = self.variant_layout(dst, id.into(), generic_args)?;
                 self.write_fields(dst, &layout, args)?;
-                return self.jump_after_call(target);
+                return self.finish_call(destination, target);
             }
         };
         let db = self.cg.db;
@@ -1650,7 +1718,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .contains(&Some(func))
         {
             self.call_fn_trait(args, dst, dst_ty.ty)?;
-            return self.jump_after_call(target);
+            return self.finish_call(destination, target);
         }
         if FunctionSignature::is_intrinsic(db, func)
             && FunctionSignature::of(db, func).name.as_str() == "const_eval_select"
@@ -1676,11 +1744,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 values.push((self.builder.ins().iadd_imm(tuple_addr, offset), ty));
             }
             self.call_direct(runtime, runtime_args, &values, dst, dst_ty.ty)?;
-            return self.jump_after_call(target);
+            return self.finish_call(destination, target);
         }
         if FunctionSignature::is_intrinsic(db, func) {
             match self.intrinsic(func, generic_args, args, dst, dst_ty.ty)? {
-                Intrinsic::Inline => return self.jump_after_call(target),
+                Intrinsic::Inline => return self.finish_call(destination, target),
                 Intrinsic::Diverges => return Ok(()),
                 Intrinsic::Unknown => {
                     let overridden = AttrFlags::query(db, func.into())
@@ -1694,7 +1762,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         let values = self.operands(args)?;
         self.call_direct(func, generic_args, &values, dst, dst_ty.ty)?;
-        self.jump_after_call(target)
+        self.finish_call(destination, target)
     }
 
     fn operands(&mut self, operands: &[Operand]) -> Result<Vec<(Value, Ty<'db>)>> {
@@ -2137,7 +2205,232 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
     }
 
-    fn jump_after_call(&mut self, target: Option<BasicBlockId>) -> Result<()> {
+    fn set_drop_flag(&mut self, place: &StoredPlace, live: bool) {
+        if !place.projection.as_slice().is_empty() {
+            return;
+        }
+        if let Some(&flag) = self.drop_flags.get(place.local) {
+            let live = self.builder.ins().iconst(types::I8, live as i64);
+            self.builder.ins().store(MEM, live, flag, 0);
+        }
+    }
+
+    /// Drops the value at `addr` in place.
+    fn drop_value(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
+        if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
+            return Ok(());
+        }
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(PTR));
+        let mut values = vec![addr];
+        if is_unsized(ty) {
+            let Some(meta) = meta else {
+                unsupported!("drop of unsized {ty:?} without metadata");
+            };
+            sig.params.push(AbiParam::new(PTR));
+            values.push(meta);
+        }
+        let args = GenericArgs::new_from_slice(&[ty.into()]);
+        let callee = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &values);
+        Ok(())
+    }
+
+    /// The body of `drop_in_place::<ty>`.
+    fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(PTR));
+        if is_unsized(ty) {
+            sig.params.push(AbiParam::new(PTR));
+        }
+        self.builder.func.signature = sig;
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let params = self.builder.block_params(entry).to_vec();
+        self.drop_contents(params[0], params.get(1).copied(), ty)?;
+        self.builder.ins().return_(&[]);
+        Ok(())
+    }
+
+    fn drop_contents(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
+        let db = self.cg.db;
+        match ty.kind() {
+            TyKind::Adt(adt_def, subst) => {
+                if adt_def.is_box() {
+                    // The compiler drops the pointee; `Box`'s `Drop` impl only frees the memory.
+                    let pointee = subst.type_at(0);
+                    let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
+                    let pointee_meta =
+                        is_unsized(pointee).then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                    self.drop_value(pointer, pointee_meta, pointee)?;
+                }
+                if adt_def.destructor(self.interner).is_some() {
+                    self.call_drop_impl(addr, ty)?;
+                }
+                let layout = self.layout(ty)?;
+                match adt_def.def_id() {
+                    AdtId::UnionId(_) => (),
+                    AdtId::StructId(id) => {
+                        let manually_drop = StructSignature::of(db, id)
+                            .flags
+                            .contains(StructFlags::IS_MANUALLY_DROP);
+                        if !manually_drop {
+                            self.drop_fields(addr, &layout, id.into(), subst)?;
+                        }
+                    }
+                    AdtId::EnumId(id) => match &layout.variants {
+                        Variants::Empty => (),
+                        Variants::Single { index } => {
+                            let variant = id
+                                .enum_variants(db)
+                                .variants
+                                .values()
+                                .map(|&(variant, _)| variant)
+                                .find(|variant| variant.index(db) == index.0);
+                            if let Some(variant) = variant {
+                                self.drop_fields(addr, &layout, variant.into(), subst)?;
+                            }
+                        }
+                        Variants::Multiple { variants, .. } => {
+                            let wide = AbiScalar { ty: types::I64, signed: true };
+                            let discr = self.discriminant(addr, ty, wide)?;
+                            let done = self.builder.create_block();
+                            let mut switch = Switch::new();
+                            let mut arms = Vec::new();
+                            for &(variant, _) in id.enum_variants(db).variants.values() {
+                                let value = db
+                                    .const_eval_discriminant(variant)
+                                    .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
+                                let block = self.builder.create_block();
+                                switch.set_entry(value as i64 as u64 as u128, block);
+                                arms.push((block, variant));
+                            }
+                            switch.emit(&mut self.builder, discr, done);
+                            for (block, variant) in arms {
+                                self.builder.switch_to_block(block);
+                                let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                                self.drop_fields(addr, layout, variant.into(), subst)?;
+                                self.builder.ins().jump(done, &[]);
+                            }
+                            self.builder.switch_to_block(done);
+                        }
+                    },
+                }
+            }
+            TyKind::Tuple(tys) => {
+                let layout = self.layout(ty)?;
+                for (i, field) in tys.iter().enumerate() {
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    let field_addr = self.builder.ins().iadd_imm(addr, offset);
+                    self.drop_value(field_addr, None, field)?;
+                }
+            }
+            TyKind::Closure(_, args) => {
+                let TyKind::Tuple(tys) = args.as_closure().tupled_upvars_ty().kind() else {
+                    unsupported!("drop glue for a closure without tupled upvars");
+                };
+                let layout = self.layout(ty)?;
+                for (i, field) in tys.iter().enumerate() {
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    let field_addr = self.builder.ins().iadd_imm(addr, offset);
+                    self.drop_value(field_addr, None, field)?;
+                }
+            }
+            TyKind::Array(element, len) => {
+                let Some(len) = try_const_usize(db, len) else {
+                    unsupported!("array with unevaluated length");
+                };
+                let len = self.builder.ins().iconst(PTR, len as i64);
+                self.drop_elements(addr, len, element)?;
+            }
+            TyKind::Slice(element) => {
+                let Some(len) = meta else {
+                    unsupported!("drop of a slice without a length");
+                };
+                self.drop_elements(addr, len, element)?;
+            }
+            TyKind::Dynamic(..) => {
+                let Some(vtable) = meta else {
+                    unsupported!("drop of `dyn` without a vtable");
+                };
+                // The first vtable entry is `drop_in_place`, null when there is nothing to drop.
+                let glue = self.builder.ins().load(PTR, MEM, vtable, 0);
+                let call = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.ins().brif(glue, call, &[], done, &[]);
+                self.builder.switch_to_block(call);
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(PTR));
+                let sig = self.builder.import_signature(sig);
+                self.builder.ins().call_indirect(sig, glue, &[addr]);
+                self.builder.ins().jump(done, &[]);
+                self.builder.switch_to_block(done);
+            }
+            _ => unsupported!("drop glue for {ty:?}"),
+        }
+        Ok(())
+    }
+
+    fn drop_fields(
+        &mut self,
+        addr: Value,
+        layout: &Layout,
+        variant: VariantId,
+        subst: GenericArgs<'db>,
+    ) -> Result<()> {
+        let field_types = self.cg.db.field_types(variant);
+        for (field, ty) in field_types.iter() {
+            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+            if is_unsized(ty) {
+                unsupported!("drop glue for an unsized field");
+            }
+            let offset = layout.fields.offset(u32::from(field.into_raw()) as usize).bytes();
+            let field_addr = self.builder.ins().iadd_imm(addr, offset as i64);
+            self.drop_value(field_addr, None, ty)?;
+        }
+        Ok(())
+    }
+
+    fn drop_elements(&mut self, addr: Value, len: Value, element: Ty<'db>) -> Result<()> {
+        let size = self.layout(element)?.size.bytes() as i64;
+        let header = self.builder.create_block();
+        let body = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(header, PTR);
+        let zero = self.builder.ins().iconst(PTR, 0);
+        self.builder.ins().jump(header, &[zero.into()]);
+        self.builder.switch_to_block(header);
+        let index = self.builder.block_params(header)[0];
+        let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+        self.builder.ins().brif(more, body, &[], done, &[]);
+        self.builder.switch_to_block(body);
+        let offset = self.builder.ins().imul_imm(index, size);
+        let element_addr = self.builder.ins().iadd(addr, offset);
+        self.drop_value(element_addr, None, element)?;
+        let next = self.builder.ins().iadd_imm(index, 1);
+        self.builder.ins().jump(header, &[next.into()]);
+        self.builder.switch_to_block(done);
+        Ok(())
+    }
+
+    /// Calls `<ty as Drop>::drop` on the value at `addr`.
+    fn call_drop_impl(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
+        let Some(drop_fn) = self.interner.lang_items().Drop_drop else {
+            unsupported!("no `Drop::drop` lang item");
+        };
+        let reference =
+            Ty::new_ref(self.interner, Region::new_erased(self.interner), ty, Mutability::Mut);
+        let slot = self.scratch();
+        self.builder.ins().store(MEM, addr, slot, 0);
+        let args = GenericArgs::new_from_slice(&[ty.into()]);
+        let unit = Ty::new_unit(self.interner);
+        self.call_direct(drop_fn, args, &[(slot, reference)], slot, unit)
+    }
+
+    fn finish_call(&mut self, destination: &StoredPlace, target: Option<BasicBlockId>) -> Result<()> {
+        self.set_drop_flag(destination, true);
         match target {
             Some(target) => self.builder.ins().jump(self.blocks[target], &[]),
             None => self.builder.ins().trap(TrapCode::user(2).expect("non-zero trap code")),
