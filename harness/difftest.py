@@ -30,6 +30,7 @@ class Fixture:
         self.ws, self.crates, self.target_args = os.path.abspath(workspace), crates, target
         self.work = tempfile.mkdtemp(prefix="rustd-diff-")
         self.run_args = []
+        self.rustd_args = []
         self.rustd_timeout = None
         self.layout_log = os.path.join(self.work, "layouts.tsv")
         if touch is None:
@@ -65,7 +66,8 @@ class Fixture:
             try:
                 run = subprocess.run(
                     [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
-                     "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols],
+                     "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"),
+                     *self.rustd_args, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,
                     env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:

@@ -2755,3 +2755,265 @@ pub mod closure_clone {
         vec![twice(captures.clone()), twice(captures), twice(plain)]
     }
 }
+
+/// `TypeId`s are rustc's hash of the type, which its own code compares ours against.
+pub mod type_id_hashes {
+    use std::any::{Any, TypeId};
+    use std::collections::HashMap;
+    use std::fmt::Debug;
+
+    pub struct Unit;
+    pub struct Tuple(pub u8, u16);
+    struct Record {
+        _a: u32,
+        pub _b: String,
+        pub(crate) _c: bool,
+    }
+    #[repr(C)]
+    pub struct ReprC {
+        pub a: u8,
+    }
+    #[repr(transparent)]
+    pub struct Transparent(u64);
+    #[repr(C, packed(2))]
+    pub struct Packed(u64);
+    #[repr(align(32))]
+    pub struct Aligned(u8);
+    pub enum Plain {
+        A,
+        B,
+    }
+    #[repr(u8)]
+    pub enum Assigned {
+        A = 3,
+        B,
+        C = 9,
+        D,
+    }
+    #[non_exhaustive]
+    pub enum Payload {
+        Unit,
+        Tuple(u8, Box<Payload>),
+        Record { _a: u8 },
+    }
+    pub union Either {
+        pub a: u8,
+        _b: u32,
+    }
+    pub struct Generic<T, const N: usize>(pub [T; N]);
+    pub struct Borrowed<'a>(pub &'a str);
+    pub mod inner {
+        pub struct Nested(pub(super) u8, pub(in crate::type_id_hashes) u8, pub(self) u8);
+    }
+    pub trait Shape {}
+    pub trait Convert<T> {}
+
+    fn id<T: ?Sized + 'static>() -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    pub fn primitives() -> Vec<TypeId> {
+        vec![
+            id::<bool>(),
+            id::<char>(),
+            id::<u8>(),
+            id::<i8>(),
+            id::<u16>(),
+            id::<i32>(),
+            id::<u64>(),
+            id::<i128>(),
+            id::<usize>(),
+            id::<isize>(),
+            id::<f32>(),
+            id::<f64>(),
+            id::<str>(),
+            id::<()>(),
+        ]
+    }
+
+    pub fn compound() -> Vec<TypeId> {
+        vec![
+            id::<&'static str>(),
+            id::<&'static mut u8>(),
+            id::<*const u8>(),
+            id::<*mut [u16]>(),
+            id::<[u8]>(),
+            id::<[u8; 4]>(),
+            id::<[[u32; 2]; 300]>(),
+            id::<(u8,)>(),
+            id::<(u8, &'static str, [i64; 0])>(),
+        ]
+    }
+
+    pub fn local_structs() -> Vec<TypeId> {
+        vec![id::<Unit>(), id::<Tuple>(), id::<Record>(), id::<inner::Nested>()]
+    }
+
+    pub fn local_reprs() -> Vec<TypeId> {
+        vec![id::<ReprC>(), id::<Transparent>(), id::<Packed>(), id::<Aligned>()]
+    }
+
+    pub fn local_enums() -> Vec<TypeId> {
+        vec![id::<Plain>(), id::<Assigned>(), id::<Payload>(), id::<Either>()]
+    }
+
+    pub fn local_generics() -> Vec<TypeId> {
+        vec![
+            id::<Generic<u8, 3>>(),
+            id::<Generic<Unit, 0>>(),
+            id::<Borrowed<'static>>(),
+            id::<Generic<Borrowed<'static>, 1>>(),
+        ]
+    }
+
+    pub fn std_types() -> Vec<TypeId> {
+        vec![
+            id::<String>(),
+            id::<Option<u8>>(),
+            id::<Result<(), String>>(),
+            id::<Vec<u8>>(),
+            id::<Box<str>>(),
+            id::<std::cell::Cell<u8>>(),
+            id::<std::marker::PhantomData<u8>>(),
+            id::<std::mem::ManuallyDrop<u8>>(),
+            id::<std::pin::Pin<Box<u8>>>(),
+            id::<std::rc::Rc<Unit>>(),
+            id::<std::sync::Arc<Plain>>(),
+            id::<HashMap<String, Vec<u32>>>(),
+            id::<std::io::Error>(),
+            id::<std::fmt::Error>(),
+            id::<std::num::NonZeroU8>(),
+            id::<std::time::Duration>(),
+            id::<std::cmp::Ordering>(),
+        ]
+    }
+
+    pub fn trait_objects() -> Vec<TypeId> {
+        vec![
+            id::<dyn Any>(),
+            id::<dyn Any + Send>(),
+            id::<dyn Any + Send + Sync>(),
+            id::<dyn Debug>(),
+            id::<dyn Shape>(),
+            id::<dyn Convert<u8> + Sync>(),
+            id::<Box<dyn std::error::Error + Send + Sync>>(),
+            id::<&'static dyn Shape>(),
+        ]
+    }
+
+    type Pick = for<'a, 'b> fn(&'a u8, &'b u8) -> &'b u8;
+    type PickSwapped = for<'a, 'b> fn(&'b u8, &'a u8) -> &'a u8;
+    type Nested = for<'a> fn(&'a u8, for<'b> fn(&'b u8, &'a u8) -> &'b u8) -> Borrowed<'a>;
+    type Callback = dyn for<'a> Fn(&'a str) -> &'a str + Send;
+    type Visitor = Box<dyn for<'a, 'b> FnMut(&'a mut Vec<&'b u8>, &'b u8)>;
+
+    pub fn functions() -> Vec<TypeId> {
+        vec![
+            id::<fn()>(),
+            id::<fn(u8) -> u8>(),
+            id::<unsafe fn(u8, String) -> Vec<u8>>(),
+            id::<extern "C" fn(i32) -> i32>(),
+            id::<unsafe extern "C" fn(*const u8, ...) -> i32>(),
+            id::<fn(fn(u8) -> String) -> !>(),
+            id::<Pick>(),
+            id::<PickSwapped>(),
+            id::<Nested>(),
+            id::<Callback>(),
+            id::<Visitor>(),
+        ]
+    }
+
+    /// The lifetimes these leave out are bound by the signature, which only rustc knows.
+    pub fn elided() -> Vec<TypeId> {
+        vec![
+            id::<fn(&u8) -> &u8>(),
+            id::<fn(&mut Borrowed<'_>) -> Borrowed<'static>>(),
+            id::<dyn FnMut(&str) -> &str>(),
+            id::<Box<dyn Fn(&dyn Fn(&u8) -> &u8) -> Box<dyn Iterator<Item = &'static str>>>>(),
+            id::<std::iter::Map<std::slice::Iter<'static, u8>, fn(&u8) -> u8>>(),
+        ]
+    }
+
+    pub fn projections() -> Vec<TypeId> {
+        vec![
+            id::<dyn Iterator<Item = u8>>(),
+            id::<dyn DoubleEndedIterator<Item = (u8, String)> + Send>(),
+            id::<dyn Fn(u8) -> u8>(),
+            id::<dyn std::ops::Deref<Target = [u8]>>(),
+            id::<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send>(),
+            id::<dyn Convert<&'static str>>(),
+        ]
+    }
+
+    pub fn more_std_types() -> Vec<TypeId> {
+        vec![
+            id::<std::borrow::Cow<'static, str>>(),
+            id::<std::collections::BTreeMap<u8, &'static [u8]>>(),
+            id::<std::collections::HashSet<char>>(),
+            id::<std::collections::VecDeque<f64>>(),
+            id::<std::sync::Mutex<Option<Box<dyn Any + Send>>>>(),
+            id::<std::sync::atomic::AtomicUsize>(),
+            id::<std::path::PathBuf>(),
+            id::<std::path::Path>(),
+            id::<std::ffi::OsString>(),
+            id::<std::ffi::CStr>(),
+            id::<std::net::IpAddr>(),
+            id::<std::ops::Range<usize>>(),
+            id::<std::ops::RangeInclusive<i128>>(),
+            id::<std::fmt::Arguments<'static>>(),
+            id::<std::thread::Thread>(),
+            id::<std::fs::File>(),
+            id::<std::cell::RefCell<std::rc::Weak<Record>>>(),
+            id::<std::mem::MaybeUninit<[u16; 7]>>(),
+            id::<std::num::Wrapping<i8>>(),
+            id::<std::task::Poll<Option<u8>>>(),
+            id::<std::alloc::Layout>(),
+            id::<std::char::ParseCharError>(),
+            id::<std::string::FromUtf8Error>(),
+            id::<std::num::ParseIntError>(),
+            id::<std::convert::Infallible>(),
+            id::<std::vec::IntoIter<u8>>(),
+            id::<std::panic::Location<'static>>(),
+            id::<std::time::Instant>(),
+            id::<std::process::ExitCode>(),
+        ]
+    }
+
+    pub fn downcasts() -> (Option<u8>, Option<String>, bool, bool) {
+        let boxed: Box<dyn Any> = Box::new(7u8);
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(std::fmt::Error);
+        let record: &dyn Any = &Tuple(1, 2);
+        (
+            boxed.downcast_ref::<u8>().copied(),
+            boxed.downcast_ref::<String>().cloned(),
+            error.downcast_ref::<std::fmt::Error>().is_some(),
+            record.is::<Tuple>(),
+        )
+    }
+}
+
+pub mod type_names {
+    pub struct Plain;
+    pub struct Generic<A, B = u8>(pub A, pub B);
+    pub mod inner {
+        pub enum Choice {
+            A,
+        }
+    }
+
+    fn of<T: ?Sized>(_: &T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    pub fn run() -> Vec<&'static str> {
+        vec![
+            of(&Generic(1i8, [Plain, Plain])),
+            std::any::type_name::<Generic<&'static str>>(),
+            std::any::type_name::<inner::Choice>(),
+            std::any::type_name::<Option<Vec<(u8, String)>>>(),
+            std::any::type_name::<*const [u16]>(),
+            std::any::type_name::<&mut (i32,)>(),
+            std::any::type_name::<dyn std::fmt::Debug + Send>(),
+        ]
+    }
+}

@@ -13,6 +13,9 @@ pub(crate) struct SymbolTable {
     /// `{closure#0}`-like segments, which we can't number the way rustc does. `None` when
     /// several symbols share such a path.
     nested: FxHashMap<String, Option<String>>,
+    /// rustc's `StableCrateId` of each crate named in a symbol. `None` when two crates share
+    /// the name.
+    crates: FxHashMap<String, Option<u64>>,
 }
 
 impl SymbolTable {
@@ -44,6 +47,7 @@ impl SymbolTable {
             }
             let Ok(name) = symbol.name() else { continue };
             let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
+            self.add_crates(&demangled.to_string());
             // `{:#}` drops the crate disambiguator hashes.
             let path = format!("{demangled:#}");
             if path.contains("::{") {
@@ -59,6 +63,33 @@ impl SymbolTable {
             }
             self.by_path.entry(path).or_insert_with(|| name.to_owned());
         }
+    }
+
+    /// Reads the `name[id]` a demangled v0 symbol prints for each crate in it.
+    fn add_crates(&mut self, demangled: &str) {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut rest = demangled;
+        while let Some((before, after)) = rest.split_once('[') {
+            rest = after;
+            let Some((id, _)) = after.split_once(']') else { break };
+            let name_len = before.chars().rev().take_while(|&c| is_ident(c)).count();
+            let name = &before[before.len() - name_len..];
+            let Ok(id) = u64::from_str_radix(id, 16) else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            match self.crates.get_mut(name) {
+                Some(known) if *known != Some(id) => *known = None,
+                Some(_) => {}
+                None => {
+                    self.crates.insert(name.to_owned(), Some(id));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn stable_crate_id(&self, name: &str) -> Option<u64> {
+        *self.crates.get(name)?
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<&str> {

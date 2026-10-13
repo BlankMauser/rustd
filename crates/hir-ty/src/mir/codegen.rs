@@ -69,6 +69,7 @@ use super::{
     eval::interpret_mir, monomorphized_promoted_mir_body_query, return_slot,
 };
 
+mod type_id;
 mod unwind;
 mod vtable;
 
@@ -113,6 +114,8 @@ pub trait SymbolResolver {
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    /// rustc's `StableCrateId` of a crate, which its symbols carry.
+    fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -569,7 +572,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_instances(&mut self) -> Vec<(Instance, String)> {
         let mut failed = Vec::new();
         while let Some((instance, env, id)) = self.pending.pop() {
-            if let Err(e) = self.define_instance(&instance, env, id) {
+            if let Err(e) = self.define_instance(&instance, env, id)
+                && self.forward_to_rustc(&instance, id).is_none()
+            {
                 failed.push((instance, e.to_string()));
             }
         }
@@ -822,8 +827,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // A `TypeId` is a hash only rustc can compute, and the two compilers have to agree on
         // it for `downcast` to work between their code. So take rustc's.
         if let InstanceDef::Fn(func) = def
-            && let Some(ty) = self.type_id_of(func, args)
+            && let Some(of) = self.type_id_of(func, args)
         {
+            let hash = type_id::TypeIdHasher::new(self.db, self.symbols).type_id(of);
+            if let Some(hash) = hash {
+                return self.constant_type_id(instance, sig, hash);
+            }
+            let Some(ty) = self.symbol_type(of) else {
+                unsupported!("`TypeId` of a type neither hashed nor named by a rustc symbol");
+            };
             if let Some(symbol) = self.symbols.path(&format!("<core::any::TypeId>::of::<{ty}>")) {
                 return self.import(&symbol, sig);
             }
@@ -894,8 +906,150 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(id)
     }
 
-    /// The `T` of `TypeId::of::<T>` as rustc's symbols spell it, when `func` is that function.
-    fn type_id_of(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
+    /// Makes `id` a call of the copy of `instance` rustc compiled, when there is one: an
+    /// instance we cannot compile is still one we can call.
+    fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
+        let InstanceDef::Fn(func) = instance.def else { return None };
+        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        let sig = self.module.declarations().get_function_decl(id).signature.clone();
+        let target = self.import(&symbol, &sig).ok()?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        let values = builder.block_params(block).to_vec();
+        let target = self.module.declare_func_in_func(target, builder.func);
+        let call = builder.ins().call(target, &values);
+        let results = builder.inst_results(call).to_vec();
+        builder.ins().return_(&results);
+        builder.seal_all_blocks();
+        builder.finalize(self.module.isa().frontend_config());
+        self.builder_ctx = builder_ctx;
+        self.emit(id, &mut ctx).ok()
+    }
+
+    /// A generic function with its arguments as it reads in a demangled rustc symbol:
+    /// `<Vec<u8> as Clone>::clone`, `<Option<u8>>::map::<u8, F>`, `core::mem::swap::<u8>`.
+    fn instance_path(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
+        let db = self.db;
+        let signature = FunctionSignature::of(db, func);
+        // The future of an `async fn` is laid out differently by the two compilers.
+        if signature.is_async() {
+            return None;
+        }
+        let name = signature.name.as_str();
+        let interner = DbInterner::new_no_crate(db);
+        let types = |args: &[crate::next_solver::GenericArg<'db>]| {
+            args.iter()
+                .filter(|it| it.region().is_none())
+                .map(|it| self.symbol_type(it.ty()?))
+                .collect::<Option<Vec<_>>>()
+        };
+        let parent = crate::generics::generics(db, func.into()).len_parent();
+        let (parent, own) = args.as_slice().split_at_checked(parent)?;
+        let mut path = match func.lookup(db).container {
+            ItemContainerId::ModuleId(_) => self.symbols.item(func.into())?,
+            ItemContainerId::TraitId(trait_) => {
+                let (self_ty, rest) = parent.split_first()?;
+                let mut path = format!(
+                    "<{} as {}",
+                    self.symbol_type(self_ty.ty()?)?,
+                    self.symbols.item(trait_.into())?
+                );
+                let rest = types(rest)?;
+                if !rest.is_empty() {
+                    path.push_str(&format!("<{}>", rest.join(", ")));
+                }
+                format!("{path}>::{name}")
+            }
+            ItemContainerId::ImplId(impl_) => {
+                let parent_args = GenericArgs::new_from_slice(parent);
+                let self_ty =
+                    db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
+                let self_ty = self.symbol_type(self_ty)?;
+                match db.impl_trait(impl_) {
+                    None => format!("<{self_ty}>::{name}"),
+                    Some(trait_ref) => {
+                        let trait_ref =
+                            trait_ref.instantiate(interner, parent_args).skip_norm_wip();
+                        let mut path = format!(
+                            "<{self_ty} as {}",
+                            self.symbols.item(trait_ref.def_id.0.into())?
+                        );
+                        let rest = types(&trait_ref.args.as_slice()[1..])?;
+                        if !rest.is_empty() {
+                            path.push_str(&format!("<{}>", rest.join(", ")));
+                        }
+                        format!("{path}>::{name}")
+                    }
+                }
+            }
+            ItemContainerId::ExternBlockId(_) => return None,
+        };
+        let own = types(own)?;
+        if !own.is_empty() {
+            path.push_str(&format!("::<{}>", own.join(", ")));
+        }
+        Some(path)
+    }
+
+    /// A `TypeId::of::<T>` that returns `hash`, the two words of which are its value.
+    fn constant_type_id(
+        &mut self,
+        instance: Instance,
+        sig: &Signature,
+        hash: u128,
+    ) -> Result<FuncId> {
+        if let Some(&id) = self.instances.get(&instance) {
+            return Ok(id);
+        }
+        let name = format!("rustd::type_id::{}", self.instances.len());
+        let id = self
+            .module
+            .declare_function(&name, Linkage::Local, sig)
+            .map_err(|e| CodegenError::Backend(e.to_string()))?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig.clone();
+        let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        let words = [hash as u64, (hash >> 64) as u64].map(|it| it as i64);
+        let returned = match *sig.returns.as_slice() {
+            [] => {
+                let &[out] = builder.block_params(block) else {
+                    unsupported!("a `TypeId` returned as `{sig}`");
+                };
+                for (word, offset) in words.into_iter().zip([0, 8]) {
+                    let word = builder.ins().iconst(types::I64, word);
+                    builder.ins().store(MEM, word, out, offset);
+                }
+                Vec::new()
+            }
+            [low, high] if low.value_type == types::I64 && high.value_type == types::I64 => {
+                words.map(|it| builder.ins().iconst(types::I64, it)).to_vec()
+            }
+            [whole] if whole.value_type == types::I128 => {
+                let [low, high] = words.map(|it| builder.ins().iconst(types::I64, it));
+                vec![builder.ins().iconcat(low, high)]
+            }
+            _ => unsupported!("a `TypeId` returned as `{sig}`"),
+        };
+        builder.ins().return_(&returned);
+        builder.seal_all_blocks();
+        builder.finalize(self.module.isa().frontend_config());
+        self.builder_ctx = builder_ctx;
+        self.emit(id, &mut ctx)?;
+        self.instances.insert(instance, id);
+        Ok(id)
+    }
+
+    /// The `T` of `TypeId::of::<T>`, when `func` is that function.
+    fn type_id_of(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<Ty<'db>> {
         let db = self.db;
         if FunctionSignature::of(db, func).name.as_str() != "of" {
             return None;
@@ -905,7 +1059,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if self.symbols.item(adt.def_id().into())? != "core::any::TypeId" {
             return None;
         }
-        self.symbol_type(args.as_slice().first()?.ty()?)
+        args.as_slice().first()?.ty()
     }
 
     /// A type as it reads in a demangled rustc symbol. `None` for the types whose spelling
@@ -4148,7 +4302,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let overridden = AttrFlags::query(db, func.into())
                         .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN);
                     let signature = FunctionSignature::of(db, func);
-                    if overridden || !signature.has_body() {
+                    // These have a body that only stands in for the const evaluator.
+                    let compile_time = matches!(
+                        signature.name.as_str(),
+                        "const_allocate"
+                            | "const_deallocate"
+                            | "const_make_global"
+                            | "size_of_type_id"
+                            | "type_id_vtable"
+                            | "type_of"
+                    );
+                    if overridden || compile_time || !signature.has_body() {
                         unsupported!("intrinsic `{}`", signature.name.as_str());
                     }
                 }

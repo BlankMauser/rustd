@@ -10,10 +10,19 @@ import argparse, json, os, re, sys
 from difftest import Fixture, compare
 
 
+UNIT = "(unit tests)"
+
+
 class TestFixture(Fixture):
     def __init__(self, crate_dir, crate, test, shared):
-        path = os.path.join(crate_dir, "tests", f"{test}.rs")
-        super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
+        if test == UNIT:
+            # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
+            super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
+                             touch=os.path.join(crate_dir, "src", "lib.rs"))
+            self.rustd_args = ["--cfg-test"]
+        else:
+            path = os.path.join(crate_dir, "tests", f"{test}.rs")
+            super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
         self.run_args = ["--test-threads=1"]
         self.shared = shared
 
@@ -34,17 +43,37 @@ class TestFixture(Fixture):
         return re.sub(rb"finished in [0-9.]+s", b"finished", stdout)
 
 
+def differing_tests(fx):
+    """Runs every test on its own in both binaries: one that aborts hides the ones after it."""
+    import subprocess
+    listed = subprocess.run([fx.reference, "--list"], capture_output=True, text=True).stdout
+    names = [l[:-len(": test")] for l in listed.splitlines() if l.endswith(": test")]
+    differing = []
+    for name in names:
+        fx.run_args = ["--test-threads=1", "--exact", name]
+        want, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
+        if want[:2] != got[:2]:
+            tail = got[2].decode(errors="replace").strip().splitlines()[-3:]
+            differing.append(name)
+            print(f"  DIFFERS {name}: rustc status {want[0]}, rustd status {got[0]}: {' | '.join(tail)[:300]}")
+    fx.run_args = ["--test-threads=1"]
+    return differing
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("crate_dir")
     ap.add_argument("--crate")
     ap.add_argument("--bisect", action="store_true")
-    ap.add_argument("--test", action="append", help="only these test binaries")
+    ap.add_argument("--test", action="append", help="only these test binaries; `unit` is the crate's own")
     ap.add_argument("--json")
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
-    tests = sorted(f[:-3] for f in os.listdir(os.path.join(a.crate_dir, "tests")) if f.endswith(".rs"))
-    tests = [t for t in tests if not a.test or t in a.test]
+    tests_dir = os.path.join(a.crate_dir, "tests")
+    tests = sorted(f[:-3] for f in os.listdir(tests_dir) if f.endswith(".rs")) if os.path.isdir(tests_dir) else []
+    if os.path.exists(os.path.join(a.crate_dir, "src", "lib.rs")):
+        tests.append(UNIT)
+    tests = [t for t in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
     results, shared = [], {}
     for test in tests:
         print(f"--- {test}", flush=True)
@@ -64,6 +93,8 @@ def main():
             print(f"ERROR: {str(e)[:1500]}")
             results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {}})
             continue
+        if not result["match"]:
+            result["differing_tests"] = differing_tests(fx)
         expected = fx.behaviour(fx.reference)[1]
         result["tests_run"] = len(re.findall(rb"^test .* \.\.\. ", expected, re.M))
         results.append(result)
@@ -73,6 +104,7 @@ def main():
     if a.json:
         merged = {"fixture": crate, "match": ok, "tests_run": total,
                   "crates": results[0]["crates"] if results else {},
+                  "binaries": results,
                   "culprits": [c for r in results for c in r.get("culprits", [])]}
         json.dump(merged, open(a.json, "w"), indent=1)
     sys.exit(0 if ok else 1)

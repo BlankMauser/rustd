@@ -785,7 +785,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "type_name generic arg is not provided".into(),
                     ));
                 };
-                let ty_name = self.db.type_name(ty, locals.body.owner.module(self.db));
+                let ty_name = crate::mir::type_name::rustc_type_name(self.db, ty)
+                    .unwrap_or_else(|| self.db.type_name(ty, locals.body.owner.module(self.db)));
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;
                 self.write_memory(addr, ty_name.as_bytes())?;

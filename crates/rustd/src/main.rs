@@ -44,6 +44,8 @@ struct Args {
     deny: Option<PathBuf>,
     /// Directory that gets one object per compiled function, for testing each in isolation.
     isolate: Option<PathBuf>,
+    /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
+    cfg_test: bool,
 }
 
 impl Args {
@@ -59,6 +61,7 @@ impl Args {
         let mut report = None;
         let mut deny = None;
         let mut isolate = None;
+        let mut cfg_test = false;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -71,6 +74,7 @@ impl Args {
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
+                "--cfg-test" => cfg_test = true,
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
@@ -86,6 +90,7 @@ impl Args {
             report,
             deny,
             isolate,
+            cfg_test,
         })
     }
 }
@@ -203,6 +208,11 @@ impl SymbolResolver for Resolver<'_> {
 
     fn function(&self, func: FunctionId) -> Option<String> {
         self.table.get(&self.path(func)?).map(str::to_owned)
+    }
+
+    fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let name = Crate::from(krate).display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str())
     }
 
     fn static_(&self, id: StaticId) -> Option<String> {
@@ -455,6 +465,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             report: Some(report.join(format!("{krate}.tsv"))),
             deny: None,
             isolate: None,
+            cfg_test: args.cfg_test,
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default())
@@ -485,7 +496,11 @@ fn main() -> anyhow::Result<()> {
     eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
 
     let start = Instant::now();
-    let cargo_config = CargoConfig { sysroot: Some(RustLibSource::Discover), ..Default::default() };
+    let cargo_config = CargoConfig {
+        sysroot: Some(RustLibSource::Discover),
+        set_test: args.cfg_test,
+        ..Default::default()
+    };
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,

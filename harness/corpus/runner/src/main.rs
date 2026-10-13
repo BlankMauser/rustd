@@ -216,4 +216,18 @@ fn main() {
     println!("backtraces {:?}", cases::backtraces::run());
     println!("inline_const_bindings {:?}", cases::inline_const_bindings::run());
     println!("closure_clone {:?}", cases::closure_clone::run());
+    println!("type_ids primitives {:?}", cases::type_id_hashes::primitives());
+    println!("type_ids compound {:?}", cases::type_id_hashes::compound());
+    println!("type_ids local_structs {:?}", cases::type_id_hashes::local_structs());
+    println!("type_ids local_reprs {:?}", cases::type_id_hashes::local_reprs());
+    println!("type_ids local_enums {:?}", cases::type_id_hashes::local_enums());
+    println!("type_ids local_generics {:?}", cases::type_id_hashes::local_generics());
+    println!("type_ids std_types {:?}", cases::type_id_hashes::std_types());
+    println!("type_ids trait_objects {:?}", cases::type_id_hashes::trait_objects());
+    println!("type_ids functions {:?}", cases::type_id_hashes::functions());
+    println!("type_ids elided {:?}", cases::type_id_hashes::elided());
+    println!("type_ids projections {:?}", cases::type_id_hashes::projections());
+    println!("type_ids more_std_types {:?}", cases::type_id_hashes::more_std_types());
+    println!("type_names {:?}", cases::type_names::run());
+    println!("type_ids downcasts {:?}", cases::type_id_hashes::downcasts());
 }

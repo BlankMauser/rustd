@@ -1197,6 +1197,7 @@ dependencies = [
  "ra-ap-rustc_next_trait_solver",
  "ra-ap-rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc-stable-hash",
  "rustc_apfloat",
  "salsa",
  "serde",

@@ -35,6 +35,7 @@ pub mod codegen;
 mod eval;
 mod lower;
 mod monomorphization;
+mod type_name;
 
 pub use eval::{
     Evaluator, IsSigned, MirEvalError, VTableMap, interpret_mir, pad16,
