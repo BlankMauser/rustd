@@ -900,7 +900,9 @@ fn hash_expand(
                     }
                 },
             );
-        let check_discriminant = if matches!(&adt.shape, AdtShape::Enum { .. }) {
+        // rustc leaves the discriminant out when there is only one variant.
+        let check_discriminant = if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1)
+        {
             quote! {span => #krate::mem::discriminant(self).hash(ra_expand_state); }
         } else {
             quote! {span =>}

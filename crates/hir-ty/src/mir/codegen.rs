@@ -26,9 +26,11 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::Body,
+    hir::ExprId,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
+use hir_expand::{FileRange, InFile};
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
@@ -38,6 +40,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
+use syntax::{AstNode, SyntaxKind, TextRange, ast};
 use triomphe::Arc;
 
 use crate::{
@@ -59,8 +62,9 @@ use crate::{
 
 use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
-    AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, PlaceTy,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
+    AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
+    PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
+    eval::interpret_mir, promoted_mir_body_query, return_slot,
 };
 
 mod vtable;
@@ -102,6 +106,8 @@ pub trait SymbolResolver {
     fn static_(&self, id: StaticId) -> Option<String>;
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
+    /// The name rustc gives a source file in panic messages.
+    fn source_path(&self, file: base_db::FileId) -> Option<String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -606,6 +612,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 tracked,
                 abi: ExternAbi::Rust,
                 location: None,
+                span: MirSpan::Unknown,
+                constant_locals: Vec::new(),
             };
             fill(&mut fx).map(|()| {
                 fx.builder.seal_all_blocks();
@@ -871,6 +879,10 @@ struct FunctionCx<'cx, 'a, 'db> {
     /// The calling convention of the function being built.
     abi: ExternAbi,
     location: Option<Value>,
+    /// Where the statement being compiled comes from.
+    span: MirSpan,
+    /// Promoted locals that are read-only data instead of a slot the body writes to.
+    constant_locals: Vec<LocalId>,
 }
 
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
@@ -1275,6 +1287,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Ok(self.builder.ins().symbol_value(PTR, data))
     }
 
+    /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
+    /// Equal constants share an address, as they do for rustc.
+    fn promoted_constant(
+        &mut self,
+        body: &'db MirBody<'db>,
+        expr: ExprId,
+        size: usize,
+    ) -> Option<Value> {
+        let db = self.cg.db;
+        let constant = promoted_mir_body_query(db, body.owner, expr).ok()?;
+        let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
+        let blob = self.allocation_blob(allocation, false).ok()?;
+        if blob.bytes.len() != size {
+            return None;
+        }
+        self.blob_addr(blob).ok()
+    }
+
     fn stack_slot(&mut self, layout: &Layout) -> Value {
         let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
         if align <= 16 {
@@ -1358,12 +1388,19 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
-            let addr = if body.promoted_locals.contains(&local)
+            let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
+            let addr = if let Some(&(_, expr)) = promoted
                 && self.is_freeze(data.ty.as_ref())
                 && has_drop_glue(&self.infcx, data.ty.as_ref(), self.env.param_env)
                     == DropGlue::None
             {
-                self.promoted_slot(&layout)?
+                match self.promoted_constant(body, expr, layout.size.bytes_usize()) {
+                    Some(addr) if layout.size.bytes() != 0 => {
+                        self.constant_locals.push(local);
+                        addr
+                    }
+                    _ => self.promoted_slot(&layout)?,
+                }
             } else {
                 self.stack_slot(&layout)
             };
@@ -1426,7 +1463,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             self.builder.switch_to_block(self.blocks[id]);
             for statement in &block.statements {
+                self.span = statement.span;
                 match &statement.kind {
+                    // A promoted constant already holds its value.
+                    StatementKind::Assign(place, _)
+                        if self.constant_locals.contains(&place.local) => {}
                     StatementKind::Assign(place, rvalue) => {
                         self.assign(place, rvalue)?;
                         self.set_drop_flag(place, true);
@@ -1441,6 +1482,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let Some(terminator) = &block.terminator else {
                 unsupported!("block without terminator");
             };
+            self.span = terminator.span;
             self.terminator(&terminator.kind)?;
         }
         // Drops are generated last, when every field that gets moved out of a local is known.
@@ -3023,24 +3065,54 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Ok(())
     }
 
+    /// File, line and column of the statement being compiled, as rustc reports them.
+    fn source_location(&self) -> Option<(String, u32, u32)> {
+        let db = self.cg.db;
+        let InferBodyId::DefWithBodyId(owner) = self.body?.owner else { return None };
+        let source_map = &Body::with_source_map(db, owner).1;
+        let source = match self.span {
+            MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+            MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+            MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
+        };
+        let mut range = source.value.syntax_node_ptr().text_range();
+        if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
+            // A method call is reported from the method's name on.
+            let root = source.file_id.parse_or_expand(db);
+            let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
+            range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
+        }
+        let FileRange { file_id, range } =
+            InFile::new(source.file_id, range).original_node_file_range_rooted(db);
+        let file_id = file_id.file_id(db);
+        let text = db.file_text(file_id).text(db);
+        let before = text.get(..usize::from(range.start()))?;
+        let line_start = before.rfind('\n').map_or(0, |it| it + 1);
+        let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
+        let col = before[line_start..].chars().count() + 1;
+        Some((self.cg.symbols.source_path(file_id)?, line as u32, col as u32))
+    }
+
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
     fn caller_location(&mut self) -> Result<Value> {
         if let Some(location) = self.location {
             return Ok(location);
         }
-        // FIXME: real spans; the layout of `Location` should come from `layout_of_ty`.
+        // FIXME: the layout of `Location` should come from `layout_of_ty`. Locations also end up
+        // in cached code, where they go stale when lines shift; they belong in a table of their
+        // own.
         let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
         let n = self.cg.location_counter;
         self.cg.location_counter += 1;
-        let file = b"<rustd>";
-        let file_id = self
-            .cg
-            .module
-            .declare_data(&format!(".Lrustd.file.{n}"), Linkage::Local, false, false)
-            .map_err(backend)?;
-        let mut file_data = DataDescription::new();
-        file_data.define(file.to_vec().into_boxed_slice());
-        self.cg.module.define_data(file_id, &file_data).map_err(backend)?;
+        let (file, line, col) =
+            self.source_location().unwrap_or_else(|| ("<rustd>".to_owned(), 0, 0));
+        // The name is followed by a NUL that its length leaves out.
+        let mut name = file.clone().into_bytes();
+        name.push(0);
+        let file_id = self.cg.define_data(
+            ConstBlob { bytes: name, relocs: Vec::new(), fn_relocs: Vec::new(), align: 1 },
+            false,
+        )?;
 
         let loc_id = self
             .cg
@@ -3050,6 +3122,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut loc_data = DataDescription::new();
         let mut bytes = vec![0u8; 24];
         bytes[8..16].copy_from_slice(&(file.len() as u64).to_le_bytes());
+        bytes[16..20].copy_from_slice(&line.to_le_bytes());
+        bytes[20..24].copy_from_slice(&col.to_le_bytes());
         loc_data.define(bytes.into_boxed_slice());
         loc_data.set_align(8);
         let file_ref = self.cg.module.declare_data_in_data(file_id, &mut loc_data);
@@ -4296,6 +4370,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let (index, _) = self.load_scalar(index)?;
                 let offset = self.builder.ins().imul_imm(index, size);
                 let value = self.builder.ins().iadd(ptr, offset);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("vtable_size" | "vtable_align", [vtable]) => {
+                let (vtable, _) = self.load_scalar(vtable)?;
+                let offset = if name == "vtable_size" { 8 } else { 16 };
+                let value = self.builder.ins().load(PTR, MEM, vtable, offset);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("size_of_val", [arg]) => {

@@ -3,6 +3,7 @@
 
 mod symbols;
 
+use ide_db::base_db::SourceDatabase as _;
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -92,6 +93,9 @@ impl Args {
 struct Resolver<'a> {
     db: &'a RootDatabase,
     table: &'a SymbolTable,
+    /// What panic locations in the workspace are relative to.
+    root: PathBuf,
+    rustc_commit: std::cell::OnceCell<Option<String>>,
 }
 
 impl Resolver<'_> {
@@ -108,8 +112,29 @@ impl Resolver<'_> {
         let self_ty = self.type_path(&imp.self_ty(self.db))?;
         match imp.trait_(self.db) {
             Some(trait_) => {
-                let trait_ =
+                let mut path =
                     self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                // `impl PartialEq<str> for String` and `impl PartialEq<&str> for String` are
+                // told apart by the trait's arguments alone.
+                let trait_ref = imp.trait_ref(self.db)?;
+                let params = hir::GenericDef::from(trait_).type_or_const_params(self.db);
+                let mut args = Vec::new();
+                for (idx, param) in params.iter().enumerate().skip(1) {
+                    let arg = trait_ref.get_type_argument(idx)?;
+                    let defaulted = param
+                        .as_type_param(self.db)
+                        .is_some_and(|it| it.default(self.db).is_some());
+                    // FIXME: the only default understood is `= Self`.
+                    let is_self = hir::attach_db(self.db, || arg == trait_ref.self_ty());
+                    if defaulted && idx + 1 == params.len() && is_self {
+                        break;
+                    }
+                    args.push(self.type_path(&arg)?);
+                }
+                if !args.is_empty() {
+                    path = format!("{path}<{}>", args.join(", "));
+                }
+                let trait_ = path;
                 Some(format!("<{self_ty} as {trait_}>::{}", name.as_str()))
             }
             None => Some(format!("<{self_ty}>::{}", name.as_str())),
@@ -128,8 +153,21 @@ impl Resolver<'_> {
         Some(path)
     }
 
-    /// Only non-generic ADTs for now; anything else has no symbol we can name.
+    /// A type the way rustc writes it in a symbol. Generic ADTs have no symbol we can name yet.
     fn type_path(&self, ty: &hir::Type<'_>) -> Option<String> {
+        if let Some((inner, mutability)) = ty.as_reference() {
+            let inner = self.type_path(&inner)?;
+            return Some(match mutability {
+                hir::Mutability::Shared => format!("&{inner}"),
+                hir::Mutability::Mut => format!("&mut {inner}"),
+            });
+        }
+        if let Some(elem) = ty.as_slice() {
+            return Some(format!("[{}]", self.type_path(&elem)?));
+        }
+        if let Some(builtin) = ty.as_builtin() {
+            return Some(builtin.name().as_str().to_owned());
+        }
         let adt = ty.as_adt()?;
         if ty.type_arguments().next().is_some() {
             return None;
@@ -138,7 +176,31 @@ impl Resolver<'_> {
     }
 }
 
+/// The commit of the toolchain installed at `toolchain`, which rustc puts in the names of the
+/// standard library's files.
+fn rustc_commit(toolchain: &str) -> Option<String> {
+    let manifest =
+        std::fs::read_to_string(format!("{toolchain}lib/rustlib/multirust-channel-manifest.toml"))
+            .ok()?;
+    let (_, rust) = manifest.split_once("[pkg.rust]")?;
+    let (_, commit) = rust.split_once("git_commit_hash = \"")?;
+    Some(commit.split_once('"')?.0.to_owned())
+}
+
 impl SymbolResolver for Resolver<'_> {
+    fn source_path(&self, file: vfs::FileId) -> Option<String> {
+        let source_root = self.db.file_source_root(file).source_root_id(self.db);
+        let source_root = self.db.source_root(source_root).source_root(self.db);
+        let path = source_root.path_for_file(&file)?.as_path()?.to_string();
+        if let Some((toolchain, file)) = path.split_once("lib/rustlib/src/rust/")
+            && let Some(commit) = self.rustc_commit.get_or_init(|| rustc_commit(toolchain))
+        {
+            return Some(format!("/rustc/{commit}/{file}"));
+        }
+        let relative = Path::new(&path).strip_prefix(&self.root).ok();
+        Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    }
+
     fn function(&self, func: FunctionId) -> Option<String> {
         self.table.get(&self.path(func)?).map(str::to_owned)
     }
@@ -232,7 +294,11 @@ fn build(
     known: &mut Rejections,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
-    let resolver = Resolver { db, table };
+    let mut root = std::fs::canonicalize(&args.project)?;
+    if root.is_file() {
+        root.pop();
+    }
+    let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
     let mut roots = functions_of(db, &args.krate)?;
     if let Some(deny) = &args.deny {

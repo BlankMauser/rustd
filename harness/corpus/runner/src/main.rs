@@ -178,5 +178,6 @@ fn main() {
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
+    println!("promoted {:?}", cases::promoted::run());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }

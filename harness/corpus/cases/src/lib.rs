@@ -1273,6 +1273,46 @@ pub mod const_pointers {
     }
 }
 
+pub mod promoted {
+    use std::hash::{Hash, Hasher};
+
+    trait Any {}
+    impl<T> Any for T {}
+
+    fn same(a: *const dyn Any, b: *const dyn Any) -> bool {
+        a == b
+    }
+
+    fn sum() -> &'static (u8, u16) {
+        &(1, 2 + 3)
+    }
+
+    #[derive(Hash)]
+    enum Single {
+        Only(u8),
+    }
+
+    struct Bytes(Vec<u8>);
+    impl Hasher for Bytes {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend(bytes);
+        }
+    }
+
+    /// Equal promoted constants are one object, arithmetic on literals is promoted, two impls
+    /// of one trait for `String` are different functions, and an enum with one variant
+    /// hashes no discriminant.
+    pub fn run() -> (bool, (u8, u16), bool, bool, Vec<u8>) {
+        let text = "foo".to_string();
+        let mut bytes = Bytes(Vec::new());
+        Single::Only(17).hash(&mut bytes);
+        (same(&0u8, &0u8), *sum(), text == "foo".to_string(), text == "foo", bytes.0)
+    }
+}
+
 pub mod evaluation_order {
     fn log(order: &mut Vec<u8>, tag: u8) -> u32 {
         order.push(tag);

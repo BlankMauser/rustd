@@ -42,7 +42,7 @@ pub use eval::{
 };
 pub use lower::{
     MirLowerError, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,
-    mir_body_query,
+    mir_body_query, promoted_mir_body_query,
 };
 pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_query,
@@ -1024,7 +1024,7 @@ pub struct MirBody<'db> {
     pub param_locals: Vec<LocalId>,
     /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
     /// value has to outlive the call.
-    pub promoted_locals: Vec<LocalId>,
+    pub promoted_locals: Vec<(LocalId, ExprId)>,
     /// This field stores the closures directly owned by this body. It is used
     /// in traversing every mir body.
     pub closures: Vec<InternedClosureId<'db>>,

@@ -1106,7 +1106,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     && p.local.into_raw().into_u32() as usize >= locals
                     && self.is_promotable(*expr)
                 {
-                    self.result.promoted_locals.push(p.local);
+                    // The local holds what the fields and elements are taken out of.
+                    let mut constant = *expr;
+                    while let Expr::Field { expr: base, .. } | Expr::Index { base, .. } =
+                        self.store[constant]
+                    {
+                        constant = base;
+                    }
+                    self.result.promoted_locals.push((p.local, constant));
                 }
                 let bk = BorrowKind::from_hir_mutability(*mutability);
                 self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
@@ -1765,6 +1772,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             } => scalar(self, expr) && self.is_promotable(expr),
             &Expr::Cast { expr: inner, .. } => {
                 scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
+            }
+            // Division is left out: it is only promoted when the divisor is known not to be 0.
+            &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
+                let promoted = match op {
+                    BinaryOp::ArithOp(ArithOp::Div | ArithOp::Rem)
+                    | BinaryOp::Assignment { .. } => false,
+                    BinaryOp::ArithOp(_) | BinaryOp::CmpOp(_) | BinaryOp::LogicOp(_) => true,
+                };
+                promoted
+                    && scalar(self, lhs)
+                    && scalar(self, rhs)
+                    && self.is_promotable(lhs)
+                    && self.is_promotable(rhs)
             }
             _ => false,
         }
@@ -2645,6 +2665,35 @@ pub fn mir_body_query<'db>(
     let mut result = lower_body_to_mir(db, def, store, infer, root_expr, self_param, params)?;
     result.shrink_to_fit();
     Ok(result)
+}
+
+/// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
+#[salsa::tracked(returns(as_ref))]
+pub fn promoted_mir_body_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: InferBodyId<'db>,
+    expr: ExprId,
+) -> Result<'db, MirBody<'db>> {
+    let store = match def {
+        InferBodyId::DefWithBodyId(def) => &**Body::of(db, def),
+        InferBodyId::AnonConstId(def) => ExpressionStore::of(db, def.loc(db).owner),
+    };
+    let infer = InferenceResult::of(db, def);
+    if infer.has_type_mismatches() || infer.is_erroneous() {
+        return Err(MirLowerError::HasErrors);
+    }
+    let mut ctx = MirLowerCtx::new(db, def, store, infer);
+    // The value itself, before what borrowing or indexing it adjusts it to.
+    ctx.result.locals.alloc(Local { ty: ctx.expr_ty_without_adjust(expr).store() });
+    let current = ctx.lower_params_and_bindings(iter::empty(), None, |_| false)?;
+    if let Some(current) =
+        ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
+    {
+        let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
+        ctx.set_terminator(current, TerminatorKind::Return, expr.into());
+    }
+    ctx.result.shrink_to_fit();
+    Ok(ctx.result)
 }
 
 fn mir_body_cycle_result<'db>(
