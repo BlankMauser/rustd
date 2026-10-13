@@ -20,7 +20,8 @@ os.environ.setdefault("RUSTFLAGS", "-C link-dead-code")
 os.environ.setdefault("CARGO_INCREMENTAL", "0")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUSTD = os.path.join(ROOT, "target/release/rustd")
+# A sweep runs against a copy, so rebuilding rustd meanwhile does not change it under the sweep.
+RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
 
 
 def sysroot_rlibs():

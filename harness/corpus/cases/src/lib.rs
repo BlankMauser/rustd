@@ -3808,3 +3808,35 @@ pub mod anonymous_consts {
         (First.name(), Second.name())
     }
 }
+
+/// `Zip` of two slices takes `fold` and its `Item` from the impls its own impl specializes.
+pub mod specialized_items {
+    pub fn copy(src: &[u8], dst: &mut [u8]) -> u32 {
+        let mut copied = 0;
+        src.iter().zip(dst.iter_mut()).for_each(|(from, to)| {
+            *to = from.to_ascii_uppercase();
+            copied += 1;
+        });
+        copied
+    }
+
+    pub fn run() -> (u32, [u8; 4], usize, Vec<(char, u8)>) {
+        let mut dst = [b'-'; 4];
+        let copied = copy(b"abc", &mut dst);
+        let sum = [1usize, 2, 3].iter().zip([10usize, 20].iter()).fold(0, |n, (a, b)| n + a * b);
+        let mixed = "xyz".chars().zip([1u8, 2].iter().copied()).rev_pairs();
+        (copied, dst, sum, mixed)
+    }
+
+    trait RevPairs: Iterator + Sized {
+        fn rev_pairs(self) -> Vec<Self::Item> {
+            let mut all = self.fold(Vec::new(), |mut all, it| {
+                all.push(it);
+                all
+            });
+            all.reverse();
+            all
+        }
+    }
+    impl<I: Iterator> RevPairs for I {}
+}

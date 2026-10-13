@@ -1,5 +1,6 @@
 //! Impl specialization related things
 
+use either::Either;
 use hir_def::{HasModule, ImplId, signatures::ImplSignature, unstable_features::UnstableFeatures};
 use tracing::debug;
 
@@ -7,6 +8,7 @@ use crate::{
     Span,
     db::HirDatabase,
     lower::GenericPredicates,
+    method_resolution::TraitImpls,
     next_solver::{
         DbInterner, TypingMode, Unnormalized,
         infer::{DbInternerInferExt, traits::ObligationCause},
@@ -156,4 +158,30 @@ pub(crate) fn specializes(
     }
 
     specializes_query(db, specializing_impl_def_id, parent_impl_def_id)
+}
+
+/// The impl that `impl_id` takes an item it leaves out from: the closest of the impls it
+/// specializes for which `has_item` holds.
+pub(crate) fn specialized_ancestor(
+    db: &dyn HirDatabase,
+    impl_id: ImplId,
+    has_item: impl Fn(ImplId) -> bool,
+) -> Option<ImplId> {
+    let features = UnstableFeatures::query(db, impl_id.krate(db));
+    if !features.specialization && !features.min_specialization {
+        return None;
+    }
+    let trait_id = db.impl_trait(impl_id)?.skip_binder().def_id.0;
+    let mut ancestors = Vec::new();
+    for impls in TraitImpls::for_crate_and_deps(db, impl_id.krate(db)).iter() {
+        impls.for_trait(trait_id, |impls| {
+            let Either::Left(impls) = impls else { return };
+            ancestors.extend(impls.iter().copied().filter(|&ancestor| {
+                ancestor != impl_id && has_item(ancestor) && specializes(db, impl_id, ancestor)
+            }));
+        });
+    }
+    ancestors.iter().copied().find(|&ancestor| {
+        ancestors.iter().all(|&other| other == ancestor || specializes(db, ancestor, other))
+    })
 }

@@ -472,13 +472,32 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
                 .map(|method| (Either::Right((impl_, method)), impl_subst));
         }
     };
-    let item =
+    let item_of = |impl_id: ImplId| {
         impl_id.impl_items(infcx.interner.db).items.iter().find_map(|(n, it)| match *it {
             AssocItemId::FunctionId(f) => (n == name).then_some(AssocItemId::FunctionId(f)),
             AssocItemId::ConstId(c) => (n == name).then_some(AssocItemId::ConstId(c)),
             AssocItemId::TypeAliasId(_) => None,
-        })?;
-    Some((Either::Left(item), impl_subst))
+        })
+    };
+    if let Some(item) = item_of(impl_id) {
+        return Some((Either::Left(item), impl_subst));
+    }
+    // A specializing impl takes the items it leaves out from the impl it specializes: the
+    // closest one that has the item.
+    let db = infcx.interner.db;
+    let parent =
+        crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())?;
+    let parent_args = infcx.fresh_args_for_item(Span::Dummy, parent.into());
+    let parent_trait_ref =
+        db.impl_trait(parent)?.instantiate(infcx.interner, parent_args).skip_norm_wip();
+    let mut ocx = ObligationCtxt::new(infcx);
+    ocx.eq(&ObligationCause::dummy(), env, trait_ref, parent_trait_ref).ok()?;
+    let parent_args = infcx.resolve_vars_if_possible(parent_args);
+    if parent_args.has_non_region_infer() {
+        return None;
+    }
+    let parent_args = parent_args.fold_with(&mut ReplaceInferWithError::new(infcx.interner));
+    Some((Either::Left(item_of(parent)?), parent_args))
 }
 
 pub(crate) fn find_matching_impl<'db>(

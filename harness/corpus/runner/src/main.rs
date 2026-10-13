@@ -250,4 +250,5 @@ fn main() {
     println!("projected_patterns {:?}", cases::projected_patterns::run());
     println!("projected_fields {:?}", cases::projected_fields::run());
     println!("anonymous_consts {:?}", cases::anonymous_consts::run());
+    println!("specialized_items {:?}", cases::specialized_items::run());
 }

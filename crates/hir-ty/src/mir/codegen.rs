@@ -920,7 +920,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 return self.import(&symbol, sig);
             }
-            unsupported!("call to `{name}`, which has no body and no rustc symbol");
+            unsupported!("call to `{name}`{args:?}, which has no body and no rustc symbol");
         }
         let symbol = format!("rustd::{name}::{}", self.instances.len());
         let id = self
