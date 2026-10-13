@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
 use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 
 #[derive(Default)]
 pub(crate) struct SymbolTable {
@@ -66,6 +67,7 @@ impl SymbolTable {
                 table.by_root.insert(source, id);
             }
         }
+        let mut ambiguous = Vec::new();
         for Symbol { name, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
@@ -84,7 +86,23 @@ impl SymbolTable {
                     symbols.push(NestedSymbol { name: name.clone(), closures });
                 }
             }
-            table.by_path.entry(path).or_insert(name);
+            match table.by_path.entry(path) {
+                Entry::Vacant(entry) => {
+                    entry.insert(name);
+                }
+                Entry::Occupied(entry) => {
+                    if without_instantiating_crate(entry.get())
+                        != without_instantiating_crate(&name)
+                    {
+                        ambiguous.push(entry.key().clone());
+                    }
+                }
+            }
+        }
+        // Items in two `const _` blocks of a module print as one path. Linking either to the
+        // other's symbol is a miscompile, so neither has one.
+        for path in ambiguous {
+            table.by_path.remove(&path);
         }
         Ok(table)
     }
@@ -101,6 +119,10 @@ impl SymbolTable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
+            // The memory a static points to is a symbol that demangles to the static's path.
+            if name.starts_with("_RNn") {
+                continue;
+            }
             let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
             let with_ids = demangled.to_string();
             for (krate, id) in crate_ids(&with_ids) {
@@ -170,6 +192,25 @@ fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     // FIXME: a path with a space in it is escaped.
     let source = sources.split(' ').next()?;
     Some((name.to_owned(), root.join(source)))
+}
+
+/// A v0 symbol without the crate that instantiated it, which ends the symbol of a generic
+/// instance as `Cs<id>_<len><name>` or as a back reference `B<offset>_`. Copies of one instance
+/// made by two crates differ only in that.
+fn without_instantiating_crate(symbol: &str) -> &str {
+    let is_base62 = |c: char| c.is_ascii_alphanumeric();
+    if let Some(body) = symbol.strip_suffix('_')
+        && let Some(start) = body.rfind('B')
+        && body[start + 1..].chars().all(is_base62)
+    {
+        return &symbol[..start];
+    }
+    // `Cs<id>_<len><name>`: the name is the last `len` bytes.
+    let Some(crate_start) = symbol.rfind("Cs") else { return symbol };
+    let Some((id, ident)) = symbol[crate_start + 2..].split_once('_') else { return symbol };
+    let digits = ident.chars().take_while(char::is_ascii_digit).count();
+    let named = ident[..digits].parse() == Ok(ident.len() - digits);
+    if id.chars().all(is_base62) && named { &symbol[..crate_start] } else { symbol }
 }
 
 /// The `name[id]` a demangled v0 symbol prints for each crate in it.

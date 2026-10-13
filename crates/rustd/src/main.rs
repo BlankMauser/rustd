@@ -244,7 +244,8 @@ impl Resolver<'_> {
             return Some(builtin.name().as_str().to_owned());
         }
         let adt = ty.as_adt()?;
-        if ty.type_arguments().next().is_some() {
+        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`.
+        if !hir::GenericDef::from(adt).type_or_const_params(self.db).is_empty() {
             return None;
         }
         self.item_path(adt.module(self.db), adt.name(self.db).as_str())

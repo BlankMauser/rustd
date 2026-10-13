@@ -248,4 +248,6 @@ fn main() {
     println!("shadowed_items {}", cases::shadowed_items::run());
     println!("hrtb_type_ids {:?}", cases::hrtb_type_ids::run());
     println!("projected_patterns {:?}", cases::projected_patterns::run());
+    println!("projected_fields {:?}", cases::projected_fields::run());
+    println!("anonymous_consts {:?}", cases::anonymous_consts::run());
 }

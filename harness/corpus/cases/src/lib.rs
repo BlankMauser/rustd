@@ -3736,3 +3736,75 @@ pub mod projected_patterns {
         )
     }
 }
+
+/// A field typed `<Flags as Public>::Internal` is compared, ordered and hashed as `Inner`.
+pub mod projected_fields {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    pub trait Public {
+        type Internal;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Inner(u8);
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Flags(<Flags as Public>::Internal);
+
+    impl Public for Flags {
+        type Internal = Inner;
+    }
+
+    pub fn run() -> (bool, std::cmp::Ordering, Option<std::cmp::Ordering>, u64, String) {
+        let (a, b) = (Flags(Inner(1)), Flags(Inner(2)));
+        let mut hasher = DefaultHasher::new();
+        a.clone().hash(&mut hasher);
+        (a == b, a.cmp(&b), b.partial_cmp(&a), hasher.finish(), format!("{a:?}"))
+    }
+}
+
+/// Two `const _` blocks of one module each have an `Inner`, and rustc's symbols for the two
+/// read the same.
+pub mod anonymous_consts {
+    pub trait Named {
+        fn name(&self) -> String;
+    }
+
+    pub struct First;
+    pub struct Second;
+
+    const _: () = {
+        #[derive(Debug, PartialEq)]
+        struct Inner(u8);
+        impl Inner {
+            fn describe(&self) -> String {
+                format!("first {:?} {}", self, *self == Inner(1))
+            }
+        }
+        impl Named for First {
+            fn name(&self) -> String {
+                Inner(1).describe()
+            }
+        }
+    };
+
+    const _: () = {
+        #[derive(Debug, PartialEq)]
+        struct Inner(&'static str);
+        impl Inner {
+            fn describe(&self) -> String {
+                format!("second {:?} {}", self, *self == Inner("b"))
+            }
+        }
+        impl Named for Second {
+            fn name(&self) -> String {
+                Inner("a").describe()
+            }
+        }
+    };
+
+    pub fn run() -> (String, String) {
+        (First.name(), Second.name())
+    }
+}

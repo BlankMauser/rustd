@@ -2715,9 +2715,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             addr = self.builder.ins().load(PTR, MEM, addr, 0);
         }
         let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
+        ty.ty = self.normalize(ty.ty);
         for proj in place.projection.as_slice() {
             let prev = ty;
             ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
+            // The pointee or field can be `Self::Buffer`, which has to be an array to index.
+            ty.ty = self.normalize(ty.ty);
             match proj {
                 ProjectionElem::Deref => match self.layout(prev.ty)?.backend_repr {
                     BackendRepr::Scalar(_) => {
