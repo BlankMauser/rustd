@@ -1167,6 +1167,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 };
                 if mutability.is_shared()
                     && p.local.into_raw().into_u32() as usize >= locals
+                    // Behind a deref the local is a pointer, an overloaded index's result say,
+                    // and not the value.
+                    && !p.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
                     && self.is_promotable(*expr)
                 {
                     // The local holds what the fields and elements are taken out of.

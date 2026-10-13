@@ -230,4 +230,5 @@ fn main() {
     println!("type_ids more_std_types {:?}", cases::type_id_hashes::more_std_types());
     println!("type_names {:?}", cases::type_names::run());
     println!("type_ids downcasts {:?}", cases::type_id_hashes::downcasts());
+    println!("promoted_slices {:?}", cases::promoted_slices::run());
 }

@@ -3017,3 +3017,16 @@ pub mod type_names {
         ]
     }
 }
+
+pub mod promoted_slices {
+    /// `&[..][..]` borrows the array and then indexes it: the temporary that is promoted is
+    /// the array, not the slice the index returns.
+    pub fn run() -> (usize, Vec<i32>, usize, Vec<u64>, [u64; 2]) {
+        let a = &[0i32, 0, 0, 0][..];
+        let b = &[5, 6, 7, 8][..];
+        let c = &[0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..];
+        let d = &[5u64, 6, 7, 8][1..3];
+        let e = &[[5u64, 6], [7, 8]][1];
+        (a.len(), b.to_vec(), c.len(), d.to_vec(), *e)
+    }
+}

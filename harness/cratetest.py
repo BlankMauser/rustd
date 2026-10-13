@@ -7,7 +7,7 @@ Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects f
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
 import argparse, json, os, re, sys
-from difftest import Fixture, compare
+from difftest import Fixture, compare, discard
 
 
 UNIT = "(unit tests)"
@@ -91,7 +91,8 @@ def main():
                 print(f"left out: rustc does not build it: {str(e)[-300:]}")
                 continue
             print(f"ERROR: {str(e)[:1500]}")
-            results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {}})
+            results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {},
+                            "work": fx.work})
             continue
         if not result["match"]:
             result["differing_tests"] = differing_tests(fx)
@@ -107,6 +108,7 @@ def main():
                   "binaries": results,
                   "culprits": [c for r in results for c in r.get("culprits", [])]}
         json.dump(merged, open(a.json, "w"), indent=1)
+    discard(results)
     sys.exit(0 if ok else 1)
 
 

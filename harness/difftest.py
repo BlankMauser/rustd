@@ -221,7 +221,16 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
         result["layouts"] = {"compared": compared, "wrong": [w[0] for w in wrong]}
         if wrong:
             result["match"] = False
+    result["work"] = fx.work
     return result
+
+
+def discard(results):
+    """Scratch directories are only worth keeping for what did not match."""
+    import shutil
+    for r in results:
+        if r.get("match"):
+            shutil.rmtree(r["work"], ignore_errors=True)
 
 
 def main():
@@ -239,6 +248,7 @@ def main():
     result = compare(fx, a.bin, a.bisect, a.memcheck, a.layouts)
     if a.json:
         json.dump(result, open(a.json, "w"), indent=1)
+    discard([result])
     sys.exit(0 if result["match"] else 1)
 
 
