@@ -2,19 +2,15 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 2899.276,
-    "compiled": 69,
-    "instances": 112,
-    "not_roots": 4,
-    "roots": 84,
+    "codegen_ms": 3015.968,
+    "compiled": 89,
+    "instances": 174,
+    "not_roots": 8,
+    "roots": 96,
     "skipped": {
-     "ReifyFnPointer cast": 1,
-     "call through a vtable": 1,
-     "closure aggregate": 5,
+     "call through a vtable": 2,
      "drop glue": 3,
-     "indirect call": 1,
      "mir: NotSupported": 1,
-     "odd-sized aggregate in a register": 2,
      "unsizing": 1
     }
    }
@@ -25,17 +21,17 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 5135.684,
-    "compiled": 27,
-    "instances": 105,
+    "codegen_ms": 5007.285,
+    "compiled": 28,
+    "instances": 113,
     "not_roots": 45,
     "roots": 47,
     "skipped": {
      "abi of SimdVector": 4,
      "call through a vtable": 3,
-     "call to `call`, which has no body and no rustc symbol": 1,
      "call to builtin derive method": 4,
-     "odd-sized aggregate in a register": 4,
+     "drop glue": 2,
+     "expected scalar": 2,
      "static without a rustc symbol": 4
     }
    }
@@ -48,7 +44,7 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 2788.774,
+    "codegen_ms": 2768.349,
     "compiled": 2,
     "instances": 14,
     "not_roots": 23,
@@ -66,16 +62,14 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 5062.202,
-    "compiled": 31,
-    "instances": 182,
+    "codegen_ms": 5132.224,
+    "compiled": 34,
+    "instances": 222,
     "not_roots": 18,
     "roots": 61,
     "skipped": {
-     "ReifyFnPointer cast": 3,
-     "call through a vtable": 9,
+     "call through a vtable": 12,
      "call to builtin derive method": 4,
-     "closure aggregate": 3,
      "drop glue": 5,
      "unsizing": 6
     }
@@ -89,28 +83,28 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 2801.102,
+    "codegen_ms": 2709.561,
     "compiled": 0,
-    "instances": 32,
+    "instances": 81,
     "not_roots": 20,
     "roots": 3,
     "skipped": {
-     "closure aggregate": 3
+     "call through a vtable": 1,
+     "drop glue": 2
     }
    },
    "hex": {
-    "codegen_ms": 2877.68,
-    "compiled": 4,
-    "instances": 48,
+    "codegen_ms": 2887.987,
+    "compiled": 5,
+    "instances": 54,
     "not_roots": 170,
     "roots": 6,
     "skipped": {
-     "ReifyFnPointer cast": 1,
-     "closure aggregate": 1
+     "call through a vtable": 1
     }
    },
    "httparse": {
-    "codegen_ms": 2881.941,
+    "codegen_ms": 2881.502,
     "compiled": 13,
     "instances": 26,
     "not_roots": 67,
@@ -118,12 +112,13 @@
     "skipped": {
      "call through a vtable": 3,
      "call to builtin derive method": 4,
-     "odd-sized aggregate in a register": 4,
+     "drop glue": 2,
+     "expected scalar": 2,
      "static without a rustc symbol": 1
     }
    },
    "itoa": {
-    "codegen_ms": 2884.116,
+    "codegen_ms": 2677.672,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -131,17 +126,16 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 2983.059,
+    "codegen_ms": 3110.815,
     "compiled": 15,
-    "instances": 16,
+    "instances": 103,
     "not_roots": 36,
     "roots": 43,
     "skipped": {
-     "ReifyFnPointer cast": 2,
-     "call through a vtable": 9,
+     "call through a vtable": 12,
      "call to builtin derive method": 2,
-     "closure aggregate": 2,
      "drop glue": 9,
+     "mir: MissingFunctionDefinition": 1,
      "unsizing": 4
     }
    }
@@ -152,7 +146,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 2671.465,
+    "codegen_ms": 2640.566,
     "compiled": 5,
     "instances": 2,
     "not_roots": 0,

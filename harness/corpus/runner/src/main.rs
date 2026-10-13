@@ -63,6 +63,14 @@ fn main() {
     case!(closures::capture(10, &xs), closures::capture_mut(5), closures::iter_chain(&xs));
     case!(closures::fn_pointer(|x| x * 3, 2));
 
+    case!(callables::reify(4), callables::reify_pair(7), callables::generic_closure(3, 5));
+    case!(callables::generic_mut(6), callables::generic_once(9), callables::takes_fn(|a, b| a ^ b, 9));
+
+    let b3 = odd::rot3(odd::B3(1, 2, 3));
+    case!((b3.0, b3.1, b3.2), odd::rot5(odd::B5([1, 2, 3, 4, 5])).0, odd::chain(odd::B3(7, 8, 9)));
+    let b6 = odd::rot6(odd::B6(100, 200, 300));
+    case!((b6.0, b6.1, b6.2), odd::rot7(odd::B7([1, 2, 3, 4, 5, 6, 7]), 99).0);
+
     case!(dynamic::call(&dynamic::Dog(4)), dynamic::call(&dynamic::Cat), dynamic::make(true), dynamic::make(false));
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));

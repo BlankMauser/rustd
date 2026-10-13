@@ -28,13 +28,14 @@ use rustc_abi::{Integer, Size};
 use rustc_ast_ir::Mutability;
 use rustc_index::Idx;
 use rustc_hash::FxHashMap;
+use salsa::plumbing::{AsId, FromId};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use triomphe::Arc;
 
 use crate::{
     CallableDefId, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::try_const_usize,
-    db::GeneralConstId,
+    db::{GeneralConstId, InternedClosureId},
     infer::PointerCast,
     utils::detect_variant_from_bytes,
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -153,7 +154,10 @@ impl CodegenUnit {
         // Rejections of the edited crate's own functions may be out of date.
         if let Some(&root) = roots.first() {
             let krate = root.krate(db);
-            known.rejected.retain(|instance, _| instance.func.krate(db) != krate);
+            known.rejected.retain(|instance, _| match instance.def {
+                InstanceDef::Fn(func) => func.krate(db) != krate,
+                InstanceDef::Closure(_) => false,
+            });
         }
         let rejected = &mut known.rejected;
         loop {
@@ -186,8 +190,21 @@ pub struct Rejections {
 /// A function with concrete generic arguments that we compile ourselves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Instance {
-    func: FunctionId,
+    def: InstanceDef,
     args: StoredGenericArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InstanceDef {
+    Fn(FunctionId),
+    /// An `InternedClosureId`, stored without its database lifetime.
+    Closure(salsa::Id),
+}
+
+/// What a call transfers control to.
+enum Callee<'db> {
+    Instance(InstanceDef, GenericArgs<'db>),
+    Pointer(Value),
 }
 
 struct ObjectCodegen<'a, 'db> {
@@ -277,10 +294,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: ParamEnvAndCrate<'db>,
         id: FuncId,
     ) -> Result<()> {
-        let body = self
-            .db
-            .monomorphized_mir_body(instance.func.into(), instance.args.clone(), env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let body = match instance.def {
+            InstanceDef::Fn(func) => {
+                self.db.monomorphized_mir_body(func.into(), instance.args.clone(), env.store())
+            }
+            InstanceDef::Closure(id) => self.db.monomorphized_mir_body_for_closure(
+                InternedClosureId::from_id(id),
+                instance.args.clone(),
+                env.store(),
+            ),
+        }
+        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let mut ctx = self.compile_body(body, env)?;
         // The call site declared the instance with the signature it computed from its operands.
         if self.module.declarations().get_function_decl(id).signature != ctx.func.signature {
@@ -346,26 +370,30 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// has a symbol we can link against, otherwise an instance compiled into this object.
     fn callee(
         &mut self,
-        func: FunctionId,
+        def: InstanceDef,
         args: GenericArgs<'db>,
         env: ParamEnvAndCrate<'db>,
         sig: &Signature,
     ) -> Result<FuncId> {
-        if args.is_empty()
+        if let InstanceDef::Fn(func) = def
+            && args.is_empty()
             && let Some(symbol) = self.symbols.function(func)
         {
             return self.import(&symbol, sig);
         }
-        let instance = Instance { func, args: args.store() };
-        let signature = FunctionSignature::of(self.db, func);
-        let name = signature.name.as_str();
+        let instance = Instance { def, args: args.store() };
+        let signature = match def {
+            InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
+            InstanceDef::Closure(_) => None,
+        };
+        let name = signature.map_or("{closure}", |it| it.name.as_str());
         if let Some(reason) = self.rejected.get(&instance) {
             unsupported!("callee `{name}`: {reason}");
         }
         if let Some(&id) = self.instances.get(&instance) {
             return Ok(id);
         }
-        if !signature.has_body() {
+        if signature.is_some_and(|it| !it.has_body()) {
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let symbol = format!("rustd::{name}::{}", self.instances.len());
@@ -512,10 +540,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     size if size > max => PassMode::Indirect,
                     1 => PassMode::Cast(types::I8),
                     2 => PassMode::Cast(types::I16),
-                    4 => PassMode::Cast(types::I32),
-                    8 => PassMode::Cast(types::I64),
-                    16 => PassMode::Cast(types::I128),
-                    size => unsupported!("aggregate of {size} bytes passed in a register"),
+                    // An integer of exactly the aggregate's size; the bits above it are undefined.
+                    3 | 4 => PassMode::Cast(types::I32),
+                    _ => PassMode::Cast(types::I64),
                 }
             }
             _ => unsupported!("abi of {:?}", layout.backend_repr),
@@ -548,6 +575,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.push_abi_params(arg, &mut sig.params);
         }
         sig
+    }
+
+    /// Loads the register image of a `PassMode::Cast` aggregate of `size` bytes.
+    fn load_cast(&mut self, ty: Type, addr: Value, size: Size) -> Value {
+        if u64::from(ty.bytes()) == size.bytes() {
+            return self.builder.ins().load(ty, MEM, addr, 0);
+        }
+        let tmp = self.scratch();
+        self.copy(tmp, addr, size);
+        self.builder.ins().load(ty, MEM, tmp, 0)
+    }
+
+    fn store_cast(&mut self, value: Value, addr: Value, size: Size) {
+        let ty = self.builder.func.dfg.value_type(value);
+        if u64::from(ty.bytes()) == size.bytes() {
+            self.builder.ins().store(MEM, value, addr, 0);
+            return;
+        }
+        let tmp = self.scratch();
+        self.builder.ins().store(MEM, value, tmp, 0);
+        self.copy(addr, tmp, size);
+    }
+
+    /// Eight bytes of stack.
+    fn scratch(&mut self) -> Value {
+        let slot = self
+            .builder
+            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        self.builder.ins().stack_addr(PTR, slot, 0)
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -589,9 +645,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             };
             match mode {
                 PassMode::Ignore | PassMode::Indirect => (),
-                PassMode::Direct(_) | PassMode::Cast(_) => {
+                PassMode::Direct(_) => {
                     let value = incoming.next().expect("direct param");
                     self.builder.ins().store(MEM, value, addr, 0);
+                }
+                PassMode::Cast(_) => {
+                    let value = incoming.next().expect("cast param");
+                    self.store_cast(value, addr, layout.size);
                 }
                 PassMode::Pair(_, _, offset) => {
                     let a = incoming.next().expect("pair param");
@@ -686,7 +746,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 ProjectionElem::ConstantIndex { offset, from_end } => {
                     let index = if *from_end {
                         let len = self.len(prev.ty, meta)?;
-                        self.builder.ins().iadd_imm(len, -(*offset as i64))
+                        // Unlike rustc's MIR, offset 0 from the end is the last element.
+                        self.builder.ins().iadd_imm(len, -(*offset as i64) - 1)
                     } else {
                         self.builder.ins().iconst(PTR, *offset as i64)
                     };
@@ -1150,7 +1211,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let size = self.layout(ty)?.size;
                     self.copy(dst, src, size);
                 }
-                AggregateKind::Closure(_) => unsupported!("closure aggregate"),
+                AggregateKind::Closure(ty) => {
+                    let layout = self.layout(ty.as_ref())?;
+                    self.write_fields(dst, &layout, operands)?;
+                }
             },
             _ => unsupported!("rvalue {rvalue:?}"),
         }
@@ -1179,6 +1243,42 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let len = self.builder.ins().iconst(PTR, len as i64);
                 self.builder.ins().store(MEM, ptr, dst, 0);
                 self.builder.ins().store(MEM, len, dst, 8);
+            }
+            CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
+                let TyKind::FnDef(def, generic_args) = from_ty.kind() else {
+                    unsupported!("fn pointer to {from_ty:?}");
+                };
+                let CallableDefId::FunctionId(func) = def.0 else {
+                    unsupported!("fn pointer to a constructor");
+                };
+                let db = self.cg.db;
+                if FunctionSignature::is_intrinsic(db, func) {
+                    unsupported!("fn pointer to an intrinsic");
+                }
+                if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
+                    unsupported!("fn pointer to a `dyn` method");
+                }
+                let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
+                let either::Either::Left(callee) = callee else {
+                    unsupported!("fn pointer to a builtin derive method");
+                };
+                let TyKind::FnPtr(sig, _) = to_ty.kind() else {
+                    unsupported!("fn pointer cast to {to_ty:?}");
+                };
+                let sig = self.interner.instantiate_bound_regions_with_erased(sig);
+                let ret_layout = self.layout(sig.output())?;
+                let ret_mode = self.pass_mode(&ret_layout, true)?;
+                let mut arg_modes = Vec::new();
+                for ty in sig.inputs().iter() {
+                    let layout = self.layout(*ty)?;
+                    arg_modes.push(self.pass_mode(&layout, false)?);
+                }
+                let sig = self.signature(&arg_modes, ret_mode);
+                let callee =
+                    self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+                let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+                let pointer = self.builder.ins().func_addr(PTR, callee);
+                self.builder.ins().store(MEM, pointer, dst, 0);
             }
             CastKind::PointerCoercion(
                 PointerCast::MutToConstPointer
@@ -1477,12 +1577,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             TerminatorKind::Return => {
                 let addr = self.locals[return_slot()].addr;
+                if let PassMode::Cast(ty) = self.ret_mode {
+                    let size = self.layout(self.body.locals[return_slot()].ty.as_ref())?.size;
+                    let value = self.load_cast(ty, addr, size);
+                    self.builder.ins().return_(&[value]);
+                    return Ok(());
+                }
                 let mut load =
                     |ty, offset| self.builder.ins().load(ty, MEM, addr, offset);
                 let values = match self.ret_mode {
-                    PassMode::Ignore | PassMode::Indirect => vec![],
+                    PassMode::Ignore | PassMode::Indirect | PassMode::Cast(_) => vec![],
                     PassMode::Direct(s) => vec![load(s.ty, 0)],
-                    PassMode::Cast(ty) => vec![load(ty, 0)],
                     PassMode::Pair(a, b, offset) => {
                         vec![load(a.ty, 0), load(b.ty, offset.bytes() as i32)]
                     }
@@ -1515,8 +1620,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         target: Option<BasicBlockId>,
     ) -> Result<()> {
         let (dst, dst_ty) = self.place(destination)?;
-        let TyKind::FnDef(def, generic_args) = self.operand_ty(func)?.kind() else {
-            unsupported!("indirect call");
+        let fn_ty = self.operand_ty(func)?;
+        if let TyKind::FnPtr(..) = fn_ty.kind() {
+            let (addr, _) = self.operand(func)?;
+            let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
+            let values = self.operands(args)?;
+            self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty.ty)?;
+            return self.jump_after_call(target);
+        }
+        let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
+            unsupported!("call of {fn_ty:?}");
         };
         let func = match def.0 {
             CallableDefId::FunctionId(func) => func,
@@ -1532,6 +1645,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         };
         let db = self.cg.db;
+        let lang_items = self.interner.lang_items();
+        if [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once]
+            .contains(&Some(func))
+        {
+            self.call_fn_trait(args, dst, dst_ty.ty)?;
+            return self.jump_after_call(target);
+        }
         if FunctionSignature::is_intrinsic(db, func)
             && FunctionSignature::of(db, func).name.as_str() == "const_eval_select"
         {
@@ -1572,12 +1692,71 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
             }
         }
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            values.push(self.operand(arg)?);
-        }
+        let values = self.operands(args)?;
         self.call_direct(func, generic_args, &values, dst, dst_ty.ty)?;
         self.jump_after_call(target)
+    }
+
+    fn operands(&mut self, operands: &[Operand]) -> Result<Vec<(Value, Ty<'db>)>> {
+        operands.iter().map(|it| self.operand(it)).collect()
+    }
+
+    /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`. MIR passes the callee first and
+    /// then the arguments one by one, not as a tuple.
+    fn call_fn_trait(&mut self, args: &[Operand], dst: Value, dst_ty: Ty<'db>) -> Result<()> {
+        let Some((callee, rest)) = args.split_first() else {
+            unsupported!("Fn-trait call without a callee");
+        };
+        let (mut addr, mut ty) = self.operand(callee)?;
+        while let TyKind::Ref(_, inner, _) = ty.kind() {
+            if let TyKind::Dynamic(..) = inner.kind() {
+                unsupported!("call through a vtable");
+            }
+            addr = self.builder.ins().load(PTR, MEM, addr, 0);
+            ty = inner;
+        }
+        let mut values = self.operands(rest)?;
+        match ty.kind() {
+            TyKind::FnDef(def, generic_args) => {
+                let CallableDefId::FunctionId(func) = def.0 else {
+                    unsupported!("constructor called through an Fn trait");
+                };
+                if FunctionSignature::is_intrinsic(self.cg.db, func) {
+                    unsupported!("intrinsic called through an Fn trait");
+                }
+                self.call_direct(func, generic_args, &values, dst, dst_ty)
+            }
+            TyKind::FnPtr(..) => {
+                let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
+                self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty)
+            }
+            TyKind::Closure(id, generic_args) => {
+                let parent_args =
+                    GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
+                let body = self
+                    .cg
+                    .db
+                    .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
+                    .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+                if body.param_locals.len() != args.len() {
+                    unsupported!("closure called with a tuple of arguments");
+                }
+                // The body takes the closure by reference or by value depending on its kind,
+                // whichever trait method the call went through.
+                let self_ty = body.locals[body.param_locals[0]].ty.as_ref();
+                let self_arg = if self_ty.as_reference().is_some() {
+                    let slot = self.scratch();
+                    self.builder.ins().store(MEM, addr, slot, 0);
+                    (slot, self_ty)
+                } else {
+                    (addr, ty)
+                };
+                values.insert(0, self_arg);
+                let def = InstanceDef::Closure(id.0.as_id());
+                self.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
+            }
+            _ => unsupported!("Fn-trait call on {ty:?}"),
+        }
     }
 
     /// Calls `func` with arguments that live at the given addresses.
@@ -1597,7 +1776,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let either::Either::Left(callee) = callee else {
             unsupported!("call to builtin derive method");
         };
+        self.emit_call(Callee::Instance(InstanceDef::Fn(callee), callee_args), args, dst, dst_ty)
+    }
 
+    /// Passes the arguments, which live at the given addresses, the way the Rust ABI wants them
+    /// and stores the result in `dst`.
+    fn emit_call(
+        &mut self,
+        callee: Callee<'db>,
+        args: &[(Value, Ty<'db>)],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
         let ret_layout = self.layout(dst_ty)?;
         let ret_mode = self.pass_mode(&ret_layout, true)?;
         let mut arg_modes = Vec::with_capacity(args.len());
@@ -1609,12 +1799,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let layout = self.layout(ty)?;
             let mode = self.pass_mode(&layout, false)?;
             arg_modes.push(mode);
+            if let PassMode::Cast(ty) = mode {
+                values.push(self.load_cast(ty, addr, layout.size));
+                continue;
+            }
             let mut load =
                 |ty, offset| self.builder.ins().load(ty, MEM, addr, offset);
             match mode {
-                PassMode::Ignore => (),
+                PassMode::Ignore | PassMode::Cast(_) => (),
                 PassMode::Direct(s) => values.push(load(s.ty, 0)),
-                PassMode::Cast(ty) => values.push(load(ty, 0)),
                 PassMode::Pair(a, b, offset) => {
                     values.extend([load(a.ty, 0), load(b.ty, offset.bytes() as i32)])
                 }
@@ -1627,15 +1820,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         }
         let sig = self.signature(&arg_modes, ret_mode);
-        let callee = self.cg.callee(callee, callee_args, self.env, &sig)?;
-        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        let call = self.builder.ins().call(callee, &values);
+        let call = match callee {
+            Callee::Instance(def, generic_args) => {
+                let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
+                let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &values)
+            }
+            Callee::Pointer(pointer) => {
+                let sig = self.builder.import_signature(sig);
+                self.builder.ins().call_indirect(sig, pointer, &values)
+            }
+        };
         let results = self.builder.inst_results(call).to_vec();
         match ret_mode {
             PassMode::Ignore | PassMode::Indirect => (),
-            PassMode::Direct(_) | PassMode::Cast(_) => {
+            PassMode::Direct(_) => {
                 self.builder.ins().store(MEM, results[0], dst, 0);
             }
+            PassMode::Cast(_) => self.store_cast(results[0], dst, ret_layout.size),
             PassMode::Pair(_, _, offset) => {
                 self.builder.ins().store(MEM, results[0], dst, 0);
                 self.builder.ins().store(

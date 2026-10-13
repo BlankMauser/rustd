@@ -369,6 +369,56 @@ pub mod closures {
     }
 }
 
+pub mod callables {
+    fn double(x: u32) -> u32 { x * 2 }
+    fn pair(x: u32) -> (u64, u64) { (x as u64, x as u64 + 1) }
+    fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
+    fn apply_mut<F: FnMut(u32)>(mut f: F, x: u32) { f(x); f(x + 1) }
+    fn apply_once<F: FnOnce() -> [u64; 3]>(f: F) -> [u64; 3] { f() }
+
+    pub fn reify(x: u32) -> u32 {
+        let f: fn(u32) -> u32 = double;
+        f(x) + apply(double, x)
+    }
+    pub fn reify_pair(x: u32) -> (u64, u64) {
+        let f: fn(u32) -> (u64, u64) = pair;
+        f(x)
+    }
+    pub fn generic_closure(k: u32, x: u32) -> u32 {
+        apply(|v| v * k, x) + apply(&|v| v + k, x)
+    }
+    pub fn generic_mut(x: u32) -> u32 {
+        let mut total = 0;
+        apply_mut(|v| total += v, x);
+        total
+    }
+    pub fn generic_once(a: u64) -> [u64; 3] {
+        let big = [a, a + 1, a + 2];
+        apply_once(move || big)
+    }
+    pub fn takes_fn(f: fn(u8, u8) -> u8, a: u8) -> u8 { f(a, 3) }
+}
+
+pub mod odd {
+    #[derive(Clone, Copy)]
+    pub struct B3(pub u8, pub u8, pub u8);
+    #[derive(Clone, Copy)]
+    pub struct B5(pub [u8; 5]);
+    #[derive(Clone, Copy)]
+    pub struct B6(pub u16, pub u16, pub u16);
+    #[derive(Clone, Copy)]
+    pub struct B7(pub [u8; 7]);
+
+    pub fn rot3(b: B3) -> B3 { B3(b.1, b.2, b.0) }
+    pub fn rot5(b: B5) -> B5 { B5([b.0[4], b.0[0], b.0[1], b.0[2], b.0[3]]) }
+    pub fn rot6(b: B6) -> B6 { B6(b.2, b.0, b.1) }
+    pub fn rot7(b: B7, x: u8) -> B7 { B7([x, b.0[0], b.0[1], b.0[2], b.0[3], b.0[4], b.0[5]]) }
+    pub fn chain(b: B3) -> u32 {
+        let r = rot3(rot3(b));
+        r.0 as u32 * 10000 + r.1 as u32 * 100 + r.2 as u32
+    }
+}
+
 pub mod dynamic {
     pub trait Speak { fn speak(&self) -> u32; }
     pub struct Dog(pub u32);
