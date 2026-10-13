@@ -103,4 +103,11 @@ fn main() {
     case!(logged(&|l| drops::looped(l, 4)), drops::strings(3));
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
+
+    let long = "the quick brown fox jumps over the lazy dog, twice over and then some more";
+    case!(simd::ascii(long), simd::ascii("caf\u{e9} au lait, s'il vous pla\u{ee}t, merci beaucoup"), simd::ascii(""));
+    case!(simd::ascii_bytes(long.as_bytes()), simd::ascii_bytes(&[b'a', 200, b'c']));
+    let hay = *b"hello, simd lane";
+    let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
+    case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
 }

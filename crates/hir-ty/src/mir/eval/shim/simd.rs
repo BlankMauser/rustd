@@ -167,6 +167,19 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 }
                 destination.write_from_bytes(self, &result)
             }
+            "splat" => {
+                let [value] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "simd_splat args are not provided".into(),
+                    ));
+                };
+                let value = value.get(self)?;
+                if value.is_empty() {
+                    return Ok(());
+                }
+                let result = value.repeat(destination.size / value.len());
+                destination.write_from_bytes(self, &result)
+            }
             _ => not_supported!("unknown simd intrinsic {name}"),
         }
     }

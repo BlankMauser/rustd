@@ -623,3 +623,33 @@ pub mod heap {
         format!("{a}-{b}")
     }
 }
+
+pub mod simd {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    pub fn ascii(s: &str) -> bool {
+        s.is_ascii()
+    }
+    pub fn ascii_bytes(b: &[u8]) -> bool {
+        b.is_ascii()
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn find(hay: &[u8; 16], needle: u8) -> i32 {
+        unsafe {
+            let hay = _mm_loadu_si128(hay.as_ptr().cast());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(hay, _mm_set1_epi8(needle as i8)))
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn mix(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+        unsafe {
+            let x = _mm_loadu_si128(a.as_ptr().cast());
+            let y = _mm_loadu_si128(b.as_ptr().cast());
+            let z = _mm_xor_si128(_mm_and_si128(x, y), _mm_or_si128(x, _mm_add_epi8(x, y)));
+            let mut out = [0; 16];
+            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_sub_epi8(z, _mm_cmpgt_epi8(x, y)));
+            out
+        }
+    }
+}

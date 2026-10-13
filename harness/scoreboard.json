@@ -2,11 +2,11 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 3168.261,
-    "compiled": 141,
-    "instances": 860,
+    "codegen_ms": 4538.516,
+    "compiled": 145,
+    "instances": 922,
     "not_roots": 32,
-    "roots": 141,
+    "roots": 145,
     "skipped": {}
    }
   },
@@ -16,14 +16,12 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 6752.898,
-    "compiled": 36,
-    "instances": 297,
+    "codegen_ms": 6119.882,
+    "compiled": 45,
+    "instances": 504,
     "not_roots": 65,
     "roots": 47,
     "skipped": {
-     "abi of SimdVector": 5,
-     "expected scalar": 4,
      "static with interior mutability and no rustc symbol": 2
     }
    }
@@ -36,7 +34,7 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 3822.535,
+    "codegen_ms": 2993.449,
     "compiled": 2,
     "instances": 14,
     "not_roots": 23,
@@ -54,14 +52,12 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 7399.657,
-    "compiled": 62,
-    "instances": 629,
+    "codegen_ms": 6034.725,
+    "compiled": 63,
+    "instances": 741,
     "not_roots": 43,
     "roots": 63,
-    "skipped": {
-     "abi of SimdVector": 1
-    }
+    "skipped": {}
    }
   },
   "culprits": [],
@@ -72,7 +68,7 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 3631.583,
+    "codegen_ms": 2990.154,
     "compiled": 3,
     "instances": 262,
     "not_roots": 20,
@@ -80,7 +76,7 @@
     "skipped": {}
    },
    "hex": {
-    "codegen_ms": 3381.795,
+    "codegen_ms": 3958.874,
     "compiled": 6,
     "instances": 193,
     "not_roots": 173,
@@ -88,19 +84,17 @@
     "skipped": {}
    },
    "httparse": {
-    "codegen_ms": 3902.578,
-    "compiled": 15,
-    "instances": 168,
+    "codegen_ms": 3757.229,
+    "compiled": 16,
+    "instances": 361,
     "not_roots": 87,
     "roots": 25,
     "skipped": {
-     "abi of SimdVector": 1,
-     "expected scalar": 4,
-     "static with interior mutability and no rustc symbol": 5
+     "static with interior mutability and no rustc symbol": 9
     }
    },
    "itoa": {
-    "codegen_ms": 2868.871,
+    "codegen_ms": 2954.954,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -108,15 +102,12 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 3876.274,
-    "compiled": 34,
-    "instances": 430,
+    "codegen_ms": 3342.278,
+    "compiled": 43,
+    "instances": 774,
     "not_roots": 63,
     "roots": 43,
-    "skipped": {
-     "abi of SimdVector": 1,
-     "mir: MissingFunctionDefinition": 8
-    }
+    "skipped": {}
    }
   },
   "fixture": "real",
@@ -125,7 +116,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 2849.934,
+    "codegen_ms": 3080.696,
     "compiled": 5,
     "instances": 2,
     "not_roots": 2,

@@ -407,6 +407,7 @@ impl<'db> Resolver<'db> {
         if skip_to_mod {
             return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path));
         }
+        let path_hygiene = hygiene_id;
 
         if n_segments <= 1 {
             let mut hygiene_info = hygiene_info(db, hygiene_id);
@@ -497,6 +498,12 @@ impl<'db> Resolver<'db> {
         }
 
         if let Some(res) = self.module_scope.resolve_path_in_value_ns(db, path) {
+            return Some(res);
+        }
+
+        if let Some(res) = macro_def_site(db, path_hygiene)
+            .and_then(|module| module.resolver(db).module_scope.resolve_path_in_value_ns(db, path))
+        {
             return Some(res);
         }
 
@@ -982,6 +989,19 @@ fn handle_macro_def_scope(
             (parent_ctx.parent(db), expansion.def)
         });
     }
+}
+
+/// The module of the `macro` whose expansion produced a name. Items named in such a macro are
+/// the ones in scope where the macro is defined.
+// FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
+fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
+    let (_, def) = hygiene_info(db, hygiene_id)?;
+    crate::crate_def_map(db, def.krate).modules().find_map(|(_, data)| {
+        data.scope.macros().find_map(|(_, it)| match it.def {
+            MacroId::Macro2Id(id) if it.def.definition(db) == def => Some(id.lookup(db).container),
+            _ => None,
+        })
+    })
 }
 
 #[inline]
