@@ -920,7 +920,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 return self.import(&symbol, sig);
             }
-            unsupported!("call to `{name}`{args:?}, which has no body and no rustc symbol");
+            unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let symbol = format!("rustd::{name}::{}", self.instances.len());
         let id = self
@@ -5207,6 +5207,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         {
             let src = self.builder.ins().load(PTR, MEM, receiver, 0);
             return self.clone_builtin(func, src, dst, dst_ty);
+        }
+        // `FnPtr::addr` is the compiler's to supply as well: a function pointer is its address.
+        if callee == func
+            && let ItemContainerId::TraitId(trait_) = func.lookup(db).container
+            && Some(trait_) == self.interner.lang_items().FnPtrTrait
+            && let &[(receiver, _)] = args
+        {
+            let addr = self.builder.ins().load(PTR, MEM, receiver, 0);
+            self.builder.ins().store(MEM, addr, dst, 0);
+            return Ok(());
         }
         self.emit_call(Callee::Instance(InstanceDef::Fn(callee), callee_args), args, dst, dst_ty)
     }

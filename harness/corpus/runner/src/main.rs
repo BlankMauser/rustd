@@ -256,4 +256,5 @@ fn main() {
     for it in cases::stringified::run() {
         println!("stringified {it:?}");
     }
+    println!("fn_pointers {:?}", cases::fn_pointers::run());
 }

@@ -4033,3 +4033,47 @@ pub mod stringified {
         ]
     }
 }
+
+/// What std does with a function pointer goes through `FnPtr::addr`, which only the compiler
+/// implements.
+pub mod fn_pointers {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn one() -> u8 {
+        1
+    }
+
+    fn two() -> u8 {
+        2
+    }
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+    pub struct Callback(fn() -> u8, unsafe extern "C" fn(u8) -> u8);
+
+    unsafe extern "C" fn id(x: u8) -> u8 {
+        x
+    }
+
+    fn hash(value: impl Hash) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn run() -> (bool, bool, bool, bool, bool, bool, usize, u8) {
+        let (a, b): (fn() -> u8, fn() -> u8) = (one, two);
+        let (x, y) = (Callback(a, id), Callback(b, id));
+        let shown = format!("{a:?} {a:p} {x:?}");
+        (
+            a == a,
+            a == b,
+            (a < b) == ((a as usize) < (b as usize)),
+            x == x.clone() && x != y,
+            hash(a) == hash(a) && hash(x) == hash(x),
+            x.cmp(&y) == a.cmp(&b),
+            shown.matches("0x").count(),
+            (x.0)() + unsafe { (y.1)(3) },
+        )
+    }
+}
