@@ -1283,14 +1283,17 @@ impl<'db> PlaceTy<'db> {
         }
         match *elem {
             ProjectionElem::Deref => {
-                let ty = structurally_normalize(self.ty).builtin_deref(true).unwrap_or_else(|| {
-                    panic!("deref projection of non-dereferenceable ty {:?}", self)
-                });
+                // Lowering a deref pattern on a smart pointer gets here, for one.
+                let ty = structurally_normalize(self.ty)
+                    .builtin_deref(true)
+                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed));
                 PlaceTy::from_ty(ty)
             }
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                PlaceTy::from_ty(structurally_normalize(self.ty).builtin_index().unwrap())
-            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => PlaceTy::from_ty(
+                structurally_normalize(self.ty)
+                    .builtin_index()
+                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed)),
+            ),
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
                 PlaceTy::from_ty(match structurally_normalize(self.ty).kind() {
                     TyKind::Slice(..) => self.ty,

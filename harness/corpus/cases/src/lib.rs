@@ -682,6 +682,27 @@ pub mod drops {
         };
         b + next(&a).1
     }
+    /// An arm's bindings are dropped when the arm ends, and a guard's temporaries before the
+    /// arm is entered. A guard that fails gives the value back for the next arm.
+    pub fn arms(log: &Cell<u64>, pick: u64) {
+        let pair = Some((make(log, 1), make(log, 2)));
+        let _late = make(log, 3);
+        match pair {
+            Some((taken, _)) if next(&taken).1 == pick => log.set(log.get() * 10 + 7),
+            Some(whole) => log.set(log.get() * 10 + whole.1.1 + 6),
+            None => {}
+        }
+    }
+    /// What `if let` binds is dropped at the end of the branch, not of the function.
+    pub fn if_let(log: &Cell<u64>, some: bool) {
+        let _outer = make(log, 1);
+        if let Some(_inner) = some.then(|| make(log, 2)) {
+            log.set(log.get() * 10 + 3);
+        } else {
+            log.set(log.get() * 10 + 4);
+        }
+        log.set(log.get() * 10 + 5);
+    }
     pub fn strings(n: usize) -> usize {
         let s = "ab".repeat(n);
         let t = s.clone();

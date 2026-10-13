@@ -796,6 +796,38 @@ struct PlaceRef<'db> {
 }
 
 /// A field that some statement moves out of a local, as the field indices leading to it.
+/// The integer type drop glue reads an enum's discriminant as, to pick the variant.
+#[derive(Clone, Copy)]
+enum DiscriminantWidth {
+    Word,
+    /// `#[repr(i128)]` and `#[repr(u128)]` enums.
+    Wide,
+}
+
+impl DiscriminantWidth {
+    fn of(tag: &rustc_abi::Scalar) -> Self {
+        match tag.primitive() {
+            Primitive::Int(Integer::I128, _) => Self::Wide,
+            _ => Self::Word,
+        }
+    }
+
+    fn scalar(self) -> AbiScalar {
+        match self {
+            Self::Word => AbiScalar { ty: types::I64, signed: true },
+            Self::Wide => AbiScalar { ty: types::I128, signed: true },
+        }
+    }
+
+    /// The switch entry for a variant whose discriminant is `value`.
+    fn entry(self, value: i128) -> u128 {
+        match self {
+            Self::Word => value as i64 as u64 as u128,
+            Self::Wide => value as u128,
+        }
+    }
+}
+
 /// The step in a [`MovedPath`] from a `Box` to what it owns.
 const BOX_CONTENTS: u32 = u32::MAX;
 /// The step in a [`MovedPath`] from an enum to the fields of one of its variants, combined with
@@ -1595,7 +1627,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let AdtId::EnumId(id) = adt_def.def_id() else { unreachable!() };
                     let db = self.cg.db;
                     let layout = self.layout(ty)?;
-                    let wide = AbiScalar { ty: types::I64, signed: true };
+                    let wide = match &layout.variants {
+                        Variants::Multiple { tag, .. } => DiscriminantWidth::of(tag),
+                        _ => DiscriminantWidth::Word,
+                    };
                     let single = match &layout.variants {
                         Variants::Empty => {
                             self.builder.ins().jump(done, &[]);
@@ -1616,7 +1651,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
                         let block = self.builder.create_block();
                         if single.is_none() {
-                            switch.set_entry(value as i64 as u64 as u128, block);
+                            switch.set_entry(wide.entry(value), block);
                         }
                         arms.push((block, variant));
                     }
@@ -1626,7 +1661,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             None => self.builder.ins().jump(done, &[]),
                         };
                     } else {
-                        let discr = self.discriminant(addr, ty, wide)?;
+                        let discr = self.discriminant(addr, ty, wide.scalar())?;
                         switch.emit(&mut self.builder, discr, done);
                     }
                     for (block, variant) in arms {
@@ -4514,9 +4549,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                                 self.drop_fields(addr, &layout, variant.into(), subst)?;
                             }
                         }
-                        Variants::Multiple { variants, .. } => {
-                            let wide = AbiScalar { ty: types::I64, signed: true };
-                            let discr = self.discriminant(addr, ty, wide)?;
+                        Variants::Multiple { variants, tag, .. } => {
+                            let wide = DiscriminantWidth::of(tag);
+                            let discr = self.discriminant(addr, ty, wide.scalar())?;
                             let done = self.builder.create_block();
                             let mut switch = Switch::new();
                             let mut arms = Vec::new();
@@ -4525,7 +4560,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                                     CodegenError::Frontend(format!("discriminant: {e:?}"))
                                 })?;
                                 let block = self.builder.create_block();
-                                switch.set_entry(value as i64 as u64 as u128, block);
+                                switch.set_entry(wide.entry(value), block);
                                 arms.push((block, variant));
                             }
                             switch.emit(&mut self.builder, discr, done);

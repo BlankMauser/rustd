@@ -106,6 +106,8 @@ fn main() {
     case!(logged(&|l| drops::box_refilled(l)), logged(&|l| drops::left_behind(l)));
     case!(logged(&|l| drops::binding_order(l, true)), logged(&|l| drops::binding_order(l, false)));
     case!(logged(&|l| { drops::tail_temporaries(l); }));
+    case!(logged(&|l| drops::arms(l, 2)), logged(&|l| drops::arms(l, 0)));
+    case!(logged(&|l| drops::if_let(l, true)), logged(&|l| drops::if_let(l, false)));
     case!(logged(&|l| drop(drops::statement_temps(l))), drops::statement_temps(&std::cell::Cell::new(0)));
     case!(logged(&|l| drop(drops::tail_temp(l))), drops::tail_temp(&std::cell::Cell::new(0)), drops::tail_temp_block(&std::cell::Cell::new(0)));
     case!(drops::tail_temp_call(&std::cell::RefCell::new(Vec::new()), 3));

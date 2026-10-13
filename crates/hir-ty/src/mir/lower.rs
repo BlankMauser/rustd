@@ -552,8 +552,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // backend can leave out the branch that cannot run.
                 let plain =
                     self.has_let(*condition) || matches!(self.store[*condition], Expr::Literal(_));
+                // What `if let` binds, and the temporaries of what it matches on, are dropped
+                // when the branch that was taken ends.
+                let bindings = self.has_let(*condition).then(|| self.push_drop_scope());
                 let (discr, current) = if plain {
                     let Some(it) = self.lower_expr_to_some_operand(*condition, current)? else {
+                        if let Some(bindings) = bindings {
+                            bindings.pop_assume_dropped(self);
+                        }
                         return Ok(None);
                     };
                     it
@@ -573,14 +579,39 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     };
                     (discr, current)
                 };
-                let start_of_then = self.new_basic_block();
-                let end_of_then = self.lower_expr_to_place(*then_branch, place, start_of_then)?;
-                let start_of_else = self.new_basic_block();
-                let end_of_else = if let Some(else_branch) = else_branch {
-                    self.lower_expr_to_place(*else_branch, place, start_of_else)?
-                } else {
-                    Some(start_of_else)
+                let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
+                let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
+                    if let Some(bound) = &bound {
+                        this.emit_drop_and_storage_dead_for_scope(
+                            bound,
+                            &mut block,
+                            (*condition).into(),
+                        );
+                    }
+                    block
                 };
+                let start_of_then = self.new_basic_block();
+                let end_of_then = self
+                    .lower_expr_to_place(*then_branch, place, start_of_then)?
+                    .map(|block| drop_bound(self, block));
+                let start_of_else = self.new_basic_block();
+                // From the 2024 edition on, the `else` branch runs after the drops.
+                let early = self.edition().at_least_2024();
+                let else_block =
+                    if early { drop_bound(self, start_of_else) } else { start_of_else };
+                let end_of_else = if let Some(else_branch) = else_branch {
+                    self.lower_expr_to_place(*else_branch, place, else_block)?
+                } else {
+                    Some(else_block)
+                };
+                let end_of_else = if early {
+                    end_of_else
+                } else {
+                    end_of_else.map(|block| drop_bound(self, block))
+                };
+                if let Some(bindings) = bindings {
+                    bindings.pop_assume_dropped(self);
+                }
                 self.set_terminator(
                     current,
                     TerminatorKind::SwitchInt {
@@ -741,6 +772,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Some(_) => self.or_expansions(*pat),
                         None => Vec::new(),
                     };
+                    // What the arm binds is dropped at the end of the arm.
+                    let arm = self.push_drop_scope();
                     if let &Some(guard) = guard
                         && (2..=64).contains(&expansions.len())
                     {
@@ -751,9 +784,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             self.or_choices.clear();
                             let (then, otherwise) = matched?;
                             let otherwise = otherwise.unwrap_or_else(|| self.new_basic_block());
-                            if let Some((discr, c)) =
-                                self.lower_expr_to_some_operand(guard, then)?
-                            {
+                            if let Some((discr, c)) = self.lower_guard(guard, then)? {
                                 self.set_terminator(
                                     c,
                                     TerminatorKind::SwitchInt {
@@ -766,8 +797,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             current = otherwise;
                         }
                         if let Some(block) = self.lower_expr_to_place(*expr, place, body)? {
+                            let block = arm.pop_and_drop(self, block, expr_id.into());
                             let r = end.get_or_insert_with(|| self.new_basic_block());
                             self.set_goto(block, *r, expr_id.into());
+                        } else {
+                            arm.pop_assume_dropped(self);
                         }
                         continue;
                     }
@@ -776,7 +810,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let then = if let &Some(guard) = guard {
                         let next = self.new_basic_block();
                         let o = otherwise.get_or_insert_with(|| self.new_basic_block());
-                        if let Some((discr, c)) = self.lower_expr_to_some_operand(guard, then)? {
+                        if let Some((discr, c)) = self.lower_guard(guard, then)? {
                             self.set_terminator(
                                 c,
                                 TerminatorKind::SwitchInt {
@@ -791,8 +825,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         then
                     };
                     if let Some(block) = self.lower_expr_to_place(*expr, place, then)? {
+                        let block = arm.pop_and_drop(self, block, expr_id.into());
                         let r = end.get_or_insert_with(|| self.new_basic_block());
                         self.set_goto(block, *r, expr_id.into());
+                    } else {
+                        arm.pop_assume_dropped(self);
                     }
                     match otherwise {
                         Some(o) => current = o,
@@ -2237,6 +2274,22 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             self.emit_drop_and_storage_dead_for_scope(scope, &mut current, span);
         }
         current
+    }
+
+    /// Lowers the guard of a match arm. Its temporaries are dropped before the arm is chosen.
+    fn lower_guard(
+        &mut self,
+        guard: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
+        let temporaries = self.push_drop_scope();
+        self.drop_scopes.last_mut().unwrap().temporaries = true;
+        let Some((discr, current)) = self.lower_expr_to_some_operand(guard, current)? else {
+            temporaries.pop_assume_dropped(self);
+            return Ok(None);
+        };
+        let current = temporaries.pop_and_drop(self, current, guard.into());
+        Ok(Some((discr, current)))
     }
 
     fn push_drop_scope(&mut self) -> DropScopeToken {
