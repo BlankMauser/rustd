@@ -5685,6 +5685,36 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let addr = self.builder.ins().iadd(dst, offset);
                 self.builder.ins().store(MEM, value, addr, 0);
             }
+            ("simd_shuffle", [first, second, indices]) => {
+                let (first, ty) = self.operand(first)?;
+                let (second, _) = self.operand(second)?;
+                // `[u32; N]`, or a wrapper of one. Lanes of `second` come after `first`'s.
+                let (indices, _) = self.operand(indices)?;
+                let layout = self.layout(ty)?;
+                let (lane, _) = self.simd_lanes(ty)?;
+                let (_, count) = self.simd_lanes(dst_ty)?;
+                let lane_size = lane.ty.bytes() as u64;
+                let both = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (layout.size.bytes() * 2) as u32,
+                    layout.align.abi.bytes().min(16).trailing_zeros() as u8,
+                ));
+                let both = self.builder.ins().stack_addr(PTR, both, 0);
+                self.copy(both, first, layout.size);
+                let upper = self.builder.ins().iadd_imm(both, layout.size.bytes() as i64);
+                self.copy(upper, second, layout.size);
+                let mut lanes = Vec::new();
+                for i in 0..count {
+                    let index = self.builder.ins().load(types::I32, MEM, indices, (i * 4) as i32);
+                    let index = self.builder.ins().uextend(PTR, index);
+                    let offset = self.builder.ins().imul_imm(index, lane_size as i64);
+                    let addr = self.builder.ins().iadd(both, offset);
+                    lanes.push(self.builder.ins().load(lane.ty, MEM, addr, 0));
+                }
+                for (i, value) in lanes.into_iter().enumerate() {
+                    self.builder.ins().store(MEM, value, dst, (i as u64 * lane_size) as i32);
+                }
+            }
             ("simd_splat", [arg]) => {
                 let (src, _) = self.operand(arg)?;
                 let (lane, count) = self.simd_lanes(dst_ty)?;

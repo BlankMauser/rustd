@@ -102,9 +102,10 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
         let RegionKind::ReEarlyParam(param) = region.kind() else {
             return Ok(region);
         };
-        self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.region()).ok_or_else(
-            || MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store()),
-        )
+        // A function generic over nothing but lifetimes is monomorphized without arguments,
+        // and what its lifetimes are makes no difference to the code.
+        let region = self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.region());
+        Ok(region.unwrap_or_else(|| Region::new_erased(self.infcx.interner)))
     }
 }
 

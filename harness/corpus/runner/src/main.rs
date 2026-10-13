@@ -239,5 +239,8 @@ fn main() {
     println!("wide_float_casts {}", cases::wide_float_casts::run());
     println!("const_floats {}", cases::const_floats::run());
     println!("static_identity {}", cases::static_identity::run());
+    println!("lifetime_impl_consts {}", cases::lifetime_impl_consts::run());
+    #[cfg(target_arch = "x86_64")]
+    println!("simd_x86 {}", cases::simd_x86::run());
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
 }

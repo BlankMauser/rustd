@@ -3446,3 +3446,71 @@ pub mod static_identity {
         )
     }
 }
+
+/// `core::arch` vector functions, whose immediates are const generics written as arguments
+/// (`#[rustc_legacy_const_generics]`).
+#[cfg(target_arch = "x86_64")]
+#[rustfmt::skip]
+pub mod simd_x86 {
+    use core::arch::x86_64::*;
+    pub fn ext(v: __m128i) -> (i32, i32) { unsafe { (_mm_extract_epi16(v, 3), _mm_extract_epi16::<5>(v)) } }
+    pub fn shift(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_srli_si128(v, 3)) } }
+    pub fn shl(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_slli_si128(v, 5)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn alignr(v: __m128i, w: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_alignr_epi8(v, w, 13)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn pshufb(v: __m128i, w: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_shuffle_epi8(v, w)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn unload(v: __m128i) -> [i32; 3] { [_mm_extract_epi8(v, 0), _mm_extract_epi8(v, 7), _mm_extract_epi8(v, 15)] }
+    pub fn lanes(v: __m128i) -> (i64, i64, i32) { unsafe { (_mm_cvtsi128_si64(v), _mm_cvtsi128_si64(_mm_srli_si128(v, 8)), _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(7)))) } }
+    pub fn shr16(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0xF))) } }
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn wide(v: __m256i, w: __m256i) -> ([u8; 32], [u8; 32], [u8; 32], i32, i64, [u8; 32]) { unsafe {
+        let p = _mm256_permute2x128_si256(w, v, 0x21);
+        (core::mem::transmute(p), core::mem::transmute(_mm256_alignr_epi8(v, p, 15)), core::mem::transmute(_mm256_shuffle_epi8(v, w)),
+         _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, w)), _mm256_extract_epi64(v, 2), core::mem::transmute(_mm256_and_si256(_mm256_srli_epi16(v, 4), _mm256_set1_epi8(0xF))))
+    } }
+    pub fn run() -> String {
+        let mut out = String::new();
+        let v = unsafe { _mm_set_epi8(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16) };
+        let w = unsafe { _mm_set_epi8(-1,0,3,14,5,6,7,-8,9,1,11,2,3,4,15,6) };
+        out += &format!("{:?} {:?} {:?} {:?} {:?}", ext(v), shift(v), shl(v), lanes(v), shr16(w));
+        if is_x86_feature_detected!("ssse3") { out += &format!(" {:?} {:?} {:?}", unsafe { alignr(v, w) }, unsafe { pshufb(v, w) }, unsafe { unload(w) }); }
+        if is_x86_feature_detected!("avx2") { unsafe {
+            let a = _mm256_set_m128i(v, w); let b = _mm256_set_m128i(w, _mm_set1_epi8(9));
+            out += &format!(" {:?}", wide(a, b)); } }
+        out
+    }
+}
+
+/// An associated constant of an impl that is generic over a lifetime, named from a method of
+/// that impl.
+pub mod lifetime_impl_consts {
+    pub struct State<'a> {
+        pub trans: &'a [u32],
+    }
+
+    impl<'a> State<'a> {
+        const DENSE: u32 = 0xFF;
+        const ONE: u32 = Self::DENSE - 1;
+
+        pub fn kind(len: usize, force: bool) -> u32 {
+            if force || len > State::ONE as usize {
+                State::DENSE
+            } else if len == 1 {
+                State::ONE
+            } else {
+                len as u32
+            }
+        }
+
+        pub fn read(&self) -> u32 {
+            self.trans.iter().sum::<u32>() + Self::kind(self.trans.len(), false)
+        }
+    }
+
+    pub fn run() -> String {
+        let state = State { trans: &[1, 2, 3] };
+        format!("{} {} {} {}", State::kind(1, false), State::kind(4, true), State::kind(999, false), state.read())
+    }
+}

@@ -729,11 +729,24 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 let callee_ty = self.expr_ty_after_adjustments(*callee);
                 match callee_ty.kind() {
-                    TyKind::FnDef(..) => {
+                    TyKind::FnDef(def, _) => {
                         let func = Operand::from_bytes(Box::default(), callee_ty);
+                        // `#[rustc_legacy_const_generics]`: those are generic arguments.
+                        let consts = match def.0 {
+                            CallableDefId::FunctionId(func) => FunctionSignature::of(self.db, func)
+                                .legacy_const_generics_indices(self.db, func)
+                                .filter(|consts| args.len() > consts.len()),
+                            _ => None,
+                        }
+                        .unwrap_or_default();
+                        let args = args
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, _)| !consts.contains(&(*idx as u32)))
+                            .map(|(_, &arg)| arg);
                         self.lower_call_and_args(
                             func,
-                            args.iter().copied(),
+                            args,
                             place,
                             current,
                             self.is_uninhabited(expr_id),
