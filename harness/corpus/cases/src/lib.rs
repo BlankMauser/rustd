@@ -3030,3 +3030,102 @@ pub mod promoted_slices {
         (a.len(), b.to_vec(), c.len(), d.to_vec(), *e)
     }
 }
+
+pub mod reified {
+    #[derive(Debug)]
+    pub struct W(u8, String);
+    #[derive(Debug)]
+    pub enum E {
+        A(u64, u64, u64),
+        B,
+    }
+    pub trait Tr {
+        fn m(&self, x: u32) -> u32;
+    }
+    impl Tr for u32 {
+        fn m(&self, x: u32) -> u32 {
+            *self + x
+        }
+    }
+    fn plain(a: u8, b: &str) -> String {
+        format!("{a}{b}")
+    }
+    extern "C" fn cfn(a: u32) -> u32 {
+        a * 2
+    }
+
+    pub fn run() -> Vec<String> {
+        let mut out = Vec::new();
+        let f: fn(u8, String) -> W = W;
+        out.push(format!("{:?}", f(1, "a".into())));
+        let g: fn(u64, u64, u64) -> E = E::A;
+        out.push(format!("{:?} {:?}", g(1, 2, 3), E::B));
+        let s: fn(u8) -> Option<u8> = Some;
+        out.push(format!("{:?}", s(4)));
+        let d: fn(&(dyn Tr + 'static), u32) -> u32 = <dyn Tr>::m;
+        out.push(format!("{}", d(&5u32, 6)));
+        let b: Box<dyn Fn(u8, String) -> W> = Box::new(W);
+        out.push(format!("{:?}", b(2, "b".into())));
+        let b: Box<dyn Fn(u8, &str) -> String> = Box::new(plain);
+        out.push(b(3, "c"));
+        let p: fn(u8, &str) -> String = plain;
+        let mut b: Box<dyn FnMut(u8, &str) -> String> = Box::new(p);
+        out.push(b(4, "d"));
+        let b: Box<dyn FnOnce(u64, u64, u64) -> E> = Box::new(E::A);
+        out.push(format!("{:?}", b(7, 8, 9)));
+        let b: Box<dyn FnOnce(u8, &str) -> String> = Box::new(p);
+        out.push(b(5, "e"));
+        let r: extern "C" fn(u32) -> u32 = cfn;
+        out.push(format!("{:?}", r(5)));
+        let v: Vec<Box<dyn Fn(u8) -> Option<u8>>> =
+            vec![Box::new(Some), Box::new(|x| x.checked_add(250))];
+        out.push(format!("{:?}", v.iter().map(|f| f(9)).collect::<Vec<_>>()));
+        out
+    }
+}
+
+pub mod boxed_fn_once {
+    use std::sync::Mutex;
+
+    static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct D(&'static str);
+    impl Drop for D {
+        fn drop(&mut self) {
+            LOG.lock().unwrap().push(format!("drop {}", self.0));
+        }
+    }
+    fn call(f: Box<dyn FnOnce(u8) -> u8 + Send>) -> u8 {
+        f(1)
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = |it: String| LOG.lock().unwrap().push(it);
+        let d = D("a");
+        let b: Box<dyn FnOnce(u8) -> u8 + Send> = Box::new(move |x| x + d.0.len() as u8);
+        log(format!("{}", call(b)));
+        let d = D("b");
+        let b: Box<dyn FnOnce()> = Box::new(move || {
+            let _d = &d;
+        });
+        drop(b);
+        let d = D("c");
+        let b: Box<dyn FnOnce()> = Box::new(move || {
+            let _d = d;
+            panic!("boom")
+        });
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(b));
+        log(format!("{}", r.is_err()));
+        let d = D("d");
+        let b: Box<dyn Fn(u8) -> u8> = Box::new(move |x| x + d.0.len() as u8);
+        let once: Box<dyn FnOnce(u8) -> u8> = b;
+        log(format!("{}", once(3)));
+        let v: Vec<Box<dyn FnOnce() -> String>> = vec![Box::new(|| "x".into()), Box::new(String::new)];
+        for f in v {
+            log(f());
+        }
+        let h = std::thread::spawn(move || 5);
+        log(format!("{}", h.join().unwrap()));
+        std::mem::take(&mut *LOG.lock().unwrap())
+    }
+}

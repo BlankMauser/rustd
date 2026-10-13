@@ -231,4 +231,6 @@ fn main() {
     println!("type_names {:?}", cases::type_names::run());
     println!("type_ids downcasts {:?}", cases::type_id_hashes::downcasts());
     println!("promoted_slices {:?}", cases::promoted_slices::run());
+    println!("reified {:?}", cases::reified::run());
+    println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
 }

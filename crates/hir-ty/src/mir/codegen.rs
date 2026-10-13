@@ -361,6 +361,13 @@ enum InstanceDef {
     /// closure type that is the instance's only generic argument, which borrows a receiver,
     /// with a dangling one.
     FnPointerShim,
+    /// A function to point at for the fn item or fn pointer type that is the instance's only
+    /// generic argument, where what the type names has no address of its own: a constructor,
+    /// or a trait method called on a `dyn`. With `receiver`, the function is what the
+    /// `Fn`-trait vtable of the type holds, and so also takes the `self` it has no use for.
+    ReifyShim {
+        receiver: bool,
+    },
 }
 
 /// What a call transfers control to.
@@ -605,9 +612,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut ctx = self.build(env, None, false, |fx| fx.fn_pointer_shim(ty))?;
             return self.emit(id, &mut ctx);
         }
+        if let InstanceDef::ReifyShim { receiver } = instance.def {
+            let ty = instance.args.as_ref().type_at(0);
+            let mut ctx = self.build(env, None, false, |fx| fx.reify_shim(ty, receiver))?;
+            return self.emit(id, &mut ctx);
+        }
         let start = std::time::Instant::now();
         let body = match instance.def {
-            InstanceDef::DropGlue | InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => {
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => {
                 unreachable!()
             }
             InstanceDef::Fn(func) => {
@@ -645,7 +660,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::Coroutine(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
-            | InstanceDef::FnPointerShim => (false, ExternAbi::Rust),
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => (false, ExternAbi::Rust),
         };
         let mut ctx = self.compile_body(body, env, tracked, abi, instance.args.clone())?;
         // The call site declared the instance with the signature it computed from its operands.
@@ -803,7 +819,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::Coroutine(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
-            | InstanceDef::FnPointerShim => None,
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
         };
         let name = match def {
             InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
@@ -812,6 +829,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
+            InstanceDef::ReifyShim { .. } => "{reify}",
         };
         if let Some(reason) = self.rejected.get(&instance) {
             unsupported!("callee `{name}`: {reason}");
@@ -1315,6 +1333,9 @@ struct MovedPath {
 #[derive(Clone, Copy)]
 struct LocalSlot {
     addr: Value,
+    /// The local's type is unsized, and the slot holds a fat pointer to the value where it
+    /// was moved from in place of the value.
+    borrowed: bool,
 }
 
 struct FunctionCx<'cx, 'a, 'db> {
@@ -1899,6 +1920,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.builder.ins().stack_addr(PTR, slot, 0)
     }
 
+    /// Storage for a fat pointer.
+    fn scratch_pair(&mut self) -> Value {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
+        self.builder.ins().stack_addr(PTR, slot, 0)
+    }
+
     /// Storage for a temporary that is borrowed for `'static`. The function writes the same
     /// constant there every time it runs.
     // FIXME: evaluate the constant and make this read-only data.
@@ -2007,7 +2038,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
         if let PassMode::Indirect = self.ret_mode {
             let addr = incoming.next().expect("sret param");
-            self.locals.insert(returned_local(body), LocalSlot { addr });
+            self.locals.insert(returned_local(body), LocalSlot { addr, borrowed: false });
         }
         for ((&local, layout), mode) in
             body.param_locals.iter().zip(&param_layouts).zip(param_modes)
@@ -2019,7 +2050,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 _ => self.stack_slot(layout),
             };
             self.receive(mode, &mut incoming, addr, layout);
-            self.locals.insert(local, LocalSlot { addr });
+            self.locals.insert(local, LocalSlot { addr, borrowed: false });
         }
         if self.tracked {
             self.location = incoming.next();
@@ -2054,7 +2085,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 && Some(local) != body.coroutine.map(|it| it.poll)
             {
                 let addr = in_frame(self, frame.local(local.into_raw().into_u32() as usize));
-                self.locals.insert(local, LocalSlot { addr });
+                self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 continue;
             }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
@@ -2073,7 +2104,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             } else {
                 self.stack_slot(&layout)
             };
-            self.locals.insert(local, LocalSlot { addr });
+            if layout.is_unsized() {
+                let addr = self.scratch_pair();
+                self.locals.insert(local, LocalSlot { addr, borrowed: true });
+                continue;
+            }
+            self.locals.insert(local, LocalSlot { addr, borrowed: false });
         }
         let mut frame_flags = Vec::new();
         for (local, data) in body.locals.iter() {
@@ -2649,8 +2685,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
-        let mut addr = self.locals[place.local].addr;
+        let LocalSlot { mut addr, borrowed } = self.locals[place.local];
         let mut meta = None;
+        if borrowed {
+            meta = Some(self.builder.ins().load(PTR, MEM, addr, 8));
+            addr = self.builder.ins().load(PTR, MEM, addr, 0);
+        }
         let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
         for proj in place.projection.as_slice() {
             let prev = ty;
@@ -3321,6 +3361,23 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn assign(&mut self, place: &StoredPlace, rvalue: &Rvalue) -> Result<()> {
+        if self.locals[place.local].borrowed && place.projection.as_slice().is_empty() {
+            let Rvalue::Use(operand) = rvalue else {
+                unsupported!("unsized local assigned {rvalue:?}");
+            };
+            let (OperandKind::Copy(from) | OperandKind::Move(from)) = &operand.kind else {
+                unsupported!("unsized local assigned a constant");
+            };
+            let PlaceRef { addr, meta: Some(meta), .. } = self.place_ref(from)? else {
+                unsupported!("unsized local assigned a place without metadata");
+            };
+            // Marks the place as moved out of.
+            self.operand(operand)?;
+            let slot = self.locals[place.local].addr;
+            self.builder.ins().store(MEM, addr, slot, 0);
+            self.builder.ins().store(MEM, meta, slot, 8);
+            return Ok(());
+        }
         let (dst, dst_ty) = self.place(place)?;
         let store = |this: &mut Self, value: Value| {
             this.builder.ins().store(MEM, value, dst, 0);
@@ -3537,14 +3594,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             unsupported!("fn pointer to {fn_ty:?}");
         };
         let CallableDefId::FunctionId(func) = def.0 else {
-            unsupported!("fn pointer to a constructor");
+            return self.reified(fn_ty, false);
         };
         let db = self.cg.db;
         if FunctionSignature::is_intrinsic(db, func) {
             unsupported!("fn pointer to an intrinsic");
         }
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
-            unsupported!("fn pointer to a `dyn` method");
+            return self.reified(fn_ty, false);
         }
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
         let either::Either::Left(callee) = callee else {
@@ -4346,6 +4403,43 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let Some((callee, rest)) = args.split_first() else {
             unsupported!("Fn-trait call without a callee");
         };
+        // A `dyn FnOnce` called by value, as `Box<dyn FnOnce>` does with what it holds: the
+        // `call_once` slot takes a pointer to the callee and leaves it dropped.
+        if let OperandKind::Copy(place) | OperandKind::Move(place) = &callee.kind {
+            let place = self.place_ref(place)?;
+            if let TyKind::Dynamic(..) = place.ty.ty.kind() {
+                let dyn_ty = place.ty.ty;
+                let Some(vtable) = place.meta else {
+                    unsupported!("Fn-trait call on {dyn_ty:?} without a vtable");
+                };
+                // Marks the callee as moved out of.
+                self.operand(callee)?;
+                let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
+                    unsupported!("vtable call on {dyn_ty:?}");
+                };
+                let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(method) else {
+                    unsupported!("method missing from the vtable of {dyn_ty:?}");
+                };
+                let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8);
+                let thin = self.scratch();
+                self.builder.ins().store(MEM, place.addr, thin, 0);
+                let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+                let mut values = vec![(thin, thin_ty)];
+                let tuple_ty = method_args.type_at(1);
+                match (&self.operands(rest)?[..], tuple_ty.kind()) {
+                    (&[(tuple, ty)], TyKind::Tuple(fields)) if ty == tuple_ty => {
+                        let layout = self.layout(tuple_ty)?;
+                        values.extend(fields.iter().enumerate().map(|(i, field)| {
+                            let offset = layout.fields.offset(i).bytes() as i64;
+                            (self.builder.ins().iadd_imm(tuple, offset), field)
+                        }));
+                    }
+                    (rest, _) => values.extend_from_slice(rest),
+                }
+                let callee = Callee::Pointer(pointer, ExternAbi::Rust);
+                return self.emit_call(callee, &values, dst, dst_ty);
+            }
+        }
         let (mut addr, mut ty) = self.operand(callee)?;
         let mut values = self.operands(rest)?;
         // A call written as `f.call_mut(args)` does pass the tuple, which the callee takes
@@ -4765,7 +4859,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     /// `call`, `call_mut` or `call_once` in the vtable of a closure.
     fn vtable_fn_method(&mut self, ty: Ty<'db>, once: bool) -> Result<FuncId> {
         let TyKind::Closure(id, generic_args) = ty.kind() else {
-            unsupported!("Fn-trait vtable of {ty:?}");
+            return self.reified(ty, true);
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
         let body = self
@@ -4782,17 +4876,127 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if receiver_ty.as_reference().is_none() {
             // The body takes the closure by value. Only when that means "through a pointer to
             // memory the body owns" is it what the `call_once` slot is called with.
-            let layout = self.layout(receiver_ty)?;
-            if !once || !matches!(self.pass_mode(&layout, false)?, PassMode::Indirect) {
+            if !once {
                 unsupported!("vtable shim for a closure taken by value");
             }
-            return self.cg.callee(closure, parent_args, self.env, &sig);
+            let layout = self.layout(receiver_ty)?;
+            let mode = self.pass_mode(&layout, false)?;
+            if matches!(mode, PassMode::Indirect) {
+                return self.cg.callee(closure, parent_args, self.env, &sig);
+            }
+            let sig = Self::by_pointer(&sig, mode);
+            let args = GenericArgs::new_from_slice(&[ty.into()]);
+            return self.cg.callee(InstanceDef::CallOnceShim, args, self.env, &sig);
         }
         if once {
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             return self.cg.callee(InstanceDef::CallOnceShim, args, self.env, &sig);
         }
         self.cg.callee(closure, parent_args, self.env, &sig)
+    }
+
+    /// The `ReifyShim` of a fn item or fn pointer type.
+    fn reified(&mut self, ty: Ty<'db>, receiver: bool) -> Result<FuncId> {
+        let sig = self.reify_signature(ty, receiver)?.1;
+        let args = GenericArgs::new_from_slice(&[ty.into()]);
+        self.cg.callee(InstanceDef::ReifyShim { receiver }, args, self.env, &sig)
+    }
+
+    /// What a `ReifyShim` is called with and how.
+    fn reify_signature(
+        &mut self,
+        ty: Ty<'db>,
+        receiver: bool,
+    ) -> Result<(rustc_type_ir::FnSig<DbInterner<'db>>, Signature, FnAbi)> {
+        if !matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..)) {
+            unsupported!("Fn-trait vtable of {ty:?}");
+        }
+        let fn_sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        if fn_sig.c_variadic() {
+            unsupported!("shim for a variadic function");
+        }
+        // A vtable is called as a Rust function, whatever the function behind it is.
+        let abi = if receiver { ExternAbi::Rust } else { fn_sig.abi() };
+        let abi = self.fn_abi(abi, fn_sig.output(), fn_sig.inputs().iter().copied())?;
+        let mut sig = self.signature(&abi.args, abi.ret);
+        if receiver {
+            let sret = matches!(abi.ret, PassMode::Indirect);
+            sig.params.insert(sret as usize, AbiParam::new(PTR));
+        }
+        Ok((fn_sig, sig, abi))
+    }
+
+    /// The body of a `ReifyShim`: calls what the type names with the arguments it is handed.
+    fn reify_shim(&mut self, ty: Ty<'db>, receiver: bool) -> Result<()> {
+        let (fn_sig, sig, FnAbi { ret, args: modes }) = self.reify_signature(ty, receiver)?;
+        self.builder.func.signature = sig;
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let mut incoming = self.builder.block_params(entry).to_vec().into_iter();
+        let dst_ty = fn_sig.output();
+        let dst_layout = self.layout(dst_ty)?;
+        let dst = match ret {
+            PassMode::Indirect => incoming.next().expect("sret param"),
+            _ => self.stack_slot(&dst_layout),
+        };
+        let receiver = if receiver { incoming.next() } else { None };
+        let mut values = Vec::new();
+        for (&ty, mode) in fn_sig.inputs().iter().zip(modes) {
+            let layout = self.layout(ty)?;
+            let addr = match mode {
+                PassMode::Indirect | PassMode::OnStack(_) => {
+                    incoming.next().expect("indirect param")
+                }
+                _ => self.stack_slot(&layout),
+            };
+            self.receive(mode, &mut incoming, addr, &layout);
+            values.push((addr, ty));
+        }
+        match ty.kind() {
+            TyKind::FnDef(def, generic_args) => match def.0 {
+                CallableDefId::FunctionId(func) => {
+                    if FunctionSignature::is_intrinsic(self.cg.db, func) {
+                        unsupported!("shim for an intrinsic");
+                    }
+                    if track_caller(self.cg.db, func) {
+                        // FIXME: rustc's shim passes the location of the function itself.
+                        unsupported!("pointer to a `#[track_caller]` function");
+                    }
+                    self.call_direct(func, generic_args, &values, dst, dst_ty)?;
+                }
+                CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
+                    let TyKind::Adt(_, adt_args) = dst_ty.kind() else {
+                        unsupported!("constructor of {dst_ty:?}");
+                    };
+                    let layout = match def.0 {
+                        CallableDefId::EnumVariantId(id) => {
+                            self.variant_layout(dst, id.into(), adt_args)?
+                        }
+                        _ => Some(self.layout(dst_ty)?),
+                    };
+                    if let Some(layout) = layout {
+                        for (i, &(src, ty)) in values.iter().enumerate() {
+                            let size = self.layout(ty)?.size;
+                            let offset = layout.fields.offset(i).bytes() as i64;
+                            let field = self.builder.ins().iadd_imm(dst, offset);
+                            self.copy(field, src, size);
+                        }
+                    }
+                }
+            },
+            _ => {
+                let receiver = receiver.expect("a fn pointer is only reified for a vtable");
+                let pointer = self.builder.ins().load(PTR, MEM, receiver, 0);
+                self.emit_call(Callee::Pointer(pointer, fn_sig.abi()), &values, dst, dst_ty)?;
+            }
+        }
+        let mut results = Vec::new();
+        if !matches!(ret, PassMode::Indirect) {
+            self.pass(ret, dst, &dst_layout, &mut results);
+        }
+        self.builder.ins().return_(&results);
+        Ok(())
     }
 
     /// The function a closure that captures nothing is as a function pointer.
@@ -4863,11 +5067,19 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let sig = self.body_signature(body, false)?;
-        self.builder.func.signature = sig.clone();
+        let Some(&receiver) = body.param_locals.first() else {
+            unsupported!("closure without a receiver");
+        };
+        let receiver_ty = body.locals[receiver].ty.as_ref();
+        let by_value = receiver_ty.as_reference().is_none();
+        let layout = self.layout(receiver_ty)?;
+        let mode = self.pass_mode(&layout, false)?;
+        self.builder.func.signature =
+            if by_value { Self::by_pointer(&sig, mode) } else { sig.clone() };
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
-        let params = self.builder.block_params(entry).to_vec();
+        let mut params = self.builder.block_params(entry).to_vec();
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let Some(&closure) = params.get(sret as usize) else {
             unsupported!("call_once shim for a closure that is not passed");
@@ -4875,10 +5087,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let callee =
             self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        if by_value {
+            // The body owns the closure and takes it in registers.
+            let mut values = Vec::new();
+            self.pass(mode, closure, &layout, &mut values);
+            params.splice(sret as usize..sret as usize + 1, values);
+            let results = self.invoke(callee, &params);
+            self.builder.ins().return_(&results);
+            return Ok(());
+        }
         let results = self.invoke(callee, &params);
         self.drop_value(closure, None, ty)?;
         self.builder.ins().return_(&results);
         Ok(())
+    }
+
+    /// `sig` with the receiver, which is passed as `mode` says, behind a pointer instead.
+    fn by_pointer(sig: &Signature, mode: PassMode) -> Signature {
+        let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
+        let count = match mode {
+            PassMode::Ignore => 0,
+            PassMode::Pair(..) => 2,
+            _ => 1,
+        };
+        let mut sig = sig.clone();
+        sig.params.splice(sret as usize..sret as usize + count, [AbiParam::new(PTR)]);
+        sig
     }
 
     /// Calls `func` with arguments that live at the given addresses.
