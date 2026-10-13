@@ -745,6 +745,101 @@ pub fn pretty(tkns: TokenTreesView<'_>) -> String {
     }
 }
 
+/// The text `stringify!` gives for tokens. This follows rustc's `print_tts`: a space goes
+/// where the source had one, unless it is one of the places rustc never puts one.
+pub fn stringify(tkns: TokenTreesView<'_>) -> String {
+    let mut text = String::new();
+    write_stringified(tkns.iter(), &mut text);
+    return text;
+
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "for",
+        "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "ref", "return", "self",
+        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+        "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro", "override",
+        "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
+    ];
+
+    fn start(tt: &TtElement<'_>) -> Span {
+        match tt {
+            TtElement::Leaf(leaf) => *leaf.span(),
+            TtElement::Subtree(subtree, _) => subtree.delimiter.open,
+        }
+    }
+
+    fn end(tt: &TtElement<'_>) -> Span {
+        match tt {
+            TtElement::Leaf(leaf) => *leaf.span(),
+            TtElement::Subtree(subtree, _) => subtree.delimiter.close,
+        }
+    }
+
+    fn punct(tt: &TtElement<'_>) -> Option<char> {
+        match tt {
+            TtElement::Leaf(Leaf::Punct(punct)) => Some(punct.char),
+            _ => None,
+        }
+    }
+
+    /// Whether the source had nothing between the two tokens.
+    fn joined(prev: &TtElement<'_>, next: &TtElement<'_>) -> bool {
+        if let TtElement::Leaf(Leaf::Punct(Punct { spacing: Spacing::Joint, .. })) = prev {
+            return true;
+        }
+        let (prev, next) = (end(prev), start(next));
+        prev.anchor == next.anchor
+            && prev.range.end() == next.range.start()
+            && prev.range != next.range
+    }
+
+    /// rustc's `space_between`.
+    fn space_between(prev: &TtElement<'_>, next: &TtElement<'_>) -> bool {
+        match (prev, next) {
+            (_, _) if punct(prev) == Some('.') && punct(next).is_none() => false,
+            (_, TtElement::Leaf(Leaf::Ident(_))) if punct(prev) == Some('$') => false,
+            (_, _) if punct(prev).is_none() && matches!(punct(next), Some(',' | ';' | '.')) => {
+                false
+            }
+            (TtElement::Leaf(Leaf::Ident(ident)), TtElement::Subtree(subtree, _))
+                if subtree.delimiter.kind == DelimiterKind::Parenthesis =>
+            {
+                ident.is_raw.no() && KEYWORDS.contains(&ident.sym.as_str())
+            }
+            (_, TtElement::Subtree(subtree, _)) if punct(prev) == Some('#') => {
+                subtree.delimiter.kind != DelimiterKind::Bracket
+            }
+            _ => true,
+        }
+    }
+
+    fn write_stringified(tkns: TtIter<'_>, text: &mut String) {
+        let mut tkns = tkns.peekable();
+        while let Some(tkn) = tkns.next() {
+            match &tkn {
+                TtElement::Leaf(leaf) => text.push_str(&leaf.to_string()),
+                TtElement::Subtree(subtree, content) => {
+                    let (open, close) = match subtree.delimiter.kind {
+                        DelimiterKind::Brace if content.clone().next().is_some() => ("{ ", " }"),
+                        DelimiterKind::Brace => ("{", "}"),
+                        DelimiterKind::Bracket => ("[", "]"),
+                        DelimiterKind::Parenthesis => ("(", ")"),
+                        DelimiterKind::Invisible => ("", ""),
+                    };
+                    text.push_str(open);
+                    write_stringified(content.clone(), text);
+                    text.push_str(close);
+                }
+            }
+            if let Some(next) = tkns.peek()
+                && !joined(&tkn, next)
+                && space_between(&tkn, next)
+            {
+                text.push(' ');
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TransformTtAction<'a> {
     Keep,

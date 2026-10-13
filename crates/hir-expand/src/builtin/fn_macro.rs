@@ -192,7 +192,7 @@ fn stringify_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let pretty = ::tt::pretty(tt.token_trees());
+    let pretty = ::tt::stringify(tt.token_trees());
 
     let expanded = quote! {span =>
         #pretty

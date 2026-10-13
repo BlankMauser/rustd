@@ -1676,3 +1676,33 @@ pub mod builtin_location {
         (direct, nested, line!() + 1)
     }
 }
+
+/// `stringify!` spaces tokens the way rustc does.
+pub mod stringify_spacing {
+    macro_rules! ty {
+        (<$t:ty>) => {
+            stringify!($t)
+        };
+    }
+    macro_rules! list {
+        ($($e:ident),*) => {
+            stringify!($($e),*)
+        };
+    }
+
+    pub fn run() -> Vec<&'static str> {
+        vec![
+            stringify!(std::option),
+            stringify!(a , b,c),
+            stringify!(f(x).y.0 + #[attr] g ( 1 )),
+            stringify!({ foo += 1; eprintln!("before"); 7331 }),
+            stringify!(let (a, b) = &'a mut x;),
+            stringify!(fn f<T: Tr>(x: Vec<T>) -> [u8; 3] {}),
+            ty!(<Vec<i32>>),
+            list!(a, b, c),
+            stringify!(("Yeah",)),
+            stringify!(1u8),
+            stringify!(r#struct . r#fn),
+        ]
+    }
+}
