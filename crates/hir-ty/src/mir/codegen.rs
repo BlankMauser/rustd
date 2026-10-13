@@ -4121,7 +4121,79 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let either::Either::Left(callee) = callee else {
             unsupported!("call to builtin derive method");
         };
+        if callee == func
+            && let ItemContainerId::TraitId(trait_) = func.lookup(db).container
+            && Some(trait_) == self.interner.lang_items().Clone
+            && FunctionSignature::of(db, func).name.as_str() == "clone"
+            && let &[(receiver, _)] = args
+        {
+            let src = self.builder.ins().load(PTR, MEM, receiver, 0);
+            return self.clone_builtin(func, src, dst, dst_ty);
+        }
         self.emit_call(Callee::Instance(InstanceDef::Fn(callee), callee_args), args, dst, dst_ty)
+    }
+
+    /// `Clone::clone` of a type whose impl the compiler supplies: tuples and arrays clone their
+    /// parts, and what is left is `Copy`.
+    fn clone_builtin(
+        &mut self,
+        clone: FunctionId,
+        src: Value,
+        dst: Value,
+        ty: Ty<'db>,
+    ) -> Result<()> {
+        let layout = self.layout(ty)?;
+        let mut clone_part = |this: &mut Self, src: Value, dst: Value, part: Ty<'db>| {
+            let reference = Ty::new_ref(
+                this.interner,
+                Region::new_erased(this.interner),
+                part,
+                Mutability::Not,
+            );
+            let slot = this.scratch();
+            this.builder.ins().store(MEM, src, slot, 0);
+            let args = GenericArgs::new_from_slice(&[part.into()]);
+            this.call_direct(clone, args, &[(slot, reference)], dst, part)
+        };
+        match ty.kind() {
+            TyKind::Tuple(fields) => {
+                for (i, field) in fields.iter().enumerate() {
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    let src = self.builder.ins().iadd_imm(src, offset);
+                    let dst = self.builder.ins().iadd_imm(dst, offset);
+                    clone_part(self, src, dst, field)?;
+                }
+            }
+            TyKind::Array(element, _) => {
+                let size = self.layout(element)?.size.bytes() as i64;
+                let len = self.builder.ins().iconst(PTR, layout.fields.count() as i64);
+                let header = self.builder.create_block();
+                let body = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.append_block_param(header, PTR);
+                let zero = self.builder.ins().iconst(PTR, 0);
+                self.builder.ins().jump(header, &[zero.into()]);
+                self.builder.switch_to_block(header);
+                let index = self.builder.block_params(header)[0];
+                let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+                self.builder.ins().brif(more, body, &[], done, &[]);
+                self.builder.switch_to_block(body);
+                let offset = self.builder.ins().imul_imm(index, size);
+                let src = self.builder.ins().iadd(src, offset);
+                let dst = self.builder.ins().iadd(dst, offset);
+                clone_part(self, src, dst, element)?;
+                let next = self.builder.ins().iadd_imm(index, 1);
+                self.builder.ins().jump(header, &[next.into()]);
+                self.builder.switch_to_block(done);
+            }
+            TyKind::FnDef(..)
+            | TyKind::FnPtr(..)
+            | TyKind::Never
+            | TyKind::RawPtr(..)
+            | TyKind::Ref(_, _, Mutability::Not) => self.copy(dst, src, layout.size),
+            _ => unsupported!("builtin `Clone` of {ty:?}"),
+        }
+        Ok(())
     }
 
     /// Passes the arguments, which live at the given addresses, the way the Rust ABI wants them

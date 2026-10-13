@@ -1303,7 +1303,7 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
         if !ident.kind().is_any_identifier() {
             continue;
         }
-        let repr = match ident.text() {
+        let repr = match ident.text().trim_start_matches("r#") {
             "packed" => {
                 let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
                     let tt = tt.clone();

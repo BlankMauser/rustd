@@ -1725,3 +1725,86 @@ pub mod stringify_spacing {
         ]
     }
 }
+
+/// Raw identifiers mean what the plain ones do, except to a macro matching on them.
+pub mod raw_identifiers {
+    #[r#repr(r#C, r#packed)]
+    pub struct Packed {
+        pub a: bool,
+        pub b: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Keyword {
+        pub r#struct: u32,
+    }
+
+    macro_rules! which {
+        (a) => {
+            6
+        };
+        (r#a) => {
+            7
+        };
+    }
+
+    pub fn run() -> (usize, String, u32, u32) {
+        let keyword = Keyword { r#struct: 3 };
+        (std::mem::size_of::<Packed>(), format!("{:?}", keyword.clone()), which!(a), which!(r#a))
+    }
+}
+
+/// A derive calls the trait's own methods, whatever else is in scope under those names.
+pub mod derive_ufcs {
+    use std::fmt;
+
+    #[derive(Debug, Clone)]
+    pub struct Named {
+        pub bar: u8,
+        pub baz: (),
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Tuple(pub u8);
+
+    #[derive(Debug, Clone)]
+    pub struct Unit;
+
+    pub trait Shadow {
+        fn debug_struct(&self, _: &str) -> u8 {
+            panic!("got into debug_struct")
+        }
+        fn debug_tuple(&self, _: &str) -> u8 {
+            panic!("got into debug_tuple")
+        }
+        fn write_str(&self, _: &str) -> u8 {
+            panic!("got into write_str")
+        }
+        fn clone(&self) -> u8 {
+            panic!("got into clone")
+        }
+    }
+    impl Shadow for &mut fmt::Formatter<'_> {}
+    impl Shadow for &u8 {}
+    impl Shadow for &() {}
+
+    pub fn run() -> String {
+        let named = Named { bar: 1, baz: () };
+        format!("{:?} {:?} {:?}", named.clone(), Tuple(2).clone(), Unit.clone())
+    }
+}
+
+/// `Clone` of the types that have no impl written anywhere.
+pub mod builtin_clone {
+    fn twice(n: u8) -> u8 {
+        n * 2
+    }
+
+    pub fn run() -> ((String, u8), [String; 2], u8, ((), (Vec<u8>,))) {
+        let pair = ("a".to_string(), 1u8);
+        let array = ["b".to_string(), "c".to_string()];
+        let pointer: fn(u8) -> u8 = twice;
+        let nested = ((), (vec![1u8, 2],));
+        (Clone::clone(&pair), array.clone(), Clone::clone(&pointer)(4), nested.clone())
+    }
+}

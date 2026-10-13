@@ -681,7 +681,7 @@ fn clone_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = dollar_crate(span);
+    let krate = &dollar_crate(span);
     expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, true, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
@@ -701,7 +701,7 @@ fn clone_expand(
         }
         let name = &adt.name;
         let patterns = adt.shape.as_pattern(span, name);
-        let exprs = adt.shape.as_pattern_map(name, |it| quote! {span => #it .clone() }, span);
+        let exprs = adt.shape.as_pattern_map(name, |it| quote! {span => #krate::clone::Clone::clone(#it) }, span);
         let arms = patterns.into_iter().zip(exprs).map(|(pat, expr)| {
             let fat_arrow = fat_arrow(span);
             quote! {span =>
@@ -805,28 +805,34 @@ fn debug_expand(
     expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, false, |adt| {
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
+                // Spelled out in full, as rustc does: a method of the same name on some other
+                // trait must not be picked up.
                 let for_fields = fields.iter().map(|it| {
-                    let x_string = it.to_string();
+                    let x_string = it.sym.as_str().to_owned();
                     quote! {span =>
-                        .field(#x_string, & #it)
+                        #krate::fmt::DebugStruct::field(&mut ra_expand_builder, #x_string, & #it);
                     }
                 });
-                quote! {span =>
-                    f.debug_struct(#name) # #for_fields .finish()
-                }
+                quote! {span => {
+                    let mut ra_expand_builder = #krate::fmt::Formatter::debug_struct(f, #name);
+                    # #for_fields
+                    #krate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+                } }
             }
             VariantShape::Tuple(n) => {
                 let for_fields = tuple_field_iterator(span, *n).map(|it| {
                     quote! {span =>
-                        .field( & #it)
+                        #krate::fmt::DebugTuple::field(&mut ra_expand_builder, & #it);
                     }
                 });
-                quote! {span =>
-                    f.debug_tuple(#name) # #for_fields .finish()
-                }
+                quote! {span => {
+                    let mut ra_expand_builder = #krate::fmt::Formatter::debug_tuple(f, #name);
+                    # #for_fields
+                    #krate::fmt::DebugTuple::finish(&mut ra_expand_builder)
+                } }
             }
             VariantShape::Unit => quote! {span =>
-                f.write_str(#name)
+                #krate::fmt::Formatter::write_str(f, #name)
             },
         };
         if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
@@ -842,7 +848,7 @@ fn debug_expand(
                 let fat_arrow = fat_arrow(span);
                 let name = &adt.name;
                 let pat = fields.as_pattern(quote!(span =>#name), span);
-                let expr = for_variant(name.to_string(), fields);
+                let expr = for_variant(name.sym.as_str().to_owned(), fields);
                 vec![quote! {span => #pat #fat_arrow #expr }]
             }
             AdtShape::Enum { variants, .. } => variants
@@ -851,7 +857,7 @@ fn debug_expand(
                     let fat_arrow = fat_arrow(span);
                     let adt_name = &adt.name;
                     let pat = v.as_pattern(quote!(span =>#adt_name :: #name), span);
-                    let expr = for_variant(name.to_string(), v);
+                    let expr = for_variant(name.sym.as_str().to_owned(), v);
                     quote! {span =>
                         #pat #fat_arrow #expr ,
                     }

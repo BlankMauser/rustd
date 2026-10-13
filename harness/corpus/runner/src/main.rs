@@ -194,4 +194,7 @@ fn main() {
     println!("builtin_location passed {:?}", cases::builtin_location::passed());
     println!("stringify_spacing {:?}", cases::stringify_spacing::run());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
+    println!("raw_identifiers {:?}", cases::raw_identifiers::run());
+    println!("derive_ufcs {:?}", cases::derive_ufcs::run());
+    println!("builtin_clone {:?}", cases::builtin_clone::run());
 }
