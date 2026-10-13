@@ -737,6 +737,21 @@ impl AttrFlags {
         AttrFlags::query(db, owner).lang_item_with_attrs(db, owner)
     }
 
+    /// The symbol a foreign item is declared to link against, if it is not its own name.
+    #[salsa::tracked(returns(clone))]
+    pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        collect_attrs(db, owner, |attr| {
+            if let ast::Meta::KeyValueMeta(attr) = attr
+                && attr.path().is1("link_name")
+                && let Some(value) = attr.value_string()
+            {
+                ControlFlow::Break(Symbol::intern(&value))
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+    }
+
     #[inline]
     pub fn lang_item_with_attrs(self, db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
         if !self.contains(AttrFlags::LANG_ITEM) {

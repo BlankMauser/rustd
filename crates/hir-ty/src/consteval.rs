@@ -282,6 +282,7 @@ pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<i
 pub(crate) enum CreateConstError<'db> {
     UsedForbiddenParam,
     ResolveToNonConst,
+    NeedsAnonConst,
     DoesNotResolve,
     ConstHasGenerics,
     UnderscoreExpr,
@@ -317,11 +318,13 @@ pub(crate) fn path_to_const<'a, 'db>(
         }
         // These are not valid as consts.
         // FIXME: Report an error?
-        ValueNs::ImplSelf(_)
-        | ValueNs::LocalBinding(_)
-        | ValueNs::FunctionId(_)
-        | ValueNs::StructId(_)
-        | ValueNs::EnumVariantId(_) => return Err(CreateConstError::ResolveToNonConst),
+        ValueNs::ImplSelf(_) | ValueNs::LocalBinding(_) => {
+            return Err(CreateConstError::ResolveToNonConst);
+        }
+        // A function or a constructor is a value, but only an anon const can hold it.
+        ValueNs::FunctionId(_) | ValueNs::StructId(_) | ValueNs::EnumVariantId(_) => {
+            return Err(CreateConstError::NeedsAnonConst);
+        }
     };
     let args = GenericArgs::empty();
     Ok(Const::new_unevaluated(interner, UnevaluatedConst { def: konst.into(), args }))
@@ -374,7 +377,9 @@ pub(crate) fn create_anon_const<'a, 'db>(
                 path_to_const(interner.db, resolver, generics, forbid_params_after, path)
                 && !matches!(
                     konst,
-                    Err(CreateConstError::DoesNotResolve | CreateConstError::ConstHasGenerics)
+                    Err(CreateConstError::DoesNotResolve
+                        | CreateConstError::ConstHasGenerics
+                        | CreateConstError::NeedsAnonConst)
                 ) =>
         {
             konst

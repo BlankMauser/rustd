@@ -14,6 +14,8 @@ fn main() {
         case!(scalars::wide((a as u128) << 70, b as u64), scalars::compare(a as i32, b as i32));
         case!(scalars::counting((a as u64) << 9 | b as u64));
     }
+    case!(scalars::wide_mul(u128::MAX / 3, 2, -5), scalars::wide_mul(1 << 100, 1 << 90, i128::MIN));
+    case!(scalars::wide_mul(12345678901234567890, 98765432109876543210, 1 << 70));
     case!(control::collatz(27), control::nested(40), control::fib(15));
     case!(control::classify(-5), control::classify(0), control::classify(7), control::classify(99));
 
@@ -110,4 +112,11 @@ fn main() {
     let hay = *b"hello, simd lane";
     let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
     case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
+
+    if is_x86_feature_detected!("ssse3") {
+        case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
+    }
+    case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
+    case!(statics::lowest(4), statics::lowest(-9), statics::lowest(-2), statics::local(2), statics::local(77));
+    case!(statics::plain(0, 5), statics::plain(2, 7), statics::plain(0, 1));
 }

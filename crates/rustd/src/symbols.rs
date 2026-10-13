@@ -15,7 +15,8 @@ impl SymbolTable {
     pub(crate) fn load(files: &[PathBuf]) -> anyhow::Result<SymbolTable> {
         let mut table = SymbolTable::default();
         for file in files {
-            let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let data =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
             match ArchiveFile::parse(&*data) {
                 Ok(archive) => {
                     for member in archive.members() {

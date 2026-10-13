@@ -13,10 +13,10 @@ use anyhow::{Context, bail};
 use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
 use hir_def::{FunctionId, ModuleDefId, StaticId};
 use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
-use rustc_hash::FxHashMap;
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
+use rustc_hash::FxHashMap;
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 use crate::symbols::SymbolTable;
@@ -215,8 +215,9 @@ fn build(
         std::fs::create_dir_all(dir)?;
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
-            let single = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func], known))
-                .map_err(anyhow::Error::msg)?;
+            let single =
+                hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func], known))
+                    .map_err(anyhow::Error::msg)?;
             std::fs::write(dir.join(format!("{i}.o")), single.object)?;
             index.push_str(&format!("{i}\t{}\n", name(func)));
         }
@@ -229,7 +230,12 @@ impl Build {
     fn write_report(&self, path: &Path) -> anyhow::Result<()> {
         use std::fmt::Write;
         let mut out = String::new();
-        writeln!(out, "#\tinstances\t{}\tcodegen_us\t{}", self.instances, self.codegen.as_micros())?;
+        writeln!(
+            out,
+            "#\tinstances\t{}\tcodegen_us\t{}",
+            self.instances,
+            self.codegen.as_micros()
+        )?;
         for name in &self.compiled {
             writeln!(out, "compiled\t{name}\t")?;
         }
@@ -301,8 +307,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
 
     let start = Instant::now();
-    let cargo_config =
-        CargoConfig { sysroot: Some(RustLibSource::Discover), ..Default::default() };
+    let cargo_config = CargoConfig { sysroot: Some(RustLibSource::Discover), ..Default::default() };
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,

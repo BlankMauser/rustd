@@ -2,11 +2,11 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 4538.516,
-    "compiled": 145,
-    "instances": 922,
+    "codegen_ms": 4884.815,
+    "compiled": 152,
+    "instances": 986,
     "not_roots": 32,
-    "roots": 145,
+    "roots": 152,
     "skipped": {}
    }
   },
@@ -16,14 +16,12 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 6119.882,
-    "compiled": 45,
-    "instances": 504,
+    "codegen_ms": 6391.813,
+    "compiled": 47,
+    "instances": 513,
     "not_roots": 65,
     "roots": 47,
-    "skipped": {
-     "static with interior mutability and no rustc symbol": 2
-    }
+    "skipped": {}
    }
   },
   "culprits": [],
@@ -34,14 +32,12 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 2993.449,
-    "compiled": 2,
+    "codegen_ms": 3353.868,
+    "compiled": 3,
     "instances": 14,
     "not_roots": 23,
     "roots": 3,
-    "skipped": {
-     "Compilation": 1
-    }
+    "skipped": {}
    }
   },
   "culprits": [],
@@ -52,7 +48,7 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 6034.725,
+    "codegen_ms": 6396.117,
     "compiled": 63,
     "instances": 741,
     "not_roots": 43,
@@ -68,7 +64,7 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 2990.154,
+    "codegen_ms": 4292.209,
     "compiled": 3,
     "instances": 262,
     "not_roots": 20,
@@ -76,7 +72,7 @@
     "skipped": {}
    },
    "hex": {
-    "codegen_ms": 3958.874,
+    "codegen_ms": 3809.443,
     "compiled": 6,
     "instances": 193,
     "not_roots": 173,
@@ -84,17 +80,15 @@
     "skipped": {}
    },
    "httparse": {
-    "codegen_ms": 3757.229,
-    "compiled": 16,
-    "instances": 361,
+    "codegen_ms": 4104.975,
+    "compiled": 25,
+    "instances": 569,
     "not_roots": 87,
     "roots": 25,
-    "skipped": {
-     "static with interior mutability and no rustc symbol": 9
-    }
+    "skipped": {}
    },
    "itoa": {
-    "codegen_ms": 2954.954,
+    "codegen_ms": 4533.727,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -102,7 +96,7 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 3342.278,
+    "codegen_ms": 5227.405,
     "compiled": 43,
     "instances": 774,
     "not_roots": 63,
@@ -116,7 +110,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 3080.696,
+    "codegen_ms": 3633.705,
     "compiled": 5,
     "instances": 2,
     "not_roots": 2,

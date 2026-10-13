@@ -110,7 +110,10 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
+            Err(MirLowerError::NotSupported(format!(
+                "monomorphization resulted in errors: {:?}",
+                t.as_ref()
+            )))
         } else {
             Ok(())
         }
@@ -120,7 +123,10 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
+            Err(MirLowerError::NotSupported(format!(
+                "monomorphization resulted in errors: {:?}",
+                t.as_ref()
+            )))
         } else {
             Ok(())
         }
@@ -130,7 +136,10 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported("monomorphization resulted in errors".to_owned()))
+            Err(MirLowerError::NotSupported(format!(
+                "monomorphization resulted in errors: {:?}",
+                t.as_ref()
+            )))
         } else {
             Ok(())
         }

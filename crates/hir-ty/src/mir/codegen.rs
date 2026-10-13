@@ -5,10 +5,11 @@
 
 use std::fmt;
 
+use base_db::Crate;
 use cranelift_codegen::{
     ir::{
-        self, AbiParam, ArgumentPurpose, InstBuilder, MemFlagsData, Signature, StackSlotData,
-        StackSlotKind, TrapCode, Type, Value, condcodes::IntCC, types,
+        self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
+        StackSlotData, StackSlotKind, TrapCode, Type, Value, condcodes::IntCC, types,
     },
     isa::{self, CallConv},
     settings::{self, Configurable},
@@ -17,7 +18,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
-    AdtId, DefWithBodyId, FunctionId, HasModule, StaticId, TraitId, VariantId,
+    AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, TraitId,
+    VariantId,
     attrs::AttrFlags,
     expr_store::Body,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
@@ -66,6 +68,9 @@ pub enum CodegenError {
     /// MIR lowering or layout failed in RA.
     Frontend(String),
     Backend(String),
+    /// rustc exports nothing for the function, so there is nothing to replace: only code in
+    /// its own crate can call it.
+    NoSymbol,
 }
 
 impl fmt::Display for CodegenError {
@@ -74,6 +79,7 @@ impl fmt::Display for CodegenError {
             CodegenError::Unsupported(it) => write!(f, "unsupported: {it}"),
             CodegenError::Frontend(it) => write!(f, "frontend: {it}"),
             CodegenError::Backend(it) => write!(f, "backend: {it}"),
+            CodegenError::NoSymbol => write!(f, "unsupported: no rustc symbol for function"),
         }
     }
 }
@@ -167,8 +173,9 @@ impl CodegenUnit {
             });
         }
         let rejected = &mut known.rejected;
+        let mut own_statics = roots.first().map(|root| root.krate(db));
         loop {
-            let mut cg = ObjectCodegen::new(db, symbols, rejected)?;
+            let mut cg = ObjectCodegen::new(db, symbols, rejected, own_statics)?;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
@@ -178,6 +185,27 @@ impl CodegenUnit {
                 }
             }
             let failed = cg.define_instances();
+            let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
+            if !cg.statics.is_empty() && from_rustc {
+                // Functions left to rustc keep using rustc's copy of the crate's private
+                // statics, so we can't bring our own.
+                {
+                    use std::io::Write;
+                    let mut o = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/dbg.txt")
+                        .unwrap();
+                    for (f, e) in &skipped {
+                        if !matches!(e, CodegenError::NoSymbol) {
+                            writeln!(o, "DBG {f:?} {e}").unwrap();
+                        }
+                    }
+                }
+                own_statics = None;
+                rejected.extend(failed);
+                continue;
+            }
             if failed.is_empty() {
                 let instances = cg.instances.len();
                 return Ok(CodegenUnit { object: cg.finish()?, compiled, skipped, instances });
@@ -229,6 +257,10 @@ struct ObjectCodegen<'a, 'db> {
     /// Instances that failed in an earlier round, with the reason.
     rejected: &'a FxHashMap<Instance, String>,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
+    /// The crate whose writable statics we define ourselves when rustc exports no symbol for
+    /// them. Only sound when every function of that crate is ours.
+    own_statics: Option<Crate>,
+    statics: FxHashMap<StaticId, DataId>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
 }
@@ -238,6 +270,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, String>,
+        own_statics: Option<Crate>,
     ) -> Result<Self> {
         let backend = |e: &dyn fmt::Display| CodegenError::Backend(e.to_string());
         let mut flags = settings::builder();
@@ -259,6 +292,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             pending: Vec::new(),
             rejected,
             vtables: FxHashMap::default(),
+            own_statics,
+            statics: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
         })
@@ -274,7 +309,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let owner: InferBodyId<'db> = func.into();
         let body = db.mir_body(owner).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let Some(symbol) = self.symbols.function(func) else {
-            unsupported!("no rustc symbol for function");
+            return Err(CodegenError::NoSymbol);
         };
         let krate = owner.module(db).krate(db);
         let env =
@@ -450,6 +485,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             if let Some(symbol) = self.symbols.path(&format!("__rustc::{name}")) {
                 return self.import(&symbol, sig);
             }
+            // FIXME: this passes arguments the way Rust functions take them, which is only
+            // what a foreign function expects for scalars and pointers.
+            if let InstanceDef::Fn(func) = def
+                && let Some(symbol) = self.link_name(func)
+                && !symbol.starts_with("llvm.")
+            {
+                return self.import(&symbol, sig);
+            }
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let symbol = format!("rustd::{name}::{}", self.instances.len());
@@ -462,13 +505,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(id)
     }
 
+    /// The symbol a function declared in an `extern` block stands for.
+    fn link_name(&self, func: FunctionId) -> Option<String> {
+        let ItemContainerId::ExternBlockId(_) = func.lookup(self.db).container else {
+            return None;
+        };
+        let name = AttrFlags::link_name(self.db, func.into())
+            .unwrap_or_else(|| FunctionSignature::of(self.db, func).name.symbol().clone());
+        Some(name.as_str().to_owned())
+    }
+
     fn define_const(&mut self, blob: ConstBlob) -> Result<DataId> {
+        self.define_data(blob, false)
+    }
+
+    fn define_data(&mut self, blob: ConstBlob, writable: bool) -> Result<DataId> {
         let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
         let n = self.location_counter;
         self.location_counter += 1;
         let id = self
             .module
-            .declare_data(&format!(".Lrustd.const.{n}"), Linkage::Local, false, false)
+            .declare_data(&format!(".Lrustd.const.{n}"), Linkage::Local, writable, false)
             .map_err(backend)?;
         let mut data = DataDescription::new();
         data.define(blob.bytes.into_boxed_slice());
@@ -596,7 +653,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
             BackendRepr::ScalarPair(a, b) => {
                 let offset = a.size(&self.dl()).align_to(b.align(&self.dl()).abi);
-                PassMode::Pair(self.scalar(a)?, self.scalar(b)?, offset)
+                let (a, b) = (self.scalar(a)?, self.scalar(b)?);
+                if is_ret && (a.ty == types::I128 || b.ty == types::I128) {
+                    // More than the two return registers hold, so LLVM returns it in memory.
+                    PassMode::Indirect
+                } else {
+                    PassMode::Pair(a, b, offset)
+                }
             }
             BackendRepr::Memory { sized: true } => {
                 let max = 8;
@@ -1027,17 +1090,31 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let db = self.cg.db;
         let ty = self.static_ty(id);
         let flags = StaticSignature::of(db, id).flags;
-        if flags.intersects(StaticFlags::MUTABLE | StaticFlags::EXTERN) {
-            unsupported!("mutable or extern static without a rustc symbol");
+        if flags.contains(StaticFlags::EXTERN) {
+            unsupported!("extern static without a rustc symbol");
         }
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
-        if !self.is_freeze(allocation.ty) {
-            unsupported!("static with interior mutability and no rustc symbol");
-        }
-        let blob = self.allocation_blob(allocation)?;
-        let value = self.blob_addr(blob)?;
+        let value = if !flags.contains(StaticFlags::MUTABLE) && self.is_freeze(allocation.ty) {
+            let blob = self.allocation_blob(allocation)?;
+            self.blob_addr(blob)?
+        } else {
+            if self.cg.own_statics != Some(id.krate(db)) {
+                unsupported!("writable static without a rustc symbol");
+            }
+            let data = match self.cg.statics.get(&id) {
+                Some(&data) => data,
+                None => {
+                    let blob = self.allocation_blob(allocation)?;
+                    let data = self.cg.define_data(blob, true)?;
+                    self.cg.statics.insert(id, data);
+                    data
+                }
+            };
+            let data = self.cg.module.declare_data_in_func(data, self.builder.func);
+            self.builder.ins().symbol_value(PTR, data)
+        };
         let addr = self.scratch();
         self.builder.ins().store(MEM, value, addr, 0);
         Ok((addr, ty))
@@ -1650,6 +1727,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if let Some(cc) = cc {
             return Ok(self.builder.ins().icmp(cc, l, r));
         }
+        if let BinOp::Mul = op
+            && self.builder.func.dfg.value_type(l) == types::I128
+        {
+            let (value, overflow) = self.wide_mul_overflow(l, r, signed)?;
+            self.panic_if(overflow, OverflowOp::Mul)?;
+            return Ok(value);
+        }
         let ins = self.builder.ins();
         Ok(match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -1923,6 +2007,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     }
                 }
             }
+        }
+        if let Some(name) = self.cg.link_name(func)
+            && let Some(name) = name.strip_prefix("llvm.")
+        {
+            self.llvm_intrinsic(name, args, dst, dst_ty.ty)?;
+            return self.finish_call(destination, target);
         }
         let values = self.operands(args)?;
         self.call_direct(func, generic_args, &values, dst, dst_ty.ty)?;
@@ -2450,8 +2540,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             ("add_with_overflow" | "sub_with_overflow" | "mul_with_overflow", [lhs, rhs]) => {
                 let (l, scalar) = self.load_scalar(lhs)?;
                 let (r, _) = self.load_scalar(rhs)?;
+                let wide = name == "mul_with_overflow" && scalar.ty == types::I128;
                 let ins = self.builder.ins();
                 let (value, overflow) = match (name, scalar.signed) {
+                    (_, signed) if wide => self.wide_mul_overflow(l, r, signed)?,
                     ("add_with_overflow", true) => ins.sadd_overflow(l, r),
                     ("add_with_overflow", false) => ins.uadd_overflow(l, r),
                     ("sub_with_overflow", true) => ins.ssub_overflow(l, r),
@@ -2514,6 +2606,56 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     unsupported!("transmute between differently sized types");
                 }
                 self.copy(dst, src, size);
+            }
+            // Cranelift's atomics are always sequentially consistent, the strongest ordering.
+            ("atomic_load", [ptr]) => {
+                let scalar = self.scalar_of(dst_ty)?;
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let value = self.builder.ins().atomic_load(scalar.ty, MEM, ptr);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("atomic_store", [ptr, value]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (value, _) = self.load_scalar(value)?;
+                self.builder.ins().atomic_store(MEM, value, ptr);
+            }
+            (
+                "atomic_xchg" | "atomic_xadd" | "atomic_xsub" | "atomic_and" | "atomic_nand"
+                | "atomic_or" | "atomic_xor" | "atomic_max" | "atomic_min" | "atomic_umax"
+                | "atomic_umin",
+                [ptr, value],
+            ) => {
+                let op = match name {
+                    "atomic_xchg" => AtomicRmwOp::Xchg,
+                    "atomic_xadd" => AtomicRmwOp::Add,
+                    "atomic_xsub" => AtomicRmwOp::Sub,
+                    "atomic_and" => AtomicRmwOp::And,
+                    "atomic_nand" => AtomicRmwOp::Nand,
+                    "atomic_or" => AtomicRmwOp::Or,
+                    "atomic_xor" => AtomicRmwOp::Xor,
+                    "atomic_max" => AtomicRmwOp::Smax,
+                    "atomic_min" => AtomicRmwOp::Smin,
+                    "atomic_umax" => AtomicRmwOp::Umax,
+                    _ => AtomicRmwOp::Umin,
+                };
+                let scalar = self.scalar_of(dst_ty)?;
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (value, _) = self.load_scalar(value)?;
+                let old = self.builder.ins().atomic_rmw(scalar.ty, MEM, op, ptr, value);
+                self.builder.ins().store(MEM, old, dst, 0);
+            }
+            ("atomic_cxchg" | "atomic_cxchgweak", [ptr, expected, new]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (expected, _) = self.load_scalar(expected)?;
+                let (new, _) = self.load_scalar(new)?;
+                let old = self.builder.ins().atomic_cas(MEM, ptr, expected, new);
+                let swapped = self.builder.ins().icmp(IntCC::Equal, old, expected);
+                let layout = self.layout(dst_ty)?;
+                self.builder.ins().store(MEM, old, dst, layout.fields.offset(0).bytes() as i32);
+                self.builder.ins().store(MEM, swapped, dst, layout.fields.offset(1).bytes() as i32);
+            }
+            ("atomic_fence" | "atomic_singlethreadfence", []) => {
+                self.builder.ins().fence();
             }
             ("read_via_copy" | "volatile_load" | "unaligned_volatile_load", [ptr]) => {
                 let (ptr, _) = self.load_scalar(ptr)?;
@@ -2601,7 +2743,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             (
                 "simd_and" | "simd_or" | "simd_xor" | "simd_add" | "simd_sub" | "simd_mul"
-                | "simd_eq" | "simd_ne" | "simd_lt" | "simd_le" | "simd_gt" | "simd_ge",
+                | "simd_shl" | "simd_shr" | "simd_eq" | "simd_ne" | "simd_lt" | "simd_le"
+                | "simd_gt" | "simd_ge",
                 [lhs, rhs],
             ) => {
                 let (l, ty) = self.operand(lhs)?;
@@ -2643,10 +2786,53 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         (None, "simd_xor") => self.builder.ins().bxor(a, b),
                         (None, "simd_add") => self.builder.ins().iadd(a, b),
                         (None, "simd_sub") => self.builder.ins().isub(a, b),
+                        (None, "simd_shl") => self.builder.ins().ishl(a, b),
+                        (None, "simd_shr") if signed => self.builder.ins().sshr(a, b),
+                        (None, "simd_shr") => self.builder.ins().ushr(a, b),
                         (None, _) => self.builder.ins().imul(a, b),
                     };
                     self.builder.ins().store(MEM, value, dst, (i * out.ty.bytes() as u64) as i32);
                 }
+            }
+            ("simd_select", [mask, on_true, on_false]) => {
+                let (mask, mask_ty) = self.operand(mask)?;
+                let (on_true, _) = self.operand(on_true)?;
+                let (on_false, _) = self.operand(on_false)?;
+                let (mask_lane, count) = self.simd_lanes(mask_ty)?;
+                let (lane, _) = self.simd_lanes(dst_ty)?;
+                for i in 0..count {
+                    let offset = (i * lane.ty.bytes() as u64) as i32;
+                    let mask_offset = (i * mask_lane.ty.bytes() as u64) as i32;
+                    // The top bit of a mask lane decides.
+                    let chosen = self.builder.ins().load(mask_lane.ty, MEM, mask, mask_offset);
+                    let chosen = self.builder.ins().icmp_imm(IntCC::SignedLessThan, chosen, 0);
+                    let a = self.builder.ins().load(lane.ty, MEM, on_true, offset);
+                    let b = self.builder.ins().load(lane.ty, MEM, on_false, offset);
+                    let value = self.builder.ins().select(chosen, a, b);
+                    self.builder.ins().store(MEM, value, dst, offset);
+                }
+            }
+            ("simd_extract", [vector, index]) => {
+                let (vector, ty) = self.operand(vector)?;
+                let (index, _) = self.load_scalar(index)?;
+                let (lane, _) = self.simd_lanes(ty)?;
+                let index = self.builder.ins().uextend(PTR, index);
+                let offset = self.builder.ins().imul_imm(index, lane.ty.bytes() as i64);
+                let addr = self.builder.ins().iadd(vector, offset);
+                let value = self.builder.ins().load(lane.ty, MEM, addr, 0);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("simd_insert", [vector, index, value]) => {
+                let (vector, ty) = self.operand(vector)?;
+                let (index, _) = self.load_scalar(index)?;
+                let (value, _) = self.load_scalar(value)?;
+                let (lane, _) = self.simd_lanes(ty)?;
+                let size = self.layout(ty)?.size;
+                self.copy(dst, vector, size);
+                let index = self.builder.ins().uextend(PTR, index);
+                let offset = self.builder.ins().imul_imm(index, lane.ty.bytes() as i64);
+                let addr = self.builder.ins().iadd(dst, offset);
+                self.builder.ins().store(MEM, value, addr, 0);
             }
             ("simd_splat", [arg]) => {
                 let (src, _) = self.operand(arg)?;
@@ -2767,12 +2953,67 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Ok(Intrinsic::Inline)
     }
 
+    /// A function `core::arch` declares as `llvm.{name}`: something LLVM implements, with no
+    /// body anywhere.
+    fn llvm_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[Operand],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
+        match (name, args) {
+            ("x86.sse3.ldu.dq" | "x86.avx.ldu.dq.256", [ptr]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let size = self.layout(dst_ty)?.size;
+                self.copy(dst, ptr, size);
+            }
+            ("x86.ssse3.pshuf.b.128" | "x86.avx2.pshuf.b", [table, indices]) => {
+                let (table, ty) = self.operand(table)?;
+                let (indices, _) = self.operand(indices)?;
+                let size = self.layout(ty)?.size.bytes();
+                // Each 16-byte half looks up bytes in itself.
+                for i in 0..size {
+                    let index = self.builder.ins().load(types::I8, MEM, indices, i as i32);
+                    let slot = self.builder.ins().band_imm(index, 0x0f);
+                    let slot = self.builder.ins().uextend(PTR, slot);
+                    let addr = self.builder.ins().iadd(table, slot);
+                    let found = self.builder.ins().load(types::I8, MEM, addr, (i & !15) as i32);
+                    let zero = self.builder.ins().iconst(types::I8, 0);
+                    let cleared = self.builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
+                    let value = self.builder.ins().select(cleared, zero, found);
+                    self.builder.ins().store(MEM, value, dst, i as i32);
+                }
+            }
+            _ => unsupported!("LLVM intrinsic `{name}`"),
+        }
+        Ok(())
+    }
+
     /// The lane type and lane count of a vector type. Lanes sit in memory in order.
     fn simd_lanes(&self, ty: Ty<'db>) -> Result<(AbiScalar, u64)> {
         match self.layout(ty)?.backend_repr {
             BackendRepr::SimdVector { element, count } => Ok((self.scalar(element)?, count)),
             _ => unsupported!("vector operation on {ty:?}"),
         }
+    }
+
+    /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in
+    /// `compiler_builtins`.
+    fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
+        sig.params.push(AbiParam::new(PTR));
+        sig.returns.push(AbiParam::new(types::I128));
+        let name = if signed { "__rust_i128_mulo" } else { "__rust_u128_mulo" };
+        let callee = self.cg.import(name, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        let overflow = self.scratch();
+        let call = self.builder.ins().call(callee, &[l, r, overflow]);
+        let value = self.builder.inst_results(call)[0];
+        let overflow = self.builder.ins().load(types::I32, MEM, overflow, 0);
+        let overflow = self.builder.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+        Ok((value, overflow))
     }
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {

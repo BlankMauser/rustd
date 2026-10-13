@@ -4,6 +4,10 @@
 //! One module per backend feature area, so a bisected culprit names the area.
 
 pub mod scalars {
+    pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
+        let (product, overflow) = a.overflowing_mul(b);
+        (product, overflow, c.checked_mul(a as i128), (a >> 64).checked_mul(b >> 64))
+    }
     pub fn arith(a: u32, b: u32) -> u32 {
         (a + b) * 3 - (a / (b | 1)) % 7
     }
@@ -642,6 +646,19 @@ pub mod simd {
         }
     }
     #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn shuffle(a: &[u8; 16], b: &[u8; 16]) -> ([u8; 16], i32) {
+        unsafe {
+            let x = _mm_lddqu_si128(a.as_ptr().cast());
+            let y = _mm_lddqu_si128(b.as_ptr().cast());
+            let z = _mm_shuffle_epi8(x, _mm_max_epu8(y, _mm_srli_epi16::<3>(x)));
+            let z = _mm_andnot_si128(_mm_slli_epi16::<1>(y), _mm_min_epi8(z, x));
+            let mut out = [0; 16];
+            _mm_storeu_si128(out.as_mut_ptr().cast(), z);
+            (out, _mm_extract_epi16::<3>(z))
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
     pub fn mix(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
         unsafe {
             let x = _mm_loadu_si128(a.as_ptr().cast());
@@ -650,6 +667,46 @@ pub mod simd {
             let mut out = [0; 16];
             _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_sub_epi8(z, _mm_cmpgt_epi8(x, y)));
             out
+        }
+    }
+}
+
+pub mod statics {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(5);
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    static LOW: AtomicI32 = AtomicI32::new(0);
+    static mut PLAIN: [u32; 3] = [1, 2, 3];
+
+    pub fn bump(n: u64) -> u64 {
+        COUNTER.fetch_add(n, Ordering::Relaxed);
+        COUNTER.fetch_sub(1, Ordering::SeqCst);
+        COUNTER.fetch_or(1 << 40, Ordering::AcqRel);
+        COUNTER.load(Ordering::Acquire)
+    }
+    pub fn once() -> (bool, bool, bool) {
+        let first = FLAG.swap(true, Ordering::SeqCst);
+        let second = FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed);
+        let third = FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed);
+        (first, second.is_ok(), third.is_ok())
+    }
+    pub fn lowest(n: i32) -> i32 {
+        LOW.fetch_min(n, Ordering::Relaxed);
+        LOW.fetch_xor(0, Ordering::Relaxed);
+        LOW.load(Ordering::Relaxed)
+    }
+    pub fn local(n: usize) -> usize {
+        let a = AtomicUsize::new(n);
+        a.store(a.load(Ordering::Relaxed) * 3, Ordering::Release);
+        a.fetch_max(10, Ordering::Relaxed);
+        a.fetch_and(!1, Ordering::Relaxed);
+        a.into_inner()
+    }
+    pub fn plain(i: usize, n: u32) -> u32 {
+        unsafe {
+            PLAIN[i] += n;
+            PLAIN[0] + PLAIN[1] + PLAIN[2]
         }
     }
 }
