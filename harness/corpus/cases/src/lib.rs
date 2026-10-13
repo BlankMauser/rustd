@@ -3569,3 +3569,82 @@ pub mod fn_thread_local {
         (push(1u8), push(2u16), other)
     }
 }
+
+/// Items of one name at the module's level, in a function and in a closure are different items.
+pub mod shadowed_items {
+    struct D(u32);
+    impl Drop for D {
+        fn drop(&mut self) {
+            println!("outer D {}", self.0);
+        }
+    }
+    fn helper() -> u32 {
+        1
+    }
+    trait Name {
+        fn name(&self) -> &'static str;
+    }
+    impl Name for D {
+        fn name(&self) -> &'static str {
+            "outer"
+        }
+    }
+
+    fn in_function() -> u32 {
+        struct D(u32, bool);
+        impl Drop for D {
+            fn drop(&mut self) {
+                println!("fn D {} {}", self.0, self.1);
+            }
+        }
+        impl Name for D {
+            fn name(&self) -> &'static str {
+                "in function"
+            }
+        }
+        fn helper() -> u32 {
+            2
+        }
+        let d = D(5, true);
+        println!("{}", d.name());
+        helper() + d.0
+    }
+
+    fn in_closure() -> u32 {
+        let f = || {
+            struct D(u8);
+            impl Drop for D {
+                fn drop(&mut self) {
+                    println!("closure D {}", self.0);
+                }
+            }
+            fn helper() -> u32 {
+                3
+            }
+            let d = D(9);
+            helper() + d.0 as u32
+        };
+        f()
+    }
+
+    impl D {
+        fn in_method(&self) -> u32 {
+            struct D(u64);
+            impl Drop for D {
+                fn drop(&mut self) {
+                    println!("method D {}", self.0);
+                }
+            }
+            fn helper() -> u32 {
+                4
+            }
+            helper() + D(11).0 as u32 + self.0
+        }
+    }
+
+    pub fn run() -> u32 {
+        let d = D(100);
+        println!("{}", d.name());
+        helper() + in_function() + in_closure() + d.in_method()
+    }
+}

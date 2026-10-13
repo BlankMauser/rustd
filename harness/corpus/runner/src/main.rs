@@ -245,4 +245,5 @@ fn main() {
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
     println!("module_paths {}", cases::module_paths::run());
     println!("fn_thread_local {:?}", cases::fn_thread_local::run());
+    println!("shadowed_items {}", cases::shadowed_items::run());
 }

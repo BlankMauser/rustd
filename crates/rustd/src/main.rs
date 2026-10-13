@@ -164,16 +164,67 @@ impl Resolver<'_> {
     }
 
     fn item_path(&self, module: Module, name: &str) -> Option<String> {
-        let krate = module.krate(self.db);
-        let krate_name = krate.display_name(self.db)?;
-        let mut path =
-            self.table.crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
-        for segment in module.path_segments(self.db) {
-            path.push_str("::");
-            path.push_str(segment.as_str());
-        }
+        let mut path = self.scope_path(module)?;
         path.push_str("::");
         path.push_str(name);
+        Some(path)
+    }
+
+    /// The path of what holds a module's items: the module, or for the items of a block the
+    /// function, closure, constant or static the block is in, which only the syntax knows.
+    fn scope_path(&self, module: Module) -> Option<String> {
+        if module.nearest_non_block_module(self.db) == module {
+            let krate = module.krate(self.db);
+            let krate_name = krate.display_name(self.db)?;
+            let mut path = self
+                .table
+                .crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
+            for segment in module.path_segments(self.db) {
+                path.push_str("::");
+                path.push_str(segment.as_str());
+            }
+            return Some(path);
+        }
+        let sema = hir::Semantics::new(self.db);
+        let source = module.definition_source(self.db);
+        let hir::ModuleSource::BlockExpr(block) = source.value else { return None };
+        let range = block.syntax().text_range();
+        let block = sema
+            .parse_or_expand(source.file_id)
+            .covering_element(range)
+            .ancestors()
+            .find(|it| it.text_range() == range && ast::BlockExpr::can_cast(it.kind()))?;
+        let mut inner = Vec::new();
+        let mut owner = None;
+        for node in sema.ancestors_with_macros(block) {
+            if let Some(func) = ast::Fn::cast(node.clone()) {
+                let func: hir::Function = sema.to_def(&func)?;
+                owner = Some(self.path(func.try_into().ok()?)?);
+                break;
+            }
+            match_ast! {
+                match node {
+                    ast::ClosureExpr(it) => inner.push(format!("{{closure#{}}}", closure_number(&it))),
+                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_string())),
+                    ast::Static(it) => inner.push(it.name()?.text().to_string()),
+                    // Anonymous constants have numbers we don't know.
+                    ast::BlockExpr(it) => if it.const_token().is_some() { return None },
+                    ast::ConstArg(_) => return None,
+                    _ => {},
+                }
+            }
+        }
+        let mut path = match owner {
+            Some(owner) => owner,
+            None => {
+                let outer = inner.pop()?;
+                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+            }
+        };
+        for segment in inner.iter().rev() {
+            path.push_str("::");
+            path.push_str(segment);
+        }
         Some(path)
     }
 
