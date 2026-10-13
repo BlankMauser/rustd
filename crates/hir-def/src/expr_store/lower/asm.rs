@@ -181,6 +181,7 @@ impl ExprCollector<'_> {
 
         let mut mappings = vec![];
         let mut curarg = 0;
+        let mut comment_only = !options.contains(AsmOptions::RAW);
         if !options.contains(AsmOptions::RAW) {
             // Don't treat raw asm as a format string.
             asm.template()
@@ -189,8 +190,15 @@ impl ExprCollector<'_> {
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
                     mappings.resize_with(idx + 1, Vec::default);
                     let Ok(text) = s.value() else {
+                        comment_only = false;
                         return;
                     };
+                    let line = text.trim();
+                    comment_only &= line.is_empty()
+                        || line
+                            .strip_prefix("/*")
+                            .and_then(|it| it.strip_suffix("*/"))
+                            .is_some_and(|it| !it.contains("*/"));
                     let mappings = &mut mappings[idx];
                     let template_snippet = match expr {
                         ast::Expr::Literal(literal) => match literal.kind() {
@@ -283,7 +291,12 @@ impl ExprCollector<'_> {
         };
 
         let idx = self.alloc_expr(
-            Expr::InlineAsm(InlineAsm { operands: operands.into_boxed_slice(), options, kind }),
+            Expr::InlineAsm(InlineAsm {
+                operands: operands.into_boxed_slice(),
+                options,
+                kind,
+                comment_only,
+            }),
             syntax_ptr,
         );
         self.store

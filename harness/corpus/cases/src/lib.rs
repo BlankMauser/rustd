@@ -710,3 +710,118 @@ pub mod statics {
         }
     }
 }
+
+pub mod floats {
+    pub fn arith(a: f64, b: f64) -> (f64, f64, f64, f64, f64) {
+        (a + b, a - b, a * b, a / b, a % b)
+    }
+    pub fn single(a: f32, b: f32) -> (f32, f32, bool, bool) {
+        (a * b + 0.5, -a % b, a < b, a == b)
+    }
+    pub fn compare(a: f64, b: f64) -> u8 {
+        (a < b) as u8 | ((a <= b) as u8) << 1 | ((a > b) as u8) << 2 | ((a >= b) as u8) << 3 | ((a != b) as u8) << 4
+    }
+    pub fn to_int(x: f64) -> (i64, u64, i32, u8, i8, u16) {
+        (x as i64, x as u64, x as i32, x as u8, x as i8, x as u16)
+    }
+    pub fn from_int(a: i64, b: u64, c: u8, d: i16) -> (f64, f64, f32, f64, f32) {
+        (a as f64, b as f64, c as f32, d as f64, b as f32)
+    }
+    pub fn widen(x: f32, y: f64) -> (f64, f32) {
+        (x as f64, y as f32)
+    }
+    pub fn bits(x: f64) -> (u64, f64, bool) {
+        (x.to_bits(), f64::from_bits(x.to_bits() ^ (1 << 63)), x.is_nan())
+    }
+    #[derive(Clone, Copy)]
+    pub struct Point {
+        pub x: f64,
+        pub y: f64,
+    }
+    pub fn point(p: Point, scale: f32) -> Point {
+        Point { x: p.x * scale as f64, y: -p.y }
+    }
+    pub fn mixed(n: u32, x: f32) -> (u32, f32) {
+        (n + 1, x + n as f32)
+    }
+    pub fn sum(values: &[f64]) -> f64 {
+        let mut total = 0.0;
+        for v in values {
+            total += *v;
+        }
+        total
+    }
+}
+
+pub mod misc {
+    pub fn big_repeat(seed: u8) -> u32 {
+        let table = [seed; 4096];
+        let wide = [(seed as u32, 7u16); 100];
+        table.iter().map(|&b| b as u32).sum::<u32>() + wide[99].0 + wide[50].1 as u32
+    }
+    pub enum Shape {
+        Circle(u32),
+        Rect(u32, u32),
+    }
+    pub struct Wrapper(pub u32, pub bool);
+    pub fn constructors(values: &[u32]) -> (u32, u32, u32) {
+        let options: Vec<Option<u32>> = values.iter().copied().map(Some).collect();
+        let shapes: Vec<Shape> = values.iter().copied().map(Shape::Circle).collect();
+        let wrapped = values.first().copied().map(|v| (v, true)).map(|(a, b)| Wrapper(a, b));
+        let area: u32 = shapes
+            .iter()
+            .map(|s| match s {
+                Shape::Circle(r) => 3 * r * r,
+                Shape::Rect(w, h) => w * h,
+            })
+            .sum();
+        (options.iter().flatten().sum(), area, wrapped.map_or(0, |w| w.0 + w.1 as u32))
+    }
+    pub fn lines(text: &str) -> (usize, usize) {
+        (text.lines().count(), text.lines().map(str::len).sum())
+    }
+    pub fn keyword(name: &str) -> u32 {
+        match name {
+            "alpha" => 1,
+            "beta" | "gamma" => 2,
+            "" => 3,
+            "alphabet" => 4,
+            _ => 0,
+        }
+    }
+    pub fn barrier(mut x: u64) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("/*{0}*/", inout(reg) x);
+        }
+        x = x.wrapping_mul(3);
+        x
+    }
+    fn target(x: u32) -> u32 {
+        x + 1
+    }
+    pub fn fn_item_cast(x: u32) -> (bool, u32) {
+        let raw = target as *const ();
+        let addr = target as usize;
+        let back: fn(u32) -> u32 = unsafe { core::mem::transmute(raw) };
+        (raw as usize == addr, back(x))
+    }
+    pub fn float_math(x: f64, y: f32) -> (f64, f64, f64, f64, f64, f32, f64, f64) {
+        (x.abs(), x.sqrt(), x.floor(), x.ceil(), x.round(), y.abs().trunc(), x.copysign(-1.0), x.max(2.5).min(100.0))
+    }
+    fn double(x: u32) -> u32 {
+        x * 2
+    }
+    fn triple(x: u32) -> u32 {
+        x * 3
+    }
+    static TABLE: [fn(u32) -> u32; 2] = [double, triple];
+    static LAZY: core::sync::atomic::AtomicPtr<()> = core::sync::atomic::AtomicPtr::new(double as *mut ());
+    pub fn fn_statics(x: u32) -> (u32, u32, u32) {
+        use core::sync::atomic::Ordering;
+        let first: fn(u32) -> u32 = unsafe { core::mem::transmute(LAZY.load(Ordering::Relaxed)) };
+        LAZY.store(triple as *mut (), Ordering::Relaxed);
+        let second: fn(u32) -> u32 = unsafe { core::mem::transmute(LAZY.load(Ordering::Relaxed)) };
+        (TABLE[0](x) + TABLE[1](x), first(x), second(x))
+    }
+}

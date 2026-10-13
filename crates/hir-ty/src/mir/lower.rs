@@ -377,6 +377,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::OffsetOf(_) => {
                 not_supported!("builtin#offset_of")
             }
+            Expr::InlineAsm(asm) if asm.comment_only => Ok(Some(current)),
             Expr::InlineAsm(_) => {
                 not_supported!("builtin#asm")
             }
@@ -907,8 +908,35 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             else {
                                 return Ok(None);
                             };
-                            (it, source_ty, current)
+                            // The operand carries the cast's coercion, e.g. fn item to pointer.
+                            (it, self.expr_ty_after_adjustments(*expr), current)
                         };
+                    // `f as *const ()` and `f as usize` go through a function pointer.
+                    let (it, source_ty) = if let TyKind::FnDef(..) = source_ty.kind()
+                        && !matches!(target_ty.kind(), TyKind::FnPtr(..))
+                    {
+                        let pointer_ty =
+                            Ty::new_fn_ptr(self.interner(), source_ty.fn_sig(self.interner()));
+                        let pointer: Place<'db> =
+                            self.temp(pointer_ty, current, expr_id.into())?.into();
+                        self.push_assignment(
+                            current,
+                            pointer,
+                            Rvalue::Cast(
+                                CastKind::PointerCoercion(PointerCast::ReifyFnPointer),
+                                it,
+                                pointer_ty.store(),
+                            ),
+                            expr_id.into(),
+                        );
+                        let operand = Operand {
+                            kind: OperandKind::Copy(pointer.store()),
+                            span: Some(expr_id.into()),
+                        };
+                        (operand, pointer_ty)
+                    } else {
+                        (it, source_ty)
+                    };
                     let cast_kind = if source_ty.as_reference().is_some() {
                         CastKind::PointerCoercion(PointerCast::ArrayToPointer)
                     } else {

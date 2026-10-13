@@ -482,6 +482,9 @@ pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
     pub options: AsmOptions,
     pub kind: InlineAsmKind,
+    /// The template is nothing but assembler comments, so the block emits no instructions.
+    /// Crates use this as an optimization barrier.
+    pub comment_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

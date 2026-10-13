@@ -1515,7 +1515,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                     }
                 }
-                CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
+                // The pointer keeps the function's id, like the fn pointer it came from.
+                CastKind::FnPtrToPtr => Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec()),
             },
             Rvalue::ThreadLocalRef(n)
             | Rvalue::AddressOf(n)

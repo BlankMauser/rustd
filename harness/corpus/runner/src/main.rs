@@ -119,4 +119,16 @@ fn main() {
     case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
     case!(statics::lowest(4), statics::lowest(-9), statics::lowest(-2), statics::local(2), statics::local(77));
     case!(statics::plain(0, 5), statics::plain(2, 7), statics::plain(0, 1));
+    case!(floats::arith(1.5, -0.25), floats::arith(1e300, 1e-300), floats::arith(7.0, 0.0), floats::single(3.25, 2.0), floats::single(-1.0, -1.0));
+    case!(floats::compare(1.0, 2.0), floats::compare(2.0, 2.0), floats::compare(f64::NAN, 1.0), floats::compare(3.0, -3.0));
+    case!(floats::to_int(3.99), floats::to_int(-3.99), floats::to_int(1e30), floats::to_int(-1e30), floats::to_int(f64::NAN), floats::to_int(300.5));
+    case!(floats::from_int(-5, u64::MAX, 200, -300), floats::from_int(i64::MIN, 1 << 63, 0, 7), floats::widen(0.1, 0.1));
+    case!(floats::bits(1.0), floats::bits(-0.0), floats::bits(f64::NAN).2);
+    let p = floats::point(floats::Point { x: 1.5, y: 2.5 }, 2.0);
+    case!(p.x, p.y, floats::mixed(4, 0.5), floats::sum(&[0.1, 0.2, 0.3]), floats::sum(&[]));
+    case!(misc::big_repeat(3), misc::big_repeat(255), misc::constructors(&[1, 2, 3]), misc::constructors(&[]));
+    case!(misc::lines("a\nbb\r\nccc\n"), misc::lines(""));
+    case!(misc::keyword("alpha"), misc::keyword("beta"), misc::keyword("gamma"), misc::keyword(""), misc::keyword("alphabet"), misc::keyword("alphx"), misc::keyword("delta"));
+    case!(misc::barrier(14), misc::fn_item_cast(41), misc::float_math(-2.5, -7.75), misc::float_math(16.0, 0.3), misc::float_math(0.5, 1.0));
+    case!(misc::fn_statics(5), misc::fn_statics(7));
 }

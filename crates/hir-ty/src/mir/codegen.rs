@@ -9,7 +9,7 @@ use base_db::Crate;
 use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
-        StackSlotData, StackSlotKind, TrapCode, Type, Value, condcodes::IntCC, types,
+        StackSlotData, StackSlotKind, TrapCode, Type, Value, condcodes::{FloatCC, IntCC}, types,
     },
     isa::{self, CallConv},
     settings::{self, Configurable},
@@ -534,6 +534,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let target = self.module.declare_data_in_data(target, &mut data);
             data.write_data_addr(offset, target, 0);
         }
+        for (offset, target) in blob.fn_relocs {
+            let target = self.module.declare_func_in_data(target, &mut data);
+            data.write_function_addr(offset, target);
+        }
         self.module.define_data(id, &data).map_err(backend)?;
         Ok(id)
     }
@@ -565,6 +569,7 @@ enum Intrinsic {
 struct ConstBlob {
     bytes: Vec<u8>,
     relocs: Vec<(u32, DataId)>,
+    fn_relocs: Vec<(u32, FuncId)>,
     align: u64,
 }
 
@@ -634,7 +639,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 signed,
             },
             Primitive::Pointer(_) => AbiScalar { ty: PTR, signed: false },
-            Primitive::Float(_) => unsupported!("float scalars"),
+            Primitive::Float(rustc_abi::Float::F32) => AbiScalar { ty: types::F32, signed: true },
+            Primitive::Float(rustc_abi::Float::F64) => AbiScalar { ty: types::F64, signed: true },
+            Primitive::Float(_) => unsupported!("f16 and f128"),
         })
     }
 
@@ -739,12 +746,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
+        let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
+        if align <= 16 {
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size,
+                align.trailing_zeros() as u8,
+            ));
+            return self.builder.ins().stack_addr(PTR, slot, 0);
+        }
+        // Cranelift keeps the frame 16-byte aligned and no more, so over-allocate and round up.
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            layout.size.bytes() as u32,
-            layout.align.abi.bytes().trailing_zeros() as u8,
+            size + align as u32,
+            4,
         ));
-        self.builder.ins().stack_addr(PTR, slot, 0)
+        let base = self.builder.ins().stack_addr(PTR, slot, 0);
+        let bumped = self.builder.ins().iadd_imm(base, align as i64 - 1);
+        self.builder.ins().band_imm(bumped, -(align as i64))
     }
 
     /// The signature a MIR body is compiled with.
@@ -1195,7 +1214,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             | TyKind::RawPtr(..) => {
                 let bits = valtree.inner().to_leaf().to_bits(layout.size);
                 let bytes = bits.to_le_bytes()[..layout.size.bytes_usize()].to_vec();
-                return Ok(ConstBlob { bytes, relocs: Vec::new(), align });
+                return Ok(ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align });
             }
             TyKind::Ref(_, pointee, _) => pointee,
             _ => unsupported!("constant of type {ty:?}"),
@@ -1203,7 +1222,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut bytes = vec![0; layout.size.bytes_usize()];
         let target = match pointee.kind() {
             TyKind::Str | TyKind::Slice(_) => {
-                let mut target = ConstBlob { bytes: Vec::new(), relocs: Vec::new(), align: 1 };
+                let mut target = ConstBlob { bytes: Vec::new(), relocs: Vec::new(), fn_relocs: Vec::new(), align: 1 };
                 let items = valtree.inner().to_branch();
                 for item in items.iter() {
                     let ConstKind::Value(item) = item.kind() else {
@@ -1223,7 +1242,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             _ => self.valtree_blob(pointee, valtree)?,
         };
         let target = self.cg.define_const(target)?;
-        Ok(ConstBlob { bytes, relocs: vec![(0, target)], align })
+        Ok(ConstBlob { bytes, relocs: vec![(0, target)], fn_relocs: Vec::new(), align })
     }
 
     fn allocation_blob(&mut self, allocation: Allocation<'db>) -> Result<ConstBlob> {
@@ -1238,7 +1257,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             (len, 16) if len < 16 => bytes.resize(16, 0),
             _ => unsupported!("constant whose size differs from its layout"),
         }
-        let mut blob = ConstBlob { bytes, relocs: Vec::new(), align: layout.align.abi.bytes() };
+        let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: layout.align.abi.bytes() };
         self.relocate(&mut blob, 0, *ty, memory_map)?;
         Ok(blob)
     }
@@ -1268,7 +1287,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 };
                 let Some(target) = target else { return Ok(()) };
                 let mut target =
-                    ConstBlob { bytes: target.to_vec(), relocs: Vec::new(), align: 16 };
+                    ConstBlob { bytes: target.to_vec(), relocs: Vec::new(), fn_relocs: Vec::new(), align: 16 };
                 match pointee.kind() {
                     TyKind::Str => (),
                     TyKind::Slice(elem) => {
@@ -1287,7 +1306,23 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 blob.bytes[offset..offset + 8].fill(0);
                 blob.relocs.push((offset as u32, target));
             }
-            TyKind::FnPtr(..) => unsupported!("fn pointer in a constant"),
+            // Const eval gives function pointers as ids into its table of fn item types. A
+            // function cast to a raw pointer keeps that id, so a raw pointer holding one is
+            // taken to be a function. FIXME: const eval should track provenance instead.
+            TyKind::FnPtr(..) | TyKind::RawPtr(..) => {
+                let Some(id) = blob.usize_at(offset) else {
+                    unsupported!("constant pointer out of bounds");
+                };
+                let fn_ty = match map.vtable_ty(id) {
+                    Ok(fn_ty) if matches!(fn_ty.kind(), TyKind::FnDef(..)) => fn_ty,
+                    _ if matches!(ty.kind(), TyKind::RawPtr(..)) => return Ok(()),
+                    _ if id == 0 => return Ok(()),
+                    _ => unsupported!("fn pointer in a constant"),
+                };
+                let target = self.fn_item(fn_ty)?;
+                blob.bytes[offset..offset + 8].fill(0);
+                blob.fn_relocs.push((offset as u32, target));
+            }
             TyKind::Adt(def, args) => {
                 let layout = self.layout(ty)?;
                 let (variant, offsets): (VariantId, Vec<usize>) = match def.def_id() {
@@ -1336,6 +1371,19 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let size = self.layout(elem)?.size.bytes_usize();
                 for i in 0..len as usize {
                     self.relocate(blob, offset + i * size, elem, map)?;
+                }
+            }
+            TyKind::Alias(..) => {
+                let normalized =
+                    crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+                        .structurally_normalize_ty(
+                            &crate::next_solver::infer::traits::ObligationCause::dummy(),
+                            self.env.param_env,
+                            ty,
+                        )
+                        .unwrap_or(ty);
+                if !matches!(normalized.kind(), TyKind::Alias(..)) {
+                    self.relocate(blob, offset, normalized, map)?;
                 }
             }
             _ => (),
@@ -1420,12 +1468,30 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 };
                 let (src, ty) = self.operand(operand)?;
                 let size = self.layout(ty)?.size;
-                if len > 64 {
-                    unsupported!("repeat of {len} elements");
-                }
-                for i in 0..len as u64 {
-                    let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
+                if len <= 16 {
+                    for i in 0..len as u64 {
+                        let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
+                        self.copy(element, src, size);
+                    }
+                } else {
+                    let header = self.builder.create_block();
+                    let body = self.builder.create_block();
+                    let done = self.builder.create_block();
+                    self.builder.append_block_param(header, PTR);
+                    let zero = self.builder.ins().iconst(PTR, 0);
+                    self.builder.ins().jump(header, &[zero.into()]);
+                    self.builder.switch_to_block(header);
+                    let index = self.builder.block_params(header)[0];
+                    let more =
+                        self.builder.ins().icmp_imm(IntCC::UnsignedLessThan, index, len as i64);
+                    self.builder.ins().brif(more, body, &[], done, &[]);
+                    self.builder.switch_to_block(body);
+                    let offset = self.builder.ins().imul_imm(index, size.bytes() as i64);
+                    let element = self.builder.ins().iadd(dst, offset);
                     self.copy(element, src, size);
+                    let next = self.builder.ins().iadd_imm(index, 1);
+                    self.builder.ins().jump(header, &[next.into()]);
+                    self.builder.switch_to_block(done);
                 }
             }
             Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
@@ -1438,6 +1504,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let value = match op {
                     UnOp::Not if is_bool => self.builder.ins().bxor_imm(value, 1),
                     UnOp::Not => self.builder.ins().bnot(value),
+                    UnOp::Neg if self.builder.func.dfg.value_type(value).is_float() => {
+                        self.builder.ins().fneg(value)
+                    }
                     UnOp::Neg => self.builder.ins().ineg(value),
                 };
                 store(self, value);
@@ -1516,37 +1585,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().store(MEM, meta, dst, 8);
             }
             CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
-                let TyKind::FnDef(def, generic_args) = from_ty.kind() else {
-                    unsupported!("fn pointer to {from_ty:?}");
-                };
-                let CallableDefId::FunctionId(func) = def.0 else {
-                    unsupported!("fn pointer to a constructor");
-                };
-                let db = self.cg.db;
-                if FunctionSignature::is_intrinsic(db, func) {
-                    unsupported!("fn pointer to an intrinsic");
-                }
-                if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
-                    unsupported!("fn pointer to a `dyn` method");
-                }
-                let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
-                let either::Either::Left(callee) = callee else {
-                    unsupported!("fn pointer to a builtin derive method");
-                };
-                let TyKind::FnPtr(sig, _) = to_ty.kind() else {
-                    unsupported!("fn pointer cast to {to_ty:?}");
-                };
-                let sig = self.interner.instantiate_bound_regions_with_erased(sig);
-                let ret_layout = self.layout(sig.output())?;
-                let ret_mode = self.pass_mode(&ret_layout, true)?;
-                let mut arg_modes = Vec::new();
-                for ty in sig.inputs().iter() {
-                    let layout = self.layout(*ty)?;
-                    arg_modes.push(self.pass_mode(&layout, false)?);
-                }
-                let sig = self.signature(&arg_modes, ret_mode);
-                let callee =
-                    self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+                let callee = self.fn_item(from_ty)?;
                 let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
                 let pointer = self.builder.ins().func_addr(PTR, callee);
                 self.builder.ins().store(MEM, pointer, dst, 0);
@@ -1574,9 +1613,46 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 ) => self.copy(dst, src, to.size),
                 _ => unsupported!("cast from {from_ty:?} to {to_ty:?}"),
             },
+            CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => {
+                let (from, to) = (self.scalar_of(from_ty)?, self.scalar_of(to_ty)?);
+                let value = self.builder.ins().load(from.ty, MEM, src, 0);
+                let value = self.float_cast(value, from, to)?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             _ => unsupported!("cast {kind:?}"),
         }
         Ok(())
+    }
+
+    /// The function a fn item type names, declared so its address can be taken.
+    fn fn_item(&mut self, fn_ty: Ty<'db>) -> Result<FuncId> {
+        let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
+            unsupported!("fn pointer to {fn_ty:?}");
+        };
+        let CallableDefId::FunctionId(func) = def.0 else {
+            unsupported!("fn pointer to a constructor");
+        };
+        let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func) {
+            unsupported!("fn pointer to an intrinsic");
+        }
+        if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
+            unsupported!("fn pointer to a `dyn` method");
+        }
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
+        let either::Either::Left(callee) = callee else {
+            unsupported!("fn pointer to a builtin derive method");
+        };
+        let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
+        let ret_layout = self.layout(sig.output())?;
+        let ret_mode = self.pass_mode(&ret_layout, true)?;
+        let mut arg_modes = Vec::new();
+        for ty in sig.inputs().iter() {
+            let layout = self.layout(*ty)?;
+            arg_modes.push(self.pass_mode(&layout, false)?);
+        }
+        let sig = self.signature(&arg_modes, ret_mode);
+        self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
 
     /// The discriminant of the enum at `addr`, as a `to`.
@@ -1684,12 +1760,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let (mut l_addr, mut ty) = self.operand(lhs)?;
         let (mut r_addr, mut r_ty) = self.operand(rhs)?;
         // RA lowers comparisons of references without the deref.
+        // Where the innermost reference is stored, for the length of a `str`.
+        let (mut l_ref, mut r_ref) = (None, None);
         while let TyKind::Ref(_, inner, _) = ty.kind() {
             ty = inner;
+            l_ref = Some(l_addr);
             l_addr = self.builder.ins().load(PTR, MEM, l_addr, 0);
         }
         while let TyKind::Ref(_, inner, _) = r_ty.kind() {
             r_ty = inner;
+            r_ref = Some(r_addr);
             r_addr = self.builder.ins().load(PTR, MEM, r_addr, 0);
         }
         // A constant pattern of array type. Elements without padding or a custom `PartialEq`
@@ -1706,11 +1786,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let cc = if let BinOp::Eq = op { IntCC::Equal } else { IntCC::NotEqual };
             return Ok(self.builder.ins().icmp_imm(cc, order, 0));
         }
+        // A string literal pattern.
+        if let (BinOp::Eq | BinOp::Ne, TyKind::Str, Some(l_ref), Some(r_ref)) =
+            (op, ty.kind(), l_ref, r_ref)
+        {
+            let l_len = self.builder.ins().load(PTR, MEM, l_ref, 8);
+            let r_len = self.builder.ins().load(PTR, MEM, r_ref, 8);
+            let same_len = self.builder.ins().icmp(IntCC::Equal, l_len, r_len);
+            let zero = self.builder.ins().iconst(PTR, 0);
+            let len = self.builder.ins().select(same_len, l_len, zero);
+            let order = self.memcmp(l_addr, r_addr, len)?;
+            let same_bytes = self.builder.ins().icmp_imm(IntCC::Equal, order, 0);
+            let equal = self.builder.ins().band(same_len, same_bytes);
+            return Ok(if let BinOp::Eq = op {
+                equal
+            } else {
+                self.builder.ins().bxor_imm(equal, 1)
+            });
+        }
         let scalar = self.scalar_of(ty)?;
         let r_scalar = self.scalar_of(r_ty)?;
         let l = self.builder.ins().load(scalar.ty, MEM, l_addr, 0);
         let r = self.builder.ins().load(r_scalar.ty, MEM, r_addr, 0);
         let signed = scalar.signed;
+        if scalar.ty.is_float() {
+            return self.float_binary_op(op, l, r);
+        }
         let cc = match (op, signed) {
             (BinOp::Eq, _) => Some(IntCC::Equal),
             (BinOp::Ne, _) => Some(IntCC::NotEqual),
@@ -1780,6 +1881,92 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 value
             }
             BinOp::Offset => unsupported!("pointer offset"),
+        })
+    }
+
+    fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
+        let ins = self.builder.ins();
+        Ok(match op {
+            BinOp::Eq => ins.fcmp(FloatCC::Equal, l, r),
+            BinOp::Ne => ins.fcmp(FloatCC::NotEqual, l, r),
+            BinOp::Lt => ins.fcmp(FloatCC::LessThan, l, r),
+            BinOp::Le => ins.fcmp(FloatCC::LessThanOrEqual, l, r),
+            BinOp::Gt => ins.fcmp(FloatCC::GreaterThan, l, r),
+            BinOp::Ge => ins.fcmp(FloatCC::GreaterThanOrEqual, l, r),
+            BinOp::Add => ins.fadd(l, r),
+            BinOp::Sub => ins.fsub(l, r),
+            BinOp::Mul => ins.fmul(l, r),
+            BinOp::Div => ins.fdiv(l, r),
+            BinOp::Rem => {
+                let ty = self.builder.func.dfg.value_type(l);
+                let name = if ty == types::F32 { "fmodf" } else { "fmod" };
+                self.float_libcall(name, ty, &[l, r])?
+            }
+            _ => unsupported!("float operator {op:?}"),
+        })
+    }
+
+    /// Calls a libm function taking and returning `ty`.
+    fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
+        sig.returns.push(AbiParam::new(ty));
+        let callee = self.cg.import(name, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        let call = self.builder.ins().call(callee, args);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// `as` between a float and an integer or another float.
+    fn float_cast(&mut self, value: Value, from: AbiScalar, to: AbiScalar) -> Result<Value> {
+        if from.ty == types::I128 || to.ty == types::I128 {
+            unsupported!("cast between a float and a 128-bit integer");
+        }
+        let ins = self.builder.ins();
+        Ok(match (from.ty.is_float(), to.ty.is_float()) {
+            (true, true) if from.ty == to.ty => value,
+            (true, true) if to.ty == types::F64 => ins.fpromote(types::F64, value),
+            (true, true) => ins.fdemote(types::F32, value),
+            (false, true) => {
+                let wide = if from.ty.bits() < 32 {
+                    if from.signed {
+                        ins.sextend(types::I32, value)
+                    } else {
+                        ins.uextend(types::I32, value)
+                    }
+                } else {
+                    value
+                };
+                if from.signed {
+                    self.builder.ins().fcvt_from_sint(to.ty, wide)
+                } else {
+                    self.builder.ins().fcvt_from_uint(to.ty, wide)
+                }
+            }
+            (true, false) => {
+                // Saturating, with NaN becoming zero, as `as` requires.
+                if to.ty.bits() >= 32 {
+                    if to.signed {
+                        ins.fcvt_to_sint_sat(to.ty, value)
+                    } else {
+                        ins.fcvt_to_uint_sat(to.ty, value)
+                    }
+                } else {
+                    let wide = ins.fcvt_to_sint_sat(types::I32, value);
+                    let bits = to.ty.bits();
+                    let (min, max) = if to.signed {
+                        (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+                    } else {
+                        (0, (1i64 << bits) - 1)
+                    };
+                    let min = self.builder.ins().iconst(types::I32, min);
+                    let max = self.builder.ins().iconst(types::I32, max);
+                    let clamped = self.builder.ins().smax(wide, min);
+                    let clamped = self.builder.ins().smin(clamped, max);
+                    self.builder.ins().ireduce(to.ty, clamped)
+                }
+            }
+            (false, false) => unreachable!("float cast between integers"),
         })
     }
 
@@ -1953,7 +2140,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         if [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once]
             .contains(&Some(func))
         {
-            self.call_fn_trait(args, dst, dst_ty.ty)?;
+            self.call_fn_trait(func, generic_args, args, dst, dst_ty.ty)?;
             return self.finish_call(destination, target);
         }
         if [lang_items.DropInPlace, lang_items.DropGlue].contains(&Some(func)) {
@@ -2025,12 +2212,22 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`. MIR passes the callee first and
     /// then the arguments one by one, not as a tuple.
-    fn call_fn_trait(&mut self, args: &[Operand], dst: Value, dst_ty: Ty<'db>) -> Result<()> {
+    fn call_fn_trait(
+        &mut self,
+        method: FunctionId,
+        method_args: GenericArgs<'db>,
+        args: &[Operand],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
         let Some((callee, rest)) = args.split_first() else {
             unsupported!("Fn-trait call without a callee");
         };
         let (mut addr, mut ty) = self.operand(callee)?;
-        while let TyKind::Ref(_, inner, _) = ty.kind() {
+        // The innermost reference to the callee and the address it is stored at.
+        let mut by_ref = None;
+        while let TyKind::Ref(_, inner, mutability) = ty.kind() {
+            by_ref = Some((addr, ty, mutability));
             if let TyKind::Dynamic(bounds, _) = inner.kind() {
                 // Which method is in the vtable depends on the object's trait, not on the
                 // trait the call was written against.
@@ -2053,8 +2250,26 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut values = self.operands(rest)?;
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => {
-                let CallableDefId::FunctionId(func) = def.0 else {
-                    unsupported!("constructor called through an Fn trait");
+                let func = match def.0 {
+                    CallableDefId::FunctionId(func) => func,
+                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
+                        let TyKind::Adt(_, adt_args) = dst_ty.kind() else {
+                            unsupported!("constructor of {dst_ty:?}");
+                        };
+                        let layout = match def.0 {
+                            CallableDefId::EnumVariantId(id) => {
+                                self.variant_layout(dst, id.into(), adt_args)?
+                            }
+                            _ => self.layout(dst_ty)?,
+                        };
+                        for (i, &(src, ty)) in values.iter().enumerate() {
+                            let size = self.layout(ty)?.size;
+                            let offset = layout.fields.offset(i).bytes() as i64;
+                            let field = self.builder.ins().iadd_imm(dst, offset);
+                            self.copy(field, src, size);
+                        }
+                        return Ok(());
+                    }
                 };
                 if FunctionSignature::is_intrinsic(self.cg.db, func) {
                     unsupported!("intrinsic called through an Fn trait");
@@ -2089,6 +2304,31 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 values.insert(0, self_arg);
                 let def = InstanceDef::Closure(id.0.as_id());
                 self.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
+            }
+            // A type with its own `Fn` impls, which take the arguments as a tuple.
+            TyKind::Adt(..) => {
+                let tuple_ty = method_args.type_at(1);
+                let layout = self.layout(tuple_ty)?;
+                let tuple = self.stack_slot(&layout);
+                for (i, &(src, ty)) in values.iter().enumerate() {
+                    let size = self.layout(ty)?.size;
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    let field = self.builder.ins().iadd_imm(tuple, offset);
+                    self.copy(field, src, size);
+                }
+                let lang_items = self.interner.lang_items();
+                let (method, self_arg) = match by_ref {
+                    None => (Some(method), (addr, ty)),
+                    Some((slot, ref_ty, Mutability::Not)) => (lang_items.Fn_call, (slot, ref_ty)),
+                    Some((slot, ref_ty, Mutability::Mut)) => {
+                        (lang_items.FnMut_call_mut, (slot, ref_ty))
+                    }
+                };
+                let Some(method) = method else {
+                    unsupported!("Fn-trait call on {ty:?}");
+                };
+                let args = GenericArgs::new_from_slice(&[ty.into(), tuple_ty.into()]);
+                self.call_direct(method, args, &[self_arg, (tuple, tuple_ty)], dst, dst_ty)
             }
             _ => unsupported!("Fn-trait call on {ty:?}"),
         }
@@ -2871,6 +3111,92 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let value = self.int_cast(bits, from, to);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            ("simd_reduce_all" | "simd_reduce_any", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (lane, count) = self.simd_lanes(ty)?;
+                let all = name == "simd_reduce_all";
+                let mut acc = self.builder.ins().iconst(types::I8, all as i64);
+                for i in 0..count {
+                    let offset = (i * lane.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(lane.ty, MEM, src, offset);
+                    let set = self.builder.ins().icmp_imm(IntCC::NotEqual, value, 0);
+                    acc = if all {
+                        self.builder.ins().band(acc, set)
+                    } else {
+                        self.builder.ins().bor(acc, set)
+                    };
+                }
+                self.builder.ins().store(MEM, acc, dst, 0);
+            }
+            (
+                "fabs" | "fabsf32" | "fabsf64" | "sqrtf32" | "sqrtf64" | "floorf32" | "floorf64"
+                | "ceilf32" | "ceilf64" | "truncf32" | "truncf64" | "round_ties_even_f32"
+                | "round_ties_even_f64" | "roundf32" | "roundf64",
+                [arg],
+            ) => {
+                let (value, scalar) = self.load_scalar(arg)?;
+                if !scalar.ty.is_float() {
+                    unsupported!("intrinsic `{name}` on {:?}", scalar.ty);
+                }
+                let op = name.trim_end_matches("f32").trim_end_matches("f64").trim_end_matches('_');
+                let value = match op {
+                    "fabs" => self.builder.ins().fabs(value),
+                    "sqrt" => self.builder.ins().sqrt(value),
+                    "floor" => self.builder.ins().floor(value),
+                    "ceil" => self.builder.ins().ceil(value),
+                    "trunc" => self.builder.ins().trunc(value),
+                    "round_ties_even" => self.builder.ins().nearest(value),
+                    _ => {
+                        let libm = if scalar.ty == types::F32 { "roundf" } else { "round" };
+                        self.float_libcall(libm, scalar.ty, &[value])?
+                    }
+                };
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            (
+                "copysignf32" | "copysignf64" | "minnumf32" | "minnumf64" | "maxnumf32"
+                | "maxnumf64" | "powf32" | "powf64" | "fadd_fast" | "fsub_fast" | "fmul_fast"
+                | "fdiv_fast" | "fadd_algebraic" | "fsub_algebraic" | "fmul_algebraic"
+                | "fdiv_algebraic",
+                [a, b],
+            ) => {
+                let (l, scalar) = self.load_scalar(a)?;
+                let (r, _) = self.load_scalar(b)?;
+                if !scalar.ty.is_float() {
+                    unsupported!("intrinsic `{name}` on {:?}", scalar.ty);
+                }
+                let single = scalar.ty == types::F32;
+                let value = match name {
+                    "copysignf32" | "copysignf64" => self.builder.ins().fcopysign(l, r),
+                    "minnumf32" | "minnumf64" => {
+                        self.float_libcall(if single { "fminf" } else { "fmin" }, scalar.ty, &[l, r])?
+                    }
+                    "maxnumf32" | "maxnumf64" => {
+                        self.float_libcall(if single { "fmaxf" } else { "fmax" }, scalar.ty, &[l, r])?
+                    }
+                    "powf32" | "powf64" => {
+                        self.float_libcall(if single { "powf" } else { "pow" }, scalar.ty, &[l, r])?
+                    }
+                    "fadd_fast" | "fadd_algebraic" => self.builder.ins().fadd(l, r),
+                    "fsub_fast" | "fsub_algebraic" => self.builder.ins().fsub(l, r),
+                    "fmul_fast" | "fmul_algebraic" => self.builder.ins().fmul(l, r),
+                    _ => self.builder.ins().fdiv(l, r),
+                };
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("fmaf32" | "fmaf64" | "fmuladdf32" | "fmuladdf64", [a, b, c]) => {
+                let (a, scalar) = self.load_scalar(a)?;
+                let (b, _) = self.load_scalar(b)?;
+                let (c, _) = self.load_scalar(c)?;
+                let value = if name.starts_with("fmuladd") {
+                    let product = self.builder.ins().fmul(a, b);
+                    self.builder.ins().fadd(product, c)
+                } else {
+                    let libm = if scalar.ty == types::F32 { "fmaf" } else { "fma" };
+                    self.float_libcall(libm, scalar.ty, &[a, b, c])?
+                };
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             ("discriminant_value", [arg]) => {
                 let (ptr, _) = self.load_scalar(arg)?;
                 let to = self.scalar_of(dst_ty)?;
@@ -3073,6 +3399,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// Drops the value at `addr` in place.
     fn drop_value(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
+        // Field types can still be projections such as `<str as ToOwned>::Owned`.
+        let ty = crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .structurally_normalize_ty(
+                &crate::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                ty,
+            )
+            .unwrap_or(ty);
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }
