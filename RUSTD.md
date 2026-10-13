@@ -202,6 +202,9 @@ The fork is RA plus two things: the `rustd` crate and the codegen module. Policy
   one RA lowering bug has turned up already. Crate test suites are how we find the rest.
 - Warm re-analysis time on a large workspace. 3 ms on a small crate says little.
 - RA's memory use: 0.5 to 0.9 GB on small crates, 8 GB on a 43k-line workspace with ~690
-  dependencies.
+  dependencies. That was RA loading the workspace the way an IDE does, not what rustd needs
+  per crate, so measure it on a mid-size crate first. Then look at cutting it: there is a
+  write-up by a compiler engineer on how RA's memory could be reduced (not yet located) that
+  should be read before designing anything here.
 - Unwinding. RA's MIR has no cleanup edges at all; adding them is real work inside RA's lowering.
 - Debug info. None today.

@@ -2,15 +2,12 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 3172.394,
-    "compiled": 138,
-    "instances": 712,
+    "codegen_ms": 3168.261,
+    "compiled": 141,
+    "instances": 860,
     "not_roots": 32,
     "roots": 141,
-    "skipped": {
-     "intrinsic `write_box_via_move`": 2,
-     "mir: NotSupported": 1
-    }
+    "skipped": {}
    }
   },
   "fixture": "runner",
@@ -19,7 +16,7 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 8570.098,
+    "codegen_ms": 6752.898,
     "compiled": 36,
     "instances": 297,
     "not_roots": 65,
@@ -39,7 +36,7 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 5413.426,
+    "codegen_ms": 3822.535,
     "compiled": 2,
     "instances": 14,
     "not_roots": 23,
@@ -57,7 +54,7 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 11865.781,
+    "codegen_ms": 7399.657,
     "compiled": 62,
     "instances": 629,
     "not_roots": 43,
@@ -75,15 +72,15 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 5037.899,
+    "codegen_ms": 3631.583,
     "compiled": 3,
-    "instances": 264,
+    "instances": 262,
     "not_roots": 20,
     "roots": 3,
     "skipped": {}
    },
    "hex": {
-    "codegen_ms": 5561.521,
+    "codegen_ms": 3381.795,
     "compiled": 6,
     "instances": 193,
     "not_roots": 173,
@@ -91,7 +88,7 @@
     "skipped": {}
    },
    "httparse": {
-    "codegen_ms": 6557.235,
+    "codegen_ms": 3902.578,
     "compiled": 15,
     "instances": 168,
     "not_roots": 87,
@@ -103,7 +100,7 @@
     }
    },
    "itoa": {
-    "codegen_ms": 2837.534,
+    "codegen_ms": 2868.871,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -111,7 +108,7 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 3854.203,
+    "codegen_ms": 3876.274,
     "compiled": 34,
     "instances": 430,
     "not_roots": 63,
@@ -128,7 +125,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 5095.613,
+    "codegen_ms": 2849.934,
     "compiled": 5,
     "instances": 2,
     "not_roots": 2,

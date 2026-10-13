@@ -578,6 +578,7 @@ language_item_table! { LangItems =>
     ExchangeMalloc,          sym::exchange_malloc,     FunctionId;
     BoxFree,                 sym::box_free,            FunctionId;
     DropInPlace,             sym::drop_in_place,       FunctionId;
+    DropGlue,                sym::drop_glue,           FunctionId;
     AllocLayout,             sym::alloc_layout,        StructId;
 
     Start,                   sym::start,               FunctionId;

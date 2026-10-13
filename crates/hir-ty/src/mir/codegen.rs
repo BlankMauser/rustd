@@ -280,6 +280,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             param_env: db.trait_environment(owner.generic_def(db)),
             krate,
         };
+        if std::env::var("RUSTD_DUMP_MIR").is_ok_and(|want| {
+            FunctionSignature::of(db, func).name.as_str() == want
+        }) {
+            eprintln!("{:#?}", body.basic_blocks);
+        }
         let mut ctx = self.compile_body(body, env)?;
         let id = self
             .module
@@ -328,6 +333,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             ),
         }
         .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        if let (Ok(want), InstanceDef::Fn(func)) = (std::env::var("RUSTD_DUMP_MIR"), instance.def)
+            && FunctionSignature::of(self.db, func).name.as_str() == want
+        {
+            eprintln!("{:#?}", body.basic_blocks);
+        }
         let mut ctx = self.compile_body(body, env)?;
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
@@ -1824,6 +1834,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .contains(&Some(func))
         {
             self.call_fn_trait(args, dst, dst_ty.ty)?;
+            return self.finish_call(destination, target);
+        }
+        if [lang_items.DropInPlace, lang_items.DropGlue].contains(&Some(func)) {
+            // The body is a placeholder for what the compiler generates.
+            let [pointer] = args else {
+                unsupported!("drop glue with {} arguments", args.len());
+            };
+            let ty = generic_args.type_at(0);
+            let (src, _) = self.operand(pointer)?;
+            let addr = self.builder.ins().load(PTR, MEM, src, 0);
+            let meta = is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+            self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
         if FunctionSignature::is_intrinsic(db, func)
