@@ -1051,7 +1051,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     #[instrument(skip(self), level = "debug")]
     fn walk_captures(&mut self, closure_expr: ExprId) {
         fn upvar_is_local_variable(upvars: UpvarsRef<'_>, var_id: BindingId) -> bool {
-            upvars.contains(var_id)
+            !upvars.contains(var_id)
         }
 
         // If we have a nested closure, we want to include the fake reads present in the nested

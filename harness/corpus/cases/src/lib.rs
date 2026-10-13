@@ -4125,3 +4125,59 @@ pub mod closure_in_bounded_field {
         (a, x, b, y)
     }
 }
+
+/// A trait method named like an unstable inherent method of std, which rustc passes over.
+pub mod unstable_name_collision {
+    use std::alloc::Layout;
+
+    pub trait LayoutExt {
+        fn padding_needed_for(&self, align: usize) -> usize;
+        fn repeated(&self, n: usize) -> Option<(Layout, usize)>;
+    }
+
+    impl LayoutExt for Layout {
+        fn padding_needed_for(&self, align: usize) -> usize {
+            let len = self.size();
+            (len.wrapping_add(align).wrapping_sub(1) & !align.wrapping_sub(1)).wrapping_sub(len)
+        }
+
+        fn repeated(&self, n: usize) -> Option<(Layout, usize)> {
+            let padded = self.size().checked_add(self.padding_needed_for(self.align()))?;
+            let layout = Layout::from_size_align(padded.checked_mul(n)?, self.align()).ok()?;
+            Some((layout, padded))
+        }
+    }
+
+    pub fn run() -> (usize, Option<(Layout, usize)>) {
+        let layout = Layout::new::<(u32, u8)>();
+        (Layout::new::<[u8; 5]>().padding_needed_for(4), layout.repeated(3))
+    }
+}
+
+/// A closure that moves out of a local of the block it is the tail of, inside another closure.
+pub mod closure_in_block_tail {
+    fn call<R>(f: impl FnOnce(u8) -> R) -> R {
+        f(1)
+    }
+
+    pub fn run() -> (usize, String) {
+        let shared = String::from("shared");
+        let sync = vec![1u8, 2];
+        call(|outer| {
+            let first = call({
+                let sync = sync.clone();
+                |inner| {
+                    let mut sync = sync;
+                    sync.push(inner + outer);
+                    sync.len() + shared.len()
+                }
+            });
+            let second = call(|_| {
+                let mut sync = sync;
+                sync.push(0);
+                format!("{sync:?} {shared}")
+            });
+            (first, second)
+        })
+    }
+}

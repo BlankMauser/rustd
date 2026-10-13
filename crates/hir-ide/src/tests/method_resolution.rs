@@ -2281,3 +2281,65 @@ impl UnrelatedTrait for &'_ MissingType {}
 "#,
     );
 }
+
+#[test]
+fn unstable_inherent_method_yields_to_trait_method() {
+    check_types(
+        r#"
+//- /main.rs crate:main deps:dep
+trait Ext {
+    fn gated(&self) -> u8;
+    fn other(&self) -> u8;
+}
+impl Ext for dep::S {
+    fn gated(&self) -> u8 { 0 }
+    fn other(&self) -> u8 { 0 }
+}
+fn test(s: dep::S) {
+    s.gated();
+  //^^^^^^^^^ u8
+    s.other();
+  //^^^^^^^^^ u16
+    s.only();
+  //^^^^^^^^ u16
+}
+
+//- /lib.rs crate:dep
+pub struct S;
+impl S {
+    #[unstable(feature = "gated", issue = "none")]
+    pub fn gated(&self) -> u16 { 0 }
+    pub fn other(&self) -> u16 { 0 }
+    #[unstable(feature = "gated", issue = "none")]
+    pub fn only(&self) -> u16 { 0 }
+}
+"#,
+    );
+}
+
+#[test]
+fn unstable_inherent_method_with_feature_enabled() {
+    check_types(
+        r#"
+//- /main.rs crate:main deps:dep
+#![feature(gated)]
+trait Ext {
+    fn gated(&self) -> u8;
+}
+impl Ext for dep::S {
+    fn gated(&self) -> u8 { 0 }
+}
+fn test(s: dep::S) {
+    s.gated();
+  //^^^^^^^^^ u16
+}
+
+//- /lib.rs crate:dep
+pub struct S;
+impl S {
+    #[unstable(feature = "gated", issue = "none")]
+    pub fn gated(&self) -> u16 { 0 }
+}
+"#,
+    );
+}

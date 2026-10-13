@@ -258,4 +258,6 @@ fn main() {
     }
     println!("fn_pointers {:?}", cases::fn_pointers::run());
     println!("closure_in_bounded_field {:?}", cases::closure_in_bounded_field::run());
+    println!("unstable_name_collision {:?}", cases::unstable_name_collision::run());
+    println!("closure_in_block_tail {:?}", cases::closure_in_block_tail::run());
 }

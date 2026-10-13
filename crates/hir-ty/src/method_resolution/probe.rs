@@ -5,7 +5,9 @@ use std::{cell::RefCell, convert::Infallible, ops::ControlFlow};
 
 use base_db::FxIndexMap;
 use hir_def::{
-    AssocItemId, FunctionId, GenericParamId, ImplId, ItemContainerId, TraitId,
+    AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId,
+    TraitId,
+    attrs::AttrFlags,
     hir::generics::GenericParams,
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
 };
@@ -256,7 +258,11 @@ struct MethodAutoderefBadTy<'db> {
 impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     #[instrument(level = "debug", skip(self))]
     pub fn probe_for_name(&self, mode: Mode, item_name: Name, self_ty: Ty<'db>) -> PickResult<'db> {
-        self.probe_op(mode, self_ty, ProbeForNameChoice { private_candidate: None, item_name })
+        self.probe_op(
+            mode,
+            self_ty,
+            ProbeForNameChoice { private_candidate: None, item_name, stable_only: false },
+        )
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -573,6 +579,10 @@ struct ProbeForNameChoice<'db> {
 
     /// Some(candidate) if there is a private candidate
     private_candidate: Option<Pick<'db>>,
+
+    /// Whether items behind a feature the crate did not enable are left out, which they are
+    /// until no other item is found.
+    stable_only: bool,
 }
 
 impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
@@ -607,6 +617,10 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         self_ty: Ty<'db>,
         mut applicable_candidates: Vec<&Candidate<'db>>,
     ) -> ControlFlow<Self::Choice> {
+        if this.choice.stable_only {
+            applicable_candidates.retain(|candidate| !this.is_denied_unstable(candidate.item));
+        }
+
         if applicable_candidates.len() > 1
             && let Some(pick) =
                 this.collapse_candidates_to_trait_pick(self_ty, &applicable_candidates)
@@ -1159,7 +1173,34 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
     }
 
     fn pick_core(&mut self) -> Option<PickResult<'db>> {
-        self.pick_all_method().break_value()
+        // Pick stable methods only first, and consider unstable candidates if not found.
+        self.choice.stable_only = true;
+        let stable = self.pick_all_method().break_value();
+        self.choice.stable_only = false;
+        stable.or_else(|| self.pick_all_method().break_value())
+    }
+
+    /// Whether using `item` needs a feature that its crate declares and this one did not enable.
+    fn is_denied_unstable(&self, item: CandidateId) -> bool {
+        let db = self.db();
+        let container = item.container(db);
+        if container.krate(db) == self.ctx.resolver.krate() {
+            return false;
+        }
+        let owner = match item {
+            CandidateId::FunctionId(id) => AttrDefId::from(id),
+            CandidateId::ConstId(id) => id.into(),
+        };
+        let inherited = match container {
+            ItemContainerId::ImplId(id) => Some(AttrDefId::from(id)),
+            ItemContainerId::TraitId(id) => Some(id.into()),
+            ItemContainerId::ExternBlockId(_) | ItemContainerId::ModuleId(_) => None,
+        };
+        [Some(owner), inherited]
+            .into_iter()
+            .flatten()
+            .find_map(|owner| AttrFlags::query(db, owner).unstable_feature(db, owner))
+            .is_some_and(|feature| !self.ctx.features.is_enabled(&feature))
     }
 
     /// Check for cases where arbitrary self types allows shadowing
