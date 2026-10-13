@@ -19,9 +19,7 @@ use crate::{
 };
 use crate::{
     method_resolution::CandidateId,
-    next_solver::{
-        GenericArgs, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
-    },
+    next_solver::{GenericArgs, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt},
 };
 
 macro_rules! not_supported {
