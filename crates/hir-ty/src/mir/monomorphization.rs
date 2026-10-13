@@ -186,11 +186,19 @@ impl<'db> Filler<'db> {
                             self.fill_operand(op)?;
                             self.fill_const(len)?;
                         }
+                        Rvalue::Cast(_, op, ty) => {
+                            self.fill_operand(op)?;
+                            self.fill_ty(ty)?;
+                        }
+                        Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                            self.fill_operand(lhs)?;
+                            self.fill_operand(rhs)?;
+                        }
+                        Rvalue::UnaryOp(_, op) => {
+                            self.fill_operand(op)?;
+                        }
                         Rvalue::Ref(_, _)
                         | Rvalue::Len(_)
-                        | Rvalue::Cast(_, _, _)
-                        | Rvalue::CheckedBinaryOp(_, _, _)
-                        | Rvalue::UnaryOp(_, _)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
                         Rvalue::ThreadLocalRef(n)

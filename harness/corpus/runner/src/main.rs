@@ -73,6 +73,28 @@ fn main() {
 
     case!(dynamic::call(&dynamic::Dog(4)), dynamic::call(&dynamic::Cat), dynamic::make(true), dynamic::make(false));
 
+    {
+        use objects::*;
+        let (mut one, mut two) = (One(5), Two(6, 7));
+        case!(use_top(&mut one), use_top(&mut two), local(8));
+        let (mut a, mut b) = (make_top(false), make_top(true));
+        case!(a.base(), a.twice(), a.mid(2), a.top(), a.big(), a.name(), b.base(), b.twice(), b.mid(2), b.top(), b.big(), b.name());
+        let r = make_ref(&one);
+        case!(r.base(), r.mid(9), r.big(), r.name());
+        case!(upcast_first(&one).mid(1), upcast_first(&two).twice(), upcast_base(&two).base(), upcast_base(&one).twice());
+        case!(upcast_named(&one).name(), upcast_named(&two).name(), upcast_box(a).name(), use_named(&two), use_named(upcast_named(&*b)));
+        case!(generic_trait(&one), boxed_sum(&[Box::new(One(1)), Box::new(Two(2, 0)), make_top(true)]));
+        case!(display(12), show(&One(345)), show(&"hello"), show(&1.5f32));
+        let log = std::cell::Cell::new(0u64);
+        case!(make_thing(&log, true).id(), make_thing(&log, false).id(), log.get());
+        case!(drop_thing(Box::new(Loud(&log, 6))), drop_thing(Box::new(3u8)), drop_thing(make_thing(&log, true)), log.get());
+        let k = 10;
+        case!(call_fn(&|a, b| a * b + k, 5), call_fn(&u32::wrapping_sub, 5));
+        let mut total = 0;
+        case!(call_fn_mut(&mut |x| { total += x; total * 2 }), total);
+        let (f, mut g, h) = (make_fn(3), make_fn_mut(100), make_fn_once("abc".to_string()));
+        case!(f(4), f(5), g(1), g(2), h(10), local_fn(&[1, 2, 3], 7));
+    }
     let log = std::cell::Cell::new(0u64);
     let mut logged = |f: &dyn Fn(&std::cell::Cell<u64>)| { log.set(0); f(&log); log.get() };
     case!(logged(&|l| drops::scope(l)), logged(&|l| drop(drops::moved(l, true))), logged(&|l| drop(drops::moved(l, false))));

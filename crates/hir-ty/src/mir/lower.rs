@@ -2049,7 +2049,8 @@ pub fn mir_body_for_closure_query<'db>(
         rustc_type_ir::ClosureKind::Fn | rustc_type_ir::ClosureKind::FnMut => true,
         rustc_type_ir::ClosureKind::FnOnce => false,
     };
-    let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId)>> = FxHashMap::default();
+    let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
+        FxHashMap::default();
     for (capture_idx, capture) in captures.enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
@@ -2077,7 +2078,7 @@ pub fn mir_body_for_closure_query<'db>(
 
         let local = capture.captured_local();
         let local = ctx.binding_local(local)?;
-        upvar_map.entry(local).or_default().push((capture, capture_local));
+        upvar_map.entry(local).or_default().push((capture, capture_local, capture_idx));
 
         ctx.result
             .upvar_locals
@@ -2127,10 +2128,23 @@ pub fn mir_body_for_closure_query<'db>(
                 Some((hir_place.0.place.projections.len(), hir_place))
             });
             match projections {
-                Some((skip_projections_up_to, (hir_place, upvar_local))) => {
-                    mir_place.local = *upvar_local;
-                    let maybe_deref: &[PlaceElem] =
-                        if hir_place.is_by_ref() { &[ProjectionElem::Deref] } else { &[] };
+                Some((skip_projections_up_to, (hir_place, upvar_local, capture_idx))) => {
+                    let in_closure = [
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIndex(*capture_idx as u32)),
+                    ];
+                    let maybe_deref: &[PlaceElem] = if hir_place.is_by_ref() {
+                        mir_place.local = *upvar_local;
+                        &[ProjectionElem::Deref]
+                    } else if is_by_ref_closure {
+                        // The closure is called again, so a capture it owns has to be used in
+                        // place: the local only holds a copy.
+                        mir_place.local = closure_local;
+                        &in_closure
+                    } else {
+                        mir_place.local = *upvar_local;
+                        &[]
+                    };
                     mir_place.projection = Projection::new_from_iter(
                         maybe_deref
                             .iter()

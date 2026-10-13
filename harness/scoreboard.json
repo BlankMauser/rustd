@@ -2,17 +2,17 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 4043.101,
-    "compiled": 99,
-    "instances": 316,
-    "not_roots": 8,
-    "roots": 106,
+    "codegen_ms": 3936.619,
+    "compiled": 133,
+    "instances": 501,
+    "not_roots": 11,
+    "roots": 141,
     "skipped": {
-     "call through a vtable": 2,
+     "builtin derive method in a vtable": 2,
      "call to `__rust_realloc`, which has no body and no rustc sym": 2,
      "intrinsic `write_box_via_move`": 1,
      "mir: NotSupported": 1,
-     "unsizing": 1
+     "static without a rustc symbol": 2
     }
    }
   },
@@ -22,15 +22,14 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 5123.443,
-    "compiled": 30,
-    "instances": 198,
+    "codegen_ms": 5264.227,
+    "compiled": 32,
+    "instances": 201,
     "not_roots": 45,
     "roots": 47,
     "skipped": {
      "abi of SimdVector": 4,
-     "call through a vtable": 3,
-     "call to builtin derive method": 4,
+     "call to builtin derive method": 5,
      "expected scalar": 2,
      "static without a rustc symbol": 4
     }
@@ -44,7 +43,7 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 2804.541,
+    "codegen_ms": 2704.33,
     "compiled": 2,
     "instances": 14,
     "not_roots": 23,
@@ -62,15 +61,15 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 5203.014,
-    "compiled": 39,
-    "instances": 240,
+    "codegen_ms": 5564.602,
+    "compiled": 48,
+    "instances": 368,
     "not_roots": 18,
     "roots": 61,
     "skipped": {
-     "call through a vtable": 12,
+     "builtin derive method in a vtable": 6,
      "call to builtin derive method": 4,
-     "unsizing": 6
+     "static without a rustc symbol": 3
     }
    }
   },
@@ -82,41 +81,39 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 2848.206,
+    "codegen_ms": 2759.729,
     "compiled": 0,
-    "instances": 81,
+    "instances": 103,
     "not_roots": 20,
     "roots": 3,
     "skipped": {
-     "call through a vtable": 1,
-     "unsizing": 2
+     "call to builtin derive method": 3
     }
    },
    "hex": {
-    "codegen_ms": 2859.511,
+    "codegen_ms": 2923.957,
     "compiled": 5,
-    "instances": 54,
+    "instances": 99,
     "not_roots": 170,
     "roots": 6,
     "skipped": {
-     "call through a vtable": 1
+     "static without a rustc symbol": 1
     }
    },
    "httparse": {
-    "codegen_ms": 2877.103,
-    "compiled": 13,
-    "instances": 26,
+    "codegen_ms": 3004.594,
+    "compiled": 15,
+    "instances": 29,
     "not_roots": 67,
     "roots": 25,
     "skipped": {
-     "call through a vtable": 3,
-     "call to builtin derive method": 4,
+     "call to builtin derive method": 5,
      "expected scalar": 2,
      "static without a rustc symbol": 3
     }
    },
    "itoa": {
-    "codegen_ms": 3010.789,
+    "codegen_ms": 2744.551,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -124,18 +121,18 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 3480.987,
-    "compiled": 20,
-    "instances": 172,
+    "codegen_ms": 3335.3,
+    "compiled": 28,
+    "instances": 279,
     "not_roots": 36,
     "roots": 43,
     "skipped": {
-     "call through a vtable": 12,
+     "builtin derive method in a vtable": 4,
      "call to `__rust_dealloc`, which has no body and no rustc sym": 1,
      "call to `__rust_no_alloc_shim_is_unstable_v2`, which has no ": 1,
      "call to builtin derive method": 4,
-     "mir: MissingFunctionDefinition": 1,
-     "unsizing": 4
+     "mir: MissingFunctionDefinition": 2,
+     "static without a rustc symbol": 3
     }
    }
   },
@@ -145,7 +142,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 2647.658,
+    "codegen_ms": 2637.943,
     "compiled": 5,
     "instances": 2,
     "not_roots": 0,

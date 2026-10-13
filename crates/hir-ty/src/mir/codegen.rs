@@ -17,7 +17,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
-    AdtId, DefWithBodyId, FunctionId, HasModule, StaticId, VariantId,
+    AdtId, DefWithBodyId, FunctionId, HasModule, StaticId, TraitId, VariantId,
     attrs::AttrFlags,
     expr_store::Body,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
@@ -29,7 +29,9 @@ use rustc_ast_ir::Mutability;
 use rustc_index::Idx;
 use rustc_hash::FxHashMap;
 use salsa::plumbing::{AsId, FromId};
-use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike, Ty as _};
+use rustc_type_ir::inherent::{
+    AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
+};
 use triomphe::Arc;
 
 use crate::{
@@ -44,15 +46,18 @@ use crate::{
     layout::{Layout, RustcEnumVariantIdx},
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region,
-        StoredGenericArgs, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
+        StoredGenericArgs, StoredTy, TraitRef, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
 
+use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand, OperandKind, PlaceTy,
     ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
 };
+
+mod vtable;
 
 #[derive(Debug)]
 pub enum CodegenError {
@@ -156,7 +161,7 @@ impl CodegenUnit {
             let krate = root.krate(db);
             known.rejected.retain(|instance, _| match instance.def {
                 InstanceDef::Fn(func) => func.krate(db) != krate,
-                InstanceDef::Closure(_) | InstanceDef::DropGlue => false,
+                InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => false,
             });
         }
         let rejected = &mut known.rejected;
@@ -201,6 +206,9 @@ enum InstanceDef {
     Closure(salsa::Id),
     /// `drop_in_place` for the type that is the instance's only generic argument.
     DropGlue,
+    /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
+    /// generic argument: calls the closure through the pointer it is handed, then drops it.
+    CallOnceShim,
 }
 
 /// What a call transfers control to.
@@ -218,6 +226,7 @@ struct ObjectCodegen<'a, 'db> {
     pending: Vec<(Instance, ParamEnvAndCrate<'db>, FuncId)>,
     /// Instances that failed in an earlier round, with the reason.
     rejected: &'a FxHashMap<Instance, String>,
+    vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
 }
@@ -247,6 +256,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             instances: FxHashMap::default(),
             pending: Vec::new(),
             rejected,
+            vtables: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
         })
@@ -301,8 +311,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut ctx = self.build(env, None, |fx| fx.drop_glue(ty))?;
             return self.emit(id, &mut ctx);
         }
+        if let InstanceDef::CallOnceShim = instance.def {
+            let ty = instance.args.as_ref().type_at(0);
+            let mut ctx = self.build(env, None, |fx| fx.call_once_shim(ty))?;
+            return self.emit(id, &mut ctx);
+        }
         let body = match instance.def {
-            InstanceDef::DropGlue => unreachable!(),
+            InstanceDef::DropGlue | InstanceDef::CallOnceShim => unreachable!(),
             InstanceDef::Fn(func) => {
                 self.db.monomorphized_mir_body(func.into(), instance.args.clone(), env.store())
             }
@@ -402,12 +417,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let instance = Instance { def, args: args.store() };
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
-            InstanceDef::Closure(_) | InstanceDef::DropGlue => None,
+            InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => None,
         };
         let name = match def {
             InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
             InstanceDef::Closure(_) => "{closure}",
             InstanceDef::DropGlue => "drop_in_place",
+            InstanceDef::CallOnceShim => "call_once",
         };
         if let Some(reason) = self.rejected.get(&instance) {
             unsupported!("callee `{name}`: {reason}");
@@ -645,6 +661,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.builder.ins().stack_addr(PTR, slot, 0)
     }
 
+    /// The signature a MIR body is compiled with.
+    fn body_signature(&self, body: &MirBody<'db>) -> Result<Signature> {
+        let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
+        let ret_mode = self.pass_mode(&ret_layout, true)?;
+        let mut param_modes = Vec::with_capacity(body.param_locals.len());
+        for &local in &body.param_locals {
+            let layout = self.layout(body.locals[local].ty.as_ref())?;
+            param_modes.push(self.pass_mode(&layout, false)?);
+        }
+        Ok(self.signature(&param_modes, ret_mode))
+    }
+
     fn codegen(&mut self) -> Result<()> {
         let body = self.body.expect("MIR body");
         let ret_layout = self.layout(body.locals[return_slot()].ty.as_ref())?;
@@ -656,7 +684,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             .collect::<Result<Vec<_>>>()?;
         let param_modes =
             param_layouts.iter().map(|l| self.pass_mode(l, false)).collect::<Result<Vec<_>>>()?;
-        self.builder.func.signature = self.signature(&param_modes, self.ret_mode);
+        self.builder.func.signature = self.body_signature(body)?;
 
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
@@ -1283,23 +1311,28 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let from = self.layout(from_ty)?;
         let to = self.layout(to_ty)?;
         match kind {
+            // RA records an unsizing coercion on both a block and its tail expression; the
+            // outer one has nothing left to do.
+            CastKind::PointerCoercion(PointerCast::Unsize) if from_ty == to_ty => {
+                self.copy(dst, src, to.size)
+            }
             CastKind::PointerCoercion(PointerCast::Unsize) => {
-                let pointees = from_ty.builtin_deref(true).zip(to_ty.builtin_deref(true));
-                let Some((from_pointee, to_pointee)) = pointees else {
-                    unsupported!("unsizing {from_ty:?}");
-                };
-                let (TyKind::Array(_, len), TyKind::Slice(_)) =
-                    (from_pointee.kind(), to_pointee.kind())
+                let (Some(from_pointee), Some(to_pointee)) =
+                    (self.coerced_pointee(from_ty, to_ty), self.coerced_pointee(to_ty, from_ty))
                 else {
-                    unsupported!("unsizing {from_pointee:?} to {to_pointee:?}");
+                    unsupported!("unsizing {from_ty:?} into {to_ty:?}");
                 };
-                let Some(len) = try_const_usize(self.cg.db, len) else {
-                    unsupported!("array with unevaluated length");
-                };
+                // The pointer comes first and the metadata right after it in everything that
+                // can be unsized: references, raw pointers, and the smart pointers around them.
+                if to.size.bytes() != 16 || !matches!(from.size.bytes(), 8 | 16) {
+                    unsupported!("unsizing {from_ty:?} to {to_ty:?}");
+                }
+                let old = (from.size.bytes() == 16)
+                    .then(|| self.builder.ins().load(PTR, MEM, src, 8));
+                let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
                 let ptr = self.builder.ins().load(PTR, MEM, src, 0);
-                let len = self.builder.ins().iconst(PTR, len as i64);
                 self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, len, dst, 8);
+                self.builder.ins().store(MEM, meta, dst, 8);
             }
             CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
                 let TyKind::FnDef(def, generic_args) = from_ty.kind() else {
@@ -1777,8 +1810,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         };
         let (mut addr, mut ty) = self.operand(callee)?;
         while let TyKind::Ref(_, inner, _) = ty.kind() {
-            if let TyKind::Dynamic(..) = inner.kind() {
-                unsupported!("call through a vtable");
+            if let TyKind::Dynamic(bounds, _) = inner.kind() {
+                // Which method is in the vtable depends on the object's trait, not on the
+                // trait the call was written against.
+                let lang_items = self.interner.lang_items();
+                let principal = bounds.principal_def_id().map(|it| it.0);
+                let method = match principal {
+                    Some(it) if Some(it) == lang_items.Fn => lang_items.Fn_call,
+                    Some(it) if Some(it) == lang_items.FnMut => lang_items.FnMut_call_mut,
+                    _ => None,
+                };
+                let Some(method) = method else {
+                    unsupported!("Fn-trait call on {inner:?}");
+                };
+                let values = self.operands(rest)?;
+                return self.call_virtual(method, inner, addr, ty, &values, dst, dst_ty);
             }
             addr = self.builder.ins().load(PTR, MEM, addr, 0);
             ty = inner;
@@ -1827,6 +1873,312 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
     }
 
+    /// Calls trait method `func` on the trait object behind the fat pointer at `receiver`.
+    #[allow(clippy::too_many_arguments)]
+    fn call_virtual(
+        &mut self,
+        func: FunctionId,
+        dyn_ty: Ty<'db>,
+        receiver: Value,
+        receiver_ty: Ty<'db>,
+        rest: &[(Value, Ty<'db>)],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
+        let receiver_layout = self.layout(receiver_ty)?;
+        if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair(..))
+            || receiver_layout.size.bytes() != 16
+        {
+            unsupported!("vtable call with receiver {receiver_ty:?}");
+        }
+        let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
+            unsupported!("vtable call on {dyn_ty:?}");
+        };
+        let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(func) else {
+            unsupported!("method missing from the vtable of {dyn_ty:?}");
+        };
+        let data = self.builder.ins().load(PTR, MEM, receiver, 0);
+        let vtable = self.builder.ins().load(PTR, MEM, receiver, 8);
+        let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8);
+        // The method takes the data pointer alone where the caller holds a fat pointer.
+        let thin = self.scratch();
+        self.builder.ins().store(MEM, data, thin, 0);
+        let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+        let mut values = vec![(thin, thin_ty)];
+        values.extend_from_slice(rest);
+        self.emit_call(Callee::Pointer(pointer), &values, dst, dst_ty)
+    }
+
+    /// The principal trait of `dyn_ty`, as implemented by `self_ty`.
+    fn principal(&self, dyn_ty: Ty<'db>, self_ty: Ty<'db>) -> Option<TraitRef<'db>> {
+        let TyKind::Dynamic(bounds, _) = dyn_ty.kind() else {
+            return None;
+        };
+        let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
+        Some(self.interner.instantiate_bound_regions_with_erased(principal))
+    }
+
+    /// The type behind the pointer that an unsizing coercion from `ty` to `other` changes.
+    fn coerced_pointee(&self, ty: Ty<'db>, other: Ty<'db>) -> Option<Ty<'db>> {
+        match (ty.kind(), other.kind()) {
+            (TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _), _) => Some(pointee),
+            // `NonNull` holds its pointer as a pattern type.
+            (TyKind::Pat(ty, _), TyKind::Pat(other, _)) => self.coerced_pointee(ty, other),
+            (TyKind::Adt(def, args), TyKind::Adt(other_def, other_args))
+                if def.def_id() == other_def.def_id() =>
+            {
+                let AdtId::StructId(id) = def.def_id() else {
+                    return None;
+                };
+                // `CoerceUnsized` allows one field to change, `PhantomData` aside.
+                let db = self.cg.db;
+                let field_types = db.field_types(id.into());
+                let mut coerced = field_types.iter().filter_map(|(_, field)| {
+                    let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    let other = field.ty().instantiate(self.interner, other_args).skip_norm_wip();
+                    let phantom = match ty.kind() {
+                        TyKind::Adt(def, _) => match def.def_id() {
+                            AdtId::StructId(id) => StructSignature::of(db, id)
+                                .flags
+                                .contains(StructFlags::IS_PHANTOM_DATA),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    (ty != other && !phantom).then_some((ty, other))
+                });
+                let (ty, other) = coerced.next()?;
+                if coerced.next().is_some() {
+                    return None;
+                }
+                self.coerced_pointee(ty, other)
+            }
+            _ => None,
+        }
+    }
+
+    /// The metadata of a pointer to `from` after unsizing its pointee to `to`. `old` is the
+    /// metadata the pointer has now, if it is fat already.
+    fn unsize_metadata(&mut self, from: Ty<'db>, to: Ty<'db>, old: Option<Value>) -> Result<Value> {
+        match (from.kind(), to.kind()) {
+            (TyKind::Array(_, len), TyKind::Slice(_)) => {
+                let Some(len) = try_const_usize(self.cg.db, len) else {
+                    unsupported!("array with unevaluated length");
+                };
+                Ok(self.builder.ins().iconst(PTR, len as i64))
+            }
+            (TyKind::Dynamic(from_bounds, _), TyKind::Dynamic(to_bounds, _)) => {
+                let Some(vtable) = old else {
+                    unsupported!("upcast of a thin pointer");
+                };
+                let (source, target) =
+                    (from_bounds.principal_def_id(), to_bounds.principal_def_id());
+                let Some(target) = target.filter(|_| source != target) else {
+                    // Dropping auto traits or the principal: every vtable has the header.
+                    return Ok(vtable);
+                };
+                let Some(trait_ref) = self.principal(from, from) else {
+                    unsupported!("upcast of {from:?}");
+                };
+                match VtableLayout::of(self.interner, trait_ref).upcast(target.0) {
+                    Some(Upcast::Same) => Ok(vtable),
+                    Some(Upcast::Load(slot)) => {
+                        Ok(self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8))
+                    }
+                    None => unsupported!("upcast of {from:?} to {to:?}"),
+                }
+            }
+            (_, TyKind::Dynamic(..)) => {
+                if is_unsized(from) {
+                    unsupported!("unsizing {from:?} to {to:?}");
+                }
+                let trait_ref = self.principal(to, from);
+                let vtable = self.vtable(from, trait_ref)?;
+                let vtable = self.cg.module.declare_data_in_func(vtable, self.builder.func);
+                Ok(self.builder.ins().symbol_value(PTR, vtable))
+            }
+            (TyKind::Adt(def, args), TyKind::Adt(to_def, to_args))
+                if def.def_id() == to_def.def_id() =>
+            {
+                // A struct is unsized through its last field.
+                let AdtId::StructId(id) = def.def_id() else {
+                    unsupported!("unsizing {from:?}");
+                };
+                let field_types = self.cg.db.field_types(id.into());
+                let Some((_, last)) = field_types.iter().last() else {
+                    unsupported!("unsizing a struct without fields");
+                };
+                let from = last.ty().instantiate(self.interner, args).skip_norm_wip();
+                let to = last.ty().instantiate(self.interner, to_args).skip_norm_wip();
+                self.unsize_metadata(from, to, old)
+            }
+            _ => unsupported!("unsizing {from:?} to {to:?}"),
+        }
+    }
+
+    /// The vtable of `ty` for `trait_ref`, or with the header alone when the trait object has
+    /// no principal trait.
+    fn vtable(&mut self, ty: Ty<'db>, trait_ref: Option<TraitRef<'db>>) -> Result<DataId> {
+        let key = (ty.store(), trait_ref.map(|it| (it.def_id.0, it.args.store())));
+        if let Some(&id) = self.cg.vtables.get(&key) {
+            return Ok(id);
+        }
+        let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
+        let layout = self.layout(ty)?;
+        let slots = trait_ref.map_or_else(Vec::new, |it| VtableLayout::of(self.interner, it).slots);
+        let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * 8];
+        bytes[8..16].copy_from_slice(&layout.size.bytes().to_le_bytes());
+        bytes[16..24].copy_from_slice(&layout.align.abi.bytes().to_le_bytes());
+        let mut data = DataDescription::new();
+        data.define(bytes.into_boxed_slice());
+        data.set_align(8);
+        if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(PTR));
+            let args = GenericArgs::new_from_slice(&[ty.into()]);
+            let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
+            let glue = self.cg.module.declare_func_in_data(glue, &mut data);
+            data.write_function_addr(0, glue);
+        }
+        for (index, slot) in slots.into_iter().enumerate() {
+            let offset = ((vtable::HEADER + index) * 8) as u32;
+            match slot {
+                Slot::Method(func, trait_ref) => {
+                    let method = self.vtable_method(func, trait_ref)?;
+                    let method = self.cg.module.declare_func_in_data(method, &mut data);
+                    data.write_function_addr(offset, method);
+                }
+                Slot::Vptr(trait_ref) => {
+                    let vptr = self.vtable(ty, Some(trait_ref))?;
+                    let vptr = self.cg.module.declare_data_in_data(vptr, &mut data);
+                    data.write_data_addr(offset, vptr, 0);
+                }
+            }
+        }
+        let n = self.cg.vtables.len();
+        let id = self
+            .cg
+            .module
+            .declare_data(&format!(".Lrustd.vtable.{n}"), Linkage::Local, false, false)
+            .map_err(backend)?;
+        self.cg.module.define_data(id, &data).map_err(backend)?;
+        self.cg.vtables.insert(key, id);
+        Ok(id)
+    }
+
+    /// The function a vtable slot for trait method `func` points to.
+    fn vtable_method(&mut self, func: FunctionId, trait_ref: TraitRef<'db>) -> Result<FuncId> {
+        let db = self.cg.db;
+        let interner = self.interner;
+        let self_ty = trait_ref.args.type_at(0);
+        let lang_items = interner.lang_items();
+        let fn_methods =
+            [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once];
+        if fn_methods.contains(&Some(func)) {
+            return self.vtable_fn_method(self_ty, Some(func) == lang_items.FnOnce_call_once);
+        }
+        // Only lifetimes can be generic in a method that is in a vtable.
+        let mut generic = false;
+        let args =
+            GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
+                generic |= !matches!(id, hir_def::GenericParamId::LifetimeParamId(_));
+                Region::new_erased(interner).into()
+            });
+        if generic {
+            unsupported!("generic method in a vtable");
+        }
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
+        let either::Either::Left(callee) = callee else {
+            unsupported!("builtin derive method in a vtable");
+        };
+        if !FunctionSignature::of(db, callee).has_body() {
+            unsupported!("vtable of {self_ty:?}: no impl found for a method");
+        }
+        let body = db
+            .monomorphized_mir_body(callee.into(), callee_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let Some(&receiver) = body.param_locals.first() else {
+            unsupported!("vtable method without a receiver");
+        };
+        // A by-value `self` reaches the method through a pointer and needs a shim.
+        let receiver = self.layout(body.locals[receiver].ty.as_ref())?;
+        let thin = match receiver.backend_repr {
+            BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Primitive::Pointer(_)),
+            _ => false,
+        };
+        if !thin {
+            unsupported!("vtable method taking `self` by value");
+        }
+        let sig = self.body_signature(body)?;
+        self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
+    }
+
+    /// `call`, `call_mut` or `call_once` in the vtable of a closure.
+    fn vtable_fn_method(&mut self, ty: Ty<'db>, once: bool) -> Result<FuncId> {
+        let TyKind::Closure(id, generic_args) = ty.kind() else {
+            unsupported!("Fn-trait vtable of {ty:?}");
+        };
+        let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
+        let body = self
+            .cg
+            .db
+            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let sig = self.body_signature(body)?;
+        let Some(&receiver) = body.param_locals.first() else {
+            unsupported!("closure without a receiver");
+        };
+        let receiver_ty = body.locals[receiver].ty.as_ref();
+        let closure = InstanceDef::Closure(id.0.as_id());
+        if receiver_ty.as_reference().is_none() {
+            // The body takes the closure by value. Only when that means "through a pointer to
+            // memory the body owns" is it what the `call_once` slot is called with.
+            let layout = self.layout(receiver_ty)?;
+            if !once || !matches!(self.pass_mode(&layout, false)?, PassMode::Indirect) {
+                unsupported!("vtable shim for a closure taken by value");
+            }
+            return self.cg.callee(closure, parent_args, self.env, &sig);
+        }
+        if once {
+            let args = GenericArgs::new_from_slice(&[ty.into()]);
+            return self.cg.callee(InstanceDef::CallOnceShim, args, self.env, &sig);
+        }
+        self.cg.callee(closure, parent_args, self.env, &sig)
+    }
+
+    /// The body of a `CallOnceShim`: same signature as the closure body, which borrows the
+    /// closure, but the shim owns it and so drops it after the call.
+    fn call_once_shim(&mut self, ty: Ty<'db>) -> Result<()> {
+        let TyKind::Closure(id, generic_args) = ty.kind() else {
+            unsupported!("call_once shim for {ty:?}");
+        };
+        let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
+        let body = self
+            .cg
+            .db
+            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let sig = self.body_signature(body)?;
+        self.builder.func.signature = sig.clone();
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let params = self.builder.block_params(entry).to_vec();
+        let sret =
+            sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
+        let Some(&closure) = params.get(sret as usize) else {
+            unsupported!("call_once shim for a closure that is not passed");
+        };
+        let callee =
+            self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        let call = self.builder.ins().call(callee, &params);
+        let results = self.builder.inst_results(call).to_vec();
+        self.drop_value(closure, None, ty)?;
+        self.builder.ins().return_(&results);
+        Ok(())
+    }
+
     /// Calls `func` with arguments that live at the given addresses.
     fn call_direct(
         &mut self,
@@ -1838,7 +2190,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     ) -> Result<()> {
         let db = self.cg.db;
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
-            unsupported!("call through a vtable");
+            let Some((&(receiver, receiver_ty), rest)) = args.split_first() else {
+                unsupported!("vtable call without a receiver");
+            };
+            let dyn_ty = generic_args.type_at(0);
+            return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
         }
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
         let either::Either::Left(callee) = callee else {
@@ -2153,10 +2509,34 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         let len = self.builder.ins().load(PTR, MEM, src, 8);
                         self.builder.ins().imul_imm(len, size)
                     }
-                    TyKind::Dynamic(..) => unsupported!("size_of_val of `dyn`"),
+                    TyKind::Dynamic(..) => {
+                        // Size and align are the vtable's second and third words.
+                        let vtable = self.builder.ins().load(PTR, MEM, src, 8);
+                        self.builder.ins().load(PTR, MEM, vtable, 8)
+                    }
                     _ => {
                         let size = self.layout(ty)?.size.bytes() as i64;
                         self.builder.ins().iconst(PTR, size)
+                    }
+                };
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("align_of_val", [arg]) => {
+                let (src, _) = self.operand(arg)?;
+                let ty = generic_args.type_at(0);
+                let value = match ty.kind() {
+                    TyKind::Dynamic(..) => {
+                        let vtable = self.builder.ins().load(PTR, MEM, src, 8);
+                        self.builder.ins().load(PTR, MEM, vtable, 16)
+                    }
+                    TyKind::Str => self.builder.ins().iconst(PTR, 1),
+                    TyKind::Slice(elem) => {
+                        let align = self.layout(elem)?.align.abi.bytes() as i64;
+                        self.builder.ins().iconst(PTR, align)
+                    }
+                    _ => {
+                        let align = self.layout(ty)?.align.abi.bytes() as i64;
+                        self.builder.ins().iconst(PTR, align)
                     }
                 };
                 self.builder.ins().store(MEM, value, dst, 0);

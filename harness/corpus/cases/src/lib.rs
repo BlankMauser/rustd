@@ -436,6 +436,109 @@ pub mod dynamic {
     }
 }
 
+pub mod objects {
+    use std::cell::Cell;
+    use std::fmt::{self, Display};
+
+    pub trait Base { fn base(&self) -> u32; fn twice(&self) -> u32 { self.base() * 2 } }
+    pub trait Named { fn name(&self) -> &'static str; }
+    pub trait Sized2: Sized { fn nope(&self) -> u32 { 0 } }
+    pub trait Mid: Base { fn mid(&self, x: u32) -> u32; }
+    /// Two supertraits with methods, a marker in between, and a method that is not in the vtable.
+    pub trait Top: Mid + Send + Named {
+        fn top(&mut self) -> u64;
+        fn skipped(&self) -> u32 where Self: Sized { 77 }
+        fn big(&self) -> [u64; 3];
+    }
+    pub trait Conv<T> { fn conv(&self, x: T) -> T; }
+
+    pub struct One(pub u32);
+    pub struct Two(pub u32, pub u64);
+    impl Base for One { fn base(&self) -> u32 { self.0 } }
+    impl Named for One { fn name(&self) -> &'static str { "one" } }
+    impl Mid for One { fn mid(&self, x: u32) -> u32 { self.0 + x } }
+    impl Top for One {
+        fn top(&mut self) -> u64 { self.0 += 1; self.0 as u64 }
+        fn big(&self) -> [u64; 3] { [self.0 as u64, 1, 2] }
+    }
+    impl Base for Two { fn base(&self) -> u32 { self.0 } fn twice(&self) -> u32 { 5 } }
+    impl Named for Two { fn name(&self) -> &'static str { "two" } }
+    impl Mid for Two { fn mid(&self, x: u32) -> u32 { self.0 * x } }
+    impl Top for Two {
+        fn top(&mut self) -> u64 { self.1 += 10; self.1 }
+        fn big(&self) -> [u64; 3] { [self.1, self.0 as u64, 0] }
+    }
+    impl Conv<u8> for One { fn conv(&self, x: u8) -> u8 { x.wrapping_add(self.0 as u8) } }
+    impl Conv<u64> for One { fn conv(&self, x: u64) -> u64 { x * self.0 as u64 } }
+    impl Display for One {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "One({})", self.0) }
+    }
+
+    /// Calls every kind of slot on an object somebody else made.
+    pub fn use_top(t: &mut dyn Top) -> (u32, u32, u32, u64, u64, usize) {
+        let big = t.big();
+        (t.base(), t.twice(), t.mid(3), t.top(), big[0] + big[1] + big[2], t.name().len())
+    }
+    /// Makes the objects for somebody else to call.
+    pub fn make_top(two: bool) -> Box<dyn Top> {
+        if two { Box::new(Two(3, 4)) } else { Box::new(One(7)) }
+    }
+    pub fn make_ref(one: &One) -> &dyn Top { one }
+    pub fn local(x: u32) -> u64 {
+        let mut one = One(x);
+        let t: &mut dyn Top = &mut one;
+        t.top() + t.mid(1) as u64 + t.twice() as u64
+    }
+    pub fn upcast_first(t: &dyn Top) -> &dyn Mid { t }
+    pub fn upcast_base(t: &dyn Top) -> &dyn Base { t }
+    pub fn upcast_named(t: &dyn Top) -> &dyn Named { t }
+    pub fn upcast_box(t: Box<dyn Top>) -> Box<dyn Named> { t }
+    pub fn use_named(n: &dyn Named) -> usize { n.name().len() }
+    pub fn generic_trait(one: &One) -> (u8, u64) {
+        let a: &dyn Conv<u8> = one;
+        let b: &dyn Conv<u64> = one;
+        (a.conv(250), b.conv(6))
+    }
+    pub fn boxed_sum(xs: &[Box<dyn Base>]) -> u32 {
+        let mut sum = 0;
+        for x in xs { sum += x.base(); }
+        sum
+    }
+    pub fn display(x: u32) -> String {
+        let d: &dyn Display = &One(x);
+        d.to_string()
+    }
+    pub fn show(d: &dyn Display) -> usize { d.to_string().len() }
+
+    pub struct Loud<'a>(pub &'a Cell<u64>, pub u64);
+    impl Drop for Loud<'_> {
+        fn drop(&mut self) { self.0.set(self.0.get() * 10 + self.1); }
+    }
+    pub trait Thing { fn id(&self) -> u64; }
+    impl Thing for Loud<'_> { fn id(&self) -> u64 { self.1 } }
+    impl Thing for u8 { fn id(&self) -> u64 { *self as u64 } }
+    pub fn make_thing<'a>(log: &'a Cell<u64>, loud: bool) -> Box<dyn Thing + 'a> {
+        if loud { Box::new(Loud(log, 4)) } else { Box::new(9u8) }
+    }
+    pub fn drop_thing(t: Box<dyn Thing + '_>) -> u64 { t.id() }
+
+    pub fn call_fn(f: &dyn Fn(u32, u32) -> u32, x: u32) -> u32 { f(x, 2) + f(1, x) }
+    pub fn call_fn_mut(f: &mut dyn FnMut(u64) -> u64) -> u64 { f(1); f(2); f(3) }
+    pub fn make_fn(k: u32) -> Box<dyn Fn(u32) -> u32> { Box::new(move |x| x * k + 1) }
+    pub fn make_fn_mut(mut acc: u64) -> Box<dyn FnMut(u64) -> u64> {
+        Box::new(move |x| { acc += x; acc })
+    }
+    pub fn make_fn_once(s: String) -> Box<dyn FnOnce(usize) -> usize> {
+        Box::new(move |x| s.len() + x)
+    }
+    pub fn local_fn(xs: &[u32], k: u32) -> u32 {
+        let f: &dyn Fn(u32) -> u32 = &|x| x + k;
+        let mut sum = 0;
+        for &x in xs { sum += f(x); }
+        sum
+    }
+}
+
 pub mod drops {
     use std::cell::Cell;
 
