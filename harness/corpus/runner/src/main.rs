@@ -164,4 +164,7 @@ fn main() {
     let (a, b) = (shapes::state(b"abc"), shapes::state(b"abd"));
     let names = shapes::names("first");
     case!(shapes::same(&a, &b), shapes::same(&a, &a.clone()), names.0, names.1.len(), a);
+    let bits = [false, true, true, false, true];
+    case!(shapes::SetBits { it: bits.iter().enumerate() }.collect::<Vec<_>>());
+    case!(shapes::wide_pointers(b"abc", b"abd"));
 }

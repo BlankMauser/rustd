@@ -1085,6 +1085,25 @@ pub mod shapes {
         Names(Arc::clone(&name), vec![None, Some(name)])
     }
 
+    /// Passes its own lifetime on to the generic iterators it calls.
+    pub struct SetBits<'a> {
+        pub it: core::iter::Enumerate<core::slice::Iter<'a, bool>>,
+    }
+
+    impl<'a> Iterator for SetBits<'a> {
+        type Item = usize;
+
+        fn next(&mut self) -> Option<usize> {
+            self.it.by_ref().find_map(|(i, &set)| set.then_some(i))
+        }
+    }
+
+    pub fn wide_pointers(a: &[u8], b: &[u8]) -> (bool, bool, bool, bool) {
+        let (short, long): (*const [u8], *const [u8]) = (&a[..1], a);
+        let other: *const [u8] = b;
+        (short == long, short < long, long == a as *const [u8], (long < other) == (other > long))
+    }
+
     pub fn same(a: &State, b: &State) -> (bool, bool, bool) {
         (a == b, a < b, Arc::ptr_eq(&a.0, &b.0))
     }

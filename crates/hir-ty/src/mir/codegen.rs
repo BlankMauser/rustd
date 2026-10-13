@@ -628,6 +628,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             return self.import(&symbol, sig);
         }
+        // Lifetimes change nothing about the code, and the ones a caller passes on are its
+        // own parameters, which mean nothing in the callee.
+        let interner = DbInterner::new_with(self.db, env.krate);
+        let args = rustc_type_ir::fold_regions(interner, args, |region, _| match region.kind() {
+            rustc_type_ir::RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(interner),
+        });
         let instance = Instance { def, args: args.store() };
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
