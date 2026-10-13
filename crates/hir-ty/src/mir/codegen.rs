@@ -1518,6 +1518,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 ProjectionElem::Field(field) => {
                     let layout = self.layout(prev.ty)?;
                     let offset = match &layout.variants {
+                        // A variant without values has no layout of its own, and code
+                        // reading its fields cannot be reached.
+                        Variants::Single { .. } | Variants::Empty
+                            if field.0 as usize >= layout.fields.count() =>
+                        {
+                            Size::ZERO
+                        }
                         Variants::Single { .. } | Variants::Empty => {
                             layout.fields.offset(field.0 as usize)
                         }
@@ -2187,8 +2194,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     self.write_fields(dst, &layout, operands)?;
                 }
                 AggregateKind::Adt(variant, args) => {
-                    let layout = self.variant_layout(dst, *variant, args.as_ref())?;
-                    self.write_fields(dst, &layout, operands)?;
+                    if let Some(layout) = self.variant_layout(dst, *variant, args.as_ref())? {
+                        self.write_fields(dst, &layout, operands)?;
+                    }
                 }
                 AggregateKind::Array(elem) => {
                     let size = self.layout(elem.as_ref())?.size;
@@ -2340,7 +2348,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))
         };
         match &layout.variants {
-            Variants::Empty => unsupported!("discriminant of an uninhabited enum"),
+            // There is no value to read it from, so this cannot be reached; rustc leaves the
+            // result undefined.
+            Variants::Empty => Ok(self.iconst(to.ty, 0)),
             Variants::Single { index } => {
                 let discr = discr_of(index.0)?;
                 Ok(self.iconst(to.ty, discr as u128))
@@ -2378,17 +2388,29 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     /// Layout whose `fields` describe `variant`. Writes the tag for multi-variant enums.
+    /// `None` for a variant the layout has no room for, which is one without values: code
+    /// building it cannot be reached.
     fn variant_layout(
         &mut self,
         dst: Value,
         variant: VariantId,
         args: GenericArgs<'db>,
-    ) -> Result<Arc<Layout>> {
+    ) -> Result<Option<Arc<Layout>>> {
         let db = self.cg.db;
         let adt: AdtId = variant.adt_id(db);
         let layout = self.layout(Ty::new_adt(self.interner, adt, args))?;
-        let Variants::Multiple { tag, tag_encoding, tag_field, variants } = &layout.variants else {
-            return Ok(layout);
+        let (tag, tag_encoding, tag_field, variants) = match &layout.variants {
+            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                (tag, tag_encoding, tag_field, variants)
+            }
+            Variants::Single { index } => {
+                let inhabited = match variant {
+                    VariantId::EnumVariantId(variant) => variant.index(db) == index.0,
+                    _ => true,
+                };
+                return Ok(inhabited.then_some(layout));
+            }
+            Variants::Empty => return Ok(None),
         };
         let VariantId::EnumVariantId(variant) = variant else {
             unsupported!("multi-variant non-enum");
@@ -2412,7 +2434,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let value = self.iconst(tag_ty, tag_value);
             self.builder.ins().store(MEM, value, dst, offset);
         }
-        Ok(Arc::new(variants[RustcEnumVariantIdx(index)].clone()))
+        Ok(Some(Arc::new(variants[RustcEnumVariantIdx(index)].clone())))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
@@ -2809,13 +2831,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let func = match def.0 {
             CallableDefId::FunctionId(func) => func,
             CallableDefId::StructId(id) => {
-                let layout = self.variant_layout(dst, id.into(), generic_args)?;
-                self.write_fields(dst, &layout, args)?;
+                if let Some(layout) = self.variant_layout(dst, id.into(), generic_args)? {
+                    self.write_fields(dst, &layout, args)?;
+                }
                 return self.finish_call(destination, target);
             }
             CallableDefId::EnumVariantId(id) => {
-                let layout = self.variant_layout(dst, id.into(), generic_args)?;
-                self.write_fields(dst, &layout, args)?;
+                if let Some(layout) = self.variant_layout(dst, id.into(), generic_args)? {
+                    self.write_fields(dst, &layout, args)?;
+                }
                 return self.finish_call(destination, target);
             }
         };
@@ -2944,7 +2968,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             CallableDefId::EnumVariantId(id) => {
                                 self.variant_layout(dst, id.into(), adt_args)?
                             }
-                            _ => self.layout(dst_ty)?,
+                            _ => Some(self.layout(dst_ty)?),
+                        };
+                        let Some(layout) = layout else {
+                            return Ok(());
                         };
                         for (i, &(src, ty)) in values.iter().enumerate() {
                             let size = self.layout(ty)?.size;

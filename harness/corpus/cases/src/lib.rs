@@ -1047,3 +1047,45 @@ pub mod foreign {
         len + (d.quot * 10 + d.rem) as usize
     }
 }
+
+pub mod shapes {
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Kind {
+        Plain,
+        Word,
+        Line,
+    }
+
+    #[derive(Clone)]
+    pub struct ByteMap {
+        pub map: [Kind; 256],
+    }
+
+    pub fn byte_map() -> ByteMap {
+        let mut map = [Kind::Plain; 256];
+        map[b'a' as usize] = Kind::Word;
+        map[b'\n' as usize] = Kind::Line;
+        ByteMap { map }.clone()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct State(pub Arc<[u8]>);
+
+    #[derive(Clone, Debug)]
+    pub struct Names(pub Arc<str>, pub Vec<Option<Arc<str>>>);
+
+    pub fn state(bytes: &[u8]) -> State {
+        State(Arc::from(bytes))
+    }
+
+    pub fn names(text: &str) -> Names {
+        let name: Arc<str> = Arc::from(text);
+        Names(Arc::clone(&name), vec![None, Some(name)])
+    }
+
+    pub fn same(a: &State, b: &State) -> (bool, bool, bool) {
+        (a == b, a < b, Arc::ptr_eq(&a.0, &b.0))
+    }
+}

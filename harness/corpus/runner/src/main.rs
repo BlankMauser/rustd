@@ -159,4 +159,9 @@ fn main() {
     case!(floats.a, floats.b[0], floats.b[1], nested.tag, nested.inner.0, nested.inner.1);
     let two = foreign::spill(1, 2, 3, 4, 5, foreign::Two { a: 6, b: 7 }, 8);
     case!(two.a, two.b, foreign::through_pointer(foreign::floats, foreign::make_big));
+    let map = shapes::byte_map();
+    case!(map.map[b'a' as usize], map.map[10], map.map[0]);
+    let (a, b) = (shapes::state(b"abc"), shapes::state(b"abd"));
+    let names = shapes::names("first");
+    case!(shapes::same(&a, &b), shapes::same(&a, &a.clone()), names.0, names.1.len(), a);
 }
