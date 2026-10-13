@@ -1108,3 +1108,42 @@ pub mod shapes {
         (a == b, a < b, Arc::ptr_eq(&a.0, &b.0))
     }
 }
+
+/// A unit struct is a value like any other: naming it makes one, which has to be dropped.
+pub mod unit_drops {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Unit;
+    impl Drop for Unit {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Unit {
+        fn this() -> Self {
+            Self
+        }
+    }
+
+    pub fn count() -> [usize; 4] {
+        let mut seen = [0; 4];
+        {
+            Unit;
+        }
+        seen[0] = DROPS.load(Ordering::Relaxed);
+        {
+            let _ = Unit;
+        }
+        seen[1] = DROPS.load(Ordering::Relaxed);
+        {
+            let _unit = Unit;
+        }
+        seen[2] = DROPS.load(Ordering::Relaxed);
+        Unit::this();
+        seen[3] = DROPS.load(Ordering::Relaxed);
+        seen
+    }
+}

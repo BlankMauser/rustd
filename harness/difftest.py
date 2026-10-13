@@ -29,6 +29,7 @@ class Fixture:
         self.ws, self.crates, self.target_args = os.path.abspath(workspace), crates, target
         self.work = tempfile.mkdtemp(prefix="rustd-diff-")
         self.run_args = []
+        self.rustd_timeout = None
         self.layout_log = os.path.join(self.work, "layouts.tsv")
         if touch is None:
             meta = json.loads(subprocess.check_output(
@@ -59,10 +60,14 @@ class Fixture:
         objects, self.reports = [], {}
         for crate in self.crates:
             obj, report = (os.path.join(self.work, f"{crate}.{ext}") for ext in ("o", "tsv"))
-            run = subprocess.run(
-                [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
-                 "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols],
-                capture_output=True, text=True, env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
+            try:
+                run = subprocess.run(
+                    [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
+                     "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols],
+                    capture_output=True, text=True, timeout=self.rustd_timeout,
+                    env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
+            except subprocess.TimeoutExpired:
+                raise SystemExit(f"rustd crashed on {crate}:\nerror: no result after {self.rustd_timeout}s")
             open(os.path.join(self.work, f"{crate}.stderr"), "w").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")

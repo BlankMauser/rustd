@@ -495,7 +495,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Ok(Some(current))
                     }
                     ValueNs::FunctionId(_) | ValueNs::StructId(_) | ValueNs::ImplSelf(_) => {
-                        // It's probably a unit struct or a zero sized function, so no action is needed.
+                        // A zero sized function needs no action, but a unit struct is a value
+                        // that has come to exist, and may have to be dropped.
+                        if let TyKind::Adt(adt, subst) = self.infer.expr_ty(expr_id).kind()
+                            && let AdtId::StructId(id) = adt.def_id()
+                        {
+                            self.push_assignment(
+                                current,
+                                place,
+                                Rvalue::Aggregate(
+                                    AggregateKind::Adt(id.into(), subst.store()),
+                                    Box::new([]),
+                                ),
+                                expr_id.into(),
+                            );
+                        }
                         Ok(Some(current))
                     }
                 }

@@ -167,4 +167,5 @@ fn main() {
     let bits = [false, true, true, false, true];
     case!(shapes::SetBits { it: bits.iter().enumerate() }.collect::<Vec<_>>());
     case!(shapes::wide_pointers(b"abc", b"abd"));
+    case!(unit_drops::count());
 }

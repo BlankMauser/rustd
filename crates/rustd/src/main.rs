@@ -29,6 +29,10 @@ use crate::symbols::SymbolTable;
 struct Args {
     project: PathBuf,
     krate: String,
+    /// More crates to compile from the same loaded workspace. `out` and `report` are then
+    /// directories that get a file per crate, and a crate that fails gets a `.error` file
+    /// instead of ending the run.
+    batch: Vec<String>,
     out: PathBuf,
     symbol_files: Vec<PathBuf>,
     watch: bool,
@@ -46,6 +50,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let mut project = None;
         let mut krate = None;
+        let mut batch = Vec::new();
         let mut out = None;
         let mut symbol_files = Vec::new();
         let mut watch = false;
@@ -56,6 +61,7 @@ impl Args {
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
+                "--crate" if krate.is_some() => batch.push(value()?),
                 "--crate" => krate = Some(value()?),
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
@@ -71,6 +77,7 @@ impl Args {
         Ok(Args {
             project: project.context("missing project path")?,
             krate: krate.context("missing --crate")?,
+            batch,
             out: out.context("missing --out")?,
             symbol_files,
             watch,
@@ -342,6 +349,43 @@ fn source_files(vfs: &Vfs, _root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTim
         .collect()
 }
 
+/// Compiles every crate asked for, each as it would be alone.
+fn build_batch(db: &RootDatabase, table: &SymbolTable, args: Args) -> anyhow::Result<()> {
+    let (out, report) = (args.out.clone(), args.report.clone().context("a batch needs --report")?);
+    let crates = std::iter::once(args.krate.clone()).chain(args.batch.iter().cloned());
+    for krate in crates.collect::<Vec<_>>() {
+        let args = Args {
+            project: args.project.clone(),
+            krate: krate.clone(),
+            batch: Vec::new(),
+            out: out.join(format!("{krate}.o")),
+            symbol_files: Vec::new(),
+            watch: false,
+            link_cmd: None,
+            report: Some(report.join(format!("{krate}.tsv"))),
+            deny: None,
+            isolate: None,
+        };
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build(db, table, &args, &mut Rejections::default())
+        }));
+        let error = match built {
+            Ok(Ok(_)) => continue,
+            Ok(Err(error)) => format!("error: {error:#}"),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("panic");
+                format!("panicked: {message}")
+            }
+        };
+        std::fs::write(report.join(format!("{krate}.error")), error)?;
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -362,6 +406,10 @@ fn main() -> anyhow::Result<()> {
     let (mut db, vfs, _proc_macro) =
         load_workspace_at(&args.project, &cargo_config, &load_config, &|_| {})?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
+
+    if !args.batch.is_empty() {
+        return build_batch(&db, &table, args);
+    }
 
     let mut known = Rejections::default();
     let cold = build(&db, &table, &args, &mut known)?;
