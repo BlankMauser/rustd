@@ -477,8 +477,13 @@ pub(crate) fn const_eval<'db>(
         let body = db.monomorphized_mir_body(
             def.into(),
             subst,
-            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-                .store(),
+            // The crate the constant is evaluated for, not the one it is in: the impls its
+            // generic arguments select can be in crates its own doesn't depend on.
+            ParamEnvAndCrate {
+                param_env: db.trait_environment(def.into()),
+                krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+            }
+            .store(),
         )?;
         let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?.0?;
         Ok(c.store())
@@ -518,7 +523,7 @@ pub(crate) fn anon_const_eval<'db>(
             subst,
             ParamEnvAndCrate {
                 param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
-                krate: def.krate(db),
+                krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
             }
             .store(),
         )?;

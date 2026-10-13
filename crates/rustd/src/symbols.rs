@@ -10,15 +10,19 @@ use rustc_hash::FxHashMap;
 pub(crate) struct SymbolTable {
     by_path: FxHashMap<String, String>,
     /// Symbols of items nested in closures and anonymous constants, by their path without the
-    /// `{closure#0}`-like segments, which we can't number the way rustc does. `None` when
-    /// several symbols share such a path.
-    nested: FxHashMap<String, Option<String>>,
+    /// `{closure#0}`-like segments, with the numbers of the closures among those.
+    nested: FxHashMap<String, Vec<NestedSymbol>>,
     /// rustc's `StableCrateId` of each crate named in a symbol. `None` when two crates share
     /// the name, two versions of one package say.
     crates: FxHashMap<String, Option<u64>>,
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
     by_root: FxHashMap<PathBuf, u64>,
+}
+
+struct NestedSymbol {
+    name: String,
+    closures: Vec<u32>,
 }
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
@@ -71,15 +75,14 @@ impl SymbolTable {
             };
             if path.contains("::{") {
                 let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
-                table
-                    .nested
-                    .entry(named.join("::"))
-                    .and_modify(|it| {
-                        if it.as_deref() != Some(&*name) {
-                            *it = None;
-                        }
-                    })
-                    .or_insert_with(|| Some(name.clone()));
+                let closures = path
+                    .split("::")
+                    .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
+                    .collect();
+                let symbols = table.nested.entry(named.join("::")).or_default();
+                if symbols.iter().all(|it| it.name != name) {
+                    symbols.push(NestedSymbol { name: name.clone(), closures });
+                }
             }
             table.by_path.entry(path).or_insert(name);
         }
@@ -137,8 +140,17 @@ impl SymbolTable {
     }
 
     /// The symbol of an item whose path has unnamed segments between the named ones given.
-    pub(crate) fn get_nested(&self, named: &str) -> Option<&str> {
-        self.nested.get(named)?.as_deref()
+    ///
+    /// `closures` are the numbers rustc gives the closures around the item, outermost first,
+    /// which tell apart the items that only differ in those. Anonymous constants are not
+    /// numbered, so two items that differ in one of those have no symbol here.
+    pub(crate) fn get_nested(&self, named: &str, closures: &[u32]) -> Option<&str> {
+        let mut symbols = match &**self.nested.get(named)? {
+            [only] => return Some(&only.name),
+            symbols => symbols.iter().filter(|it| it.closures == closures),
+        };
+        let symbol = symbols.next()?;
+        symbols.next().is_none().then_some(&*symbol.name)
     }
 
     pub(crate) fn len(&self) -> usize {

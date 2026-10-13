@@ -337,7 +337,16 @@ pub fn layout_of_ty_query(
             Layout::scalar(dl, ptr)
         }
         TyKind::Closure(_, args) => {
-            return db.layout_of_ty(args.as_closure().tupled_upvars_ty().store(), trait_env);
+            // Not the layout of the tuple of captures: a tuple's last field can be unsized and
+            // so stays last, where a closure's fields are all free to move.
+            let fields =
+                rustc_type_ir::inherent::Ty::tuple_fields(args.as_closure().tupled_upvars_ty())
+                    .iter()
+                    .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+            let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
+            let fields = fields.iter().collect::<IndexVec<_, _>>();
+            cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
         }
         TyKind::Coroutine(id, args) => {
             // What was captured, then everything `CoroutineFrame` describes. A local only

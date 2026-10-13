@@ -1205,6 +1205,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 expr,
                 op: op @ (hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg),
             } => {
+                let is_builtin = matches!(
+                    self.expr_ty_without_adjust(*expr).kind(),
+                    TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+                );
+                if !is_builtin
+                    && let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id)
+                {
+                    let func = Operand::from_fn(self.db, func_id, generic_args);
+                    return self.lower_call_and_args(
+                        func,
+                        [*expr].into_iter(),
+                        place,
+                        current,
+                        self.is_uninhabited(expr_id),
+                        expr_id.into(),
+                    );
+                }
                 let Some((operand, current)) = self.lower_expr_to_some_operand(*expr, current)?
                 else {
                     return Ok(None);

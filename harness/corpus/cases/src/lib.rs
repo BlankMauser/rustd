@@ -3129,3 +3129,320 @@ pub mod boxed_fn_once {
         std::mem::take(&mut *LOG.lock().unwrap())
     }
 }
+
+pub mod overloaded_unary {
+    use std::ops::{Neg, Not};
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Bits(u8);
+    impl Not for Bits {
+        type Output = Self;
+        fn not(self) -> Self {
+            Bits(!self.0 & 7)
+        }
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Sat(i8);
+    impl Neg for Sat {
+        type Output = Self;
+        fn neg(self) -> Self {
+            Sat(self.0.saturating_neg())
+        }
+    }
+    impl Neg for &Sat {
+        type Output = i32;
+        fn neg(self) -> i32 {
+            -(self.0 as i32) * 100
+        }
+    }
+    #[derive(Debug)]
+    pub struct Wide(f64, String);
+    impl Neg for Wide {
+        type Output = Wide;
+        fn neg(self) -> Wide {
+            Wide(-self.0, self.1 + "!")
+        }
+    }
+    fn generic<T: Not<Output = T>>(value: T) -> T {
+        !value
+    }
+
+    pub fn run() -> String {
+        let (bits, sat) = (Bits(1), Sat(i8::MIN));
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            !bits,
+            generic(bits),
+            generic(5u8),
+            generic(true),
+            -sat,
+            -&sat,
+            -Wide(1.5, "w".into()),
+            -(-1.5f32),
+        )
+    }
+}
+
+/// A closure whose last capture is the widest one: its fields are free to be reordered, where
+/// the tuple of the same captures keeps the last one in place. Made and called in different
+/// functions, so that a mixed build has rustc's code and ours agree on where the captures are.
+pub mod closure_layout {
+    #[derive(Clone, Copy)]
+    #[repr(packed)]
+    pub struct Edge {
+        byte: u8,
+        next: u32,
+        link: u32,
+    }
+
+    pub struct Graph {
+        heads: Vec<u32>,
+        edges: Vec<Edge>,
+    }
+
+    impl Graph {
+        pub fn edges(&self, node: usize) -> impl Iterator<Item = Edge> + '_ {
+            let mut link = self.heads[node];
+            core::iter::from_fn(move || {
+                if link == 0 {
+                    return None;
+                }
+                let edge = self.edges[link as usize];
+                link = edge.link;
+                Some(edge)
+            })
+        }
+
+        pub fn follow(&self, node: usize, byte: u8) -> u32 {
+            for edge in self.edges(node) {
+                if byte <= edge.byte {
+                    if byte == edge.byte {
+                        return edge.next;
+                    }
+                    break;
+                }
+            }
+            99
+        }
+    }
+
+    pub fn small_first(a: u8, b: &str, c: u16) -> impl Fn(u64) -> String + '_ {
+        move |d| format!("{a} {b} {c} {d}")
+    }
+
+    pub fn call(f: &dyn Fn(u64) -> String) -> String {
+        f(7)
+    }
+
+    /// Collected by `Vec`'s general `from_iter`: the in-place one is for adapters of a
+    /// `vec::IntoIter`, which this iterator is not.
+    pub fn collected(graph: &Graph) -> Vec<u8> {
+        graph.edges(0).map(|edge| edge.byte).collect()
+    }
+
+    pub fn run() -> String {
+        let edge = |byte, next, link| Edge { byte, next, link };
+        let graph = Graph { heads: vec![1], edges: vec![edge(0, 0, 0), edge(3, 7, 2), edge(9, 8, 0)] };
+        format!(
+            "{} {} {} {} {} {:?}",
+            graph.follow(0, 9),
+            graph.follow(0, 3),
+            graph.follow(0, 4),
+            graph.edges(0).count(),
+            call(&small_first(1, "two", 3)),
+            collected(&graph),
+        )
+    }
+}
+
+/// `Vec`'s in-place `collect`, which is chosen by constants of the adapters (`MERGE_BY`) whose
+/// impls are spread over `core` and `alloc`.
+pub mod in_place_collect {
+    pub fn mapped(v: Vec<u32>) -> Vec<(u16, u16)> {
+        v.into_iter().map(|m| (m as u16, m as u16 + 1)).collect()
+    }
+
+    pub fn filtered(v: Vec<u64>) -> Vec<u32> {
+        v.into_iter().map(|m| m as u32).filter(|x| *x != 3).collect()
+    }
+
+    pub fn run() -> String {
+        format!("{:?} {:?}", mapped(vec![1, 2, 3]), filtered(vec![1, 2, 3, 4]))
+    }
+}
+
+/// A static that holds a `&dyn Trait` to another static: both the data pointer and the vtable
+/// are relocations.
+pub mod dyn_statics {
+    pub trait Callsite: Sync {
+        fn name(&self) -> &'static str;
+    }
+
+    pub struct First(u8);
+    pub struct Second(u16);
+
+    impl Callsite for First {
+        fn name(&self) -> &'static str {
+            "first"
+        }
+    }
+
+    impl Callsite for Second {
+        fn name(&self) -> &'static str {
+            "second"
+        }
+    }
+
+    static FIRST: First = First(1);
+    static SECOND: Second = Second(2);
+
+    pub struct Meta {
+        callsite: &'static dyn Callsite,
+        n: u32,
+    }
+
+    static ONE: Meta = Meta { callsite: &FIRST, n: 1 };
+    static TWO: Meta = Meta { callsite: &SECOND, n: 2 };
+    static INLINE: Meta = Meta { callsite: &Second(7), n: 3 };
+    const BOTH: [&dyn Callsite; 2] = [&FIRST, &SECOND];
+
+    fn same(a: &Meta, b: &Meta) -> bool {
+        core::ptr::addr_eq(a.callsite, b.callsite)
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {} {} {}",
+            same(&ONE, &TWO),
+            same(&ONE, &ONE),
+            ONE.n + TWO.n + INLINE.n,
+            ONE.callsite.name(),
+            TWO.callsite.name(),
+            INLINE.callsite.name(),
+            BOTH.iter().map(|it| it.name()).collect::<String>(),
+        )
+    }
+}
+
+/// `as` between floats and 128-bit integers, which saturates and turns NaN into zero.
+pub mod wide_float_casts {
+    pub fn to_int(f: f32, d: f64) -> (i128, u128, i128, u128) {
+        (f as i128, f as u128, d as i128, d as u128)
+    }
+
+    pub fn to_float(a: i128, b: u128) -> (f32, f64, f32, f64) {
+        (a as f32, a as f64, b as f32, b as f64)
+    }
+
+    pub fn run() -> String {
+        let floats = [0.0f32, -1.0, 1.5, 3.0e38, f32::MAX, f32::MIN, f32::NAN, f32::INFINITY, 1e20];
+        let ints = [0i128, -1, i128::MAX, i128::MIN, 1 << 100, -(1 << 70), 12345678901234567890123];
+        let mut out = String::new();
+        for f in floats {
+            out += &format!("{:?} {:?}\n", to_int(f, f as f64 * 4.0), to_int(-f, -f as f64));
+        }
+        for a in ints {
+            out += &format!("{:?}\n", to_float(a, a as u128));
+        }
+        out
+    }
+}
+
+/// Floats computed at compile time: a NaN is rustc's positive quiet one whatever the host's
+/// arithmetic gives, and casts to and from 128-bit integers saturate.
+pub mod const_floats {
+    use core::cmp::Ordering;
+
+    pub const CASTS: (f32, f64, u128, u128, i128, u128) = (
+        u128::MAX as f32,
+        i128::MIN as f64,
+        1e30f64 as u128,
+        3e38f32 as u128,
+        -1e30f32 as i128,
+        -5.0f64 as u128,
+    );
+    pub const NANS: (f32, f64, f64) = (0.0 / 0.0, f64::INFINITY - f64::INFINITY, f64::NAN);
+    pub const SMALL: (u8, i8, u32, u64, i64) =
+        (-0.5f32 as u8, f32::NAN as i8, f64::INFINITY as u32, -1.0f64 as u64, f64::MAX as i64);
+
+    pub fn total(a: f64, b: f64) -> Ordering {
+        a.total_cmp(&b)
+    }
+
+    pub fn total_single(a: &f32, b: &f32) -> Ordering {
+        f32::total_cmp(a, b)
+    }
+
+    pub fn sorted<T: Copy>(mut v: Vec<T>, cmp: impl Fn(&T, &T) -> Ordering) -> Vec<T> {
+        v.sort_by(cmp);
+        v
+    }
+
+    pub fn run() -> String {
+        let doubles = [f64::NAN, -f64::NAN, f64::INFINITY, -0.0, 0.0, -1.5, f64::NEG_INFINITY, 2.0];
+        let singles = [f32::NAN, -f32::NAN, f32::INFINITY, -0.0, 0.0, -1.5, f32::MIN, 2.0];
+        format!(
+            "{:?} {:?} {:x} {:x} {:x} {:?} {:?} {:?} {:?} {:?} {:?}",
+            CASTS,
+            SMALL,
+            NANS.0.to_bits(),
+            NANS.1.to_bits(),
+            NANS.2.to_bits(),
+            total(f64::NAN, f64::INFINITY),
+            total(-f64::NAN, f64::NEG_INFINITY),
+            total(-0.0, 0.0),
+            total_single(&f32::NAN, &f32::MAX),
+            sorted(doubles.to_vec(), f64::total_cmp),
+            sorted(singles.to_vec(), |a, b| total_single(a, b)),
+        )
+    }
+}
+
+/// Statics with equal contents are still different objects.
+pub mod static_identity {
+    pub trait Callsite: Sync {
+        fn id(&self) -> u32;
+    }
+    pub struct First {
+        _unused: u8,
+    }
+    pub struct Second {
+        _unused: u8,
+    }
+    impl Callsite for First {
+        fn id(&self) -> u32 {
+            1
+        }
+    }
+    impl Callsite for Second {
+        fn id(&self) -> u32 {
+            2
+        }
+    }
+    pub struct Meta {
+        pub name: &'static str,
+        pub site: &'static dyn Callsite,
+        pub plain: &'static First,
+    }
+    static FIRST: First = First { _unused: 0 };
+    static TWIN: First = First { _unused: 0 };
+    static SECOND: Second = Second { _unused: 0 };
+    static META: Meta = Meta { name: "a", site: &FIRST, plain: &FIRST };
+    static OTHER: Meta = Meta { name: "b", site: &SECOND, plain: &TWIN };
+
+    pub fn thin(meta: &Meta) -> *const () {
+        meta.site as *const _ as *const ()
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {} {}",
+            thin(&META) == thin(&OTHER),
+            core::ptr::eq(META.plain, OTHER.plain),
+            core::ptr::eq(META.plain, &FIRST),
+            thin(&OTHER) == &SECOND as *const Second as *const (),
+            META.site.id(),
+            OTHER.site.id(),
+        )
+    }
+}

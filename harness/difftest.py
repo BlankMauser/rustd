@@ -13,6 +13,10 @@ import argparse, glob, json, os, shlex, subprocess, sys, tempfile
 # has to come from the rustc that copy was taken from.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
 
+# rustc makes what only one codegen unit uses local to it unless it is told to keep unused code.
+# rustd needs the symbols: a private `static mut` has to be the one object for both compilers.
+os.environ.setdefault("RUSTFLAGS", "-C link-dead-code")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.path.join(ROOT, "target/release/rustd")
 
@@ -124,6 +128,27 @@ def isolate(fx, expected):
     return culprits
 
 
+def minimize(items, fails):
+    """Delta debugging: a smaller list for which `fails` still holds."""
+    n = 2
+    while len(items) >= 2:
+        size = max(len(items) // n, 1)
+        chunks = [items[i:i + size] for i in range(0, len(items), size)]
+        for i, chunk in enumerate(chunks):
+            rest = [x for j, c in enumerate(chunks) if j != i for x in c]
+            if fails(chunk):
+                items, n = chunk, 2
+                break
+            if len(chunks) > 2 and fails(rest):
+                items, n = rest, max(n - 1, 2)
+                break
+        else:
+            if size == 1:
+                break
+            n = min(n * 2, len(items))
+    return items
+
+
 def symptom(expected, got):
     if got[0] != expected[0]:
         return f"exit status {got[0]}"
@@ -165,7 +190,7 @@ def memcheck(fx):
     return errors
 
 
-def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
+def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False, mixed=0):
     fx.rustc_build()
     expected = fx.behaviour(fx.reference)
     fx.rustd_build()
@@ -208,6 +233,27 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
             result["culprits"] = isolate(fx, expected)
             for c in result["culprits"]:
                 print(f"  MISCOMPILED {c['function']}: {c['symptom']}")
+    if ok and mixed:
+        # The boundary between rustc's code and ours: leave a random half of the functions to
+        # rustc, so that values made on one side (closures, futures, vtables) are used on the other.
+        import random
+        compiled = sorted(r[1] for rows in fx.reports.values() for r in rows if r[0] == "compiled")
+        for seed in range(mixed):
+            deny = random.Random(seed).sample(compiled, len(compiled) // 2)
+            fx.rustd_build(deny)
+            if not fx.matches(expected):
+                got = fx.behaviour(fx.binary)
+                print(f"  MIXED MISMATCH (seed {seed}): {symptom(expected, got)}")
+                deny = minimize(deny, lambda d: fx.rustd_build(d) or not fx.matches(expected))
+                fx.rustd_build(deny)
+                print("    smallest set left to rustc that still differs:\n" + "\n".join("      " + d for d in deny))
+                result["mixed_deny"] = deny
+                result["match"] = False
+                result["mixed_seed"] = seed
+                do_memcheck = True
+                break
+        else:
+            print(f"  mixed: {mixed} random splits match")
     if do_memcheck:
         errors = memcheck(fx)
         result["valgrind_errors"] = None if errors is None else len(errors)
@@ -242,11 +288,12 @@ def main():
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--memcheck", action="store_true", help="also fail on valgrind errors when the output matches")
     ap.add_argument("--layouts", action="store_true", help="compare type sizes and alignments with rustc's")
+    ap.add_argument("--mixed", type=int, default=0, help="also run this many builds with a random half of the functions left to rustc")
     ap.add_argument("--json")
     a = ap.parse_args()
 
     fx = Fixture(a.workspace, a.crate, ["-p", a.bin])
-    result = compare(fx, a.bin, a.bisect, a.memcheck, a.layouts)
+    result = compare(fx, a.bin, a.bisect, a.memcheck, a.layouts, a.mixed)
     if a.json:
         json.dump(result, open(a.json, "w"), indent=1)
     discard([result])

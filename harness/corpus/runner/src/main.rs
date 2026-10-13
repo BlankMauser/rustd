@@ -232,5 +232,12 @@ fn main() {
     println!("type_ids downcasts {:?}", cases::type_id_hashes::downcasts());
     println!("promoted_slices {:?}", cases::promoted_slices::run());
     println!("reified {:?}", cases::reified::run());
+    println!("overloaded_unary {}", cases::overloaded_unary::run());
+    println!("closure_layout {}", cases::closure_layout::run());
+    println!("in_place_collect {}", cases::in_place_collect::run());
+    println!("dyn_statics {}", cases::dyn_statics::run());
+    println!("wide_float_casts {}", cases::wide_float_casts::run());
+    println!("const_floats {}", cases::const_floats::run());
+    println!("static_identity {}", cases::static_identity::run());
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
 }

@@ -199,6 +199,7 @@ impl CodegenUnit {
         db: &dyn HirDatabase,
         symbols: &dyn SymbolResolver,
         roots: &[FunctionId],
+        denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
@@ -215,6 +216,13 @@ impl CodegenUnit {
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
+                if denied.contains(&root) {
+                    skipped.push((
+                        root,
+                        CodegenError::Unsupported("left to rustc on request".to_owned()),
+                    ));
+                    continue;
+                }
                 if left.contains(&root) {
                     let reason = "shares an `async` block with a function left to rustc";
                     skipped.push((root, CodegenError::Unsupported(reason.to_owned())));
@@ -1193,10 +1201,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn define_data(&mut self, blob: ConstBlob, writable: bool) -> Result<DataId> {
+        let identity = if writable { DataIdentity::Writable } else { DataIdentity::Shared };
+        self.define_data_as(blob, identity)
+    }
+
+    fn define_data_as(&mut self, blob: ConstBlob, identity: DataIdentity) -> Result<DataId> {
         let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
-        // Read-only data with the same content is one object, as it is for rustc, where the
-        // same constant has the same address wherever it is named.
-        let shared = (!writable).then(|| blob.clone());
+        let writable = identity == DataIdentity::Writable;
+        let shared = (identity == DataIdentity::Shared).then(|| blob.clone());
         if let Some(&id) = shared.as_ref().and_then(|blob| self.consts.get(blob)) {
             return Ok(id);
         }
@@ -1252,6 +1264,17 @@ struct Relocations<'a, 'db> {
     map: &'a MemoryMap<'db>,
     in_static: bool,
     defined: FxHashMap<usize, DataId>,
+}
+
+/// Whether a data object can be the same object as another with the same content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataIdentity {
+    /// Read-only and one object with every equal constant, as the same constant is for rustc
+    /// wherever it is named.
+    Shared,
+    /// Read-only with an address of its own, as a static has.
+    Own,
+    Writable,
 }
 
 /// Read-only data whose pointers refer to other data objects.
@@ -2966,7 +2989,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         let blob = self.allocation_blob(allocation, true)?;
         // Not `define_const`: a static has an address of its own.
-        let data = self.cg.define_data(blob, writable)?;
+        let identity = if writable { DataIdentity::Writable } else { DataIdentity::Own };
+        let data = self.cg.define_data_as(blob, identity)?;
         if writable {
             self.cg.statics.insert(id, data);
         } else {
@@ -3134,6 +3158,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let Some(addr) = blob.usize_at(offset) else {
                     unsupported!("constant pointer out of bounds");
                 };
+                // Const eval gives a vtable as an id into its table of types.
+                let pointee = match pointee.kind() {
+                    TyKind::Dynamic(..) => {
+                        let erased =
+                            blob.usize_at(offset + 8).and_then(|id| map.map.vtable_ty(id).ok());
+                        let Some(erased) = erased else {
+                            unsupported!("`dyn` constant without a known type");
+                        };
+                        let trait_ref = self.principal(pointee, erased);
+                        let vtable = self.vtable(erased, trait_ref)?;
+                        blob.point_to(offset + 8, vtable, 0);
+                        erased
+                    }
+                    _ => pointee,
+                };
                 if let Some((id, at)) = map.map.static_at(addr) {
                     let target = self.static_data(id)?;
                     blob.point_to(offset, target, at);
@@ -3143,7 +3182,6 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let elem = match pointee.kind() {
                     TyKind::Str => None,
                     TyKind::Slice(elem) => Some(elem),
-                    TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
                     _ => Some(pointee),
                 };
                 if memory.is_empty() {
@@ -3935,7 +3973,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     /// `as` between a float and an integer or another float.
     fn float_cast(&mut self, value: Value, from: AbiScalar, to: AbiScalar) -> Result<Value> {
         if from.ty == types::I128 || to.ty == types::I128 {
-            unsupported!("cast between a float and a 128-bit integer");
+            // compiler-builtins' conversions, which saturate and turn NaN into zero as `as` does.
+            let name = match (from.ty, from.signed, to.ty, to.signed) {
+                (types::F32, _, _, true) => "__fixsfti",
+                (types::F32, _, _, false) => "__fixunssfti",
+                (types::F64, _, _, true) => "__fixdfti",
+                (types::F64, _, _, false) => "__fixunsdfti",
+                (_, true, types::F32, _) => "__floattisf",
+                (_, false, types::F32, _) => "__floatuntisf",
+                (_, true, types::F64, _) => "__floattidf",
+                (_, false, types::F64, _) => "__floatuntidf",
+                _ => unsupported!("cast from {} to {}", from.ty, to.ty),
+            };
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(from.ty));
+            sig.returns.push(AbiParam::new(to.ty));
+            let callee = self.cg.import(name, &sig)?;
+            let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+            return Ok(self.invoke(callee, &[value])[0]);
         }
         let ins = self.builder.ins();
         Ok(match (from.ty.is_float(), to.ty.is_float()) {

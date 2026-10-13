@@ -56,7 +56,7 @@ def run_chunk(index, paths, root, base):
         '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[profile.dev]\ndebug = false\n')
     out = subprocess.run(
         ["cargo", "build", "--workspace", "--keep-going"], cwd=ws, capture_output=True, text=True,
-        env={**os.environ, "RUSTFLAGS": "--print link-args -C save-temps --cap-lints allow"})
+        env={**os.environ, "RUSTFLAGS": "--print link-args -C save-temps -C link-dead-code --cap-lints allow"})
     links = {}
     for line in (out.stdout + out.stderr).splitlines():
         if '"cc"' not in line:

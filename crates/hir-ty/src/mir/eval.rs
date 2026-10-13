@@ -525,7 +525,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             Err(e) => return Err(MirEvalError::TargetDataLayoutNotAvailable(e)),
         };
         let cached_ptr_size = target_data_layout.pointer_size().bytes_usize();
-        let interner = DbInterner::new_with(db, crate_id);
+        // Impls are looked up from the crate the body is evaluated for: the ones its generic
+        // arguments select can be in crates the body's own doesn't depend on.
+        let interner = DbInterner::new_with(db, trait_env.map_or(crate_id, |env| env.krate));
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         let lang_items = interner.lang_items();
         Ok(Evaluator {
@@ -1212,6 +1214,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                         BinOp::Div => l / r,
                                         _ => unreachable!(),
                                     };
+                                    // rustc's const eval makes every NaN it computes the
+                                    // positive quiet one, where the host's can be negative.
+                                    let r = if r.is_nan() { f32::NAN } else { r };
                                     Owned(r.to_le_bytes().into())
                                 }
                                 it => not_supported!(
@@ -1240,6 +1245,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                         BinOp::Div => l / r,
                                         _ => unreachable!(),
                                     };
+                                    // rustc's const eval makes every NaN it computes the
+                                    // positive quiet one, where the host's can be negative.
+                                    let r = if r.is_nan() { f64::NAN } else { r };
                                     Owned(r.to_le_bytes().into())
                                 }
                                 it => not_supported!(
@@ -1489,8 +1497,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     } else {
                         ((1i128 << dest_bits) - 1, 0)
                     };
-                    let value = (value as i128).min(max).max(min);
-                    let result = value.to_le_bytes();
+                    let result = if dest_bits == 128 && !is_signed {
+                        (value as u128).to_le_bytes()
+                    } else {
+                        (value as i128).min(max).max(min).to_le_bytes()
+                    };
                     Owned(result[0..dest_size].to_vec())
                 }
                 CastKind::FloatToFloat => {
@@ -1531,9 +1542,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
                         not_supported!("invalid int to float cast");
                     };
+                    // The padded bytes of a `u128` above `i128::MAX` read as negative.
+                    let (single, double) = match current_ty.kind() {
+                        TyKind::Int(_) => (value as f32, value as f64),
+                        _ => (value as u128 as f32, value as u128 as f64),
+                    };
                     match target_ty {
-                        rustc_type_ir::FloatTy::F32 => Owned((value as f32).to_le_bytes().to_vec()),
-                        rustc_type_ir::FloatTy::F64 => Owned((value as f64).to_le_bytes().to_vec()),
+                        rustc_type_ir::FloatTy::F32 => Owned(single.to_le_bytes().to_vec()),
+                        rustc_type_ir::FloatTy::F64 => Owned(double.to_le_bytes().to_vec()),
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
                             not_supported!("unstable floating point type f16 and f128");
                         }

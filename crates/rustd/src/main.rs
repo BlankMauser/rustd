@@ -19,7 +19,7 @@ use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode,
+    AstNode, SyntaxNode,
     ast::{self, HasName},
     match_ast,
 };
@@ -249,8 +249,13 @@ impl SymbolResolver for Resolver<'_> {
         let sema = hir::Semantics::new(self.db);
         let source = sema.source(it)?;
         let mut names = vec![name.as_str().to_owned()];
+        let mut closures = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
+            if let Some(closure) = ast::ClosureExpr::cast(node.clone()) {
+                closures.push(closure_number(&closure));
+                continue;
+            }
             if let Some(func) = ast::Fn::cast(node.clone()) {
                 let func: hir::Function = sema.to_def(&func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
@@ -274,7 +279,8 @@ impl SymbolResolver for Resolver<'_> {
         };
         names.push(owner);
         names.reverse();
-        self.table.get_nested(&names.join("::")).map(str::to_owned)
+        closures.reverse();
+        self.table.get_nested(&names.join("::"), &closures).map(str::to_owned)
     }
 
     fn path(&self, path: &str) -> Option<String> {
@@ -285,6 +291,26 @@ impl SymbolResolver for Resolver<'_> {
         let item = ModuleDef::from(item);
         self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
     }
+}
+
+/// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
+/// definition it is written in, a closure's own closures being counted apart.
+fn closure_number(closure: &ast::ClosureExpr) -> u32 {
+    let is_definition = |node: &SyntaxNode| {
+        ast::Item::can_cast(node.kind())
+            || ast::AssocItem::can_cast(node.kind())
+            || ast::ClosureExpr::can_cast(node.kind())
+            || ast::ConstArg::can_cast(node.kind())
+            || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_some())
+    };
+    let owner_of = |node: &SyntaxNode| node.ancestors().skip(1).find(is_definition);
+    let owner = owner_of(closure.syntax());
+    let root = owner.clone().unwrap_or_else(|| closure.syntax().ancestors().last().unwrap());
+    let earlier = root
+        .descendants()
+        .take_while(|node| node != closure.syntax())
+        .filter(|node| ast::ClosureExpr::can_cast(node.kind()) && owner_of(node) == owner);
+    earlier.count() as u32
 }
 
 fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {
@@ -337,15 +363,22 @@ fn build(
     let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
-    let mut roots = functions_of(db, &args.krate)?;
+    let roots = functions_of(db, &args.krate)?;
+    // Not dropped from the roots: what they share with the others has to stay with rustc too.
+    let mut denied = rustc_hash::FxHashSet::default();
     if let Some(deny) = &args.deny {
         let deny = std::fs::read_to_string(deny)?;
         let deny: rustc_hash::FxHashSet<&str> = deny.lines().collect();
-        roots.retain(|&func| resolver.path(func).is_none_or(|path| !deny.contains(path.as_str())));
+        denied.extend(
+            roots.iter().copied().filter(|&func| {
+                resolver.path(func).is_some_and(|path| deny.contains(path.as_str()))
+            }),
+        );
     }
     // Salsa attaches the database for the duration of the closure; the solver needs it.
-    let unit = hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots, known))
-        .map_err(anyhow::Error::msg)?;
+    let unit =
+        hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots, &denied, known))
+            .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     let start = Instant::now();
@@ -364,9 +397,10 @@ fn build(
         std::fs::create_dir_all(dir)?;
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
-            let single =
-                hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &[func], known))
-                    .map_err(anyhow::Error::msg)?;
+            let single = hir::attach_db(db, || {
+                CodegenUnit::compile(hir_db, &resolver, &[func], &Default::default(), known)
+            })
+            .map_err(anyhow::Error::msg)?;
             std::fs::write(dir.join(format!("{i}.o")), single.object)?;
             index.push_str(&format!("{i}\t{}\n", name(func)));
         }
