@@ -2,16 +2,14 @@
  "corpus": {
   "crates": {
    "cases": {
-    "codegen_ms": 4407.118,
-    "compiled": 135,
-    "instances": 518,
+    "codegen_ms": 3172.394,
+    "compiled": 138,
+    "instances": 712,
     "not_roots": 32,
     "roots": 141,
     "skipped": {
-     "call to `__rust_realloc`, which has no body and no rustc sym": 2,
-     "intrinsic `write_box_via_move`": 1,
-     "mir: NotSupported": 1,
-     "static without a rustc symbol": 2
+     "intrinsic `write_box_via_move`": 2,
+     "mir: NotSupported": 1
     }
    }
   },
@@ -21,16 +19,15 @@
  "httparse-tests": {
   "crates": {
    "httparse": {
-    "codegen_ms": 6265.827,
-    "compiled": 34,
-    "instances": 278,
+    "codegen_ms": 8570.098,
+    "compiled": 36,
+    "instances": 297,
     "not_roots": 65,
     "roots": 47,
     "skipped": {
-     "abi of SimdVector": 4,
-     "call site and body disagree on the signature": 1,
+     "abi of SimdVector": 5,
      "expected scalar": 4,
-     "static without a rustc symbol": 4
+     "static with interior mutability and no rustc symbol": 2
     }
    }
   },
@@ -42,7 +39,7 @@
  "itoa-tests": {
   "crates": {
    "itoa": {
-    "codegen_ms": 2992.938,
+    "codegen_ms": 5413.426,
     "compiled": 2,
     "instances": 14,
     "not_roots": 23,
@@ -60,15 +57,13 @@
  "semver-tests": {
   "crates": {
    "semver": {
-    "codegen_ms": 7141.803,
-    "compiled": 58,
-    "instances": 462,
+    "codegen_ms": 11865.781,
+    "compiled": 62,
+    "instances": 629,
     "not_roots": 43,
     "roots": 63,
     "skipped": {
-     "call to `__rust_dealloc`, which has no body and no rustc sym": 1,
-     "call to `__rust_realloc`, which has no body and no rustc sym": 1,
-     "static without a rustc symbol": 3
+     "abi of SimdVector": 1
     }
    }
   },
@@ -80,7 +75,7 @@
  "small-deps": {
   "crates": {
    "heck": {
-    "codegen_ms": 2992.005,
+    "codegen_ms": 5037.899,
     "compiled": 3,
     "instances": 264,
     "not_roots": 20,
@@ -88,29 +83,27 @@
     "skipped": {}
    },
    "hex": {
-    "codegen_ms": 3136.663,
-    "compiled": 5,
-    "instances": 89,
+    "codegen_ms": 5561.521,
+    "compiled": 6,
+    "instances": 193,
     "not_roots": 173,
     "roots": 6,
-    "skipped": {
-     "static without a rustc symbol": 1
-    }
+    "skipped": {}
    },
    "httparse": {
-    "codegen_ms": 3395.942,
+    "codegen_ms": 6557.235,
     "compiled": 15,
-    "instances": 149,
+    "instances": 168,
     "not_roots": 87,
     "roots": 25,
     "skipped": {
-     "call site and body disagree on the signature": 1,
+     "abi of SimdVector": 1,
      "expected scalar": 4,
-     "static without a rustc symbol": 5
+     "static with interior mutability and no rustc symbol": 5
     }
    },
    "itoa": {
-    "codegen_ms": 3618.883,
+    "codegen_ms": 2837.534,
     "compiled": 1,
     "instances": 14,
     "not_roots": 25,
@@ -118,16 +111,14 @@
     "skipped": {}
    },
    "semver": {
-    "codegen_ms": 3752.331,
-    "compiled": 30,
-    "instances": 291,
+    "codegen_ms": 3854.203,
+    "compiled": 34,
+    "instances": 430,
     "not_roots": 63,
     "roots": 43,
     "skipped": {
-     "call to `__rust_dealloc`, which has no body and no rustc sym": 1,
-     "call to `__rust_no_alloc_shim_is_unstable_v2`, which has no ": 3,
-     "mir: MissingFunctionDefinition": 6,
-     "static without a rustc symbol": 3
+     "abi of SimdVector": 1,
+     "mir: MissingFunctionDefinition": 8
     }
    }
   },
@@ -137,7 +128,7 @@
  "toy": {
   "crates": {
    "hot": {
-    "codegen_ms": 2914.536,
+    "codegen_ms": 5095.613,
     "compiled": 5,
     "instances": 2,
     "not_roots": 2,

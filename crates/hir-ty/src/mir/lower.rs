@@ -1293,6 +1293,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         match &self.store[*loc] {
             Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
             Expr::Path(c) => {
+                if let Some((CandidateId::ConstId(c), subst)) =
+                    self.infer.assoc_resolutions_for_expr(*loc)
+                {
+                    return self.lower_const_to_operand(subst, c.into());
+                }
                 let unresolved_name = || MirLowerError::UnresolvedName {
                     owner: self.owner.expression_store_owner(self.db),
                     path: c.clone(),
@@ -2015,7 +2020,9 @@ pub fn mir_body_for_closure_query<'db>(
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
 
     // 0 is return local
-    ctx.result.locals.alloc(Local { ty: infer.expr_ty(*root).store() });
+    // The body's own type can still be waiting for a coercion to the declared return type.
+    let sig = infer.closures_data[&expr].liberated_sig.get();
+    ctx.result.locals.alloc(Local { ty: sig.output().store() });
     let closure_local = ctx.result.locals.alloc(Local {
         ty: match kind {
             rustc_type_ir::ClosureKind::FnOnce => infer.expr_ty(expr),
@@ -2035,7 +2042,6 @@ pub fn mir_body_for_closure_query<'db>(
         .store(),
     });
     ctx.result.param_locals.push(closure_local);
-    let sig = infer.closures_data[&expr].liberated_sig.get();
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
     let current = ctx.lower_params_and_bindings(
         args.iter().zip(sig.inputs().iter()).map(|(it, y)| (*it, *y)),

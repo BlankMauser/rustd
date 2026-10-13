@@ -330,8 +330,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let mut ctx = self.compile_body(body, env)?;
         // The call site declared the instance with the signature it computed from its operands.
-        if self.module.declarations().get_function_decl(id).signature != ctx.func.signature {
-            unsupported!("call site and body disagree on the signature");
+        let declared = &self.module.declarations().get_function_decl(id).signature;
+        if *declared != ctx.func.signature {
+            unsupported!(
+                "call site and body disagree on the signature: {declared} and {}",
+                ctx.func.signature
+            );
         }
         self.emit(id, &mut ctx)
     }
@@ -432,6 +436,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         if signature.is_some_and(|it| !it.has_body()) {
+            // The allocator entry points are declared in `alloc` and defined at link time,
+            // under names in a crate of their own.
+            if let Some(symbol) = self.symbols.path(&format!("__rustc::{name}")) {
+                return self.import(&symbol, sig);
+            }
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let symbol = format!("rustd::{name}::{}", self.instances.len());
@@ -2465,6 +2474,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let (src, ty) = self.operand(value)?;
                 let size = self.layout(ty)?.size;
                 self.copy(ptr, src, size);
+            }
+            ("write_box_via_move", [boxed, value]) => {
+                let (boxed, boxed_ty) = self.operand(boxed)?;
+                let (src, ty) = self.operand(value)?;
+                let size = self.layout(ty)?.size;
+                let ptr = self.builder.ins().load(PTR, MEM, boxed, 0);
+                self.copy(ptr, src, size);
+                let size = self.layout(boxed_ty)?.size;
+                self.copy(dst, boxed, size);
             }
             ("offset" | "arith_offset", [ptr, count]) => {
                 let Some(pointee) = self.operand_ty(ptr)?.builtin_deref(true) else {

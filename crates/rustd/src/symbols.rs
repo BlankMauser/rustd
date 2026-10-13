@@ -32,7 +32,9 @@ impl SymbolTable {
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
         for symbol in object.symbols() {
-            if !symbol.is_definition() || !symbol.is_global() {
+            // A reference is as good as a definition: something in the link defines it.
+            let linkable = symbol.is_undefined() || (symbol.is_definition() && symbol.is_global());
+            if !linkable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
