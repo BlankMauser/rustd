@@ -350,10 +350,26 @@ fn source_files(vfs: &Vfs, _root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTim
 }
 
 /// Compiles every crate asked for, each as it would be alone.
-fn build_batch(db: &RootDatabase, table: &SymbolTable, args: Args) -> anyhow::Result<()> {
+/// Builds each crate into `<out>/<crate>.o`. The crates are separate programs that share only
+/// the workspace, so each one sees the symbols of its own rlib and of the rlibs that belong to
+/// none of them: a symbol from another crate's rlib would not be there at link time.
+fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
     let (out, report) = (args.out.clone(), args.report.clone().context("a batch needs --report")?);
-    let crates = std::iter::once(args.krate.clone()).chain(args.batch.iter().cloned());
-    for krate in crates.collect::<Vec<_>>() {
+    let crates: Vec<_> =
+        std::iter::once(args.krate.clone()).chain(args.batch.iter().cloned()).collect();
+    let rlib_of = |file: &Path| {
+        let name = file.file_name()?.to_str()?.strip_prefix("lib")?;
+        let name = name.rsplit_once('-').map_or(name, |(name, _)| name);
+        crates.iter().find(|krate| krate.as_str() == name)
+    };
+    for krate in &crates {
+        let symbol_files: Vec<_> = args
+            .symbol_files
+            .iter()
+            .filter(|file| rlib_of(file).is_none_or(|owner| owner == krate))
+            .cloned()
+            .collect();
+        let table = &SymbolTable::load(&symbol_files)?;
         let args = Args {
             project: args.project.clone(),
             krate: krate.clone(),
@@ -407,8 +423,8 @@ fn main() -> anyhow::Result<()> {
         load_workspace_at(&args.project, &cargo_config, &load_config, &|_| {})?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
-    if !args.batch.is_empty() {
-        return build_batch(&db, &table, args);
+    if !args.batch.is_empty() || args.out.is_dir() {
+        return build_batch(&db, args);
     }
 
     let mut known = Rejections::default();
