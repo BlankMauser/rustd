@@ -1022,6 +1022,9 @@ pub struct MirBody<'db> {
     pub binding_locals: ArenaMap<BindingId, LocalId>,
     pub upvar_locals: FxHashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
     pub param_locals: Vec<LocalId>,
+    /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
+    /// value has to outlive the call.
+    pub promoted_locals: Vec<LocalId>,
     /// This field stores the closures directly owned by this body. It is used
     /// in traversing every mir body.
     pub closures: Vec<InternedClosureId<'db>>,
@@ -1123,8 +1126,10 @@ impl MirBody<'_> {
             binding_locals,
             upvar_locals,
             param_locals,
+            promoted_locals,
             closures,
         } = self;
+        promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
         locals.shrink_to_fit();
         binding_locals.shrink_to_fit();
@@ -1289,14 +1294,13 @@ impl<'db> PlaceTy<'db> {
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
                 PlaceTy::from_ty(match structurally_normalize(self.ty).kind() {
                     TyKind::Slice(..) => self.ty,
-                    TyKind::Array(inner, _) /*if !from_end*/ => Ty::new_array_opt(tcx, inner, to.checked_sub(from).map(|x| x.into())),
-                    // TyKind::Array(inner, size) if from_end => {
-                    //     let size = size
-                    //         .try_to_target_usize(tcx)
-                    //         .expect("expected subslice projection on fixed-size array");
-                    //     let len = size - from - to;
-                    //     Ty::new_array(tcx, *inner, len)
-                    // }
+                    // `to` counts from the end.
+                    TyKind::Array(inner, size) => Ty::new_array_opt(
+                        tcx,
+                        inner,
+                        crate::consteval::try_const_usize(tcx.db, size)
+                            .and_then(|size| size.checked_sub(from as u128 + to as u128)),
+                    ),
                     _ => panic!("cannot subslice non-array type: `{:?}`", self),
                 })
             }

@@ -171,4 +171,7 @@ fn main() {
     println!("operand_order {:?}", cases::operand_order());
     println!("format_temporaries {}", cases::format_temporaries(4));
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
+    println!("const_pointers {:?}", cases::const_pointers::run());
+    println!("evaluation_order {:?}", cases::evaluation_order::run());
+    println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }

@@ -1174,3 +1174,92 @@ pub fn format_temporaries(x: i32) -> String {
 pub fn exclusive_ranges(x: u32) -> [bool; 3] {
     [matches!(x, 6..7), matches!(x, 6..=7), matches!(x, ..7)]
 }
+
+pub mod const_pointers {
+    static mut COUNTER: u32 = 42;
+    struct Ptr(*mut u32);
+    unsafe impl Sync for Ptr {}
+    static TO_STATIC: Ptr = Ptr(&raw mut COUNTER);
+    static mut SLICE: &mut [isize] = &mut [1];
+    type Big = [u64; 4];
+    const BIG: &Big = &[13, 14, 10, 13];
+    const PAIR: &(isize, &Big) = &(15, BIG);
+    const NUMS: [u32; 2] = [7, 9];
+    #[repr(align(4))]
+    struct Aligned;
+    const ZST: *const () = (&Aligned as *const Aligned as *const ()).wrapping_byte_add(2);
+
+    fn element(i: usize) -> &'static u32 {
+        &NUMS[i]
+    }
+
+    fn field() -> &'static u32 {
+        &(42, 1).0
+    }
+
+    /// A static that points to another static, to memory it may write, and constants that
+    /// share what they point to.
+    #[allow(static_mut_refs)]
+    pub fn run() -> (u32, isize, bool, u32, u32, usize, usize) {
+        unsafe {
+            *TO_STATIC.0 += 1;
+            SLICE[0] += 1;
+            let unit: &'static () = &();
+            (
+                COUNTER,
+                SLICE[0],
+                std::ptr::eq(BIG, PAIR.1),
+                *element(1),
+                *field(),
+                ZST.addr(),
+                unit as *const () as usize,
+            )
+        }
+    }
+}
+
+pub mod evaluation_order {
+    fn log(order: &mut Vec<u8>, tag: u8) -> u32 {
+        order.push(tag);
+        tag as u32
+    }
+
+    struct Pair {
+        a: u32,
+        b: u32,
+    }
+
+    /// The right-hand side of `+=` on integers runs first, and the base of a struct literal
+    /// runs last.
+    pub fn run() -> (Vec<u8>, u32, u32) {
+        let mut order = Vec::new();
+        let mut xs = [0u32; 4];
+        xs[log(&mut order, 1) as usize] += log(&mut order, 2);
+        let pair = Pair { a: log(&mut order, 3), ..Pair { a: 0, b: log(&mut order, 4) } };
+        (order, xs[1], pair.a + pair.b)
+    }
+}
+
+pub mod pattern_alternatives {
+    /// A guard that fails is run again for the next alternative of an or-pattern.
+    pub fn guard(pair: (u32, u32)) -> (u32, u32) {
+        let mut guards = 0;
+        let found = match pair {
+            (a, _) | (_, a)
+                if {
+                    guards += 1;
+                    a > 10
+                } =>
+            {
+                a
+            }
+            _ => 0,
+        };
+        (found, guards)
+    }
+
+    pub fn slices(xs: [u8; 5]) -> (u8, [u8; 2], u8, u8) {
+        let [a, middle @ .., d, e] = xs;
+        (a, middle, d, e)
+    }
+}

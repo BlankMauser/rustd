@@ -341,6 +341,9 @@ struct ObjectCodegen<'a, 'db> {
     /// them. Only sound when every function of that crate is ours.
     own_statics: Option<Crate>,
     statics: FxHashMap<StaticId, DataId>,
+    /// Statics nothing exports and nothing can write to, which we give a copy of the value.
+    frozen_statics: FxHashMap<StaticId, DataId>,
+    consts: FxHashMap<ConstBlob, DataId>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
 }
@@ -381,6 +384,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             vtables: FxHashMap::default(),
             own_statics,
             statics: FxHashMap::default(),
+            frozen_statics: FxHashMap::default(),
+            consts: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
         })
@@ -698,6 +703,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     fn define_data(&mut self, blob: ConstBlob, writable: bool) -> Result<DataId> {
         let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
+        // Read-only data with the same content is one object, as it is for rustc, where the
+        // same constant has the same address wherever it is named.
+        let shared = (!writable).then(|| blob.clone());
+        if let Some(&id) = shared.as_ref().and_then(|blob| self.consts.get(blob)) {
+            return Ok(id);
+        }
         let n = self.location_counter;
         self.location_counter += 1;
         let id = self
@@ -716,6 +727,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             data.write_function_addr(offset, target);
         }
         self.module.define_data(id, &data).map_err(backend)?;
+        if let Some(blob) = shared {
+            self.consts.insert(blob, id);
+        }
         Ok(id)
     }
 
@@ -742,7 +756,15 @@ enum Intrinsic {
     Unknown,
 }
 
+/// The pointers of one constant, and the data objects made for what they point to.
+struct Relocations<'a, 'db> {
+    map: &'a MemoryMap<'db>,
+    in_static: bool,
+    defined: FxHashMap<usize, DataId>,
+}
+
 /// Read-only data whose pointers refer to other data objects.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ConstBlob {
     bytes: Vec<u8>,
     relocs: Vec<(u32, DataId, i64)>,
@@ -751,6 +773,12 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Makes the pointer at `offset` the address `at` bytes into `target`.
+    fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
+        self.bytes[offset..offset + 8].fill(0);
+        self.relocs.push((offset as u32, target, at as i64));
+    }
+
     fn usize_at(&self, offset: usize) -> Option<usize> {
         let bytes = self.bytes.get(offset..offset + 8)?;
         Some(u64::from_le_bytes(bytes.try_into().ok()?) as usize)
@@ -1188,6 +1216,25 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.builder.ins().stack_addr(PTR, slot, 0)
     }
 
+    /// Storage for a temporary that is borrowed for `'static`. The function writes the same
+    /// constant there every time it runs.
+    // FIXME: evaluate the constant and make this read-only data.
+    fn promoted_slot(&mut self, layout: &Layout) -> Result<Value> {
+        let align = layout.align.abi.bytes();
+        if layout.size.bytes() == 0 {
+            return Ok(self.builder.ins().iconst(PTR, align as i64));
+        }
+        let blob = ConstBlob {
+            bytes: vec![0; layout.size.bytes_usize()],
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align,
+        };
+        let data = self.cg.define_data(blob, true)?;
+        let data = self.cg.module.declare_data_in_func(data, self.builder.func);
+        Ok(self.builder.ins().symbol_value(PTR, data))
+    }
+
     fn stack_slot(&mut self, layout: &Layout) -> Value {
         let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
         if align <= 16 {
@@ -1271,7 +1318,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
-            let addr = self.stack_slot(&layout);
+            let addr = if body.promoted_locals.contains(&local)
+                && self.is_freeze(data.ty.as_ref())
+                && has_drop_glue(&self.infcx, data.ty.as_ref(), self.env.param_env)
+                    == DropGlue::None
+            {
+                self.promoted_slot(&layout)?
+            } else {
+                self.stack_slot(&layout)
+            };
             self.locals.insert(local, LocalSlot { addr });
         }
         for (local, data) in body.locals.iter() {
@@ -1703,7 +1758,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     }
                     ConstKind::Unevaluated(unevaluated) => {
                         let allocation = self.eval_const(unevaluated)?;
-                        self.allocation_blob(allocation)?
+                        self.allocation_blob(allocation, false)?
                     }
                     kind => unsupported!("constant {kind:?}"),
                 };
@@ -1712,20 +1767,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
                 let ty = allocation.ty;
-                let blob = self.allocation_blob(allocation)?;
+                let blob = self.allocation_blob(allocation, false)?;
                 Ok((self.blob_addr(blob)?, ty))
             }
             OperandKind::Static(id) => {
-                let Some(symbol) = self.cg.symbols.static_(*id) else {
-                    return self.private_static(*id);
-                };
                 let thread_local =
                     AttrFlags::query(self.cg.db, (*id).into()).contains(AttrFlags::THREAD_LOCAL);
-                let data = self
-                    .cg
-                    .module
-                    .declare_data(&symbol, Linkage::Import, false, thread_local)
-                    .map_err(|e| CodegenError::Backend(e.to_string()))?;
+                let data = self.static_data(*id)?;
                 let data = self.cg.module.declare_data_in_func(data, self.builder.func);
                 let value = if thread_local {
                     self.builder.ins().tls_value(PTR, data)
@@ -1741,44 +1789,43 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
     }
 
-    /// A static nothing exports gets a copy of its value. Nobody can tell the copy from the
-    /// original as long as it cannot be written to.
-    // FIXME: the copy has its own address, which pointer comparisons can observe.
-    fn private_static(&mut self, id: StaticId) -> Result<(Value, Ty<'db>)> {
+    /// The data object of a static: rustc's when it exports one, else our own copy of its value.
+    fn static_data(&mut self, id: StaticId) -> Result<DataId> {
         let db = self.cg.db;
-        let ty = self.static_ty(id);
+        let thread_local = AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL);
+        if let Some(symbol) = self.cg.symbols.static_(id) {
+            return self
+                .cg
+                .module
+                .declare_data(&symbol, Linkage::Import, false, thread_local)
+                .map_err(|e| CodegenError::Backend(e.to_string()));
+        }
+        if let Some(&data) = self.cg.statics.get(&id).or_else(|| self.cg.frozen_statics.get(&id)) {
+            return Ok(data);
+        }
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
-        if AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL) {
+        if thread_local {
             unsupported!("thread local without a rustc symbol");
         }
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
-        let value = if !flags.contains(StaticFlags::MUTABLE) && self.is_freeze(allocation.ty) {
-            let blob = self.allocation_blob(allocation)?;
-            self.blob_addr(blob)?
+        let writable = flags.contains(StaticFlags::MUTABLE) || !self.is_freeze(allocation.ty);
+        if writable && self.cg.own_statics != Some(id.krate(db)) {
+            unsupported!("writable static without a rustc symbol");
+        }
+        let blob = self.allocation_blob(allocation, true)?;
+        // Not `define_const`: a static has an address of its own.
+        let data = self.cg.define_data(blob, writable)?;
+        if writable {
+            self.cg.statics.insert(id, data);
         } else {
-            if self.cg.own_statics != Some(id.krate(db)) {
-                unsupported!("writable static without a rustc symbol");
-            }
-            let data = match self.cg.statics.get(&id) {
-                Some(&data) => data,
-                None => {
-                    let blob = self.allocation_blob(allocation)?;
-                    let data = self.cg.define_data(blob, true)?;
-                    self.cg.statics.insert(id, data);
-                    data
-                }
-            };
-            let data = self.cg.module.declare_data_in_func(data, self.builder.func);
-            self.builder.ins().symbol_value(PTR, data)
-        };
-        let addr = self.scratch();
-        self.builder.ins().store(MEM, value, addr, 0);
-        Ok((addr, ty))
+            self.cg.frozen_statics.insert(id, data);
+        }
+        Ok(data)
     }
 
     /// Whether `ty` is known to have no `UnsafeCell` outside of indirections.
@@ -1892,7 +1939,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Ok(ConstBlob { bytes, relocs: vec![(0, target, 0)], fn_relocs: Vec::new(), align })
     }
 
-    fn allocation_blob(&mut self, allocation: Allocation<'db>) -> Result<ConstBlob> {
+    /// `in_static` says the value is a static's, where memory behind a mutable pointer can be
+    /// written to.
+    fn allocation_blob(
+        &mut self,
+        allocation: Allocation<'db>,
+        in_static: bool,
+    ) -> Result<ConstBlob> {
         let AllocationData { ty, memory, memory_map } = &*allocation;
         let layout = self.layout(*ty)?;
         let size = layout.size.bytes_usize();
@@ -1910,7 +1963,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             fn_relocs: Vec::new(),
             align: layout.align.abi.bytes(),
         };
-        self.relocate(&mut blob, 0, *ty, memory_map)?;
+        let mut map = Relocations { map: memory_map, in_static, defined: FxHashMap::default() };
+        self.relocate(&mut blob, 0, *ty, &mut map)?;
         Ok(blob)
     }
 
@@ -1921,30 +1975,50 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         blob: &mut ConstBlob,
         offset: usize,
         ty: Ty<'db>,
-        map: &MemoryMap<'db>,
+        map: &mut Relocations<'_, 'db>,
     ) -> Result<()> {
-        if let MemoryMap::Empty = map {
+        if let MemoryMap::Empty = map.map {
             return Ok(());
         }
         let db = self.cg.db;
         match ty.kind() {
             TyKind::Pat(base, _) => self.relocate(blob, offset, base, map)?,
-            TyKind::Ref(_, pointee, _) => {
+            TyKind::Ref(_, pointee, mutability) => {
                 let Some(addr) = blob.usize_at(offset) else {
                     unsupported!("constant pointer out of bounds");
                 };
-                let target = match map {
-                    MemoryMap::Simple(memory) if addr == 0 => Some(&**memory),
-                    MemoryMap::Complex(complex) => complex.memory.get(&addr).map(|it| &**it),
-                    _ => None,
+                if let Some((id, at)) = map.map.static_at(addr) {
+                    let target = self.static_data(id)?;
+                    blob.point_to(offset, target, at);
+                    return Ok(());
+                }
+                let Some((start, memory)) = map.map.memory_at(addr) else { return Ok(()) };
+                let elem = match pointee.kind() {
+                    TyKind::Str => None,
+                    TyKind::Slice(elem) => Some(elem),
+                    TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
+                    _ => Some(pointee),
                 };
-                let Some(target) = target else { return Ok(()) };
+                if memory.is_empty() {
+                    // Nothing is behind the pointer, and rustc makes it the alignment.
+                    let align = match elem {
+                        Some(elem) => self.layout(elem)?.align.abi.bytes(),
+                        None => 1,
+                    };
+                    blob.bytes[offset..offset + 8].copy_from_slice(&align.to_le_bytes());
+                    return Ok(());
+                }
+                if let Some(&target) = map.defined.get(&start) {
+                    blob.point_to(offset, target, addr - start);
+                    return Ok(());
+                }
                 let mut target = ConstBlob {
-                    bytes: target.to_vec(),
+                    bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
                     align: 16,
                 };
+                let at = addr - start;
                 match pointee.kind() {
                     TyKind::Str => (),
                     TyKind::Slice(elem) => {
@@ -1953,15 +2027,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         };
                         let size = self.layout(elem)?.size.bytes_usize();
                         for i in 0..len {
-                            self.relocate(&mut target, i * size, elem, map)?;
+                            self.relocate(&mut target, at + i * size, elem, map)?;
                         }
                     }
-                    TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
-                    _ => self.relocate(&mut target, 0, pointee, map)?,
+                    _ => self.relocate(&mut target, at, pointee, map)?,
                 }
-                let target = self.cg.define_const(target)?;
-                blob.bytes[offset..offset + 8].fill(0);
-                blob.relocs.push((offset as u32, target, 0));
+                let writable = map.in_static && mutability == Mutability::Mut;
+                let target = self.cg.define_data(target, writable)?;
+                map.defined.insert(start, target);
+                blob.point_to(offset, target, at);
             }
             // Const eval gives function pointers as ids into its table of fn item types. A
             // function cast to a raw pointer keeps that id, so a raw pointer holding one is
@@ -1970,31 +2044,37 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let Some(id) = blob.usize_at(offset) else {
                     unsupported!("constant pointer out of bounds");
                 };
-                let fn_ty = match map.vtable_ty(id) {
+                let fn_ty = match map.map.vtable_ty(id) {
                     Ok(fn_ty)
                         if matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) =>
                     {
                         fn_ty
                     }
-                    _ if matches!(ty.kind(), TyKind::RawPtr(..)) => {
-                        // Const eval keeps the whole allocation a raw pointer points into.
-                        // FIXME: the copy is read-only and is not shared between pointers.
-                        let MemoryMap::Complex(complex) = map else { return Ok(()) };
-                        let Some((&start, memory)) = complex
-                            .memory
-                            .iter()
-                            .find(|&(&start, memory)| (start..start + memory.len()).contains(&id))
-                        else {
+                    _ if let TyKind::RawPtr(_, mutability) = ty.kind() => {
+                        if let Some((id, at)) = map.map.static_at(id) {
+                            let target = self.static_data(id)?;
+                            blob.point_to(offset, target, at);
                             return Ok(());
+                        }
+                        // Const eval keeps the whole allocation a raw pointer points into.
+                        // FIXME: pointers inside that allocation are not relocated.
+                        let Some((start, memory)) = map.map.memory_at(id) else { return Ok(()) };
+                        let target = match map.defined.get(&start) {
+                            Some(&target) => target,
+                            None => {
+                                let target = ConstBlob {
+                                    bytes: memory.to_vec(),
+                                    relocs: Vec::new(),
+                                    fn_relocs: Vec::new(),
+                                    align: 16,
+                                };
+                                let writable = map.in_static && mutability == Mutability::Mut;
+                                let target = self.cg.define_data(target, writable)?;
+                                map.defined.insert(start, target);
+                                target
+                            }
                         };
-                        let target = self.cg.define_const(ConstBlob {
-                            bytes: memory.to_vec(),
-                            relocs: Vec::new(),
-                            fn_relocs: Vec::new(),
-                            align: 16,
-                        })?;
-                        blob.bytes[offset..offset + 8].fill(0);
-                        blob.relocs.push((offset as u32, target, (id - start) as i64));
+                        blob.point_to(offset, target, id - start);
                         return Ok(());
                     }
                     _ if id == 0 => return Ok(()),

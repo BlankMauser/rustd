@@ -94,6 +94,9 @@ struct MirLowerCtx<'a, 'db> {
     /// Expressions whose temporary lives as long as the `let` they initialize, with the index of
     /// the scope that `let` is in.
     extended_temporaries: FxHashMap<ExprId, usize>,
+    /// The alternative to match for an or-pattern, while an arm is lowered once per
+    /// combination of alternatives.
+    or_choices: FxHashMap<PatId, usize>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -216,6 +219,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             binding_locals,
             upvar_locals: FxHashMap::default(),
             param_locals: vec![],
+            promoted_locals: vec![],
             owner,
             closures: vec![],
         };
@@ -240,6 +244,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
+            or_choices: FxHashMap::default(),
             env,
             infcx,
         }
@@ -730,6 +735,42 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
                 for MatchArm { pat, guard, expr } in arms.iter() {
+                    // When the guard fails, rustc goes on to the next way the or-patterns of
+                    // the arm can match, and runs the guard again for it.
+                    let expansions = match guard {
+                        Some(_) => self.or_expansions(*pat),
+                        None => Vec::new(),
+                    };
+                    if let &Some(guard) = guard
+                        && (2..=64).contains(&expansions.len())
+                    {
+                        let body = self.new_basic_block();
+                        for choice in expansions {
+                            self.or_choices = choice.into_iter().collect();
+                            let matched = self.pattern_match(current, None, cond_place, *pat);
+                            self.or_choices.clear();
+                            let (then, otherwise) = matched?;
+                            let otherwise = otherwise.unwrap_or_else(|| self.new_basic_block());
+                            if let Some((discr, c)) =
+                                self.lower_expr_to_some_operand(guard, then)?
+                            {
+                                self.set_terminator(
+                                    c,
+                                    TerminatorKind::SwitchInt {
+                                        discr,
+                                        targets: SwitchTargets::static_if(1, body, otherwise),
+                                    },
+                                    expr_id.into(),
+                                );
+                            }
+                            current = otherwise;
+                        }
+                        if let Some(block) = self.lower_expr_to_place(*expr, place, body)? {
+                            let r = end.get_or_insert_with(|| self.new_basic_block());
+                            self.set_goto(block, *r, expr_id.into());
+                        }
+                        continue;
+                    }
                     let (then, mut otherwise) =
                         self.pattern_match(current, None, cond_place, *pat)?;
                     let then = if let &Some(guard) = guard {
@@ -840,17 +881,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Become { .. } => not_supported!("tail-calls"),
             Expr::Yield { .. } => not_supported!("yield"),
             Expr::RecordLit { fields, path, spread, .. } => {
-                let spread_place = match *spread {
-                    RecordSpread::Expr(it) => {
-                        let Some((p, c)) = self.lower_expr_as_place(current, it, true)? else {
-                            return Ok(None);
-                        };
-                        current = c;
-                        Some(p)
-                    }
-                    RecordSpread::None => None,
-                    RecordSpread::FieldDefaults => not_supported!("empty record spread"),
-                };
                 let variant_id =
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
                         MirLowerError::UnresolvedName {
@@ -876,6 +906,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             current = c;
                             operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                         }
+                        // The fields are evaluated in the order written, and the base after
+                        // them.
+                        let spread_place = match *spread {
+                            RecordSpread::Expr(it) => {
+                                let Some((p, c)) = self.lower_expr_as_place(current, it, true)?
+                                else {
+                                    return Ok(None);
+                                };
+                                current = c;
+                                Some(p)
+                            }
+                            RecordSpread::None => None,
+                            RecordSpread::FieldDefaults => not_supported!("empty record spread"),
+                        };
                         let rvalue = Rvalue::Aggregate(
                             AggregateKind::Adt(variant_id, subst.store()),
                             match spread_place {
@@ -1017,9 +1061,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             Expr::Ref { expr, rawness: _, mutability } => {
+                let locals = self.result.locals.len();
                 let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
                     return Ok(None);
                 };
+                if mutability.is_shared()
+                    && p.local.into_raw().into_u32() as usize >= locals
+                    && self.is_promotable(*expr)
+                {
+                    self.result.promoted_locals.push(p.local);
+                }
                 let bk = BorrowKind::from_hir_mutability(*mutability);
                 self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
                 Ok(Some(current))
@@ -1119,12 +1170,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         .and_then(|it| it.split_last())
                         .map(|it| it.1)
                         .ok_or(MirLowerError::TypeError("adjustment of binary op was missing"))?;
-                    let Some((lhs_place, current)) =
-                        self.lower_expr_as_place_with_adjust(current, *lhs, false, adjusts)?
+                    // rustc evaluates the right-hand side of a built-in compound assignment
+                    // before the place it assigns to.
+                    let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
                     else {
                         return Ok(None);
                     };
-                    let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
+                    let Some((lhs_place, current)) =
+                        self.lower_expr_as_place_with_adjust(current, *lhs, false, adjusts)?
                     else {
                         return Ok(None);
                     };
@@ -1619,6 +1672,65 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn set_goto(&mut self, source: BasicBlockId, target: BasicBlockId, span: MirSpan) {
         self.set_terminator(source, TerminatorKind::Goto { target }, span);
+    }
+
+    /// Whether `&expr` is a borrow of a constant that rustc gives the `'static` lifetime.
+    /// This looks at the syntax only; whether the type allows it is left to the user of
+    /// `MirBody::promoted_locals`.
+    fn is_promotable(&mut self, expr: ExprId) -> bool {
+        if let &Expr::Index { base, .. } = &self.store[expr]
+            && matches!(self.expr_ty_without_adjust(base).kind(), TyKind::Array(..))
+        {
+            // Indexing an array is built in, whatever adjustments inference left on it.
+            return self.is_promotable_unadjusted(base);
+        }
+        if self.infer.expr_adjustments.get(&expr).is_some_and(|it| !it.is_empty()) {
+            return false;
+        }
+        self.is_promotable_unadjusted(expr)
+    }
+
+    fn is_promotable_unadjusted(&mut self, expr: ExprId) -> bool {
+        let scalar = |this: &Self, expr| {
+            matches!(
+                this.expr_ty_without_adjust(expr).kind(),
+                TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+            )
+        };
+        match &self.store[expr] {
+            Expr::Literal(_) => true,
+            Expr::Path(path) => {
+                let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
+                let hygiene = self.store.expr_path_hygiene(expr);
+                let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
+                self.resolver.reset_to_guard(guard);
+                match resolved {
+                    Some(ValueNs::ConstId(_) | ValueNs::EnumVariantId(_)) => true,
+                    Some(ValueNs::StructId(_)) => {
+                        !matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..))
+                    }
+                    _ => false,
+                }
+            }
+            Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
+                exprs.clone().iter().all(|&it| self.is_promotable(it))
+            }
+            Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
+                fields.clone().iter().all(|it| self.is_promotable(it.expr))
+            }
+            &Expr::Field { expr, .. } => self.is_promotable(expr),
+            &Expr::Ref { expr, mutability, .. } => {
+                mutability.is_shared() && self.is_promotable(expr)
+            }
+            &Expr::UnaryOp {
+                expr,
+                op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
+            } => scalar(self, expr) && self.is_promotable(expr),
+            &Expr::Cast { expr: inner, .. } => {
+                scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
+            }
+            _ => false,
+        }
     }
 
     fn expr_ty_without_adjust(&self, e: ExprId) -> Ty<'db> {

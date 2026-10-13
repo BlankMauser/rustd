@@ -87,6 +87,37 @@ impl<'db> MirLowerCtx<'_, 'db> {
         Ok((current, current_else))
     }
 
+    /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
+    /// rustc tries them. A choice maps an or-pattern to the index of its alternative.
+    pub(super) fn or_expansions(&self, pattern: PatId) -> Vec<Vec<(PatId, usize)>> {
+        if let Pat::Or(alternatives) = &self.store[pattern] {
+            return alternatives
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &alternative)| {
+                    self.or_expansions(alternative).into_iter().map(move |mut choice| {
+                        choice.push((pattern, i));
+                        choice
+                    })
+                })
+                .collect();
+        }
+        let mut expansions = vec![Vec::new()];
+        self.store[pattern].walk_child_pats(|child| {
+            let children = self.or_expansions(child);
+            if children.len() == 1 && children[0].is_empty() {
+                return;
+            }
+            expansions = expansions
+                .iter()
+                .flat_map(|choice| {
+                    children.iter().map(move |child| [&choice[..], &child[..]].concat())
+                })
+                .collect();
+        });
+        expansions
+    }
+
     pub(super) fn pattern_match_assignment(
         &mut self,
         current: BasicBlockId,
@@ -155,6 +186,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     &cond_place,
                     mode,
                 )?
+            }
+            Pat::Or(pats) if let Some(&chosen) = self.or_choices.get(&pattern) => {
+                self.pattern_match_inner(current, current_else, cond_place, pats[chosen], mode)?
             }
             Pat::Or(pats) => {
                 let then_target = self.new_basic_block();
@@ -354,8 +388,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     )?;
                 }
                 for (i, &pat) in suffix.iter().enumerate() {
+                    // Offset 0 from the end is the last element.
                     let next_place = cond_place.project(ProjectionElem::ConstantIndex {
-                        offset: i as u64,
+                        offset: (suffix.len() - 1 - i) as u64,
                         from_end: true,
                     });
                     (current, current_else) =

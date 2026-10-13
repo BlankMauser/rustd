@@ -176,6 +176,8 @@ pub struct Evaluator<'a, 'db> {
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
+    /// The memory of each evaluated static, as start and size.
+    static_memory: Vec<(usize, usize, StaticId)>,
     /// We don't really have function pointers, i.e. pointers to some assembly instructions that we can run. Instead, we
     /// store the type as an interned id in place of function and vtable pointers, and we recover back the type at the
     /// time of use.
@@ -489,7 +491,10 @@ pub fn interpret_mir<'db>(
             &Locals { ptr: ArenaMap::new(), body, drop_flags: DropFlags::default() },
         )?;
         let bytes = Box::from(bytes);
-        let memory_map = if memory_map.memory.is_empty() && evaluator.vtable_map.is_empty() {
+        let memory_map = if memory_map.memory.is_empty()
+            && memory_map.statics.is_empty()
+            && evaluator.vtable_map.is_empty()
+        {
             MemoryMap::Empty
         } else {
             memory_map.vtable = mem::take(&mut evaluator.vtable_map);
@@ -532,6 +537,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
+            static_memory: Vec::new(),
             db,
             random_state: oorandom::Rand64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
@@ -1011,6 +1017,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     &locals,
                     "no unsized local in extending stack",
                 )?;
+                if size == 0 {
+                    // Nothing is stored, so the address only has to be aligned. It is the
+                    // alignment itself, which is what rustc gives a constant of no size.
+                    locals.ptr.insert(id, Interval { addr: Invalid(align), size });
+                    continue;
+                }
                 while !stack_ptr.is_multiple_of(align) {
                     stack_ptr += 1;
                 }
@@ -2066,6 +2078,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     }
 
     fn write_memory_using_ref(&mut self, addr: Address, size: usize) -> Result<'db, &mut [u8]> {
+        if size == 0 {
+            return Ok(&mut []);
+        }
         let (mem, pos) = match addr {
             Stack(it) => (&mut self.stack, it),
             Heap(it) => (&mut self.heap, it),
@@ -2243,6 +2258,21 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         ) -> Result<'db, ()> {
             if stack_depth_limit.checked_sub(1).is_none() {
                 return Err(MirEvalError::StackOverflow);
+            }
+            if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind()
+                && let Some(addr) = bytes.get(..size_of::<usize>())
+            {
+                let addr = from_bytes!(usize, addr);
+                let pointee = this.static_memory.iter().find(|&&(start, size, _)| {
+                    addr.checked_sub(start).is_some_and(|offset| offset < size.max(1))
+                });
+                if let Some(&(start, size, id)) = pointee {
+                    let pointee = crate::StaticMemory { start, size, id };
+                    if !mm.statics.contains(&pointee) {
+                        mm.statics.push(pointee);
+                    }
+                    return Ok(());
+                }
             }
             match ty.kind() {
                 TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
@@ -2932,6 +2962,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             let addr = self.heap_allocate(size, align)?;
             Interval::new(addr, size)
         };
+        self.static_memory.push((result.addr.to_usize(), result.size, st));
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
         self.write_memory(addr, &result.addr.to_bytes())?;
         self.static_locations.insert(st, addr);
