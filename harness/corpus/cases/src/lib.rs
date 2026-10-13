@@ -648,6 +648,40 @@ pub mod drops {
         let _late = make(log, 6);
         p.a
     }
+    /// `*b;` moves the contents out and drops them, and the box can be filled again.
+    pub fn box_refilled(log: &Cell<u64>) {
+        let mut b = Box::new(make(log, 1));
+        *b;
+        let _mid = make(log, 2);
+        *b = make(log, 3);
+    }
+    /// What a pattern leaves behind in an enum or an array is still dropped.
+    pub fn left_behind(log: &Cell<u64>) {
+        let pair = Some((make(log, 1), make(log, 2)));
+        match pair {
+            Some((_taken, _)) => {}
+            None => {}
+        }
+        let [_first, ..] = [make(log, 3), make(log, 4), make(log, 5)];
+    }
+    /// Bindings drop in the reverse of the order the pattern names them, whichever
+    /// alternative matched, and those of a later parameter go first.
+    pub fn binding_order(log: &Cell<u64>, first: bool) {
+        let ((true, _x, _y) | (false, _y, _x)) = (first, make(log, 1), make(log, 2));
+        (|_a, (Ok(_b) | Err(_b)), _c| {})(make(log, 3), Ok::<_, Noisy<'_>>(make(log, 4)), make(log, 5));
+    }
+    fn next<'a>(n: &Noisy<'a>) -> Noisy<'a> {
+        make(n.0, n.1 + 1)
+    }
+    /// Before the 2024 edition the temporaries in a block's tail outlive its locals.
+    pub fn tail_temporaries(log: &Cell<u64>) -> u64 {
+        let a = make(log, 1);
+        let b = {
+            let _local = make(log, 5);
+            next(&next(&a)).1
+        };
+        b + next(&a).1
+    }
     pub fn strings(n: usize) -> usize {
         let s = "ab".repeat(n);
         let t = s.clone();

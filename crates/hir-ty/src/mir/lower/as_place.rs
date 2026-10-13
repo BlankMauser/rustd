@@ -10,6 +10,15 @@ use crate::{
 };
 
 impl<'db> MirLowerCtx<'_, 'db> {
+    /// A temporary is dropped before the ones that were made while computing its value.
+    fn declare_last(&mut self, local: LocalId) {
+        let scope = self.drop_scopes.iter_mut().rev().find(|it| it.locals.contains(&local));
+        if let Some(scope) = scope {
+            scope.locals.retain(|&it| it != local);
+            scope.locals.push(local);
+        }
+    }
+
     fn lower_expr_to_some_place_without_adjust(
         &mut self,
         expr_id: ExprId,
@@ -21,6 +30,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         else {
             return Ok(None);
         };
+        self.declare_last(place.local);
         Ok(Some((place, current)))
     }
 
@@ -40,6 +50,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         else {
             return Ok(None);
         };
+        self.declare_last(place.local);
         Ok(Some((place, current)))
     }
 

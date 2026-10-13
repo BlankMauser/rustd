@@ -601,6 +601,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 drop_flags: ArenaMap::new(),
                 moved_paths: Vec::new(),
                 deferred_drops: Vec::new(),
+                deferred_clears: Vec::new(),
                 ret_mode: PassMode::Ignore,
                 tracked,
                 abi: ExternAbi::Rust,
@@ -795,6 +796,12 @@ struct PlaceRef<'db> {
 }
 
 /// A field that some statement moves out of a local, as the field indices leading to it.
+/// The step in a [`MovedPath`] from a `Box` to what it owns.
+const BOX_CONTENTS: u32 = u32::MAX;
+/// The step in a [`MovedPath`] from an enum to the fields of one of its variants, combined with
+/// the variant's index.
+const VARIANT_FIELDS: u32 = 1 << 30;
+
 struct MovedPath {
     local: LocalId,
     path: Vec<u32>,
@@ -824,6 +831,7 @@ struct FunctionCx<'cx, 'a, 'db> {
     moved_paths: Vec<MovedPath>,
     /// The block to generate each `Drop` terminator in, with its place and target.
     deferred_drops: Vec<(ir::Block, StoredPlace, ir::Block)>,
+    deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
     /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
     /// hidden argument.
@@ -1404,6 +1412,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.terminator(&terminator.kind)?;
         }
         // Drops are generated last, when every field that gets moved out of a local is known.
+        for (block, place, target) in std::mem::take(&mut self.deferred_clears) {
+            self.builder.switch_to_block(block);
+            self.clear_moved_now(&place);
+            self.builder.ins().jump(target, &[]);
+        }
         for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
             self.builder.switch_to_block(block);
             self.drop_place(&place, target)?;
@@ -1417,9 +1430,33 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut ty = PlaceTy::from_ty(self.body?.locals[place.local].ty.as_ref());
         let mut path = Vec::new();
         for proj in place.projection.as_slice() {
+            if let (ProjectionElem::Deref, TyKind::Adt(adt_def, _)) = (proj, ty.ty.kind())
+                && adt_def.is_box()
+            {
+                path.push(BOX_CONTENTS);
+                ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
+                continue;
+            }
+            if let (ProjectionElem::Downcast(VariantId::EnumVariantId(variant)), TyKind::Adt(..)) =
+                (proj, ty.ty.kind())
+            {
+                path.push(VARIANT_FIELDS | variant.index(self.cg.db) as u32);
+                ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
+                continue;
+            }
+            if let (&ProjectionElem::ConstantIndex { offset, from_end }, TyKind::Array(_, len)) =
+                (proj, ty.ty.kind())
+            {
+                let len = crate::consteval::try_const_usize(self.cg.db, len)? as u64;
+                let index = if from_end { len.checked_sub(offset)? } else { offset };
+                path.push(u32::try_from(index).ok().filter(|&it| it < VARIANT_FIELDS)?);
+                ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
+                continue;
+            }
             let ProjectionElem::Field(field) = proj else { return None };
             match ty.ty.kind() {
                 TyKind::Tuple(_) | TyKind::Closure(..) => (),
+                TyKind::Adt(..) if ty.variant_id.is_some() => (),
                 TyKind::Adt(adt_def, _)
                     if matches!(adt_def.def_id(), AdtId::StructId(_)) && !adt_def.is_box() => {}
                 _ => return None,
@@ -1428,6 +1465,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
         }
         Some(path)
+    }
+
+    /// Says that the fields of `place` are all there again, after an assignment to it.
+    fn clear_moved(&mut self, place: &StoredPlace) {
+        if !self.drop_flags.contains_idx(place.local)
+            || self.field_path(place).is_none_or(|it| it.is_empty())
+        {
+            return;
+        }
+        // Filled in last, when every field that gets moved out of the local is known.
+        let clear = self.builder.create_block();
+        let after = self.builder.create_block();
+        self.builder.ins().jump(clear, &[]);
+        self.builder.switch_to_block(after);
+        self.deferred_clears.push((clear, place.clone(), after));
+    }
+
+    fn clear_moved_now(&mut self, place: &StoredPlace) {
+        let (Some(&flag), Some(path)) = (self.drop_flags.get(place.local), self.field_path(place))
+        else {
+            return;
+        };
+        let within = |it: &&MovedPath| it.local == place.local && it.path.starts_with(&path);
+        let mask = self.moved_paths.iter().filter(within).fold(0u64, |mask, it| mask | 1 << it.bit);
+        if mask != 0 {
+            let state = self.builder.ins().load(types::I64, MEM, flag, 0);
+            let state = self.builder.ins().band_imm(state, !mask as i64);
+            self.builder.ins().store(MEM, state, flag, 0);
+        }
     }
 
     /// The bit in a local's drop flag that says one of its fields has been moved out.
@@ -1498,10 +1564,98 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let ty = self.normalize(ty);
             let fields: Vec<Ty<'db>> = match ty.kind() {
                 TyKind::Tuple(tys) => tys.iter().collect(),
+                TyKind::Array(element, len) => {
+                    match crate::consteval::try_const_usize(self.cg.db, len) {
+                        Some(len) => vec![element; len as usize],
+                        None => unsupported!("partial move out of {ty:?}"),
+                    }
+                }
                 TyKind::Closure(_, args) => match args.as_closure().tupled_upvars_ty().kind() {
                     TyKind::Tuple(tys) => tys.iter().collect(),
                     _ => unsupported!("partial move out of a closure without tupled upvars"),
                 },
+                TyKind::Adt(adt_def, subst) if adt_def.is_box() => {
+                    let pointee = subst.type_at(0);
+                    let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
+                    let pointee_meta =
+                        is_unsized(pointee).then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                    path.push(BOX_CONTENTS);
+                    self.drop_unmoved(pointer, pointee_meta, pointee, local, path, state)?;
+                    path.pop();
+                    self.call_drop_impl(addr, ty)?;
+                    if let AdtId::StructId(id) = adt_def.def_id() {
+                        let layout = self.layout(ty)?;
+                        self.drop_fields(addr, &layout, id.into(), subst)?;
+                    }
+                    self.builder.ins().jump(done, &[]);
+                    self.builder.switch_to_block(done);
+                    return Ok(());
+                }
+                TyKind::Adt(adt_def, subst) if matches!(adt_def.def_id(), AdtId::EnumId(_)) => {
+                    let AdtId::EnumId(id) = adt_def.def_id() else { unreachable!() };
+                    let db = self.cg.db;
+                    let layout = self.layout(ty)?;
+                    let wide = AbiScalar { ty: types::I64, signed: true };
+                    let single = match &layout.variants {
+                        Variants::Empty => {
+                            self.builder.ins().jump(done, &[]);
+                            self.builder.switch_to_block(done);
+                            return Ok(());
+                        }
+                        Variants::Single { index } => Some(index.0),
+                        Variants::Multiple { .. } => None,
+                    };
+                    let mut switch = Switch::new();
+                    let mut arms = Vec::new();
+                    for &(variant, _) in id.enum_variants(db).variants.values() {
+                        if single.is_some_and(|index| index != variant.index(db)) {
+                            continue;
+                        }
+                        let value = db
+                            .const_eval_discriminant(variant)
+                            .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
+                        let block = self.builder.create_block();
+                        if single.is_none() {
+                            switch.set_entry(value as i64 as u64 as u128, block);
+                        }
+                        arms.push((block, variant));
+                    }
+                    if single.is_some() {
+                        match arms.first() {
+                            Some(&(block, _)) => self.builder.ins().jump(block, &[]),
+                            None => self.builder.ins().jump(done, &[]),
+                        };
+                    } else {
+                        let discr = self.discriminant(addr, ty, wide)?;
+                        switch.emit(&mut self.builder, discr, done);
+                    }
+                    for (block, variant) in arms {
+                        self.builder.switch_to_block(block);
+                        let index = variant.index(db);
+                        let variant_layout = match &layout.variants {
+                            Variants::Multiple { variants, .. } => {
+                                variants[RustcEnumVariantIdx(index)].clone()
+                            }
+                            _ => (*layout).clone(),
+                        };
+                        path.push(VARIANT_FIELDS | index as u32);
+                        let field_types = db.field_types(variant.into());
+                        for (field, field_ty) in field_types.iter() {
+                            let field_ty =
+                                field_ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                            let field = u32::from(field.into_raw());
+                            let offset = variant_layout.fields.offset(field as usize).bytes();
+                            let field_addr = self.builder.ins().iadd_imm(addr, offset as i64);
+                            path.push(field);
+                            self.drop_unmoved(field_addr, None, field_ty, local, path, state)?;
+                            path.pop();
+                        }
+                        path.pop();
+                        self.builder.ins().jump(done, &[]);
+                    }
+                    self.builder.switch_to_block(done);
+                    return Ok(());
+                }
                 TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
                     AdtId::StructId(id) => self
                         .cg
@@ -1515,7 +1669,29 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 _ => unsupported!("partial move out of {ty:?}"),
             };
             let layout = self.layout(ty)?;
-            for (i, field) in fields.into_iter().enumerate() {
+            let mut fields: Vec<_> = fields.into_iter().enumerate().collect();
+            if matches!(ty.kind(), TyKind::Array(..)) {
+                // An array that has lost elements drops what is left from the back, except
+                // that a run of whole elements is dropped front to back.
+                let mut runs: Vec<Vec<(usize, Ty<'db>)>> = Vec::new();
+                let mut in_run = false;
+                for (i, field) in fields {
+                    path.push(i as u32);
+                    let whole = !self
+                        .moved_paths
+                        .iter()
+                        .any(|it| it.local == local && it.path.starts_with(path));
+                    path.pop();
+                    match runs.last_mut() {
+                        Some(run) if whole && in_run => run.push((i, field)),
+                        _ => runs.push(vec![(i, field)]),
+                    }
+                    in_run = whole;
+                }
+                runs.reverse();
+                fields = runs.into_iter().flatten().collect();
+            }
+            for (i, field) in fields {
                 let offset = layout.fields.offset(i).bytes() as i64;
                 let field_addr = self.builder.ins().iadd_imm(addr, offset);
                 path.push(i as u32);
@@ -4248,6 +4424,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     fn set_drop_flag(&mut self, place: &StoredPlace, live: bool) {
         if !place.projection.as_slice().is_empty() {
+            if live {
+                self.clear_moved(place);
+            }
             return;
         }
         if let Some(&flag) = self.drop_flags.get(place.local) {

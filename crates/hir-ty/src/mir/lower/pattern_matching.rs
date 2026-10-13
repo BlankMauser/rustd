@@ -77,6 +77,20 @@ impl<'db> MirLowerCtx<'_, 'db> {
             pattern,
             MatchingMode::Check,
         )?;
+        // Bindings are dropped in the reverse of the order the pattern names them, whichever
+        // alternative of an or-pattern ends up binding them.
+        let mut bindings = Vec::new();
+        let mut alternatives = false;
+        self.store.walk_pats(pattern, &mut |pat| match &self.store[pat] {
+            Pat::Or(_) => alternatives = true,
+            &Pat::Bind { id, .. } if !bindings.contains(&id) => bindings.push(id),
+            _ => (),
+        });
+        if alternatives {
+            for binding in bindings {
+                self.push_storage_live(binding, current)?;
+            }
+        }
         let (current, current_else) = self.pattern_match_inner(
             current,
             current_else,

@@ -1894,7 +1894,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Some(scope) => scope,
             None => self.drop_scopes.last_mut().unwrap(),
         };
-        scope.locals.push(l);
+        if !scope.locals.contains(&l) {
+            scope.locals.push(l);
+        }
         self.push_statement(current, StatementKind::StorageLive(l).with_span(span));
         Ok(())
     }
@@ -2058,7 +2060,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 &hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
                     let scope2 = self.push_drop_scope();
-                    let Some((p, c)) = self.lower_expr_as_place(current, expr, true)? else {
+                    // A place used as a statement (`*x;`) is moved out of, and the value
+                    // dropped at the end of the statement.
+                    let unsized_place = matches!(
+                        self.expr_ty_after_adjustments(expr).kind(),
+                        TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..)
+                    );
+                    let lowered = if unsized_place {
+                        self.lower_expr_as_place(current, expr, true)?
+                    } else {
+                        self.lower_expr_to_fresh_place(expr, current)?
+                    };
+                    let Some((p, c)) = lowered else {
                         scope2.pop_assume_dropped(self);
                         scope.pop_assume_dropped(self);
                         return Ok(None);
@@ -2070,11 +2083,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
         }
         if let Some(tail) = tail {
+            let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
                 scope.pop_assume_dropped(self);
                 return Ok(None);
             };
             current = c;
+            // Before the 2024 edition the temporaries of a block's tail outlive its locals.
+            if !self.edition().at_least_2024()
+                && let Some(scope) = self.drop_scopes.last_mut()
+                && declared <= scope.locals.len()
+            {
+                let temporaries = scope.locals.len() - declared;
+                scope.locals.rotate_right(temporaries);
+            }
         }
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
@@ -2145,7 +2167,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             {
                 continue;
             }
+            let scope = self.drop_scopes.iter().rposition(|it| !it.temporaries);
+            let declared = scope.map_or(0, |it| self.drop_scopes[it].locals.len());
             let r = self.pattern_match(current, None, local.into(), param)?;
+            // What a parameter's pattern binds is dropped before the parameters ahead of it.
+            if let Some(scope) = scope.map(|it| &mut self.drop_scopes[it].locals)
+                && let Some(param) = scope.iter().position(|&it| it == local)
+                && param < declared
+            {
+                let bound = scope.split_off(declared);
+                scope.splice(param + 1..param + 1, bound);
+            }
             if let Some(b) = r.1 {
                 self.set_terminator(b, TerminatorKind::Unreachable, param.into());
             }
