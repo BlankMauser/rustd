@@ -1660,3 +1660,18 @@ pub mod boxed_fn_tuple {
         (joined, seen, none())
     }
 }
+
+/// `line!()`, `column!()` and `file!()` are where the outermost macro is called.
+pub mod builtin_location {
+    macro_rules! here {
+        () => {
+            (line!(), column!(), file!())
+        };
+    }
+
+    pub fn run() -> ((u32, u32, &'static str), (u32, u32, &'static str), u32) {
+        let direct = (line!(), column!(), file!());
+        let nested = here!();
+        (direct, nested, line!() + 1)
+    }
+}

@@ -278,7 +278,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             && let Expr::Literal(l) = &self.store[expr_id]
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            return Ok(Some((self.lower_literal_to_operand(ty, l)?, current)));
+            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            operand.span = Some(expr_id.into());
+            return Ok(Some((operand, current)));
         }
         let Some((p, current)) = self.lower_expr_to_fresh_place(expr_id, current)? else {
             return Ok(None);
@@ -1452,7 +1454,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             },
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let op = self.lower_literal_to_operand(ty, l)?;
+                let mut op = self.lower_literal_to_operand(ty, l)?;
+                op.span = Some(expr_id.into());
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }

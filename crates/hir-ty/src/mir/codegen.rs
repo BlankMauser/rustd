@@ -30,7 +30,10 @@ use hir_def::{
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
-use hir_expand::{FileRange, InFile};
+use hir_expand::{
+    FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander,
+};
+use rustc_type_ir::UintTy;
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
@@ -2154,6 +2157,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             OperandKind::Constant { konst, ty } => {
                 let ty = ty.as_ref();
+                if let Some(MirSpan::ExprId(expr)) = operand.span
+                    && let Some(addr) = self.builtin_location(expr, ty)?
+                {
+                    return Ok((addr, ty));
+                }
                 let blob = match konst.as_ref().kind() {
                     ConstKind::Value(value) => {
                         let is_int = matches!(
@@ -2182,6 +2190,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
                 let ty = allocation.ty;
+                if let Some(MirSpan::ExprId(expr)) = operand.span
+                    && let Some(addr) = self.builtin_location(expr, ty)?
+                {
+                    return Ok((addr, ty));
+                }
                 let blob = self.allocation_blob(allocation, false)?;
                 Ok((self.blob_addr(blob)?, ty))
             }
@@ -3249,6 +3262,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
             range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
         }
+        self.location_of(source.file_id, range)
+    }
+
+    fn location_of(&self, file_id: HirFileId, range: TextRange) -> Option<(String, u32, u32)> {
+        let db = self.cg.db;
+        let source = InFile::new(file_id, ());
         // What a macro writes itself is reported from where the outermost macro is called;
         // what it is passed keeps its own place.
         let own_tokens = source.file_id.macro_file().is_some()
@@ -3271,6 +3290,67 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
         let col = before[line_start..].chars().count() + 1;
         Some((self.cg.symbols.source_path(file_id)?, line as u32, col as u32))
+    }
+
+    /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
+    /// rust-analyzer expands them to placeholders, since a real value would make every body
+    /// below an edit change.
+    fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
+        let db = self.cg.db;
+        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
+            return Ok(None);
+        };
+        let Ok(source) = Body::with_source_map(db, owner).1.expr_syntax(expr) else {
+            return Ok(None);
+        };
+        let Some(call) = source.file_id.macro_file() else { return Ok(None) };
+        let MacroDefKind::BuiltIn(_, expander) = call.loc(db).def.kind else { return Ok(None) };
+        if !matches!(
+            expander,
+            BuiltinFnLikeExpander::Line
+                | BuiltinFnLikeExpander::Column
+                | BuiltinFnLikeExpander::File
+        ) {
+            return Ok(None);
+        }
+        let Some(site) = source.file_id.original_call_node(db) else { return Ok(None) };
+        let Some((file, line, col)) = self.location_of(site.file_id.into(), site.value.text_range())
+        else {
+            return Ok(None);
+        };
+        let number = match expander {
+            BuiltinFnLikeExpander::Line => line,
+            BuiltinFnLikeExpander::Column => col,
+            _ => {
+                let len = file.len();
+                let name = self.cg.define_data(
+                    ConstBlob {
+                        bytes: file.into_bytes(),
+                        relocs: Vec::new(),
+                        fn_relocs: Vec::new(),
+                        align: 1,
+                    },
+                    false,
+                )?;
+                let mut fat = ConstBlob {
+                    bytes: vec![0; 16],
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 8,
+                };
+                fat.point_to(0, name, 0);
+                fat.bytes[8..].copy_from_slice(&(len as u64).to_le_bytes());
+                return self.blob_addr(fat).map(Some);
+            }
+        };
+        if !matches!(ty.kind(), TyKind::Uint(UintTy::U32)) {
+            return Ok(None);
+        }
+        let layout = self.layout(ty)?;
+        let addr = self.stack_slot(&layout);
+        let value = self.builder.ins().iconst(types::I32, number as i64);
+        self.builder.ins().store(MEM, value, addr, 0);
+        Ok(Some(addr))
     }
 
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
