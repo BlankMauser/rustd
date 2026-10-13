@@ -112,6 +112,10 @@ fn main() {
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
     case!(heap::clears(3));
+    let (mut map, mut maps) = (heap::hashmap(), heap::hashmaps(2));
+    map.insert("a".into(), 1);
+    maps[1].insert("b".into(), 2);
+    case!(map.len(), map["a"], maps[0].len(), maps[1]["b"]);
     let (cell, lock) = (std::cell::RefCell::new([3u64; 14]), std::sync::Mutex::new((1u128, 2u8)));
     case!(heap::unsizable_tail(&cell, &lock), cell.borrow()[13], *lock.lock().unwrap());
 

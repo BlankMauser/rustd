@@ -17,6 +17,11 @@ use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
 use rustc_hash::FxHashMap;
+use syntax::{
+    AstNode,
+    ast::{self, HasName},
+    match_ast,
+};
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 use crate::symbols::SymbolTable;
@@ -135,8 +140,42 @@ impl SymbolResolver for Resolver<'_> {
         let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
             return None;
         };
-        let path = self.item_path(it.module(self.db), it.name(self.db).as_str())?;
-        self.table.get(&path).map(str::to_owned)
+        let module = it.module(self.db);
+        let name = it.name(self.db);
+        if module.nearest_non_block_module(self.db) == module {
+            let path = self.item_path(module, name.as_str())?;
+            return self.table.get(&path).map(str::to_owned);
+        }
+        // A static in a body is named after the items around it, which only the syntax knows.
+        let sema = hir::Semantics::new(self.db);
+        let source = sema.source(it)?;
+        let mut names = vec![name.as_str().to_owned()];
+        let mut owner = None;
+        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
+            if let Some(func) = ast::Fn::cast(node.clone()) {
+                let func: hir::Function = sema.to_def(&func)?;
+                owner = Some(self.path(func.try_into().ok()?)?);
+                break;
+            }
+            let name = match_ast! {
+                match node {
+                    ast::Const(it) => it.name(),
+                    ast::Static(it) => it.name(),
+                    _ => None,
+                }
+            };
+            names.extend(name.map(|it| it.text().to_string()));
+        }
+        let owner = match owner {
+            Some(owner) => owner,
+            None => {
+                let outer = names.pop()?;
+                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+            }
+        };
+        names.push(owner);
+        names.reverse();
+        self.table.get_nested(&names.join("::")).map(str::to_owned)
     }
 
     fn path(&self, path: &str) -> Option<String> {
@@ -291,9 +330,9 @@ fn source_files(vfs: &Vfs, _root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTim
         .filter_map(|(id, path)| {
             let path: &Path = path.as_path()?.as_ref();
             // Everything but the sysroot and the registry: path dependencies live outside `root`.
-            let immutable = path.components().any(|c| {
-                matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry"))
-            });
+            let immutable = path
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")));
             if immutable {
                 return None;
             }
@@ -371,7 +410,10 @@ fn main() -> anyhow::Result<()> {
         report(&warm);
         let stats = known.stats;
         if stats.bodies > 0 {
-            eprintln!("stats: mir {:.1?}, {} of {} bodies changed", stats.mir, stats.changed, stats.bodies);
+            eprintln!(
+                "stats: mir {:.1?}, {} of {} bodies changed",
+                stats.mir, stats.changed, stats.bodies
+            );
             eprintln!("code: {} reused, {} compiled", stats.reused, stats.compiled);
         }
         link(&args)?;

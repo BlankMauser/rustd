@@ -9,13 +9,17 @@ use base_db::Crate;
 use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
-        StackSlotData, StackSlotKind, TrapCode, Type, Value, condcodes::{FloatCC, IntCC}, types,
+        StackSlotData, StackSlotKind, TrapCode, Type, Value,
+        condcodes::{FloatCC, IntCC},
+        types,
     },
     isa::{self, CallConv},
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, default_libcall_names};
+use cranelift_module::{
+    DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, default_libcall_names,
+};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, TraitId,
@@ -269,6 +273,10 @@ enum InstanceDef {
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
     /// generic argument: calls the closure through the pointer it is handed, then drops it.
     CallOnceShim,
+    /// What a closure that captures nothing coerces to as a function pointer: calls the
+    /// closure type that is the instance's only generic argument, which borrows a receiver,
+    /// with a dangling one.
+    FnPointerShim,
 }
 
 /// What a call transfers control to.
@@ -310,6 +318,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let backend = |e: &dyn fmt::Display| CodegenError::Backend(e.to_string());
         let mut flags = settings::builder();
         flags.set("is_pic", "true").map_err(|e| backend(&e))?;
+        flags.set("tls_model", "elf_gd").map_err(|e| backend(&e))?;
         flags.set("opt_level", "none").map_err(|e| backend(&e))?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(|e| backend(&e))?;
         let isa = isa::lookup_by_name("x86_64-unknown-linux-gnu")
@@ -350,10 +359,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let body = db.mir_body(owner);
         self.mir_time += start.elapsed();
         let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let root = Instance {
-            def: InstanceDef::Fn(func),
-            args: GenericArgs::new_from_slice(&[]).store(),
-        };
+        let root =
+            Instance { def: InstanceDef::Fn(func), args: GenericArgs::new_from_slice(&[]).store() };
         self.fingerprint(root, body);
         let Some(symbol) = self.symbols.function(func) else {
             return Err(CodegenError::NoSymbol);
@@ -412,9 +419,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut ctx = self.build(env, None, false, |fx| fx.call_once_shim(ty))?;
             return self.emit(id, &mut ctx);
         }
+        if let InstanceDef::FnPointerShim = instance.def {
+            let ty = instance.args.as_ref().type_at(0);
+            let mut ctx = self.build(env, None, false, |fx| fx.fn_pointer_shim(ty))?;
+            return self.emit(id, &mut ctx);
+        }
         let start = std::time::Instant::now();
         let body = match instance.def {
-            InstanceDef::DropGlue | InstanceDef::CallOnceShim => unreachable!(),
+            InstanceDef::DropGlue | InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => {
+                unreachable!()
+            }
             InstanceDef::Fn(func) => {
                 self.db.monomorphized_mir_body(func.into(), instance.args.clone(), env.store())
             }
@@ -434,7 +448,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let tracked = match instance.def {
             InstanceDef::Fn(func) => track_caller(self.db, func),
-            InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => false,
+            InstanceDef::Closure(_)
+            | InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim => false,
         };
         let mut ctx = self.compile_body(body, env, tracked)?;
         // The call site declared the instance with the signature it computed from its operands.
@@ -562,13 +579,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let instance = Instance { def, args: args.store() };
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
-            InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => None,
+            InstanceDef::Closure(_)
+            | InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim => None,
         };
         let name = match def {
             InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
             InstanceDef::Closure(_) => "{closure}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
+            InstanceDef::FnPointerShim => "{closure}::fn_pointer",
         };
         if let Some(reason) = self.rejected.get(&instance) {
             unsupported!("callee `{name}`: {reason}");
@@ -627,9 +648,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let mut data = DataDescription::new();
         data.define(blob.bytes.into_boxed_slice());
         data.set_align(blob.align);
-        for (offset, target) in blob.relocs {
+        for (offset, target, addend) in blob.relocs {
             let target = self.module.declare_data_in_data(target, &mut data);
-            data.write_data_addr(offset, target, 0);
+            data.write_data_addr(offset, target, addend);
         }
         for (offset, target) in blob.fn_relocs {
             let target = self.module.declare_func_in_data(target, &mut data);
@@ -665,7 +686,7 @@ enum Intrinsic {
 /// Read-only data whose pointers refer to other data objects.
 struct ConstBlob {
     bytes: Vec<u8>,
-    relocs: Vec<(u32, DataId)>,
+    relocs: Vec<(u32, DataId, i64)>,
     fn_relocs: Vec<(u32, FuncId)>,
     align: u64,
 }
@@ -726,9 +747,8 @@ struct FunctionCx<'cx, 'a, 'db> {
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
 /// impl inherits the attribute from the trait's declaration.
 fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    let has = |func: FunctionId| {
-        AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER)
-    };
+    let has =
+        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
     if has(func) {
         return true;
     }
@@ -1006,10 +1026,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 continue;
             }
             match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
-                Some(TerminatorKind::SwitchInt { discr, targets }) => match self.const_bits(discr) {
-                    Some(bits) => worklist.push(targets.target_for_value(bits)),
-                    None => worklist.extend_from_slice(targets.all_targets()),
-                },
+                Some(TerminatorKind::SwitchInt { discr, targets }) => {
+                    match self.const_bits(discr) {
+                        Some(bits) => worklist.push(targets.target_for_value(bits)),
+                        None => worklist.extend_from_slice(targets.all_targets()),
+                    }
+                }
                 Some(
                     TerminatorKind::Goto { target }
                     | TerminatorKind::Drop { target, .. }
@@ -1409,13 +1431,19 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let Some(symbol) = self.cg.symbols.static_(*id) else {
                     return self.private_static(*id);
                 };
+                let thread_local =
+                    AttrFlags::query(self.cg.db, (*id).into()).contains(AttrFlags::THREAD_LOCAL);
                 let data = self
                     .cg
                     .module
-                    .declare_data(&symbol, Linkage::Import, false, false)
+                    .declare_data(&symbol, Linkage::Import, false, thread_local)
                     .map_err(|e| CodegenError::Backend(e.to_string()))?;
                 let data = self.cg.module.declare_data_in_func(data, self.builder.func);
-                let value = self.builder.ins().symbol_value(PTR, data);
+                let value = if thread_local {
+                    self.builder.ins().tls_value(PTR, data)
+                } else {
+                    self.builder.ins().symbol_value(PTR, data)
+                };
                 let ty = self.static_ty(*id);
                 let layout = self.layout(ty)?;
                 let addr = self.stack_slot(&layout);
@@ -1434,6 +1462,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
+        }
+        if AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL) {
+            unsupported!("thread local without a rustc symbol");
         }
         let allocation = db
             .const_eval_static(id)
@@ -1545,7 +1576,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut bytes = vec![0; layout.size.bytes_usize()];
         let target = match pointee.kind() {
             TyKind::Str | TyKind::Slice(_) => {
-                let mut target = ConstBlob { bytes: Vec::new(), relocs: Vec::new(), fn_relocs: Vec::new(), align: 1 };
+                let mut target = ConstBlob {
+                    bytes: Vec::new(),
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 1,
+                };
                 let items = valtree.inner().to_branch();
                 for item in items.iter() {
                     let ConstKind::Value(item) = item.kind() else {
@@ -1565,7 +1601,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             _ => self.valtree_blob(pointee, valtree)?,
         };
         let target = self.cg.define_const(target)?;
-        Ok(ConstBlob { bytes, relocs: vec![(0, target)], fn_relocs: Vec::new(), align })
+        Ok(ConstBlob { bytes, relocs: vec![(0, target, 0)], fn_relocs: Vec::new(), align })
     }
 
     fn allocation_blob(&mut self, allocation: Allocation<'db>) -> Result<ConstBlob> {
@@ -1580,7 +1616,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             (len, 16) if len < 16 => bytes.resize(16, 0),
             _ => unsupported!("constant whose size differs from its layout"),
         }
-        let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: layout.align.abi.bytes() };
+        let mut blob = ConstBlob {
+            bytes,
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align: layout.align.abi.bytes(),
+        };
         self.relocate(&mut blob, 0, *ty, memory_map)?;
         Ok(blob)
     }
@@ -1599,6 +1640,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         let db = self.cg.db;
         match ty.kind() {
+            TyKind::Pat(base, _) => self.relocate(blob, offset, base, map)?,
             TyKind::Ref(_, pointee, _) => {
                 let Some(addr) = blob.usize_at(offset) else {
                     unsupported!("constant pointer out of bounds");
@@ -1609,8 +1651,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     _ => None,
                 };
                 let Some(target) = target else { return Ok(()) };
-                let mut target =
-                    ConstBlob { bytes: target.to_vec(), relocs: Vec::new(), fn_relocs: Vec::new(), align: 16 };
+                let mut target = ConstBlob {
+                    bytes: target.to_vec(),
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 16,
+                };
                 match pointee.kind() {
                     TyKind::Str => (),
                     TyKind::Slice(elem) => {
@@ -1627,7 +1673,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
                 let target = self.cg.define_const(target)?;
                 blob.bytes[offset..offset + 8].fill(0);
-                blob.relocs.push((offset as u32, target));
+                blob.relocs.push((offset as u32, target, 0));
             }
             // Const eval gives function pointers as ids into its table of fn item types. A
             // function cast to a raw pointer keeps that id, so a raw pointer holding one is
@@ -1637,8 +1683,32 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     unsupported!("constant pointer out of bounds");
                 };
                 let fn_ty = match map.vtable_ty(id) {
-                    Ok(fn_ty) if matches!(fn_ty.kind(), TyKind::FnDef(..)) => fn_ty,
-                    _ if matches!(ty.kind(), TyKind::RawPtr(..)) => return Ok(()),
+                    Ok(fn_ty)
+                        if matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) =>
+                    {
+                        fn_ty
+                    }
+                    _ if matches!(ty.kind(), TyKind::RawPtr(..)) => {
+                        // Const eval keeps the whole allocation a raw pointer points into.
+                        // FIXME: the copy is read-only and is not shared between pointers.
+                        let MemoryMap::Complex(complex) = map else { return Ok(()) };
+                        let Some((&start, memory)) = complex
+                            .memory
+                            .iter()
+                            .find(|&(&start, memory)| (start..start + memory.len()).contains(&id))
+                        else {
+                            return Ok(());
+                        };
+                        let target = self.cg.define_const(ConstBlob {
+                            bytes: memory.to_vec(),
+                            relocs: Vec::new(),
+                            fn_relocs: Vec::new(),
+                            align: 16,
+                        })?;
+                        blob.bytes[offset..offset + 8].fill(0);
+                        blob.relocs.push((offset as u32, target, (id - start) as i64));
+                        return Ok(());
+                    }
                     _ if id == 0 => return Ok(()),
                     _ => unsupported!("fn pointer in a constant"),
                 };
@@ -1907,7 +1977,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().store(MEM, ptr, dst, 0);
                 self.builder.ins().store(MEM, meta, dst, 8);
             }
-            CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
+            CastKind::PointerCoercion(
+                PointerCast::ReifyFnPointer | PointerCast::ClosureFnPointer(_),
+            ) => {
                 let callee = self.fn_item(from_ty)?;
                 let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
                 let pointer = self.builder.ins().func_addr(PTR, callee);
@@ -1949,6 +2021,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// The function a fn item type names, declared so its address can be taken.
     fn fn_item(&mut self, fn_ty: Ty<'db>) -> Result<FuncId> {
+        if let TyKind::Closure(..) = fn_ty.kind() {
+            return self.closure_fn_pointer(fn_ty);
+        }
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
             unsupported!("fn pointer to {fn_ty:?}");
         };
@@ -2935,6 +3010,62 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.cg.callee(closure, parent_args, self.env, &sig)
     }
 
+    /// The function a closure that captures nothing is as a function pointer.
+    fn closure_fn_pointer(&mut self, ty: Ty<'db>) -> Result<FuncId> {
+        let TyKind::Closure(id, generic_args) = ty.kind() else {
+            unsupported!("fn pointer to {ty:?}");
+        };
+        let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
+        let body = self
+            .cg
+            .db
+            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let mut sig = self.body_signature(body, false)?;
+        let Some(&receiver) = body.param_locals.first() else {
+            unsupported!("closure without a receiver");
+        };
+        if body.locals[receiver].ty.as_ref().as_reference().is_none() {
+            // Taken by value, a closure without captures is not passed at all.
+            return self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig);
+        }
+        let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
+        sig.params.remove(sret as usize);
+        let args = GenericArgs::new_from_slice(&[ty.into()]);
+        self.cg.callee(InstanceDef::FnPointerShim, args, self.env, &sig)
+    }
+
+    /// The body of a `FnPointerShim`: the signature of the closure body less its receiver.
+    fn fn_pointer_shim(&mut self, ty: Ty<'db>) -> Result<()> {
+        let TyKind::Closure(id, generic_args) = ty.kind() else {
+            unsupported!("fn pointer shim for {ty:?}");
+        };
+        let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
+        let body = self
+            .cg
+            .db
+            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let sig = self.body_signature(body, false)?;
+        let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
+        let mut shim = sig.clone();
+        shim.params.remove(sret as usize);
+        self.builder.func.signature = shim;
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let mut params = self.builder.block_params(entry).to_vec();
+        let receiver = self.builder.ins().iconst(PTR, 1);
+        params.insert(sret as usize, receiver);
+        let callee =
+            self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
+        let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
+        let call = self.builder.ins().call(callee, &params);
+        let results = self.builder.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+        Ok(())
+    }
+
     /// The body of a `CallOnceShim`: same signature as the closure body, which borrows the
     /// closure, but the shim owns it and so drops it after the call.
     fn call_once_shim(&mut self, ty: Ty<'db>) -> Result<()> {
@@ -3463,9 +3594,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().store(MEM, acc, dst, 0);
             }
             (
-                "fabs" | "fabsf32" | "fabsf64" | "sqrtf32" | "sqrtf64" | "floorf32" | "floorf64"
-                | "ceilf32" | "ceilf64" | "truncf32" | "truncf64" | "round_ties_even_f32"
-                | "round_ties_even_f64" | "roundf32" | "roundf64",
+                "fabs"
+                | "fabsf32"
+                | "fabsf64"
+                | "sqrtf32"
+                | "sqrtf64"
+                | "floorf32"
+                | "floorf64"
+                | "ceilf32"
+                | "ceilf64"
+                | "truncf32"
+                | "truncf64"
+                | "round_ties_even_f32"
+                | "round_ties_even_f64"
+                | "roundf32"
+                | "roundf64",
                 [arg],
             ) => {
                 let (value, scalar) = self.load_scalar(arg)?;
@@ -3502,12 +3645,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let single = scalar.ty == types::F32;
                 let value = match name {
                     "copysignf32" | "copysignf64" => self.builder.ins().fcopysign(l, r),
-                    "minnumf32" | "minnumf64" => {
-                        self.float_libcall(if single { "fminf" } else { "fmin" }, scalar.ty, &[l, r])?
-                    }
-                    "maxnumf32" | "maxnumf64" => {
-                        self.float_libcall(if single { "fmaxf" } else { "fmax" }, scalar.ty, &[l, r])?
-                    }
+                    "minnumf32" | "minnumf64" => self.float_libcall(
+                        if single { "fminf" } else { "fmin" },
+                        scalar.ty,
+                        &[l, r],
+                    )?,
+                    "maxnumf32" | "maxnumf64" => self.float_libcall(
+                        if single { "fmaxf" } else { "fmax" },
+                        scalar.ty,
+                        &[l, r],
+                    )?,
                     "powf32" | "powf64" => {
                         self.float_libcall(if single { "powf" } else { "pow" }, scalar.ty, &[l, r])?
                     }

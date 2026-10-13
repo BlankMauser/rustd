@@ -2726,6 +2726,7 @@ dependencies = [
  "project-model",
  "rustc-demangle",
  "rustc-hash 2.1.2",
+ "syntax",
  "vfs",
 ]
 

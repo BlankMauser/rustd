@@ -691,6 +691,16 @@ pub mod heap {
         cell.borrow_mut()[13] += 1;
         cell.borrow()[0] + cell.borrow()[13]
     }
+    pub fn hashmap() -> std::collections::HashMap<std::sync::Arc<str>, u32> {
+        std::collections::HashMap::new()
+    }
+    pub fn hashmaps(n: usize) -> Vec<std::collections::HashMap<std::sync::Arc<str>, u32>> {
+        let mut maps = vec![];
+        for _ in 0..n {
+            maps.push(std::collections::HashMap::new());
+        }
+        maps
+    }
     pub fn format(a: u32, b: &str) -> String {
         format!("{a}-{b}")
     }

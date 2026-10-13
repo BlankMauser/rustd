@@ -169,6 +169,9 @@ pub struct Evaluator<'a, 'db> {
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
     heap: Vec<u8>,
+    /// Start and size of every stack and heap allocation, in address order. A raw pointer
+    /// in a constant doesn't say how much memory it can reach, its allocation does.
+    allocations: [Vec<(usize, usize)>; 2],
     code_stack: Vec<StackFrame<'a, 'db>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
@@ -524,6 +527,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
+            allocations: Default::default(),
             code_stack: vec![],
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
@@ -1013,6 +1017,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
                 locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
+                if size != 0 {
+                    self.allocations[0].push((Stack(my_ptr).to_usize(), size));
+                }
             }
             stack_ptr - self.stack.len()
         };
@@ -1516,7 +1523,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     }
                 }
                 // The pointer keeps the function's id, like the fn pointer it came from.
-                CastKind::FnPtrToPtr => Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec()),
+                CastKind::FnPtrToPtr => {
+                    Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
+                }
             },
             Rvalue::ThreadLocalRef(n)
             | Rvalue::AddressOf(n)
@@ -2199,6 +2208,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         }
         let pos = self.heap.len();
         self.heap.extend(std::iter::repeat_n(0, size));
+        if size != 0 {
+            self.allocations[1].push((Address::Heap(pos).to_usize(), size));
+        }
         Ok(Address::Heap(pos))
     }
 
@@ -2233,6 +2245,21 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 return Err(MirEvalError::StackOverflow);
             }
             match ty.kind() {
+                TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
+                TyKind::RawPtr(..) => {
+                    let Some(addr) = bytes.get(..size_of::<usize>()) else { return Ok(()) };
+                    let addr = from_bytes!(usize, addr);
+                    let allocation = this.allocations.iter().find_map(|allocations| {
+                        let i = allocations.partition_point(|&(start, _)| start <= addr);
+                        let &(start, size) = allocations.get(i.checked_sub(1)?)?;
+                        (addr - start < size).then_some((start, size))
+                    });
+                    if let Some((start, size)) = allocation
+                        && let Ok(memory) = this.read_memory(Address::from_usize(start), size)
+                    {
+                        mm.insert(start, memory.into());
+                    }
+                }
                 TyKind::Ref(_, t, _) => {
                     let size = this.size_align_of(t, locals)?;
                     match size {

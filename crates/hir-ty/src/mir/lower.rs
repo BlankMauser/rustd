@@ -503,8 +503,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::If { condition, then_branch, else_branch } => {
                 // A literal condition, as in `if cfg!(..)`, stays a constant operand so that a
                 // backend can leave out the branch that cannot run.
-                let plain = self.has_let(*condition)
-                    || matches!(self.store[*condition], Expr::Literal(_));
+                let plain =
+                    self.has_let(*condition) || matches!(self.store[*condition], Expr::Literal(_));
                 let (discr, current) = if plain {
                     let Some(it) = self.lower_expr_to_some_operand(*condition, current)? else {
                         return Ok(None);
@@ -1750,10 +1750,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn extend_temporaries(&mut self, initializer: ExprId, pat: PatId) {
         let mut by_ref = false;
         self.store.walk_bindings_in_pat(pat, |b| {
-            by_ref |= matches!(
-                self.store[b].mode,
-                BindingAnnotation::Ref | BindingAnnotation::RefMut
-            );
+            by_ref |=
+                matches!(self.store[b].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut);
         });
         if by_ref {
             self.extend_operand(initializer);
