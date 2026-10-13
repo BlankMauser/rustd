@@ -29,6 +29,7 @@ class Fixture:
         self.ws, self.crates, self.target_args = os.path.abspath(workspace), crates, target
         self.work = tempfile.mkdtemp(prefix="rustd-diff-")
         self.run_args = []
+        self.layout_log = os.path.join(self.work, "layouts.tsv")
         if touch is None:
             meta = json.loads(subprocess.check_output(
                 ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=self.ws))
@@ -60,7 +61,8 @@ class Fixture:
             obj, report = (os.path.join(self.work, f"{crate}.{ext}") for ext in ("o", "tsv"))
             run = subprocess.run(
                 [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
-                 "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols], capture_output=True, text=True)
+                 "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols],
+                capture_output=True, text=True, env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             open(os.path.join(self.work, f"{crate}.stderr"), "w").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")
@@ -150,7 +152,7 @@ def memcheck(fx):
     return errors
 
 
-def compare(fx, name, do_bisect, do_memcheck=False):
+def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
     fx.rustc_build()
     expected = fx.behaviour(fx.reference)
     fx.rustd_build()
@@ -184,6 +186,15 @@ def compare(fx, name, do_bisect, do_memcheck=False):
         result["valgrind_errors"] = None if errors is None else len(errors)
         if errors:
             result["match"] = False
+    if do_layouts:
+        import layoutdiff
+        compared, wrong = layoutdiff.diff(fx.ws, fx.crates, fx.layout_log)
+        print(f"  layouts: {len(wrong)} of {compared} differ from rustc")
+        for name, want, have in wrong:
+            print(f"    {name}: rustc (size, align) {want}, rust-analyzer {have}")
+        result["layouts"] = {"compared": compared, "wrong": [w[0] for w in wrong]}
+        if wrong:
+            result["match"] = False
     return result
 
 
@@ -194,11 +205,12 @@ def main():
     ap.add_argument("--crate", action="append", required=True)
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--memcheck", action="store_true", help="also fail on valgrind errors when the output matches")
+    ap.add_argument("--layouts", action="store_true", help="compare type sizes and alignments with rustc's")
     ap.add_argument("--json")
     a = ap.parse_args()
 
     fx = Fixture(a.workspace, a.crate, ["-p", a.bin])
-    result = compare(fx, a.bin, a.bisect, a.memcheck)
+    result = compare(fx, a.bin, a.bisect, a.memcheck, a.layouts)
     if a.json:
         json.dump(result, open(a.json, "w"), indent=1)
     sys.exit(0 if result["match"] else 1)

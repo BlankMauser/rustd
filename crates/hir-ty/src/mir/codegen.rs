@@ -206,6 +206,22 @@ impl CodegenUnit {
                         stats.changed += 1;
                     }
                 }
+                if let (Some(path), Some(layouts)) =
+                    (std::env::var_os("RUSTD_LAYOUTS"), cg.layouts.take())
+                {
+                    let lines = layouts
+                        .into_inner()
+                        .into_iter()
+                        .map(|(ty, (size, align))| format!("{ty:?}\t{size}\t{align}\n"))
+                        .collect::<String>();
+                    // Appended: isolated builds of single functions go through here too.
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, lines.as_bytes()))
+                        .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
+                }
                 return Ok(CodegenUnit { object: cg.finish()?, compiled, skipped, instances });
             }
             rejected.extend(failed);
@@ -286,6 +302,9 @@ enum Callee<'db> {
 }
 
 struct ObjectCodegen<'a, 'db> {
+    /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` names a file
+    /// to write them to. The harness compares them with rustc's.
+    layouts: Option<std::cell::RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
@@ -337,6 +356,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             rejected,
             code,
             track: false,
+            layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             mir_time: Default::default(),
             seen: Vec::new(),
             vtables: FxHashMap::default(),
@@ -777,10 +797,15 @@ const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 
 impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
-        self.cg
+        let layout = self
+            .cg
             .db
             .layout_of_ty(ty.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))
+            .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))?;
+        if let Some(log) = &self.cg.layouts {
+            log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));
+        }
+        Ok(layout)
     }
 
     fn scalar(&self, scalar: Scalar) -> Result<AbiScalar> {
