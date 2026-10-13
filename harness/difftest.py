@@ -16,6 +16,8 @@ os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.p
 # rustc makes what only one codegen unit uses local to it unless it is told to keep unused code.
 # rustd needs the symbols: a private `static mut` has to be the one object for both compilers.
 os.environ.setdefault("RUSTFLAGS", "-C link-dead-code")
+# Incremental caches of a sweep over many crates fill the disk.
+os.environ.setdefault("CARGO_INCREMENTAL", "0")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.path.join(ROOT, "target/release/rustd")

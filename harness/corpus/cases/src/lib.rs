@@ -3648,3 +3648,31 @@ pub mod shadowed_items {
         helper() + in_function() + in_closure() + d.in_method()
     }
 }
+
+/// A `for<'a>` written in a body binds its lifetime, so `Any` can't turn `'a` into `'static`.
+pub mod hrtb_type_ids {
+    use std::any::Any;
+
+    trait AsStr<'a, 'b> {
+        fn get(&'a self) -> &'b str;
+    }
+    impl<'a> AsStr<'a, 'a> for String {
+        fn get(&'a self) -> &'a str {
+            self
+        }
+    }
+
+    fn escape(s: String) -> Option<&'static str> {
+        let a: Box<dyn Any> = Box::new(Box::new(s) as Box<dyn for<'a> AsStr<'a, 'a>>);
+        a.downcast_ref::<Box<dyn for<'a> AsStr<'a, 'static>>>().map(|x| x.get())
+    }
+
+    fn same(s: String) -> Option<usize> {
+        let a: Box<dyn Any> = Box::new(Box::new(s) as Box<dyn for<'a> AsStr<'a, 'a>>);
+        a.downcast_ref::<Box<dyn for<'b> AsStr<'b, 'b>>>().map(|x| x.get().len())
+    }
+
+    pub fn run() -> (Option<&'static str>, Option<usize>) {
+        (escape(String::from("bar")), same(String::from("bar")))
+    }
+}

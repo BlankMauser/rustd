@@ -1382,11 +1382,15 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         if let LifetimeRef::Named(lt_name) = &self.store[lifetime] {
             self.bound_vars.iter().rev().enumerate().find_map(|(debruijn, (binder, _))| {
                 binder.iter().enumerate().find_map(|(index, l)| {
+                    // A `for<'a>` binds its lifetime in a body as much as in a signature.
                     (l == lt_name).then(|| {
-                        self.hrtb_region_param(
-                            index as u32,
+                        Region::new_bound(
+                            self.interner,
                             DebruijnIndex::from_usize(debruijn),
-                            self.generic_def,
+                            BoundRegion {
+                                var: BoundVar::from_u32(index as u32),
+                                kind: BoundRegionKind::Named(self.generic_def.into()),
+                            },
                         )
                     })
                 })
