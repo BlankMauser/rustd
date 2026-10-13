@@ -957,16 +957,33 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     [lhs.ty, Ty::new_bool(self.interner())].into_iter(),
                 );
                 let op_size = self.size_of_sized(lhs.ty, locals, "operand of add_with_overflow")?;
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let (ans, u128overflow) = match name {
-                    "add_with_overflow" => lhs.overflowing_add(rhs),
-                    "sub_with_overflow" => lhs.overflowing_sub(rhs),
-                    "mul_with_overflow" => lhs.overflowing_mul(rhs),
-                    _ => unreachable!(),
+                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
+                let extend = || if signed { IsSigned::Yes } else { IsSigned::No };
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, extend()));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, extend()));
+                let (ans, is_overflow) = if signed {
+                    let (lhs, rhs) = (lhs as i128, rhs as i128);
+                    let (ans, overflow) = match name {
+                        "add_with_overflow" => lhs.overflowing_add(rhs),
+                        "sub_with_overflow" => lhs.overflowing_sub(rhs),
+                        "mul_with_overflow" => lhs.overflowing_mul(rhs),
+                        _ => unreachable!(),
+                    };
+                    // The result fits when sign-extending its low bytes gives it back.
+                    let fits = op_size == 16 || {
+                        let shift = 128 - 8 * op_size as u32;
+                        (ans << shift) >> shift == ans
+                    };
+                    (ans as u128, overflow || !fits)
+                } else {
+                    let (ans, overflow) = match name {
+                        "add_with_overflow" => lhs.overflowing_add(rhs),
+                        "sub_with_overflow" => lhs.overflowing_sub(rhs),
+                        "mul_with_overflow" => lhs.overflowing_mul(rhs),
+                        _ => unreachable!(),
+                    };
+                    (ans, overflow || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0))
                 };
-                let is_overflow = u128overflow
-                    || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0 && it != 255);
                 let is_overflow = vec![u8::from(is_overflow)];
                 let layout = self.layout(result_ty)?;
                 let result = self.construct_with_layout(

@@ -60,6 +60,7 @@ use crate::{
     utils::detect_variant_from_bytes,
 };
 
+use self::unwind::UnwindContext;
 use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
@@ -67,6 +68,7 @@ use super::{
     eval::interpret_mir, promoted_mir_body_query, return_slot,
 };
 
+mod unwind;
 mod vtable;
 
 #[derive(Debug)]
@@ -333,6 +335,7 @@ struct ObjectCodegen<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
+    unwind: UnwindContext,
     imports: FxHashMap<String, FuncId>,
     instances: FxHashMap<Instance, FuncId>,
     pending: Vec<(Instance, ParamEnvAndCrate<'db>, FuncId)>,
@@ -374,10 +377,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map_err(|e| backend(&e))?;
         let builder =
             ObjectBuilder::new(isa, "rustd", default_libcall_names()).map_err(|e| backend(&e))?;
+        let mut module = ObjectModule::new(builder);
+        let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
         Ok(ObjectCodegen {
             db,
             symbols,
-            module: ObjectModule::new(builder),
+            module,
+            unwind,
             imports: FxHashMap::default(),
             instances: FxHashMap::default(),
             pending: Vec::new(),
@@ -398,7 +404,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn finish(self) -> Result<Vec<u8>> {
-        self.module.finish().emit().map_err(|e| CodegenError::Backend(e.to_string()))
+        let mut product = self.module.finish();
+        self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
+        product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
     /// Compiles a non-generic function and exports it under its rustc symbol name.
@@ -526,7 +534,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
     /// (i128 corners, for one); that must cost us one function, not the process.
     fn emit(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
-        let (module, code) = (&mut self.module, &mut *self.code);
+        let (module, code, unwind) = (&mut self.module, &mut *self.code, &mut self.unwind);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (_, hit) = ctx
                 .compile_with_cache(module.isa(), code, &mut Default::default())
@@ -548,6 +556,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     &relocs,
                 )
                 .map_err(|e| format!("{e:?}"))?;
+            unwind.add_function(module, id, ctx)?;
             Ok::<_, String>(hit)
         }));
         match outcome {
@@ -607,6 +616,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 drop_flags: ArenaMap::new(),
                 moved_paths: Vec::new(),
                 deferred_drops: Vec::new(),
+                cleanup: None,
+                in_cleanup: false,
                 deferred_clears: Vec::new(),
                 ret_mode: PassMode::Ignore,
                 tracked,
@@ -871,6 +882,9 @@ struct FunctionCx<'cx, 'a, 'db> {
     moved_paths: Vec<MovedPath>,
     /// The block to generate each `Drop` terminator in, with its place and target.
     deferred_drops: Vec<(ir::Block, StoredPlace, ir::Block)>,
+    /// Where a call that unwinds lands, taking the exception.
+    cleanup: Option<ir::Block>,
+    in_cleanup: bool,
     deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
     /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
@@ -903,15 +917,153 @@ fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
     trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }
 
-fn is_unsized(ty: Ty<'_>) -> bool {
-    matches!(ty.kind(), TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..))
-}
-
 const PTR: Type = types::I64;
 /// Field accesses can be unaligned (packed structs, chunked copies).
 const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 
 impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
+    /// Whether pointers to `ty` carry metadata: slices, `str`, trait objects and structs
+    /// ending in one.
+    fn is_unsized(&self, ty: Ty<'db>) -> bool {
+        match ty.kind() {
+            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) => true,
+            TyKind::Adt(..) | TyKind::Tuple(_) => {
+                self.layout(ty).is_ok_and(|layout| layout.is_unsized())
+            }
+            _ => false,
+        }
+    }
+
+    /// The last field of a struct or tuple, which is the only one that can be unsized.
+    fn last_field(&self, ty: Ty<'db>) -> Result<(usize, Ty<'db>)> {
+        match ty.kind() {
+            TyKind::Tuple(tys) if !tys.is_empty() => {
+                Ok((tys.len() - 1, tys.iter().last().expect("non-empty tuple")))
+            }
+            TyKind::Adt(adt_def, subst) => {
+                let AdtId::StructId(id) = adt_def.def_id() else {
+                    unsupported!("unsized {ty:?}");
+                };
+                let field_types = self.cg.db.field_types(id.into());
+                let Some((field, field_ty)) = field_types.iter().last() else {
+                    unsupported!("unsized {ty:?} without fields");
+                };
+                let field_ty = field_ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                Ok((u32::from(field.into_raw()) as usize, self.normalize(field_ty)))
+            }
+            _ => unsupported!("unsized {ty:?}"),
+        }
+    }
+
+    /// `packed(N)` of a struct, which caps the alignment of its fields.
+    fn pack(&self, ty: Ty<'db>) -> Option<u64> {
+        let TyKind::Adt(adt_def, _) = ty.kind() else { return None };
+        let repr = hir_def::attrs::AttrFlags::repr(self.cg.db, adt_def.def_id())?;
+        repr.pack.map(|pack| pack.bytes())
+    }
+
+    /// Size and alignment of the value behind a pointer with metadata `meta`, as
+    /// `size_and_align_of_dst` in rustc's backends.
+    fn size_and_align_of_val(
+        &mut self,
+        ty: Ty<'db>,
+        meta: Option<Value>,
+    ) -> Result<(Value, Value)> {
+        let layout = self.layout(ty)?;
+        let align = layout.align.abi.bytes() as i64;
+        let meta = match meta {
+            Some(meta) if self.is_unsized(ty) => meta,
+            _ => {
+                let size = self.builder.ins().iconst(PTR, layout.size.bytes() as i64);
+                return Ok((size, self.builder.ins().iconst(PTR, align)));
+            }
+        };
+        match ty.kind() {
+            TyKind::Str => Ok((meta, self.builder.ins().iconst(PTR, 1))),
+            TyKind::Slice(elem) => {
+                let elem = self.layout(elem)?;
+                let size = self.builder.ins().imul_imm(meta, elem.size.bytes() as i64);
+                Ok((size, self.builder.ins().iconst(PTR, elem.align.abi.bytes() as i64)))
+            }
+            // Size and align are the vtable's second and third words.
+            TyKind::Dynamic(..) => Ok((
+                self.builder.ins().load(PTR, MEM, meta, 8),
+                self.builder.ins().load(PTR, MEM, meta, 16),
+            )),
+            _ => {
+                let (field, field_ty) = self.last_field(ty)?;
+                let offset = layout.fields.offset(field).bytes() as i64;
+                let (tail_size, mut tail_align) =
+                    self.size_and_align_of_val(field_ty, Some(meta))?;
+                if let Some(pack) = self.pack(ty) {
+                    let pack = self.builder.ins().iconst(PTR, pack as i64);
+                    tail_align = self.builder.ins().umin(tail_align, pack);
+                }
+                let sized_align = self.builder.ins().iconst(PTR, align);
+                let full_align = self.builder.ins().umax(tail_align, sized_align);
+                let offset = self.builder.ins().iconst(PTR, offset);
+                let offset = self.align_up(offset, tail_align);
+                let size = self.builder.ins().iadd(offset, tail_size);
+                Ok((self.align_up(size, full_align), full_align))
+            }
+        }
+    }
+
+    /// Where to drop a field of `container`: destructors take an aligned `&mut self`, so
+    /// a field a packed struct leaves misaligned is moved out first, as rustc does.
+    fn aligned_for_drop(
+        &mut self,
+        addr: Value,
+        field: Ty<'db>,
+        container: Ty<'db>,
+    ) -> Result<Value> {
+        let Some(pack) = self.pack(container) else { return Ok(addr) };
+        let field = self.normalize(field);
+        let layout = self.layout(field)?;
+        if layout.align.abi.bytes() <= pack
+            || has_drop_glue(&self.infcx, field, self.env.param_env) == DropGlue::None
+        {
+            return Ok(addr);
+        }
+        let slot = self.stack_slot(&layout);
+        self.copy(slot, addr, layout.size);
+        Ok(slot)
+    }
+
+    fn align_up(&mut self, value: Value, align: Value) -> Value {
+        let mask = self.builder.ins().iadd_imm(align, -1);
+        let value = self.builder.ins().iadd(value, mask);
+        self.builder.ins().band_not(value, mask)
+    }
+
+    /// Address of a field whose type is unsized. A trait object's alignment, and so the
+    /// field's offset, is only known from the vtable.
+    fn unsized_field_addr(
+        &mut self,
+        addr: Value,
+        meta: Option<Value>,
+        container: Ty<'db>,
+        offset: Size,
+        field_ty: Ty<'db>,
+    ) -> Result<Value> {
+        let field_ty = self.normalize(field_ty);
+        let mut tail = field_ty;
+        while matches!(tail.kind(), TyKind::Adt(..) | TyKind::Tuple(_)) && self.is_unsized(tail) {
+            tail = self.last_field(tail)?.1;
+        }
+        let (Some(meta), TyKind::Dynamic(..)) = (meta, tail.kind()) else {
+            return Ok(self.builder.ins().iadd_imm(addr, offset.bytes() as i64));
+        };
+        let (_, mut align) = self.size_and_align_of_val(field_ty, Some(meta))?;
+        if let Some(pack) = self.pack(container) {
+            let pack = self.builder.ins().iconst(PTR, pack as i64);
+            align = self.builder.ins().umin(align, pack);
+        }
+        let offset = self.builder.ins().iconst(PTR, offset.bytes() as i64);
+        let offset = self.align_up(offset, align);
+        Ok(self.builder.ins().iadd(addr, offset))
+    }
+
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
         let layout = self
             .cg
@@ -1495,7 +1647,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.builder.switch_to_block(block);
             self.drop_place(&place, target)?;
         }
-        Ok(())
+        self.emit_cleanup()
     }
 
     /// The fields a place selects in its local, if it is nothing but fields of structs, tuples
@@ -1522,7 +1674,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 (proj, ty.ty.kind())
             {
                 let len = crate::consteval::try_const_usize(self.cg.db, len)? as u64;
-                let index = if from_end { len.checked_sub(offset)? } else { offset };
+                // Offset 0 from the end is the last element.
+                let index = if from_end { len.checked_sub(offset + 1)? } else { offset };
                 path.push(u32::try_from(index).ok().filter(|&it| it < VARIANT_FIELDS)?);
                 ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
                 continue;
@@ -1651,15 +1804,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 TyKind::Adt(adt_def, subst) if adt_def.is_box() => {
                     let pointee = subst.type_at(0);
                     let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
-                    let pointee_meta =
-                        is_unsized(pointee).then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                    let pointee_meta = self
+                        .is_unsized(pointee)
+                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
                     path.push(BOX_CONTENTS);
                     self.drop_unmoved(pointer, pointee_meta, pointee, local, path, state)?;
                     path.pop();
                     self.call_drop_impl(addr, ty)?;
                     if let AdtId::StructId(id) = adt_def.def_id() {
                         let layout = self.layout(ty)?;
-                        self.drop_fields(addr, &layout, id.into(), subst)?;
+                        self.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
                     }
                     self.builder.ins().jump(done, &[]);
                     self.builder.switch_to_block(done);
@@ -1771,6 +1925,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             for (i, field) in fields {
                 let offset = layout.fields.offset(i).bytes() as i64;
                 let field_addr = self.builder.ins().iadd_imm(addr, offset);
+                let field_addr = self.aligned_for_drop(field_addr, field, ty)?;
                 path.push(i as u32);
                 self.drop_unmoved(field_addr, None, field, local, path, state)?;
                 path.pop();
@@ -1852,7 +2007,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                                 .offset(field.0 as usize)
                         }
                     };
-                    addr = self.builder.ins().iadd_imm(addr, offset.bytes() as i64);
+                    addr = self.unsized_field_addr(addr, meta, prev.ty, offset, ty.ty)?;
                 }
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
@@ -1941,7 +2096,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         sig.params.extend([AbiParam::new(PTR); 3]);
         let callee = self.cg.import(&symbol, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        self.builder.ins().call(callee, &[index, len, location]);
+        self.invoke(callee, &[index, len, location]);
         self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
 
         self.builder.switch_to_block(ok_block);
@@ -2973,8 +3128,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         sig.returns.push(AbiParam::new(ty));
         let callee = self.cg.import(name, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        let call = self.builder.ins().call(callee, args);
-        Ok(self.builder.inst_results(call)[0])
+        Ok(self.invoke(callee, args)[0])
     }
 
     /// `as` between a float and an integer or another float.
@@ -3058,7 +3212,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.import(&symbol, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        self.builder.ins().call(callee, &[location]);
+        self.invoke(callee, &[location]);
         self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
 
         self.builder.switch_to_block(ok_block);
@@ -3082,8 +3236,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
             range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
         }
-        let FileRange { file_id, range } =
-            InFile::new(source.file_id, range).original_node_file_range_rooted(db);
+        // What a macro writes itself is reported from where the outermost macro is called;
+        // what it is passed keeps its own place.
+        let own_tokens = source.file_id.macro_file().is_some()
+            && !source
+                .file_id
+                .span_map(db)
+                .span_for_range(TextRange::empty(range.start()))
+                .ctx
+                .is_root();
+        let FileRange { file_id, range } = match source.file_id.original_call_node(db) {
+            Some(call) if own_tokens => {
+                FileRange { file_id: call.file_id, range: call.value.text_range() }
+            }
+            _ => InFile::new(source.file_id, range).original_node_file_range_rooted(db),
+        };
         let file_id = file_id.file_id(db);
         let text = db.file_text(file_id).text(db);
         let before = text.get(..usize::from(range.start()))?;
@@ -3231,7 +3398,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let ty = generic_args.type_at(0);
             let (src, _) = self.operand(pointer)?;
             let addr = self.builder.ins().load(PTR, MEM, src, 0);
-            let meta = is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+            let meta = self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
             self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
@@ -3512,20 +3679,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 };
                 Ok(self.builder.ins().iconst(PTR, len as i64))
             }
-            (TyKind::Dynamic(from_bounds, _), TyKind::Dynamic(to_bounds, _)) => {
+            (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
                 let Some(vtable) = old else {
                     unsupported!("upcast of a thin pointer");
                 };
-                let (source, target) =
-                    (from_bounds.principal_def_id(), to_bounds.principal_def_id());
-                let Some(target) = target.filter(|_| source != target) else {
-                    // Dropping auto traits or the principal: every vtable has the header.
+                let (Some(trait_ref), Some(target)) =
+                    (self.principal(from, from), self.principal(to, from))
+                else {
+                    // Dropping the principal: every vtable has the header.
                     return Ok(vtable);
                 };
-                let Some(trait_ref) = self.principal(from, from) else {
-                    unsupported!("upcast of {from:?}");
-                };
-                match VtableLayout::of(self.interner, trait_ref).upcast(target.0) {
+                if trait_ref == target {
+                    // Only auto traits or lifetimes change.
+                    return Ok(vtable);
+                }
+                match VtableLayout::of(self.interner, trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
                     Some(Upcast::Load(slot)) => {
                         Ok(self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8))
@@ -3534,7 +3702,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
             }
             (_, TyKind::Dynamic(..)) => {
-                if is_unsized(from) {
+                if self.is_unsized(from) {
                     unsupported!("unsizing {from:?} to {to:?}");
                 }
                 let trait_ref = self.principal(to, from);
@@ -3745,8 +3913,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let callee =
             self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        let call = self.builder.ins().call(callee, &params);
-        let results = self.builder.inst_results(call).to_vec();
+        let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
         Ok(())
     }
@@ -3776,8 +3943,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let callee =
             self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        let call = self.builder.ins().call(callee, &params);
-        let results = self.builder.inst_results(call).to_vec();
+        let results = self.invoke(callee, &params);
         self.drop_value(closure, None, ty)?;
         self.builder.ins().return_(&results);
         Ok(())
@@ -3841,18 +4007,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             sig.params.push(AbiParam::new(PTR));
             values.push(self.caller_location()?);
         }
-        let call = match callee {
+        let results = match callee {
             Callee::Instance(def, generic_args) => {
                 let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
                 let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-                self.builder.ins().call(callee, &values)
+                self.invoke(callee, &values)
             }
             Callee::Pointer(pointer, _) => {
                 let sig = self.builder.import_signature(sig);
-                self.builder.ins().call_indirect(sig, pointer, &values)
+                self.invoke_indirect(sig, pointer, &values)
             }
         };
-        let results = self.builder.inst_results(call).to_vec();
         self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
     }
@@ -4378,47 +4543,55 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let value = self.builder.ins().load(PTR, MEM, vtable, offset);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            ("size_of_val", [arg]) => {
+            ("size_of_val" | "align_of_val", [arg]) => {
                 let (src, _) = self.operand(arg)?;
                 let ty = generic_args.type_at(0);
-                let value = match ty.kind() {
-                    TyKind::Str => self.builder.ins().load(PTR, MEM, src, 8),
-                    TyKind::Slice(elem) => {
-                        let size = self.layout(elem)?.size.bytes() as i64;
-                        let len = self.builder.ins().load(PTR, MEM, src, 8);
-                        self.builder.ins().imul_imm(len, size)
-                    }
-                    TyKind::Dynamic(..) => {
-                        // Size and align are the vtable's second and third words.
-                        let vtable = self.builder.ins().load(PTR, MEM, src, 8);
-                        self.builder.ins().load(PTR, MEM, vtable, 8)
-                    }
-                    _ => {
-                        let size = self.layout(ty)?.size.bytes() as i64;
-                        self.builder.ins().iconst(PTR, size)
-                    }
-                };
+                let meta = self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+                let (size, align) = self.size_and_align_of_val(ty, meta)?;
+                let value = if name == "size_of_val" { size } else { align };
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            ("align_of_val", [arg]) => {
-                let (src, _) = self.operand(arg)?;
-                let ty = generic_args.type_at(0);
-                let value = match ty.kind() {
-                    TyKind::Dynamic(..) => {
-                        let vtable = self.builder.ins().load(PTR, MEM, src, 8);
-                        self.builder.ins().load(PTR, MEM, vtable, 16)
-                    }
-                    TyKind::Str => self.builder.ins().iconst(PTR, 1),
-                    TyKind::Slice(elem) => {
-                        let align = self.layout(elem)?.align.abi.bytes() as i64;
-                        self.builder.ins().iconst(PTR, align)
-                    }
-                    _ => {
-                        let align = self.layout(ty)?.align.abi.bytes() as i64;
-                        self.builder.ins().iconst(PTR, align)
-                    }
-                };
-                self.builder.ins().store(MEM, value, dst, 0);
+            ("catch_unwind", [try_fn, data, catch_fn]) => {
+                let (try_fn, _) = self.load_scalar(try_fn)?;
+                let (data, _) = self.load_scalar(data)?;
+                let (catch_fn, _) = self.load_scalar(catch_fn)?;
+                let mut sig = self.cg.module.make_signature();
+                sig.params.push(AbiParam::new(PTR));
+                let try_sig = self.builder.import_signature(sig.clone());
+                sig.params.push(AbiParam::new(PTR));
+                let catch_sig = self.builder.import_signature(sig);
+
+                let returned = self.builder.create_block();
+                let caught = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.append_block_param(caught, PTR);
+                self.builder.append_block_param(done, types::I32);
+                let normal = self.builder.func.dfg.block_call(returned, &[]);
+                let unwound =
+                    self.builder.func.dfg.block_call(caught, &[ir::BlockArg::TryCallExn(0)]);
+                let tag = ir::ExceptionTag::with_number(unwind::CATCH).expect("a small tag");
+                let table =
+                    self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
+                        try_sig,
+                        normal,
+                        [ir::ExceptionTableItem::Tag(tag, unwound)],
+                    ));
+                self.builder.ins().try_call_indirect(try_fn, &[data], table);
+
+                self.builder.switch_to_block(returned);
+                let zero = self.builder.ins().iconst(types::I32, 0);
+                self.builder.ins().jump(done, &[zero.into()]);
+
+                self.builder.switch_to_block(caught);
+                self.builder.set_cold_block(caught);
+                let exception = self.builder.block_params(caught)[0];
+                self.invoke_indirect(catch_sig, catch_fn, &[data, exception]);
+                let one = self.builder.ins().iconst(types::I32, 1);
+                self.builder.ins().jump(done, &[one.into()]);
+
+                self.builder.switch_to_block(done);
+                let result = self.builder.block_params(done)[0];
+                self.builder.ins().store(MEM, result, dst, 0);
             }
             ("caller_location", []) => {
                 let value = self.caller_location()?;
@@ -4485,8 +4658,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let callee = self.cg.import(name, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
         let overflow = self.scratch();
-        let call = self.builder.ins().call(callee, &[l, r, overflow]);
-        let value = self.builder.inst_results(call)[0];
+        let value = self.invoke(callee, &[l, r, overflow])[0];
         let overflow = self.builder.ins().load(types::I32, MEM, overflow, 0);
         let overflow = self.builder.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
         Ok((value, overflow))
@@ -4537,6 +4709,96 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
     }
 
+    /// Calls a function that may unwind. When this function has values to drop, the call gets a
+    /// landing pad that drops them and resumes unwinding.
+    fn invoke(&mut self, callee: ir::FuncRef, args: &[Value]) -> Vec<Value> {
+        let Some(sig) = self.landing_pad_for_call() else {
+            let call = self.builder.ins().call(callee, args);
+            return self.builder.inst_results(call).to_vec();
+        };
+        let _ = sig;
+        let sig = self.builder.func.dfg.ext_funcs[callee].signature;
+        let (table, after) = self.exception_table(sig);
+        self.builder.ins().try_call(callee, args, table);
+        self.builder.switch_to_block(after);
+        self.builder.block_params(after).to_vec()
+    }
+
+    fn invoke_indirect(&mut self, sig: ir::SigRef, pointer: Value, args: &[Value]) -> Vec<Value> {
+        if self.landing_pad_for_call().is_none() {
+            let call = self.builder.ins().call_indirect(sig, pointer, args);
+            return self.builder.inst_results(call).to_vec();
+        }
+        let (table, after) = self.exception_table(sig);
+        self.builder.ins().try_call_indirect(pointer, args, table);
+        self.builder.switch_to_block(after);
+        self.builder.block_params(after).to_vec()
+    }
+
+    /// The block that cleans up after a call that unwinds, if there is anything to clean up.
+    fn landing_pad_for_call(&mut self) -> Option<ir::Block> {
+        if self.in_cleanup || self.drop_flags.iter().next().is_none() {
+            return None;
+        }
+        if self.cleanup.is_none() {
+            let block = self.builder.create_block();
+            self.builder.append_block_param(block, PTR);
+            self.builder.set_cold_block(block);
+            self.cleanup = Some(block);
+        }
+        self.cleanup
+    }
+
+    fn exception_table(&mut self, sig: ir::SigRef) -> (ir::ExceptionTable, ir::Block) {
+        let cleanup = self.cleanup.expect("a call with a landing pad has a cleanup block");
+        let after = self.builder.create_block();
+        let returns: Vec<_> =
+            self.builder.func.dfg.signatures[sig].returns.iter().map(|it| it.value_type).collect();
+        let mut results = Vec::new();
+        for (i, &ty) in returns.iter().enumerate() {
+            self.builder.append_block_param(after, ty);
+            results.push(ir::BlockArg::TryCallRet(i as u32));
+        }
+        let normal = self.builder.func.dfg.block_call(after, &results);
+        let unwound = self.builder.func.dfg.block_call(cleanup, &[ir::BlockArg::TryCallExn(0)]);
+        let tag = ir::ExceptionTag::with_number(unwind::CLEANUP).expect("a small tag");
+        let table = self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
+            sig,
+            normal,
+            [ir::ExceptionTableItem::Tag(tag, unwound)],
+        ));
+        (table, after)
+    }
+
+    /// Fills in the landing pad: drops every local that holds a value, last declared first, and
+    /// carries on unwinding.
+    fn emit_cleanup(&mut self) -> Result<()> {
+        let Some(cleanup) = self.cleanup else { return Ok(()) };
+        self.in_cleanup = true;
+        self.builder.switch_to_block(cleanup);
+        let exception = self.builder.block_params(cleanup)[0];
+        let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
+        locals.reverse();
+        for local in locals {
+            let next = self.builder.create_block();
+            self.builder.set_cold_block(next);
+            let place = crate::mir::Place::from(local).store();
+            self.drop_place(&place, next)?;
+            self.builder.switch_to_block(next);
+        }
+        let mut sig = self.cg.module.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        let resume = self
+            .cg
+            .module
+            .declare_function("_Unwind_Resume", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::Backend(e.to_string()))?;
+        let resume = self.cg.module.declare_func_in_func(resume, self.builder.func);
+        self.builder.ins().call(resume, &[exception]);
+        self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
+        Ok(())
+    }
+
     fn set_drop_flag(&mut self, place: &StoredPlace, live: bool) {
         if !place.projection.as_slice().is_empty() {
             if live {
@@ -4559,7 +4821,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(PTR));
         let mut values = vec![addr];
-        if is_unsized(ty) {
+        if self.is_unsized(ty) {
             let Some(meta) = meta else {
                 unsupported!("drop of unsized {ty:?} without metadata");
             };
@@ -4569,7 +4831,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         let callee = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
         let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-        self.builder.ins().call(callee, &values);
+        self.invoke(callee, &values);
         Ok(())
     }
 
@@ -4577,7 +4839,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(PTR));
-        if is_unsized(ty) {
+        if self.is_unsized(ty) {
             sig.params.push(AbiParam::new(PTR));
         }
         self.builder.func.signature = sig;
@@ -4598,8 +4860,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     // The compiler drops the pointee; `Box`'s `Drop` impl only frees the memory.
                     let pointee = subst.type_at(0);
                     let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
-                    let pointee_meta =
-                        is_unsized(pointee).then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                    let pointee_meta = self
+                        .is_unsized(pointee)
+                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
                     self.drop_value(pointer, pointee_meta, pointee)?;
                 }
                 if adt_def.destructor(self.interner).is_some() {
@@ -4613,7 +4876,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             .flags
                             .contains(StructFlags::IS_MANUALLY_DROP);
                         if !manually_drop {
-                            self.drop_fields(addr, &layout, id.into(), subst)?;
+                            self.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
                         }
                     }
                     AdtId::EnumId(id) => match &layout.variants {
@@ -4626,7 +4889,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                                 .map(|&(variant, _)| variant)
                                 .find(|variant| variant.index(db) == index.0);
                             if let Some(variant) = variant {
-                                self.drop_fields(addr, &layout, variant.into(), subst)?;
+                                self.drop_fields(addr, &layout, variant.into(), subst, ty, meta)?;
                             }
                         }
                         Variants::Multiple { variants, tag, .. } => {
@@ -4647,7 +4910,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                             for (block, variant) in arms {
                                 self.builder.switch_to_block(block);
                                 let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
-                                self.drop_fields(addr, layout, variant.into(), subst)?;
+                                self.drop_fields(addr, layout, variant.into(), subst, ty, meta)?;
                                 self.builder.ins().jump(done, &[]);
                             }
                             self.builder.switch_to_block(done);
@@ -4700,7 +4963,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let mut sig = Signature::new(CallConv::SystemV);
                 sig.params.push(AbiParam::new(PTR));
                 let sig = self.builder.import_signature(sig);
-                self.builder.ins().call_indirect(sig, glue, &[addr]);
+                self.invoke_indirect(sig, glue, &[addr]);
                 self.builder.ins().jump(done, &[]);
                 self.builder.switch_to_block(done);
             }
@@ -4715,16 +4978,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         layout: &Layout,
         variant: VariantId,
         subst: GenericArgs<'db>,
+        container: Ty<'db>,
+        meta: Option<Value>,
     ) -> Result<()> {
         let field_types = self.cg.db.field_types(variant);
         for (field, ty) in field_types.iter() {
             let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
-            if is_unsized(ty) {
-                unsupported!("drop glue for an unsized field");
+            let offset = layout.fields.offset(u32::from(field.into_raw()) as usize);
+            if self.is_unsized(self.normalize(ty)) {
+                let field_addr = self.unsized_field_addr(addr, meta, container, offset, ty)?;
+                self.drop_value(field_addr, meta, ty)?;
+            } else {
+                let field_addr = self.builder.ins().iadd_imm(addr, offset.bytes() as i64);
+                let field_addr = self.aligned_for_drop(field_addr, ty, container)?;
+                self.drop_value(field_addr, None, ty)?;
             }
-            let offset = layout.fields.offset(u32::from(field.into_raw()) as usize).bytes();
-            let field_addr = self.builder.ins().iadd_imm(addr, offset as i64);
-            self.drop_value(field_addr, None, ty)?;
         }
         Ok(())
     }

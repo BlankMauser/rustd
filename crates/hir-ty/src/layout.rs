@@ -294,7 +294,11 @@ pub fn layout_of_ty_query(
             //     return Ok(tcx.mk_layout(LayoutS::scalar(cx, data_ptr)));
             // }
 
-            let unsized_part = struct_tail_erasing_lifetimes(db, pointee);
+            // The tail can be behind an associated type, such as `A::Dyn`.
+            let normalize = |ty| {
+                infer_ctxt.at(&cause, trait_env.param_env(db)).deeply_normalize(ty).unwrap_or(ty)
+            };
+            let unsized_part = struct_tail_erasing_lifetimes(db, pointee, &normalize);
             // FIXME(next-solver)
             /*
             if let TyKind::AssociatedType(id, subst) = unsized_part.kind(Interner) {
@@ -528,7 +532,11 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
     }
 }
 
-fn struct_tail_erasing_lifetimes<'a>(db: &'a dyn HirDatabase, pointee: Ty<'a>) -> Ty<'a> {
+fn struct_tail_erasing_lifetimes<'a>(
+    db: &'a dyn HirDatabase,
+    pointee: Ty<'a>,
+    normalize: &dyn Fn(Ty<'a>) -> Ty<'a>,
+) -> Ty<'a> {
     match pointee.kind() {
         TyKind::Adt(def, args) => {
             let struct_id = match def.def_id() {
@@ -539,15 +547,15 @@ fn struct_tail_erasing_lifetimes<'a>(db: &'a dyn HirDatabase, pointee: Ty<'a>) -
             let mut it = data.fields().iter().rev();
             match it.next() {
                 Some((f, _)) => {
-                    let last_field_ty = field_ty(db, struct_id.into(), f, args);
-                    struct_tail_erasing_lifetimes(db, last_field_ty)
+                    let last_field_ty = normalize(field_ty(db, struct_id.into(), f, args));
+                    struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
                 }
                 None => pointee,
             }
         }
         TyKind::Tuple(tys) => {
             if let Some(last_field_ty) = tys.iter().next_back() {
-                struct_tail_erasing_lifetimes(db, last_field_ty)
+                struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
             } else {
                 pointee
             }

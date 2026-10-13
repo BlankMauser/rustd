@@ -6,6 +6,7 @@ usage: difftest.py <workspace> --bin <package> --crate <name> [--crate <name> ..
 Exit code 0 when stdout, stderr and exit status match. With --bisect, each rustd function is
 also linked in on its own to name the ones that change behaviour.
 """
+import re
 import argparse, glob, json, os, shlex, subprocess, sys, tempfile
 
 # rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
@@ -91,7 +92,9 @@ class Fixture:
     def behaviour(self, binary):
         try:
             run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=120)
-            return run.returncode, self.normalize(run.stdout), run.stderr
+            # The thread id in a panic message differs from run to run.
+            stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
+            return run.returncode, self.normalize(run.stdout), stderr
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""
 
@@ -176,6 +179,9 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False):
             "compiled": n, "roots": total - no_symbol, "not_roots": no_symbol,
             "instances": int(rows[0][2]), "codegen_ms": int(rows[0][4]) / 1000, "skipped": reasons}
         print(f"{crate}: {n}/{total - no_symbol} functions from rustd")
+        for r in rows:
+            if r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function":
+                print(f"  skipped {r[1]}: {r[2][:200]}")
     print("MATCH" if ok else "MISMATCH")
     if not ok:
         got = fx.behaviour(fx.binary)

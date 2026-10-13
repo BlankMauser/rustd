@@ -13,10 +13,13 @@ import argparse, collections, concurrent.futures, glob, json, os, re, shlex, shu
 import difftest
 
 # Tests needing more than a plain `rustc file.rs && ./file` are left out.
-DIRECTIVE = re.compile(r"^//@(?! *run-pass\b)", re.M)
+DIRECTIVE = re.compile(
+    r"^//@(?! *(run-pass|needs-unwind|needs-threads|check-run-results|reference|edition|only-linux|only-x86_64|only-unix"
+    r"|only-64bit|ignore-backends|ignore-(?!linux|x86_64|unix|64bit|test|pass)[\w-]+)\b)", re.M)
+EDITION = re.compile(r"^//@ *edition: *(\d+)", re.M)
 UNSUITABLE = re.compile(
     r"^\s*(pub )?mod \w+;|extern crate|include(_str|_bytes)?!|env::args|process::|#!\[no_std\]|#!\[no_main\]"
-    r"|#!\[crate_type|proc_macro|catch_unwind|#\[path", re.M)
+    r"|#!\[crate_type|proc_macro|#\[path", re.M)
 MAIN = re.compile(r"^(pub )?fn main\(\)", re.M)
 
 
@@ -42,9 +45,12 @@ def run_chunk(index, paths, root, base):
     names = {f"t{index}_{i}": path for i, path in enumerate(paths)}
     for name, path in names.items():
         os.makedirs(f"{ws}/crates/{name}/src")
+        text = open(path).read()
+        edition = EDITION.search(text)
+        edition = edition.group(1) if edition else "2015"
         open(f"{ws}/crates/{name}/Cargo.toml", "w").write(
-            f'[package]\nname = "{name}"\nversion = "0.0.0"\nedition = "2015"\n')
-        open(f"{ws}/crates/{name}/src/lib.rs", "w").write(MAIN.sub("pub fn main()", open(path).read(), count=1))
+            f'[package]\nname = "{name}"\nversion = "0.0.0"\nedition = "{edition}"\n')
+        open(f"{ws}/crates/{name}/src/lib.rs", "w").write(MAIN.sub("pub fn main()", text, count=1))
         open(f"{ws}/crates/{name}/src/main.rs", "w").write(f"fn main() {{\n    {name}::main()\n}}\n")
     open(f"{ws}/Cargo.toml", "w").write(
         '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[profile.dev]\ndebug = false\n')
@@ -128,7 +134,8 @@ def run_chunk(index, paths, root, base):
         def behaviour(binary):
             try:
                 run = subprocess.run([binary], capture_output=True, timeout=10, cwd=work)
-                return run.returncode, run.stdout, run.stderr
+                # The thread id in a panic message differs from run to run.
+                return run.returncode, run.stdout, re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
             except subprocess.TimeoutExpired:
                 return "timeout", b"", b""
         expected, got = behaviour(reference), behaviour(binary)

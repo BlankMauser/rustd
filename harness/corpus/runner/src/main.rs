@@ -179,5 +179,11 @@ fn main() {
     println!("const_pointers {:?}", cases::const_pointers::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
+    println!("unsized_tail {:?}", cases::unsized_tail::run());
+    println!("upcast_generic {:?}", cases::upcast_generic::run());
+    println!("packed_drop {:?}", cases::packed_drop::run());
+    println!("array_move {:?}", cases::array_move::run());
+    println!("const_overflow {:?}", cases::const_overflow::run());
+    println!("unwind_cleanup {:?}", cases::unwind_cleanup::run());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }

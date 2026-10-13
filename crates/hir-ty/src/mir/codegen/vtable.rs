@@ -23,7 +23,7 @@ pub(super) enum Slot<'db> {
 pub(super) struct VtableLayout<'db> {
     pub(super) slots: Vec<Slot<'db>>,
     /// The supertraits whose vtable is a prefix of this one.
-    prefixes: Vec<TraitId>,
+    prefixes: Vec<TraitRef<'db>>,
 }
 
 impl<'db> VtableLayout<'db> {
@@ -49,9 +49,9 @@ impl<'db> VtableLayout<'db> {
     }
 
     /// How a pointer to this vtable becomes one to the vtable of supertrait `target`.
-    pub(super) fn upcast(&self, target: TraitId) -> Option<Upcast> {
+    pub(super) fn upcast(&self, target: TraitRef<'db>) -> Option<Upcast> {
         let slot = self.slots.iter().position(|slot| match slot {
-            Slot::Vptr(it) => it.def_id.0 == target,
+            Slot::Vptr(it) => *it == target,
             Slot::Method(..) => false,
         });
         match slot {
@@ -73,7 +73,7 @@ struct Walk<'db> {
     interner: DbInterner<'db>,
     visited: FxHashSet<TraitRef<'db>>,
     slots: Vec<Slot<'db>>,
-    prefixes: Vec<TraitId>,
+    prefixes: Vec<TraitRef<'db>>,
     /// Set once a trait with methods has been laid out: every later supertrait is no longer
     /// at the start of the vtable and needs a pointer to its own.
     emit_vptr: bool,
@@ -99,7 +99,7 @@ impl<'db> Walk<'db> {
         self.emit_vptr |= has_methods;
         self.slots.extend(methods.into_iter().map(|func| Slot::Method(func, trait_ref)));
         if !vptr {
-            self.prefixes.push(trait_ref.def_id.0);
+            self.prefixes.push(trait_ref);
         } else if has_methods {
             // rustc gives a supertrait without methods no slot.
             self.slots.push(Slot::Vptr(trait_ref));

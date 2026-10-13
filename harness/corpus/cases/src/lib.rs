@@ -1358,3 +1358,213 @@ pub mod pattern_alternatives {
         (a, middle, d, e)
     }
 }
+
+pub mod unsized_tail {
+    use std::cell::Cell;
+    use std::mem::{align_of_val, size_of_val};
+
+    pub trait Get {
+        fn get(&self) -> u64;
+    }
+    impl Get for u64 {
+        fn get(&self) -> u64 {
+            *self
+        }
+    }
+    impl Get for u8 {
+        fn get(&self) -> u64 {
+            *self as u64
+        }
+    }
+    struct Noisy<'a>(u8, &'a Cell<u32>);
+    impl Get for Noisy<'_> {
+        fn get(&self) -> u64 {
+            self.0 as u64
+        }
+    }
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.1.set(self.1.get() * 10 + self.0 as u32);
+        }
+    }
+
+    struct Tail<T: ?Sized> {
+        head: u16,
+        tail: T,
+    }
+
+    #[repr(C, packed(2))]
+    struct Packed<T: ?Sized>(u8, std::mem::ManuallyDrop<T>);
+
+    /// The offset of a `dyn` field depends on the alignment in its vtable.
+    pub fn field(wide: u64, narrow: u8) -> (u64, u64, u64, usize, usize) {
+        let a: &Tail<dyn Get> = &Tail { head: 1, tail: wide };
+        let b: &Tail<dyn Get> = &Tail { head: 2, tail: narrow };
+        let nested: &Tail<Tail<dyn Get>> = &Tail { head: 3, tail: Tail { head: 4, tail: wide } };
+        (
+            a.tail.get() + a.head as u64,
+            b.tail.get() + b.head as u64,
+            nested.tail.tail.get() + nested.tail.head as u64,
+            size_of_val(a) * 100 + align_of_val(a),
+            size_of_val(b) * 100 + align_of_val(b),
+        )
+    }
+
+    pub fn packed(value: u64) -> (usize, usize, isize) {
+        let p: &Packed<dyn Get> = &Packed(0, std::mem::ManuallyDrop::new(value));
+        let offset = unsafe {
+            (&raw const p.1).cast::<u8>().offset_from(&raw const p.0)
+        };
+        (size_of_val(p), align_of_val(p), offset)
+    }
+
+    pub fn drop_tail(value: u8) -> u32 {
+        let log = Cell::new(0);
+        let boxed: Box<Tail<dyn Get + '_>> = Box::new(Tail { head: 0, tail: Noisy(value, &log) });
+        let seen = boxed.tail.get() as u32;
+        drop(boxed);
+        log.get() * 100 + seen
+    }
+
+    pub fn run() -> ((u64, u64, u64, usize, usize), (usize, usize, isize), u32) {
+        (field(11, 5), packed(7), drop_tail(3))
+    }
+}
+
+pub mod upcast_generic {
+    pub trait Named<T: Default + ToString> {
+        fn name(&self) -> String {
+            T::default().to_string()
+        }
+    }
+    pub trait Both<T: Default + ToString>: Named<i32> + Named<T> {}
+
+    struct S;
+    impl Named<i32> for S {}
+    impl Named<bool> for S {}
+    impl Both<bool> for S {}
+
+    /// Two supertraits that differ only in their arguments have separate vtables.
+    pub fn run() -> (String, String) {
+        let both: &dyn Both<bool> = &S;
+        let int = both as &dyn Named<i32>;
+        let boolean = both as &dyn Named<bool>;
+        (int.name(), boolean.name())
+    }
+}
+
+pub mod packed_drop {
+    use std::cell::Cell;
+
+    thread_local!(static ODD: Cell<u32> = const { Cell::new(0) });
+
+    struct Aligned(u16);
+    impl Drop for Aligned {
+        fn drop(&mut self) {
+            let odd = std::hint::black_box(self as *mut Aligned as usize) % 2;
+            ODD.with(|it| it.set(it.get() * 10 + odd as u32 + self.0 as u32));
+        }
+    }
+    struct Other;
+    impl Drop for Other {
+        fn drop(&mut self) {}
+    }
+    struct Pair {
+        a: Aligned,
+        b: Other,
+    }
+    #[repr(packed)]
+    struct Misalign(u8, Pair);
+    #[repr(packed)]
+    struct Whole(u8, Aligned);
+
+    /// A destructor never sees a misaligned `self`, with or without a partial move.
+    pub fn run() -> u32 {
+        let m: ([u16; 0], Misalign) = ([], Misalign(0, Pair { a: Aligned(2), b: Other }));
+        let _b = m.1.1.b;
+        let w: ([u16; 0], Whole) = ([], Whole(0, Aligned(4)));
+        drop(w);
+        drop(m.1.1.a);
+        ODD.with(|it| it.get())
+    }
+}
+
+pub mod array_move {
+    use std::cell::RefCell;
+
+    struct Loud<'a>(u32, &'a RefCell<Vec<u32>>);
+    impl Drop for Loud<'_> {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    fn take<'a>([a, ref mut b, ref rest @ .., ref c, d]: [Loud<'a>; 6]) -> u32 {
+        a.0 + b.0 + rest.len() as u32 + c.0 + d.0
+    }
+
+    /// Moving the first and last element out of an array parameter leaves the middle to drop.
+    pub fn run() -> (u32, Vec<u32>) {
+        let log = RefCell::new(Vec::new());
+        let mk = |v| Loud(v, &log);
+        let sum = take([mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)]);
+        (sum, log.into_inner())
+    }
+}
+
+/// Overflow checks on signed integers when a constant is evaluated.
+pub mod const_overflow {
+    const SUB: Option<i8> = (-127i8).checked_sub(2);
+    const ADD: Option<i8> = 127i8.checked_add(2);
+    const MUL: Option<i8> = (-127i8).checked_mul(-99);
+    const FITS: Option<i8> = (-5i8).checked_mul(3);
+    const WIDE: (i128, bool) = i128::MIN.overflowing_sub(1);
+    const UNSIGNED: (u8, bool) = 3u8.overflowing_sub(5);
+
+    pub fn run() -> (Option<i8>, Option<i8>, Option<i8>, Option<i8>, bool, (u8, bool)) {
+        (SUB, ADD, MUL, FITS, WIDE.1, UNSIGNED)
+    }
+}
+
+/// A panic unwinds through frames that own values, and each is dropped once.
+pub mod unwind_cleanup {
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+
+    struct Noisy<'a>(&'a RefCell<Vec<u32>>, u32);
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+
+    #[inline(never)]
+    fn inner(log: &RefCell<Vec<u32>>, fail: bool) -> u32 {
+        let _a = Noisy(log, 1);
+        let moved = Noisy(log, 2);
+        let _b = Noisy(log, 3);
+        drop(moved);
+        let pair = (Noisy(log, 4), Noisy(log, 5));
+        let _kept = pair.0;
+        if fail {
+            panic!("unwinding with {} values live", log.borrow().len());
+        }
+        6
+    }
+
+    #[inline(never)]
+    fn outer(log: &RefCell<Vec<u32>>, fail: bool) -> u32 {
+        let _o = Noisy(log, 10);
+        let boxed = Box::new(Noisy(log, 11));
+        let n = inner(log, fail);
+        drop(boxed);
+        n
+    }
+
+    pub fn run() -> (Vec<u32>, Vec<u32>, bool) {
+        let (ok, failed) = (RefCell::new(Vec::new()), RefCell::new(Vec::new()));
+        outer(&ok, false);
+        let caught = panic::catch_unwind(AssertUnwindSafe(|| outer(&failed, true))).is_err();
+        (ok.into_inner(), failed.into_inner(), caught)
+    }
+}
