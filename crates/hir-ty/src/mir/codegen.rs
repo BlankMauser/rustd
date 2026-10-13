@@ -43,7 +43,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, TextRange, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
 use triomphe::Arc;
 
 use crate::{
@@ -3268,6 +3268,21 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.location_of(source.file_id, range)
     }
 
+    /// The macro call an expansion comes from that is itself written out, in the source or in
+    /// what a macro was passed, and not by another macro.
+    fn written_call(&self, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
+        let db = self.cg.db;
+        let mut call = file_id.macro_file()?.loc(db).to_node(db);
+        while let Some(outer) = call.file_id.macro_file() {
+            let start = TextRange::empty(call.value.text_range().start());
+            if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
+                break;
+            }
+            call = outer.loc(db).to_node(db);
+        }
+        Some(call)
+    }
+
     fn location_of(&self, file_id: HirFileId, range: TextRange) -> Option<(String, u32, u32)> {
         let db = self.cg.db;
         let source = InFile::new(file_id, ());
@@ -3280,10 +3295,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 .span_for_range(TextRange::empty(range.start()))
                 .ctx
                 .is_root();
-        let FileRange { file_id, range } = match source.file_id.original_call_node(db) {
-            Some(call) if own_tokens => {
-                FileRange { file_id: call.file_id, range: call.value.text_range() }
-            }
+        let FileRange { file_id, range } = match self.written_call(source.file_id) {
+            Some(call) if own_tokens => InFile::new(call.file_id, call.value.text_range())
+                .original_node_file_range_rooted(db),
             _ => InFile::new(source.file_id, range).original_node_file_range_rooted(db),
         };
         let file_id = file_id.file_id(db);
@@ -3342,9 +3356,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         else {
             return Ok(None);
         };
-        let Some(site) = file_id.original_call_node(db) else { return Ok(None) };
-        let Some((file, line, col)) = self.location_of(site.file_id.into(), site.value.text_range())
-        else {
+        let Some(site) = self.written_call(file_id) else { return Ok(None) };
+        let range = InFile::new(site.file_id, site.value.text_range());
+        let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
+        let Some((file, line, col)) = self.location_of(file_id.into(), range) else {
             return Ok(None);
         };
         let number = match expander {

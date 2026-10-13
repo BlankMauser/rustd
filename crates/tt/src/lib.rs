@@ -819,6 +819,13 @@ pub fn stringify(tkns: TokenTreesView<'_>) -> String {
                 TtElement::Leaf(leaf) => text.push_str(&leaf.to_string()),
                 TtElement::Subtree(subtree, content) => {
                     let (open, close) = match subtree.delimiter.kind {
+                        // What a macro puts around an expression it was passed, which is not
+                        // in the source.
+                        DelimiterKind::Parenthesis
+                            if subtree.delimiter.open == subtree.delimiter.close =>
+                        {
+                            ("", "")
+                        }
                         DelimiterKind::Brace if content.clone().next().is_some() => ("{ ", " }"),
                         DelimiterKind::Brace => ("{", "}"),
                         DelimiterKind::Bracket => ("[", "]"),

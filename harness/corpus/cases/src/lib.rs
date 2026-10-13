@@ -1669,6 +1669,17 @@ pub mod builtin_location {
         };
     }
 
+    macro_rules! column_of {
+        ($e:expr) => {
+            ($e, column!())
+        };
+    }
+
+    /// A macro call passed to another macro is where it was written.
+    pub fn passed() -> (u32, u32) {
+        column_of!(column_of!(7).1)
+    }
+
     pub fn run() -> ((u32, u32, &'static str), (u32, u32, &'static str), u32) {
         let direct = (line!(), column!(), file!());
         let nested = here!();
@@ -1682,6 +1693,11 @@ pub mod stringify_spacing {
     macro_rules! ty {
         (<$t:ty>) => {
             stringify!($t)
+        };
+    }
+    macro_rules! expr {
+        ($e:expr) => {
+            stringify!($e)
         };
     }
     macro_rules! list {
@@ -1703,6 +1719,9 @@ pub mod stringify_spacing {
             stringify!(("Yeah",)),
             stringify!(1u8),
             stringify!(r#struct . r#fn),
+            expr!(1 + 2),
+            expr!(Point { x: 42 }),
+            expr!(&a),
         ]
     }
 }

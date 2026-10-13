@@ -191,6 +191,7 @@ fn main() {
     println!("autoref_promoted {:?}", cases::autoref_promoted::run());
     println!("boxed_fn_tuple {:?}", cases::boxed_fn_tuple::run());
     println!("builtin_location {:?}", cases::builtin_location::run());
+    println!("builtin_location passed {:?}", cases::builtin_location::passed());
     println!("stringify_spacing {:?}", cases::stringify_spacing::run());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }
