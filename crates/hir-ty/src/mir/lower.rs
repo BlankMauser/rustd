@@ -1817,9 +1817,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         match self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it) {
             [] => self.is_promotable_unadjusted(expr),
             // A function's address is a constant.
-            [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }] => {
-                is_fn && matches!(self.store[expr], Expr::Path(_))
-            }
+            [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }]
+            | [
+                Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
+                Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
+            ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
             _ => false,
         }
     }

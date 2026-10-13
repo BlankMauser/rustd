@@ -721,7 +721,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 ProjectionElem::Field(f) => {
                     let layout = self.layout(prev_ty.ty)?;
                     let variant_layout = match &layout.variants {
-                        Variants::Single { .. } | Variants::Empty => &layout,
+                        Variants::Empty => {
+                            return Err(MirEvalError::UndefinedBehavior(
+                                "field of an uninhabited type".to_owned(),
+                            ));
+                        }
+                        Variants::Single { .. } => &layout,
                         Variants::Multiple { variants, .. } => {
                             &variants[match prev_ty.variant_id {
                                 Some(hir_def::VariantId::EnumVariantId(it)) => {

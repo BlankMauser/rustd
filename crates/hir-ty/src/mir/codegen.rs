@@ -746,6 +746,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 span: MirSpan::Unknown,
                 constant_locals: Vec::new(),
                 suspended: None,
+                suspended_drop: None,
             };
             fill(&mut fx).map(|()| {
                 fx.builder.seal_all_blocks();
@@ -1195,6 +1196,8 @@ struct FunctionCx<'cx, 'a, 'db> {
     /// While compiling an `async` body: the address of the word that says where it left off,
     /// and the blocks it can be resumed in.
     suspended: Option<(Value, Vec<BasicBlockId>)>,
+    /// Where a suspended future is dropped, and where that carries on.
+    suspended_drop: Option<(ir::Block, ir::Block)>,
 }
 
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
@@ -2066,6 +2069,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
                 _ => self.drop_place(&place, target)?,
             }
+        }
+        // So is dropping a suspended future, which drops the same locals as unwinding does.
+        // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
+        if let Some((suspended, done)) = self.suspended_drop.take() {
+            self.builder.switch_to_block(suspended);
+            self.drop_live_locals()?;
+            self.builder.ins().jump(done, &[]);
         }
         self.emit_cleanup()
     }
@@ -5751,10 +5761,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.drop_value(field_addr, None, field)?;
         }
         self.builder.ins().jump(done, &[]);
-        self.builder.switch_to_block(suspended);
-        self.drop_live_locals()?;
-        self.builder.ins().jump(done, &[]);
         self.in_cleanup = false;
+        self.suspended_drop = Some((suspended, done));
         self.builder.switch_to_block(done);
         self.return_()
     }
@@ -6550,15 +6558,49 @@ fn drop_order(body: &MirBody, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -
             }
         }
     }
-    let mut order = Vec::new();
-    for &id in post_order.iter().rev() {
-        if let Some(TerminatorKind::Drop { place, .. }) =
-            body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
-            && place.projection.as_ref().as_slice().is_empty()
-            && !order.contains(&place.local)
-        {
-            order.push(place.local);
+    // `local = value` drops what the local held first, which says nothing about its scope, so
+    // those drops only count for a local that has no other.
+    let replaces = |place: &StoredPlace, target: BasicBlockId| {
+        let assigned = body.basic_blocks[target].statements.iter().find_map(|it| match &it.kind {
+            StatementKind::Assign(to, _) => Some(to),
+            _ => None,
+        });
+        assigned == Some(place)
+    };
+    let mut order: Vec<(LocalId, BasicBlockId)> = Vec::new();
+    for replaced in [false, true] {
+        for &id in post_order.iter().rev() {
+            if let Some(TerminatorKind::Drop { place, target, .. }) =
+                body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
+                && place.projection.as_ref().as_slice().is_empty()
+                && replaces(place, *target) == replaced
+                && !order.iter().any(|&(local, _)| local == place.local)
+            {
+                order.push((place.local, id));
+            }
         }
     }
-    order
+    // A drop that another one is reached from, and not the other way around, is of an outer
+    // scope. Reverse post-order alone can put the exit of a loop before its body.
+    let reached: Vec<rustc_hash::FxHashSet<BasicBlockId>> = order
+        .iter()
+        .map(|&(_, from)| {
+            let mut reached = rustc_hash::FxHashSet::default();
+            let mut pending = successors(from);
+            while let Some(id) = pending.pop() {
+                if reachable.contains(&id) && reached.insert(id) {
+                    pending.extend(successors(id));
+                }
+            }
+            reached
+        })
+        .collect();
+    let later = |at: usize| {
+        let after = |a: usize, b: usize| reached[a].contains(&order[b].1);
+        (0..order.len()).filter(|&other| after(at, other) && !after(other, at)).count()
+    };
+    let mut ranked: Vec<(usize, LocalId)> =
+        order.iter().enumerate().map(|(at, &(local, _))| (later(at), local)).collect();
+    ranked.sort_by_key(|&(later, _)| std::cmp::Reverse(later));
+    ranked.into_iter().map(|(_, local)| local).collect()
 }

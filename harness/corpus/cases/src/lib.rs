@@ -2517,3 +2517,89 @@ pub mod unwind_drops {
         logs
     }
 }
+
+pub mod async_drops {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    type Log = Rc<RefCell<Vec<u32>>>;
+
+    struct Noisy(u32, Log, u32);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+            if self.0 == self.2 {
+                panic!("drop of {}", self.0);
+            }
+        }
+    }
+
+    struct Pair(Noisy, Noisy);
+
+    struct Yield(bool);
+
+    impl Future for Yield {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if std::mem::replace(&mut self.0, true) { Poll::Ready(()) } else { Poll::Pending }
+        }
+    }
+
+    // The safe `drop` is coerced to an unsafe function pointer in a promoted constant.
+    fn raw_waker(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &RawWakerVTable::new(raw_waker, drop, drop, drop))
+    }
+
+    async fn moves(log: Log, first: bool, second: bool, fails: u32) {
+        for i in 0..2u32 {
+            let x;
+            let y;
+            if (first && i == 0) || (second && i == 1) {
+                let at = i * 10;
+                x = (
+                    Noisy(at + 1, log.clone(), fails),
+                    Noisy(at + 2, log.clone(), fails),
+                    Noisy(at + 3, log.clone(), fails),
+                );
+                Yield(false).await;
+                y = Pair(Noisy(at + 4, log.clone(), fails), Noisy(at + 5, log.clone(), fails));
+                drop(x.1);
+                Yield(false).await;
+                drop(y.0);
+                Yield(false).await;
+            }
+        }
+    }
+
+    pub fn run() -> Vec<String> {
+        let waker = unsafe { Waker::from_raw(raw_waker(std::ptr::null())) };
+        let cloned = waker.clone();
+        let cx = &mut Context::from_waker(&cloned);
+        let mut out = Vec::new();
+        for (first, second) in [(true, false), (false, true), (true, true)] {
+            for fails in [0, 3, 5, 12, 14] {
+                for polls in 0..8 {
+                    let log = Log::default();
+                    let panicked = catch_unwind(AssertUnwindSafe(|| {
+                        let mut future = Box::pin(moves(log.clone(), first, second, fails));
+                        for _ in 0..polls {
+                            if future.as_mut().poll(cx).is_ready() {
+                                break;
+                            }
+                        }
+                    }))
+                    .is_err();
+                    let log = log.borrow();
+                    out.push(format!("{first} {second} {fails} {polls} {panicked} {log:?}"));
+                }
+            }
+        }
+        out
+    }
+}
