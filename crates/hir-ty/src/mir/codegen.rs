@@ -617,6 +617,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 moved_paths: Vec::new(),
                 deferred_drops: Vec::new(),
                 cleanup: None,
+                inner_pad: None,
+                drop_order: Vec::new(),
                 in_cleanup: false,
                 deferred_clears: Vec::new(),
                 ret_mode: PassMode::Ignore,
@@ -884,6 +886,10 @@ struct FunctionCx<'cx, 'a, 'db> {
     deferred_drops: Vec<(ir::Block, StoredPlace, ir::Block)>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
+    /// A landing pad that takes over from `cleanup` for the calls made while it is set.
+    inner_pad: Option<ir::Block>,
+    /// The locals the body drops, in the order it gets to dropping them.
+    drop_order: Vec<LocalId>,
     in_cleanup: bool,
     deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
@@ -1609,6 +1615,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 _ => (),
             }
         }
+        self.drop_order = drop_order(body, &reachable);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -3236,6 +3243,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
             range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
         }
+        if source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
+            // An index is reported from its bracket on.
+            let root = source.file_id.parse_or_expand(db);
+            let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
+            range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
+        }
         // What a macro writes itself is reported from where the outermost macro is called;
         // what it is passed keeps its own place.
         let own_tokens = source.file_id.macro_file().is_some()
@@ -4712,24 +4725,23 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     /// Calls a function that may unwind. When this function has values to drop, the call gets a
     /// landing pad that drops them and resumes unwinding.
     fn invoke(&mut self, callee: ir::FuncRef, args: &[Value]) -> Vec<Value> {
-        let Some(sig) = self.landing_pad_for_call() else {
+        let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call(callee, args);
             return self.builder.inst_results(call).to_vec();
         };
-        let _ = sig;
         let sig = self.builder.func.dfg.ext_funcs[callee].signature;
-        let (table, after) = self.exception_table(sig);
+        let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call(callee, args, table);
         self.builder.switch_to_block(after);
         self.builder.block_params(after).to_vec()
     }
 
     fn invoke_indirect(&mut self, sig: ir::SigRef, pointer: Value, args: &[Value]) -> Vec<Value> {
-        if self.landing_pad_for_call().is_none() {
+        let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call_indirect(sig, pointer, args);
             return self.builder.inst_results(call).to_vec();
-        }
-        let (table, after) = self.exception_table(sig);
+        };
+        let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call_indirect(pointer, args, table);
         self.builder.switch_to_block(after);
         self.builder.block_params(after).to_vec()
@@ -4737,7 +4749,13 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// The block that cleans up after a call that unwinds, if there is anything to clean up.
     fn landing_pad_for_call(&mut self) -> Option<ir::Block> {
-        if self.in_cleanup || self.drop_flags.iter().next().is_none() {
+        if self.in_cleanup {
+            return None;
+        }
+        if self.inner_pad.is_some() {
+            return self.inner_pad;
+        }
+        if self.drop_flags.iter().next().is_none() {
             return None;
         }
         if self.cleanup.is_none() {
@@ -4749,8 +4767,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.cleanup
     }
 
-    fn exception_table(&mut self, sig: ir::SigRef) -> (ir::ExceptionTable, ir::Block) {
-        let cleanup = self.cleanup.expect("a call with a landing pad has a cleanup block");
+    fn exception_table(
+        &mut self,
+        sig: ir::SigRef,
+        cleanup: ir::Block,
+    ) -> (ir::ExceptionTable, ir::Block) {
         let after = self.builder.create_block();
         let returns: Vec<_> =
             self.builder.func.dfg.signatures[sig].returns.iter().map(|it| it.value_type).collect();
@@ -4777,8 +4798,14 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
+        // Locals the body never drops come first, last declared first. The rest go in the
+        // order the body drops them when nothing unwinds, which is innermost scope first.
         let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
         locals.reverse();
+        let rank = |local: &LocalId| {
+            self.drop_order.iter().position(|it| it == local).map_or(0, |at| at + 1)
+        };
+        locals.sort_by_key(rank);
         for local in locals {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
@@ -4786,6 +4813,10 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
+        self.resume_unwinding(exception)
+    }
+
+    fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
         let mut sig = self.cg.module.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let resume = self
@@ -4796,6 +4827,44 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let resume = self.cg.module.declare_func_in_func(resume, self.builder.func);
         self.builder.ins().call(resume, &[exception]);
         self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
+        Ok(())
+    }
+
+    /// Runs a type's `Drop` impl. If that unwinds the fields are dropped all the same, on the
+    /// way out.
+    fn call_drop_impl_guarded(
+        &mut self,
+        addr: Value,
+        meta: Option<Value>,
+        ty: Ty<'db>,
+    ) -> Result<()> {
+        if self.in_cleanup {
+            return self.call_drop_impl(addr, ty);
+        }
+        let outer = self.landing_pad_for_call();
+        let pad = self.builder.create_block();
+        self.builder.append_block_param(pad, PTR);
+        self.builder.set_cold_block(pad);
+        let enclosing = self.inner_pad.replace(pad);
+        let called = self.call_drop_impl(addr, ty);
+        self.inner_pad = enclosing;
+        called?;
+        let Some(after) = self.builder.current_block() else {
+            unsupported!("drop impl call without a block to return to");
+        };
+        self.builder.switch_to_block(pad);
+        let exception = self.builder.block_params(pad)[0];
+        self.in_cleanup = true;
+        let dropped = self.drop_adt_fields(addr, meta, ty);
+        self.in_cleanup = false;
+        dropped?;
+        match outer {
+            Some(outer) => {
+                self.builder.ins().jump(outer, &[exception.into()]);
+            }
+            None => self.resume_unwinding(exception)?,
+        }
+        self.builder.switch_to_block(after);
         Ok(())
     }
 
@@ -4852,22 +4921,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         Ok(())
     }
 
-    fn drop_contents(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
+    /// Drops the fields of a struct or of the variant an enum is in.
+    fn drop_adt_fields(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let db = self.cg.db;
-        match ty.kind() {
-            TyKind::Adt(adt_def, subst) => {
-                if adt_def.is_box() {
-                    // The compiler drops the pointee; `Box`'s `Drop` impl only frees the memory.
-                    let pointee = subst.type_at(0);
-                    let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
-                    let pointee_meta = self
-                        .is_unsized(pointee)
-                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
-                    self.drop_value(pointer, pointee_meta, pointee)?;
-                }
-                if adt_def.destructor(self.interner).is_some() {
-                    self.call_drop_impl(addr, ty)?;
-                }
+        let TyKind::Adt(adt_def, subst) = ty.kind() else { return Ok(()) };
+        {
+            {
                 let layout = self.layout(ty)?;
                 match adt_def.def_id() {
                     AdtId::UnionId(_) => (),
@@ -4917,6 +4976,28 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         }
                     },
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_contents(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
+        let db = self.cg.db;
+        match ty.kind() {
+            TyKind::Adt(adt_def, subst) => {
+                if adt_def.is_box() {
+                    // The compiler drops the pointee; `Box`'s `Drop` impl only frees the memory.
+                    let pointee = subst.type_at(0);
+                    let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
+                    let pointee_meta = self
+                        .is_unsized(pointee)
+                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                    self.drop_value(pointer, pointee_meta, pointee)?;
+                }
+                if adt_def.destructor(self.interner).is_some() {
+                    self.call_drop_impl_guarded(addr, meta, ty)?;
+                }
+                self.drop_adt_fields(addr, meta, ty)?;
             }
             TyKind::Tuple(tys) => {
                 let layout = self.layout(ty)?;
@@ -5075,4 +5156,51 @@ fn dump_mir(body: &MirBody<'_>) {
             eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
         }
     }
+}
+
+/// The locals a body drops whole, in the order of the blocks that drop them when each block
+/// comes after the blocks leading to it.
+fn drop_order(body: &MirBody, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
+    let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
+        match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
+            Some(
+                TerminatorKind::Goto { target }
+                | TerminatorKind::Drop { target, .. }
+                | TerminatorKind::DropAndReplace { target, .. }
+                | TerminatorKind::Assert { target, .. }
+                | TerminatorKind::FalseEdge { real_target: target, .. }
+                | TerminatorKind::FalseUnwind { real_target: target, .. },
+            ) => vec![*target],
+            Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut post_order = Vec::new();
+    let mut stack = vec![(body.start_block, successors(body.start_block))];
+    seen.insert(body.start_block);
+    while let Some((id, pending)) = stack.last_mut() {
+        match pending.pop() {
+            Some(next) if reachable.contains(&next) && seen.insert(next) => {
+                stack.push((next, successors(next)));
+            }
+            Some(_) => (),
+            None => {
+                post_order.push(*id);
+                stack.pop();
+            }
+        }
+    }
+    let mut order = Vec::new();
+    for &id in post_order.iter().rev() {
+        if let Some(TerminatorKind::Drop { place, .. }) =
+            body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
+            && place.projection.as_ref().as_slice().is_empty()
+            && !order.contains(&place.local)
+        {
+            order.push(place.local);
+        }
+    }
+    order
 }

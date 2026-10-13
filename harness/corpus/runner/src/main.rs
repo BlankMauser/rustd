@@ -184,6 +184,8 @@ fn main() {
     println!("packed_drop {:?}", cases::packed_drop::run());
     println!("array_move {:?}", cases::array_move::run());
     println!("const_overflow {:?}", cases::const_overflow::run());
+    println!("const_overflow more {:?}", cases::const_overflow::more());
     println!("unwind_cleanup {:?}", cases::unwind_cleanup::run());
+    println!("failing_drop {:?}", cases::unwind_cleanup::failing_drop());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }

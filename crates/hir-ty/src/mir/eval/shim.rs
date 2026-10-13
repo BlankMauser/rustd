@@ -827,20 +827,28 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "saturating_add args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = match name {
-                    "saturating_add" => lhs.saturating_add(rhs),
-                    "saturating_sub" => lhs.saturating_sub(rhs),
-                    _ => unreachable!(),
+                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
+                let bits = destination.size as u32 * 8;
+                let ans = if signed {
+                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
+                    let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
+                    let ans = match name {
+                        "saturating_add" => lhs.saturating_add(rhs),
+                        "saturating_sub" => lhs.saturating_sub(rhs),
+                        _ => unreachable!(),
+                    };
+                    let max = i128::MAX >> (128 - bits);
+                    ans.clamp(-max - 1, max) as u128
+                } else {
+                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                    let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
+                    let ans = match name {
+                        "saturating_add" => lhs.saturating_add(rhs),
+                        "saturating_sub" => lhs.saturating_sub(rhs),
+                        _ => unreachable!(),
+                    };
+                    ans.min(u128::MAX >> (128 - bits))
                 };
-                let bits = destination.size * 8;
-                // FIXME: signed
-                let is_signed = false;
-                let mx: u128 = if is_signed { (1 << (bits - 1)) - 1 } else { (1 << bits) - 1 };
-                // FIXME: signed
-                let mn: u128 = 0;
-                let ans = cmp::min(mx, cmp::max(mn, ans));
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
             "wrapping_add" | "unchecked_add" => {
@@ -913,9 +921,15 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "unchecked_shr args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
                 let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = lhs.wrapping_shr(rhs as u32);
+                let ans = if signed {
+                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
+                    lhs.wrapping_shr(rhs as u32) as u128
+                } else {
+                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                    lhs.wrapping_shr(rhs as u32)
+                };
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
             "unchecked_rem" => {
@@ -925,9 +939,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "unchecked_rem args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = lhs.checked_rem(rhs).ok_or_else(|| {
+                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
+                let ans = if signed {
+                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
+                    let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
+                    lhs.checked_rem(rhs).map(|it| it as u128)
+                } else {
+                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                    let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
+                    lhs.checked_rem(rhs)
+                };
+                let ans = ans.ok_or_else(|| {
                     MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
                 })?;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
@@ -939,9 +961,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "unchecked_div args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = lhs.checked_div(rhs).ok_or_else(|| {
+                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
+                let ans = if signed {
+                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
+                    let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
+                    lhs.checked_div(rhs).map(|it| it as u128)
+                } else {
+                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                    let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
+                    lhs.checked_div(rhs)
+                };
+                let ans = ans.ok_or_else(|| {
                     MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
                 })?;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])

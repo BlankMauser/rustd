@@ -1520,9 +1520,22 @@ pub mod const_overflow {
     const FITS: Option<i8> = (-5i8).checked_mul(3);
     const WIDE: (i128, bool) = i128::MIN.overflowing_sub(1);
     const UNSIGNED: (u8, bool) = 3u8.overflowing_sub(5);
+    const DIV: Option<i8> = (i8::MIN + 1).checked_div(-1);
+    const REM: Option<i8> = (-7i8).checked_rem(2);
+    const SHR: i8 = (-64i8) >> 3;
+    const SATURATED: (i8, i8, u128, u8) = (
+        100i8.saturating_add(100),
+        (-100i8).saturating_sub(100),
+        u128::MAX.saturating_add(1),
+        3u8.saturating_sub(5),
+    );
 
     pub fn run() -> (Option<i8>, Option<i8>, Option<i8>, Option<i8>, bool, (u8, bool)) {
         (SUB, ADD, MUL, FITS, WIDE.1, UNSIGNED)
+    }
+
+    pub fn more() -> (Option<i8>, Option<i8>, i8, (i8, i8, u128, u8)) {
+        (DIV, REM, SHR, SATURATED)
     }
 }
 
@@ -1559,6 +1572,33 @@ pub mod unwind_cleanup {
         let n = inner(log, fail);
         drop(boxed);
         n
+    }
+
+    struct Failing<'a>(Noisy<'a>, Noisy<'a>);
+    impl Drop for Failing<'_> {
+        fn drop(&mut self) {
+            panic!("a destructor that fails after {} drops", (self.0).0.borrow().len());
+        }
+    }
+
+    #[inline(never)]
+    fn scopes(log: &RefCell<Vec<u32>>) {
+        let _first = Noisy(log, 20);
+        let _second = Noisy(log, 21);
+        {
+            let _inner = Noisy(log, 22);
+            let _failing = Failing(Noisy(log, 23), Noisy(log, 24));
+            let _last = Noisy(log, 25);
+        }
+        let _unreached = Noisy(log, 26);
+    }
+
+    /// A destructor that panics still has its fields dropped, and the scopes around it unwind
+    /// innermost first.
+    pub fn failing_drop() -> (Vec<u32>, bool) {
+        let log = RefCell::new(Vec::new());
+        let caught = panic::catch_unwind(AssertUnwindSafe(|| scopes(&log))).is_err();
+        (log.into_inner(), caught)
     }
 
     pub fn run() -> (Vec<u32>, Vec<u32>, bool) {
