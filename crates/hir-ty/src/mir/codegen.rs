@@ -446,6 +446,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             eprintln!("{:#?}", body.basic_blocks);
         }
+        if matches!(instance.def, InstanceDef::Closure(_))
+            && std::env::var("RUSTD_DUMP_MIR").is_ok_and(|want| want == "{closure}")
+        {
+            eprintln!("{:#?}", body.basic_blocks);
+        }
         let tracked = match instance.def {
             InstanceDef::Fn(func) => track_caller(self.db, func),
             InstanceDef::Closure(_)

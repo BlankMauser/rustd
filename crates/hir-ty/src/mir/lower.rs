@@ -2225,12 +2225,16 @@ pub fn mir_body_for_closure_query<'db>(
         };
         let capture_local_rvalue =
             Rvalue::Use(Operand { kind: OperandKind::Move(capture_param_place), span: None });
-        ctx.push_assignment(
-            current,
-            capture_local_place.as_ref(),
-            capture_local_rvalue,
-            MirSpan::Unknown,
-        );
+        // A closure that is only borrowed uses the captures it owns in place (see below), so
+        // moving them into the local would drop them on every call.
+        if !is_by_ref_closure || capture.is_by_ref() {
+            ctx.push_assignment(
+                current,
+                capture_local_place.as_ref(),
+                capture_local_rvalue,
+                MirSpan::Unknown,
+            );
+        }
 
         let local = capture.captured_local();
         let local = ctx.binding_local(local)?;

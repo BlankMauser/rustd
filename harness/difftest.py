@@ -61,6 +61,7 @@ class Fixture:
             run = subprocess.run(
                 [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
                  "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"), *symbols], capture_output=True, text=True)
+            open(os.path.join(self.work, f"{crate}.stderr"), "w").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")
             objects.append(obj)
@@ -129,7 +130,27 @@ def bucket(error):
     return re.split(r"[({]", reason)[0].strip()[:60]
 
 
-def compare(fx, name, do_bisect):
+def memcheck(fx):
+    """Runs the rustd binary under valgrind: the first invalid access is usually the miscompile,
+    where the crash or wrong output is only what it led to. Returns the error blocks."""
+    import re, shutil
+    if not shutil.which("valgrind"):
+        return None
+    log = os.path.join(fx.work, "valgrind.log")
+    try:
+        subprocess.run(["valgrind", "-q", "--num-callers=30", f"--log-file={log}", fx.binary, *fx.run_args],
+                       capture_output=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        pass
+    text = re.sub(r"^==\d+== ?", "", open(log).read(), flags=re.M)
+    errors = [e for e in text.split("\n\n") if e.strip()]
+    print(f"  valgrind: {len(errors)} errors ({log})")
+    if errors:
+        print("\n".join("    " + line[:200] for line in errors[0].splitlines()))
+    return errors
+
+
+def compare(fx, name, do_bisect, do_memcheck=False):
     fx.rustc_build()
     expected = fx.behaviour(fx.reference)
     fx.rustd_build()
@@ -153,10 +174,16 @@ def compare(fx, name, do_bisect):
         got = fx.behaviour(fx.binary)
         print(f"  rustc: status {expected[0]}\n{expected[1].decode(errors='replace')}")
         print(f"  rustd: status {got[0]}\n{got[1].decode(errors='replace')}{got[2].decode(errors='replace')[-600:]}")
+        do_memcheck = True
         if do_bisect:
             result["culprits"] = isolate(fx, expected)
             for c in result["culprits"]:
                 print(f"  MISCOMPILED {c['function']}: {c['symptom']}")
+    if do_memcheck:
+        errors = memcheck(fx)
+        result["valgrind_errors"] = None if errors is None else len(errors)
+        if errors:
+            result["match"] = False
     return result
 
 
@@ -166,11 +193,12 @@ def main():
     ap.add_argument("--bin", required=True)
     ap.add_argument("--crate", action="append", required=True)
     ap.add_argument("--bisect", action="store_true")
+    ap.add_argument("--memcheck", action="store_true", help="also fail on valgrind errors when the output matches")
     ap.add_argument("--json")
     a = ap.parse_args()
 
     fx = Fixture(a.workspace, a.crate, ["-p", a.bin])
-    result = compare(fx, a.bin, a.bisect)
+    result = compare(fx, a.bin, a.bisect, a.memcheck)
     if a.json:
         json.dump(result, open(a.json, "w"), indent=1)
     sys.exit(0 if result["match"] else 1)

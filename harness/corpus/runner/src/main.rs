@@ -112,6 +112,10 @@ fn main() {
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
     case!(heap::clears(3));
+    let (shared, call) = heap::shared("abc");
+    case!(std::sync::Arc::strong_count(&shared), call());
+    drop(call);
+    case!(std::sync::Arc::strong_count(&shared));
     let (mut map, mut maps) = (heap::hashmap(), heap::hashmaps(2));
     map.insert("a".into(), 1);
     maps[1].insert("b".into(), 2);

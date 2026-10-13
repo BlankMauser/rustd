@@ -691,6 +691,23 @@ pub mod heap {
         cell.borrow_mut()[13] += 1;
         cell.borrow()[0] + cell.borrow()[13]
     }
+    pub trait Named {
+        fn name(&self) -> usize;
+    }
+    impl Named for String {
+        fn name(&self) -> usize {
+            self.len()
+        }
+    }
+    pub fn shared(text: &str) -> (std::sync::Arc<dyn Named>, Box<dyn Fn() -> usize>) {
+        let shared: std::sync::Arc<dyn Named> = std::sync::Arc::new(text.to_owned());
+        let call = {
+            let shared = std::sync::Arc::clone(&shared);
+            let call: Box<dyn Fn() -> usize> = Box::new(move || shared.name());
+            call
+        };
+        (shared, call)
+    }
     pub fn hashmap() -> std::collections::HashMap<std::sync::Arc<str>, u32> {
         std::collections::HashMap::new()
     }
