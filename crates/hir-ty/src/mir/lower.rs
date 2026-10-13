@@ -97,6 +97,9 @@ struct MirLowerCtx<'a, 'db> {
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
+    /// While the pattern of a match arm that has a guard is lowered: what it binds by value, and
+    /// the place each came out of.
+    guarded_moves: Option<Vec<(LocalId, Place<'db>)>>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -245,6 +248,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             or_choices: FxHashMap::default(),
+            guarded_moves: None,
             env,
             infcx,
         }
@@ -792,19 +796,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         let body = self.new_basic_block();
                         for choice in expansions {
                             self.or_choices = choice.into_iter().collect();
+                            let outer = self.guarded_moves.replace(Vec::new());
                             let matched = self.pattern_match(current, None, cond_place, *pat);
+                            let moves = std::mem::replace(&mut self.guarded_moves, outer);
                             self.or_choices.clear();
                             let (then, otherwise) = matched?;
                             let otherwise = otherwise.unwrap_or_else(|| self.new_basic_block());
+                            let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                             if let Some((discr, c)) = self.lower_guard(guard, then)? {
+                                let failed = self.new_basic_block();
                                 self.set_terminator(
                                     c,
                                     TerminatorKind::SwitchInt {
                                         discr,
-                                        targets: SwitchTargets::static_if(1, body, otherwise),
+                                        targets: SwitchTargets::static_if(1, body, failed),
                                     },
                                     expr_id.into(),
                                 );
+                                let failed = self.guard_failed(
+                                    failed,
+                                    bound,
+                                    moves.unwrap_or_default(),
+                                    guard.into(),
+                                );
+                                self.set_goto(failed, otherwise, expr_id.into());
                             }
                             current = otherwise;
                         }
@@ -817,20 +832,34 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         }
                         continue;
                     }
-                    let (then, mut otherwise) =
-                        self.pattern_match(current, None, cond_place, *pat)?;
+                    let outer = match guard {
+                        Some(_) => self.guarded_moves.replace(Vec::new()),
+                        None => self.guarded_moves.take(),
+                    };
+                    let matched = self.pattern_match(current, None, cond_place, *pat);
+                    let moves = std::mem::replace(&mut self.guarded_moves, outer);
+                    let (then, mut otherwise) = matched?;
                     let then = if let &Some(guard) = guard {
                         let next = self.new_basic_block();
-                        let o = otherwise.get_or_insert_with(|| self.new_basic_block());
+                        let o = *otherwise.get_or_insert_with(|| self.new_basic_block());
+                        let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                         if let Some((discr, c)) = self.lower_guard(guard, then)? {
+                            let failed = self.new_basic_block();
                             self.set_terminator(
                                 c,
                                 TerminatorKind::SwitchInt {
                                     discr,
-                                    targets: SwitchTargets::static_if(1, next, *o),
+                                    targets: SwitchTargets::static_if(1, next, failed),
                                 },
                                 expr_id.into(),
                             );
+                            let failed = self.guard_failed(
+                                failed,
+                                bound,
+                                moves.unwrap_or_default(),
+                                guard.into(),
+                            );
+                            self.set_goto(failed, o, expr_id.into());
                         }
                         next
                     } else {
@@ -1245,9 +1274,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.push_assignment(current, lhs_place, r_value, expr_id.into());
                     return Ok(Some(current));
                 }
-                let Some((lhs_op, current)) = self.lower_expr_to_some_operand(*lhs, current)?
-                else {
-                    return Ok(None);
+                // Each side of `&&` and `||` drops its temporaries when it is done, unless it
+                // is a `let`, whose temporaries live as long as what it binds.
+                let lazy = matches!(op, hir_def::hir::BinaryOp::LogicOp(_));
+                let (lhs_op, current) = if lazy && !self.has_let(*lhs) {
+                    let ty = Ty::new_bool(self.interner());
+                    let result: Place<'db> = self.temp(ty, current, MirSpan::Unknown)?.into();
+                    let scope = self.push_drop_scope();
+                    self.drop_scopes.last_mut().unwrap().temporaries = true;
+                    let Some(c) = self.lower_expr_to_place(*lhs, result, current)? else {
+                        scope.pop_assume_dropped(self);
+                        return Ok(None);
+                    };
+                    let current = scope.pop_and_drop(self, c, (*lhs).into());
+                    let operand = Operand {
+                        kind: OperandKind::Copy(result.store()),
+                        span: Some((*lhs).into()),
+                    };
+                    (operand, current)
+                } else {
+                    let Some(it) = self.lower_expr_to_some_operand(*lhs, current)? else {
+                        return Ok(None);
+                    };
+                    it
                 };
                 if let hir_def::hir::BinaryOp::LogicOp(op) = op {
                     let value_to_short = match op {
@@ -1263,7 +1312,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     );
                     let end_of_then = Some(start_of_then);
                     let start_of_else = self.new_basic_block();
-                    let end_of_else = self.lower_expr_to_place(*rhs, place, start_of_else)?;
+                    let end_of_else = if self.has_let(*rhs) {
+                        self.lower_expr_to_place(*rhs, place, start_of_else)?
+                    } else {
+                        let scope = self.push_drop_scope();
+                        self.drop_scopes.last_mut().unwrap().temporaries = true;
+                        match self.lower_expr_to_place(*rhs, place, start_of_else)? {
+                            Some(block) => Some(scope.pop_and_drop(self, block, (*rhs).into())),
+                            None => {
+                                scope.pop_assume_dropped(self);
+                                None
+                            }
+                        }
+                    };
                     self.set_terminator(
                         current,
                         TerminatorKind::SwitchInt {
@@ -2309,12 +2370,41 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current
     }
 
-    /// Lowers the guard of a match arm. Its temporaries are dropped before the arm is chosen.
+    /// The way out of a match arm whose guard was false. What the guard bound is dropped, and
+    /// what the pattern took out of the matched value goes back, for the arms that follow and
+    /// for whoever drops that value.
+    fn guard_failed(
+        &mut self,
+        mut current: BasicBlockId,
+        bound_by_pattern: usize,
+        moves: Vec<(LocalId, Place<'db>)>,
+        span: MirSpan,
+    ) -> BasicBlockId {
+        if let Some(arm) = self.drop_scopes.last() {
+            let by_guard = DropScope {
+                locals: arm.locals.get(bound_by_pattern..).unwrap_or_default().to_vec(),
+                temporaries: false,
+            };
+            self.emit_drop_and_storage_dead_for_scope(&by_guard, &mut current, span);
+        }
+        for (local, from) in moves.into_iter().rev() {
+            let value = Operand { kind: OperandKind::Move(Place::from(local).store()), span: None };
+            self.push_assignment(current, from, value.into(), span);
+        }
+        current
+    }
+
+    /// Lowers the guard of a match arm.
     fn lower_guard(
         &mut self,
         guard: ExprId,
         current: BasicBlockId,
     ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
+        if self.has_let(guard) {
+            // What a `let` binds lives to the end of the arm, and so do the temporaries of
+            // what it matched on.
+            return self.lower_expr_to_some_operand(guard, current);
+        }
         let temporaries = self.push_drop_scope();
         self.drop_scopes.last_mut().unwrap().temporaries = true;
         let Some((discr, current)) = self.lower_expr_to_some_operand(guard, current)? else {

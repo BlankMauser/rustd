@@ -585,6 +585,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let target_place = self.binding_local(id)?;
         self.push_storage_live(id, current)?;
+        if let BindingMode(ByRef::No, _) = mode
+            && self.guarded_moves.is_some()
+            && !self
+                .infcx
+                .type_is_copy_modulo_regions(self.env, self.result.locals[target_place].ty.as_ref())
+            && let Some(moves) = &mut self.guarded_moves
+        {
+            moves.push((target_place, cond_place));
+        }
         self.push_match_assignment(current, target_place, mode, cond_place, span);
         Ok((current, current_else))
     }

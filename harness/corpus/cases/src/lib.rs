@@ -1808,3 +1808,47 @@ pub mod builtin_clone {
         (Clone::clone(&pair), array.clone(), Clone::clone(&pointer)(4), nested.clone())
     }
 }
+
+/// A guard that fails gives back what the pattern took, and `&&` drops as it goes.
+pub mod guard_moves {
+    use std::cell::RefCell;
+
+    struct Noisy<'a>(&'a RefCell<Vec<u32>>, u32);
+
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+
+    impl Noisy<'_> {
+        fn yes(&self) -> bool {
+            true
+        }
+    }
+
+    fn failed(log: &RefCell<Vec<u32>>) -> u32 {
+        match (Noisy(log, 2), Noisy(log, 3)) {
+            (_x, _y) if let _z = Noisy(log, 1) && false => 0,
+            (x, _) if x.1 == 7 => 1,
+            (_, y) => y.1,
+        }
+    }
+
+    fn chain(log: &RefCell<Vec<u32>>) -> u32 {
+        if Noisy(log, 1).yes()
+            && let Some(_v) = Some(Noisy(log, 5))
+            && Noisy(log, 2).yes()
+            && let Some(_) = Some(Noisy(log, 4)).as_ref()
+        {
+            log.borrow_mut().push(3);
+        }
+        (Noisy(log, 6).yes() || Noisy(log, 99).yes()) as u32
+    }
+
+    pub fn run() -> (u32, u32, Vec<u32>) {
+        let log = RefCell::new(Vec::new());
+        let (a, b) = (failed(&log), chain(&log));
+        (a, b, log.into_inner())
+    }
+}

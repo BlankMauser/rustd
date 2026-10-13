@@ -197,4 +197,5 @@ fn main() {
     println!("raw_identifiers {:?}", cases::raw_identifiers::run());
     println!("derive_ufcs {:?}", cases::derive_ufcs::run());
     println!("builtin_clone {:?}", cases::builtin_clone::run());
+    println!("guard_moves {:?}", cases::guard_moves::run());
 }
