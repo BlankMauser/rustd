@@ -243,4 +243,6 @@ fn main() {
     #[cfg(target_arch = "x86_64")]
     println!("simd_x86 {}", cases::simd_x86::run());
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
+    println!("module_paths {}", cases::module_paths::run());
+    println!("fn_thread_local {:?}", cases::fn_thread_local::run());
 }

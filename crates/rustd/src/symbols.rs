@@ -94,7 +94,9 @@ impl SymbolTable {
         let Ok(object) = object::File::parse(data) else { return };
         for symbol in object.symbols() {
             // A reference is as good as a definition: something in the link defines it.
-            let linkable = symbol.is_undefined() || (symbol.is_definition() && symbol.is_global());
+            // Not `is_definition`, which leaves out thread locals.
+            let defined = symbol.section_index().is_some() || symbol.is_common();
+            let linkable = symbol.is_undefined() || (defined && symbol.is_global());
             if !linkable {
                 continue;
             }

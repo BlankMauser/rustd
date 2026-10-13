@@ -1894,7 +1894,10 @@ impl<'db> ExprCollector<'db> {
                 }
             }
 
-            ast::Expr::Literal(e) => self.alloc_expr(Expr::Literal(e.kind().into()), syntax_ptr),
+            ast::Expr::Literal(e) => {
+                let literal = self.module_path_literal().unwrap_or_else(|| e.kind().into());
+                self.alloc_expr(Expr::Literal(literal), syntax_ptr)
+            }
             ast::Expr::IndexExpr(e) => {
                 let base = self.collect_expr_opt(e.base());
                 let index = self.collect_expr_opt(e.index());
@@ -2621,6 +2624,32 @@ impl<'db> ExprCollector<'db> {
         };
         let arms = Box::new([continue_arm, break_arm]);
         self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
+    }
+
+    /// The path of the module being lowered when the literal being lowered is what
+    /// `module_path!()` expanded to, which is a placeholder: the expander doesn't know modules.
+    fn module_path_literal(&self) -> Option<Literal> {
+        let call = self.expander.current_file_id().macro_file()?;
+        let hir_expand::MacroDefKind::BuiltIn(
+            _,
+            hir_expand::builtin::BuiltinFnLikeExpander::ModulePath,
+        ) = call.loc(self.db).def.kind
+        else {
+            return None;
+        };
+        let mut module = self.module;
+        let mut segments = Vec::new();
+        while let Some(parent) = module.containing_module(self.db) {
+            if !module.is_block_module(self.db) {
+                segments.push(module.name(self.db)?.symbol().as_str().to_owned());
+            }
+            // SAFETY: the module is of this database.
+            module = unsafe { parent.to_static() };
+        }
+        let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
+        segments.push(krate.crate_name().symbol().as_str().to_owned());
+        segments.reverse();
+        Some(Literal::String(Symbol::intern(&segments.join("::"))))
     }
 
     fn collect_macro_call<T, U>(

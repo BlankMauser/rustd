@@ -3514,3 +3514,58 @@ pub mod lifetime_impl_consts {
         format!("{} {} {} {}", State::kind(1, false), State::kind(4, true), State::kind(999, false), state.read())
     }
 }
+
+/// `module_path!()` names the module it is written in, also through a macro and in a static.
+pub mod module_paths {
+    macro_rules! here {
+        () => {
+            module_path!()
+        };
+    }
+    static IN_STATIC: &str = module_path!();
+    const IN_CONST: (&str, usize) = (module_path!(), module_path!().len());
+
+    pub mod nested {
+        pub fn path() -> &'static str {
+            fn inner() -> &'static str {
+                module_path!()
+            }
+            inner()
+        }
+        pub fn through_macro() -> &'static str {
+            here!()
+        }
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {:?}",
+            module_path!(),
+            nested::path(),
+            nested::through_macro(),
+            IN_STATIC,
+            IN_CONST
+        )
+    }
+}
+
+/// A lazy thread local with a destructor inside a function, as `block_on` caches its parker.
+pub mod fn_thread_local {
+    use std::cell::RefCell;
+
+    fn push<T: Into<u32>>(value: T) -> usize {
+        thread_local! {
+            static CACHE: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        }
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.push(value.into());
+            cache.len()
+        })
+    }
+
+    pub fn run() -> (usize, usize, usize) {
+        let other = std::thread::spawn(|| push(7u8)).join().unwrap();
+        (push(1u8), push(2u16), other)
+    }
+}
