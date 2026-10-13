@@ -286,11 +286,15 @@ fn link(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn source_files(vfs: &Vfs, root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTime)> {
+fn source_files(vfs: &Vfs, _root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTime)> {
     vfs.iter()
         .filter_map(|(id, path)| {
             let path: &Path = path.as_path()?.as_ref();
-            if !path.starts_with(root) || path.components().any(|c| c.as_os_str() == "target") {
+            // Everything but the sysroot and the registry: path dependencies live outside `root`.
+            let immutable = path.components().any(|c| {
+                matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry"))
+            });
+            if immutable {
                 return None;
             }
             let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -302,6 +306,7 @@ fn source_files(vfs: &Vfs, root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTime
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
+    project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
     let table = SymbolTable::load(&args.symbol_files)?;
     eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
@@ -323,6 +328,7 @@ fn main() -> anyhow::Result<()> {
     let cold = build(&db, &table, &args, &mut known)?;
     eprint!("cold: ");
     report(&cold);
+    eprintln!("stats: mir {:.1?}, {} bodies", known.stats.mir, known.stats.bodies);
     link(&args)?;
     if !args.watch {
         return Ok(());
@@ -334,24 +340,40 @@ fn main() -> anyhow::Result<()> {
     loop {
         std::thread::sleep(Duration::from_millis(5));
         let mut change = ChangeWithProcMacros::default();
-        let mut changed = false;
-        for (id, path, mtime) in &mut files {
-            let Ok(now) = std::fs::metadata(&*path).and_then(|m| m.modified()) else { continue };
-            if now != *mtime {
-                *mtime = now;
-                change.change_file(*id, Some(std::fs::read_to_string(&*path)?));
-                changed = true;
+        let mut changed = 0;
+        // Keep scanning until a pass finds nothing new, so one save of several files is one build.
+        loop {
+            let before = changed;
+            for (id, path, mtime) in &mut files {
+                let Ok(now) = std::fs::metadata(&*path).and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if now != *mtime {
+                    *mtime = now;
+                    change.change_file(*id, Some(std::fs::read_to_string(&*path)?));
+                    changed += 1;
+                }
             }
+            if changed == before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        if !changed {
+        if changed == 0 {
             continue;
         }
+        eprintln!("change: {changed} files");
         let start = Instant::now();
         db.apply_change(change);
         let apply = start.elapsed();
         let warm = build(&db, &table, &args, &mut known)?;
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
+        let stats = known.stats;
+        if stats.bodies > 0 {
+            eprintln!("stats: mir {:.1?}, {} of {} bodies changed", stats.mir, stats.changed, stats.bodies);
+            eprintln!("code: {} reused, {} compiled", stats.reused, stats.compiled);
+        }
         link(&args)?;
         eprintln!("edit-to-binary: {:.1?}", start.elapsed());
     }

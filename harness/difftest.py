@@ -73,7 +73,9 @@ class Fixture:
         args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
-        subprocess.run(args, check=True, capture_output=True)
+        run = subprocess.run(args, capture_output=True, text=True)
+        if run.returncode != 0:
+            raise SystemExit(f"link failed:\n{run.stderr[-3000:]}")
 
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]

@@ -15,7 +15,7 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, TraitId,
@@ -162,20 +162,15 @@ impl CodegenUnit {
         roots: &[FunctionId],
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
-        // Rejections of the edited crate's own functions may be out of date.
-        if let Some(&root) = roots.first() {
-            let krate = root.krate(db);
-            known.rejected.retain(|instance, _| match instance.def {
-                InstanceDef::Fn(func) => func.krate(db) != krate,
-                InstanceDef::Closure(_) | InstanceDef::DropGlue | InstanceDef::CallOnceShim => {
-                    false
-                }
-            });
-        }
-        let rejected = &mut known.rejected;
+        // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
+        // full pass per rejected call chain, and they go away with the rustc fallback.
+        let Rejections { rejected, fingerprints, code, stats } = known;
+        (code.hits, code.misses) = (0, 0);
+        let track = std::env::var_os("RUSTD_STATS").is_some();
         let mut own_statics = roots.first().map(|root| root.krate(db));
         loop {
-            let mut cg = ObjectCodegen::new(db, symbols, rejected, own_statics)?;
+            let mut cg = ObjectCodegen::new(db, symbols, rejected, code, own_statics)?;
+            cg.track = track;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
@@ -189,25 +184,24 @@ impl CodegenUnit {
             if !cg.statics.is_empty() && from_rustc {
                 // Functions left to rustc keep using rustc's copy of the crate's private
                 // statics, so we can't bring our own.
-                {
-                    use std::io::Write;
-                    let mut o = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/dbg.txt")
-                        .unwrap();
-                    for (f, e) in &skipped {
-                        if !matches!(e, CodegenError::NoSymbol) {
-                            writeln!(o, "DBG {f:?} {e}").unwrap();
-                        }
-                    }
-                }
                 own_statics = None;
                 rejected.extend(failed);
                 continue;
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
+                *stats = BuildStats {
+                    mir: cg.mir_time,
+                    bodies: cg.seen.len(),
+                    changed: 0,
+                    reused: cg.code.hits,
+                    compiled: cg.code.misses,
+                };
+                for (key, print) in cg.seen.drain(..) {
+                    if fingerprints.insert(key, print) != Some(print) {
+                        stats.changed += 1;
+                    }
+                }
                 return Ok(CodegenUnit { object: cg.finish()?, compiled, skipped, instances });
             }
             rejected.extend(failed);
@@ -220,6 +214,42 @@ impl CodegenUnit {
 #[derive(Default)]
 pub struct Rejections {
     rejected: FxHashMap<Instance, String>,
+    /// A hash of each body's MIR in the last build, to count how many an edit changed.
+    fingerprints: FxHashMap<Instance, u64>,
+    code: CodeCache,
+    pub stats: BuildStats,
+}
+
+/// Machine code by a hash of the Cranelift IR it was compiled from. The IR holds no source
+/// positions and names its callees indirectly, so moving or renaming code does not miss.
+#[derive(Default)]
+struct CodeCache {
+    entries: FxHashMap<Box<[u8]>, Vec<u8>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl cranelift_codegen::incremental_cache::CacheKvStore for CodeCache {
+    fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.entries.get(key).map(|blob| blob.as_slice().into())
+    }
+
+    fn insert(&mut self, key: &[u8], blob: Vec<u8>) {
+        self.entries.insert(key.into(), blob);
+    }
+}
+
+/// Measurements of the last build, collected when `RUSTD_STATS` is set.
+#[derive(Default, Clone, Copy)]
+pub struct BuildStats {
+    /// Time spent in the queries that return MIR.
+    pub mir: std::time::Duration,
+    pub bodies: usize,
+    /// Bodies whose MIR differs from the build before.
+    pub changed: usize,
+    /// Functions whose machine code was reused, and functions that went through Cranelift.
+    pub reused: usize,
+    pub compiled: usize,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.
@@ -256,6 +286,10 @@ struct ObjectCodegen<'a, 'db> {
     pending: Vec<(Instance, ParamEnvAndCrate<'db>, FuncId)>,
     /// Instances that failed in an earlier round, with the reason.
     rejected: &'a FxHashMap<Instance, String>,
+    code: &'a mut CodeCache,
+    track: bool,
+    mir_time: std::time::Duration,
+    seen: Vec<(Instance, u64)>,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     /// The crate whose writable statics we define ourselves when rustc exports no symbol for
     /// them. Only sound when every function of that crate is ours.
@@ -270,6 +304,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, String>,
+        code: &'a mut CodeCache,
         own_statics: Option<Crate>,
     ) -> Result<Self> {
         let backend = |e: &dyn fmt::Display| CodegenError::Backend(e.to_string());
@@ -291,6 +326,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             instances: FxHashMap::default(),
             pending: Vec::new(),
             rejected,
+            code,
+            track: false,
+            mir_time: Default::default(),
+            seen: Vec::new(),
             vtables: FxHashMap::default(),
             own_statics,
             statics: FxHashMap::default(),
@@ -307,7 +346,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_function(&mut self, func: FunctionId) -> Result<String> {
         let db = self.db;
         let owner: InferBodyId<'db> = func.into();
-        let body = db.mir_body(owner).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let start = std::time::Instant::now();
+        let body = db.mir_body(owner);
+        self.mir_time += start.elapsed();
+        let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let root = Instance {
+            def: InstanceDef::Fn(func),
+            args: GenericArgs::new_from_slice(&[]).store(),
+        };
+        self.fingerprint(root, body);
         let Some(symbol) = self.symbols.function(func) else {
             return Err(CodegenError::NoSymbol);
         };
@@ -326,6 +373,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
         self.emit(id, &mut ctx)?;
         Ok(symbol)
+    }
+
+    fn fingerprint(&mut self, instance: Instance, body: &MirBody<'db>) {
+        if !self.track {
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        format!("{:?}{:?}", body.basic_blocks, body.locals).hash(&mut hasher);
+        self.seen.push((instance, hasher.finish()));
     }
 
     /// Compiles the instances requested by calls. Returns the ones that failed.
@@ -355,6 +412,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut ctx = self.build(env, None, |fx| fx.call_once_shim(ty))?;
             return self.emit(id, &mut ctx);
         }
+        let start = std::time::Instant::now();
         let body = match instance.def {
             InstanceDef::DropGlue | InstanceDef::CallOnceShim => unreachable!(),
             InstanceDef::Fn(func) => {
@@ -365,8 +423,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 instance.args.clone(),
                 env.store(),
             ),
-        }
-        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        };
+        self.mir_time += start.elapsed();
+        let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        self.fingerprint(instance.clone(), body);
         if let (Ok(want), InstanceDef::Fn(func)) = (std::env::var("RUSTD_DUMP_MIR"), instance.def)
             && FunctionSignature::of(self.db, func).name.as_str() == want
         {
@@ -387,13 +447,40 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
     /// (i128 corners, for one); that must cost us one function, not the process.
     fn emit(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
-        let module = &mut self.module;
+        let (module, code) = (&mut self.module, &mut *self.code);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            module.define_function(id, ctx)
+            let (_, hit) = ctx
+                .compile_with_cache(module.isa(), code, &mut Default::default())
+                .map_err(|e| format!("{:?}", e.inner))?;
+            let Some(compiled) = ctx.compiled_code() else {
+                return Err("no compiled code".to_owned());
+            };
+            let relocs: Vec<_> = compiled
+                .buffer
+                .relocs()
+                .iter()
+                .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, id))
+                .collect();
+            module
+                .define_function_bytes(
+                    id,
+                    compiled.buffer.alignment.into(),
+                    compiled.buffer.data(),
+                    &relocs,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+            Ok::<_, String>(hit)
         }));
         match outcome {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(CodegenError::Backend(format!("{e:?}"))),
+            Ok(Ok(hit)) => {
+                if hit {
+                    self.code.hits += 1;
+                } else {
+                    self.code.misses += 1;
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(CodegenError::Backend(e)),
             Err(panic) => {
                 let message = panic
                     .downcast_ref::<String>()
@@ -858,7 +945,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         self.builder.ins().jump(self.blocks[body.start_block], &[]);
 
+        // Only blocks that can run are compiled: `if cfg!(miri) { .. }` calls functions that do
+        // not exist.
+        let mut reachable = rustc_hash::FxHashSet::default();
+        let mut worklist = vec![body.start_block];
+        while let Some(id) = worklist.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+                Some(TerminatorKind::SwitchInt { discr, targets }) => match self.const_bits(discr) {
+                    Some(bits) => worklist.push(targets.target_for_value(bits)),
+                    None => worklist.extend_from_slice(targets.all_targets()),
+                },
+                Some(
+                    TerminatorKind::Goto { target }
+                    | TerminatorKind::Drop { target, .. }
+                    | TerminatorKind::DropAndReplace { target, .. }
+                    | TerminatorKind::Assert { target, .. }
+                    | TerminatorKind::FalseEdge { real_target: target, .. }
+                    | TerminatorKind::FalseUnwind { real_target: target, .. },
+                ) => worklist.push(*target),
+                Some(TerminatorKind::Call { target, .. }) => worklist.extend(*target),
+                _ => (),
+            }
+        }
         for (id, block) in body.basic_blocks.iter() {
+            if !reachable.contains(&id) {
+                continue;
+            }
             self.builder.switch_to_block(self.blocks[id]);
             for statement in &block.statements {
                 match &statement.kind {
@@ -879,6 +994,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             self.terminator(&terminator.kind)?;
         }
         Ok(())
+    }
+
+    /// The value of an integer, `bool` or `char` literal operand.
+    fn const_bits(&self, operand: &Operand) -> Option<u128> {
+        let OperandKind::Constant { konst, ty } = &operand.kind else { return None };
+        let ty = ty.as_ref();
+        if !matches!(ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)) {
+            return None;
+        }
+        let ConstKind::Value(value) = konst.as_ref().kind() else { return None };
+        let layout = self.layout(ty).ok()?;
+        Some(value.value.inner().to_leaf().to_bits(layout.size))
     }
 
     fn place(&mut self, place: &StoredPlace) -> Result<(Value, PlaceTy<'db>)> {
@@ -1747,6 +1874,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
+        if operands.len() > layout.fields.count() {
+            unsupported!("constructor with more operands than the layout has fields");
+        }
         for (i, operand) in operands.iter().enumerate() {
             let (src, ty) = self.operand(operand)?;
             let size = self.layout(ty)?.size;
@@ -2047,6 +2177,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.builder.ins().jump(self.blocks[*target], &[]);
             }
             TerminatorKind::SwitchInt { discr, targets } => {
+                if let Some(bits) = self.const_bits(discr) {
+                    let target = self.blocks[targets.target_for_value(bits)];
+                    self.builder.ins().jump(target, &[]);
+                    return Ok(());
+                }
                 let (value, _) = self.load_scalar(discr)?;
                 let mut switch = Switch::new();
                 for (case, target) in targets.iter() {

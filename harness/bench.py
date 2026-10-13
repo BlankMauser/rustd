@@ -135,4 +135,5 @@ def main():
     open(os.path.join(HERE, "BENCH.md"), "w").write("\n".join(lines) + "\n")
 
 
-main()
+if __name__ == "__main__":
+    main()

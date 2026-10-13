@@ -1804,6 +1804,16 @@ fn extend_crate_graph_with_sysroot(
     (SysrootPublicDeps { deps: pub_deps }, libproc_macro)
 }
 
+/// The sysroot is analyzed with `cfg(miri)` and `cfg(debug_assertions)` by default, which
+/// picks the simplest code paths. A consumer that links against the prebuilt standard library
+/// needs the configuration that library was built with instead.
+pub static SYSROOT_AS_BUILT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn sysroot_as_built() -> bool {
+    SYSROOT_AS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn sysroot_to_crate_graph(
     crate_graph: &mut CrateGraphBuilder,
     sysroot: &Sysroot,
@@ -1821,14 +1831,18 @@ fn sysroot_to_crate_graph(
                 &Sysroot::empty(),
                 rustc_cfg,
                 &CfgOverrides {
-                    global: CfgDiff::new(
-                        vec![
-                            CfgAtom::Flag(sym::debug_assertions),
-                            CfgAtom::Flag(sym::miri),
-                            CfgAtom::Flag(sym::bootstrap),
-                        ],
-                        vec![CfgAtom::Flag(sym::test)],
-                    ),
+                    global: if sysroot_as_built() {
+                        CfgDiff::new(vec![], vec![CfgAtom::Flag(sym::test)])
+                    } else {
+                        CfgDiff::new(
+                            vec![
+                                CfgAtom::Flag(sym::debug_assertions),
+                                CfgAtom::Flag(sym::miri),
+                                CfgAtom::Flag(sym::bootstrap),
+                            ],
+                            vec![CfgAtom::Flag(sym::test)],
+                        )
+                    },
                     ..Default::default()
                 },
                 &WorkspaceBuildScripts::default(),
@@ -1846,10 +1860,14 @@ fn sysroot_to_crate_graph(
                 &Sysroot::empty(),
                 &FxHashMap::default(),
                 &CfgOverrides {
-                    global: CfgDiff::new(
-                        vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
-                        vec![],
-                    ),
+                    global: if sysroot_as_built() {
+                        CfgDiff::new(vec![], vec![])
+                    } else {
+                        CfgDiff::new(
+                            vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
+                            vec![],
+                        )
+                    },
                     ..Default::default()
                 },
                 false,
@@ -1863,8 +1881,10 @@ fn sysroot_to_crate_graph(
             let cfg_options = {
                 let mut cfg_options = CfgOptions::default();
                 cfg_options.extend(rustc_cfg);
-                cfg_options.insert_atom(sym::debug_assertions);
-                cfg_options.insert_atom(sym::miri);
+                if !sysroot_as_built() {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::miri);
+                }
                 cfg_options
             };
             let sysroot_crates: FxHashMap<
