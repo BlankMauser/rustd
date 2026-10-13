@@ -2441,3 +2441,79 @@ pub mod type_ids {
         ]
     }
 }
+
+/// A destructor that panics does not stop the values next to it from being dropped, each once.
+pub mod unwind_drops {
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+
+    type Log = RefCell<Vec<u8>>;
+
+    /// Logs its number when dropped, and panics after that if the number is the log's first
+    /// entry, which is the one to fail.
+    struct Noisy<'a>(u8, &'a Log);
+
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            let failing = self.1.borrow()[0];
+            self.1.borrow_mut().push(self.0);
+            if self.0 == failing {
+                panic::panic_any(self.0);
+            }
+        }
+    }
+
+    struct Two<'a>(Noisy<'a>, Noisy<'a>);
+
+    fn array(log: &Log) {
+        let _all = [Noisy(1, log), Noisy(2, log), Noisy(3, log)];
+    }
+
+    fn tuple(log: &Log) {
+        let _all = (Noisy(1, log), Two(Noisy(2, log), Noisy(3, log)), Noisy(4, log));
+    }
+
+    fn boxed(log: &Log) {
+        let _all = Box::new((Noisy(1, log), Noisy(2, log)));
+        let _slice: Box<[Noisy<'_>]> = vec![Noisy(3, log), Noisy(4, log)].into_boxed_slice();
+    }
+
+    fn assigned(log: &Log) {
+        let mut pair = (Noisy(1, log), Noisy(2, log));
+        pair.1 = Noisy(3, log);
+        let moved = pair.0;
+        pair.0 = Noisy(4, log);
+        drop(moved);
+    }
+
+    fn subslice(log: &Log) {
+        let all = [Noisy(1, log), Noisy(2, log), Noisy(3, log)];
+        let [_, _rest @ ..] = all;
+    }
+
+    fn partly_moved(log: &Log) {
+        let all = (Noisy(1, log), Noisy(2, log), Noisy(3, log));
+        drop(all.1);
+    }
+
+    /// The operands of an expression that unwinds go before the temporaries it borrowed.
+    fn operands(log: &Log) {
+        (Noisy(1, log), &Noisy(2, log), Noisy(3, log), &Noisy(4, log), panic::panic_any(0u8));
+    }
+
+    pub fn run() -> Vec<Vec<u8>> {
+        let cases: [fn(&Log); 6] = [array, tuple, boxed, assigned, subslice, partly_moved];
+        let mut logs = Vec::new();
+        let mut run = |case: fn(&Log), failing| {
+            let log = RefCell::new(vec![failing]);
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| case(&log)));
+            logs.push(log.into_inner());
+        };
+        for case in cases {
+            (0..5).for_each(|failing| run(case, failing));
+        }
+        // This one unwinds by itself, and a second panic on the way out would abort.
+        run(operands, 0);
+        logs
+    }
+}

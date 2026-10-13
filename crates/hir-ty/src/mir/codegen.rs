@@ -579,6 +579,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::DropGlue = instance.def {
             let ty = instance.args.as_ref().type_at(0);
             let mut ctx = self.build(env, None, false, |fx| fx.drop_glue(ty))?;
+            if std::env::var_os("RUSTD_DUMP_CLIF").is_some() {
+                eprintln!("drop glue for {ty:?}\n{}", ctx.func.display());
+            }
             return self.emit(id, &mut ctx);
         }
         if let InstanceDef::CallOnceShim = instance.def {
@@ -733,6 +736,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 cleanup: None,
                 inner_pad: None,
                 drop_order: Vec::new(),
+                operand_temps: Default::default(),
                 in_cleanup: false,
                 deferred_clears: Vec::new(),
                 ret_mode: PassMode::Ignore,
@@ -1166,13 +1170,15 @@ struct FunctionCx<'cx, 'a, 'db> {
     drop_flags: ArenaMap<LocalId, Value>,
     moved_paths: Vec<MovedPath>,
     /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, ir::Block)>,
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
     inner_pad: Option<ir::Block>,
     /// The locals the body drops, in the order it gets to dropping them.
     drop_order: Vec<LocalId>,
+    /// Temporaries that hold an operand: never borrowed, only moved whole.
+    operand_temps: rustc_hash::FxHashSet<LocalId>,
     in_cleanup: bool,
     deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
@@ -1978,6 +1984,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
         }
         self.drop_order = drop_order(body, &reachable);
+        self.operand_temps = operand_temps(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -2028,7 +2035,37 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
             self.builder.switch_to_block(block);
-            self.drop_place(&place, target)?;
+            // `place = value` drops what `place` held and then writes to it. If that drop
+            // unwinds the write still happens, so that `place` is not dropped twice.
+            let replace =
+                body.basic_blocks[target].statements.iter().find_map(|it| match &it.kind {
+                    StatementKind::Assign(to, rvalue) => Some((to, rvalue)),
+                    _ => None,
+                });
+            let target = self.blocks[target];
+            match replace {
+                Some((to, rvalue))
+                    if *to == place
+                        && !place.projection.as_slice().is_empty()
+                        && !self.in_cleanup =>
+                {
+                    let dropped = self.builder.create_block();
+                    self.guarded(
+                        |this| {
+                            this.drop_place(&place, dropped)?;
+                            this.builder.switch_to_block(dropped);
+                            Ok(())
+                        },
+                        |this| {
+                            this.assign(to, rvalue)?;
+                            this.clear_moved_now(to);
+                            Ok(())
+                        },
+                    )?;
+                    self.builder.ins().jump(target, &[]);
+                }
+                _ => self.drop_place(&place, target)?,
+            }
         }
         self.emit_cleanup()
     }
@@ -2036,9 +2073,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     /// The fields a place selects in its local, if it is nothing but fields of structs, tuples
     /// and closures. Those are the places that can be moved out of on their own.
     fn field_path(&self, place: &StoredPlace) -> Option<Vec<u32>> {
-        let mut ty = PlaceTy::from_ty(self.body?.locals[place.local].ty.as_ref());
+        Some(self.path_of(place.local, place.projection.as_slice())?.0)
+    }
+
+    /// The paths a move out of `place` takes away: its own, or one for each element when it
+    /// is a subslice of an array.
+    fn moved_out_paths(&self, place: &StoredPlace) -> Option<Vec<Vec<u32>>> {
+        let projection = place.projection.as_slice();
+        let Some((&ProjectionElem::Subslice { from, to }, array)) = projection.split_last() else {
+            return Some(vec![self.field_path(place)?]);
+        };
+        let (path, ty) = self.path_of(place.local, array)?;
+        let TyKind::Array(_, len) = ty.ty.kind() else { return None };
+        let len = crate::consteval::try_const_usize(self.cg.db, len)? as u64;
+        (from..len.checked_sub(to)?)
+            .map(|index| {
+                let index = u32::try_from(index).ok().filter(|&it| it < VARIANT_FIELDS)?;
+                Some(path.iter().copied().chain([index]).collect())
+            })
+            .collect()
+    }
+
+    fn path_of(
+        &self,
+        local: LocalId,
+        projection: &[crate::mir::PlaceElem],
+    ) -> Option<(Vec<u32>, PlaceTy<'db>)> {
+        let mut ty = PlaceTy::from_ty(self.body?.locals[local].ty.as_ref());
         let mut path = Vec::new();
-        for proj in place.projection.as_slice() {
+        for proj in projection {
             if let (ProjectionElem::Deref, TyKind::Adt(adt_def, _)) = (proj, ty.ty.kind())
                 && adt_def.is_box()
             {
@@ -2074,7 +2137,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             path.push(field.0 as u32);
             ty = ty.projection_ty(&self.infcx, proj, self.env.param_env);
         }
-        Some(path)
+        Some((path, ty))
     }
 
     /// Says that the fields of `place` are all there again, after an assignment to it.
@@ -2190,14 +2253,27 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let pointee_meta = self
                         .is_unsized(pointee)
                         .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
-                    path.push(BOX_CONTENTS);
-                    self.drop_unmoved(pointer, pointee_meta, pointee, local, path, state)?;
-                    path.pop();
-                    self.call_drop_impl(addr, ty)?;
-                    if let AdtId::StructId(id) = adt_def.def_id() {
-                        let layout = self.layout(ty)?;
-                        self.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
-                    }
+                    self.drop_ladder(2, |this, at| {
+                        if at == 0 {
+                            path.push(BOX_CONTENTS);
+                            let dropped = this.drop_unmoved(
+                                pointer,
+                                pointee_meta,
+                                pointee,
+                                local,
+                                path,
+                                state,
+                            );
+                            path.pop();
+                            return dropped;
+                        }
+                        this.call_drop_impl(addr, ty)?;
+                        if let AdtId::StructId(id) = adt_def.def_id() {
+                            let layout = this.layout(ty)?;
+                            this.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
+                        }
+                        Ok(())
+                    })?;
                     self.builder.ins().jump(done, &[]);
                     self.builder.switch_to_block(done);
                     return Ok(());
@@ -2254,16 +2330,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                         };
                         path.push(VARIANT_FIELDS | index as u32);
                         let field_types = db.field_types(variant.into());
-                        for (field, field_ty) in field_types.iter() {
-                            let field_ty =
-                                field_ty.ty().instantiate(self.interner, subst).skip_norm_wip();
-                            let field = u32::from(field.into_raw());
+                        let fields: Vec<_> = field_types
+                            .iter()
+                            .map(|(field, ty)| {
+                                let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                                (u32::from(field.into_raw()), ty)
+                            })
+                            .filter(|&(_, ty)| self.needs_drop(ty))
+                            .collect();
+                        self.drop_ladder(fields.len(), |this, at| {
+                            let (field, field_ty) = fields[at];
                             let offset = variant_layout.fields.offset(field as usize).bytes();
-                            let field_addr = self.builder.ins().iadd_imm(addr, offset as i64);
+                            let field_addr = this.builder.ins().iadd_imm(addr, offset as i64);
                             path.push(field);
-                            self.drop_unmoved(field_addr, None, field_ty, local, path, state)?;
+                            let dropped =
+                                this.drop_unmoved(field_addr, None, field_ty, local, path, state);
                             path.pop();
-                        }
+                            dropped
+                        })?;
                         path.pop();
                         self.builder.ins().jump(done, &[]);
                     }
@@ -2305,14 +2389,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 runs.reverse();
                 fields = runs.into_iter().flatten().collect();
             }
-            for (i, field) in fields {
+            fields.retain(|&(_, field)| self.needs_drop(field));
+            self.drop_ladder(fields.len(), |this, at| {
+                let (i, field) = fields[at];
                 let offset = layout.fields.offset(i).bytes() as i64;
-                let field_addr = self.builder.ins().iadd_imm(addr, offset);
-                let field_addr = self.aligned_for_drop(field_addr, field, ty)?;
+                let field_addr = this.builder.ins().iadd_imm(addr, offset);
+                let field_addr = this.aligned_for_drop(field_addr, field, ty)?;
                 path.push(i as u32);
-                self.drop_unmoved(field_addr, None, field, local, path, state)?;
+                let dropped = this.drop_unmoved(field_addr, None, field, local, path, state);
                 path.pop();
-            }
+                dropped
+            })?;
         } else {
             self.drop_value(addr, meta, ty)?;
         }
@@ -2544,11 +2631,18 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     && has_drop_glue(&self.infcx, ty.ty, self.env.param_env) != DropGlue::None
                 {
                     let flag = self.drop_flags[place.local];
-                    let path = self.field_path(place).filter(|it| !it.is_empty());
-                    let state = match path.and_then(|it| self.moved_bit(place.local, it)) {
-                        Some(bit) => {
+                    let paths = self
+                        .moved_out_paths(place)
+                        .filter(|paths| paths.iter().all(|it| !it.is_empty()));
+                    let mask = paths.and_then(|paths| {
+                        paths.into_iter().try_fold(0i64, |mask, path| {
+                            Some(mask | 1i64 << self.moved_bit(place.local, path)?)
+                        })
+                    });
+                    let state = match mask {
+                        Some(mask) => {
                             let state = self.builder.ins().load(types::I64, MEM, flag, 0);
-                            self.builder.ins().bor_imm(state, 1i64 << bit)
+                            self.builder.ins().bor_imm(state, mask)
                         }
                         // FIXME: a move out of an enum or a box forgets the rest of the local,
                         // which leaks it.
@@ -3927,7 +4021,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), self.blocks[*target]));
+                self.deferred_drops.push((block, place.clone(), *target));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -5554,12 +5648,15 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
 
     /// Drops every local that holds a value.
     fn drop_live_locals(&mut self) -> Result<()> {
-        // Locals the body never drops come first, last declared first. The rest go in the
-        // order the body drops them when nothing unwinds, which is innermost scope first.
+        // Locals the body never drops come first, last declared first, and of those the
+        // operands of the expression that unwound before the temporaries it borrowed, which
+        // live to the end of the statement. The rest go in the order the body drops them when
+        // nothing unwinds, which is innermost scope first.
         let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
         locals.reverse();
-        let rank = |local: &LocalId| {
-            self.drop_order.iter().position(|it| it == local).map_or(0, |at| at + 1)
+        let rank = |local: &LocalId| match self.drop_order.iter().position(|it| it == local) {
+            Some(at) => at + 2,
+            None => !self.operand_temps.contains(local) as usize,
         };
         locals.sort_by_key(rank);
         for local in locals {
@@ -6086,31 +6183,26 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     let pointee_meta = self
                         .is_unsized(pointee)
                         .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
-                    self.drop_value(pointer, pointee_meta, pointee)?;
+                    // The memory is freed even if dropping what it holds unwinds.
+                    self.guarded(
+                        |this| this.drop_value(pointer, pointee_meta, pointee),
+                        |this| {
+                            this.call_drop_impl(addr, ty)?;
+                            this.drop_adt_fields(addr, meta, ty)
+                        },
+                    )?;
                 }
                 if adt_def.destructor(self.interner).is_some() {
                     self.call_drop_impl_guarded(addr, meta, ty)?;
                 }
                 self.drop_adt_fields(addr, meta, ty)?;
             }
-            TyKind::Tuple(tys) => {
-                let layout = self.layout(ty)?;
-                for (i, field) in tys.iter().enumerate() {
-                    let offset = layout.fields.offset(i).bytes() as i64;
-                    let field_addr = self.builder.ins().iadd_imm(addr, offset);
-                    self.drop_value(field_addr, None, field)?;
-                }
-            }
+            TyKind::Tuple(tys) => self.drop_tuple_fields(addr, ty, tys.iter().collect())?,
             TyKind::Closure(_, args) => {
                 let TyKind::Tuple(tys) = args.as_closure().tupled_upvars_ty().kind() else {
                     unsupported!("drop glue for a closure without tupled upvars");
                 };
-                let layout = self.layout(ty)?;
-                for (i, field) in tys.iter().enumerate() {
-                    let offset = layout.fields.offset(i).bytes() as i64;
-                    let field_addr = self.builder.ins().iadd_imm(addr, offset);
-                    self.drop_value(field_addr, None, field)?;
-                }
+                self.drop_tuple_fields(addr, ty, tys.iter().collect())?
             }
             TyKind::Coroutine(..) => self.drop_coroutine(addr, ty)?,
             TyKind::Array(element, len) => {
@@ -6158,29 +6250,150 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         meta: Option<Value>,
     ) -> Result<()> {
         let field_types = self.cg.db.field_types(variant);
-        for (field, ty) in field_types.iter() {
-            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
-            let offset = layout.fields.offset(u32::from(field.into_raw()) as usize);
-            if self.is_unsized(self.normalize(ty)) {
-                let field_addr = self.unsized_field_addr(addr, meta, container, offset, ty)?;
-                self.drop_value(field_addr, meta, ty)?;
+        let fields: Vec<_> = field_types
+            .iter()
+            .map(|(field, ty)| {
+                let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                (layout.fields.offset(u32::from(field.into_raw()) as usize), ty)
+            })
+            .filter(|&(_, ty)| self.needs_drop(ty))
+            .collect();
+        self.drop_ladder(fields.len(), |this, at| {
+            let (offset, ty) = fields[at];
+            if this.is_unsized(this.normalize(ty)) {
+                let field_addr = this.unsized_field_addr(addr, meta, container, offset, ty)?;
+                this.drop_value(field_addr, meta, ty)
             } else {
-                let field_addr = self.builder.ins().iadd_imm(addr, offset.bytes() as i64);
-                let field_addr = self.aligned_for_drop(field_addr, ty, container)?;
-                self.drop_value(field_addr, None, ty)?;
+                let field_addr = this.builder.ins().iadd_imm(addr, offset.bytes() as i64);
+                let field_addr = this.aligned_for_drop(field_addr, ty, container)?;
+                this.drop_value(field_addr, None, ty)
+            }
+        })
+    }
+
+    fn drop_tuple_fields(&mut self, addr: Value, ty: Ty<'db>, fields: Vec<Ty<'db>>) -> Result<()> {
+        let layout = self.layout(ty)?;
+        let fields: Vec<_> =
+            fields.into_iter().enumerate().filter(|&(_, field)| self.needs_drop(field)).collect();
+        self.drop_ladder(fields.len(), |this, at| {
+            let (index, field) = fields[at];
+            let offset = layout.fields.offset(index).bytes() as i64;
+            let field_addr = this.builder.ins().iadd_imm(addr, offset);
+            this.drop_value(field_addr, None, field)
+        })
+    }
+
+    fn needs_drop(&self, ty: Ty<'db>) -> bool {
+        let ty = self.normalize(ty);
+        has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None
+    }
+
+    /// Runs `drop` for each of `0..count` in turn. If one unwinds the ones after it still run,
+    /// on the way out.
+    fn drop_ladder(
+        &mut self,
+        count: usize,
+        mut drop: impl FnMut(&mut Self, usize) -> Result<()>,
+    ) -> Result<()> {
+        if self.in_cleanup || count < 2 {
+            return (0..count).try_for_each(|at| drop(self, at));
+        }
+        let outer = self.landing_pad_for_call();
+        let pads: Vec<ir::Block> = (1..count)
+            .map(|_| {
+                let pad = self.builder.create_block();
+                self.builder.append_block_param(pad, PTR);
+                self.builder.set_cold_block(pad);
+                pad
+            })
+            .collect();
+        let enclosing = self.inner_pad;
+        let mut dropped = Ok(());
+        for at in 0..count {
+            self.inner_pad = pads.get(at).copied().or(enclosing);
+            dropped = drop(self, at);
+            if dropped.is_err() {
+                break;
             }
         }
+        self.inner_pad = enclosing;
+        dropped?;
+        let Some(after) = self.builder.current_block() else {
+            unsupported!("drop without a block to return to");
+        };
+        self.in_cleanup = true;
+        let mut cleaned = Ok(());
+        for at in 1..count {
+            self.builder.switch_to_block(pads[at - 1]);
+            let exception = self.builder.block_params(pads[at - 1])[0];
+            cleaned = drop(self, at);
+            if cleaned.is_err() {
+                break;
+            }
+            match (pads.get(at), outer) {
+                (Some(&next), _) | (None, Some(next)) => {
+                    self.builder.ins().jump(next, &[exception.into()]);
+                }
+                (None, None) => cleaned = self.resume_unwinding(exception),
+            }
+        }
+        self.in_cleanup = false;
+        cleaned?;
+        self.builder.switch_to_block(after);
         Ok(())
     }
 
     fn drop_elements(&mut self, addr: Value, len: Value, element: Ty<'db>) -> Result<()> {
         let size = self.layout(element)?.size.bytes() as i64;
+        let done = self.builder.create_block();
+        let zero = self.builder.ins().iconst(PTR, 0);
+        if self.in_cleanup {
+            self.drop_elements_from(addr, len, element, size, zero, None, done)?;
+        } else {
+            // If an element's drop unwinds, the ones after it are still dropped on the way out.
+            let outer = self.landing_pad_for_call();
+            let pad = self.builder.create_block();
+            self.builder.append_block_param(pad, PTR);
+            self.builder.set_cold_block(pad);
+            let index = self.drop_elements_from(addr, len, element, size, zero, Some(pad), done)?;
+            self.builder.switch_to_block(pad);
+            let exception = self.builder.block_params(pad)[0];
+            let rest = self.builder.ins().iadd_imm(index, 1);
+            let resume = self.builder.create_block();
+            self.builder.set_cold_block(resume);
+            self.in_cleanup = true;
+            let cleaned = self.drop_elements_from(addr, len, element, size, rest, None, resume);
+            self.in_cleanup = false;
+            cleaned?;
+            self.builder.switch_to_block(resume);
+            match outer {
+                Some(outer) => {
+                    self.builder.ins().jump(outer, &[exception.into()]);
+                }
+                None => self.resume_unwinding(exception)?,
+            }
+        }
+        self.builder.switch_to_block(done);
+        Ok(())
+    }
+
+    /// Drops the elements from `start` on and jumps to `done`, unwinding to `pad` if there is
+    /// one. Returns the index of the element being dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_elements_from(
+        &mut self,
+        addr: Value,
+        len: Value,
+        element: Ty<'db>,
+        size: i64,
+        start: Value,
+        pad: Option<ir::Block>,
+        done: ir::Block,
+    ) -> Result<Value> {
         let header = self.builder.create_block();
         let body = self.builder.create_block();
-        let done = self.builder.create_block();
         self.builder.append_block_param(header, PTR);
-        let zero = self.builder.ins().iconst(PTR, 0);
-        self.builder.ins().jump(header, &[zero.into()]);
+        self.builder.ins().jump(header, &[start.into()]);
         self.builder.switch_to_block(header);
         let index = self.builder.block_params(header)[0];
         let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
@@ -6188,11 +6401,16 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         self.builder.switch_to_block(body);
         let offset = self.builder.ins().imul_imm(index, size);
         let element_addr = self.builder.ins().iadd(addr, offset);
-        self.drop_value(element_addr, None, element)?;
+        let enclosing = self.inner_pad;
+        if pad.is_some() {
+            self.inner_pad = pad;
+        }
+        let dropped = self.drop_value(element_addr, None, element);
+        self.inner_pad = enclosing;
+        dropped?;
         let next = self.builder.ins().iadd_imm(index, 1);
         self.builder.ins().jump(header, &[next.into()]);
-        self.builder.switch_to_block(done);
-        Ok(())
+        Ok(index)
     }
 
     /// Calls `<ty as Drop>::drop` on the value at `addr`.
@@ -6255,6 +6473,50 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals a body drops whole, in the order of the blocks that drop them when each block
 /// comes after the blocks leading to it.
+fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let mut temps: rustc_hash::FxHashSet<LocalId> = body.locals.iter().map(|(id, _)| id).collect();
+    for &local in body.binding_locals.values().chain(&body.param_locals) {
+        temps.remove(&local);
+    }
+    let mut held = |place: &StoredPlace| {
+        temps.remove(&place.local);
+    };
+    let mut operand = |operand: &Operand, held: &mut dyn FnMut(&StoredPlace)| {
+        if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind
+            && !place.projection.as_slice().is_empty()
+        {
+            held(place);
+        }
+    };
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(to, rvalue) = &statement.kind else { continue };
+            if !to.projection.as_slice().is_empty() {
+                held(to);
+            }
+            match rvalue {
+                Rvalue::Ref(_, place)
+                | Rvalue::CopyForDeref(place)
+                | Rvalue::Discriminant(place)
+                | Rvalue::Len(place) => held(place),
+                Rvalue::Use(it) | Rvalue::UnaryOp(_, it) | Rvalue::Cast(_, it, _) => {
+                    operand(it, &mut held)
+                }
+                Rvalue::Aggregate(_, operands) => {
+                    operands.iter().for_each(|it| operand(it, &mut held))
+                }
+                _ => (),
+            }
+        }
+        if let Some(TerminatorKind::Call { args, .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
+        {
+            args.iter().for_each(|it| operand(it, &mut held));
+        }
+    }
+    temps
+}
+
 fn drop_order(body: &MirBody, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
     let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
         match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {

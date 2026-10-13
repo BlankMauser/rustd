@@ -209,4 +209,5 @@ fn main() {
     println!("box_patterns {:?}", cases::box_patterns::run());
     println!("promoted_call {:?}", cases::promoted_call::run());
     println!("type_ids {:?}", cases::type_ids::run());
+    println!("unwind_drops {:?}", cases::unwind_drops::run());
 }
