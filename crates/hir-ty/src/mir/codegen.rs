@@ -109,6 +109,8 @@ pub trait SymbolResolver {
     fn static_(&self, id: StaticId) -> Option<String>;
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
+    /// The path of an item, e.g. `core::any::TypeId`.
+    fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
 }
@@ -798,6 +800,60 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&id) = self.instances.get(&instance) {
             return Ok(id);
         }
+        if let InstanceDef::Fn(func) = def
+            && let Some(symbol) = self.any_method(func, args)
+        {
+            return self.import(&symbol, sig);
+        }
+        // A `TypeId` is a hash only rustc can compute, and the two compilers have to agree on
+        // it for `downcast` to work between their code. So take rustc's.
+        if let InstanceDef::Fn(func) = def
+            && let Some(ty) = self.type_id_of(func, args)
+        {
+            if let Some(symbol) = self.symbols.path(&format!("<core::any::TypeId>::of::<{ty}>")) {
+                return self.import(&symbol, sig);
+            }
+            // rustc inlines `TypeId::of` into most of its callers. What is left then is the
+            // `Any` method a `dyn Any` of the type calls, which makes no use of its `self`.
+            let Some(symbol) = self.symbols.path(&format!("<{ty} as core::any::Any>::type_id"))
+            else {
+                unsupported!("`TypeId` of `{ty}`, which rustc has no symbol for");
+            };
+            if let Some(&id) = self.instances.get(&instance) {
+                return Ok(id);
+            }
+            let mut method = sig.clone();
+            method.params.push(AbiParam::new(PTR));
+            let method = self.import(&symbol, &method)?;
+            let id = self
+                .module
+                .declare_function(
+                    &format!("rustd::type_id::{}", self.instances.len()),
+                    Linkage::Local,
+                    sig,
+                )
+                .map_err(|e| CodegenError::Backend(e.to_string()))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.signature = sig.clone();
+            let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            let mut values = builder.block_params(block).to_vec();
+            // A `&self` that points at nothing: any aligned address will do.
+            values.push(builder.ins().iconst(PTR, 16));
+            let method = self.module.declare_func_in_func(method, builder.func);
+            let call = builder.ins().call(method, &values);
+            let results = builder.inst_results(call).to_vec();
+            builder.ins().return_(&results);
+            builder.seal_all_blocks();
+            builder.finalize(self.module.isa().frontend_config());
+            self.builder_ctx = builder_ctx;
+            self.emit(id, &mut ctx)?;
+            self.instances.insert(instance, id);
+            return Ok(id);
+        }
         if signature.is_some_and(|it| !it.has_body()) {
             // The allocator entry points are declared in `alloc` and defined at link time,
             // under names in a crate of their own.
@@ -822,6 +878,118 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.instances.insert(instance.clone(), id);
         self.pending.push((instance, env, id));
         Ok(id)
+    }
+
+    /// The `T` of `TypeId::of::<T>` as rustc's symbols spell it, when `func` is that function.
+    fn type_id_of(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
+        let db = self.db;
+        if FunctionSignature::of(db, func).name.as_str() != "of" {
+            return None;
+        }
+        let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
+        let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).skip_binder().kind() else { return None };
+        if self.symbols.item(adt.def_id().into())? != "core::any::TypeId" {
+            return None;
+        }
+        self.symbol_type(args.as_slice().first()?.ty()?)
+    }
+
+    /// A type as it reads in a demangled rustc symbol. `None` for the types whose spelling
+    /// there this does not know: closures, `dyn`, function pointers, anything with a lifetime
+    /// argument.
+    fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
+        use std::fmt::Write;
+        let db = self.db;
+        let list = |tys: &mut dyn Iterator<Item = Ty<'db>>| {
+            tys.map(|it| self.symbol_type(it)).collect::<Option<Vec<_>>>().map(|it| it.join(", "))
+        };
+        Some(match ty.kind() {
+            TyKind::Bool => "bool".to_owned(),
+            TyKind::Char => "char".to_owned(),
+            TyKind::Str => "str".to_owned(),
+            TyKind::Never => "!".to_owned(),
+            TyKind::Int(it) => it.name_str().to_owned(),
+            TyKind::Uint(it) => it.name_str().to_owned(),
+            TyKind::Float(it) => it.name_str().to_owned(),
+            TyKind::Ref(_, pointee, Mutability::Not) => format!("&{}", self.symbol_type(pointee)?),
+            TyKind::Ref(_, pointee, Mutability::Mut) => {
+                format!("&mut {}", self.symbol_type(pointee)?)
+            }
+            TyKind::RawPtr(pointee, Mutability::Not) => {
+                format!("*const {}", self.symbol_type(pointee)?)
+            }
+            TyKind::RawPtr(pointee, Mutability::Mut) => {
+                format!("*mut {}", self.symbol_type(pointee)?)
+            }
+            TyKind::Slice(element) => format!("[{}]", self.symbol_type(element)?),
+            TyKind::Array(element, len) => {
+                format!("[{}; {}]", self.symbol_type(element)?, try_const_usize(db, len)?)
+            }
+            TyKind::Tuple(tys) if tys.len() == 1 => format!("({},)", list(&mut tys.iter())?),
+            TyKind::Tuple(tys) => format!("({})", list(&mut tys.iter())?),
+            TyKind::Adt(adt, args) => {
+                let mut path = self.symbols.item(adt.def_id().into())?;
+                let interner = DbInterner::new_no_crate(db);
+                let defaults = db.generic_defaults(adt.def_id().into());
+                let mut args = args.as_slice();
+                // rustc leaves out the arguments that say what the default says.
+                while let Some((last, rest)) = args.split_last()
+                    && let Some(default) = defaults.get(rest.len())
+                    && default.instantiate(interner, rest).skip_norm_wip() == *last
+                {
+                    args = rest;
+                }
+                let tys = args.iter().map(|it| it.ty()).collect::<Option<Vec<_>>>()?;
+                if !tys.is_empty() {
+                    write!(path, "<{}>", list(&mut tys.into_iter())?).ok()?;
+                }
+                path
+            }
+            TyKind::FnPtr(..) => {
+                let sig = ty.fn_sig(DbInterner::new_no_crate(db)).no_bound_vars()?;
+                if sig.abi() != ExternAbi::Rust
+                    || sig.c_variadic()
+                    || sig.safety() != crate::next_solver::abi::Safety::Safe
+                {
+                    return None;
+                }
+                let mut path = format!("fn({})", list(&mut sig.inputs().iter().copied())?);
+                if !sig.output().is_unit() {
+                    write!(path, " -> {}", self.symbol_type(sig.output())?).ok()?;
+                }
+                path
+            }
+            TyKind::Dynamic(bounds, _) => {
+                let principal = bounds.principal()?.skip_binder();
+                if principal.args.len() != 0 || bounds.projection_bounds().into_iter().count() != 0
+                {
+                    return None;
+                }
+                let mut path = format!("dyn {}", self.symbols.item(principal.def_id.0.into())?);
+                for auto in bounds.auto_traits() {
+                    write!(path, " + {}", self.symbols.item(auto.0.into())?).ok()?;
+                }
+                path
+            }
+            _ => return None,
+        })
+    }
+
+    /// rustc's own `<dyn Any>::is::<T>` or `downcast_ref::<T>`, when `func` is such a method
+    /// and rustc compiled it for this `T`. It has the `TypeId` of `T` inlined in it, which may
+    /// be the one place to get it.
+    fn any_method(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
+        let db = self.db;
+        let name = FunctionSignature::of(db, func).name.as_str();
+        let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
+        let self_ty = db.impl_self_ty(impl_).skip_binder();
+        let TyKind::Dynamic(bounds, _) = self_ty.kind() else { return None };
+        let principal = bounds.principal_def_id()?.0;
+        if self.symbols.item(principal.into())? != "core::any::Any" {
+            return None;
+        }
+        let ty = self.symbol_type(args.as_slice().first()?.ty()?)?;
+        self.symbols.path(&format!("<{}>::{name}::<{ty}>", self.symbol_type(self_ty)?))
     }
 
     /// The symbol a function declared in an `extern` block stands for.

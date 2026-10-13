@@ -2418,3 +2418,26 @@ pub mod promoted_call {
         vec![size.to_string()]
     }
 }
+
+pub mod type_ids {
+    use std::any::{Any, TypeId};
+
+    #[derive(Debug)]
+    pub struct Local(pub u8);
+    pub struct Generic<T>(pub T);
+
+    // A `TypeId` has to be the one rustc computed, or a value boxed by one compiler does not
+    // downcast in code from the other.
+    pub fn run() -> Vec<String> {
+        let boxed: Box<dyn Any> = Box::new(Local(3));
+        vec![
+            format!("{:?}", boxed.downcast_ref::<Local>()),
+            boxed.downcast_ref::<String>().is_some().to_string(),
+            boxed.is::<Local>().to_string(),
+            (TypeId::of::<Generic<Vec<u8>>>() == TypeId::of::<Generic<Vec<u8>>>()).to_string(),
+            (TypeId::of::<(u8, &'static str)>() == TypeId::of::<[u8; 4]>()).to_string(),
+            (TypeId::of::<dyn Any>() == TypeId::of::<fn(u8) -> u8>()).to_string(),
+            (boxed.type_id() == TypeId::of::<Box<dyn Any>>()).to_string(),
+        ]
+    }
+}

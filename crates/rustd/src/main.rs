@@ -250,6 +250,11 @@ impl SymbolResolver for Resolver<'_> {
     fn path(&self, path: &str) -> Option<String> {
         self.table.get(path).map(str::to_owned)
     }
+
+    fn item(&self, item: ModuleDefId) -> Option<String> {
+        let item = ModuleDef::from(item);
+        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+    }
 }
 
 fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {

@@ -208,4 +208,5 @@ fn main() {
     println!("array_map {:?}", cases::array_map::run());
     println!("box_patterns {:?}", cases::box_patterns::run());
     println!("promoted_call {:?}", cases::promoted_call::run());
+    println!("type_ids {:?}", cases::type_ids::run());
 }
