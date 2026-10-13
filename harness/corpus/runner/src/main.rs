@@ -247,4 +247,5 @@ fn main() {
     println!("fn_thread_local {:?}", cases::fn_thread_local::run());
     println!("shadowed_items {}", cases::shadowed_items::run());
     println!("hrtb_type_ids {:?}", cases::hrtb_type_ids::run());
+    println!("projected_patterns {:?}", cases::projected_patterns::run());
 }

@@ -79,7 +79,7 @@ class Fixture:
             except subprocess.TimeoutExpired:
                 raise SystemExit(f"rustd crashed on {crate}:\nerror: no result after {self.rustd_timeout}s")
             open(os.path.join(self.work, f"{crate}.stderr"), "w").write(run.stderr)
-            if os.environ.get("RUSTD_STDERR"): open(os.environ["RUSTD_STDERR"], "w").write(run.stderr)
+            if os.environ.get("RUSTD_STDERR"): open(os.environ["RUSTD_STDERR"], "a").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")
             objects.append(obj)

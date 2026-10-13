@@ -17,7 +17,12 @@ use crate::{
         },
     },
 };
-use crate::{method_resolution::CandidateId, next_solver::GenericArgs};
+use crate::{
+    method_resolution::CandidateId,
+    next_solver::{
+        GenericArgs, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
+    },
+};
 
 macro_rules! not_supported {
     ($x: expr) => {
@@ -182,7 +187,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Pat::Wild => (current, current_else),
             Pat::Tuple { args, ellipsis } => {
-                let place_ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+                let place_ty = self.place_ty(&cond_place);
                 let subst = match place_ty.kind() {
                     TyKind::Tuple(s) => s,
                     _ => {
@@ -541,7 +546,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 )?
             }
             Pat::Ref { pat, mutability: _ } => {
-                let ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+                let ty = self.place_ty(&cond_place);
                 if !ty.is_ref() {
                     return Err(MirLowerError::TypeError(
                         "non reference type matched with reference pattern",
@@ -661,6 +666,16 @@ impl<'db> MirLowerCtx<'_, 'db> {
         Ok((then_target, Some(else_target)))
     }
 
+    /// The type of a place, normalized: the local of a `?` has the type `<R as Try>::Residual`.
+    fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
+        let ty = place.ty(&self.result, &self.infcx, self.env).ty;
+        if !matches!(ty.kind(), TyKind::Alias(..)) {
+            return ty;
+        }
+        let mut ocx = ObligationCtxt::new(&self.infcx);
+        ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty).unwrap_or(ty)
+    }
+
     fn pattern_matching_variant(
         &mut self,
         cond_place: Place<'db>,
@@ -671,7 +686,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         shape: AdtPatternShape<'_>,
         mode: MatchingMode,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
-        let place_ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+        let place_ty = self.place_ty(&cond_place);
         let Some((place_adt, _)) = place_ty.as_adt() else {
             return Err(MirLowerError::TypeError("non ADT type matched with ADT pattern"));
         };

@@ -3676,3 +3676,63 @@ pub mod hrtb_type_ids {
         (escape(String::from("bar")), same(String::from("bar")))
     }
 }
+
+/// A parameter typed `Self::Residual` in an impl is matched as the type the impl gives it.
+pub mod projected_patterns {
+    use std::convert::Infallible;
+    use std::task::Poll;
+
+    pub trait Try {
+        type Output;
+        type Residual;
+        fn from_residual(residual: Self::Residual) -> Self;
+        fn branch(self) -> Result<Self::Output, Self::Residual>;
+    }
+
+    impl<T> Try for Option<T> {
+        type Output = T;
+        type Residual = Option<Infallible>;
+        fn from_residual(residual: Self::Residual) -> Self {
+            match residual {
+                None => None,
+                Some(never) => match never {},
+            }
+        }
+        fn branch(self) -> Result<T, Self::Residual> {
+            match self {
+                Some(value) => Ok(value),
+                None => Err(None),
+            }
+        }
+    }
+
+    impl<T, E> Try for Poll<Result<T, E>> {
+        type Output = Poll<T>;
+        type Residual = Result<Infallible, E>;
+        fn from_residual(residual: Self::Residual) -> Self {
+            match residual {
+                Err(e) => Poll::Ready(Err(e)),
+                Ok(never) => match never {},
+            }
+        }
+        fn branch(self) -> Result<Poll<T>, Self::Residual> {
+            match self {
+                Poll::Pending => Ok(Poll::Pending),
+                Poll::Ready(Ok(value)) => Ok(Poll::Ready(value)),
+                Poll::Ready(Err(e)) => Err(Err(e)),
+            }
+        }
+    }
+
+    fn round_trip<R: Try>(value: R) -> Option<R> {
+        value.branch().err().map(R::from_residual)
+    }
+
+    pub fn run() -> (Option<Option<u8>>, Option<Poll<Result<u8, String>>>, bool) {
+        (
+            round_trip(None::<u8>),
+            round_trip(Poll::Ready(Err::<u8, _>(String::from("bad")))),
+            round_trip(Poll::Ready(Ok::<u8, String>(3))).is_none(),
+        )
+    }
+}
