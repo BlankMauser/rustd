@@ -507,17 +507,25 @@ fn expand_repeat(
         }
 
         if let Some(sep) = separator {
+            let marked = |mut leaf: tt::Leaf| {
+                match &mut leaf {
+                    tt::Leaf::Literal(it) => marker(&mut it.span),
+                    tt::Leaf::Punct(it) => marker(&mut it.span),
+                    tt::Leaf::Ident(it) => marker(&mut it.span),
+                }
+                leaf
+            };
             match sep {
-                Separator::Ident(ident) => builder.push(tt::Leaf::from(ident.clone())),
-                Separator::Literal(lit) => builder.push(tt::Leaf::from(lit.clone())),
+                Separator::Ident(ident) => builder.push(marked(ident.clone().into())),
+                Separator::Literal(lit) => builder.push(marked(lit.clone().into())),
                 Separator::Puncts(puncts) => {
                     for &punct in puncts {
-                        builder.push(tt::Leaf::from(punct));
+                        builder.push(marked(punct.into()));
                     }
                 }
                 Separator::Lifetime(punct, ident) => {
-                    builder.push(tt::Leaf::from(*punct));
-                    builder.push(tt::Leaf::from(ident.clone()));
+                    builder.push(marked((*punct).into()));
+                    builder.push(marked(ident.clone().into()));
                 }
             };
         }

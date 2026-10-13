@@ -126,6 +126,34 @@ fn main() {
 }
 
 #[test]
+fn test_stringify_spacing() {
+    check(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! stringify {() => {}}
+
+fn main() {
+    stringify!(0 as int! {...} != 0);
+    stringify!(1 + 'a: loop { break 'a 1 } == 1);
+    stringify!(E::U::<>>E::U::<u8>);
+    stringify!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1);
+}
+"#,
+        expect![[r##"
+#[rustc_builtin_macro]
+macro_rules! stringify {() => {}}
+
+fn main() {
+    "0 as int! {...} != 0";
+    "1 + \'a: loop { break \'a 1 } == 1";
+    "E::U::<>>E::U::<u8>";
+    "a +-b; x<<=y; &&z; {} {} {a} { a } {a} { a }; f::<\'a>(); |&\'a x| 1";
+}
+"##]],
+    );
+}
+
+#[test]
 fn test_env_expand() {
     check(
         r#"

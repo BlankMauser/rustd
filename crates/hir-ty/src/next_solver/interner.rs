@@ -1630,6 +1630,8 @@ impl<'db> Interner for DbInterner<'db> {
                 };
                 module.block(self.db)
             });
+            let in_block = type_block.is_some() || trait_block.is_some();
+            let mut seen = Vec::new();
             TraitImpls::for_each_crate_and_block_trait_and_type(
                 self.db,
                 krate,
@@ -1638,11 +1640,20 @@ impl<'db> Interner for DbInterner<'db> {
                 &mut |impls| {
                     let (regular_impls, builtin_derive_impls) =
                         impls.for_trait_and_self_ty(trait_def_id.0, &simp);
-                    for &impl_ in regular_impls {
-                        try_visit!(f(impl_.into()));
-                    }
-                    for &impl_ in builtin_derive_impls {
-                        try_visit!(f(impl_.into()));
+                    for impl_ in regular_impls
+                        .iter()
+                        .map(|&it| AnyImplId::from(it))
+                        .chain(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)))
+                    {
+                        // The impls of a `const _` block are among those of its crate as well
+                        // as its own, and the solver takes a second copy for an ambiguity.
+                        if in_block {
+                            if seen.contains(&impl_) {
+                                continue;
+                            }
+                            seen.push(impl_);
+                        }
+                        try_visit!(f(impl_));
                     }
                     R::output()
                 },

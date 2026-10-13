@@ -197,11 +197,10 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                 type_of(impl_id)
                     // A specializing impl has the types of the impl it specializes.
                     .or_else(|| {
-                        let ancestor = crate::specialization::specialized_ancestor(
-                            db,
-                            impl_id,
-                            |it| type_of(it).is_some(),
-                        )?;
+                        let ancestor =
+                            crate::specialization::specialized_ancestor(db, impl_id, |it| {
+                                type_of(it).is_some()
+                            })?;
                         type_of(ancestor)
                     })
                     .or_else(|| {

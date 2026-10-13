@@ -11,8 +11,11 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use hir::{AsAssocItem, AssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
-use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
+use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
+use hir_def::{
+    AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
+    expr_store::Body, item_scope::ItemScope,
+};
 use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -332,7 +335,10 @@ impl SymbolResolver for Resolver<'_> {
         names.push(owner);
         names.reverse();
         closures.reverse();
-        self.table.get_nested(&names.join("::"), &closures).map(str::to_owned)
+        let path = names.join("::");
+        // Only a path through a closure or an anonymous constant has segments left out of it.
+        let symbol = self.table.get_nested(&path, &closures).or_else(|| self.table.get(&path));
+        symbol.map(str::to_owned)
     }
 
     fn path(&self, path: &str) -> Option<String> {
@@ -374,23 +380,47 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
         .with_context(|| format!("crate {krate} not found in workspace"))?;
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
-    while let Some(module) = modules.pop() {
-        modules.extend(module.children(db));
-        for def in module.declarations(db) {
-            // A function declared in an `extern` block has no body to compile.
-            if let Ok(ModuleDefId::FunctionId(id)) = ModuleDefId::try_from(def)
-                && !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_))
-            {
-                functions.push(id);
+    // Each scope's functions, and the bodies whose blocks declare more scopes.
+    let mut bodies: Vec<DefWithBodyId> = Vec::new();
+    let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
+        for def in scope.declarations() {
+            match def {
+                // A function declared in an `extern` block has no body to compile.
+                ModuleDefId::FunctionId(id)
+                    if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) =>
+                {
+                    functions.push(id);
+                    bodies.push(id.into());
+                }
+                ModuleDefId::ConstId(id) => bodies.push(id.into()),
+                ModuleDefId::StaticId(id) => bodies.push(id.into()),
+                _ => {}
             }
         }
-        for imp in module.impl_defs(db) {
-            for item in imp.items(db) {
-                if let AssocItem::Function(func) = item
-                    && let Ok(func) = FunctionId::try_from(func)
-                {
-                    functions.push(func);
+        bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                match item {
+                    AssocItemId::FunctionId(id) => {
+                        functions.push(id);
+                        bodies.push(id.into());
+                    }
+                    AssocItemId::ConstId(id) => bodies.push(id.into()),
+                    AssocItemId::TypeAliasId(_) => {}
                 }
+            }
+        }
+    };
+    while let Some(module) = modules.pop() {
+        modules.extend(module.children(db));
+        let id = hir_def::ModuleId::from(module);
+        scope(&id.def_map(db)[id].scope, &mut bodies);
+    }
+    // A body's blocks include those of the blocks in it, but not those of the items in them.
+    while let Some(body) = bodies.pop() {
+        for (_, def_map) in Body::of(db, body).blocks(db) {
+            for (_, module) in def_map.modules() {
+                scope(&module.scope, &mut bodies);
             }
         }
     }

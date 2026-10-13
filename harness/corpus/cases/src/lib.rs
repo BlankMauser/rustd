@@ -3840,3 +3840,196 @@ pub mod specialized_items {
     }
     impl<I: Iterator> RevPairs for I {}
 }
+
+/// A derive on a struct outside a `const _` calls the derives of a type declared inside it.
+pub mod hidden_derives {
+    pub trait Public {
+        type Internal;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Small(<Small as Public>::Internal);
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Wide(<Wide as Public>::Internal);
+
+    const _: () = {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        pub struct Internal(u8);
+        impl Public for Small {
+            type Internal = Internal;
+        }
+        impl Small {
+            pub fn new(bits: u8) -> Small {
+                Small(Internal(bits))
+            }
+        }
+    };
+
+    const _: () = {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        pub struct Internal(u64, u64);
+        impl Public for Wide {
+            type Internal = Internal;
+        }
+        impl Wide {
+            pub fn new(bits: u64) -> Wide {
+                Wide(Internal(bits, !bits))
+            }
+        }
+    };
+
+    pub fn run() -> (bool, bool, std::cmp::Ordering, std::cmp::Ordering, String, String) {
+        let (a, b) = (Small::new(1), Small::new(2));
+        let (c, d) = (Wide::new(7), Wide::new(7));
+        (a == b, c == d, a.cmp(&b), c.cmp(&d), format!("{a:?}"), format!("{c:?}"))
+    }
+}
+
+/// A parameter moved out in the operand of a `break` is not dropped again when the function
+/// returns.
+pub mod moved_in_break {
+    use std::mem;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Counted(u8);
+
+    impl Counted {
+        fn new(value: u8) -> Counted {
+            LIVE.fetch_add(1, SeqCst);
+            Counted(value)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, SeqCst);
+        }
+    }
+
+    const fn same_size<A, B>() -> bool {
+        mem::size_of::<A>() == mem::size_of::<B>()
+    }
+
+    unsafe fn swap<T>(dst: *mut T, val: T) -> T {
+        loop {
+            if same_size::<T, ()>() {
+                break {
+                    let res = unsafe { mem::transmute_copy(&()) };
+                    mem::forget(val);
+                    res
+                };
+            }
+            if same_size::<T, AtomicU8>() {
+                let a: &AtomicU8;
+                break {
+                    a = unsafe { &*(dst as *const AtomicU8) };
+                    let res = unsafe {
+                        mem::transmute_copy(&a.swap(mem::transmute_copy(&val), SeqCst))
+                    };
+                    mem::forget(val);
+                    res
+                };
+            }
+            break unsafe { std::ptr::replace(dst, val) };
+        }
+    }
+
+    fn local() -> (usize, usize) {
+        static CNT: AtomicUsize = AtomicUsize::new(0);
+        CNT.store(0, SeqCst);
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Foo();
+
+        impl Foo {
+            fn new() -> Foo {
+                CNT.fetch_add(1, SeqCst);
+                Foo()
+            }
+        }
+
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                CNT.fetch_sub(1, SeqCst);
+            }
+        }
+
+        let mut a = Foo::new();
+        assert_eq!(unsafe { swap(&mut a, Foo::new()) }, Foo::new());
+        let one = CNT.load(SeqCst);
+        drop(a);
+        (one, CNT.load(SeqCst))
+    }
+
+    pub fn run() -> (u8, usize, usize, usize, (usize, usize)) {
+        let mut cell = Counted::new(5);
+        let old = unsafe { swap(&mut cell, Counted::new(6)) };
+        let two = LIVE.load(SeqCst);
+        let value = old.0;
+        drop(old);
+        let one = LIVE.load(SeqCst);
+        let mut wide = (Counted::new(1), 7u32);
+        drop(unsafe { swap(&mut wide, (Counted::new(2), 8)) });
+        (value, two, one, LIVE.load(SeqCst), local())
+    }
+}
+
+/// `stringify!` keeps the spacing of the source, also for tokens a macro took apart as `tt`s
+/// and put back together.
+pub mod stringified {
+    macro_rules! all {
+        ($($t:tt)*) => {
+            stringify!($($t)*)
+        };
+    }
+
+    // Moves one token at a time into the buffer and writes the `>>` itself, as `anyhow::ensure!`
+    // does.
+    macro_rules! munch {
+        (($($buf:tt)*) $dup:tt >> $($rest:tt)*) => {
+            stringify!($($buf)* > > $($rest)*)
+        };
+        (($($buf:tt)*) ($first:tt $($dup:tt)*) $skip:tt $($rest:tt)*) => {
+            munch!(($($buf)* $first) ($($rest)*) $($rest)*)
+        };
+    }
+
+    macro_rules! body {
+        ($a:tt $b:tt) => {
+            stringify!($a+$b; $a+ $b; $a +$b, f($a)+1, ($a)$b, [$a]+{$b}+{ $b}, $a::$b, $a+=..=$b<-1)
+        };
+    }
+
+    macro_rules! tts {
+        ($a:tt,$b:tt) => {
+            stringify!($a $b|$a+1|$a 1|$a)
+        };
+    }
+
+    macro_rules! fragments {
+        ($a:expr, $b:ty) => {
+            stringify!($a+$b;$a,$b)
+        };
+    }
+
+    pub fn run() -> [&'static str; 14] {
+        [
+            body!(x y),
+            tts!(x,y),
+            tts!(+,-),
+            fragments!(x+1, Vec<u8>),
+            stringify!(0 as int! {...} != 0),
+            stringify!(1 + 'a: loop { break 'a 1 } == 1),
+            stringify!(E::U::<>>E::U::<u8>),
+            stringify!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
+            all!(0 as int! {...} != 0),
+            all!(1 + 'a: loop { break 'a 1 } == 1),
+            all!(E::U::<>>E::U::<u8>),
+            all!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
+            munch!(() (E::U::<>>E::U::<u8>) E::U::<>>E::U::<u8>),
+            munch!(() (a; &b + 'c: loop {}>>d) a; &b + 'c: loop {}>>d),
+        ]
+    }
+}

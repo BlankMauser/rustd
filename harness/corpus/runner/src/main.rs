@@ -251,4 +251,9 @@ fn main() {
     println!("projected_fields {:?}", cases::projected_fields::run());
     println!("anonymous_consts {:?}", cases::anonymous_consts::run());
     println!("specialized_items {:?}", cases::specialized_items::run());
+    println!("hidden_derives {:?}", cases::hidden_derives::run());
+    println!("moved_in_break {:?}", cases::moved_in_break::run());
+    for it in cases::stringified::run() {
+        println!("stringified {it:?}");
+    }
 }

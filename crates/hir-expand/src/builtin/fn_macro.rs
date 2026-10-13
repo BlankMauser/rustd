@@ -186,13 +186,29 @@ fn trace_macros_expand(
     ExpandResult::ok(quote! {span =>})
 }
 
+/// Whether the source has another token right after the token `text` at `span`. `None` if the
+/// source does not have that token there, which is the case for a token made by a macro.
+fn source_joined(db: &dyn SourceDatabase, span: Span, text: &str) -> Option<bool> {
+    let crate::FileRange { file_id, range } = crate::resolve_span(db, span);
+    let source = db.file_text(file_id.file_id(db)).text(db);
+    if source.get(std::ops::Range::<usize>::from(range))? != text {
+        return None;
+    }
+    let rest = &source[usize::from(range.end())..];
+    let is_trivia = rest.starts_with(char::is_whitespace)
+        || rest.starts_with("//")
+        || rest.starts_with("/*")
+        || rest.is_empty();
+    Some(!is_trivia)
+}
+
 fn stringify_expand(
-    _db: &dyn SourceDatabase,
+    db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let pretty = ::tt::stringify(tt.token_trees());
+    let pretty = ::tt::stringify(tt.token_trees(), &|span, text| source_joined(db, span, text));
 
     let expanded = quote! {span =>
         #pretty
@@ -224,7 +240,10 @@ fn assert_expand(
     let panic_args = rest.iter();
     let mac = if rest.is_empty() {
         // Without a message of its own, the assertion reports the condition.
-        let message = format!("assertion failed: {}", ::tt::stringify(cond.value));
+        let message = format!(
+            "assertion failed: {}",
+            ::tt::stringify(cond.value, &|span, text| source_joined(db, span, text))
+        );
         quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
     } else if use_panic_2021(db, span) {
         quote! {call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args) }
