@@ -204,4 +204,6 @@ fn main() {
     println!("union_pointer {:?}", cases::union_pointer::run());
     println!("async_basic {:?}", cases::async_basic::run());
     println!("async_more {:?}", cases::async_more::run());
+    println!("const_patterns {:?}", cases::const_patterns::run());
+    println!("array_map {:?}", cases::array_map::run());
 }

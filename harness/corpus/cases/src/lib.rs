@@ -2306,3 +2306,47 @@ pub mod async_more {
         out
     }
 }
+
+pub mod const_patterns {
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
+    pub enum Shape { Dot, Line(u8, u8), Named(&'static str), Many(&'static [u16]) }
+    #[derive(PartialEq, Eq)]
+    pub struct Pair(pub i32, pub Option<Shape>);
+    const A: Shape = Shape::Line(1, 2);
+    const B: Shape = Shape::Named("bee");
+    const C: Pair = Pair(7, Some(Shape::Many(&[1, 2, 3])));
+    const D: &[u8] = b"hello";
+    const E: [(u8, bool); 2] = [(1, true), (2, false)];
+    const F: &Pair = &Pair(1, None);
+    const G: (f32, char) = (1.5, 'x');
+    fn shape(s: Shape) -> u8 {
+        match s { A => 1, B => 2, Shape::Dot => 3, _ => 4 }
+    }
+    fn pair(p: &Pair) -> u8 {
+        match *p { C => 1, _ => match p { F => 2, _ => 3 } }
+    }
+    fn bytes(b: &[u8]) -> u8 {
+        match b { D => 1, b"" => 2, _ => 3 }
+    }
+    fn arr(e: [(u8, bool); 2]) -> u8 { match e { E => 1, _ => 0 } }
+    fn fl(e: (f32, char)) -> u8 { match e { G => 1, _ => 0 } }
+    pub fn run() -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!("{:?}", [shape(Shape::Line(1, 2)), shape(Shape::Line(1, 3)), shape(Shape::Named("bee")),
+            shape(Shape::Named("be")), shape(Shape::Dot), shape(Shape::Many(&[]))])); 
+        out.push(format!("{:?}", [pair(&Pair(7, Some(Shape::Many(&[1, 2, 3])))), pair(&Pair(7, Some(Shape::Many(&[1, 2])))),
+            pair(&Pair(7, None)), pair(&Pair(1, None)), pair(&Pair(7, Some(Shape::Many(&[1, 2, 4]))))])); 
+        out.push(format!("{:?}", [bytes(b"hello"), bytes(b""), bytes(b"hellp"), bytes(b"hell")])); 
+        out.push(format!("{:?}", [arr(E), arr([(1, true), (2, true)])])); 
+        out.push(format!("{:?}", [fl((1.5, 'x')), fl((1.5, 'y')), fl((f32::NAN, 'x'))])); 
+        out
+    }
+}
+
+pub mod array_map {
+    pub fn run() -> Vec<String> {
+        let doubled = [1u8, 2, 3].map(|x| x as u32 * 2);
+        let owned = [String::from("a"), String::from("b")].map(|s| s + "!");
+        vec![format!("{doubled:?}"), format!("{owned:?}")]
+    }
+}

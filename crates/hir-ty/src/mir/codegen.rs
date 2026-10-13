@@ -1759,6 +1759,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         // Only blocks that can run are compiled: `if cfg!(miri) { .. }` calls functions that do
         // not exist.
         let mut reachable = rustc_hash::FxHashSet::default();
+        // Switches on a value known now, and the one way they go.
+        let mut decided = FxHashMap::default();
         let mut worklist = vec![body.start_block];
         while let Some(id) = worklist.pop() {
             if !reachable.insert(id) {
@@ -1766,8 +1768,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::SwitchInt { discr, targets }) => {
-                    match self.const_bits(discr) {
-                        Some(bits) => worklist.push(targets.target_for_value(bits)),
+                    match self.switch_bits(&body.basic_blocks[id], discr) {
+                        Some(bits) => {
+                            let target = targets.target_for_value(bits);
+                            decided.insert(id, target);
+                            worklist.push(target)
+                        }
                         None => worklist.extend_from_slice(targets.all_targets()),
                     }
                 }
@@ -1830,7 +1836,12 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 unsupported!("block without terminator");
             };
             self.span = terminator.span;
-            self.terminator(&terminator.kind)?;
+            match decided.get(&id) {
+                Some(&target) => {
+                    self.builder.ins().jump(self.blocks[target], &[]);
+                }
+                None => self.terminator(&terminator.kind)?,
+            }
         }
         // Drops are generated last, when every field that gets moved out of a local is known.
         for (block, place, target) in std::mem::take(&mut self.deferred_clears) {
@@ -2154,6 +2165,36 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         let ConstKind::Value(value) = konst.as_ref().kind() else { return None };
         let layout = self.layout(ty).ok()?;
         Some(value.value.inner().to_leaf().to_bits(layout.size))
+    }
+
+    /// The value `block` switches on, when it is a constant: a literal, or an associated
+    /// constant such as `T::IS_ZST` that the block has just read. rustc does not compile the
+    /// arms such a switch never takes either, and they may not even type check for this `T`.
+    fn switch_bits(&mut self, block: &crate::mir::BasicBlock, discr: &Operand) -> Option<u128> {
+        if let Some(bits) = self.const_bits(discr) {
+            return Some(bits);
+        }
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &discr.kind else {
+            return None;
+        };
+        if self.field_path(place).is_none_or(|it| !it.is_empty()) {
+            return None;
+        }
+        let assigned = block.statements.iter().rev().find_map(|it| match &it.kind {
+            StatementKind::Assign(to, rvalue) => Some((to, rvalue)),
+            _ => None,
+        });
+        let Some((to, Rvalue::Use(Operand { kind: OperandKind::Constant { konst, ty }, .. }))) =
+            assigned
+        else {
+            return None;
+        };
+        if to != place || !matches!(ty.as_ref().kind(), TyKind::Bool) {
+            return None;
+        }
+        let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind() else { return None };
+        let allocation = self.eval_const(unevaluated).ok()?;
+        Some(*allocation.memory.first()? as u128)
     }
 
     fn place(&mut self, place: &StoredPlace) -> Result<(Value, PlaceTy<'db>)> {
@@ -3199,37 +3240,35 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             r_ref = Some(r_addr);
             r_addr = self.builder.ins().load(PTR, MEM, r_addr, 0);
         }
-        // A constant pattern of array type. Elements without padding or a custom `PartialEq`
-        // are equal exactly when their bytes are.
-        if let (BinOp::Eq | BinOp::Ne, TyKind::Array(element, _)) = (op, ty.kind())
+        // A constant pattern of a type that has no `==` of its own: rustc matches such a
+        // constant field by field, never through `PartialEq`.
+        if let BinOp::Eq | BinOp::Ne = op
             && matches!(
-                element.kind(),
-                TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char
+                ty.kind(),
+                TyKind::Adt(..)
+                    | TyKind::Tuple(_)
+                    | TyKind::Array(..)
+                    | TyKind::Slice(_)
+                    | TyKind::Str
             )
         {
-            let size = self.layout(ty)?.size.bytes();
-            let len = self.builder.ins().iconst(PTR, size as i64);
-            let order = self.memcmp(l_addr, r_addr, len)?;
-            let cc = if let BinOp::Eq = op { IntCC::Equal } else { IntCC::NotEqual };
-            return Ok(self.builder.ins().icmp_imm(cc, order, 0));
-        }
-        // A string literal pattern.
-        if let (BinOp::Eq | BinOp::Ne, TyKind::Str, Some(l_ref), Some(r_ref)) =
-            (op, ty.kind(), l_ref, r_ref)
-        {
-            let l_len = self.builder.ins().load(PTR, MEM, l_ref, 8);
-            let r_len = self.builder.ins().load(PTR, MEM, r_ref, 8);
-            let same_len = self.builder.ins().icmp(IntCC::Equal, l_len, r_len);
-            let zero = self.builder.ins().iconst(PTR, 0);
-            let len = self.builder.ins().select(same_len, l_len, zero);
-            let order = self.memcmp(l_addr, r_addr, len)?;
-            let same_bytes = self.builder.ins().icmp_imm(IntCC::Equal, order, 0);
-            let equal = self.builder.ins().band(same_len, same_bytes);
-            return Ok(if let BinOp::Eq = op {
-                equal
-            } else {
-                self.builder.ins().bxor_imm(equal, 1)
-            });
+            let metas = match (l_ref, r_ref) {
+                (Some(l_ref), Some(r_ref)) if self.is_unsized(ty) => Some((
+                    self.builder.ins().load(PTR, MEM, l_ref, 8),
+                    self.builder.ins().load(PTR, MEM, r_ref, 8),
+                )),
+                _ => None,
+            };
+            let (differ, done) = (self.builder.create_block(), self.builder.create_block());
+            self.builder.append_block_param(done, types::I8);
+            self.branch_unless_equal(l_addr, r_addr, metas, ty, differ)?;
+            let equal = self.builder.ins().iconst(types::I8, matches!(op, BinOp::Eq) as i64);
+            self.builder.ins().jump(done, &[equal.into()]);
+            self.builder.switch_to_block(differ);
+            let unequal = self.builder.ins().iconst(types::I8, matches!(op, BinOp::Ne) as i64);
+            self.builder.ins().jump(done, &[unequal.into()]);
+            self.builder.switch_to_block(done);
+            return Ok(self.builder.block_params(done)[0]);
         }
         if matches!(ty.kind(), TyKind::RawPtr(..))
             && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair(..))
@@ -3865,6 +3904,9 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         // The innermost reference to the callee and the address it is stored at.
         let mut by_ref = None;
         while let TyKind::Ref(_, inner, mutability) = ty.kind() {
+            if self.implements_fn_itself(method, ty, tuple_ty) {
+                break;
+            }
             by_ref = Some((addr, ty, mutability));
             if let TyKind::Dynamic(bounds, _) = inner.kind() {
                 // Which method is in the vtable depends on the object's trait, not on the
@@ -3956,7 +3998,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 }
             }
             // A type with its own `Fn` impls, which take the arguments as a tuple.
-            TyKind::Adt(..) => {
+            TyKind::Adt(..) | TyKind::Ref(..) => {
                 let layout = self.layout(tuple_ty)?;
                 let tuple = self.stack_slot(&layout);
                 for (i, &(src, ty)) in values.iter().enumerate() {
@@ -3980,6 +4022,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 self.call_direct(method, args, &[self_arg, (tuple, tuple_ty)], dst, dst_ty)
             }
             _ => unsupported!("Fn-trait call on {ty:?}"),
+        }
+    }
+
+    /// Whether the reference type `ty` has an `Fn` impl written for it, as opposed to the ones
+    /// every reference to a callable has, which call what it points to.
+    fn implements_fn_itself(&self, method: FunctionId, ty: Ty<'db>, tuple_ty: Ty<'db>) -> bool {
+        let db = self.cg.db;
+        let args = GenericArgs::new_from_slice(&[ty.into(), tuple_ty.into()]);
+        let (either::Either::Left(callee), _) = db.lookup_impl_method(self.env, method, args)
+        else {
+            return false;
+        };
+        let ItemContainerId::ImplId(impl_) = callee.lookup(db).container else {
+            return false;
+        };
+        match db.impl_self_ty(impl_).skip_binder().kind() {
+            TyKind::Ref(_, pointee, _) => !matches!(pointee.kind(), TyKind::Param(_)),
+            _ => false,
         }
     }
 
@@ -5579,6 +5639,204 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
     }
 
     /// Drops the fields of a struct or of the variant an enum is in.
+    /// Jumps to `differ` unless the values at `l` and `r` are the same value of `ty`, compared
+    /// the way a constant pattern is: field by field and through references. `metas` are the
+    /// lengths of the two when `ty` is unsized.
+    fn branch_unless_equal(
+        &mut self,
+        l: Value,
+        r: Value,
+        metas: Option<(Value, Value)>,
+        ty: Ty<'db>,
+        differ: ir::Block,
+    ) -> Result<()> {
+        let db = self.cg.db;
+        let ty = self.normalize(ty);
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) => {
+                let metas = self.is_unsized(pointee).then(|| {
+                    (
+                        self.builder.ins().load(PTR, MEM, l, 8),
+                        self.builder.ins().load(PTR, MEM, r, 8),
+                    )
+                });
+                let l = self.builder.ins().load(PTR, MEM, l, 0);
+                let r = self.builder.ins().load(PTR, MEM, r, 0);
+                self.branch_unless_equal(l, r, metas, pointee, differ)
+            }
+            TyKind::Str | TyKind::Slice(_) | TyKind::Array(..) => {
+                let element = match ty.kind() {
+                    TyKind::Slice(element) | TyKind::Array(element, _) => element,
+                    _ => Ty::new_uint(self.interner, rustc_type_ir::UintTy::U8),
+                };
+                let len = match (ty.kind(), metas) {
+                    (TyKind::Array(_, len), _) => {
+                        let Some(len) = try_const_usize(db, len) else {
+                            unsupported!("array with unevaluated length");
+                        };
+                        self.builder.ins().iconst(PTR, len as i64)
+                    }
+                    (_, Some((l_len, r_len))) => {
+                        let same = self.builder.ins().icmp(IntCC::Equal, l_len, r_len);
+                        self.branch_unless(same, differ);
+                        l_len
+                    }
+                    (_, None) => unsupported!("comparison of a slice without a length"),
+                };
+                let size = self.layout(element)?.size.bytes() as i64;
+                // Elements without padding or references are equal exactly when their bytes
+                // are.
+                if matches!(
+                    element.kind(),
+                    TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char
+                ) {
+                    let bytes = self.builder.ins().imul_imm(len, size);
+                    let order = self.memcmp(l, r, bytes)?;
+                    let same = self.builder.ins().icmp_imm(IntCC::Equal, order, 0);
+                    self.branch_unless(same, differ);
+                    return Ok(());
+                }
+                let header = self.builder.create_block();
+                let body = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.append_block_param(header, PTR);
+                let zero = self.builder.ins().iconst(PTR, 0);
+                self.builder.ins().jump(header, &[zero.into()]);
+                self.builder.switch_to_block(header);
+                let index = self.builder.block_params(header)[0];
+                let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+                self.builder.ins().brif(more, body, &[], done, &[]);
+                self.builder.switch_to_block(body);
+                let offset = self.builder.ins().imul_imm(index, size);
+                let l = self.builder.ins().iadd(l, offset);
+                let r = self.builder.ins().iadd(r, offset);
+                self.branch_unless_equal(l, r, None, element, differ)?;
+                let next = self.builder.ins().iadd_imm(index, 1);
+                self.builder.ins().jump(header, &[next.into()]);
+                self.builder.switch_to_block(done);
+                Ok(())
+            }
+            TyKind::Tuple(tys) => {
+                let layout = self.layout(ty)?;
+                for (i, field) in tys.iter().enumerate() {
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    let l = self.builder.ins().iadd_imm(l, offset);
+                    let r = self.builder.ins().iadd_imm(r, offset);
+                    self.branch_unless_equal(l, r, None, field, differ)?;
+                }
+                Ok(())
+            }
+            TyKind::Adt(adt_def, subst) => {
+                let layout = self.layout(ty)?;
+                match adt_def.def_id() {
+                    AdtId::UnionId(_) => unsupported!("comparison of a union"),
+                    AdtId::StructId(id) => {
+                        self.branch_unless_fields_equal(l, r, &layout, id.into(), subst, differ)
+                    }
+                    AdtId::EnumId(id) => {
+                        let wide = match &layout.variants {
+                            Variants::Multiple { tag, .. } => DiscriminantWidth::of(tag),
+                            Variants::Empty => return Ok(()),
+                            Variants::Single { index } => {
+                                let variant = id
+                                    .enum_variants(db)
+                                    .variants
+                                    .values()
+                                    .map(|&(variant, _)| variant)
+                                    .find(|variant| variant.index(db) == index.0);
+                                let Some(variant) = variant else { return Ok(()) };
+                                return self.branch_unless_fields_equal(
+                                    l,
+                                    r,
+                                    &layout,
+                                    variant.into(),
+                                    subst,
+                                    differ,
+                                );
+                            }
+                        };
+                        let Variants::Multiple { variants, .. } = &layout.variants else {
+                            return Ok(());
+                        };
+                        let l_discr = self.discriminant(l, ty, wide.scalar())?;
+                        let r_discr = self.discriminant(r, ty, wide.scalar())?;
+                        let same = self.builder.ins().icmp(IntCC::Equal, l_discr, r_discr);
+                        self.branch_unless(same, differ);
+                        let done = self.builder.create_block();
+                        let mut switch = Switch::new();
+                        let mut arms = Vec::new();
+                        for &(variant, _) in id.enum_variants(db).variants.values() {
+                            if db.field_types(variant.into()).iter().next().is_none() {
+                                continue;
+                            }
+                            let value = db.const_eval_discriminant(variant).map_err(|e| {
+                                CodegenError::Frontend(format!("discriminant: {e:?}"))
+                            })?;
+                            let block = self.builder.create_block();
+                            switch.set_entry(wide.entry(value), block);
+                            arms.push((block, variant));
+                        }
+                        switch.emit(&mut self.builder, l_discr, done);
+                        for (block, variant) in arms {
+                            self.builder.switch_to_block(block);
+                            let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                            self.branch_unless_fields_equal(
+                                l,
+                                r,
+                                layout,
+                                variant.into(),
+                                subst,
+                                differ,
+                            )?;
+                            self.builder.ins().jump(done, &[]);
+                        }
+                        self.builder.switch_to_block(done);
+                        Ok(())
+                    }
+                }
+            }
+            _ => {
+                let scalar = self.scalar_of(ty)?;
+                let l = self.builder.ins().load(scalar.ty, MEM, l, 0);
+                let r = self.builder.ins().load(scalar.ty, MEM, r, 0);
+                let same = if scalar.ty.is_float() {
+                    self.builder.ins().fcmp(FloatCC::Equal, l, r)
+                } else {
+                    self.builder.ins().icmp(IntCC::Equal, l, r)
+                };
+                self.branch_unless(same, differ);
+                Ok(())
+            }
+        }
+    }
+
+    fn branch_unless_fields_equal(
+        &mut self,
+        l: Value,
+        r: Value,
+        layout: &Layout,
+        variant: VariantId,
+        subst: GenericArgs<'db>,
+        differ: ir::Block,
+    ) -> Result<()> {
+        let field_types = self.cg.db.field_types(variant);
+        for (field, ty) in field_types.iter() {
+            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+            let offset = layout.fields.offset(u32::from(field.into_raw()) as usize).bytes() as i64;
+            let l = self.builder.ins().iadd_imm(l, offset);
+            let r = self.builder.ins().iadd_imm(r, offset);
+            self.branch_unless_equal(l, r, None, ty, differ)?;
+        }
+        Ok(())
+    }
+
+    /// Jumps to `otherwise` when `condition` is false, and carries on in a new block.
+    fn branch_unless(&mut self, condition: Value, otherwise: ir::Block) {
+        let next = self.builder.create_block();
+        self.builder.ins().brif(condition, next, &[], otherwise, &[]);
+        self.builder.switch_to_block(next);
+    }
+
     fn drop_adt_fields(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let db = self.cg.db;
         let TyKind::Adt(adt_def, subst) = ty.kind() else { return Ok(()) };
