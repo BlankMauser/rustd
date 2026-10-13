@@ -3470,8 +3470,8 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         operands.iter().map(|it| self.operand(it)).collect()
     }
 
-    /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`. MIR passes the callee first and
-    /// then the arguments one by one, not as a tuple.
+    /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`. For a call expression MIR passes
+    /// the callee first and then the arguments one by one, not as a tuple.
     fn call_fn_trait(
         &mut self,
         method: FunctionId,
@@ -3484,6 +3484,23 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             unsupported!("Fn-trait call without a callee");
         };
         let (mut addr, mut ty) = self.operand(callee)?;
+        let mut values = self.operands(rest)?;
+        // A call written as `f.call_mut(args)` does pass the tuple, which the callee takes
+        // apart all the same.
+        let tuple_ty = method_args.type_at(1);
+        if let (&[(tuple, ty)], TyKind::Tuple(fields)) = (&values[..], tuple_ty.kind())
+            && ty == tuple_ty
+        {
+            let layout = self.layout(tuple_ty)?;
+            values = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    let offset = layout.fields.offset(i).bytes() as i64;
+                    (self.builder.ins().iadd_imm(tuple, offset), field)
+                })
+                .collect();
+        }
         // The innermost reference to the callee and the address it is stored at.
         let mut by_ref = None;
         while let TyKind::Ref(_, inner, mutability) = ty.kind() {
@@ -3501,13 +3518,11 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 let Some(method) = method else {
                     unsupported!("Fn-trait call on {inner:?}");
                 };
-                let values = self.operands(rest)?;
                 return self.call_virtual(method, inner, addr, ty, &values, dst, dst_ty);
             }
             addr = self.builder.ins().load(PTR, MEM, addr, 0);
             ty = inner;
         }
-        let mut values = self.operands(rest)?;
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => {
                 let func = match def.0 {
@@ -3552,7 +3567,7 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                     .db
                     .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
                     .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-                if body.param_locals.len() != args.len() {
+                if body.param_locals.len() != values.len() + 1 {
                     unsupported!("closure called with a tuple of arguments");
                 }
                 // The body takes the closure by reference or by value depending on its kind,
@@ -3571,7 +3586,6 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
             }
             // A type with its own `Fn` impls, which take the arguments as a tuple.
             TyKind::Adt(..) => {
-                let tuple_ty = method_args.type_at(1);
                 let layout = self.layout(tuple_ty)?;
                 let tuple = self.stack_slot(&layout);
                 for (i, &(src, ty)) in values.iter().enumerate() {

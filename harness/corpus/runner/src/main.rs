@@ -187,5 +187,8 @@ fn main() {
     println!("const_overflow more {:?}", cases::const_overflow::more());
     println!("unwind_cleanup {:?}", cases::unwind_cleanup::run());
     println!("failing_drop {:?}", cases::unwind_cleanup::failing_drop());
+    println!("capture_enum_field {:?}", cases::capture_enum_field::run());
+    println!("autoref_promoted {:?}", cases::autoref_promoted::run());
+    println!("boxed_fn_tuple {:?}", cases::boxed_fn_tuple::run());
     println!("pattern_alternatives {:?} {:?}", cases::pattern_alternatives::guard((3, 42)), cases::pattern_alternatives::slices([1, 2, 3, 4, 5]));
 }

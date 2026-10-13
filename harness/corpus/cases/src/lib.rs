@@ -1608,3 +1608,55 @@ pub mod unwind_cleanup {
         (ok.into_inner(), failed.into_inner(), caught)
     }
 }
+
+/// Closures that each capture one field of an enum with a single variant.
+pub mod capture_enum_field {
+    #[derive(Debug, PartialEq)]
+    pub enum Color {
+        Rgb(u8, u8, u8),
+    }
+
+    pub fn run() -> Color {
+        let mut color = Color::Rgb(9, 9, 9);
+        let mut red = |v| {
+            let Color::Rgb(ref mut r, _, _) = color;
+            *r = v;
+        };
+        let mut blue = |v| {
+            let Color::Rgb(_, _, ref mut b) = color;
+            *b = v;
+        };
+        red(1);
+        blue(3);
+        color
+    }
+}
+
+/// A method call that borrows a constant uses the constant where it is, not a copy on the stack.
+pub mod autoref_promoted {
+    const BIG: [u8; 32 * 1024 * 1024] = [42; 32 * 1024 * 1024];
+    const SMALL: [u16; 3] = [1, 2, 3];
+
+    pub fn run() -> (usize, Option<&'static u16>, bool) {
+        (BIG.len(), SMALL.last(), std::ptr::eq(SMALL.as_ptr(), SMALL.as_ptr()))
+    }
+}
+
+/// `Box<dyn FnMut>` forwards its arguments to the closure as the tuple it was called with.
+pub mod boxed_fn_tuple {
+    fn join(key: String, val: String, n: u8) -> String {
+        format!("{key}={val}/{n}")
+    }
+
+    pub fn run() -> (String, u32, String) {
+        let mut seen = 0;
+        let mut two: Box<dyn FnMut(String, String, u8) -> String> = Box::new(|a, b, n| {
+            seen += 1;
+            join(a, b, n)
+        });
+        let joined = two("k".to_string(), "v".to_string(), 7);
+        drop(two);
+        let none: Box<dyn Fn() -> String> = Box::new(|| "none".to_string());
+        (joined, seen, none())
+    }
+}

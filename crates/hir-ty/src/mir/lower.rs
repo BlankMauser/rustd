@@ -385,11 +385,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         rest: &[Adjustment],
         m: Mutability,
     ) -> Result<'db, Option<BasicBlockId>> {
+        let locals = self.result.locals.len();
         let Some((p, current)) =
             self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
         else {
             return Ok(None);
         };
+        // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does.
+        if m.is_not()
+            && rest.is_empty()
+            && p.local.into_raw().into_u32() as usize >= locals
+            && p.projection.as_slice().is_empty()
+            && self.is_promotable_unadjusted(expr_id)
+        {
+            self.result.promoted_locals.push((p.local, expr_id));
+        }
         let bk = BorrowKind::from_rustc_mutability(m);
         self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
         Ok(Some(current))
@@ -2578,7 +2588,7 @@ pub fn mir_body_for_closure_query<'db>(
                     }
                 }
                 // Exactly this place.
-                Some((hir_place.0.place.projections.len(), hir_place))
+                Some((mir_projections.len(), hir_place))
             });
             match projections {
                 Some((skip_projections_up_to, (hir_place, upvar_local, capture_idx))) => {

@@ -669,7 +669,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
         Ok(match variant {
             VariantId::EnumVariantId(v) => {
-                if mode == MatchingMode::Check {
+                // A pattern for the only variant of an enum always matches, and a closure that
+                // captures one field of such an enum has no discriminant to read.
+                let only_variant = hir_def::Lookup::lookup(&v, self.db)
+                    .parent
+                    .enum_variants(self.db)
+                    .variants
+                    .len()
+                    == 1;
+                if mode == MatchingMode::Check && !only_variant {
                     let e = self.const_eval_discriminant(v)? as u128;
                     let tmp = self.discr_temp_place(current);
                     self.push_assignment(
