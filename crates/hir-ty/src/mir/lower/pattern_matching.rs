@@ -569,7 +569,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 );
                 (current, current_else)
             }
-            Pat::Box { .. } => not_supported!("box pattern"),
+            &Pat::Box { inner } => {
+                let cond_place = cond_place.project(ProjectionElem::Deref);
+                self.pattern_match_inner(current, current_else, cond_place, inner, mode)?
+            }
             Pat::Deref { .. } => not_supported!("deref pattern"),
         })
     }

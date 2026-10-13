@@ -2,6 +2,7 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
+#![feature(box_patterns)]
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
@@ -2348,5 +2349,72 @@ pub mod array_map {
         let doubled = [1u8, 2, 3].map(|x| x as u32 * 2);
         let owned = [String::from("a"), String::from("b")].map(|s| s + "!");
         vec![format!("{doubled:?}"), format!("{owned:?}")]
+    }
+}
+
+pub mod box_patterns {
+    pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(format!("drop {}", self.0));
+        }
+    }
+    pub enum List {
+        Nil,
+        Cons(u32, Box<List>),
+    }
+    fn sum(list: &List) -> u32 {
+        match list {
+            List::Nil => 0,
+            List::Cons(value, box rest) => *value + sum(rest),
+        }
+    }
+    fn take(pair: Box<(Noisy, Noisy)>) -> Noisy {
+        let box (first, _second) = pair;
+        first.1.borrow_mut().push("taken".to_owned());
+        first
+    }
+    fn by_ref(option: &Box<Option<String>>) -> usize {
+        match option {
+            box Some(text) => text.len(),
+            box None => 0,
+        }
+    }
+    fn mutate(pair: &mut Box<(u8, String)>) {
+        let box (_, ref mut text) = *pair;
+        text.push('!');
+    }
+    fn nested(inner: Box<Box<Noisy>>) -> &'static str {
+        let box box noisy = inner;
+        noisy.0
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
+        let mut out = vec![sum(&list).to_string()];
+        let kept = take(Box::new((Noisy("a", log.clone()), Noisy("b", log.clone()))));
+        out.push(kept.0.to_owned());
+        out.push(by_ref(&Box::new(Some("hey".to_owned()))).to_string());
+        out.push(by_ref(&Box::new(None)).to_string());
+        let mut pair = Box::new((1, "x".to_owned()));
+        mutate(&mut pair);
+        out.push(pair.1.clone());
+        out.push(nested(Box::new(Box::new(Noisy("n", log.clone())))).to_owned());
+        drop(kept);
+        out.extend(log.borrow().iter().cloned());
+        out
+    }
+}
+
+pub mod promoted_call {
+    #[repr(packed)]
+    pub struct Packed(pub u8, pub u32);
+
+    // `size_of` is promotable: `&size_of::<T>()` is a constant, not a call that writes one.
+    pub fn run() -> Vec<String> {
+        let size: &'static usize = &std::mem::size_of::<Packed>();
+        assert_eq!(std::mem::size_of::<Packed>(), 5);
+        vec![size.to_string()]
     }
 }

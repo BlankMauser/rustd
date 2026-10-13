@@ -1836,8 +1836,17 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
                 unsupported!("block without terminator");
             };
             self.span = terminator.span;
-            match decided.get(&id) {
-                Some(&target) => {
+            let target = match &terminator.kind {
+                // A promoted call already holds its value, and that value is read-only.
+                TerminatorKind::Call { destination, target: Some(target), .. }
+                    if self.constant_locals.contains(&destination.local) =>
+                {
+                    Some(*target)
+                }
+                _ => decided.get(&id).copied(),
+            };
+            match target {
+                Some(target) => {
                     self.builder.ins().jump(self.blocks[target], &[]);
                 }
                 None => self.terminator(&terminator.kind)?,

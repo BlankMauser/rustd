@@ -206,4 +206,6 @@ fn main() {
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());
     println!("array_map {:?}", cases::array_map::run());
+    println!("box_patterns {:?}", cases::box_patterns::run());
+    println!("promoted_call {:?}", cases::promoted_call::run());
 }
