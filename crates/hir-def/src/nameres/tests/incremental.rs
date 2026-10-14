@@ -651,3 +651,30 @@ fn execute_assert_events(
     }
     expect.assert_debug_eq(&events);
 }
+
+#[test]
+fn item_after_impl_is_its_own_span_anchor() {
+    use hir_expand::HirFileId;
+    use syntax::{
+        AstNode,
+        ast::{self, HasModuleItem},
+    };
+
+    let (db, pos) = TestDB::with_position(
+        r#"
+struct S;
+impl S {
+    fn first(&self) {}
+    fn last(&self) {$0}
+}
+struct AfterImpl;
+"#,
+    );
+    let file_id = HirFileId::from(pos.file_id);
+    let after_impl = pos.file_id.parse(&db).tree().items().last().unwrap();
+    assert!(matches!(after_impl, ast::Item::Struct(_)));
+    let span = file_id.span_map(&db).span_for_range(after_impl.syntax().text_range());
+
+    assert_eq!(span.anchor.ast_id, file_id.ast_id_map(&db).ast_id(&after_impl).erase());
+    assert_eq!(u32::from(span.range.start()), 0);
+}

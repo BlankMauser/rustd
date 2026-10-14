@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """How much of a crate rust-analyzer redoes after different kinds of edit.
 
-usage: invalidation.py [crate]
+usage: invalidation.py [crate] [--only TEXT] [--perf DIR]
+
+`--only` keeps the scenarios whose name contains TEXT, plus one per entry of BODIES. `--perf`
+records the daemon with `perf` during each edit, into DIR/<n>.data.
 
 Starts the daemon on bench2 for one crate (default regex_automata) with RUSTD_STATS set, applies
 each scenario, and records the time to apply the change, the time spent in MIR queries, the
 total rebuild time, and how many MIR bodies came out different. Writes INVALIDATION.md.
 """
-import os, re, subprocess, sys, time
+import os, re, signal, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
@@ -66,7 +69,18 @@ SCENARIOS = {
 
 
 def main():
-    crate = sys.argv[1] if len(sys.argv) > 1 else "regex_automata"
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("crate", nargs="?", default="regex_automata")
+    ap.add_argument("--only")
+    ap.add_argument("--perf")
+    a = ap.parse_args()
+    crate = a.crate
+    scenarios = SCENARIOS
+    if a.only:
+        scenarios = {f"body in {os.path.basename(p)}": [insert_after(p, l, BODY)] for p, l in BODIES}
+        scenarios.update(SCENARIOS)
+        scenarios = {name: it for name, it in scenarios.items() if a.only in name}
     ws = os.path.join(HERE, "bench2")
     fx = Fixture(ws, [crate], ["-p", "bench2"])
     fx.rustc_build()
@@ -121,9 +135,15 @@ def main():
 
     try:
         wait(r"watching \d+ files", 0)
-        for name, changes in SCENARIOS.items():
+        for n, (name, changes) in enumerate(scenarios.items()):
             before = edits
+            perf = a.perf and subprocess.Popen(
+                ["perf", "record", "--call-graph", "dwarf,16384", "-F", "499", "-q", "-p", str(daemon.pid), "-o", f"{a.perf}/{n}.data"],
+                stderr=subprocess.DEVNULL)
             write(changes)
+            if perf:
+                perf.send_signal(signal.SIGINT)
+                perf.wait()
             log.seek(0)
             text = log.read()
             builds = re.findall(
@@ -154,11 +174,11 @@ def main():
            "|---|---|---|---|---|---|---|"]
     for name, builds, apply, total, changed, bodies, compiled, e2b in rows:
         out.append(f"| {name} | {builds} | {apply:.1f} | {total:.0f} | {e2b:.0f} | {changed} of {bodies} | {compiled} |")
-    open(os.path.join(HERE, f"INVALIDATION-{crate}.md"), "w").write("\n".join(out) + "\n")
+    if not a.only:
+        open(os.path.join(HERE, f"INVALIDATION-{crate}.md"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))
 
 
 if __name__ == "__main__":
-    import signal
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     main()

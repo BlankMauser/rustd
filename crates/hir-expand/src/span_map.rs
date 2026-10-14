@@ -106,6 +106,9 @@ pub(crate) fn real_span_map(
         }
         _ => (),
     });
+    // The lookup is a binary search, and the nested items were added after the items that
+    // hold them.
+    pairs.sort_by_key(|&(offset, _)| offset);
 
     RealSpanMap::from_file(
         editioned_file_id.span_file_id(db),
