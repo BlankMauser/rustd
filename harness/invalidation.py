@@ -93,6 +93,8 @@ def main():
     ap.add_argument("--perf")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--cargo", action="store_true")
+    ap.add_argument("--patch", action="store_true",
+                    help="with --cargo: the daemon answers an edit with a patch object linked ahead of the first one")
     a = ap.parse_args()
     crate = a.crate
     crates = [x for name in crate.split(",") for x in ("--crate", name)]
@@ -108,9 +110,11 @@ def main():
     if a.cargo:
         args = list(fx.link_args)
         first = next(i for i, arg in enumerate(args) if arg.endswith((".rlib", ".rcgu.o")))
-        args[first:first] = [os.path.join(fx.work, "rustd.o"), "-Wl,--allow-multiple-definition"]
+        patch = os.path.join(fx.work, "rustd.patch.o")
+        objects = [patch] * a.patch + [os.path.join(fx.work, "rustd.o")]
+        args[first:first] = [*objects, "-Wl,--allow-multiple-definition"]
         fx.binary = args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
-        link = ["--link-cmd", shlex.join(args)]
+        link = ["--link-cmd", shlex.join(args)] + ["--patch", patch] * a.patch
         # cargo as it comes: incremental, and none of the flags the harness builds with.
         cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTFLAGS", "CARGO_INCREMENTAL")}
         cargo_env["CARGO_TARGET_DIR"] = os.path.join(fx.work, "cargo")
@@ -191,7 +195,7 @@ def main():
             log.seek(0)
             text = log.read()
             builds = re.findall(
-                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\nphases: compile (\S+), resolve (\S+), define (\S+), (?:fallback \S+, )?object (\S+), \d+ rounds\n(?:link: (\S+) .*\n)?edit-to-binary: (\S+)",
+                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\n(?:(?:no )?patch: .*\n)?phases: compile (\S+), resolve (\S+), define (\S+), (?:fallback \S+, )?object (\S+), \d+ rounds\n(?:link: (\S+) .*\n)?edit-to-binary: (\S+)",
                 text)[before:edits]
             apply = sum(millis(b[0]) for b in builds)
             total = sum(millis(b[4]) for b in builds)

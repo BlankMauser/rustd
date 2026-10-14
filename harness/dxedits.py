@@ -6,7 +6,7 @@ usage: dxedits.py CHECKOUT crate[,crate...] SYMBOLS_FILE
 Starts the daemon on the crates, waits for the first build, applies each edit and reports the
 time the daemon took to rebuild and how many functions it compiled again.
 """
-import os, re, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
@@ -38,6 +38,7 @@ def main():
             ("1 function body (is_wrapping_rustc)", f"{cli}/rustcwrapper.rs", lambda t: t.replace(wrap, wrap + BODY + "\n", 1)),
             ("new private fn", f"{cli}/build/builder.rs", lambda t: t + NEW_FN),
             ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
+            ("what `dx doctor --help` prints", f"{cli}/cli/mod.rs", lambda t: t.replace("/// Diagnose installed", "/// Diagnose (edited) installed", 1)),
         ]
     work = os.path.join(root, "work")
     log_path = os.path.join(work, "dxedits.log")
@@ -45,6 +46,15 @@ def main():
     out = open(log_path, "a")
     log = open(log_path)
     args = [x for c in crates for x in ("--crate", c)]
+    # DXEDITS_PATCH: the daemon links after each build, with a patch object ahead of the first one.
+    binary = os.path.join(work, "dx-rustd-bin")
+    if os.environ.get("DXEDITS_PATCH"):
+        link = list(json.load(open(os.path.join(work, "fixture.json")))["link_args"])
+        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
+        patch = os.path.join(work, "dx.patch.o")
+        link[first:first] = [patch, os.path.join(work, "dx.o"), "-Wl,--allow-multiple-definition"]
+        link[link.index("-o") + 1] = binary
+        args += ["--patch", patch, "--link-cmd", shlex.join(link)]
     start = time.time()
     daemon = subprocess.Popen([RUSTD, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), "--watch", *symbols],
                               stderr=out, stdout=out)
@@ -72,17 +82,20 @@ def main():
             perf = subprocess.Popen(["perf", "record", "-F", "499", "-g", "-o", perf_out, "-p", str(daemon.pid)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for name, path, apply in edits:
-            if only and only not in name:
+            if only and not any(o in name for o in only.split(",")):
                 continue
             original = open(path).read()
             edited = apply(original)
             assert edited != original, name
             for label, text in ((name, edited), ("  (revert)", original)):
                 open(path, "w").write(text)
-                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n.*\n(?:link: .*\n)?edit-to-binary: (\S+)", done)
+                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?edit-to-binary: (\S+)", done)
                 done = len(found)
                 b = found[-1]
-                print(f"{label:38} edit-to-object {b[7]:>8}  recompiled {b[5]:>5} of {b[6]}")
+                print(f"{label:38} {'edit-to-binary' if '--patch' in args else 'edit-to-object'} {b[7]:>8}  recompiled {b[5]:>5} of {b[6]}")
+                if "--patch" in args and "doctor" in name:
+                    ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
+                    print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
         print(f"rss after edits: {rss} MB")
         if perf_out:

@@ -43,6 +43,9 @@ struct Args {
     symbol_files: Vec<PathBuf>,
     watch: bool,
     link_cmd: Option<String>,
+    /// Where to write the object that amends `out` after an edit, for the link to take ahead of
+    /// `out`. Without it every edit writes `out` again.
+    patch: Option<PathBuf>,
     /// Tab-separated per-function outcome, for the harness.
     report: Option<PathBuf>,
     /// File of function paths to leave to rustc, for bisecting miscompiles.
@@ -74,6 +77,7 @@ impl Args {
         let mut symbol_files = Vec::new();
         let mut watch = false;
         let mut link_cmd = None;
+        let mut patch = None;
         let mut report = None;
         let mut deny = None;
         let mut isolate = None;
@@ -87,6 +91,7 @@ impl Args {
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
                 "--link-cmd" => link_cmd = Some(value()?),
+                "--patch" => patch = Some(PathBuf::from(value()?)),
                 "--report" => report = Some(PathBuf::from(value()?)),
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
@@ -105,6 +110,7 @@ impl Args {
             symbol_files,
             watch,
             link_cmd,
+            patch,
             report,
             deny,
             isolate,
@@ -560,6 +566,14 @@ fn build(
             }),
         );
     }
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for part in 0..threads {
+            let (db, known) = (db.clone(), &*known);
+            scope.spawn(move || hir::attach_db(&db, || known.revalidate(&db, part, threads)));
+        }
+    });
+    let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let unit =
         hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
@@ -567,10 +581,19 @@ fn build(
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
-        eprintln!("roots: {setup:.1?}, compile: {:.1?}", codegen - setup);
+        eprintln!(
+            "roots: {setup:.1?}, revalidate: {:.1?}, compile: {:.1?}",
+            revalidate - setup,
+            codegen - revalidate
+        );
     }
     let start = Instant::now();
-    std::fs::write(&args.out, &unit.object)?;
+    if let Some(object) = &unit.object {
+        std::fs::write(&args.out, object)?;
+    }
+    if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
+        std::fs::write(path, patch)?;
+    }
     let build = Build {
         compiled: unit.compiled.iter().map(|&(func, _)| name(func)).collect(),
         skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
@@ -590,7 +613,7 @@ fn build(
                 CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
-            std::fs::write(dir.join(format!("{i}.o")), single.object)?;
+            std::fs::write(dir.join(format!("{i}.o")), single.object.unwrap_or_default())?;
             index.push_str(&format!("{i}\t{}\n", name(func)));
         }
         std::fs::write(dir.join("index.tsv"), index)?;
@@ -704,6 +727,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             symbol_files: Vec::new(),
             watch: false,
             link_cmd: None,
+            patch: None,
             report: Some(report.join(format!("{krate}.tsv"))),
             deny: None,
             isolate: None,
@@ -767,7 +791,9 @@ fn main() -> anyhow::Result<()> {
     let resolved = resolve_crates(&db, &args)?;
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
 
+    anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
     let mut known = Rejections::default();
+    known.patching = args.patch.is_some();
     let cold = build(&db, &table, &args, &mut known)?;
     eprint!("cold: ");
     report(&cold);
@@ -837,6 +863,12 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
         "stats: {} of {} functions compiled, {} reused",
         stats.compiled, stats.bodies, stats.reused
     );
+    if let Some(patched) = stats.patched {
+        eprintln!("patch: {patched} functions");
+    }
+    if let Some(why) = stats.declined {
+        eprintln!("no patch: {why}");
+    }
     let phases = stats.phases;
     eprintln!(
         "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, fallback {:.1?}, object {:.1?}, {} rounds",

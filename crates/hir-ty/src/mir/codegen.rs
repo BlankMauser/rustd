@@ -76,6 +76,7 @@ use super::{
 };
 
 mod fragment;
+mod patch;
 mod type_id;
 mod unwind;
 mod vtable;
@@ -188,7 +189,11 @@ impl AbiScalar {
 
 /// The result of compiling a set of root functions into one object file.
 pub struct CodegenUnit {
-    pub object: Vec<u8>,
+    /// The object, unless the one of the build before still stands and `patch` amends it.
+    pub object: Option<Vec<u8>>,
+    /// With [`Rejections::patching`], an object to link ahead of the last `object`: its
+    /// definitions replace those of the same name there.
+    pub patch: Option<Vec<u8>>,
     /// Roots that were compiled, with their exported symbol.
     pub compiled: Vec<(FunctionId, String)>,
     /// Roots that have to come from rustc.
@@ -221,10 +226,49 @@ impl CodegenUnit {
     ) -> Result<CodegenUnit> {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
+        let mut declined = None;
+        if let Some(base) = known.base.take() {
+            let own_statics = OwnStatics {
+                crates: all().map(|root| root.krate(db)).collect(),
+                theirs: known.theirs.clone(),
+                unknown: known.unknown.clone(),
+            };
+            let patch = base.patch(db, symbols, roots, &on_demand, denied, known, own_statics);
+            let patch = match patch {
+                Ok(Ok(patch)) => Some(patch),
+                Ok(Err(why)) => {
+                    declined = Some(why);
+                    None
+                }
+                Err(_) => None,
+            };
+            if let Some(patch) = patch {
+                let compiled_now = known.compiled_since_last_build();
+                known.stats = BuildStats {
+                    bodies: base.bodies,
+                    reused: base.bodies.saturating_sub(compiled_now),
+                    compiled: compiled_now,
+                    phases: patch.phases,
+                    rounds: 1,
+                    patched: Some(patch.bodies),
+                    declined: None,
+                };
+                let unit = CodegenUnit {
+                    object: None,
+                    patch: Some(patch.object),
+                    compiled: base.compiled.clone(),
+                    skipped: base.skipped.clone(),
+                    instances: base.instances.len(),
+                };
+                known.base = Some(base);
+                return Ok(unit);
+            }
+        }
+        let patching = known.patching;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
-        let Rejections { rejected, stats, theirs, unknown, left } = known;
-        let compiled_before = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let Rejections { rejected, stats, theirs, unknown, left, base, patching: _, counted } =
+            known;
         let mut own_statics = OwnStatics {
             crates: all().map(|root| root.krate(db)).collect(),
             theirs: std::mem::take(theirs),
@@ -234,7 +278,8 @@ impl CodegenUnit {
         loop {
             rounds += 1;
             let mut cg =
-                ObjectCodegen::new(db, symbols, rejected, own_statics.clone(), &on_demand)?;
+                ObjectCodegen::new(db, symbols, rejected, own_statics.clone(), &on_demand, None)?;
+            cg.patching = patching;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             let mut failed = Vec::new();
@@ -321,15 +366,20 @@ impl CodegenUnit {
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
-                let compiled_now =
-                    COMPILED.load(std::sync::atomic::Ordering::Relaxed) - compiled_before;
+                let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+                let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
                     phases: Phases { fallback: fallback_start.elapsed(), ..cg.phases },
                     rounds,
+                    patched: None,
+                    declined,
                 };
+                if patching {
+                    *base = patch::Base::record(db, &cg, roots.entries, &compiled, &skipped);
+                }
                 if let Some(path) = std::env::var_os("RUSTD_LAYOUTS") {
                     let lines = cg
                         .layouts
@@ -348,7 +398,14 @@ impl CodegenUnit {
                 let object = cg.finish()?;
                 stats.phases.object = start.elapsed();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
-                return Ok(CodegenUnit { object, compiled, skipped, instances });
+                let patch = if patching { Some(patch::empty_object()?) } else { None };
+                return Ok(CodegenUnit {
+                    object: Some(object),
+                    patch,
+                    compiled,
+                    skipped,
+                    instances,
+                });
             }
             rejected.extend(failed);
         }
@@ -387,7 +444,27 @@ pub struct Rejections {
     unknown: FxHashSet<Crate>,
     /// Roots given up on because a function left to rustc handles the same future.
     left: FxHashSet<FunctionId>,
+    /// Whether to answer an edit with a patch for the object of the last full build.
+    pub patching: bool,
+    base: Option<patch::Base>,
+    /// How many functions had been compiled when the last build finished.
+    counted: usize,
     pub stats: BuildStats,
+}
+
+impl Rejections {
+    fn compiled_since_last_build(&mut self) -> usize {
+        let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        total - std::mem::replace(&mut self.counted, total)
+    }
+
+    /// Brings one part in `parts` of what the last full build compiled up to date, so that
+    /// threads can share the work the next build would otherwise do alone.
+    pub fn revalidate(&self, db: &dyn HirDatabase, part: usize, parts: usize) {
+        if let Some(base) = &self.base {
+            base.revalidate(db, part, parts);
+        }
+    }
 }
 
 /// Measurements of the last build.
@@ -402,6 +479,10 @@ pub struct BuildStats {
     pub phases: Phases,
     /// How many times stitching started over because a callee turned out not to compile.
     pub rounds: usize,
+    /// How many functions the patch defines, when the build made one.
+    pub patched: Option<usize>,
+    /// Why the build wrote the whole object again, when a patch was tried.
+    pub declined: Option<&'static str>,
 }
 
 /// Time spent in each step of the last round.
@@ -469,10 +550,18 @@ struct ObjectCodegen<'a, 'db> {
     imports: FxHashMap<String, FuncId>,
     instances: FxHashMap<Instance, FuncId>,
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
-    /// Functions compiled only once something refers to them, and the ones referred to since
-    /// the list was last taken.
+    /// Every instance that went through `pending`.
+    envs: Vec<(Instance, StoredParamEnvAndCrate)>,
+    /// The instances that call rustc's copy instead of having code of their own.
+    forwarded: FxHashSet<Instance>,
+    /// Whether instances and statics get names another object can refer to.
+    patching: bool,
+    /// The object this one is a patch for.
+    base: Option<&'a patch::Base>,
     /// The statics given a value here, in the order their values were asked for.
     own_static_order: Vec<StaticId>,
+    /// Functions compiled only once something refers to them, and the ones referred to since
+    /// the list was last taken.
     on_demand: &'a FxHashSet<FunctionId>,
     wanted: Vec<FunctionId>,
     on_demand_crates: FxHashSet<Crate>,
@@ -563,6 +652,12 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
 
 /// How many functions went through Cranelift since the process started.
 static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A number no other compiled function or static has: a query that ran again gives another.
+fn next_serial() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref), no_eq)]
@@ -704,7 +799,7 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
         Ok(())
     })?;
     let (blob, writable) = value.expect("`build` ran the closure");
-    Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
+    Ok(CompiledStatic { requests: cg.finish().0, blob, writable, serial: next_serial() })
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
@@ -841,7 +936,7 @@ fn compile<'db>(
     let code = emit(isa, &mut ctx)?;
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, layouts })
+    Ok(CompiledFunction { requests, code, layouts, serial: next_serial() })
 }
 
 fn build<'db>(
@@ -963,6 +1058,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         rejected: &'a FxHashMap<Instance, String>,
         own_statics: OwnStatics,
         on_demand: &'a FxHashSet<FunctionId>,
+        base: Option<&'a patch::Base>,
     ) -> Result<Self> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
@@ -975,6 +1071,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             imports: FxHashMap::default(),
             instances: FxHashMap::default(),
             pending: Vec::new(),
+            envs: Vec::new(),
+            forwarded: FxHashSet::default(),
+            patching: false,
+            base,
             own_static_order: Vec::new(),
             on_demand,
             wanted: Vec::new(),
@@ -1159,10 +1259,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_instances(&mut self) -> Vec<(Instance, String)> {
         let mut failed = Vec::new();
         while let Some((instance, env, id)) = self.pending.pop() {
-            if let Err(e) = self.define_instance(&instance, &env, id)
-                && self.forward_to_rustc(&instance, id).is_none()
-            {
-                failed.push((instance, e.to_string()));
+            if let Err(e) = self.define_instance(&instance, &env, id) {
+                if self.forward_to_rustc(&instance, id).is_some() {
+                    self.forwarded.insert(instance);
+                } else {
+                    failed.push((instance, e.to_string()));
+                }
             }
         }
         failed
@@ -1415,13 +1517,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(data);
         }
+        if let Some(known) = self.base.and_then(|base| base.statics.get(&id)) {
+            let data =
+                self.module.declare_data(&known.symbol, Linkage::Import, known.writable, false)?;
+            self.imported_statics.insert(id, data);
+            return Ok(data);
+        }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
         if compiled.writable && !self.own_statics.owns(db, id) {
             unsupported!("writable static without a rustc symbol");
         }
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
-        let data = self.declare_local_data(compiled.writable)?;
+        let data = if self.patching {
+            let name = format!("rustd::static::{}", self.location_counter);
+            self.location_counter += 1;
+            self.module.declare_data(&name, Linkage::Hidden, compiled.writable, false)?
+        } else {
+            self.declare_local_data(compiled.writable)?
+        };
         let known = if compiled.writable { &mut self.statics } else { &mut self.frozen_statics };
         known.insert(id, data);
         let begun = self.own_static_order.len();
@@ -1514,6 +1628,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&id) = self.instances.get(instance) {
             return Ok(id);
         }
+        if let Some(known) = self.base.and_then(|base| base.instances.get(instance)) {
+            return self.import(&known.symbol, sig);
+        }
         if let InstanceDef::Fn(func) = def
             && let Some(symbol) = self.any_method(func, args)
         {
@@ -1588,13 +1705,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
-        let symbol = format!("rustd::{name}::{}", self.instances.len());
+        // A patch is linked with its base, whose names these must not take.
+        let prefix = if self.base.is_some() { "rustd.patch" } else { "rustd" };
+        let symbol = format!("{prefix}::{name}::{}", self.instances.len());
+        let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
         let id = self
             .module
-            .declare_function(&symbol, Linkage::Local, sig)
+            .declare_function(&symbol, linkage, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
         self.instances.insert(instance.clone(), id);
         self.pending.push((instance.clone(), env.clone(), id));
+        self.envs.push((instance.clone(), env.clone()));
         Ok(id)
     }
 

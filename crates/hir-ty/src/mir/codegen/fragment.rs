@@ -86,6 +86,7 @@ pub struct CompiledFunction {
     pub(super) code: Code,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
+    pub(super) serial: u64,
 }
 
 /// The value of a static rustc exports no symbol for.
@@ -93,6 +94,7 @@ pub struct CompiledStatic {
     pub(super) requests: Requests,
     pub(super) blob: ConstBlob,
     pub(super) writable: bool,
+    pub(super) serial: u64,
 }
 
 /// Collects the requests of one function while its IR is built.
