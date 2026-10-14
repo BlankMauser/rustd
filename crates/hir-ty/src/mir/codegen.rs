@@ -77,6 +77,7 @@ use super::{
 
 mod fragment;
 mod patch;
+pub use patch::Stale;
 mod type_id;
 mod unwind;
 mod vtable;
@@ -233,7 +234,12 @@ impl CodegenUnit {
                 theirs: known.theirs.clone(),
                 unknown: known.unknown.clone(),
             };
-            let patch = base.patch(db, symbols, roots, &on_demand, denied, known, own_statics);
+            let mut stale = std::mem::take(&mut known.stale);
+            if stale.is_empty() {
+                stale.push(base.stale(db, 0, 1));
+            }
+            let patch =
+                base.patch(db, symbols, roots, &on_demand, denied, known, own_statics, stale);
             let patch = match patch {
                 Ok(Ok(patch)) => Some(patch),
                 Ok(Err(why)) => {
@@ -267,8 +273,17 @@ impl CodegenUnit {
         let patching = known.patching;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
-        let Rejections { rejected, stats, theirs, unknown, left, base, patching: _, counted } =
-            known;
+        let Rejections {
+            rejected,
+            stats,
+            theirs,
+            unknown,
+            left,
+            base,
+            patching: _,
+            counted,
+            stale: _,
+        } = known;
         let mut own_statics = OwnStatics {
             crates: all().map(|root| root.krate(db)).collect(),
             theirs: std::mem::take(theirs),
@@ -447,6 +462,7 @@ pub struct Rejections {
     /// Whether to answer an edit with a patch for the object of the last full build.
     pub patching: bool,
     base: Option<patch::Base>,
+    stale: Vec<Stale>,
     /// How many functions had been compiled when the last build finished.
     counted: usize,
     pub stats: BuildStats,
@@ -458,12 +474,16 @@ impl Rejections {
         total - std::mem::replace(&mut self.counted, total)
     }
 
-    /// Brings one part in `parts` of what the last full build compiled up to date, so that
-    /// threads can share the work the next build would otherwise do alone.
-    pub fn revalidate(&self, db: &dyn HirDatabase, part: usize, parts: usize) {
-        if let Some(base) = &self.base {
-            base.revalidate(db, part, parts);
-        }
+    /// Looks at one part in `parts` of what the last full build compiled for what an edit
+    /// changed, which threads can do a part each. `None` when no patch is to be made.
+    pub fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Option<Stale> {
+        Some(self.base.as_ref()?.stale(db, part, parts))
+    }
+
+    /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
+    /// edit in between.
+    pub fn set_stale(&mut self, stale: Vec<Stale>) {
+        self.stale = stale;
     }
 }
 

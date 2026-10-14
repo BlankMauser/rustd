@@ -74,6 +74,12 @@ SCENARIOS = {
         insert_after(f"{S}/hir/mod.rs", 10**9, NEW_FN),
         substitute(f"{B}/main.rs", "    let re = Regex::new(",
                    '    println!("{}", regex_syntax::hir::rustd_new_item(41));\n    let re = Regex::new(')],
+    "generic fn with a closure removed, its one call written out": [
+        substitute(f"{B}/main.rs", "        show(m.range(), &hay[m.range()]);\n",
+                   '        println!("{:?} {}", m.range(), &hay[m.range()]);\n'),
+        substitute(f"{B}/main.rs", "\nfn show<T: std::fmt::Debug>(value: T, text: &str) {\n"
+                   "    let line = |value: &T| format!(\"{value:?} {text}\");\n"
+                   "    println!(\"{}\", line(&value));\n}\n", "")],
     "derive added to a struct (Span: Debug is hand-written, add PartialOrd)": [
         substitute(f"{A}/util/search.rs", "#[derive(Clone, Copy, Eq, Hash, PartialEq)]\npub struct Span {",
                    "#[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd)]\npub struct Span {")],

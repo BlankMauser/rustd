@@ -529,6 +529,12 @@ struct Build {
     emit: Duration,
 }
 
+thread_local! {
+    /// Set on a thread that asks about what an edit may have removed. A query about something
+    /// that is gone panics, which is the answer and not worth a report.
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn build(
     db: &RootDatabase,
     table: &SymbolTable,
@@ -567,12 +573,19 @@ fn build(
         );
     }
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    std::thread::scope(|scope| {
-        for part in 0..threads {
-            let (db, known) = (db.clone(), &*known);
-            scope.spawn(move || hir::attach_db(&db, || known.revalidate(&db, part, threads)));
-        }
+    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|part| {
+                let (db, known) = (db.clone(), &*known);
+                scope.spawn(move || {
+                    PROBING.set(true);
+                    hir::attach_db(&db, || known.stale(&db, part, threads))
+                })
+            })
+            .collect();
+        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
     });
+    known.set_stale(stale.unwrap_or_default());
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let unit =
@@ -792,6 +805,12 @@ fn main() -> anyhow::Result<()> {
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
 
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
+    let report_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !PROBING.get() {
+            report_panic(info);
+        }
+    }));
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
     let cold = build(&db, &table, &args, &mut known)?;

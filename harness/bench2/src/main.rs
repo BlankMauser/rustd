@@ -10,6 +10,11 @@ fn main() {
     let re = Regex::new(r"(?P<y>\d{4})-(?P<m>\d{2})|qu[a-z]+k").unwrap();
     let hay = "on 2026-10 the quick brown fox, 1999-12";
     for m in re.find_iter(hay) {
-        println!("{:?} {}", m.range(), &hay[m.range()]);
+        show(m.range(), &hay[m.range()]);
     }
+}
+
+fn show<T: std::fmt::Debug>(value: T, text: &str) {
+    let line = |value: &T| format!("{value:?} {text}");
+    println!("{}", line(&value));
 }

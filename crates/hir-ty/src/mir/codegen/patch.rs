@@ -17,7 +17,7 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
     SymbolResolver, compiled_instance, compiled_root, compiled_static,
-    fragment::{DataRequest, Requests},
+    fragment::{DataRequest, FuncTarget, Requests},
     source_location, target,
 };
 
@@ -41,18 +41,50 @@ impl Mark {
     }
 }
 
+/// Something in the base that an edit can change or take away.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Node {
+    Root(FunctionId),
+    Instance(Instance),
+    Static(StaticId),
+}
+
+impl Node {
+    fn is_asked_for_by(&self, requests: &Requests) -> bool {
+        match self {
+            Node::Root(_) => false,
+            Node::Instance(instance) => requests.funcs.iter().any(
+                |it| matches!(&it.target, FuncTarget::Instance(asked, _) if asked == instance),
+            ),
+            Node::Static(id) => requests
+                .datas
+                .iter()
+                .any(|it| matches!(it, DataRequest::Static(asked) if asked == id)),
+        }
+    }
+}
+
+/// What a query gives for something of the base, or `None` when it panics: the edit may have
+/// taken away what the base knew it by, and only looking tells.
+fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)).ok()
+}
+
 pub(super) struct BaseInstance {
     env: StoredParamEnvAndCrate,
     pub(super) symbol: String,
     /// `None` when the base calls rustc's copy and compiling the instance failed.
     mark: Option<Mark>,
     forwarded: bool,
+    /// What in the base refers to it.
+    parents: Vec<Node>,
 }
 
 pub(super) struct BaseStatic {
     pub(super) symbol: String,
     pub(super) writable: bool,
     mark: Mark,
+    parents: Vec<Node>,
 }
 
 /// What a function left to rustc keeps the rest of the build from doing.
@@ -89,6 +121,31 @@ pub(super) struct Base {
     pub(super) bodies: usize,
 }
 
+/// What a look at a part of the base found changed.
+#[derive(Default)]
+pub struct Stale {
+    roots: Vec<FunctionId>,
+    instances: Vec<Instance>,
+    /// What a patch can't replace, and why. That only matters for what the program still
+    /// reaches.
+    broken: Vec<(Node, &'static str)>,
+    /// Why no patch can hold the change.
+    declined: Option<&'static str>,
+}
+
+impl Stale {
+    fn declined(mut self, why: &'static str) -> Stale {
+        self.declined = Some(why);
+        self
+    }
+}
+
+/// What of the base an edit left as it was: everything but these.
+struct Unchanged {
+    changed: FxHashSet<Node>,
+    broken: FxHashSet<Node>,
+}
+
 pub(super) struct Patch {
     pub(super) object: Vec<u8>,
     pub(super) bodies: usize,
@@ -119,7 +176,7 @@ impl Base {
                 Some(Mark::new(db, compiled.serial, &compiled.requests))
             })
             .collect::<Option<Vec<_>>>()?;
-        let instances = cg
+        let mut instances = cg
             .envs
             .iter()
             .map(|(instance, env)| {
@@ -130,11 +187,12 @@ impl Base {
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark: compiled.map(|it| Mark::new(db, it.serial, &it.requests)),
                     forwarded: cg.forwarded.contains(instance),
+                    parents: Vec::new(),
                 };
                 (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
             })
             .collect::<Option<FxHashMap<_, _>>>()?;
-        let statics = cg
+        let mut statics = cg
             .statics
             .iter()
             .chain(&cg.frozen_statics)
@@ -144,10 +202,45 @@ impl Base {
                     symbol: decls.get_data_decl(data).linkage_name(data).into_owned(),
                     writable: compiled.writable,
                     mark: Mark::new(db, compiled.serial, &compiled.requests),
+                    parents: Vec::new(),
                 };
                 Some((id, known))
             })
             .collect::<Option<FxHashMap<_, _>>>()?;
+        let mut edges = Vec::new();
+        let mut note = |parent: Node, requests: &Requests| {
+            for request in &requests.funcs {
+                if let FuncTarget::Instance(instance, _) = &request.target {
+                    edges.push((Node::Instance(instance.clone()), parent.clone()));
+                }
+            }
+            for request in &requests.datas {
+                if let DataRequest::Static(id) = request {
+                    edges.push((Node::Static(*id), parent.clone()));
+                }
+            }
+        };
+        for &(root, _) in compiled {
+            note(Node::Root(root), &compiled_root(db, root).as_ref().ok()?.requests);
+        }
+        for (instance, known) in &instances {
+            if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
+                note(Node::Instance(instance.clone()), &compiled.requests);
+            }
+        }
+        for &id in statics.keys() {
+            note(Node::Static(id), &compiled_static(db, id).as_ref().ok()?.requests);
+        }
+        for (child, parent) in edges {
+            let parents = match &child {
+                Node::Root(_) => None,
+                Node::Instance(instance) => instances.get_mut(instance).map(|it| &mut it.parents),
+                Node::Static(id) => statics.get_mut(id).map(|it| &mut it.parents),
+            };
+            if let Some(parents) = parents {
+                parents.push(parent);
+            }
+        }
         let left = skipped
             .iter()
             .map(|(root, e)| (!matches!(e, CodegenError::NoSymbol)).then(|| Left::of(db, *root)))
@@ -164,15 +257,101 @@ impl Base {
         })
     }
 
-    pub(super) fn revalidate(&self, db: &dyn HirDatabase, part: usize, parts: usize) {
-        let left = self.skipped.iter().zip(&self.left).filter(|it| it.1.is_some());
-        let roots = self.compiled.iter().map(|it| it.0).chain(left.map(|it| it.0.0));
-        for root in roots.skip(part).step_by(parts) {
-            _ = compiled_root(db, root);
+    /// What one part in `parts` of the base no longer is what it was. Looking is most of the
+    /// work of a patch, and the parts can be looked at on a thread each.
+    pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
+        let mut stale = Stale::default();
+        let every = |len: usize| (part..len).step_by(parts);
+        for i in every(self.compiled.len()) {
+            let root = self.compiled[i].0;
+            let mark = probe(|| {
+                let compiled = compiled_root(db, root).as_ref().ok()?;
+                Some(Mark::new(db, compiled.serial, &compiled.requests))
+            });
+            match mark {
+                Some(Some(mark)) if mark == self.marks[i] => {}
+                Some(Some(_)) => stale.roots.push(root),
+                Some(None) => return stale.declined("a root of the base no longer compiles"),
+                None => return stale.declined("a root of the base is gone"),
+            }
         }
         for (instance, was) in self.instances.iter().skip(part).step_by(parts) {
-            _ = compiled_instance(db, instance.clone(), was.env.clone());
+            let mark = probe(|| {
+                let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+                compiled.as_ref().ok().map(|it| Mark::new(db, it.serial, &it.requests))
+            });
+            match mark {
+                Some(mark) if mark == was.mark => {}
+                Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
+                // One that had no code of its own might have now.
+                _ => stale.broken.push((
+                    Node::Instance(instance.clone()),
+                    "an instance of the base gained or lost code of its own",
+                )),
+            }
         }
+        for (&id, was) in self.statics.iter().skip(part).step_by(parts) {
+            let mark = probe(|| {
+                let compiled = compiled_static(db, id).as_ref().ok()?;
+                Some(Mark::new(db, compiled.serial, &compiled.requests))
+            });
+            if mark != Some(Some(was.mark)) {
+                stale.broken.push((Node::Static(id), "a static of the base changed"));
+            }
+        }
+        for i in every(self.skipped.len()) {
+            let Some(was) = &self.left[i] else { continue };
+            if probe(|| Left::of(db, self.skipped[i].0)).as_ref() != Some(was) {
+                return stale.declined("a function left to rustc changed");
+            }
+        }
+        stale
+    }
+
+    /// Whether a root still refers to the node, directly or through others.
+    fn reaches(&self, db: &dyn HirDatabase, node: &Node, unchanged: &Unchanged) -> bool {
+        let mut seen = FxHashSet::default();
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let parents = match node {
+                Node::Root(_) => return true,
+                Node::Instance(instance) => self.instances.get(instance).map(|it| &it.parents),
+                Node::Static(id) => self.statics.get(id).map(|it| &it.parents),
+            };
+            for parent in parents.into_iter().flatten() {
+                if !seen.contains(parent) && self.still_asks_for(db, parent, node, unchanged) {
+                    seen.insert(parent);
+                    stack.push(parent);
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether what referred to the node in the base does so after the edit.
+    fn still_asks_for(
+        &self,
+        db: &dyn HirDatabase,
+        parent: &Node,
+        node: &Node,
+        unchanged: &Unchanged,
+    ) -> bool {
+        // A broken parent that is reached stops the patch by itself.
+        if unchanged.broken.contains(parent) {
+            return false;
+        }
+        if !unchanged.changed.contains(parent) {
+            return true;
+        }
+        let requests = match parent {
+            Node::Root(root) => compiled_root(db, *root).as_ref().ok().map(|it| &it.requests),
+            Node::Instance(instance) => self.instances.get(instance).and_then(|known| {
+                let compiled = compiled_instance(db, instance.clone(), known.env.clone());
+                compiled.as_ref().ok().map(|it| &it.requests)
+            }),
+            Node::Static(_) => None,
+        };
+        requests.is_some_and(|requests| node.is_asked_for_by(requests))
     }
 
     /// The futures that functions left to rustc handle, or `None` when that can be any.
@@ -201,6 +380,7 @@ impl Base {
         denied: &FxHashSet<FunctionId>,
         known: &Rejections,
         own_statics: OwnStatics,
+        stale: Vec<Stale>,
     ) -> Result<std::result::Result<Patch, &'static str>> {
         let start = std::time::Instant::now();
         if roots.entries != self.entries {
@@ -214,50 +394,40 @@ impl Base {
             return Ok(Err("a root of the base is gone"));
         }
 
-        // What the base holds that is no longer what it was.
         let mut changed_roots = Vec::new();
-        for (&(root, _), mark) in self.compiled.iter().zip(&self.marks) {
-            let Ok(compiled) = compiled_root(db, root).as_ref() else {
-                return Ok(Err("a root of the base no longer compiles"));
-            };
-            if Mark::new(db, compiled.serial, &compiled.requests) != *mark {
-                changed_roots.push(root);
-            }
-        }
         let mut changed_instances = Vec::new();
-        for (instance, was) in &self.instances {
-            let compiled = compiled_instance(db, instance.clone(), was.env.clone()).as_ref().ok();
-            let mark = compiled.map(|it| Mark::new(db, it.serial, &it.requests));
-            if mark == was.mark {
-                continue;
+        let mut broken = Vec::new();
+        for part in stale {
+            if let Some(why) = part.declined {
+                return Ok(Err(why));
             }
-            // One that had no code of its own might have now.
-            if was.forwarded || mark.is_none() {
-                return Ok(Err("an instance of the base gained or lost code of its own"));
-            }
-            changed_instances.push((instance, was, compiled));
+            changed_roots.extend(part.roots);
+            changed_instances.extend(part.instances);
+            broken.extend(part.broken);
         }
-        for (&id, was) in &self.statics {
-            let Ok(compiled) = compiled_static(db, id).as_ref() else {
-                return Ok(Err("a static of the base no longer has a value"));
-            };
-            if Mark::new(db, compiled.serial, &compiled.requests) != was.mark {
-                return Ok(Err("a static of the base changed"));
-            }
+        // What the edit took away is still in the base, where nothing refers to it any more.
+        let unchanged = Unchanged {
+            changed: changed_roots
+                .iter()
+                .map(|&root| Node::Root(root))
+                .chain(changed_instances.iter().cloned().map(Node::Instance))
+                .collect(),
+            broken: broken.iter().map(|it| it.0.clone()).collect(),
+        };
+        if let Some((_, why)) = broken.iter().find(|it| self.reaches(db, &it.0, &unchanged)) {
+            return Ok(Err(why));
         }
-        for ((root, _), was) in self.skipped.iter().zip(&self.left) {
-            if was.as_ref().is_some_and(|was| *was != Left::of(db, *root)) {
-                return Ok(Err("a function left to rustc changed"));
-            }
-        }
+        changed_instances.retain(|it| self.reaches(db, &Node::Instance(it.clone()), &unchanged));
         let verify = start.elapsed();
 
         let mut cg =
             ObjectCodegen::new(db, symbols, &known.rejected, own_statics, on_demand, Some(self))?;
         cg.phases.compile = verify;
         // rustc's copies are the ones the base was built against: what they call is in it.
-        for (instance, was, compiled) in changed_instances {
-            let Some(compiled) = compiled else {
+        for instance in &changed_instances {
+            let was = &self.instances[instance];
+            let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
+            else {
                 return Ok(Err("an instance of the base no longer compiles"));
             };
             let id = cg.module.declare_function(
