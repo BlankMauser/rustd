@@ -398,6 +398,8 @@ struct ObjectCodegen<'a, 'db> {
     /// to write them to. The harness compares them with rustc's.
     layouts: FxHashMap<String, (u64, u64)>,
     phases: Phases,
+    /// One line per function for `harness/shapes.py`, when `RUSTD_SHAPES` is set.
+    shapes: Option<std::io::BufWriter<std::fs::File>>,
     /// How many compiled functions went into the object.
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
@@ -881,6 +883,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             rejected,
             layouts: FxHashMap::default(),
             phases: Phases::default(),
+            shapes: std::env::var_os("RUSTD_SHAPES")
+                .and_then(|path| {
+                    use std::io::Write;
+                    let mut file =
+                        std::fs::File::options().append(true).create(true).open(path).ok()?;
+                    writeln!(file, "R").ok()?;
+                    Some(file)
+                })
+                .map(std::io::BufWriter::new),
             bodies: 0,
             vtables: FxHashMap::default(),
             own_statics,
@@ -954,10 +965,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let start = std::time::Instant::now();
         let compiled = compiled_root(db, func);
-        self.phases.compile += start.elapsed();
+        let took = start.elapsed();
+        self.phases.compile += took;
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
         let id =
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
+        self.shape_origin(id, InstanceDef::Fn(func), false, took);
         self.stitch(id, compiled)?;
         Ok(symbol)
     }
@@ -983,8 +996,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     ) -> Result<()> {
         let start = std::time::Instant::now();
         let compiled = compiled_instance(self.db, instance.clone(), env.clone());
-        self.phases.compile += start.elapsed();
+        let took = start.elapsed();
+        self.phases.compile += took;
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
+        let generic = instance.args.as_ref().iter().any(|arg| arg.ty().is_some());
+        self.shape_origin(id, instance.def, generic, took);
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         let has_body = matches!(
@@ -1008,6 +1024,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let ids = ids?;
         let start = std::time::Instant::now();
         let relocs: Vec<_> = compiled.code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
+        self.shape_code(id, &compiled.code, &relocs);
         self.define_code(id, &compiled.code, &relocs)?;
         for (ty, size, align) in &compiled.layouts {
             self.layouts.entry(ty.clone()).or_insert((*size, *align));
@@ -1015,6 +1032,84 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.bodies += 1;
         self.phases.define += start.elapsed();
         Ok(())
+    }
+
+    fn shape_origin(
+        &mut self,
+        id: FuncId,
+        def: InstanceDef,
+        generic: bool,
+        took: std::time::Duration,
+    ) {
+        use std::io::Write;
+        if self.shapes.is_none() {
+            return;
+        }
+        let db = self.db;
+        let (name, derive) = match def {
+            InstanceDef::Fn(func) => {
+                let derive = func.loc(db).id.file_id.macro_file().is_some_and(|call| {
+                    matches!(call.loc(db).def.kind, MacroDefKind::BuiltInDerive(..))
+                });
+                (FunctionSignature::of(db, func).name.as_str().to_owned(), derive)
+            }
+            _ => (String::new(), false),
+        };
+        let decls = self.module.declarations();
+        let symbol = decls.get_function_decl(id).linkage_name(id).into_owned();
+        let kind = format!("{def:?}");
+        let kind = kind.split(['(', ' ']).next().unwrap_or_default().to_owned();
+        let origin = match def {
+            InstanceDef::Fn(func) => format!("{func:?}"),
+            InstanceDef::Closure(it) | InstanceDef::Coroutine(it) => format!("{it:?}"),
+            _ => kind.clone(),
+        };
+        if let Some(out) = &mut self.shapes {
+            let _ = writeln!(
+                out,
+                "O\t{symbol}\t{kind}\t{origin}\t{name}\t{}\t{}\t{}",
+                generic as u8,
+                derive as u8,
+                took.as_micros()
+            );
+        }
+    }
+
+    fn shape_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) {
+        use std::hash::{Hash, Hasher};
+        use std::io::Write;
+        if self.shapes.is_none() {
+            return;
+        }
+        let decls = self.module.declarations();
+        let mut hasher = rustc_hash::FxHasher::default();
+        code.bytes.hash(&mut hasher);
+        let mut targets = Vec::new();
+        for reloc in relocs {
+            (reloc.offset, format!("{:?}", reloc.kind), reloc.addend).hash(&mut hasher);
+            targets.push(match reloc.name {
+                ModuleRelocTarget::User { namespace: 0, index } => {
+                    let id = FuncId::from_u32(index);
+                    decls.get_function_decl(id).linkage_name(id).into_owned()
+                }
+                ModuleRelocTarget::User { index, .. } => {
+                    let id = DataId::from_u32(index);
+                    format!("data:{}", decls.get_data_decl(id).linkage_name(id))
+                }
+                ModuleRelocTarget::FunctionOffset(..) => "self".to_owned(),
+                ref other => format!("{other:?}"),
+            });
+        }
+        let symbol = decls.get_function_decl(id).linkage_name(id).into_owned();
+        if let Some(out) = &mut self.shapes {
+            let _ = writeln!(
+                out,
+                "C\t{symbol}\t{}\t{:x}\t{}",
+                code.bytes.len(),
+                hasher.finish(),
+                targets.join(" ")
+            );
+        }
     }
 
     fn define_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) -> Result<()> {
