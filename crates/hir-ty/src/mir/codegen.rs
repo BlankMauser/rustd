@@ -970,7 +970,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
         let id =
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
-        self.shape_origin(id, InstanceDef::Fn(func), false, took);
+        self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
         Ok(symbol)
     }
@@ -1000,7 +1000,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.phases.compile += took;
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
         let generic = instance.args.as_ref().iter().any(|arg| arg.ty().is_some());
-        self.shape_origin(id, instance.def, generic, took);
+        self.shape_origin(id, instance.def, &(instance, env), generic, took);
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         let has_body = matches!(
@@ -1038,9 +1038,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         &mut self,
         id: FuncId,
         def: InstanceDef,
+        // The symbol of an instance changes from one round to the next.
+        identity: &impl std::hash::Hash,
         generic: bool,
         took: std::time::Duration,
     ) {
+        use std::hash::{Hash, Hasher};
         use std::io::Write;
         if self.shapes.is_none() {
             return;
@@ -1064,13 +1067,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::Closure(it) | InstanceDef::Coroutine(it) => format!("{it:?}"),
             _ => kind.clone(),
         };
+        let mut hasher = rustc_hash::FxHasher::default();
+        identity.hash(&mut hasher);
         if let Some(out) = &mut self.shapes {
             let _ = writeln!(
                 out,
-                "O\t{symbol}\t{kind}\t{origin}\t{name}\t{}\t{}\t{}",
+                "O\t{symbol}\t{kind}\t{origin}\t{name}\t{}\t{}\t{}\t{:x}",
                 generic as u8,
                 derive as u8,
-                took.as_micros()
+                took.as_micros(),
+                hasher.finish()
             );
         }
     }

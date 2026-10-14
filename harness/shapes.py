@@ -23,18 +23,19 @@ def load(path):
         tag, *rest = line.rstrip("\n").split("\t")
         if tag == "R":
             # A round starts over, and only the round that compiles a function takes time.
-            times, origins, codes = {s: o["micros"] for s, o in origins.items()} | times, {}, {}
+            times, origins, codes = {o["key"]: o["micros"] for o in origins.values()} | times, {}, {}
             continue
         symbol, *rest = rest
         if tag == "O":
-            kind, origin, name, generic, derive, micros = rest
-            micros = max(int(micros), times.get(symbol, 0))
+            kind, origin, name, generic, derive, micros, key = rest
+            micros = max(int(micros), times.get(key, 0))
             origins[symbol] = dict(kind=kind, origin=origin, name=name, generic=generic == "1",
-                                   derive=derive == "1", micros=int(micros))
+                                   derive=derive == "1", micros=micros, key=key)
         else:
             size, code, targets = rest
             codes[symbol] = (int(size), code, targets.split())
-    dropped = [t for s, t in times.items() if s not in origins]
+    kept = {o["key"] for o in origins.values()}
+    dropped = [t for key, t in times.items() if key not in kept]
     print(f"{len(dropped)} functions compiled in an earlier round and left to rustc in the last, "
           f"{sum(dropped) / 1e6:.2f} s")
     return origins, codes
