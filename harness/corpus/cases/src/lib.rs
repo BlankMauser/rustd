@@ -3086,6 +3086,57 @@ pub mod type_id_hashes {
         ]
     }
 
+    struct Holder<F>(F, u8);
+
+    fn two_closures<T: 'static>(seed: T) -> (impl Fn() -> u8 + 'static, impl Fn(&str) -> usize) {
+        let _ = seed;
+        (|| 1, |text: &str| text.len())
+    }
+
+    fn is<T: 'static>(_: &T, any: &dyn Any) -> bool {
+        any.is::<T>()
+    }
+
+    /// A closure's `TypeId` is only ever compared with what was made from the same closure.
+    pub fn closures() -> Vec<bool> {
+        let captured = String::from("captured");
+        let borrowing = move |field: &str| field.len() + captured.len();
+        let plain = |a: u8| a + 1;
+        let (first, second) = two_closures(0u8);
+        let (other, _) = two_closures(0u16);
+        let held: Box<dyn Any> = Box::new(Holder(plain, 3));
+        vec![
+            of_value(&borrowing) == of_value(&borrowing),
+            of_value(&borrowing) == of_value(&plain),
+            of_value(&first) == of_value(&second),
+            of_value(&first) == of_value(&other),
+            of_value(&first) == of_value(&two_closures(1u8).0),
+            is(&Holder(plain, 0), &*held),
+            is(&plain, &*held),
+            held.downcast_ref::<Holder<fn(u8) -> u8>>().is_some(),
+            borrowing("ab") == 10 && first() == 1 && second("abc") == 3 && other() == 1,
+        ]
+    }
+
+    fn name_of<T>(_: &T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    pub fn type_names() -> Vec<&'static str> {
+        let outer = |a: u8| {
+            let inner = move |b: u8| a + b;
+            (name_of(&inner), inner(1))
+        };
+        vec![
+            name_of(&outer),
+            outer(1).0,
+            name_of(&primitives),
+            name_of(&Holder(|| 3u8, 0)),
+            std::any::type_name::<Generic<Unit, 2>>(),
+            std::any::type_name::<(&'static str, Vec<Option<Box<dyn Shape>>>)>(),
+        ]
+    }
+
     pub fn projections() -> Vec<TypeId> {
         vec![
             id::<dyn Iterator<Item = u8>>(),

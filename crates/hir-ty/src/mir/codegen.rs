@@ -1799,7 +1799,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && let Some(of) = self.type_id_of(func, args)
         {
-            let hash = type_id::TypeIdHasher::new(self.db, self.symbols).type_id(of);
+            let hash = type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates)
+                .type_id(of);
             if let Some(hash) = hash {
                 return self.constant_type_id(instance.clone(), sig, hash);
             }
@@ -6229,6 +6230,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if name == "size_of" { layout.size.bytes() } else { layout.align.abi.bytes() };
                 let value = self.builder.ins().iconst(PTR, bytes as i64);
                 self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("type_name", []) => {
+                let ty = generic_args.type_at(0);
+                let Some(name) = super::type_name::rustc_type_name(self.cg.db, ty) else {
+                    unsupported!("`type_name` of `{ty:?}`");
+                };
+                let len = self.builder.ins().iconst(PTR, name.len() as i64);
+                let data = self.cg.define_const(ConstBlob {
+                    bytes: name.into_bytes(),
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 1,
+                })?;
+                let data = self.cg.declare_data_in_func(data, self.builder.func);
+                let ptr = self.builder.ins().symbol_value(PTR, data);
+                self.builder.ins().store(MEM, ptr, dst, 0);
+                self.builder.ins().store(MEM, len, dst, 8);
             }
             ("needs_drop", []) => {
                 let ty = generic_args.type_at(0);

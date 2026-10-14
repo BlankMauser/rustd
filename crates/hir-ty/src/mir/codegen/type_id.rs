@@ -8,8 +8,8 @@ use std::hash::Hasher;
 
 use base_db::Crate;
 use hir_def::{
-    AdtId, CallableDefId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup,
-    ModuleIdLt, TraitId, TypeAliasId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId,
+    Lookup, ModuleIdLt, TraitId, TypeAliasId, VariantId,
     attrs::AttrFlags,
     item_tree::FieldsShape,
     signatures::{
@@ -25,14 +25,17 @@ use rustc_stable_hash::{FromStableHash, SipHasher128Hash, StableSipHasher128};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ExistentialPredicate, FloatTy, GenericArgKind, IntTy, RegionKind,
     UintTy,
-    inherent::{IntoKind, Safety as _, Term as _},
+    inherent::{GenericArgs as _, IntoKind, Safety as _, Term as _},
 };
 use syntax::ast::HasVisibility;
 
+use rustc_hash::FxHashSet;
+
 use super::SymbolResolver;
 use crate::{
+    InferBodyId,
     consteval::try_const_usize,
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure, InternedClosureId},
     next_solver::{Const, GenericArgs, Region, TermId, Ty, TyKind},
 };
 
@@ -105,11 +108,17 @@ pub(super) struct TypeIdHasher<'a, 'db> {
     /// one (`fn(&u8)`, `dyn Fn(&u8)`) is bound by it, where rust-analyzer has no lifetime at
     /// all, so there only a lifetime it did bind is one this knows.
     signatures: usize,
+    /// The crates whose code is ours.
+    owned: &'a FxHashSet<Crate>,
 }
 
 impl<'a, 'db> TypeIdHasher<'a, 'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, symbols: &'a dyn SymbolResolver) -> Self {
-        Self { db, symbols, binders: Vec::new(), signatures: 0 }
+    pub(super) fn new(
+        db: &'db dyn HirDatabase,
+        symbols: &'a dyn SymbolResolver,
+        owned: &'a FxHashSet<Crate>,
+    ) -> Self {
+        Self { db, symbols, binders: Vec::new(), signatures: 0, owned }
     }
 
     pub(super) fn type_id(&mut self, ty: Ty<'db>) -> Option<u128> {
@@ -172,6 +181,42 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         };
         let name = &FunctionSignature::of(db, func).name;
         Some(parent.child(DefPathData::ValueNs(name.as_str())))
+    }
+
+    /// A closure of a crate we compile, which is named by what only we know.
+    ///
+    /// rustc hashes the signature and the captures it inferred for the closure, with the
+    /// lifetimes the signature binds, and rust-analyzer infers no lifetimes. But only code that
+    /// was instantiated with the closure can ask for its `TypeId`, and that is all ours when the
+    /// function it is written in is, so there is no hash of rustc's to agree with.
+    // FIXME: a function of the crate that is left to rustc, and got the closure from one that
+    // is ours, has rustc's hash for it.
+    fn closure(&self, hasher: &mut StableSipHasher128, id: InternedClosureId<'db>) -> Option<()> {
+        let db = self.db;
+        let InternedClosure { owner, expr, .. } = id.loc(db);
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
+            return None;
+        };
+        if !self.owned.contains(&func.krate(db)) {
+            return None;
+        }
+        let loc = func.lookup(db);
+        let parent = match loc.container {
+            ItemContainerId::ModuleId(module) => self.module(module)?,
+            ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
+            ItemContainerId::ImplId(impl_) => {
+                let loc = impl_.lookup(db);
+                let module = self.module(loc.container)?;
+                module.hash(hasher);
+                Fingerprint(0, u64::from(loc.id.value.erase().into_raw()))
+            }
+            ItemContainerId::ExternBlockId(_) => return None,
+        };
+        hasher.write(b"rustd closure");
+        parent.hash(hasher);
+        hash_str(hasher, FunctionSignature::of(db, func).name.as_str());
+        hasher.write_u32(expr.into_raw().into_u32());
+        Some(())
     }
 
     fn ty(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
@@ -250,6 +295,12 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 }
                 self.function_path(func)?.hash(hasher);
                 self.args(args)?.hash(hasher);
+            }
+            TyKind::Closure(id, args) => {
+                hasher.write_isize(17);
+                self.closure(hasher, id.0)?;
+                let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                self.args(parent)?.hash(hasher);
             }
             TyKind::FnPtr(signature, header) => {
                 hasher.write_isize(14);
@@ -331,7 +382,6 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 hasher.write_isize(22);
                 self.list(hasher, tys.iter(), |this, list, ty| this.ty(list, ty))?;
             }
-            // A closure is named by a disambiguator only rustc knows.
             _ => return None,
         }
         Some(())

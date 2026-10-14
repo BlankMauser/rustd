@@ -4,15 +4,21 @@
 use std::fmt::Write;
 
 use hir_def::{
-    AdtId, HasModule, ModuleIdLt,
-    signatures::{EnumSignature, StructSignature, TraitSignature, UnionSignature},
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
+    ModuleIdLt,
+    expr_store::Body,
+    hir::{Expr, ExprId},
+    signatures::{
+        EnumSignature, FunctionSignature, StructSignature, TraitSignature, UnionSignature,
+    },
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, IntoKind};
 
 use crate::{
+    InferBodyId,
     consteval::try_const_usize,
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure},
     next_solver::{DbInterner, Ty, TyKind},
 };
 
@@ -148,7 +154,47 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut String, ty: Ty<'db>) -> Opt
                 write!(out, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
             }
         }
+        TyKind::FnDef(def, args) => {
+            let CallableDefId::FunctionId(func) = def.0 else { return None };
+            // FIXME: rustc writes the arguments too.
+            if !args.is_empty() {
+                return None;
+            }
+            write_function(db, out, func)?;
+        }
+        TyKind::Closure(id, _) => {
+            let InternedClosure { owner, expr, .. } = id.0.loc(db);
+            let InferBodyId::DefWithBodyId(owner @ DefWithBodyId::FunctionId(func)) = owner else {
+                return None;
+            };
+            write_function(db, out, func)?;
+            let body = Body::of(db, owner);
+            for _ in 0..=closures_around(body, body.root_expr(), expr)? {
+                out.push_str("::{{closure}}");
+            }
+        }
         _ => return None,
     }
     Some(())
+}
+
+/// A function of a module. rustc names one of an `impl` after the type, as `<T as Trait>::f`
+/// or `path::Type<T>::f`.
+fn write_function<'db>(db: &'db dyn HirDatabase, out: &mut String, func: FunctionId) -> Option<()> {
+    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return None };
+    write_module(db, out, module)?;
+    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()
+}
+
+/// How many closures and `async` blocks `target` is written in, looking for it from `at` down.
+fn closures_around(body: &Body, at: ExprId, target: ExprId) -> Option<usize> {
+    if at == target {
+        return Some(0);
+    }
+    let mut found = None;
+    body.walk_child_exprs(at, |child| {
+        found = found.or_else(|| closures_around(body, child, target));
+    });
+    let nests = matches!(body[at], Expr::Closure { .. });
+    found.map(|depth| depth + usize::from(nests))
 }

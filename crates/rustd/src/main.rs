@@ -285,7 +285,7 @@ impl Resolver<'_> {
         Some(path)
     }
 
-    /// A type the way rustc writes it in a symbol. Generic ADTs have no symbol we can name yet.
+    /// A type the way rustc writes it in a symbol.
     fn type_path(&self, ty: &hir::Type<'_>) -> Option<String> {
         if let Some((inner, mutability)) = ty.as_reference() {
             let inner = self.type_path(&inner)?;
@@ -300,12 +300,28 @@ impl Resolver<'_> {
         if let Some(builtin) = ty.as_builtin() {
             return Some(builtin.name().as_str().to_owned());
         }
+        // A parameter of the `impl` an item is in, where the item is not generic itself: a
+        // static, or what a closure or constant in a generic function holds.
+        if ty.as_type_param(self.db).is_some() {
+            return Some("_".to_owned());
+        }
         let adt = ty.as_adt()?;
-        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`.
-        if !hir::GenericDef::from(adt).type_or_const_params(self.db).is_empty() {
+        let path = self.item_path(adt.module(self.db), adt.name(self.db).as_str())?;
+        let generics = hir::GenericDef::from(adt);
+        let params = generics.type_or_const_params(self.db);
+        if params.is_empty() {
+            return Some(path);
+        }
+        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`,
+        // and writes a lifetime as `'_`.
+        // FIXME: name those too.
+        let only_types = params.iter().all(|it| it.as_type_param(self.db).is_some())
+            && generics.lifetime_params(self.db).is_empty();
+        if !only_types {
             return None;
         }
-        self.item_path(adt.module(self.db), adt.name(self.db).as_str())
+        let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
+        Some(format!("{path}<{}>", args?.join(", ")))
     }
 }
 
