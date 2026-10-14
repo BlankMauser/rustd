@@ -501,8 +501,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let body = db.mir_body(owner);
         let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let krate = owner.module(db).krate(db);
-        let env =
-            ParamEnvAndCrate { param_env: db.trait_environment(owner.generic_def(db)), krate };
+        // Not the function's own bounds: with nothing generic they are bounds on concrete
+        // types, which hold through impls, and the calls have to resolve to those.
+        let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
         // The future an `async fn` returns is `impl Future` to the body that calls it.
         let opaque = body.locals.iter().any(|(_, local)| {
             rustc_type_ir::TypeVisitableExt::has_type_flags(
@@ -5378,9 +5379,24 @@ impl<'cx, 'a, 'db> FunctionCx<'cx, 'a, 'db> {
         }
         let results = match callee {
             Callee::Instance(def, generic_args) => {
+                let variadic = matches!(def, InstanceDef::Fn(func)
+                    if FunctionSignature::of(self.cg.db, func).is_varargs());
                 let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
                 let callee = self.cg.module.declare_func_in_func(callee, self.builder.func);
-                self.invoke(callee, &values)
+                if variadic {
+                    // Each call of a variadic function has a signature of its own, and the
+                    // function is declared with only one of them.
+                    // FIXME: the callee is told how many vector registers hold arguments,
+                    // which Cranelift has no way to say.
+                    if sig.params.iter().any(|param| param.value_type.is_float()) {
+                        unsupported!("float passed to a variadic function");
+                    }
+                    let sig = self.builder.import_signature(sig);
+                    let pointer = self.builder.ins().func_addr(PTR, callee);
+                    self.invoke_indirect(sig, pointer, &values)
+                } else {
+                    self.invoke(callee, &values)
+                }
             }
             Callee::Pointer(pointer, _) => {
                 let sig = self.builder.import_signature(sig);

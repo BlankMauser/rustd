@@ -260,4 +260,12 @@ fn main() {
     println!("closure_in_bounded_field {:?}", cases::closure_in_bounded_field::run());
     println!("unstable_name_collision {:?}", cases::unstable_name_collision::run());
     println!("closure_in_block_tail {:?}", cases::closure_in_block_tail::run());
+    println!("build_cfgs {:?} {}", cases::build_cfgs::flags(), cases::build_cfgs::debug_assert_runs());
+    println!("trivial_bounds {}", cases::trivial_bounds::default_len());
+    println!(
+        "variadic {} {} {}",
+        cases::variadic::none(),
+        cases::variadic::two(-3, u64::MAX),
+        cases::variadic::string(c"text")
+    );
 }

@@ -4181,3 +4181,66 @@ pub mod closure_in_block_tail {
         })
     }
 }
+
+/// What cargo's dev profile sets and what it does not.
+pub mod build_cfgs {
+    pub struct Sized {
+        #[cfg(debug_assertions)]
+        pub id: usize,
+        pub fd: u32,
+    }
+
+    pub fn flags() -> (bool, bool, usize) {
+        (cfg!(debug_assertions), cfg!(rust_analyzer), size_of::<Sized>())
+    }
+
+    pub fn debug_assert_runs() -> u32 {
+        let mut ran = 0;
+        debug_assert!({
+            ran += 1;
+            true
+        });
+        ran
+    }
+}
+
+/// A bound on a concrete type holds through the type's impl, not through the bound.
+pub mod trivial_bounds {
+    type Storage = Vec<u8>;
+
+    pub fn default_len() -> usize
+    where
+        Storage: 'static + Send + Default,
+    {
+        let mut storage = Storage::default();
+        storage.push(7);
+        storage.len()
+    }
+}
+
+/// One variadic function called with different numbers of arguments.
+pub mod variadic {
+    unsafe extern "C" {
+        fn snprintf(buf: *mut u8, len: usize, format: *const u8, ...) -> i32;
+    }
+
+    pub fn none() -> String {
+        let mut buf = [0u8; 32];
+        let len = unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"plain".as_ptr().cast()) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+
+    pub fn two(a: i32, b: u64) -> String {
+        let mut buf = [0u8; 32];
+        let len =
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%lu".as_ptr().cast(), a, b) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+
+    pub fn string(text: &std::ffi::CStr) -> String {
+        let mut buf = [0u8; 32];
+        let len =
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"<%s>".as_ptr().cast(), text.as_ptr()) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+}
