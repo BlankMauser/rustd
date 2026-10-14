@@ -54,6 +54,10 @@ def main():
         patch = os.path.join(work, "dx.patch.o")
         link[first:first] = [patch, os.path.join(work, "dx.o"), "-Wl,--allow-multiple-definition"]
         link[link.index("-o") + 1] = binary
+        # DXEDITS_LD: a directory holding the `ld` to link with, instead of rustc's lld.
+        if ld := os.environ.get("DXEDITS_LD"):
+            link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
+            link[link.index("-fuse-ld=lld")] = "-B" + ld
         args += ["--patch", patch, "--link-cmd", shlex.join(link)]
     start = time.time()
     daemon = subprocess.Popen([RUSTD, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), "--watch", *symbols],
