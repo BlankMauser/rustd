@@ -19,7 +19,7 @@ use hir_def::{
 use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
-use project_model::{CargoConfig, RustLibSource};
+use project_model::{CargoConfig, CargoFeatures, RustLibSource};
 use rustc_hash::FxHashMap;
 use syntax::{
     AstNode, SyntaxNode,
@@ -49,6 +49,8 @@ struct Args {
     isolate: Option<PathBuf>,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
+    /// Cargo features to build the workspace's crates with, on top of the default ones.
+    features: Vec<String>,
 }
 
 impl Args {
@@ -74,6 +76,7 @@ impl Args {
         let mut deny = None;
         let mut isolate = None;
         let mut cfg_test = false;
+        let mut features = Vec::new();
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -87,6 +90,7 @@ impl Args {
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--cfg-test" => cfg_test = true,
+                "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
@@ -103,6 +107,7 @@ impl Args {
             deny,
             isolate,
             cfg_test,
+            features,
         })
     }
 }
@@ -601,6 +606,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             deny: None,
             isolate: None,
             cfg_test: args.cfg_test,
+            features: args.features.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default())
@@ -634,6 +640,10 @@ fn main() -> anyhow::Result<()> {
     let cargo_config = CargoConfig {
         sysroot: Some(RustLibSource::Discover),
         set_test: args.cfg_test,
+        features: CargoFeatures::Selected {
+            features: args.features.clone(),
+            no_default_features: false,
+        },
         ..Default::default()
     };
     let load_config = LoadCargoConfig {

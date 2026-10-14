@@ -1299,7 +1299,13 @@ fn cargo_to_crate_graph(
                     // Add test cfg for local crates
                     cfg_options.insert_atom(sym::test);
                 }
-                cfg_options.insert_atom(sym::rust_analyzer);
+                if !sysroot_as_built() {
+                    cfg_options.insert_atom(sym::rust_analyzer);
+                }
+            }
+            // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
+            if sysroot_as_built() && !cargo.is_sysroot() {
+                cfg_options.insert_atom(sym::debug_assertions);
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
@@ -1814,6 +1820,8 @@ fn extend_crate_graph_with_sysroot(
 /// The sysroot is analyzed with `cfg(miri)` and `cfg(debug_assertions)` by default, which
 /// picks the simplest code paths. A consumer that links against the prebuilt standard library
 /// needs the configuration that library was built with instead.
+/// Likewise the crates cargo builds: its dev profile has `cfg(debug_assertions)`, and nothing
+/// it builds has `cfg(rust_analyzer)`.
 pub static SYSROOT_AS_BUILT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

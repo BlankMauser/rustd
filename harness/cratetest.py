@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential test using a crate's own integration tests.
 
-usage: cratetest.py <crate-dir> [--crate <name>] [--bisect] [--json out.json]
+usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--bisect] [--json out.json]
 
 Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects for the crate in
 front of rustc's rlib. Both binaries must report the same result for every test.
@@ -14,7 +14,7 @@ UNIT = "(unit tests)"
 
 
 class TestFixture(Fixture):
-    def __init__(self, crate_dir, crate, test, shared):
+    def __init__(self, crate_dir, crate, test, shared, features=None):
         if test == UNIT:
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
@@ -23,6 +23,9 @@ class TestFixture(Fixture):
         else:
             path = os.path.join(crate_dir, "tests", f"{test}.rs")
             super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
+        if features:
+            self.target_args += ["--features", features]
+            self.rustd_args += ["--features", features]
         self.run_args = ["--test-threads=1"]
         self.shared = shared
 
@@ -66,6 +69,7 @@ def main():
     ap.add_argument("--crate")
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--test", action="append", help="only these test binaries; `unit` is the crate's own")
+    ap.add_argument("--features", help="cargo features to turn on, comma separated")
     ap.add_argument("--json")
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
@@ -77,7 +81,7 @@ def main():
     results, shared = [], {}
     for test in tests:
         print(f"--- {test}", flush=True)
-        fx = TestFixture(a.crate_dir, crate, test, shared)
+        fx = TestFixture(a.crate_dir, crate, test, shared, a.features)
         try:
             result = compare(fx, test, a.bisect)
         except SystemExit as e:
@@ -101,6 +105,10 @@ def main():
         results.append(result)
     ok = all(r["match"] for r in results)
     total = sum(r["tests_run"] for r in results)
+    # A crate rustd compiled nothing of matches rustc by construction, which is no result.
+    if ok and not sum(c["compiled"] for r in results for c in r["crates"].values()):
+        print(f"UNTESTED: {len(results)} test binaries, {total} tests, no function from rustd")
+        sys.exit(2)
     print(f"{'MATCH' if ok else 'MISMATCH'}: {len(results)} test binaries, {total} tests")
     if a.json:
         merged = {"fixture": crate, "match": ok, "tests_run": total,
