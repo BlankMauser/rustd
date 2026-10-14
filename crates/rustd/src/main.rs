@@ -20,7 +20,7 @@ use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, CargoFeatures, RustLibSource};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode, SyntaxNode,
     ast::{self, HasName},
@@ -452,10 +452,10 @@ fn build(
     let hir_db: &dyn HirDatabase = db;
     let roots = functions_of(db, &args.krate)?;
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
-    let mut denied = rustc_hash::FxHashSet::default();
+    let mut denied = FxHashSet::default();
     if let Some(deny) = &args.deny {
         let deny = std::fs::read_to_string(deny)?;
-        let deny: rustc_hash::FxHashSet<&str> = deny.lines().collect();
+        let deny: FxHashSet<&str> = deny.lines().collect();
         denied.extend(
             roots.iter().copied().filter(|&func| {
                 resolver.path(func).is_some_and(|path| deny.contains(path.as_str()))
@@ -676,25 +676,31 @@ fn main() -> anyhow::Result<()> {
     eprintln!("watching {} files", files.len());
     loop {
         std::thread::sleep(Duration::from_millis(5));
-        let mut change = ChangeWithProcMacros::default();
-        let mut changed = 0;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
+        // Files are read after that: a timestamp can be that of a write still under way, and
+        // the rest of that write may not change it again.
+        let mut touched = FxHashSet::default();
         loop {
-            let before = changed;
-            for (id, path, mtime) in &mut files {
+            let before = touched.len();
+            for (index, (_, path, mtime)) in files.iter_mut().enumerate() {
                 let Ok(now) = std::fs::metadata(&*path).and_then(|m| m.modified()) else {
                     continue;
                 };
                 if now != *mtime {
                     *mtime = now;
-                    change.change_file(*id, Some(std::fs::read_to_string(&*path)?));
-                    changed += 1;
+                    touched.insert(index);
                 }
             }
-            if changed == before {
+            if touched.len() == before {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut change = ChangeWithProcMacros::default();
+        let changed = touched.len();
+        for index in touched {
+            let (id, path, _) = &files[index];
+            change.change_file(*id, Some(std::fs::read_to_string(path)?));
         }
         if changed == 0 {
             continue;

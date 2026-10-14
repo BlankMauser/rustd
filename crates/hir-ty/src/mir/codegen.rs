@@ -80,7 +80,7 @@ mod type_id;
 mod unwind;
 mod vtable;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodegenError {
     /// The function uses something this backend can't compile yet; fall back to rustc.
     Unsupported(String),
@@ -567,6 +567,47 @@ fn compiled_instance<'db>(
     })
 }
 
+/// The types a body takes and returns, which is all its callers have to know about it. Asked
+/// for on its own so that they do not depend on the rest of the body.
+#[derive(Clone, PartialEq, Eq)]
+struct BodyTypes {
+    params: Vec<StoredTy>,
+    returned: StoredTy,
+    /// For the body of an `async` block, the `Poll` it hands to the caller of `poll`.
+    poll: Option<StoredTy>,
+}
+
+#[salsa::tracked(returns(ref))]
+fn body_types<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> Result<BodyTypes> {
+    let body = match instance.def {
+        InstanceDef::Fn(func) => db.monomorphized_mir_body(func.into(), instance.args, env),
+        InstanceDef::Closure(id) => db.monomorphized_mir_body_for_closure(
+            InternedClosureId::from_id(id),
+            instance.args,
+            env,
+        ),
+        InstanceDef::Coroutine(id) => db.monomorphized_mir_body_for_coroutine(
+            InternedCoroutineId::from_id(id),
+            instance.args,
+            env,
+        ),
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
+    };
+    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    Ok(BodyTypes {
+        params: body.param_locals.iter().map(|&local| body.locals[local].ty.clone()).collect(),
+        returned: body.locals[returned_local(body)].ty.clone(),
+        poll: body.coroutine.map(|it| body.locals[it.poll].ty.clone()),
+    })
+}
+
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref), no_eq)]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
@@ -609,6 +650,33 @@ fn source_location<'db>(
         range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
     }
     location_of(db, source.file_id, range)
+}
+
+/// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
+/// changes with every edit above the body, and this keeps code without such literals from
+/// changing with it.
+#[salsa::tracked(returns(ref))]
+fn location_macros<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+) -> FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
+    let (body, source_map) = Body::with_source_map(db, owner);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+        .filter_map(|(id, _)| {
+            let file_id = source_map.expr_syntax(id).ok()?.file_id;
+            let MacroDefKind::BuiltIn(_, expander) = file_id.macro_file()?.loc(db).def.kind else {
+                return None;
+            };
+            matches!(
+                expander,
+                BuiltinFnLikeExpander::Line
+                    | BuiltinFnLikeExpander::Column
+                    | BuiltinFnLikeExpander::File
+            )
+            .then_some((id, (expander, file_id)))
+        })
+        .collect()
 }
 
 /// The macro call an expansion comes from that is itself written out, in the source or in
@@ -2313,13 +2381,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
     }
 
-    fn body_signature(&self, body: &MirBody<'db>, tracked: bool) -> Result<Signature> {
-        let abi = self.body_abi(body, ExternAbi::Rust)?;
-        let mut sig = self.signature(&abi.args, abi.ret);
-        if tracked {
-            sig.params.push(AbiParam::new(PTR));
-        }
-        Ok(sig)
+    fn body_types(&self, def: InstanceDef, args: GenericArgs<'db>) -> Result<&'db BodyTypes> {
+        let instance = Instance { def, args: args.store() };
+        body_types(self.cg.db, instance, self.env.store()).as_ref().map_err(Clone::clone)
+    }
+
+    /// The signature the body of an instance is compiled with.
+    fn body_signature(&self, body: &BodyTypes) -> Result<Signature> {
+        let abi = self.fn_abi(
+            ExternAbi::Rust,
+            body.returned.as_ref(),
+            body.params.iter().map(|ty| ty.as_ref()),
+        )?;
+        Ok(self.signature(&abi.args, abi.ret))
     }
 
     fn codegen(&mut self) -> Result<()> {
@@ -4337,23 +4411,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         body: &MirBody<'db>,
         expr: ExprId,
     ) -> Option<(BuiltinFnLikeExpander, HirFileId)> {
-        let db = self.cg.db;
         let InferBodyId::DefWithBodyId(owner) = body.owner else { return None };
-        let (body, source_map) = Body::with_source_map(db, owner);
-        if !matches!(body[expr], hir_def::hir::Expr::Literal(_)) {
-            return None;
-        }
-        let file_id = source_map.expr_syntax(expr).ok()?.file_id;
-        let MacroDefKind::BuiltIn(_, expander) = file_id.macro_file()?.loc(db).def.kind else {
-            return None;
-        };
-        matches!(
-            expander,
-            BuiltinFnLikeExpander::Line
-                | BuiltinFnLikeExpander::Column
-                | BuiltinFnLikeExpander::File
-        )
-        .then_some((expander, file_id))
+        location_macros(self.cg.db, owner).get(&expr).copied()
     }
 
     /// Whether a promoted expression takes its value from where it is in the source.
@@ -4720,17 +4779,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Closure(id, generic_args) => {
                 let parent_args =
                     GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-                let body = self
-                    .cg
-                    .db
-                    .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
-                    .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-                if body.param_locals.len() != values.len() + 1 {
+                let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+                if body.params.len() != values.len() + 1 {
                     unsupported!("closure called with a tuple of arguments");
                 }
                 // The body takes the closure by reference or by value depending on its kind,
                 // whichever trait method the call went through.
-                let self_ty = body.locals[body.param_locals[0]].ty.as_ref();
+                let self_ty = body.params[0].as_ref();
                 let self_arg = if self_ty.as_reference().is_some() {
                     let slot = self.scratch();
                     self.builder.ins().store(MEM, addr, slot, 0);
@@ -4993,11 +5048,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && let TyKind::Coroutine(id, args) = self_ty.kind()
         {
             let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-            let body = db
-                .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), self.env.store())
-                .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-            let sig = self.body_signature(body, false)?;
             let def = InstanceDef::Coroutine(id.0.as_id());
+            let sig = self.body_signature(self.body_types(def, parent_args)?)?;
             return self.cg.callee(def, parent_args, self.env, &sig);
         }
         // Only lifetimes can be generic in a method that is in a vtable.
@@ -5017,14 +5069,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !FunctionSignature::of(db, callee).has_body() {
             unsupported!("vtable of {self_ty:?}: no impl found for a method");
         }
-        let body = db
-            .monomorphized_mir_body(callee.into(), callee_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let Some(&receiver) = body.param_locals.first() else {
+        let body = self.body_types(InstanceDef::Fn(callee), callee_args)?;
+        let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
         // A by-value `self` reaches the method through a pointer and needs a shim.
-        let receiver = self.layout(body.locals[receiver].ty.as_ref())?;
+        let receiver = self.layout(receiver.as_ref())?;
         let thin = match receiver.backend_repr {
             BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Primitive::Pointer(_)),
             _ => false,
@@ -5036,7 +5086,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // FIXME: rustc puts a shim in the vtable that supplies the location.
             unsupported!("`#[track_caller]` method in a vtable");
         }
-        let sig = self.body_signature(body, false)?;
+        let sig = self.body_signature(body)?;
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
 
@@ -5046,16 +5096,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.reified(ty, true);
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self
-            .cg
-            .db
-            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let sig = self.body_signature(body, false)?;
-        let Some(&receiver) = body.param_locals.first() else {
+        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
         };
-        let receiver_ty = body.locals[receiver].ty.as_ref();
+        let receiver_ty = receiver.as_ref();
         let closure = InstanceDef::Closure(id.0.as_id());
         if receiver_ty.as_reference().is_none() {
             // The body takes the closure by value. Only when that means "through a pointer to
@@ -5189,16 +5235,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("fn pointer to {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self
-            .cg
-            .db
-            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let mut sig = self.body_signature(body, false)?;
-        let Some(&receiver) = body.param_locals.first() else {
+        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let mut sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
         };
-        if body.locals[receiver].ty.as_ref().as_reference().is_none() {
+        if receiver.as_ref().as_reference().is_none() {
             // Taken by value, a closure without captures is not passed at all.
             return self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig);
         }
@@ -5214,12 +5256,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("fn pointer shim for {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self
-            .cg
-            .db
-            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let sig = self.body_signature(body, false)?;
+        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let sig = self.body_signature(body)?;
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let mut shim = sig.clone();
         shim.params.remove(sret as usize);
@@ -5245,16 +5283,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("call_once shim for {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self
-            .cg
-            .db
-            .monomorphized_mir_body_for_closure(id.0, parent_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let sig = self.body_signature(body, false)?;
-        let Some(&receiver) = body.param_locals.first() else {
+        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
         };
-        let receiver_ty = body.locals[receiver].ty.as_ref();
+        let receiver_ty = receiver.as_ref();
         let by_value = receiver_ty.as_reference().is_none();
         let layout = self.layout(receiver_ty)?;
         let mode = self.pass_mode(&layout, false)?;
@@ -6445,22 +6479,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("drop glue for {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-        let body = self
-            .cg
-            .db
-            .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-        let Some(crate::mir::CoroutineLocals { poll, .. }) = body.coroutine else {
+        let body = self.body_types(InstanceDef::Coroutine(id.0.as_id()), parent_args)?;
+        let Some(poll_ty) = &body.poll else {
             unsupported!("async block whose body is not one");
         };
         let mut values = Vec::new();
-        for (&param, value) in body.param_locals.iter().zip([Some(addr), None]) {
+        for (param, value) in body.params.iter().zip([Some(addr), None]) {
             let slot = self.scratch();
             let value = value.unwrap_or_else(|| self.builder.ins().iconst(PTR, 0));
             self.builder.ins().store(MEM, value, slot, 0);
-            values.push((slot, body.locals[param].ty.as_ref()));
+            values.push((slot, param.as_ref()));
         }
-        let poll_ty = body.locals[poll].ty.as_ref();
+        let poll_ty = poll_ty.as_ref();
         let layout = self.layout(poll_ty)?;
         let ignored = self.stack_slot(&layout);
         let callee = Callee::Instance(InstanceDef::Coroutine(id.0.as_id()), parent_args);
