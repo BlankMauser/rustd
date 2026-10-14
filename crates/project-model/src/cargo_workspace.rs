@@ -528,6 +528,12 @@ impl CargoWorkspace {
         }
     }
 
+    /// Replaces the features `cargo metadata` resolved for a package, which are those of a
+    /// build of the whole workspace.
+    pub fn set_active_features(&mut self, package: Package, features: Vec<String>) {
+        self.packages[package].active_features = features;
+    }
+
     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
         self.packages.iter().map(|(id, _pkg)| id)
     }

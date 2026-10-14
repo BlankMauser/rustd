@@ -1769,6 +1769,27 @@ pub mod async_frames {
         pinned.await
     }
 
+    /// The futures of the arms never exist at once and share the memory of the future
+    /// awaiting them; the ones awaited in turn while `kept` is borrowed do too.
+    async fn arms(which: u8) -> u64 {
+        let kept = [which; 32];
+        let first = match which {
+            0 => leaf(1).await,
+            1 => leaf(2).await + leaf(3).await,
+            2 => borrows(4).await,
+            _ => leaf(5).await,
+        };
+        let view = &kept[..4];
+        let second = leaf(first as u8).await;
+        let third = leaf(second as u8).await;
+        first + second + third + checksum(view)
+    }
+
+    pub fn shared() -> (Vec<u64>, bool) {
+        let size = std::mem::size_of_val(&arms(0));
+        ((0..4).map(|which| block_on(arms(which))).collect(), size < 2 * 4096)
+    }
+
     pub fn run() -> (u64, u64, u64) {
         (block_on(leaf(3)), block_on(borrows(5)), block_on(nested(1)))
     }
@@ -2148,6 +2169,42 @@ pub mod union_pointer {
     pub fn run() -> (i32, u64, u8) {
         let direct = unsafe { DIRECT.assume_init() };
         (unsafe { COPIED.assume_init().read() }, direct.0, *direct.1)
+    }
+}
+
+/// Items in the body of an `async fn`, which rustc names through the closure the body is.
+pub mod async_items {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    async fn outer(n: u32) -> u32 {
+        static TABLE: [u32; 3] = [3, 5, 7];
+        fn double(n: u32) -> u32 {
+            n * 2
+        }
+        async fn inner(n: u32) -> u32 {
+            fn triple(n: u32) -> u32 {
+                n * 3
+            }
+            triple(n) + 1
+        }
+        let scale = |n: u32| {
+            fn in_closure(n: u32) -> u32 {
+                n + 100
+            }
+            in_closure(n)
+        };
+        double(n) + inner(n).await + TABLE[n as usize % 3] + scale(n)
+    }
+
+    pub fn run() -> u32 {
+        let mut future = pin!(outer(4));
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => value,
+            Poll::Pending => 0,
+        }
     }
 }
 
@@ -3118,6 +3175,24 @@ pub mod type_id_hashes {
         ]
     }
 
+    /// And so is that of the future of an `async` block or function.
+    pub fn futures() -> Vec<bool> {
+        async fn waits<T>(value: T) -> T {
+            value
+        }
+        let block = async { 1u8 };
+        let other = async { 1u8 };
+        let held: Box<dyn Any> = Box::new(Some(waits(2u8)));
+        vec![
+            of_value(&block) == of_value(&block),
+            of_value(&block) == of_value(&other),
+            of_value(&waits(1u8)) == of_value(&waits(2u8)),
+            of_value(&waits(1u8)) == of_value(&waits(1u16)),
+            is(&Some(waits(3u8)), &*held),
+            is(&Some(waits(3u16)), &*held),
+        ]
+    }
+
     fn name_of<T>(_: &T) -> &'static str {
         std::any::type_name::<T>()
     }
@@ -3218,6 +3293,66 @@ pub mod type_names {
             std::any::type_name::<&mut (i32,)>(),
             std::any::type_name::<dyn std::fmt::Debug + Send>(),
         ]
+    }
+
+    pub struct Holder<T>(pub T);
+
+    pub trait Named {
+        fn named<F: Fn()>(&self, f: F) -> &'static str;
+    }
+
+    fn generic<T, const N: usize>(_: T) {}
+
+    impl<T> Holder<T> {
+        fn inherent<F: Fn() -> u8>(&self, f: F) -> [&'static str; 3] {
+            let inner = || f();
+            [of(&inner), of(&Self::inherent::<F>), of(&generic::<F, 3>)]
+        }
+
+        async fn waits(&self, f: impl Fn() -> u8) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    impl<T> Named for Holder<T> {
+        fn named<F: Fn()>(&self, f: F) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    impl Named for u8 {
+        fn named<F: Fn()>(&self, f: F) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    mod elsewhere {
+        impl super::Named for super::inner::Choice {
+            fn named<F: Fn()>(&self, f: F) -> &'static str {
+                let inner = || f();
+                super::of(&inner)
+            }
+        }
+    }
+
+    /// Names that go through an `impl`, a generic function or a closure of one.
+    pub fn nested() -> Vec<&'static str> {
+        use std::future::Future;
+        let holder = Holder(Some(1u16));
+        let mut names = holder.inherent(|| 1).to_vec();
+        let future = std::pin::pin!(holder.waits(|| 2));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(name) = future.poll(&mut cx) {
+            names.push(name);
+        }
+        names.push(holder.named(|| ()));
+        names.push(7u8.named(|| ()));
+        names.push(inner::Choice::A.named(|| ()));
+        names.push(std::any::type_name::<std::slice::Iter<'static, u8>>());
+        names
     }
 }
 
@@ -4623,5 +4758,149 @@ pub mod shadowed_item_macro {
 
     pub fn run() -> [Option<&'static str>; 3] {
         [visit(&mut Names, 0), visit(&mut Names, 1), visit(&mut Names, 2)]
+    }
+}
+
+pub mod repeated_statics {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    macro_rules! bump {
+        ($by:expr) => {{
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            static mut LAST: u32 = 0;
+            unsafe { LAST = $by };
+            COUNT.fetch_add($by, Ordering::Relaxed) + unsafe { LAST }
+        }};
+    }
+
+    static LAZY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "lazy".repeat(2));
+
+    pub fn lazy() -> usize {
+        fn named() -> u32 {
+            7
+        }
+        static NAMED: std::sync::LazyLock<u32> = std::sync::LazyLock::new(named);
+        LAZY.len() + *NAMED as usize
+    }
+
+    pub fn twice() -> (u32, u32, u32) {
+        (bump!(1), bump!(10), bump!(100) + bump!(1000))
+    }
+
+    pub fn in_closure() -> (u32, u32) {
+        let first = || bump!(2) + bump!(20);
+        let second = || bump!(200);
+        (first() + first(), second() + bump!(2000))
+    }
+
+    async fn waits() -> (u32, u32) {
+        let first = bump!(3);
+        let second = async { bump!(30) + bump!(300) }.await;
+        (first, second + bump!(3000))
+    }
+
+    pub fn in_async() -> (u32, u32) {
+        let mut future = std::pin::pin!(waits());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+}
+
+/// `writeln!` adds its newline to a raw string as to any other.
+pub mod raw_newline {
+    use std::fmt::Write;
+
+    pub fn run() -> String {
+        let mut out = String::new();
+        let name = "raw";
+        writeln!(
+            out,
+            r#"first {name}
+second "quoted"
+"#
+        )
+        .unwrap();
+        writeln!(out, r"plain
+ {}", 1).unwrap();
+        writeln!(out, "escaped\n {name}\n").unwrap();
+        out
+    }
+}
+
+/// A map filled in here and read by the caller: both sides must agree on where a tree node
+/// keeps its keys and values.
+pub mod shared_map {
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Number(f64),
+        String(String),
+        Array(Vec<Value>),
+        Object(BTreeMap<String, Value>),
+    }
+
+    pub fn build() -> Value {
+        let mut inner = BTreeMap::new();
+        inner.insert("message".to_string(), Value::String("unexpected token".to_string()));
+        inner.insert("line".to_string(), Value::Number(3.0));
+        let mut outer = BTreeMap::new();
+        outer.insert("error".to_string(), Value::Object(inner));
+        outer.insert("ok".to_string(), Value::Bool(false));
+        outer.insert("rest".to_string(), Value::Array(vec![Value::Null, Value::Bool(true)]));
+        Value::Object(outer)
+    }
+}
+
+/// A temporary in the tail of a block that an older-edition macro wrote lives to the end of
+/// the statement around the block, not to the end of the block.
+pub mod tail_temporaries {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub struct Noisy(String);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            LOG.with(|log| log.borrow_mut().push(format!("drop {}", self.0)));
+        }
+    }
+
+    pub struct Shown<'a>(&'a Noisy);
+
+    pub fn show(value: &Noisy) -> Shown<'_> {
+        Shown(value)
+    }
+
+    fn read(values: &[(&str, Option<&Shown<'_>>)]) -> String {
+        let read: Vec<String> =
+            values.iter().map(|it| format!("{}={}", it.0, it.1.unwrap().0.0)).collect();
+        LOG.with(|log| log.borrow_mut().push(format!("read {read:?}")));
+        read.join(",")
+    }
+
+    pub fn run(pick: bool) -> Vec<String> {
+        let first = read(old_macros::values!(
+            show;
+            "a" = Noisy("one".to_string()),
+            "b" = Noisy("two".to_string())
+        ));
+        let second = if pick {
+            read(old_macros::values!(show; "c" = Noisy(format!("three {first}"))))
+        } else {
+            read(&[])
+        };
+        LOG.with(|log| log.borrow_mut().push(second));
+        LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
     }
 }

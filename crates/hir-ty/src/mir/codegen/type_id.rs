@@ -35,7 +35,7 @@ use super::SymbolResolver;
 use crate::{
     InferBodyId,
     consteval::try_const_usize,
-    db::{HirDatabase, InternedClosure, InternedClosureId},
+    db::{HirDatabase, InternedClosure},
     next_solver::{Const, GenericArgs, Region, TermId, Ty, TyKind},
 };
 
@@ -191,9 +191,9 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// function it is written in is, so there is no hash of rustc's to agree with.
     // FIXME: a function of the crate that is left to rustc, and got the closure from one that
     // is ours, has rustc's hash for it.
-    fn closure(&self, hasher: &mut StableSipHasher128, id: InternedClosureId<'db>) -> Option<()> {
+    fn closure(&self, hasher: &mut StableSipHasher128, closure: InternedClosure<'_>) -> Option<()> {
         let db = self.db;
-        let InternedClosure { owner, expr, .. } = id.loc(db);
+        let InternedClosure { owner, expr, .. } = closure;
         let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
             return None;
         };
@@ -202,6 +202,14 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         }
         let loc = func.lookup(db);
         let parent = match loc.container {
+            // A function written in a body: told apart by where it is in the file.
+            ItemContainerId::ModuleId(mut module) if module.is_block_module(db) => {
+                while module.is_block_module(db) {
+                    module = module.containing_module(db)?;
+                }
+                self.module(module)?.hash(hasher);
+                Fingerprint(1, u64::from(loc.id.value.erase().into_raw()))
+            }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ImplId(impl_) => {
@@ -298,8 +306,14 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::Closure(id, args) => {
                 hasher.write_isize(17);
-                self.closure(hasher, id.0)?;
+                self.closure(hasher, id.0.loc(self.db))?;
                 let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                self.args(parent)?.hash(hasher);
+            }
+            TyKind::Coroutine(id, args) => {
+                hasher.write_isize(19);
+                self.closure(hasher, id.0.loc(self.db))?;
+                let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
                 self.args(parent)?.hash(hasher);
             }
             TyKind::FnPtr(signature, header) => {

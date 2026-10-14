@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
 use rustc_hash::FxHashMap;
-use std::collections::hash_map::Entry;
 
 #[derive(Default)]
 pub(crate) struct SymbolTable {
-    by_path: FxHashMap<String, String>,
+    /// More than one symbol for the items that print as one path: of two `const _` blocks of
+    /// a module, or of one name in one function. Linking one to another's symbol is a
+    /// miscompile.
+    by_path: FxHashMap<String, Vec<Placed>>,
     /// Symbols of items nested in closures and anonymous constants, by their path without the
     /// `{closure#0}`-like segments, with the numbers of the closures among those.
     nested: FxHashMap<String, Vec<NestedSymbol>>,
@@ -24,11 +26,20 @@ pub(crate) struct SymbolTable {
 struct NestedSymbol {
     name: String,
     closures: Vec<u32>,
+    place: Option<u64>,
+}
+
+struct Placed {
+    name: String,
+    /// The place of the item among those of its name in what it is written in, which rustc
+    /// mangles into the symbol and no path says. `None` for a symbol we can't read it from.
+    place: Option<u64>,
 }
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
 struct Symbol {
     name: String,
+    place: Option<u64>,
     with_ids: String,
     path: String,
 }
@@ -67,8 +78,7 @@ impl SymbolTable {
                 table.by_root.insert(source, id);
             }
         }
-        let mut ambiguous = Vec::new();
-        for Symbol { name, with_ids, path } in symbols {
+        for Symbol { name, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
@@ -85,26 +95,16 @@ impl SymbolTable {
                     .collect();
                 let symbols = table.nested.entry(named.join("::")).or_default();
                 if symbols.iter().all(|it| it.name != name) {
-                    symbols.push(NestedSymbol { name: name.clone(), closures });
+                    symbols.push(NestedSymbol { name: name.clone(), closures, place });
                 }
             }
-            match table.by_path.entry(path) {
-                Entry::Vacant(entry) => {
-                    entry.insert(name);
-                }
-                Entry::Occupied(entry) => {
-                    if without_instantiating_crate(entry.get())
-                        != without_instantiating_crate(&name)
-                    {
-                        ambiguous.push(entry.key().clone());
-                    }
-                }
+            let known = table.by_path.entry(path).or_default();
+            let same = |it: &Placed| {
+                without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
+            };
+            if !known.iter().any(same) {
+                known.push(Placed { name, place });
             }
-        }
-        // Items in two `const _` blocks of a module print as one path. Linking either to the
-        // other's symbol is a miscompile, so neither has one.
-        for path in ambiguous {
-            table.by_path.remove(&path);
         }
         Ok(table)
     }
@@ -139,6 +139,7 @@ impl SymbolTable {
             // `{:#}` drops the crate disambiguator hashes.
             symbols.push(Symbol {
                 name: name.to_owned(),
+                place: V0::place(name),
                 with_ids,
                 path: format!("{demangled:#}"),
             });
@@ -162,18 +163,38 @@ impl SymbolTable {
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<&str> {
-        self.by_path.get(path).map(String::as_str)
+        match &**self.by_path.get(path)? {
+            [only] => Some(&only.name),
+            _ => None,
+        }
+    }
+
+    /// The symbol of the item at `path` that is the `place`th of its name in what it is
+    /// written in.
+    pub(crate) fn get_at(&self, path: &str, place: u64) -> Option<&str> {
+        let mut symbols = match &**self.by_path.get(path)? {
+            [only] => {
+                return Some(only)
+                    .filter(|it| it.place.is_none_or(|it| it == place))
+                    .map(|it| &*it.name);
+            }
+            symbols => symbols.iter().filter(|it| it.place == Some(place)),
+        };
+        let symbol = symbols.next()?;
+        symbols.next().is_none().then_some(&*symbol.name)
     }
 
     /// The symbol of an item whose path has unnamed segments between the named ones given.
     ///
     /// `closures` are the numbers rustc gives the closures around the item, outermost first,
-    /// which tell apart the items that only differ in those. Anonymous constants are not
-    /// numbered, so two items that differ in one of those have no symbol here.
-    pub(crate) fn get_nested(&self, named: &str, closures: &[u32]) -> Option<&str> {
+    /// which tell apart the items that only differ in those, and `place` is as in `get_at`.
+    /// Anonymous constants are not numbered, so two items that differ in one of those have
+    /// no symbol here.
+    pub(crate) fn get_nested(&self, named: &str, closures: &[u32], place: u64) -> Option<&str> {
+        let here = |it: &&NestedSymbol| it.place.is_none_or(|known| known == place);
         let mut symbols = match &**self.nested.get(named)? {
-            [only] => return Some(&only.name),
-            symbols => symbols.iter().filter(|it| it.closures == closures),
+            [only] => return Some(only).filter(here).map(|it| &*it.name),
+            symbols => symbols.iter().filter(here).filter(|it| it.closures == closures),
         };
         let symbol = symbols.next()?;
         symbols.next().is_none().then_some(&*symbol.name)
@@ -266,4 +287,194 @@ fn without_ids(demangled: &str, drop: impl Fn(&str) -> bool) -> String {
     }
     path.push_str(rest);
     path
+}
+
+/// A reader of v0 symbols, for what `rustc_demangle` reads and does not print.
+struct V0<'a> {
+    rest: &'a [u8],
+}
+
+impl V0<'_> {
+    /// The disambiguator of the last name in the path of a symbol: `0` for the first item of
+    /// that name in what it is written in, `1` for the next.
+    fn place(symbol: &str) -> Option<u64> {
+        V0 { rest: symbol.strip_prefix("_R")?.as_bytes() }.path()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let (&first, rest) = self.rest.split_first()?;
+        self.rest = rest;
+        Some(first)
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        let found = self.rest.first() == Some(&byte);
+        if found {
+            self.rest = &self.rest[1..];
+        }
+        found
+    }
+
+    fn base62(&mut self) -> Option<u64> {
+        if self.eat(b'_') {
+            return Some(0);
+        }
+        let mut value = 0u64;
+        loop {
+            let digit = match self.next()? {
+                b'_' => return value.checked_add(1),
+                byte @ b'0'..=b'9' => byte - b'0',
+                byte @ b'a'..=b'z' => byte - b'a' + 10,
+                byte @ b'A'..=b'Z' => byte - b'A' + 36,
+                _ => return None,
+            };
+            value = value.checked_mul(62)?.checked_add(digit.into())?;
+        }
+    }
+
+    fn disambiguator(&mut self) -> Option<u64> {
+        if self.eat(b's') { self.base62()?.checked_add(1) } else { Some(0) }
+    }
+
+    fn identifier(&mut self) -> Option<()> {
+        self.eat(b'u');
+        let digits = self.rest.iter().take_while(|it| it.is_ascii_digit()).count();
+        let len: usize = str::from_utf8(&self.rest[..digits]).ok()?.parse().ok()?;
+        self.rest = &self.rest[digits..];
+        self.eat(b'_');
+        self.rest = self.rest.get(len..)?;
+        Some(())
+    }
+
+    /// Reads a path, for the disambiguator of the name it ends in.
+    fn path(&mut self) -> Option<u64> {
+        match self.next()? {
+            b'C' => {
+                self.disambiguator()?;
+                self.identifier()?;
+                Some(0)
+            }
+            b'M' => {
+                self.disambiguator()?;
+                self.path()?;
+                self.ty()?;
+                Some(0)
+            }
+            b'X' => {
+                self.disambiguator()?;
+                self.path()?;
+                self.ty()?;
+                self.path()?;
+                Some(0)
+            }
+            b'Y' => {
+                self.ty()?;
+                self.path()?;
+                Some(0)
+            }
+            b'N' => {
+                self.next()?;
+                self.path()?;
+                let place = self.disambiguator()?;
+                self.identifier()?;
+                Some(place)
+            }
+            b'I' => {
+                let place = self.path()?;
+                while !self.eat(b'E') {
+                    match self.rest.first()? {
+                        b'L' => {
+                            self.next();
+                            self.base62()?;
+                        }
+                        b'K' => {
+                            self.next();
+                            self.constant()?;
+                        }
+                        _ => self.ty()?,
+                    }
+                }
+                Some(place)
+            }
+            b'B' => {
+                self.base62()?;
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    fn binder(&mut self) -> Option<()> {
+        if self.eat(b'G') {
+            self.base62()?;
+        }
+        Some(())
+    }
+
+    fn ty(&mut self) -> Option<()> {
+        match *self.rest.first()? {
+            b'C' | b'M' | b'X' | b'Y' | b'N' | b'I' | b'B' => return self.path().map(drop),
+            _ => {}
+        }
+        match self.next()? {
+            b'A' => {
+                self.ty()?;
+                self.constant()?;
+            }
+            b'S' | b'P' | b'O' => self.ty()?,
+            b'T' => {
+                while !self.eat(b'E') {
+                    self.ty()?;
+                }
+            }
+            b'R' | b'Q' => {
+                if self.eat(b'L') {
+                    self.base62()?;
+                }
+                self.ty()?;
+            }
+            b'F' => {
+                self.binder()?;
+                self.eat(b'U');
+                if self.eat(b'K') && !self.eat(b'C') {
+                    self.identifier()?;
+                }
+                while !self.eat(b'E') {
+                    self.ty()?;
+                }
+                self.ty()?;
+            }
+            b'D' => {
+                self.binder()?;
+                while !self.eat(b'E') {
+                    self.path()?;
+                    while self.eat(b'p') {
+                        self.identifier()?;
+                        self.ty()?;
+                    }
+                }
+                if !self.eat(b'L') {
+                    return None;
+                }
+                self.base62()?;
+            }
+            // A basic type is one lowercase letter.
+            byte if byte.is_ascii_lowercase() => {}
+            _ => return None,
+        }
+        Some(())
+    }
+
+    // FIXME: the constants of `adt_const_params` are not read.
+    fn constant(&mut self) -> Option<()> {
+        if self.eat(b'p') {
+            return Some(());
+        }
+        if self.eat(b'B') {
+            return self.base62().map(drop);
+        }
+        self.ty()?;
+        while self.next()? != b'_' {}
+        Some(())
+    }
 }

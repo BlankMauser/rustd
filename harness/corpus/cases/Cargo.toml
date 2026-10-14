@@ -2,3 +2,6 @@
 name = "cases"
 version = "0.0.0"
 edition = "2024"
+
+[dependencies]
+old_macros = { path = "../old_macros" }

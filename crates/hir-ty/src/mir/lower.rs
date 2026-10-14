@@ -682,20 +682,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Block { id: _, statements, tail, label, unsafe_: _ } => {
                 if let Some(label) = label {
                     self.lower_loop(current, place, Some(*label), expr_id.into(), |this, begin| {
-                        if let Some(current) = this.lower_block_to_place(
-                            statements,
-                            begin,
-                            *tail,
-                            place,
-                            expr_id.into(),
-                        )? {
+                        if let Some(current) =
+                            this.lower_block_to_place(statements, begin, *tail, place, expr_id)?
+                        {
                             let end = this.current_loop_end()?;
                             this.set_goto(current, end, expr_id.into());
                         }
                         Ok(())
                     })
                 } else {
-                    self.lower_block_to_place(statements, current, *tail, place, expr_id.into())
+                    self.lower_block_to_place(statements, current, *tail, place, expr_id)
                 }
             }
             Expr::Loop { body, label, source: _ } => {
@@ -2254,8 +2250,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         mut current: BasicBlockId,
         tail: Option<ExprId>,
         place: Place<'db>,
-        span: MirSpan,
+        block: ExprId,
     ) -> Result<'db, Option<Idx<BasicBlock>>> {
+        let span = MirSpan::from(block);
         if self.is_super_let_block(statements)
             && let Some(tail) = tail
         {
@@ -2370,8 +2367,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 return Ok(None);
             };
             current = c;
-            // Before the 2024 edition the temporaries of a block's tail outlive its locals.
-            if !self.edition().at_least_2024()
+            // Before the 2024 edition the temporaries of a block's tail live as long as those
+            // of the expression the block is in. The edition is the one the block was written
+            // in, which for a macro's block is the macro's.
+            let edition = self.store.block_edition(block).unwrap_or_else(|| self.edition());
+            if !edition.at_least_2024()
+                && let [.., outer, scope] = &mut self.drop_scopes[..]
+                && declared <= scope.locals.len()
+            {
+                outer.locals.extend(scope.locals.drain(declared..));
+            } else if !edition.at_least_2024()
                 && let Some(scope) = self.drop_scopes.last_mut()
                 && declared <= scope.locals.len()
             {

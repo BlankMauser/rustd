@@ -77,6 +77,7 @@ use super::{
 
 mod fragment;
 mod patch;
+mod stable;
 pub use patch::{Stale, StaleSteps};
 mod type_id;
 mod unwind;
@@ -125,6 +126,11 @@ pub trait SymbolResolver {
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
+    /// Runs `work` for each of `0..count`, on as many threads as there are, each with a
+    /// database of its own. What `work` computes is kept by the queries it asks.
+    fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
+        _ = (count, work);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -382,6 +388,20 @@ impl CodegenUnit {
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
+                if let Some(path) = std::env::var_os("RUSTD_STABLE_NAMES") {
+                    let names = stable::StableNames::new(db, cg.symbols, &cg.own_statics.crates);
+                    let mut all: Vec<String> =
+                        cg.envs.iter().filter_map(|(it, _)| names.instance(it)).collect();
+                    let named = all.len();
+                    all.sort();
+                    all.dedup();
+                    eprintln!(
+                        "stable names: {named} of {} instances, {} distinct",
+                        cg.envs.len(),
+                        all.len()
+                    );
+                    std::fs::write(path, all.join("\n")).ok();
+                }
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
@@ -1411,12 +1431,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
     fn define_instances(&mut self) -> Vec<(Instance, String)> {
         let mut failed = Vec::new();
-        while let Some((instance, env, id)) = self.pending.pop() {
-            if let Err(e) = self.define_instance(&instance, &env, id) {
-                if self.forward_to_rustc(&instance, id).is_some() {
-                    self.forwarded.insert(instance);
-                } else {
-                    failed.push((instance, e.to_string()));
+        while !self.pending.is_empty() {
+            // Each wave is compiled on every core, and then put in the object one by one.
+            let wave = std::mem::take(&mut self.pending);
+            let start = std::time::Instant::now();
+            self.symbols.in_parallel(wave.len(), &|db, at| {
+                let (instance, env, _) = &wave[at];
+                _ = compiled_instance(db, instance.clone(), env.clone());
+            });
+            self.phases.compile += start.elapsed();
+            for (instance, env, id) in wave {
+                if let Err(e) = self.define_instance(&instance, &env, id) {
+                    if self.forward_to_rustc(&instance, id).is_some() {
+                        self.forwarded.insert(instance);
+                    } else {
+                        failed.push((instance, e.to_string()));
+                    }
                 }
             }
         }
@@ -1478,7 +1508,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         generic: bool,
         took: std::time::Duration,
     ) {
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
         use std::io::Write;
         if self.shapes.is_none() {
             return;
@@ -1680,7 +1710,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
         if compiled.writable && !self.own_statics.owns(db, id) {
-            unsupported!("writable static without a rustc symbol");
+            let name = hir_def::signatures::StaticSignature::of(db, id).name.as_str();
+            unsupported!("writable static `{name}` without a rustc symbol");
         }
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
@@ -3049,11 +3080,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             this.builder.ins().iadd_imm(*addr, layout.fields.offset(field).bytes() as i64)
         };
         let held = match &frame {
-            Some(_) => body.locals_held_across_yields(|local| {
+            Some(_) => Some(body.locals_held_across_yields(|local| {
                 has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
                     != DropGlue::None
-            }),
-            None => Default::default(),
+            })),
+            None => None,
         };
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local) {
@@ -3061,7 +3092,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             let layout = self.layout(data.ty.as_ref())?;
             if let Some((frame, ..)) = &frame
-                && held.contains(&local)
+                && held.as_ref().is_some_and(|it| it.contains(local))
             {
                 let addr = in_frame(self, frame.local(local.into_raw().into_u32() as usize));
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
@@ -4189,12 +4220,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // word that is the address of something it kept is taken to be one.
                     AdtId::UnionId(_) => {
                         let align = layout.align.abi.bytes_usize();
+                        let mut may_hold_fn = None;
                         if align.is_multiple_of(8) {
                             for word in 0..layout.size.bytes_usize() / 8 {
                                 let at = offset + word * 8;
-                                if let Some(id) = blob.usize_at(at) {
-                                    self.relocate_data_pointer(blob, at, id, Mutability::Not, map)?;
+                                let Some(id) = blob.usize_at(at) else { continue };
+                                // And every word that is the id of a function is taken to
+                                // be that function, in a union that may hold one, as the
+                                // one of a `LazyLock` does.
+                                if may_hold_fn.get_or_insert_with(|| self.holds_fn_pointer(ty, 8))
+                                    == &true
+                                    && let Ok(fn_ty) = map.map.vtable_ty(id)
+                                    && matches!(
+                                        fn_ty.kind(),
+                                        TyKind::FnDef(..) | TyKind::Closure(..)
+                                    )
+                                {
+                                    let target = self.fn_item(fn_ty)?;
+                                    blob.bytes[at..at + 8].fill(0);
+                                    blob.fn_relocs.push((at as u32, target));
+                                    continue;
                                 }
+                                self.relocate_data_pointer(blob, at, id, Mutability::Not, map)?;
                             }
                         }
                         return Ok(());
@@ -4255,6 +4302,36 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => (),
         }
         Ok(())
+    }
+
+    /// Whether a value of the type has a function pointer in it, not behind a pointer, looking
+    /// `depth` types deep.
+    fn holds_fn_pointer(&self, ty: Ty<'db>, depth: u32) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let db = self.cg.db;
+        match ty.kind() {
+            TyKind::FnPtr(..) => true,
+            TyKind::Tuple(tys) => tys.iter().any(|it| self.holds_fn_pointer(it, depth - 1)),
+            TyKind::Array(elem, _) => self.holds_fn_pointer(elem, depth - 1),
+            TyKind::Adt(def, args) => {
+                let variants: Vec<VariantId> = match def.def_id() {
+                    AdtId::StructId(id) => vec![id.into()],
+                    AdtId::UnionId(id) => vec![id.into()],
+                    AdtId::EnumId(id) => {
+                        id.enum_variants(db).variants.iter().map(|it| it.1.0.into()).collect()
+                    }
+                };
+                variants.into_iter().any(|variant| {
+                    db.field_types(variant).iter().any(|(_, field)| {
+                        let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                        self.holds_fn_pointer(field, depth - 1)
+                    })
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Points the word at `offset`, which const eval left holding address `addr`, at the static
@@ -7804,7 +7881,7 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     let mut held = |place: &StoredPlace| {
         temps.remove(&place.local);
     };
-    let mut operand = |operand: &Operand, held: &mut dyn FnMut(&StoredPlace)| {
+    let operand = |operand: &Operand, held: &mut dyn FnMut(&StoredPlace)| {
         if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind
             && !place.projection.as_slice().is_empty()
         {
@@ -7840,7 +7917,7 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     temps
 }
 
-fn drop_order(body: &MirBody, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
+fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
     let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
         match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
             Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),

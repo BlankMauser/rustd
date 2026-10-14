@@ -384,13 +384,20 @@ pub fn layout_of_ty_query(
                     trait_env.param_env(db),
                 ) != crate::drop::DropGlue::None
             });
-            for (id, local) in body.locals.iter() {
-                if !used.contains(&id) || !held.contains(&id) {
-                    fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
-                    continue;
+            // The locals come after everything else, where two that never hold a value at once
+            // share memory: the futures of the arms of a `match`, each awaited in its arm.
+            let first_local = fields.len();
+            let mut in_frame = Vec::new();
+            for (at, &id) in held.locals.iter().enumerate() {
+                if used.contains(&id) {
+                    let layout = db.layout_of_ty(body.locals[id].ty.clone(), trait_env.clone())?;
+                    if layout.size.bytes() != 0 {
+                        in_frame.push((at, id, layout.size, layout.align));
+                    }
                 }
-                let layout = db.layout_of_ty(local.ty.clone(), trait_env.clone())?;
-                fields.push(opaque(layout.size, layout.align));
+            }
+            for _ in body.locals.iter() {
+                fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
             }
             fields.extend(body.locals.iter().map(|_| word.clone()));
             fields.push(word);
@@ -400,6 +407,36 @@ pub fn layout_of_ty_query(
                 cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?;
             layout.largest_niche = None;
             layout.backend_repr = BackendRepr::Memory { sized: true };
+            // The largest first, each at the lowest offset clear of the ones it can't share
+            // memory with.
+            in_frame.sort_by_key(|&(at, _, size, align)| {
+                (std::cmp::Reverse(size), std::cmp::Reverse(align.abi), at)
+            });
+            let FieldsShape::Arbitrary { offsets, .. } = &mut layout.fields else {
+                return Err(LayoutError::Unknown);
+            };
+            let start = layout.size;
+            let mut placed: Vec<(usize, Size, Size)> = Vec::new();
+            for &(at, id, size, align) in &in_frame {
+                let mut taken: Vec<(Size, Size)> = placed
+                    .iter()
+                    .filter(|&&(other, ..)| held.conflict(at, other))
+                    .map(|&(_, from, to)| (from, to))
+                    .collect();
+                taken.sort();
+                let mut offset = start.align_to(align.abi);
+                for (from, to) in taken {
+                    if from < offset + size && offset < to {
+                        offset = to.align_to(align.abi);
+                    }
+                }
+                placed.push((at, offset, offset + size));
+                let field = first_local + id.into_raw().into_u32() as usize;
+                offsets[RustcFieldIdx::new(field)] = offset;
+                layout.size = layout.size.max(offset + size);
+                layout.align = layout.align.max(align);
+            }
+            layout.size = layout.size.align_to(layout.align.abi);
             layout
         }
         TyKind::CoroutineClosure(_, args) => {

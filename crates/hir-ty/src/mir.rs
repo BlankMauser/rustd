@@ -9,7 +9,7 @@ use hir_def::{
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -1044,14 +1044,31 @@ pub struct CoroutineLocals {
     pub context: LocalId,
 }
 
+/// The locals of an `async` block that may hold a value when it yields, in the order the body
+/// declares them, and which of them may hold a value at the same time as which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldLocals {
+    pub locals: Vec<LocalId>,
+    conflicts: Vec<bool>,
+}
+
+impl HeldLocals {
+    pub fn contains(&self, local: LocalId) -> bool {
+        self.locals.binary_search(&local).is_ok()
+    }
+
+    /// Whether the `a`th and the `b`th of the locals may both hold a value at some point, and
+    /// so can't share memory.
+    pub fn conflict(&self, a: usize, b: usize) -> bool {
+        self.conflicts[a * self.locals.len() + b]
+    }
+}
+
 impl MirBody<'_> {
     /// The locals that may hold a value when the body yields: the ones an `async` block has to
     /// keep from one `poll` to the next. `moved_by_use` says whether using a local as an operand
     /// takes its value, which the operand does not say.
-    pub fn locals_held_across_yields(
-        &self,
-        moved_by_use: impl Fn(LocalId) -> bool,
-    ) -> FxHashSet<LocalId> {
+    pub fn locals_held_across_yields(&self, moved_by_use: impl Fn(LocalId) -> bool) -> HeldLocals {
         let index = |local: LocalId| local.into_raw().into_u32() as usize;
         let mut moved = vec![false; self.locals.len()];
         for (local, _) in self.locals.iter() {
@@ -1069,27 +1086,29 @@ impl MirBody<'_> {
         for &param in &self.param_locals {
             start[index(param)] = true;
         }
-        let mut entry: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
-        entry.insert(self.start_block, start);
-        let mut across = vec![false; self.locals.len()];
-        let mut worklist = vec![self.start_block];
-        while let Some(id) = worklist.pop() {
-            let mut held = entry[id].clone();
+        // What a block does to the locals held on entry to it, and the blocks that follow.
+        // `gains` is told of a local about to be given a value, before the operands it is
+        // computed from are taken, and `yields` of what is held where the block yields.
+        let transfer = |id: BasicBlockId,
+                        held: &mut Vec<bool>,
+                        gains: &mut dyn FnMut(&[bool], usize),
+                        yields: &mut dyn FnMut(&[bool])| {
             let block = &self.basic_blocks[id];
             for statement in &block.statements {
                 match &statement.kind {
                     StatementKind::Assign(place, rvalue) => {
+                        gains(held, index(place.local));
                         match rvalue {
                             Rvalue::UnaryOp(_, operand)
                             | Rvalue::Cast(_, operand, _)
                             | Rvalue::Repeat(operand, _)
-                            | Rvalue::Use(operand) => take(&mut held, operand),
+                            | Rvalue::Use(operand) => take(held, operand),
                             Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
-                                take(&mut held, lhs);
-                                take(&mut held, rhs);
+                                take(held, lhs);
+                                take(held, rhs);
                             }
                             Rvalue::Aggregate(_, operands) => {
-                                operands.iter().for_each(|it| take(&mut held, it));
+                                operands.iter().for_each(|it| take(held, it));
                             }
                             Rvalue::CopyForDeref(_)
                             | Rvalue::Discriminant(_)
@@ -1112,7 +1131,7 @@ impl MirBody<'_> {
             let mut successors = SmallVec::<[BasicBlockId; 2]>::new();
             match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::SwitchInt { discr, targets }) => {
-                    take(&mut held, discr);
+                    take(held, discr);
                     successors.extend(targets.all_targets().iter().copied());
                 }
                 Some(
@@ -1127,25 +1146,26 @@ impl MirBody<'_> {
                     successors.push(*target);
                 }
                 Some(TerminatorKind::DropAndReplace { place, value, target, .. }) => {
-                    take(&mut held, value);
+                    gains(held, index(place.local));
+                    take(held, value);
                     held[index(place.local)] = true;
                     successors.push(*target);
                 }
                 Some(TerminatorKind::Call { func, args, destination, target, .. }) => {
-                    take(&mut held, func);
-                    args.iter().for_each(|it| take(&mut held, it));
+                    gains(held, index(destination.local));
+                    take(held, func);
+                    args.iter().for_each(|it| take(held, it));
                     held[index(destination.local)] = true;
                     successors.extend(*target);
                 }
                 Some(TerminatorKind::Assert { cond, target, .. }) => {
-                    take(&mut held, cond);
+                    take(held, cond);
                     successors.push(*target);
                 }
                 Some(TerminatorKind::Yield { value, resume_arg, resume, .. }) => {
-                    take(&mut held, value);
-                    for (across, &held) in across.iter_mut().zip(&held) {
-                        *across |= held;
-                    }
+                    take(held, value);
+                    yields(held);
+                    gains(held, index(resume_arg.local));
                     held[index(resume_arg.local)] = true;
                     successors.push(*resume);
                 }
@@ -1158,6 +1178,19 @@ impl MirBody<'_> {
                 )
                 | None => (),
             }
+            successors
+        };
+        let mut entry: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+        entry.insert(self.start_block, start);
+        let mut across = vec![false; self.locals.len()];
+        let mut worklist = vec![self.start_block];
+        while let Some(id) = worklist.pop() {
+            let mut held = entry[id].clone();
+            let successors = transfer(id, &mut held, &mut |_, _| (), &mut |held| {
+                for (across, &held) in across.iter_mut().zip(held) {
+                    *across |= held;
+                }
+            });
             for successor in successors {
                 match entry.get_mut(successor) {
                     Some(known) => {
@@ -1177,7 +1210,55 @@ impl MirBody<'_> {
                 }
             }
         }
-        self.locals.iter().map(|(local, _)| local).filter(|&it| across[index(it)]).collect()
+        let locals: Vec<LocalId> =
+            self.locals.iter().map(|(local, _)| local).filter(|&it| across[index(it)]).collect();
+        // Two of them that may hold a value at once can't share memory. With what is held on
+        // entry to each block known, one more pass over the blocks finds every such pair.
+        let mut slot = vec![None; self.locals.len()];
+        for (at, &local) in locals.iter().enumerate() {
+            slot[index(local)] = Some(at);
+        }
+        let words = locals.len().div_ceil(64);
+        let mut together = vec![0u64; locals.len() * words];
+        let bits = |held: &[bool]| {
+            let mut bits = vec![0u64; words];
+            for (at, &local) in locals.iter().enumerate() {
+                if held[index(local)] {
+                    bits[at / 64] |= 1 << (at % 64);
+                }
+            }
+            bits
+        };
+        let mut with = |at: usize, bits: &[u64]| {
+            for (known, bits) in together[at * words..][..words].iter_mut().zip(bits) {
+                *known |= bits;
+            }
+        };
+        for (id, held) in entry.iter() {
+            let on_entry = bits(held);
+            for at in 0..locals.len() {
+                if on_entry[at / 64] & 1 << (at % 64) != 0 {
+                    with(at, &on_entry);
+                }
+            }
+            let mut held = held.clone();
+            let mut gains = |held: &[bool], local: usize| {
+                if let Some(at) = slot[local] {
+                    with(at, &bits(held));
+                }
+            };
+            transfer(id, &mut held, &mut gains, &mut |_| ());
+        }
+        let mut conflicts = vec![false; locals.len() * locals.len()];
+        for a in 0..locals.len() {
+            for b in 0..locals.len() {
+                if a != b && together[a * words + b / 64] & 1 << (b % 64) != 0 {
+                    conflicts[a * locals.len() + b] = true;
+                    conflicts[b * locals.len() + a] = true;
+                }
+            }
+        }
+        HeldLocals { locals, conflicts }
     }
 
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {

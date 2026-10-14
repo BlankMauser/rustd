@@ -13,13 +13,14 @@ use hir_def::{
     },
 };
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::inherent::{BoundExistentialPredicates as _, IntoKind};
+use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
 
 use crate::{
     InferBodyId,
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure},
-    next_solver::{DbInterner, Ty, TyKind},
+    generics::generics,
+    next_solver::{DbInterner, GenericArg, TraitRef, Ty, TyKind},
 };
 
 /// `None` is a type whose rustc spelling this does not reproduce.
@@ -122,22 +123,7 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut String, ty: Ty<'db>) -> Opt
             {
                 args = rest;
             }
-            let mut first = true;
-            for arg in args {
-                if arg.region().is_some() {
-                    continue;
-                }
-                out.push_str(if first { "<" } else { ", " });
-                first = false;
-                match (arg.ty(), arg.konst()) {
-                    (Some(ty), _) => write_ty(db, out, ty)?,
-                    (_, Some(konst)) => write!(out, "{}", try_const_usize(db, konst)?).ok()?,
-                    _ => return None,
-                }
-            }
-            if !first {
-                out.push('>');
-            }
+            write_args(db, out, args)?;
         }
         TyKind::Dynamic(bounds, _) => {
             let principal = bounds.principal()?.skip_binder();
@@ -156,18 +142,14 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut String, ty: Ty<'db>) -> Opt
         }
         TyKind::FnDef(def, args) => {
             let CallableDefId::FunctionId(func) = def.0 else { return None };
-            // FIXME: rustc writes the arguments too.
-            if !args.is_empty() {
-                return None;
-            }
-            write_function(db, out, func)?;
+            write_function(db, out, func, args.as_slice())?;
         }
-        TyKind::Closure(id, _) => {
+        TyKind::Closure(id, args) => {
             let InternedClosure { owner, expr, .. } = id.0.loc(db);
             let InferBodyId::DefWithBodyId(owner @ DefWithBodyId::FunctionId(func)) = owner else {
                 return None;
             };
-            write_function(db, out, func)?;
+            write_function(db, out, func, args.as_closure().parent_args())?;
             let body = Body::of(db, owner);
             for _ in 0..=closures_around(body, body.root_expr(), expr)? {
                 out.push_str("::{{closure}}");
@@ -178,12 +160,115 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut String, ty: Ty<'db>) -> Opt
     Some(())
 }
 
-/// A function of a module. rustc names one of an `impl` after the type, as `<T as Trait>::f`
-/// or `path::Type<T>::f`.
-fn write_function<'db>(db: &'db dyn HirDatabase, out: &mut String, func: FunctionId) -> Option<()> {
-    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return None };
-    write_module(db, out, module)?;
-    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()
+/// `<A, B>`, or nothing for no arguments. rustc writes every lifetime as `'_`.
+fn write_args<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut String,
+    args: &[GenericArg<'db>],
+) -> Option<()> {
+    for (i, arg) in args.iter().enumerate() {
+        out.push_str(if i == 0 { "<" } else { ", " });
+        match (arg.ty(), arg.konst()) {
+            (Some(ty), _) => write_ty(db, out, ty)?,
+            (_, Some(konst)) => write!(out, "{}", try_const_usize(db, konst)?).ok()?,
+            _ => out.push_str("'_"),
+        }
+    }
+    if !args.is_empty() {
+        out.push('>');
+    }
+    Some(())
+}
+
+/// The module of the item rustc takes a type to be about, when it has one.
+fn characteristic_module<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<ModuleIdLt<'db>> {
+    match ty.kind() {
+        TyKind::Adt(adt, _) => Some(adt.def_id().module(db)),
+        TyKind::Dynamic(bounds, _) => Some(bounds.principal()?.skip_binder().def_id.0.module(db)),
+        TyKind::Ref(_, inner, _)
+        | TyKind::RawPtr(inner, _)
+        | TyKind::Slice(inner)
+        | TyKind::Array(inner, _) => characteristic_module(db, inner),
+        TyKind::Tuple(tys) => tys.iter().find_map(|ty| characteristic_module(db, ty)),
+        // FIXME: a function or a closure is about itself, in what it is written in.
+        _ => None,
+    }
+}
+
+fn write_trait<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut String,
+    trait_ref: TraitRef<'db>,
+) -> Option<()> {
+    let trait_ = trait_ref.def_id.0;
+    write_module(db, out, trait_.module(db))?;
+    write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
+    // FIXME: rustc leaves out the arguments that repeat a default.
+    write_args(db, out, trait_ref.args.as_slice().get(1..)?)
+}
+
+/// A function with its generic arguments: `path::f<A>`, and for one of an `impl`
+/// `path::Type<T>::f`, `<T as Trait>::f`, or `path::<impl Trait for T>::f` when the `impl` is
+/// in the module of neither the type nor the trait.
+fn write_function<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut String,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<()> {
+    let (parent_args, own_args) = args.split_at_checked(generics(db, func.into()).len_parent())?;
+    // A lifetime of a function is mostly late bound, and then no argument to rustc.
+    if own_args.iter().any(|arg| arg.region().is_some()) {
+        return None;
+    }
+    match func.lookup(db).container {
+        ItemContainerId::ModuleId(module) => write_module(db, out, module)?,
+        ItemContainerId::ImplId(impl_) => {
+            let interner = DbInterner::new_no_crate(db);
+            let self_ty = db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
+            let trait_ref = db
+                .impl_trait(impl_)
+                .map(|it| it.instantiate(interner, parent_args).skip_norm_wip());
+            let module = impl_.lookup(db).container;
+            let in_self_module = characteristic_module(db, self_ty) == Some(module);
+            let in_trait_module = trait_ref.is_some_and(|it| it.def_id.0.module(db) == module);
+            if !in_self_module && !in_trait_module {
+                write_module(db, out, module)?;
+                out.push_str("::<impl ");
+                if let Some(trait_ref) = trait_ref {
+                    write_trait(db, out, trait_ref)?;
+                    out.push_str(" for ");
+                }
+                write_ty(db, out, self_ty)?;
+                out.push('>');
+            } else if let Some(trait_ref) = trait_ref {
+                out.push('<');
+                write_ty(db, out, self_ty)?;
+                out.push_str(" as ");
+                write_trait(db, out, trait_ref)?;
+                out.push('>');
+            } else if matches!(
+                self_ty.kind(),
+                TyKind::Adt(..)
+                    | TyKind::Bool
+                    | TyKind::Char
+                    | TyKind::Str
+                    | TyKind::Int(_)
+                    | TyKind::Uint(_)
+                    | TyKind::Float(_)
+            ) {
+                write_ty(db, out, self_ty)?;
+            } else {
+                out.push('<');
+                write_ty(db, out, self_ty)?;
+                out.push('>');
+            }
+        }
+        // FIXME: a provided method is `<T as Trait>::f`.
+        ItemContainerId::TraitId(_) | ItemContainerId::ExternBlockId(_) => return None,
+    }
+    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+    write_args(db, out, own_args)
 }
 
 /// How many closures and `async` blocks `target` is written in, looking for it from `at` down.

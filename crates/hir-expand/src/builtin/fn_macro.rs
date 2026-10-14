@@ -305,11 +305,13 @@ fn format_args_nl_expand(
     tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
     let lit = tt.as_token_trees().iter_flat_tokens().nth(1);
     if let Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
-        mut lit @ tt::Literal { kind: tt::LitKind::Str, .. },
+        mut lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
     ))) = lit
     {
+        // A raw string has no escapes: the newline goes in as it is.
+        let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
         let (text, suffix) = lit.text_and_suffix();
-        lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}\\n{suffix}"));
+        lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}{newline}{suffix}"));
         tt.set_token(1, lit.into());
     }
     ExpandResult::ok(quote! {span =>

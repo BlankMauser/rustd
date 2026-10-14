@@ -13,7 +13,7 @@ use crate::{PackageData, TargetKind, cargo_config_file::CargoConfigFile};
 /// FIXME: ask Cargo to provide this data instead of re-deriving.
 pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
     // FIXME: Missing variables:
-    // CARGO_BIN_NAME, CARGO_BIN_EXE_<name>
+    // CARGO_BIN_EXE_<name>
 
     let manifest_dir = package.manifest.parent();
     env.set("CARGO_MANIFEST_DIR", manifest_dir.as_str());
@@ -52,11 +52,9 @@ pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {
 }
 
 pub(crate) fn inject_rustc_tool_env(env: &mut Env, cargo_name: &str, kind: TargetKind) {
-    _ = kind;
-    // FIXME
-    // if kind.is_executable() {
-    //     env.set("CARGO_BIN_NAME", cargo_name);
-    // }
+    if matches!(kind, TargetKind::Bin | TargetKind::Example) {
+        env.set("CARGO_BIN_NAME", cargo_name);
+    }
     env.set("CARGO_CRATE_NAME", cargo_name.replace('-', "_"));
 }
 

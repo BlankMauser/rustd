@@ -20,8 +20,11 @@ use hir_ty::mir::codegen::{
     CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
-use project_model::{CargoConfig, CargoFeatures, RustLibSource};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
+use project_model::{
+    CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
+    RustLibSource,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode, SyntaxNode,
@@ -254,14 +257,21 @@ impl Resolver<'_> {
         let mut inner = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(block) {
+            if is_closure(&node) {
+                inner.push(format!("{{closure#{}}}", closure_number(&sema, &node)?));
+                continue;
+            }
             if let Some(func) = ast::Fn::cast(node.clone()) {
+                // The body of an `async fn` is a closure to rustc.
+                if func.async_token().is_some() {
+                    inner.push("{closure#0}".to_owned());
+                }
                 let func = self.function_at(&sema, module, &func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
             match_ast! {
                 match node {
-                    ast::ClosureExpr(it) => inner.push(format!("{{closure#{}}}", closure_number(&it))),
                     ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_string())),
                     ast::Static(it) => inner.push(it.name()?.text().to_string()),
                     // Anonymous constants have numbers we don't know.
@@ -337,6 +347,31 @@ fn rustc_commit(toolchain: &str) -> Option<String> {
 }
 
 impl SymbolResolver for Resolver<'_> {
+    fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
+        if threads < 2 {
+            return;
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let db = self.db.clone();
+                let next = &next;
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if at >= count {
+                                break;
+                            }
+                            work(&db, at);
+                        }
+                    })
+                });
+            }
+        });
+    }
+
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
         let source_root = self.db.file_source_root(file).source_root_id(self.db);
         let source_root = self.db.source_root(source_root).source_root(self.db);
@@ -380,11 +415,14 @@ impl SymbolResolver for Resolver<'_> {
         let mut closures = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
-            if let Some(closure) = ast::ClosureExpr::cast(node.clone()) {
-                closures.push(closure_number(&closure));
+            if is_closure(&node) {
+                closures.push(closure_number(&sema, &node)?);
                 continue;
             }
             if let Some(func) = ast::Fn::cast(node.clone()) {
+                if func.async_token().is_some() {
+                    closures.push(0);
+                }
                 let func = self.function_at(&sema, module, &func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
@@ -410,7 +448,15 @@ impl SymbolResolver for Resolver<'_> {
         closures.reverse();
         let path = names.join("::");
         // Only a path through a closure or an anonymous constant has segments left out of it.
-        let symbol = self.table.get_nested(&path, &closures).or_else(|| self.table.get(&path));
+        let named = |node: &SyntaxNode| {
+            ast::Static::cast(node.clone())
+                .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
+        };
+        let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
+        let symbol = self
+            .table
+            .get_nested(&path, &closures, place)
+            .or_else(|| self.table.get_at(&path, place));
         symbol.map(str::to_owned)
     }
 
@@ -424,24 +470,81 @@ impl SymbolResolver for Resolver<'_> {
     }
 }
 
+/// Whether rustc numbers the node as a closure: a closure, or an `async` block.
+fn is_closure(node: &SyntaxNode) -> bool {
+    ast::ClosureExpr::can_cast(node.kind())
+        || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.async_token().is_some())
+}
+
+fn is_definition(node: &SyntaxNode) -> bool {
+    !ast::MacroCall::can_cast(node.kind())
+        && (ast::Item::can_cast(node.kind())
+            || ast::AssocItem::can_cast(node.kind())
+            || ast::ConstArg::can_cast(node.kind())
+            || is_closure(node)
+            || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_some()))
+}
+
+/// The place of a node among those of the definition it is written in that `counts` holds
+/// of, through the macros used in the definition. This is how rustc tells apart the closures
+/// of a function, and the statics of one name that a macro used twice in it declares.
+fn place_in_definition(
+    sema: &hir::Semantics<'_, RootDatabase>,
+    target: &SyntaxNode,
+    counts: &dyn Fn(&SyntaxNode) -> bool,
+) -> Option<u32> {
+    let mut around = sema.ancestors_with_macros(target.clone()).skip(1);
+    let mut root = None;
+    let owner = around.find(|node| {
+        root = Some(node.clone());
+        is_definition(node)
+    });
+    let mut earlier = 0;
+    Place { sema, target, counts, earlier: &mut earlier }
+        .find_in(&owner.or(root)?)
+        .then_some(earlier)
+}
+
+struct Place<'a, 'db> {
+    sema: &'a hir::Semantics<'db, RootDatabase>,
+    target: &'a SyntaxNode,
+    counts: &'a dyn Fn(&SyntaxNode) -> bool,
+    earlier: &'a mut u32,
+}
+
+impl Place<'_, '_> {
+    /// Counts the nodes before the target in the definition `node` is of. Whether the target
+    /// is there.
+    fn find_in(&mut self, node: &SyntaxNode) -> bool {
+        for child in node.children() {
+            if let Some(call) = ast::MacroCall::cast(child.clone()) {
+                let found = self
+                    .sema
+                    .expand_macro_call(&call)
+                    .is_some_and(|expansion| self.find_in(&expansion.value));
+                if found {
+                    return true;
+                }
+                continue;
+            }
+            if child == *self.target {
+                return true;
+            }
+            if (self.counts)(&child) {
+                *self.earlier += 1;
+            }
+            if !is_definition(&child) && self.find_in(&child) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
 /// definition it is written in, a closure's own closures being counted apart.
-fn closure_number(closure: &ast::ClosureExpr) -> u32 {
-    let is_definition = |node: &SyntaxNode| {
-        ast::Item::can_cast(node.kind())
-            || ast::AssocItem::can_cast(node.kind())
-            || ast::ClosureExpr::can_cast(node.kind())
-            || ast::ConstArg::can_cast(node.kind())
-            || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_some())
-    };
-    let owner_of = |node: &SyntaxNode| node.ancestors().skip(1).find(is_definition);
-    let owner = owner_of(closure.syntax());
-    let root = owner.clone().unwrap_or_else(|| closure.syntax().ancestors().last().unwrap());
-    let earlier = root
-        .descendants()
-        .take_while(|node| node != closure.syntax())
-        .filter(|node| ast::ClosureExpr::can_cast(node.kind()) && owner_of(node) == owner);
-    earlier.count() as u32
+fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode) -> Option<u32> {
+    place_in_definition(sema, closure, &is_closure)
 }
 
 fn crate_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Crate> {
@@ -455,6 +558,72 @@ fn crate_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Crate> {
 
 /// Resolves the names and collects the impls of the crates being built and of everything they
 /// depend on, a crate per thread. Every build needs them, and one thread would do them in turn.
+/// `load_workspace_at`, with each package's features those of a build of the package at
+/// `project` alone, as the artifacts we link against were built.
+fn load(
+    project: &Path,
+    cargo_config: &CargoConfig,
+    load_config: &LoadCargoConfig,
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, impl Sized + use<>)> {
+    let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
+    let manifest = ProjectManifest::discover_single(&root)?;
+    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
+        let built = built_features(manifest.manifest_path().as_ref(), cargo_config)?;
+        let packages: Vec<_> = cargo.packages().collect();
+        for package in packages {
+            let key = (cargo[package].name.clone(), cargo[package].version.to_string());
+            if let Some(features) = built.get(&key) {
+                cargo.set_active_features(package, features.iter().cloned().collect());
+            }
+        }
+    }
+    if load_config.load_out_dirs_from_check {
+        let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
+        workspace.set_build_scripts(build_scripts);
+    }
+    load_workspace(workspace, &cargo_config.extra_env, load_config)
+}
+
+/// The features of each package, by name and version, in a build of the package of `manifest`.
+///
+/// `cargo metadata` unifies features over every member of the workspace, and cargo doesn't
+/// when it builds one of them.
+// FIXME: a package built for the host with other features than for the target has both here.
+fn built_features(
+    manifest: &Path,
+    cargo_config: &CargoConfig,
+) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
+    let mut command = Command::new("cargo");
+    command.args(["tree", "--edges", "normal", "--prefix", "none", "--format", "{p}|{f}"]);
+    command.arg("--manifest-path").arg(manifest);
+    if let CargoFeatures::Selected { features, .. } = &cargo_config.features
+        && !features.is_empty()
+    {
+        command.arg("--features").arg(features.join(","));
+    }
+    let output = command.output().context("running `cargo tree`")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`cargo tree` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut built = FxHashMap::default();
+    for line in String::from_utf8(output.stdout)?.lines() {
+        // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
+        let Some((package, features)) = line.split_once('|') else { continue };
+        let mut package = package.split(' ');
+        let (Some(name), Some(version)) = (package.next(), package.next()) else { continue };
+        let version = version.trim_start_matches('v');
+        let features = features.trim_end_matches(" (*)").split(',').filter(|it| !it.is_empty());
+        built
+            .entry((name.to_owned(), version.to_owned()))
+            .or_insert_with(std::collections::BTreeSet::new)
+            .extend(features.map(str::to_owned));
+    }
+    Ok(built)
+}
+
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
@@ -533,11 +702,13 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
     while !bodies.is_empty() {
         let round = std::mem::take(&mut bodies);
         std::thread::scope(|threads_scope| {
-            for part in round.chunks(round.len().div_ceil(threads)) {
-                let db = db.clone();
+            // The bodies of one file are next to each other, and the edited file's are the slow
+            // ones: each thread takes every nth, so that they are spread over all of them.
+            for part in 0..threads.min(round.len()) {
+                let (db, round) = (db.clone(), &round);
                 threads_scope.spawn(move || {
                     hir::attach_db(&db, || {
-                        for &body in part {
+                        for &body in round.iter().skip(part).step_by(threads) {
                             Body::of(&db, body);
                         }
                     })
@@ -868,8 +1039,7 @@ fn main() -> anyhow::Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (mut db, vfs, _proc_macro) =
-        load_workspace_at(&args.project, &cargo_config, &load_config, &|_| {})?;
+    let (mut db, vfs, _proc_macro) = load(&args.project, &cargo_config, &load_config)?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
     if args.out.is_dir() {

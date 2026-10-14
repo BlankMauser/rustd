@@ -2906,9 +2906,17 @@ impl<'db> ExprCollector<'db> {
             None
         });
 
+        let written_in = block
+            .stmt_list()
+            .and_then(|it| it.l_curly_token())
+            .map(|it| self.expander.ctx_for_range(it.text_range()))
+            .filter(|it| !it.is_root());
         let syntax_node_ptr = AstPtr::new(&block.into());
         let expr = mk_block(self, block_id, statements.into_boxed_slice(), tail);
         let expr_id = self.alloc_expr(expr, syntax_node_ptr);
+        if let Some(written_in) = written_in {
+            self.store.block_editions.insert(expr_id, written_in.edition(self.db));
+        }
 
         self.def_map = prev_def_map;
         self.module = prev_local_module;

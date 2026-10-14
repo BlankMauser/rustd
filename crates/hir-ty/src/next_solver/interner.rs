@@ -1248,9 +1248,12 @@ impl<'db> Interner for DbInterner<'db> {
     fn recursion_limit(self) -> usize {
         // The crate's `#![recursion_limit]`, or rustc's default. A lower limit makes deeply
         // nested but valid obligations (tower's future types) ambiguous.
-        self.krate.map_or(128, |krate| {
-            hir_def::nameres::crate_def_map(self.db, krate).recursion_limit() as usize
-        })
+        let limit = self
+            .krate
+            .map_or(128, |krate| hir_def::nameres::crate_def_map(self.db, krate).recursion_limit());
+        // FIXME: an unoptimized build overflows a 2 MB stack at that depth; grow the stack
+        // instead, as rustc does.
+        if cfg!(debug_assertions) { limit.min(50) as usize } else { limit as usize }
     }
 
     fn is_type_const(self, _def_id: Self::DefId) -> bool {
