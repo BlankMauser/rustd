@@ -4244,3 +4244,60 @@ pub mod variadic {
         String::from_utf8_lossy(&buf[..len as usize]).into_owned()
     }
 }
+
+/// A constant holding a pointer into another, over-aligned constant.
+pub mod const_pointer_into_const {
+    use std::marker::PhantomData;
+
+    #[repr(align(16))]
+    #[derive(Clone, Copy)]
+    struct Wide([u8; 16]);
+
+    const fn tags() -> &'static [u8; 16] {
+        #[repr(C)]
+        struct Aligned {
+            _align: [Wide; 0],
+            tags: [u8; 16],
+        }
+        const ALIGNED: Aligned = Aligned { _align: [], tags: [0x80; 16] };
+        &ALIGNED.tags
+    }
+
+    struct Inner {
+        ctrl: std::ptr::NonNull<u8>,
+        mask: usize,
+    }
+
+    impl Inner {
+        const NEW: Self = Inner::new();
+
+        const fn new() -> Self {
+            Self { ctrl: unsafe { std::ptr::NonNull::new_unchecked(tags().as_ptr().cast_mut()) }, mask: 0 }
+        }
+    }
+
+    pub struct Table<T, S> {
+        inner: Inner,
+        hasher: S,
+        marker: PhantomData<T>,
+    }
+
+    impl<T, S> Table<T, S> {
+        pub const fn with_hasher(hasher: S) -> Self {
+            Self { inner: Inner::NEW, hasher, marker: PhantomData }
+        }
+
+        pub fn first(&self) -> (u8, usize, usize) {
+            let ptr = self.inner.ctrl.as_ptr();
+            (unsafe { *ptr.add(self.inner.mask) }, ptr as usize % 16, size_of_val(&self.hasher))
+        }
+    }
+
+    pub fn run() -> ((u8, usize, usize), (u8, usize, usize)) {
+        #[derive(Clone)]
+        struct Hasher;
+        const EMPTY: Table<u32, Hasher> = Table::with_hasher(Hasher);
+        let local = EMPTY;
+        (local.first(), Table::<u8, u64>::with_hasher(3).first())
+    }
+}

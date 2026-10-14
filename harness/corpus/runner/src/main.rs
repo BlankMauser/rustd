@@ -268,4 +268,5 @@ fn main() {
         cases::variadic::two(-3, u64::MAX),
         cases::variadic::string(c"text")
     );
+    println!("const_pointer_into_const {:?}", cases::const_pointer_into_const::run());
 }

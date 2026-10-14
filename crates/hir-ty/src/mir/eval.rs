@@ -2060,6 +2060,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         self.write_memory(addr, &v)?;
         self.patch_addresses(
             &patch_map,
+            memory_map,
             |bytes| match memory_map {
                 MemoryMap::Empty | MemoryMap::Simple(_) => {
                     Err(MirEvalError::InvalidVTableId(from_bytes!(usize, bytes)))
@@ -2510,6 +2511,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     fn patch_addresses(
         &mut self,
         patch_map: &FxHashMap<usize, usize>,
+        source: &MemoryMap<'db>,
         ty_of_bytes: impl Fn(&[u8]) -> Result<'db, Ty<'db>> + Copy,
         addr: Address,
         ty: Ty<'db>,
@@ -2533,6 +2535,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         };
                         self.patch_addresses(
                             patch_map,
+                            source,
                             ty_of_bytes,
                             Address::from_usize(patched),
                             t,
@@ -2558,6 +2561,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             for i in 0..len {
                                 self.patch_addresses(
                                     patch_map,
+                                    source,
                                     ty_of_bytes,
                                     patched.offset(i * size),
                                     inner,
@@ -2566,6 +2570,18 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             }
                         }
                     }
+                }
+            }
+            TyKind::Pat(base, _) => {
+                self.patch_addresses(patch_map, source, ty_of_bytes, addr, base, locals)?
+            }
+            // A raw pointer can point anywhere into the allocation that was kept for it.
+            TyKind::RawPtr(..) => {
+                let current = from_bytes!(usize, self.read_memory(addr, size_of::<usize>())?);
+                if let Some((start, _)) = source.memory_at(current)
+                    && let Some(new_start) = patch_map.get(&start)
+                {
+                    self.write_memory(addr, &(new_start + (current - start)).to_le_bytes())?;
                 }
             }
             TyKind::FnPtr(_, _) => {
@@ -2580,6 +2596,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
                         self.patch_addresses(
                             patch_map,
+                            source,
                             ty_of_bytes,
                             addr.offset(offset),
                             ty,
@@ -2601,6 +2618,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
                             self.patch_addresses(
                                 patch_map,
+                                source,
                                 ty_of_bytes,
                                 addr.offset(offset),
                                 ty,
@@ -2613,7 +2631,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             TyKind::Tuple(tys) => {
                 for (id, ty) in tys.iter().enumerate() {
                     let offset = layout.fields.offset(id).bytes_usize();
-                    self.patch_addresses(patch_map, ty_of_bytes, addr.offset(offset), ty, locals)?;
+                    self.patch_addresses(
+                        patch_map,
+                        source,
+                        ty_of_bytes,
+                        addr.offset(offset),
+                        ty,
+                        locals,
+                    )?;
                 }
             }
             TyKind::Array(inner, len) => {
@@ -2625,6 +2650,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 for i in 0..len {
                     self.patch_addresses(
                         patch_map,
+                        source,
                         ty_of_bytes,
                         addr.offset(i * size),
                         inner,
@@ -2638,7 +2664,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             | TyKind::Uint(_)
             | TyKind::Float(_)
             | TyKind::Slice(_)
-            | TyKind::RawPtr(_, _)
             | TyKind::FnDef(_, _)
             | TyKind::Str
             | TyKind::Never
@@ -2652,7 +2677,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             | TyKind::Alias(..)
             | TyKind::Bound(_, _)
             | TyKind::Infer(_)
-            | TyKind::Pat(_, _)
             | TyKind::Param(_)
             | TyKind::UnsafeBinder(_)
             | TyKind::CoroutineClosure(_, _) => (),
