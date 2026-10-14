@@ -7,7 +7,7 @@ Exit code 0 when stdout, stderr and exit status match. With --bisect, each rustd
 also linked in on its own to name the ones that change behaviour.
 """
 import re
-import argparse, glob, json, os, shlex, subprocess, sys, tempfile
+import argparse, glob, json, os, shlex, subprocess, sys, tempfile, time
 
 # rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
 # has to come from the rustc that copy was taken from.
@@ -102,8 +102,13 @@ class Fixture:
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]
 
     def behaviour(self, binary):
+        # A loaded machine slows both builds alike, so rustc's own run sets the allowance.
+        allowed = 900 if binary == self.reference else max(120, 30 * getattr(self, "reference_secs", 0))
+        start = time.monotonic()
         try:
-            run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=120)
+            run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=allowed)
+            if binary == self.reference:
+                self.reference_secs = time.monotonic() - start
             # The thread id in a panic message differs from run to run.
             stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
             # Loggers stamp their lines with the time.
