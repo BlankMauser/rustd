@@ -703,6 +703,11 @@ fn main() -> anyhow::Result<()> {
                 stats.mir, stats.changed, stats.bodies
             );
             eprintln!("code: {} reused, {} compiled", stats.reused, stats.compiled);
+            let phases = stats.phases;
+            eprintln!(
+                "phases: fingerprint {:.1?}, ir {:.1?}, emit {:.1?}, object {:.1?}, {} rounds",
+                phases.fingerprint, phases.ir, phases.emit, phases.object, stats.rounds
+            );
         }
         link(&args)?;
         eprintln!("edit-to-binary: {:.1?}", start.elapsed());

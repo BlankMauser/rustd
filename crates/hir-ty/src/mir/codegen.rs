@@ -210,7 +210,9 @@ impl CodegenUnit {
         let mut own_statics = roots.first().map(|root| root.krate(db));
         // Roots given up on because a function left to rustc handles the same future.
         let mut left = FxHashSet::default();
+        let mut rounds = 0;
         loop {
+            rounds += 1;
             let mut cg = ObjectCodegen::new(db, symbols, rejected, code, own_statics)?;
             cg.track = track;
             let mut compiled = Vec::new();
@@ -273,6 +275,8 @@ impl CodegenUnit {
                     changed: 0,
                     reused: cg.code.hits,
                     compiled: cg.code.misses,
+                    phases: cg.phases,
+                    rounds,
                 };
                 for (key, print) in cg.seen.drain(..) {
                     if fingerprints.insert(key, print) != Some(print) {
@@ -295,7 +299,10 @@ impl CodegenUnit {
                         .and_then(|mut file| std::io::Write::write_all(&mut file, lines.as_bytes()))
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
-                return Ok(CodegenUnit { object: cg.finish()?, compiled, skipped, instances });
+                let start = std::time::Instant::now();
+                let object = cg.finish()?;
+                stats.phases.object = start.elapsed();
+                return Ok(CodegenUnit { object, compiled, skipped, instances });
             }
             rejected.extend(failed);
         }
@@ -343,6 +350,23 @@ pub struct BuildStats {
     /// Functions whose machine code was reused, and functions that went through Cranelift.
     pub reused: usize,
     pub compiled: usize,
+    /// Where the last round of the build spent its time.
+    pub phases: Phases,
+    /// How many times codegen started over because a callee turned out not to compile.
+    pub rounds: usize,
+}
+
+/// Time spent in each step below MIR.
+#[derive(Default, Clone, Copy)]
+pub struct Phases {
+    /// Hashing each body's MIR, which only happens for these measurements.
+    pub fingerprint: std::time::Duration,
+    /// Building Cranelift IR from MIR.
+    pub ir: std::time::Duration,
+    /// Hashing the IR, and on a miss compiling it; then handing the code to the object.
+    pub emit: std::time::Duration,
+    /// Writing the object file.
+    pub object: std::time::Duration,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.
@@ -400,6 +424,7 @@ struct ObjectCodegen<'a, 'db> {
     code: &'a mut CodeCache,
     track: bool,
     mir_time: std::time::Duration,
+    phases: Phases,
     seen: Vec<(Instance, u64)>,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     /// The crate whose writable statics we define ourselves when rustc exports no symbol for
@@ -448,6 +473,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             track: false,
             layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             mir_time: Default::default(),
+            phases: Phases::default(),
             seen: Vec::new(),
             vtables: FxHashMap::default(),
             own_statics,
@@ -558,13 +584,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             dump_mir(body);
         }
         let abi = FunctionSignature::of(db, func).abi;
-        let mut ctx = self.compile_body(
+        let start = std::time::Instant::now();
+        let ctx = self.compile_body(
             body,
             env,
             track_caller(db, func),
             abi,
             GenericArgs::new_from_slice(&[]).store(),
-        )?;
+        );
+        self.phases.ir += start.elapsed();
+        let mut ctx = ctx?;
         let id = self
             .module
             .declare_function(&symbol, Linkage::Export, &ctx.func.signature)
@@ -578,9 +607,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return;
         }
         use std::hash::{Hash, Hasher};
+        let start = std::time::Instant::now();
         let mut hasher = rustc_hash::FxHasher::default();
         format!("{:?}{:?}", body.basic_blocks, body.locals).hash(&mut hasher);
         self.seen.push((instance, hasher.finish()));
+        self.phases.fingerprint += start.elapsed();
     }
 
     /// Compiles the instances requested by calls. Returns the ones that failed.
@@ -671,7 +702,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => (false, ExternAbi::Rust),
         };
-        let mut ctx = self.compile_body(body, env, tracked, abi, instance.args.clone())?;
+        let start = std::time::Instant::now();
+        let ctx = self.compile_body(body, env, tracked, abi, instance.args.clone());
+        self.phases.ir += start.elapsed();
+        let mut ctx = ctx?;
         // The call site declared the instance with the signature it computed from its operands.
         let declared = &self.module.declarations().get_function_decl(id).signature;
         if *declared != ctx.func.signature {
@@ -687,6 +721,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// (i128 corners, for one); that must cost us one function, not the process.
     fn emit(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
         let (module, code, unwind) = (&mut self.module, &mut *self.code, &mut self.unwind);
+        let start = std::time::Instant::now();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (_, hit) = ctx
                 .compile_with_cache(module.isa(), code, &mut Default::default())
@@ -711,6 +746,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unwind.add_function(module, id, ctx)?;
             Ok::<_, String>(hit)
         }));
+        self.phases.emit += start.elapsed();
         match outcome {
             Ok(Ok(hit)) => {
                 if hit {

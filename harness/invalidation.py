@@ -127,7 +127,7 @@ def main():
             log.seek(0)
             text = log.read()
             builds = re.findall(
-                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: mir (\S+), (\d+) of (\d+) bodies changed\ncode: (\d+) reused, (\d+) compiled\nedit-to-binary: (\S+)",
+                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: mir (\S+), (\d+) of (\d+) bodies changed\ncode: (\d+) reused, (\d+) compiled\n(?:phases: .*\n)?edit-to-binary: (\S+)",
                 text)[before:edits]
             apply = sum(millis(b[0]) for b in builds)
             total = sum(millis(b[4]) for b in builds)
