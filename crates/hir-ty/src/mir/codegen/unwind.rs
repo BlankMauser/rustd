@@ -5,9 +5,7 @@ use cranelift_codegen::{
     Context, FinalizedMachExceptionHandler,
     gimli::{
         self, Encoding, Format, RunTimeEndian, SectionId,
-        write::{
-            Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Section, Writer,
-        },
+        write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Writer},
     },
     ir::{AbiParam, Signature, types},
     isa::{TargetIsa, unwind::UnwindInfo},

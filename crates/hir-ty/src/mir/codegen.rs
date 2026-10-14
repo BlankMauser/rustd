@@ -213,13 +213,13 @@ impl CodegenUnit {
         // full pass per rejected call chain, and they go away with the rustc fallback.
         let Rejections { rejected, stats } = known;
         let compiled_before = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let mut own_statics = roots.first().map(|root| root.krate(db));
+        let mut own_statics: FxHashSet<Crate> = roots.iter().map(|root| root.krate(db)).collect();
         // Roots given up on because a function left to rustc handles the same future.
         let mut left = FxHashSet::default();
         let mut rounds = 0;
         loop {
             rounds += 1;
-            let mut cg = ObjectCodegen::new(db, symbols, rejected, own_statics)?;
+            let mut cg = ObjectCodegen::new(db, symbols, rejected, own_statics.clone())?;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
             for &root in roots {
@@ -245,7 +245,7 @@ impl CodegenUnit {
             if !cg.statics.is_empty() && from_rustc {
                 // Functions left to rustc keep using rustc's copy of the crate's private
                 // statics, so we can't bring our own.
-                own_statics = None;
+                own_statics.clear();
                 rejected.extend(failed);
                 continue;
             }
@@ -401,9 +401,9 @@ struct ObjectCodegen<'a, 'db> {
     /// How many compiled functions went into the object.
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
-    /// The crate whose writable statics we define ourselves when rustc exports no symbol for
-    /// them. Only sound when every function of that crate is ours.
-    own_statics: Option<Crate>,
+    /// The crates whose writable statics we define ourselves when rustc exports no symbol for
+    /// them. Only sound when every function of those crates is ours.
+    own_statics: FxHashSet<Crate>,
     statics: FxHashMap<StaticId, DataId>,
     /// Statics nothing exports and nothing can write to, which we give a copy of the value.
     frozen_statics: FxHashMap<StaticId, DataId>,
@@ -865,7 +865,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, String>,
-        own_statics: Option<Crate>,
+        own_statics: FxHashSet<Crate>,
     ) -> Result<Self> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
@@ -1129,7 +1129,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
-        if compiled.writable && self.own_statics != Some(id.krate(db)) {
+        if compiled.writable && !self.own_statics.contains(&id.krate(db)) {
             unsupported!("writable static without a rustc symbol");
         }
         let ids = self.resolve(&compiled.requests)?;

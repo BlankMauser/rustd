@@ -33,9 +33,9 @@ use crate::symbols::SymbolTable;
 struct Args {
     project: PathBuf,
     krate: String,
-    /// More crates to compile from the same loaded workspace. `out` and `report` are then
-    /// directories that get a file per crate, and a crate that fails gets a `.error` file
-    /// instead of ending the run.
+    /// More crates to compile from the same loaded workspace, into the same object. When `out`
+    /// is a directory, each crate is a program of its own instead: `out` and `report` get a
+    /// file per crate, and a crate that fails gets a `.error` file instead of ending the run.
     batch: Vec<String>,
     out: PathBuf,
     symbol_files: Vec<PathBuf>,
@@ -450,7 +450,10 @@ fn build(
     let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
-    let roots = functions_of(db, &args.krate)?;
+    let mut roots = functions_of(db, &args.krate)?;
+    for krate in &args.batch {
+        roots.extend(functions_of(db, krate)?);
+    }
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
     let mut denied = FxHashSet::default();
     if let Some(deny) = &args.deny {
@@ -657,7 +660,7 @@ fn main() -> anyhow::Result<()> {
         load_workspace_at(&args.project, &cargo_config, &load_config, &|_| {})?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
-    if !args.batch.is_empty() || args.out.is_dir() {
+    if args.out.is_dir() {
         return build_batch(&db, args);
     }
 

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """How much of a crate rust-analyzer redoes after different kinds of edit.
 
-usage: invalidation.py [crate] [--only TEXT] [--perf DIR] [--check]
+usage: invalidation.py [crate[,crate...]] [--only TEXT] [--perf DIR] [--check] [--cargo]
 
 `--only` keeps the scenarios whose name contains TEXT, plus one per entry of BODIES. `--perf`
 records the daemon with `perf` during each edit, into DIR/<n>.data. `--check` compares the object
 the daemon wrote after each edit with the one a new rustd process writes from the same source.
+`--cargo` has the daemon link the program after each build, times `cargo build` on the same edit
+in a target directory of its own, and compares what the two programs print.
 
 Starts the daemon on bench2 for one crate (default regex_automata) with RUSTD_STATS set, applies
 each scenario, and records the time to apply the change, the time spent in MIR queries, the
 total rebuild time, where it went, and how many functions were compiled again. Writes INVALIDATION.md.
 """
-import os, re, signal, subprocess, sys, time
+import os, re, shlex, signal, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
@@ -21,6 +23,7 @@ from bench import millis
 
 V = os.path.join(HERE, "vendor")
 A, S = os.path.join(V, "regex-automata/src"), os.path.join(V, "regex-syntax/src")
+B = os.path.join(HERE, "bench2/src")
 BODY = "let _rustd_edit = 1u32;"
 
 
@@ -47,7 +50,7 @@ def substitute(path, old, new):
 
 BODIES = [(f"{A}/util/look.rs", 291), (f"{A}/util/sparse_set.rs", 151), (f"{A}/nfa/thompson/builder.rs", 149),
           (f"{A}/meta/strategy.rs", 383), (f"{A}/nfa/thompson/pikevm.rs", 165)]
-NEW_FN = "\npub fn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
+NEW_FN = "\n/// Added by the harness.\npub fn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
 SCENARIOS = {
     "comment appended to one file": [insert_after(f"{A}/util/look.rs", 10**9, "// edit")],
     "blank line at top of one file": [top(f"{A}/nfa/thompson/builder.rs")],
@@ -66,6 +69,14 @@ SCENARIOS = {
         *[insert_after(p, l, BODY) for p, l in BODIES[:3]],
         insert_after(f"{S}/ast/mod.rs", 36, BODY), insert_after(f"{S}/ast/mod.rs", 10**9, NEW_FN),
         insert_after(f"{S}/hir/mod.rs", 1008, BODY), insert_after(f"{S}/hir/literal.rs", 10**9, "// edit")],
+    "upstream crate: what the program prints": [substitute(f"{S}/hir/print.rs", 'r"(?:"', 'r"(?~"')],
+    "upstream crate: new pub fn, called from the binary": [
+        insert_after(f"{S}/hir/mod.rs", 10**9, NEW_FN),
+        substitute(f"{B}/main.rs", "    let re = Regex::new(",
+                   '    println!("{}", regex_syntax::hir::rustd_new_item(41));\n    let re = Regex::new(')],
+    "field added to a struct used everywhere (Input)": [
+        substitute(f"{A}/util/search.rs", "    earliest: bool,\n}", "    earliest: bool,\n    extra: u64,\n}"),
+        substitute(f"{A}/util/search.rs", "            earliest: false,\n        }", "            earliest: false,\n            extra: 0,\n        }")],
 }
 
 
@@ -76,21 +87,42 @@ def main():
     ap.add_argument("--only")
     ap.add_argument("--perf")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--cargo", action="store_true")
     a = ap.parse_args()
     crate = a.crate
+    crates = [x for name in crate.split(",") for x in ("--crate", name)]
     scenarios = SCENARIOS
     if a.only:
         scenarios = {f"body in {os.path.basename(p)}": [insert_after(p, l, BODY)] for p, l in BODIES}
         scenarios.update(SCENARIOS)
         scenarios = {name: it for name, it in scenarios.items() if a.only in name}
     ws = os.path.join(HERE, "bench2")
-    fx = Fixture(ws, [crate], ["-p", "bench2"])
+    fx = Fixture(ws, crate.split(","), ["-p", "bench2"])
     fx.rustc_build()
+    link, cargo_env, cargo_bin = [], None, None
+    if a.cargo:
+        args = list(fx.link_args)
+        first = next(i for i, arg in enumerate(args) if arg.endswith((".rlib", ".rcgu.o")))
+        args[first:first] = [os.path.join(fx.work, "rustd.o"), "-Wl,--allow-multiple-definition"]
+        fx.binary = args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
+        link = ["--link-cmd", shlex.join(args)]
+        # cargo as it comes: incremental, and none of the flags the harness builds with.
+        cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTFLAGS", "CARGO_INCREMENTAL")}
+        cargo_env["CARGO_TARGET_DIR"] = os.path.join(fx.work, "cargo")
+        cargo_bin = os.path.join(fx.work, "cargo/debug/bench2")
+
+    def cargo_build():
+        start = time.time()
+        subprocess.run(["cargo", "build"], cwd=ws, env=cargo_env, check=True, capture_output=True)
+        return (time.time() - start) * 1000
+
+    if a.cargo:
+        cargo_build()
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     log = open(os.path.join(fx.work, "daemon.log"), "w+")
     obj = os.path.join(fx.work, "rustd.o")
     mismatches = 0
-    daemon = subprocess.Popen([RUSTD, ws, "--crate", crate, "--out", obj, "--watch", *symbols],
+    daemon = subprocess.Popen([RUSTD, ws, *crates, "--out", obj, "--watch", *link, *symbols],
                               stderr=log, stdout=log)
 
     def wait(pattern, seen):
@@ -151,22 +183,32 @@ def main():
             log.seek(0)
             text = log.read()
             builds = re.findall(
-                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\nphases: compile (\S+), resolve (\S+), define (\S+), object (\S+), \d+ rounds\nedit-to-binary: (\S+)",
+                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\nphases: compile (\S+), resolve (\S+), define (\S+), object (\S+), \d+ rounds\n(?:link: (\S+) .*\n)?edit-to-binary: (\S+)",
                 text)[before:edits]
             apply = sum(millis(b[0]) for b in builds)
             total = sum(millis(b[4]) for b in builds)
             phases = [sum(millis(b[i]) for b in builds) for i in (7, 8, 9, 10)]
-            rows.append((name, len(builds), apply, total, sum(int(b[5]) for b in builds),
-                         int(builds[-1][6]), phases, sum(millis(b[11]) for b in builds)))
-            print(rows[-1], flush=True)
+            row = {"name": name, "builds": len(builds), "apply": apply, "codegen": total,
+                   "compiled": sum(int(b[5]) for b in builds), "bodies": int(builds[-1][6]), "phases": phases,
+                   "link": sum(millis(b[11]) for b in builds if b[11]),
+                   "total": sum(millis(b[12]) for b in builds)}
+            if a.cargo:
+                row["cargo"] = cargo_build()
+                ours, theirs = (subprocess.run([binary], capture_output=True) for binary in (fx.binary, cargo_bin))
+                row["same"] = (ours.returncode, ours.stdout) == (theirs.returncode, theirs.stdout)
+                mismatches += not row["same"]
+            rows.append(row)
+            print(row, flush=True)
             if a.check:
                 scratch = os.path.join(fx.work, "scratch.o")
-                subprocess.run([RUSTD, ws, "--crate", crate, "--out", scratch, *symbols],
+                subprocess.run([RUSTD, ws, *crates, "--out", scratch, *symbols],
                                check=True, capture_output=True)
                 same = open(scratch, "rb").read() == open(obj, "rb").read()
                 print("  from scratch:", "same object" if same else "DIFFERENT OBJECT", flush=True)
                 mismatches += not same
             restore({path for path, _ in changes})
+            if a.cargo:
+                cargo_build()
         log.seek(0)
         text = log.read()
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
@@ -180,17 +222,25 @@ def main():
     out = [f"# What an edit invalidates ({crate})", "",
            "Generated by `harness/invalidation.py`. The daemon holds bench2 (regex-syntax and regex-automata, vendored).",
            f"Cold: load {load}, {cold[1]} of {cold[2]} functions + {cold[3]} instances in {cold[4]}. Daemon RSS {rss} MB.",
-           "", "Each row is one save, followed by a restore that is not counted. Times in ms.", "",
-           "| Edit | Builds | Apply change | Codegen | of which compile / resolve / define / object | Edit to binary | Functions recompiled |",
-           "|---|---|---|---|---|---|---|"]
-    for name, builds, apply, total, compiled, bodies, phases, e2b in rows:
-        split = " / ".join(f"{p:.0f}" for p in phases)
-        out.append(f"| {name} | {builds} | {apply:.1f} | {total:.0f} | {split} | {e2b:.0f} | {compiled} of {bodies} |")
+           "", "Each row is one save, followed by a restore that is not counted. Times in ms.", ""]
+    head = ["Edit", "Builds", "Apply change", "Codegen", "of which compile / resolve / define / object"]
+    head += ["Link", "Edit to binary", "`cargo build`", "Program output"] if a.cargo else ["Edit to binary"]
+    head.append("Functions recompiled")
+    out += ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for r in rows:
+        cells = [r["name"], r["builds"], f"{r['apply']:.1f}", f"{r['codegen']:.0f}",
+                 " / ".join(f"{p:.0f}" for p in r["phases"])]
+        if a.cargo:
+            cells += [f"{r['link']:.0f}", f"{r['total']:.0f}", f"{r['cargo']:.0f}", "same" if r["same"] else "DIFFERS"]
+        else:
+            cells.append(f"{r['total']:.0f}")
+        cells.append(f"{r['compiled']} of {r['bodies']}")
+        out.append("| " + " | ".join(map(str, cells)) + " |")
     if not a.only:
-        open(os.path.join(HERE, f"INVALIDATION-{crate}.md"), "w").write("\n".join(out) + "\n")
+        open(os.path.join(HERE, f"INVALIDATION-{crate.replace(',', '+')}.md"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))
     if mismatches:
-        raise SystemExit(f"{mismatches} edits gave an object that differs from a build from scratch")
+        raise SystemExit(f"{mismatches} edits differ from a build from scratch")
 
 
 if __name__ == "__main__":
