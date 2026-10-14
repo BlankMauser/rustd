@@ -875,6 +875,40 @@ fn body_types<'db>(
     })
 }
 
+/// Whether a non-generic function returns a future of an `async` block, by itself or inside
+/// another type. rustc lays such a future out differently, so the function that makes one has
+/// to come from the compiler that compiles what holds and polls it.
+#[salsa::tracked]
+fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool {
+    struct Finder {
+        opaque: bool,
+        coroutine: bool,
+    }
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Finder {
+        type Result = ();
+
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            match ty.kind() {
+                TyKind::Coroutine(..) => self.coroutine = true,
+                TyKind::Alias(..) => self.opaque = true,
+                _ => {}
+            }
+            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
+        }
+    }
+    let mut finder = Finder { opaque: false, coroutine: false };
+    // The declared type names a future only as an `impl Trait`, which the body's own does not.
+    let declared = db.callable_item_signature(func.into()).skip_binder().skip_binder().output();
+    rustc_type_ir::TypeVisitable::visit_with(&declared, &mut finder);
+    if !finder.opaque && !FunctionSignature::of(db, func).is_async() {
+        return false;
+    }
+    let Ok((body, _)) = root_body(db, func) else { return false };
+    let returned = body.locals[returned_local(body)].ty.as_ref();
+    rustc_type_ir::TypeVisitable::visit_with(&returned, &mut finder);
+    finder.coroutine
+}
+
 /// The `async` blocks whose futures the body of `func` holds, or `None` when the body
 /// can't be read. rustc lays a future out differently, so every function that touches one
 /// has to come from the same compiler.
@@ -1721,6 +1755,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && args.is_empty()
             && let Some(symbol) = self.symbols.function(func)
+            // rustc's copy of a function of another crate would hand out rustc's future.
+            && (self.own_statics.crates.contains(&func.krate(self.db))
+                || !returns_async_block(self.db, func))
         {
             self.want(func);
             return self.import(&symbol, sig);
