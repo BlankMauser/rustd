@@ -16,9 +16,9 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
-    SymbolResolver, compiled_instance, compiled_root, compiled_static,
+    SymbolResolver, TheirStatics, async_blocks, compiled_instance, compiled_root, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
-    source_location, target,
+    left_to_rustc, source_location, target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -93,7 +93,6 @@ struct Left {
     /// Its code, when the function compiles and something else keeps it from the object.
     /// A full build looks at it again once that changes.
     code: Option<Mark>,
-    statics: (FxHashSet<StaticId>, bool),
     async_blocks: Option<FxHashSet<salsa::Id>>,
 }
 
@@ -102,8 +101,7 @@ impl Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
             code: code.map(|it| Mark::new(db, it.serial, &it.requests)),
-            statics: ObjectCodegen::statics_reachable_from(db, root),
-            async_blocks: ObjectCodegen::async_blocks(db, root),
+            async_blocks: async_blocks(db, root).clone(),
         }
     }
 }
@@ -116,6 +114,7 @@ pub(super) struct Base {
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
     left: Vec<Option<Left>>,
+    their_statics: TheirStatics,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     pub(super) bodies: usize,
@@ -131,9 +130,28 @@ pub struct Stale {
     broken: Vec<(Node, &'static str)>,
     /// Why no patch can hold the change.
     declined: Option<&'static str>,
+    pub steps: StaleSteps,
+}
+
+/// How long looking at each kind of thing in the base took, in the order they are looked at.
+#[derive(Default, Clone, Copy)]
+pub struct StaleSteps {
+    pub roots: std::time::Duration,
+    pub instances: std::time::Duration,
+    pub statics: std::time::Duration,
+    /// The functions left to rustc.
+    pub left: std::time::Duration,
 }
 
 impl Stale {
+    /// Declines when the functions the base left to rustc reach other statics than they did.
+    fn their_statics(&mut self, base: &Base, db: &dyn HirDatabase) {
+        let now = probe(|| TheirStatics::of(db, left_to_rustc(&base.skipped)));
+        if now.as_ref() != Some(&base.their_statics) {
+            self.declined = Some("the statics of a function left to rustc changed");
+        }
+    }
+
     fn declined(mut self, why: &'static str) -> Stale {
         self.declined = Some(why);
         self
@@ -251,6 +269,7 @@ impl Base {
             marks,
             skipped: skipped.to_vec(),
             left,
+            their_statics: TheirStatics::of(db, left_to_rustc(skipped)),
             instances,
             statics,
             bodies: cg.bodies,
@@ -260,6 +279,7 @@ impl Base {
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
+        let start = std::time::Instant::now();
         let mut stale = Stale::default();
         let every = |len: usize| (part..len).step_by(parts);
         for i in every(self.compiled.len()) {
@@ -275,6 +295,7 @@ impl Base {
                 None => return stale.declined("a root of the base is gone"),
             }
         }
+        stale.steps.roots = start.elapsed();
         for (instance, was) in self.instances.iter().skip(part).step_by(parts) {
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
@@ -290,6 +311,7 @@ impl Base {
                 )),
             }
         }
+        stale.steps.instances = start.elapsed() - stale.steps.roots;
         for (&id, was) in self.statics.iter().skip(part).step_by(parts) {
             let mark = probe(|| {
                 let compiled = compiled_static(db, id).as_ref().ok()?;
@@ -299,12 +321,18 @@ impl Base {
                 stale.broken.push((Node::Static(id), "a static of the base changed"));
             }
         }
+        stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
         for i in every(self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
             if probe(|| Left::of(db, self.skipped[i].0)).as_ref() != Some(was) {
                 return stale.declined("a function left to rustc changed");
             }
         }
+        if part == 0 {
+            stale.their_statics(self, db);
+        }
+        stale.steps.left =
+            start.elapsed() - stale.steps.roots - stale.steps.instances - stale.steps.statics;
         stale
     }
 
@@ -464,7 +492,7 @@ impl Base {
         // A future is laid out by one compiler: a function that now handles one of rustc's
         // has to be left to rustc as well.
         if let Some(theirs) = self.their_async_blocks() {
-            let shares = |root| match (ObjectCodegen::async_blocks(db, root), &theirs) {
+            let shares = |root| match (async_blocks(db, root).clone(), &theirs) {
                 (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                 (Some(ours), None) => !ours.is_empty(),
                 (None, _) => true,

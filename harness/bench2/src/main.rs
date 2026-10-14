@@ -12,6 +12,32 @@ fn main() {
     for m in re.find_iter(hay) {
         show(m.range(), &hay[m.range()]);
     }
+    tally(hay, &re);
+}
+
+const LIMIT: usize = 3;
+static GREETING: &str = "matches";
+
+macro_rules! label {
+    ($value:expr) => {
+        format!("<{}>", $value)
+    };
+}
+
+trait Describe {
+    fn describe(&self) -> String {
+        String::from("thing")
+    }
+}
+
+struct Hit(usize);
+
+impl Describe for Hit {}
+
+fn tally(hay: &str, re: &Regex) {
+    let count = re.find_iter(hay).take(LIMIT).count();
+    let twice = (0..count).map(|n| n * 2).sum::<usize>();
+    println!("{GREETING}: {} {twice} {}", label!(count), Hit(count).describe());
 }
 
 fn show<T: std::fmt::Debug>(value: T, text: &str) {

@@ -11,7 +11,7 @@ import json, os, re, shlex, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["RUSTD_STATS"] = "1"
-RUSTD = os.path.join(HERE, "../target/release/rustd")
+RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "../target/release/rustd")
 BODY = "let _rustd_edit = 1u32;"
 NEW_FN = "\nfn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
 
@@ -82,29 +82,42 @@ def main():
         log.seek(0)
         print(re.search(r"cold: .*", log.read())[0])
         only = os.environ.get("DXEDITS_ONLY")
-        if perf_out := os.environ.get("DXEDITS_PERF"):
-            perf = subprocess.Popen(["perf", "record", "-F", "499", "-g", "-o", perf_out, "-p", str(daemon.pid)],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for name, path, apply in edits:
+        # DXEDITS_PERF: a directory that gets one profile of the daemon and its linker per edit.
+        perf_dir = os.environ.get("DXEDITS_PERF")
+        repeat = int(os.environ.get("DXEDITS_REPEAT", "1"))
+        samples = []
+        for turn, (name, path, apply) in enumerate(edits * repeat):
             if only and not any(o in name for o in only.split(",")):
                 continue
             original = open(path).read()
             edited = apply(original)
             assert edited != original, name
             for label, text in ((name, edited), ("  (revert)", original)):
+                perf = None
+                if perf_dir and label == name and turn >= len(edits) * (repeat - 1):
+                    slug = re.sub(r"\W+", "-", name).strip("-")
+                    perf = subprocess.Popen(["perf", "record", "-F", "1999", "-g", "--inherit", "-o", f"{perf_dir}/{slug}.data", "-p", str(daemon.pid)],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    time.sleep(1.5)
+                saved = time.time()
                 open(path, "w").write(text)
-                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?edit-to-binary: (\S+)", done)
+                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)", done)
                 done = len(found)
                 b = found[-1]
-                print(f"{label:38} {'edit-to-binary' if '--patch' in args else 'edit-to-object'} {b[7]:>8}  recompiled {b[5]:>5} of {b[6]}")
+                wall = (os.path.getmtime(binary) - saved) * 1000 if "--patch" in args else None
+                if perf:
+                    perf.send_signal(2)
+                    perf.wait()
+                print(f"{label:38} {'edit-to-binary' if '--patch' in args else 'edit-to-object'} {b[8]:>8}  recompiled {b[5]:>5} of {b[6]}"
+                      + (f"  save-to-binary-on-disk {wall:.0f}ms" if wall else ""), flush=True)
+                steps = dict((k, int(v) / 1000) for k, v in (kv.split("=") for kv in b[7].split()))
+                samples.append({"edit": name, "revert": label != name, "wall_ms": wall, "steps_ms": steps, "recompiled": int(b[5]), "profiled": perf is not None})
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
                     print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
         print(f"rss after edits: {rss} MB")
-        if perf_out:
-            perf.send_signal(2)
-            perf.wait()
+        json.dump(samples, open(os.path.join(work, "timeline.json"), "w"), indent=1)
     finally:
         daemon.kill()
 

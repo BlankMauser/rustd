@@ -80,6 +80,27 @@ SCENARIOS = {
         substitute(f"{B}/main.rs", "\nfn show<T: std::fmt::Debug>(value: T, text: &str) {\n"
                    "    let line = |value: &T| format!(\"{value:?} {text}\");\n"
                    "    println!(\"{}\", line(&value));\n}\n", "")],
+    "closure body": [substitute(f"{B}/main.rs", "map(|n| n * 2)", "map(|n| n * 3)")],
+    "const value": [substitute(f"{B}/main.rs", "const LIMIT: usize = 3;", "const LIMIT: usize = 1;")],
+    "static initializer": [substitute(f"{B}/main.rs", 'static GREETING: &str = "matches";', 'static GREETING: &str = "hits";')],
+    "string literal in a body": [substitute(f"{B}/main.rs", '"on 2026-10 the quick', '"in 2026-10 the quick')],
+    "println! added to a body": [
+        substitute(f"{B}/main.rs", "    let twice = ", '    println!("counted {count}");\n    let twice = ')],
+    "macro_rules! body": [substitute(f"{B}/main.rs", 'format!("<{}>", $value)', 'format!("[{}]", $value)')],
+    "default method body of a trait": [substitute(f"{B}/main.rs", 'String::from("thing")', 'String::from("item")')],
+    "method added to a trait impl": [
+        substitute(f"{B}/main.rs", "impl Describe for Hit {}",
+                   "impl Describe for Hit {\n    fn describe(&self) -> String {\n        self.0.to_string()\n    }\n}")],
+    "trait impl added, not used": [
+        insert_after(f"{B}/main.rs", 10**9, "\nimpl std::fmt::Display for Hit {\n"
+                     "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
+                     "        write!(f, \"{}\", self.0)\n    }\n}\n")],
+    "private fn renamed, with its one call": [
+        substitute(f"{B}/main.rs", "    tally(hay, &re);", "    tally_up(hay, &re);"),
+        substitute(f"{B}/main.rs", "fn tally(hay: &str", "fn tally_up(hay: &str")],
+    "two items swapped": [
+        substitute(f"{B}/main.rs", "const LIMIT: usize = 3;\nstatic GREETING: &str = \"matches\";\n",
+                   "static GREETING: &str = \"matches\";\nconst LIMIT: usize = 3;\n")],
     "derive added to a struct (Span: Debug is hand-written, add PartialOrd)": [
         substitute(f"{A}/util/search.rs", "#[derive(Clone, Copy, Eq, Hash, PartialEq)]\npub struct Span {",
                    "#[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd)]\npub struct Span {")],
@@ -201,7 +222,7 @@ def main():
             log.seek(0)
             text = log.read()
             builds = re.findall(
-                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\n(?:(?:no )?patch: .*\n)?phases: compile (\S+), resolve (\S+), define (\S+), (?:fallback \S+, )?object (\S+), \d+ rounds\n(?:link: (\S+) .*\n)?edit-to-binary: (\S+)",
+                r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled, \d+ reused\n(?:(?:no )?patch: .*\n)?phases: compile (\S+), resolve (\S+), define (\S+), (?:fallback \S+, )?object (\S+), \d+ rounds\n(?:link: (\S+) .*\n)?(?:timeline-us: .*\n)?edit-to-binary: (\S+)",
                 text)[before:edits]
             apply = sum(millis(b[0]) for b in builds)
             total = sum(millis(b[4]) for b in builds)
@@ -215,6 +236,9 @@ def main():
                 ours, theirs = (subprocess.run([binary], capture_output=True) for binary in (fx.binary, cargo_bin))
                 row["same"] = (ours.returncode, ours.stdout) == (theirs.returncode, theirs.stdout)
                 mismatches += not row["same"]
+                if not row["same"]:
+                    for who, run in (("rustd", ours), ("cargo", theirs)):
+                        print(f"  {who}: exit {run.returncode}\n" + run.stdout.decode(errors="replace")[-400:], flush=True)
             rows.append(row)
             print(row, flush=True)
             if a.check:

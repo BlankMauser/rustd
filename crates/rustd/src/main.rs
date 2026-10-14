@@ -511,10 +511,28 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
         scope(&id.def_map(db)[id].scope(db), &mut bodies);
     }
     // A body's blocks include those of the blocks in it, but not those of the items in them.
-    while let Some(body) = bodies.pop() {
-        for (_, def_map) in Body::of(db, body).blocks(db) {
-            for (_, module) in def_map.modules() {
-                scope(module.scope(db), &mut bodies);
+    // An edit to a file has every body in it lowered again, which is most of the work here, so
+    // each round of bodies is lowered on all threads before it is read.
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    while !bodies.is_empty() {
+        let round = std::mem::take(&mut bodies);
+        std::thread::scope(|threads_scope| {
+            for part in round.chunks(round.len().div_ceil(threads)) {
+                let db = db.clone();
+                threads_scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        for &body in part {
+                            Body::of(&db, body);
+                        }
+                    })
+                });
+            }
+        });
+        for body in round {
+            for (_, def_map) in Body::of(db, body).blocks(db) {
+                for (_, module) in def_map.modules() {
+                    scope(module.scope(db), &mut bodies);
+                }
             }
         }
     }
@@ -527,6 +545,10 @@ struct Build {
     instances: usize,
     codegen: Duration,
     emit: Duration,
+    /// How long finding the roots, checking what is cached and compiling took, in that order.
+    steps: [Duration; 3],
+    /// Within the checking, the longest a thread took over each kind of cached thing.
+    looked: hir_ty::mir::codegen::StaleSteps,
 }
 
 thread_local! {
@@ -586,6 +608,7 @@ fn build(
         parts.into_iter().map(|it| it.join().ok().flatten()).collect()
     });
     known.set_stale(stale.unwrap_or_default());
+    let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let unit =
@@ -613,6 +636,8 @@ fn build(
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
+        steps: [setup, revalidate - setup, codegen - revalidate],
+        looked,
     };
     if let Some(path) = &args.report {
         build.write_report(path)?;
@@ -827,6 +852,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("watching {} files", files.len());
     loop {
         std::thread::sleep(Duration::from_millis(5));
+        let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
         // the rest of that write may not change it again.
@@ -840,6 +866,7 @@ fn main() -> anyhow::Result<()> {
                 if now != *mtime {
                     *mtime = now;
                     touched.insert(index);
+                    noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
             if touched.len() == before {
@@ -847,25 +874,71 @@ fn main() -> anyhow::Result<()> {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let Some((noticed, age)) = noticed else { continue };
+        let settled = noticed.elapsed();
+        let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
         let changed = touched.len();
         for index in touched {
             let (id, path, _) = &files[index];
             change.change_file(*id, Some(std::fs::read_to_string(path)?));
         }
-        if changed == 0 {
-            continue;
-        }
+        let read = read.elapsed();
         eprintln!("change: {changed} files");
         let start = Instant::now();
         db.apply_change(change);
         let apply = start.elapsed();
         let warm = build(&db, &table, &args, &mut known)?;
+        let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        let reported = start.elapsed();
         link(&args)?;
-        eprintln!("edit-to-binary: {:.1?}", start.elapsed());
+        let total = start.elapsed();
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            let [roots, revalidate, compile] = warm.steps;
+            let phases = known.stats.phases;
+            // In the order they happen, from the save on. Each is a duration of its own.
+            let steps = [
+                ("notice", age),
+                ("settle", settled),
+                ("read", read),
+                ("apply", apply),
+                ("roots", roots),
+                ("check-roots", warm.looked.roots),
+                ("check-instances", warm.looked.instances),
+                ("check-statics", warm.looked.statics),
+                ("check-left", warm.looked.left),
+                (
+                    "check-rest",
+                    revalidate.saturating_sub(
+                        warm.looked.roots
+                            + warm.looked.instances
+                            + warm.looked.statics
+                            + warm.looked.left,
+                    ),
+                ),
+                ("reach", phases.compile),
+                ("resolve", phases.resolve),
+                ("define", phases.define),
+                ("object", phases.object),
+                (
+                    "compile-rest",
+                    compile.saturating_sub(
+                        phases.compile + phases.resolve + phases.define + phases.object,
+                    ),
+                ),
+                ("write", warm.emit),
+                ("build-rest", built.saturating_sub(apply + warm.codegen + warm.emit)),
+                ("report", reported - built),
+                ("link", total - reported),
+            ];
+            let steps: Vec<String> =
+                steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
+            eprintln!("timeline-us: {}", steps.join(" "));
+        }
+        eprintln!("edit-to-binary: {total:.1?}");
     }
 }
 

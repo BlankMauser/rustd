@@ -77,7 +77,7 @@ use super::{
 
 mod fragment;
 mod patch;
-pub use patch::Stale;
+pub use patch::{Stale, StaleSteps};
 mod type_id;
 mod unwind;
 mod vtable;
@@ -229,11 +229,13 @@ impl CodegenUnit {
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
         if let Some(base) = known.base.take() {
-            let own_statics = OwnStatics {
-                crates: all().map(|root| root.krate(db)).collect(),
-                theirs: known.theirs.clone(),
-                unknown: known.unknown.clone(),
-            };
+            let own_statics = OwnStatics::new(
+                db,
+                all().map(|root| root.krate(db)).collect(),
+                known.theirs.clone(),
+                known.unknown.clone(),
+                !roots.on_demand.is_empty(),
+            );
             let mut stale = std::mem::take(&mut known.stale);
             if stale.is_empty() {
                 stale.push(base.stale(db, 0, 1));
@@ -284,11 +286,13 @@ impl CodegenUnit {
             counted,
             stale: _,
         } = known;
-        let mut own_statics = OwnStatics {
-            crates: all().map(|root| root.krate(db)).collect(),
-            theirs: std::mem::take(theirs),
-            unknown: std::mem::take(unknown),
-        };
+        let mut own_statics = OwnStatics::new(
+            db,
+            all().map(|root| root.krate(db)).collect(),
+            std::mem::take(theirs),
+            std::mem::take(unknown),
+            !roots.on_demand.is_empty(),
+        );
         let mut rounds = 0;
         loop {
             rounds += 1;
@@ -341,16 +345,13 @@ impl CodegenUnit {
             // A function left to rustc keeps using rustc's copy of a private static, so we
             // can't bring our own.
             let mut split = false;
-            for (root, e) in &skipped {
-                if matches!(e, CodegenError::NoSymbol) {
-                    continue;
-                }
-                let (theirs, complete) = ObjectCodegen::statics_reachable_from(db, *root);
-                split |= theirs.iter().any(|it| cg.statics.contains_key(it));
-                own_statics.theirs.extend(theirs);
-                if !complete && own_statics.unknown.insert(root.krate(db)) {
-                    split |= cg.statics.keys().any(|&it| !own_statics.owns(db, it));
-                }
+            let found = TheirStatics::of(db, left_to_rustc(&skipped));
+            split |= found.statics.iter().any(|it| cg.statics.contains_key(it));
+            own_statics.theirs.extend(found.statics);
+            let before = own_statics.unknown.len();
+            own_statics.unknown.extend(found.unknown);
+            if own_statics.unknown.len() != before {
+                split |= cg.statics.keys().any(|&it| !own_statics.owns(db, it));
             }
             if split {
                 rejected.extend(failed);
@@ -360,7 +361,7 @@ impl CodegenUnit {
                 let mut theirs = Some(FxHashSet::default());
                 for (root, e) in &skipped {
                     if !matches!(e, CodegenError::NoSymbol) {
-                        let blocks = ObjectCodegen::async_blocks(db, *root);
+                        let blocks = async_blocks(db, *root).clone();
                         theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
                             all.extend(blocks);
                             all
@@ -369,7 +370,7 @@ impl CodegenUnit {
                 }
                 let before = left.len();
                 left.extend(compiled.iter().map(|it| it.0).filter(|&root| {
-                    match (ObjectCodegen::async_blocks(db, root), &theirs) {
+                    match (async_blocks(db, root).clone(), &theirs) {
                         (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                         (Some(ours), None) => !ours.is_empty(),
                         (None, _) => true,
@@ -427,12 +428,15 @@ impl CodegenUnit {
     }
 }
 
-/// Which of the writable statics that rustc exports no symbol for we define ourselves. A
-/// function left to rustc uses rustc's copy of such a static, so the ones it refers to stay
-/// rustc's, along with whatever refers to them.
+/// Which statics we define ourselves rather than use rustc's. A function left to rustc uses
+/// rustc's copy of a static, so the ones it refers to stay rustc's, along with whatever refers
+/// to them.
 #[derive(Clone)]
 struct OwnStatics {
     crates: FxHashSet<Crate>,
+    /// Those of `crates` that a crate of the program left to rustc depends on: its code refers
+    /// to the statics rustc exports from them.
+    shared: FxHashSet<Crate>,
     theirs: FxHashSet<StaticId>,
     /// Crates with a function left to rustc that refers to we don't know what. That can be
     /// any static of the crate but the ones declared in the body of another function.
@@ -441,11 +445,62 @@ struct OwnStatics {
 }
 
 impl OwnStatics {
+    fn new(
+        db: &dyn HirDatabase,
+        crates: FxHashSet<Crate>,
+        theirs: FxHashSet<StaticId>,
+        unknown: FxHashSet<Crate>,
+        is_program: bool,
+    ) -> OwnStatics {
+        // With on-demand roots the build is of a program whose `main` is in `crates`, and only
+        // what that depends on is linked. Without, anything may be linked on top.
+        let program: FxHashSet<Crate> = if is_program {
+            crates.iter().flat_map(|krate| krate.transitive_deps(db)).collect()
+        } else {
+            base_db::all_crates(db).iter().copied().collect()
+        };
+        let mut dependents = FxHashMap::<Crate, Vec<Crate>>::default();
+        for &krate in &program {
+            for dep in &krate.data(db).dependencies {
+                dependents.entry(dep.crate_id).or_default().push(krate);
+            }
+        }
+        let is_shared = |krate: &Crate| {
+            let mut seen = FxHashSet::default();
+            let mut stack = vec![*krate];
+            while let Some(krate) = stack.pop() {
+                for &dependent in dependents.get(&krate).into_iter().flatten() {
+                    if !crates.contains(&dependent) {
+                        return true;
+                    }
+                    if seen.insert(dependent) {
+                        stack.push(dependent);
+                    }
+                }
+            }
+            false
+        };
+        let shared = crates.iter().copied().filter(is_shared).collect();
+        OwnStatics { crates, shared, theirs, unknown }
+    }
+
     fn owns(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
         let module = id.module(db);
         self.crates.contains(&module.krate(db))
             && !self.theirs.contains(&id)
             && (module.is_block_module(db) || !self.unknown.contains(&module.krate(db)))
+    }
+
+    /// Whether our copy of the static stands in for the one rustc exports. rustc's is what the
+    /// static was when rustc last built the crate, which an edit to its value leaves behind.
+    // FIXME: `#[used]` and `#[link_section]` statics are found by the linker or a runtime
+    // through rustc's copy and should stay rustc's too.
+    fn replaces(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+        self.owns(db, id)
+            && !self.shared.contains(&id.krate(db))
+            && !is_thread_local(db, id)
+            && !AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE)
+            && AttrFlags::export_name(db, id.into()).is_none()
     }
 }
 
@@ -484,6 +539,19 @@ impl Rejections {
     /// edit in between.
     pub fn set_stale(&mut self, stale: Vec<Stale>) {
         self.stale = stale;
+    }
+
+    /// The longest any thread took over each step of looking for what is stale.
+    pub fn stale_steps(&self) -> StaleSteps {
+        let longest = |step: fn(&StaleSteps) -> std::time::Duration| {
+            self.stale.iter().map(|it| step(&it.steps)).max().unwrap_or_default()
+        };
+        StaleSteps {
+            roots: longest(|it| it.roots),
+            instances: longest(|it| it.instances),
+            statics: longest(|it| it.statics),
+            left: longest(|it| it.left),
+        }
     }
 }
 
@@ -805,6 +873,119 @@ fn body_types<'db>(
         returned: body.locals[returned_local(body)].ty.clone(),
         poll: body.coroutine.map(|it| body.locals[it.poll].ty.clone()),
     })
+}
+
+/// The `async` blocks whose futures the body of `func` holds, or `None` when the body
+/// can't be read. rustc lays a future out differently, so every function that touches one
+/// has to come from the same compiler.
+#[salsa::tracked(returns(ref))]
+fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
+    struct Collector<'db>(Vec<Ty<'db>>);
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
+        type Result = ();
+
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if let TyKind::Coroutine(..) | TyKind::Closure(..) = ty.kind() {
+                self.0.push(ty);
+            }
+            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
+        }
+    }
+    let (body, env) = root_body(db, func).ok()?;
+    let (mut found, mut seen) = (FxHashSet::default(), FxHashSet::default());
+    let mut bodies = vec![body];
+    while let Some(body) = bodies.pop() {
+        let mut collector = Collector(Vec::new());
+        for (_, local) in body.locals.iter() {
+            rustc_type_ir::TypeVisitable::visit_with(&local.ty.as_ref(), &mut collector);
+        }
+        for ty in collector.0 {
+            if !seen.insert(ty) {
+                continue;
+            }
+            let body = match ty.kind() {
+                TyKind::Coroutine(id, args) => {
+                    found.insert(id.0.as_id());
+                    let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+                    db.monomorphized_mir_body_for_coroutine(id.0, parent.store(), env.store())
+                }
+                TyKind::Closure(id, args) => {
+                    let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                    db.monomorphized_mir_body_for_closure(id.0, parent.store(), env.store())
+                }
+                _ => continue,
+            };
+            bodies.push(body.ok()?);
+        }
+    }
+    Some(found)
+}
+
+/// The functions skipped that rustc has a copy of.
+fn left_to_rustc(skipped: &[(FunctionId, CodegenError)]) -> impl Iterator<Item = FunctionId> + '_ {
+    skipped.iter().filter(|(_, e)| !matches!(e, CodegenError::NoSymbol)).map(|it| it.0)
+}
+
+/// The statics that functions left to rustc refer to, themselves or through the instances they
+/// name.
+#[derive(Default, PartialEq, Eq)]
+struct TheirStatics {
+    statics: FxHashSet<StaticId>,
+    /// The crates with a function for which that is not all of them: what could not be
+    /// compiled refers to who knows what.
+    unknown: FxHashSet<Crate>,
+}
+
+impl TheirStatics {
+    /// The functions of a crate are walked together: they mostly reach the same instances.
+    fn of(db: &dyn HirDatabase, funcs: impl IntoIterator<Item = FunctionId>) -> TheirStatics {
+        let mut by_crate = FxHashMap::<Crate, Vec<FunctionId>>::default();
+        for func in funcs {
+            by_crate.entry(func.krate(db)).or_default().push(func);
+        }
+        let mut theirs = TheirStatics::default();
+        for (krate, funcs) in by_crate {
+            let (mut seen, mut statics) = (FxHashSet::default(), FxHashSet::default());
+            let mut complete = true;
+            let mut stack = Vec::new();
+            for func in funcs {
+                match compiled_root(db, func).as_ref() {
+                    Ok(compiled) => stack.push(&compiled.requests),
+                    Err(_) => complete = false,
+                }
+            }
+            while let Some(requests) = stack.pop() {
+                for request in &requests.funcs {
+                    let FuncTarget::Instance(instance, env) = &request.target else { continue };
+                    if matches!(instance.def, InstanceDef::Fn(_))
+                        && instance.args.as_ref().is_empty()
+                        || !seen.insert(instance)
+                    {
+                        continue;
+                    }
+                    match compiled_instance(db, instance.clone(), env.clone()).as_ref() {
+                        Ok(compiled) => stack.push(&compiled.requests),
+                        Err(_) => complete = false,
+                    }
+                }
+                for request in &requests.datas {
+                    if let DataRequest::Static(id) = request
+                        && statics.insert(*id)
+                    {
+                        match compiled_static(db, *id).as_ref() {
+                            Ok(compiled) => stack.push(&compiled.requests),
+                            Err(_) => complete = false,
+                        }
+                    }
+                }
+            }
+            theirs.statics.extend(statics);
+            if !complete {
+                theirs.unknown.insert(krate);
+            }
+        }
+        theirs
+    }
 }
 
 /// The value of a static that rustc exports no symbol for.
@@ -1130,51 +1311,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
-    /// The `async` blocks whose futures the body of `func` holds, or `None` when the body
-    /// can't be read. rustc lays a future out differently, so every function that touches one
-    /// has to come from the same compiler.
-    fn async_blocks(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
-        struct Collector<'db>(Vec<Ty<'db>>);
-        impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
-            type Result = ();
-
-            fn visit_ty(&mut self, ty: Ty<'db>) {
-                if let TyKind::Coroutine(..) | TyKind::Closure(..) = ty.kind() {
-                    self.0.push(ty);
-                }
-                rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
-            }
-        }
-        let (body, env) = root_body(db, func).ok()?;
-        let (mut found, mut seen) = (FxHashSet::default(), FxHashSet::default());
-        let mut bodies = vec![body];
-        while let Some(body) = bodies.pop() {
-            let mut collector = Collector(Vec::new());
-            for (_, local) in body.locals.iter() {
-                rustc_type_ir::TypeVisitable::visit_with(&local.ty.as_ref(), &mut collector);
-            }
-            for ty in collector.0 {
-                if !seen.insert(ty) {
-                    continue;
-                }
-                let body = match ty.kind() {
-                    TyKind::Coroutine(id, args) => {
-                        found.insert(id.0.as_id());
-                        let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-                        db.monomorphized_mir_body_for_coroutine(id.0, parent.store(), env.store())
-                    }
-                    TyKind::Closure(id, args) => {
-                        let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                        db.monomorphized_mir_body_for_closure(id.0, parent.store(), env.store())
-                    }
-                    _ => continue,
-                };
-                bodies.push(body.ok()?);
-            }
-        }
-        Some(found)
-    }
-
     fn want(&mut self, func: FunctionId) {
         if self.on_demand.contains(&func) {
             self.wanted.push(func);
@@ -1188,43 +1324,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let Ok(compiled) = compiled_root(db, func).as_ref() else { return false };
         self.want_requested(&compiled.requests);
         true
-    }
-
-    /// The statics a function refers to, itself or through the instances it names, and whether
-    /// that is all of them: what could not be compiled refers to who knows what.
-    fn statics_reachable_from(
-        db: &'db dyn HirDatabase,
-        func: FunctionId,
-    ) -> (FxHashSet<StaticId>, bool) {
-        let (mut seen, mut statics) = (FxHashSet::default(), FxHashSet::default());
-        let Ok(compiled) = compiled_root(db, func).as_ref() else { return (statics, false) };
-        let mut complete = true;
-        let mut stack = vec![&compiled.requests];
-        while let Some(requests) = stack.pop() {
-            for request in &requests.funcs {
-                let FuncTarget::Instance(instance, env) = &request.target else { continue };
-                if matches!(instance.def, InstanceDef::Fn(_)) && instance.args.as_ref().is_empty()
-                    || !seen.insert(instance)
-                {
-                    continue;
-                }
-                match compiled_instance(db, instance.clone(), env.clone()).as_ref() {
-                    Ok(compiled) => stack.push(&compiled.requests),
-                    Err(_) => complete = false,
-                }
-            }
-            for request in &requests.datas {
-                if let DataRequest::Static(id) = request
-                    && statics.insert(*id)
-                {
-                    match compiled_static(db, *id).as_ref() {
-                        Ok(compiled) => stack.push(&compiled.requests),
-                        Err(_) => complete = false,
-                    }
-                }
-            }
-        }
-        (statics, complete)
     }
 
     /// Wants the functions the requests and the instances they name refer to, without putting
@@ -1521,7 +1620,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&data) = known.into_iter().find_map(|it| it.get(&id)) {
             return Ok(data);
         }
-        if let Some(symbol) = self.symbols.static_(id) {
+        // rustc's copy when ours has no value to give.
+        let ours = self.own_statics.replaces(db, id) && compiled_static(db, id).is_ok();
+        if !ours && let Some(symbol) = self.symbols.static_(id) {
             let data = self.module.declare_data(
                 &symbol,
                 Linkage::Import,
