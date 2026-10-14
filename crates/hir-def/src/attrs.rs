@@ -762,6 +762,21 @@ impl AttrFlags {
         })
     }
 
+    /// The symbol `#[export_name]` gives an item.
+    #[salsa::tracked(returns(clone))]
+    pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        collect_attrs(db, owner, |attr| {
+            if let ast::Meta::KeyValueMeta(attr) = attr
+                && attr.path().is1("export_name")
+                && let Some(value) = attr.value_string()
+            {
+                ControlFlow::Break(Symbol::intern(&value))
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+    }
+
     #[inline]
     pub fn lang_item_with_attrs(self, db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
         if !self.contains(AttrFlags::LANG_ITEM) {

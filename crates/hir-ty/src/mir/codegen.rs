@@ -197,6 +197,16 @@ pub struct CodegenUnit {
     pub instances: usize,
 }
 
+/// The functions a build starts from.
+#[derive(Clone, Copy)]
+pub struct Roots<'a> {
+    /// Compiled whether or not anything calls them.
+    pub entries: &'a [FunctionId],
+    /// Compiled once code in the object refers to them. A function not reached keeps rustc's
+    /// copy, which nothing in the program calls.
+    pub on_demand: &'a [FunctionId],
+}
+
 impl CodegenUnit {
     /// Compiles every root it can, together with the instances those roots call.
     ///
@@ -205,47 +215,83 @@ impl CodegenUnit {
     pub fn compile(
         db: &dyn HirDatabase,
         symbols: &dyn SymbolResolver,
-        roots: &[FunctionId],
+        roots: Roots<'_>,
         denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
+        let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
+        let all = || roots.entries.iter().chain(roots.on_demand).copied();
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
-        let Rejections { rejected, stats } = known;
+        let Rejections { rejected, stats, theirs, unknown, left } = known;
         let compiled_before = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let mut own_statics: FxHashSet<Crate> = roots.iter().map(|root| root.krate(db)).collect();
-        // Roots given up on because a function left to rustc handles the same future.
-        let mut left = FxHashSet::default();
+        let mut own_statics = OwnStatics {
+            crates: all().map(|root| root.krate(db)).collect(),
+            theirs: std::mem::take(theirs),
+            unknown: std::mem::take(unknown),
+        };
         let mut rounds = 0;
         loop {
             rounds += 1;
-            let mut cg = ObjectCodegen::new(db, symbols, rejected, own_statics.clone())?;
+            let mut cg =
+                ObjectCodegen::new(db, symbols, rejected, own_statics.clone(), &on_demand)?;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
-            for &root in roots {
-                if denied.contains(&root) {
-                    skipped.push((
-                        root,
-                        CodegenError::Unsupported("left to rustc on request".to_owned()),
-                    ));
-                    continue;
+            let mut failed = Vec::new();
+            let mut queue = roots.entries.to_vec();
+            let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
+            let mut next = 0;
+            loop {
+                while let Some(&root) = queue.get(next) {
+                    next += 1;
+                    let result = if denied.contains(&root) {
+                        Err(CodegenError::Unsupported("left to rustc on request".to_owned()))
+                    } else if left.contains(&root) {
+                        let reason = "shares an `async` block with a function left to rustc";
+                        Err(CodegenError::Unsupported(reason.to_owned()))
+                    } else {
+                        cg.define_function(root)
+                    };
+                    match result {
+                        Ok(symbol) => compiled.push((root, symbol)),
+                        Err(e) => {
+                            // rustc's copy calls what ours would have.
+                            if !on_demand.is_empty()
+                                && !matches!(e, CodegenError::NoSymbol)
+                                && !cg.want_reachable_from(root)
+                            {
+                                let krate = root.krate(db);
+                                let rest =
+                                    roots.on_demand.iter().filter(|it| it.krate(db) == krate);
+                                cg.wanted.extend(rest);
+                            }
+                            skipped.push((root, e));
+                        }
+                    }
+                    queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
                 }
-                if left.contains(&root) {
-                    let reason = "shares an `async` block with a function left to rustc";
-                    skipped.push((root, CodegenError::Unsupported(reason.to_owned())));
-                    continue;
-                }
-                match cg.define_function(root) {
-                    Ok(symbol) => compiled.push((root, symbol)),
-                    Err(e) => skipped.push((root, e)),
+                failed.extend(cg.define_instances());
+                queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
+                if next == queue.len() {
+                    break;
                 }
             }
-            let failed = cg.define_instances();
             let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
-            if !cg.statics.is_empty() && from_rustc {
-                // Functions left to rustc keep using rustc's copy of the crate's private
-                // statics, so we can't bring our own.
-                own_statics.clear();
+            // A function left to rustc keeps using rustc's copy of a private static, so we
+            // can't bring our own.
+            let mut split = false;
+            for (root, e) in &skipped {
+                if matches!(e, CodegenError::NoSymbol) {
+                    continue;
+                }
+                let (theirs, complete) = ObjectCodegen::statics_reachable_from(db, *root);
+                split |= theirs.iter().any(|it| cg.statics.contains_key(it));
+                own_statics.theirs.extend(theirs);
+                if !complete && own_statics.unknown.insert(root.krate(db)) {
+                    split |= cg.statics.keys().any(|&it| !own_statics.owns(db, it));
+                }
+            }
+            if split {
                 rejected.extend(failed);
                 continue;
             }
@@ -300,10 +346,33 @@ impl CodegenUnit {
                 let start = std::time::Instant::now();
                 let object = cg.finish()?;
                 stats.phases.object = start.elapsed();
+                (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
                 return Ok(CodegenUnit { object, compiled, skipped, instances });
             }
             rejected.extend(failed);
         }
+    }
+}
+
+/// Which of the writable statics that rustc exports no symbol for we define ourselves. A
+/// function left to rustc uses rustc's copy of such a static, so the ones it refers to stay
+/// rustc's, along with whatever refers to them.
+#[derive(Clone)]
+struct OwnStatics {
+    crates: FxHashSet<Crate>,
+    theirs: FxHashSet<StaticId>,
+    /// Crates with a function left to rustc that refers to we don't know what. That can be
+    /// any static of the crate but the ones declared in the body of another function.
+    // FIXME: a closure that such a function hands out can refer to the statics of its body.
+    unknown: FxHashSet<Crate>,
+}
+
+impl OwnStatics {
+    fn owns(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+        let module = id.module(db);
+        self.crates.contains(&module.krate(db))
+            && !self.theirs.contains(&id)
+            && (module.is_block_module(db) || !self.unknown.contains(&module.krate(db)))
     }
 }
 
@@ -312,6 +381,11 @@ impl CodegenUnit {
 #[derive(Default)]
 pub struct Rejections {
     rejected: FxHashMap<Instance, String>,
+    /// The statics that functions left to rustc refer to, and the crates where that is unknown.
+    theirs: FxHashSet<StaticId>,
+    unknown: FxHashSet<Crate>,
+    /// Roots given up on because a function left to rustc handles the same future.
+    left: FxHashSet<FunctionId>,
     pub stats: BuildStats,
 }
 
@@ -392,6 +466,13 @@ struct ObjectCodegen<'a, 'db> {
     imports: FxHashMap<String, FuncId>,
     instances: FxHashMap<Instance, FuncId>,
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
+    /// Functions compiled only once something refers to them, and the ones referred to since
+    /// the list was last taken.
+    /// The statics given a value here, in the order their values were asked for.
+    own_static_order: Vec<StaticId>,
+    on_demand: &'a FxHashSet<FunctionId>,
+    wanted: Vec<FunctionId>,
+    on_demand_crates: FxHashSet<Crate>,
     /// Instances that failed in an earlier round, with the reason.
     rejected: &'a FxHashMap<Instance, String>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` names a file
@@ -403,9 +484,7 @@ struct ObjectCodegen<'a, 'db> {
     /// How many compiled functions went into the object.
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
-    /// The crates whose writable statics we define ourselves when rustc exports no symbol for
-    /// them. Only sound when every function of those crates is ours.
-    own_statics: FxHashSet<Crate>,
+    own_statics: OwnStatics,
     statics: FxHashMap<StaticId, DataId>,
     /// Statics nothing exports and nothing can write to, which we give a copy of the value.
     frozen_statics: FxHashMap<StaticId, DataId>,
@@ -723,6 +802,18 @@ fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {
     AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL)
 }
 
+/// The symbol a function is exported under when an attribute names it: the runtime or the
+/// program loading the library looks it up by that name, so it is compiled whether or not
+/// anything calls it.
+pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+    if let Some(name) = AttrFlags::export_name(db, func.into()) {
+        return Some(name.as_str().to_owned());
+    }
+    AttrFlags::query(db, func.into())
+        .contains(AttrFlags::NO_MANGLE)
+        .then(|| FunctionSignature::of(db, func).name.as_str().to_owned())
+}
+
 /// The symbol an item of an `extern` block links to.
 fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
@@ -867,7 +958,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, String>,
-        own_statics: FxHashSet<Crate>,
+        own_statics: OwnStatics,
+        on_demand: &'a FxHashSet<FunctionId>,
     ) -> Result<Self> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
@@ -880,6 +972,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             imports: FxHashMap::default(),
             instances: FxHashMap::default(),
             pending: Vec::new(),
+            own_static_order: Vec::new(),
+            on_demand,
+            wanted: Vec::new(),
+            on_demand_crates: on_demand.iter().map(|func| func.krate(db)).collect(),
             rejected,
             layouts: FxHashMap::default(),
             phases: Phases::default(),
@@ -954,6 +1050,87 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
         }
         Some(found)
+    }
+
+    fn want(&mut self, func: FunctionId) {
+        if self.on_demand.contains(&func) {
+            self.wanted.push(func);
+        }
+    }
+
+    /// Wants the functions that `func` and the instances it calls refer to, for when `func`
+    /// itself is left to rustc. `false` when the body can't be compiled to find them.
+    fn want_reachable_from(&mut self, func: FunctionId) -> bool {
+        let db = self.db;
+        let Ok(compiled) = compiled_root(db, func).as_ref() else { return false };
+        self.want_requested(&compiled.requests);
+        true
+    }
+
+    /// The statics a function refers to, itself or through the instances it names, and whether
+    /// that is all of them: what could not be compiled refers to who knows what.
+    fn statics_reachable_from(
+        db: &'db dyn HirDatabase,
+        func: FunctionId,
+    ) -> (FxHashSet<StaticId>, bool) {
+        let (mut seen, mut statics) = (FxHashSet::default(), FxHashSet::default());
+        let Ok(compiled) = compiled_root(db, func).as_ref() else { return (statics, false) };
+        let mut complete = true;
+        let mut stack = vec![&compiled.requests];
+        while let Some(requests) = stack.pop() {
+            for request in &requests.funcs {
+                let FuncTarget::Instance(instance, env) = &request.target else { continue };
+                if matches!(instance.def, InstanceDef::Fn(_)) && instance.args.as_ref().is_empty()
+                    || !seen.insert(instance)
+                {
+                    continue;
+                }
+                match compiled_instance(db, instance.clone(), env.clone()).as_ref() {
+                    Ok(compiled) => stack.push(&compiled.requests),
+                    Err(_) => complete = false,
+                }
+            }
+            for request in &requests.datas {
+                if let DataRequest::Static(id) = request
+                    && statics.insert(*id)
+                {
+                    match compiled_static(db, *id).as_ref() {
+                        Ok(compiled) => stack.push(&compiled.requests),
+                        Err(_) => complete = false,
+                    }
+                }
+            }
+        }
+        (statics, complete)
+    }
+
+    /// Wants the functions the requests and the instances they name refer to, without putting
+    /// any of it in the object.
+    fn want_requested(&mut self, requests: &'db Requests) {
+        let db = self.db;
+        let (mut seen, mut seen_statics) = (FxHashSet::default(), FxHashSet::default());
+        let mut stack = vec![requests];
+        while let Some(requests) = stack.pop() {
+            for request in &requests.funcs {
+                let FuncTarget::Instance(instance, env) = &request.target else { continue };
+                match instance.def {
+                    InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => self.want(func),
+                    _ if !seen.insert(instance) => {}
+                    _ => {
+                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        stack.extend(compiled.as_ref().ok().map(|it| &it.requests));
+                    }
+                }
+            }
+            for request in &requests.datas {
+                if let DataRequest::Static(id) = request
+                    && seen_statics.insert(*id)
+                    && let Ok(compiled) = compiled_static(db, *id).as_ref()
+                {
+                    stack.push(&compiled.requests);
+                }
+            }
+        }
     }
 
     /// Puts a non-generic function in the object, exported under its rustc symbol name.
@@ -1227,22 +1404,46 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 is_thread_local(db, id),
             )?;
             self.imported_statics.insert(id, data);
+            // rustc's value of the static points to rustc's copies of functions.
+            if self.on_demand_crates.contains(&id.krate(db))
+                && let Ok(compiled) = compiled_static(db, id).as_ref()
+            {
+                self.want_requested(&compiled.requests);
+            }
             return Ok(data);
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
-        if compiled.writable && !self.own_statics.contains(&id.krate(db)) {
+        if compiled.writable && !self.own_statics.owns(db, id) {
             unsupported!("writable static without a rustc symbol");
         }
-        let ids = self.resolve(&compiled.requests)?;
-        // Not shared: a static has an address of its own.
-        let identity = if compiled.writable { DataIdentity::Writable } else { DataIdentity::Own };
-        let data = self.define_data_as(ids.blob(&compiled.blob), identity)?;
-        if compiled.writable {
-            self.statics.insert(id, data);
-        } else {
-            self.frozen_statics.insert(id, data);
+        // Not shared with equal data: a static has an address of its own. Known before its
+        // value is: what the value points to may point back at the static.
+        let data = self.declare_local_data(compiled.writable)?;
+        let known = if compiled.writable { &mut self.statics } else { &mut self.frozen_statics };
+        known.insert(id, data);
+        let begun = self.own_static_order.len();
+        self.own_static_order.push(id);
+        match self.resolve(&compiled.requests) {
+            Ok(ids) => {
+                self.fill_data(data, ids.blob(&compiled.blob))?;
+                Ok(data)
+            }
+            Err(e) => {
+                // The statics defined since may point to this one, which has no value.
+                for id in self.own_static_order.drain(begun..) {
+                    self.statics.remove(&id);
+                    self.frozen_statics.remove(&id);
+                }
+                let nothing = ConstBlob {
+                    bytes: Vec::new(),
+                    relocs: Vec::new(),
+                    fn_relocs: Vec::new(),
+                    align: 1,
+                };
+                self.fill_data(data, nothing)?;
+                Err(e)
+            }
         }
-        Ok(data)
     }
 
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`).
@@ -1283,6 +1484,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && args.is_empty()
             && let Some(symbol) = self.symbols.function(func)
         {
+            self.want(func);
             return self.import(&symbol, sig);
         }
         let signature = match def {
@@ -1658,18 +1860,28 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn define_data_as(&mut self, blob: ConstBlob, identity: DataIdentity) -> Result<DataId> {
-        let backend = |e: cranelift_module::ModuleError| CodegenError::Backend(e.to_string());
         let writable = identity == DataIdentity::Writable;
         let shared = (identity == DataIdentity::Shared).then(|| blob.clone());
         if let Some(&id) = shared.as_ref().and_then(|blob| self.consts.get(blob)) {
             return Ok(id);
         }
+        let id = self.declare_local_data(writable)?;
+        self.fill_data(id, blob)?;
+        if let Some(blob) = shared {
+            self.consts.insert(blob, id);
+        }
+        Ok(id)
+    }
+
+    fn declare_local_data(&mut self, writable: bool) -> Result<DataId> {
         let n = self.location_counter;
         self.location_counter += 1;
-        let id = self
-            .module
+        self.module
             .declare_data(&format!(".Lrustd.const.{n}"), Linkage::Local, writable, false)
-            .map_err(backend)?;
+            .map_err(|e| CodegenError::Backend(e.to_string()))
+    }
+
+    fn fill_data(&mut self, id: DataId, blob: ConstBlob) -> Result<()> {
         let mut data = DataDescription::new();
         data.define(blob.bytes.into_boxed_slice());
         data.set_align(blob.align);
@@ -1681,11 +1893,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let target = self.module.declare_func_in_data(target, &mut data);
             data.write_function_addr(offset, target);
         }
-        self.module.define_data(id, &data).map_err(backend)?;
-        if let Some(blob) = shared {
-            self.consts.insert(blob, id);
-        }
-        Ok(id)
+        self.module.define_data(id, &data).map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
     fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
@@ -2557,13 +2765,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (_, layout, addr, _) = frame.as_ref().expect("frame");
             this.builder.ins().iadd_imm(*addr, layout.fields.offset(field).bytes() as i64)
         };
+        let held = match &frame {
+            Some(_) => body.locals_held_across_yields(|local| {
+                has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
+                    != DropGlue::None
+            }),
+            None => Default::default(),
+        };
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local) {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
             if let Some((frame, ..)) = &frame
-                && Some(local) != body.coroutine.map(|it| it.poll)
+                && held.contains(&local)
             {
                 let addr = in_frame(self, frame.local(local.into_raw().into_u32() as usize));
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
@@ -3818,6 +4033,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn copy(&mut self, dst: Value, src: Value, size: Size) {
+        // A load and a store per word of a future holding the whole program's state is
+        // more IR than fits in memory.
+        if size.bytes() > 128 {
+            let config = self.cg.target_config();
+            let bytes = self.builder.ins().iconst(PTR, size.bytes() as i64);
+            self.builder.call_memcpy(config, dst, src, bytes);
+            return;
+        }
         let mut offset = 0i32;
         let mut left = size.bytes() as i32;
         for ty in [types::I64, types::I32, types::I16, types::I8] {

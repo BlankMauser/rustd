@@ -29,6 +29,16 @@ def main():
         ("new private fn", f"{core}/virtual_dom.rs", lambda t: t + NEW_FN),
         ("new private fn in lib.rs", f"{core}/lib.rs", lambda t: t + NEW_FN),
     ]
+    if "dx" in crates:
+        cli = os.path.join(root, "packages/cli/src")
+        wrap = "pub fn is_wrapping_rustc() -> bool {\n"
+        edits = [
+            ("blank line at top", f"{cli}/rustcwrapper.rs", lambda t: "\n" + t),
+            ("comment appended", f"{cli}/build/builder.rs", lambda t: t + "// edit\n"),
+            ("1 function body (is_wrapping_rustc)", f"{cli}/rustcwrapper.rs", lambda t: t.replace(wrap, wrap + BODY + "\n", 1)),
+            ("new private fn", f"{cli}/build/builder.rs", lambda t: t + NEW_FN),
+            ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
+        ]
     work = os.path.join(root, "work")
     log_path = os.path.join(work, "dxedits.log")
     open(log_path, "w").close()
@@ -62,7 +72,6 @@ def main():
             edited = apply(original)
             assert edited != original, name
             for label, text in ((name, edited), ("  (revert)", original)):
-                time.sleep(0.3)
                 open(path, "w").write(text)
                 found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n.*\n(?:link: .*\n)?edit-to-binary: (\S+)", done)
                 done = len(found)

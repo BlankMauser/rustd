@@ -1,6 +1,11 @@
 //! This module provides a MIR interpreter, which is used in const eval.
 
-use std::{borrow::Cow, cell::RefCell, iter, mem, ops::Range};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    iter, mem,
+    ops::Range,
+};
 
 use base_db::{Crate, target::TargetLoadError};
 use either::Either;
@@ -178,6 +183,14 @@ pub struct Evaluator<'a, 'db> {
     static_locations: FxHashMap<StaticId, Address>,
     /// The memory of each evaluated static, as start and size.
     static_memory: Vec<(usize, usize, StaticId)>,
+    /// The statics whose value is read, when the others are left unevaluated: a static that
+    /// is only pointed to needs no value, and may itself point back at the one being
+    /// evaluated. `None` evaluates every static that is named.
+    read_statics: Option<FxHashSet<StaticId>>,
+    /// Heap memory standing in for the statics left unevaluated, as start and size.
+    unevaluated_statics: Vec<(usize, usize, StaticId)>,
+    /// The unevaluated static whose memory was read, which fails the evaluation.
+    missing_static: Cell<Option<StaticId>>,
     /// We don't really have function pointers, i.e. pointers to some assembly instructions that we can run. Instead, we
     /// store the type as an interned id in place of function and vtable pointers, and we recover back the type at the
     /// time of use.
@@ -478,14 +491,35 @@ pub fn interpret_mir<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
-    let mut evaluator = Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
-    let it: Result<'db, Allocation<'db>> = (|| {
-        if evaluator.ptr_size() != size_of::<usize>() {
+    let mut read_statics = FxHashSet::default();
+    loop {
+        let mut evaluator =
+            Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
+        evaluator.read_statics = Some(read_statics.clone());
+        let it = evaluator.evaluate(body, ty);
+        if let Some(read) = evaluator.missing_static.take()
+            && read_statics.insert(read)
+        {
+            continue;
+        }
+        return Ok((it, MirOutput { stdout: evaluator.stdout, stderr: evaluator.stderr }));
+    }
+}
+
+#[cfg(test)]
+const EXECUTION_LIMIT: usize = 100_000;
+#[cfg(not(test))]
+const EXECUTION_LIMIT: usize = 10_000_000;
+
+impl<'db> Evaluator<'db, 'db> {
+    /// Runs a body without arguments and takes its result out of the evaluator's memory.
+    fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
+        if self.ptr_size() != size_of::<usize>() {
             not_supported!("targets with different pointer size from host");
         }
-        let interval = evaluator.interpret_mir(body, None.into_iter())?;
-        let bytes = interval.get(&evaluator)?;
-        let mut memory_map = evaluator.create_memory_map(
+        let interval = self.interpret_mir(body, None.into_iter())?;
+        let bytes = interval.get(self)?;
+        let mut memory_map = self.create_memory_map(
             bytes,
             ty,
             &Locals { ptr: ArenaMap::new(), body, drop_flags: DropFlags::default() },
@@ -493,23 +527,17 @@ pub fn interpret_mir<'db>(
         let bytes = Box::from(bytes);
         let memory_map = if memory_map.memory.is_empty()
             && memory_map.statics.is_empty()
-            && evaluator.vtable_map.is_empty()
+            && self.vtable_map.is_empty()
         {
             MemoryMap::Empty
         } else {
-            memory_map.vtable = mem::take(&mut evaluator.vtable_map);
+            memory_map.vtable = mem::take(&mut self.vtable_map);
             memory_map.vtable.shrink_to_fit();
             MemoryMap::Complex(Box::new(memory_map))
         };
         Ok(Allocation::new(AllocationData { ty, memory: bytes, memory_map }))
-    })();
-    Ok((it, MirOutput { stdout: evaluator.stdout, stderr: evaluator.stderr }))
+    }
 }
-
-#[cfg(test)]
-const EXECUTION_LIMIT: usize = 100_000;
-#[cfg(not(test))]
-const EXECUTION_LIMIT: usize = 10_000_000;
 
 impl<'a, 'db> Evaluator<'a, 'db> {
     pub fn new(
@@ -540,6 +568,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
             static_memory: Vec::new(),
+            read_statics: None,
+            unevaluated_statics: Vec::new(),
+            missing_static: Cell::new(None),
             db,
             random_state: oorandom::Rand64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
@@ -2037,13 +2068,27 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         locals: &Locals<'a, 'db>,
         allocation: Allocation<'db>,
     ) -> Result<'db, Interval> {
+        let (size, align) =
+            self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+        let addr = self.heap_allocate(size, align)?;
+        self.write_allocation(locals, allocation, addr, size)?;
+        Ok(Interval::new(addr, size))
+    }
+
+    /// Copies a constant's value to `addr`, along with the memory it points to.
+    fn write_allocation(
+        &mut self,
+        locals: &Locals<'a, 'db>,
+        allocation: Allocation<'db>,
+        addr: Address,
+        size: usize,
+    ) -> Result<'db, ()> {
         let AllocationData { ty, memory: ref v, ref memory_map } = *allocation;
         let patch_map = memory_map.transform_addresses(|b, align| {
             let addr = self.heap_allocate(b.len(), align)?;
             self.write_memory(addr, b)?;
             Ok(addr.to_usize())
         })?;
-        let (size, align) = self.size_align_of(allocation.ty, locals)?.unwrap_or((v.len(), 1));
         let v: Cow<'_, [u8]> = if size != v.len() {
             // Handle self enum
             if size == 16 && v.len() < 16 {
@@ -2056,7 +2101,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         } else {
             Cow::Borrowed(v)
         };
-        let addr = self.heap_allocate(size, align)?;
         self.write_memory(addr, &v)?;
         self.patch_addresses(
             &patch_map,
@@ -2070,8 +2114,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             addr,
             ty,
             locals,
-        )?;
-        Ok(Interval::new(addr, size))
+        )
     }
 
     fn eval_place(&mut self, p: &StoredPlace, locals: &Locals<'a, 'db>) -> Result<'db, Interval> {
@@ -2088,7 +2131,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         }
         let (mem, pos) = match addr {
             Stack(it) => (&self.stack, it),
-            Heap(it) => (&self.heap, it),
+            Heap(it) => {
+                self.check_static_is_evaluated(it, size)?;
+                (&self.heap, it)
+            }
             Invalid(it) => {
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "read invalid memory address {it} with size {size}"
@@ -2097,6 +2143,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         };
         mem.get(pos..pos + size)
             .ok_or_else(|| MirEvalError::UndefinedBehavior("out of bound memory read".to_owned()))
+    }
+
+    /// Fails a read of heap memory that stands in for a static left unevaluated.
+    fn check_static_is_evaluated(&self, pos: usize, size: usize) -> Result<'db, ()> {
+        let read = self
+            .unevaluated_statics
+            .iter()
+            .find(|&&(start, len, _)| pos < start + len && start < pos + size);
+        let Some(&(.., id)) = read else { return Ok(()) };
+        self.missing_static.set(Some(id));
+        not_supported!("reading a static that was left unevaluated")
     }
 
     fn write_memory_using_ref(&mut self, addr: Address, size: usize) -> Result<'db, &mut [u8]> {
@@ -2142,6 +2199,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
 
         let oob = || MirEvalError::UndefinedBehavior("out of bounds memory write".to_owned());
 
+        if let Heap(src) = r.addr {
+            self.check_static_is_evaluated(src, r.size)?;
+        }
         match (addr, r.addr) {
             (Stack(dst), Stack(src)) => {
                 if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
@@ -2520,6 +2580,15 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         let layout = self.layout(ty)?;
         let my_size = self.size_of_sized(ty, locals, "value to patch address")?;
         use rustc_type_ir::TyKind;
+        // A pointer into a static points into this evaluator's copy of it.
+        if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
+            let current = from_bytes!(usize, self.read_memory(addr, size_of::<usize>())?);
+            if let Some((id, offset)) = source.static_at(current) {
+                let location = self.eval_static(id, locals)?;
+                let start = from_bytes!(usize, self.read_memory(location, size_of::<usize>())?);
+                return self.write_memory(addr, &(start + offset).to_le_bytes());
+            }
+        }
         match ty.kind() {
             TyKind::Ref(_, t, _) => {
                 let size = self.size_align_of(t, locals)?;
@@ -3028,11 +3097,30 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             return Ok(*o);
         };
         let static_data = StaticSignature::of(self.db, st);
-        let result = if !static_data.flags.contains(StaticFlags::EXTERN) {
+        let is_read = self.read_statics.as_ref().is_none_or(|read| read.contains(&st));
+        let unevaluated = if is_read || static_data.flags.contains(StaticFlags::EXTERN) {
+            None
+        } else {
+            let ty = self.db.type_for_static(st).instantiate_identity().skip_norm_wip();
+            self.size_align_of(ty, locals)?
+        };
+        let result = if let Some((size, align)) = unevaluated {
+            let addr = self.heap_allocate(size, align)?;
+            if let Heap(start) = addr {
+                self.unevaluated_statics.push((start, size, st));
+            }
+            Interval::new(addr, size)
+        } else if !static_data.flags.contains(StaticFlags::EXTERN) {
             let allocation = self.db.const_eval_static(st).map_err(|e| {
                 MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
             })?;
-            self.allocate_allocation_in_heap(locals, allocation)?
+            let (size, align) =
+                self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+            let result = Interval::new(self.heap_allocate(size, align)?, size);
+            // Known before its value is written: what it points to may point back at it.
+            let location = self.locate_static(st, result)?;
+            self.write_allocation(locals, allocation, result.addr, size)?;
+            return Ok(location);
         } else {
             let ty = InferenceResult::of(self.db, DefWithBodyId::from(st))
                 .expr_ty(Body::of(self.db, st.into()).root_expr());
@@ -3042,9 +3130,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             let addr = self.heap_allocate(size, align)?;
             Interval::new(addr, size)
         };
-        self.static_memory.push((result.addr.to_usize(), result.size, st));
+        self.locate_static(st, result)
+    }
+
+    /// Records where the memory of a static is, and gives the address of a pointer to it.
+    fn locate_static(&mut self, st: StaticId, memory: Interval) -> Result<'db, Address> {
+        self.static_memory.push((memory.addr.to_usize(), memory.size, st));
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-        self.write_memory(addr, &result.addr.to_bytes())?;
+        self.write_memory(addr, &memory.addr.to_bytes())?;
         self.static_locations.insert(st, addr);
         Ok(addr)
     }

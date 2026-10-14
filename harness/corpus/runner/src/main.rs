@@ -189,6 +189,9 @@ fn main() {
     println!("failing_drop {:?}", cases::unwind_cleanup::failing_drop());
     println!("capture_enum_field {:?}", cases::capture_enum_field::run());
     println!("autoref_promoted {:?}", cases::autoref_promoted::run());
+    println!("promoted_self_variant {:?}", cases::promoted_self_variant::run());
+    println!("static_cycle {:?}", cases::static_cycle::run());
+    println!("async_frames {:?}", cases::async_frames::run());
     println!("boxed_fn_tuple {:?}", cases::boxed_fn_tuple::run());
     println!("builtin_location {:?}", cases::builtin_location::run());
     println!("builtin_location passed {:?}", cases::builtin_location::passed());

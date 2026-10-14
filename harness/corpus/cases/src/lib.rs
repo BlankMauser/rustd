@@ -1643,6 +1643,137 @@ pub mod autoref_promoted {
     }
 }
 
+/// A borrowed array of `Self::Variant`s outlives the function, as `derive(ValueEnum)` relies on.
+pub mod promoted_self_variant {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Kind {
+        Webview,
+        Native,
+    }
+
+    impl Kind {
+        fn all<'a>() -> &'a [Self] {
+            &[Self::Webview, Self::Native]
+        }
+    }
+
+    #[inline(never)]
+    fn clobber() -> [u64; 8] {
+        std::hint::black_box([u64::MAX; 8])
+    }
+
+    pub fn run() -> (Vec<Kind>, u64) {
+        let all = Kind::all();
+        let noise = clobber();
+        (all.to_vec(), noise[0])
+    }
+}
+
+/// Two statics that point at each other, and a static in a function body whose value is made
+/// by a closure on first use.
+pub mod static_cycle {
+    use std::sync::LazyLock;
+
+    pub struct Site {
+        meta: &'static Meta,
+        id: u32,
+    }
+    pub struct Meta {
+        name: &'static str,
+        site: &'static Site,
+    }
+
+    fn pair() -> (&'static Site, &'static Meta) {
+        static SITE: Site = Site { meta: &META, id: 7 };
+        static META: Meta = Meta { name: "event", site: &SITE };
+        (&SITE, &META)
+    }
+
+    fn settings() -> &'static Vec<String> {
+        static SETTINGS: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["a".to_string(), "b".to_string()]);
+        &SETTINGS
+    }
+
+    pub fn run() -> (u32, &'static str, bool, bool, Vec<String>, bool) {
+        let (site, meta) = pair();
+        (
+            meta.site.id,
+            site.meta.name,
+            std::ptr::eq(site.meta, meta),
+            std::ptr::eq(meta.site, site),
+            settings().clone(),
+            std::ptr::eq(settings(), settings()),
+        )
+    }
+}
+
+/// An `async` block keeps what lives across an `.await`, borrowed locals included, and not
+/// the large temporaries in between.
+pub mod async_frames {
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::task::{Context, Poll, Waker};
+
+    struct Twice(bool);
+    impl Future for Twice {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if std::mem::replace(&mut self.0, true) { Poll::Ready(()) } else { Poll::Pending }
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            // Whatever a suspended future left on `poll`'s stack is gone by the next call.
+            std::hint::black_box([u64::MAX; 64]);
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    fn checksum(bytes: &[u8]) -> u64 {
+        bytes.iter().map(|&it| it as u64).sum()
+    }
+
+    async fn leaf(seed: u8) -> u64 {
+        let scratch = [seed; 4096];
+        let before = checksum(&scratch);
+        Twice(false).await;
+        let after = [seed.wrapping_add(1); 4096];
+        before + checksum(&after)
+    }
+
+    async fn borrows(seed: u8) -> u64 {
+        let kept = [seed; 64];
+        let view = &kept[1..];
+        let mut total = String::from("t");
+        let grows = &mut total;
+        Twice(false).await;
+        grows.push('u');
+        let moved = total;
+        Twice(false).await;
+        checksum(view) + moved.len() as u64
+    }
+
+    async fn nested(depth: u8) -> u64 {
+        let mut total = 0;
+        for round in 0..3 {
+            let step = if round == depth { borrows(round).await } else { leaf(round).await };
+            total += step;
+        }
+        let pinned = Box::pin(async move { leaf(depth).await + total });
+        pinned.await
+    }
+
+    pub fn run() -> (u64, u64, u64) {
+        (block_on(leaf(3)), block_on(borrows(5)), block_on(nested(1)))
+    }
+}
+
 /// `Box<dyn FnMut>` forwards its arguments to the closure as the tuple it was called with.
 pub mod boxed_fn_tuple {
     fn join(key: String, val: String, n: u8) -> String {

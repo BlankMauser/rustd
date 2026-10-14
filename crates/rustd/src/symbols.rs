@@ -75,7 +75,9 @@ impl SymbolTable {
             } else {
                 path
             };
-            if path.contains("::{") {
+            // A closure is not an item nested in itself.
+            let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
+            if path.contains("::{") && !unnamed {
                 let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
                 let closures = path
                     .split("::")

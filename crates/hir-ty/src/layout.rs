@@ -376,8 +376,16 @@ pub fn layout_of_ty_query(
             places.walk_places(|place| {
                 used.insert(place.local);
             });
+            // A local that holds nothing whenever the body yields lives on the stack of `poll`.
+            let held = body.locals_held_across_yields(|local| {
+                crate::drop::has_drop_glue(
+                    &infer_ctxt,
+                    body.locals[local].ty.as_ref(),
+                    trait_env.param_env(db),
+                ) != crate::drop::DropGlue::None
+            });
             for (id, local) in body.locals.iter() {
-                if !used.contains(&id) {
+                if !used.contains(&id) || !held.contains(&id) {
                     fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
                     continue;
                 }

@@ -1947,6 +1947,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 {
                     return true;
                 }
+                // `Self::Variant` likewise.
+                if self.infer.variant_resolution_for_expr(expr).is_some() {
+                    return !matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
+                }
                 let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
                 let hygiene = self.store.expr_path_hygiene(expr);
                 let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);

@@ -16,7 +16,9 @@ use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
 };
-use hir_ty::mir::codegen::{CodegenError, CodegenUnit, Rejections, SymbolResolver};
+use hir_ty::mir::codegen::{
+    CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
+};
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, CargoFeatures, RustLibSource};
@@ -327,6 +329,9 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
+        if let Some(symbol) = exported_symbol(self.db, func) {
+            return Some(symbol);
+        }
         self.table.get(&self.path(func)?).map(str::to_owned)
     }
 
@@ -528,24 +533,35 @@ fn build(
     let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
-    let mut roots = functions_of(db, &args.krate)?;
+    let mut functions = functions_of(db, &args.krate)?;
     for krate in &args.batch {
-        roots.extend(functions_of(db, krate)?);
+        functions.extend(functions_of(db, krate)?);
     }
+    // With a program to start from, only what it reaches is compiled, and what a runtime
+    // looks up by name. Without one any function may be the one called.
+    let is_main = |&func: &FunctionId| hir::Function::from(func).is_main(db);
+    let (entries, on_demand): (Vec<_>, Vec<_>) = if functions.iter().any(is_main) {
+        functions
+            .into_iter()
+            .partition(|func| is_main(func) || exported_symbol(db, *func).is_some())
+    } else {
+        (functions, Vec::new())
+    };
+    let roots = Roots { entries: &entries, on_demand: &on_demand };
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
     let mut denied = FxHashSet::default();
     if let Some(deny) = &args.deny {
         let deny = std::fs::read_to_string(deny)?;
         let deny: FxHashSet<&str> = deny.lines().collect();
         denied.extend(
-            roots.iter().copied().filter(|&func| {
+            entries.iter().chain(&on_demand).copied().filter(|&func| {
                 resolver.path(func).is_some_and(|path| deny.contains(path.as_str()))
             }),
         );
     }
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let unit =
-        hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, &roots, &denied, known))
+        hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
             .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
@@ -566,7 +582,8 @@ fn build(
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
-                CodegenUnit::compile(hir_db, &resolver, &[func], &Default::default(), known)
+                let roots = Roots { entries: &[func], on_demand: &[] };
+                CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
             std::fs::write(dir.join(format!("{i}.o")), single.object)?;
