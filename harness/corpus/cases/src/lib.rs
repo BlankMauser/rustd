@@ -4506,3 +4506,50 @@ pub mod nested_macro_self {
         handler.out
     }
 }
+
+pub mod shadowed_item_macro {
+    macro_rules! for_each_op {
+        ($mac:ident) => {
+            $mac! { nop unreachable }
+        };
+    }
+
+    macro_rules! define_ops {
+        ($($op:ident)*) => {
+            $( fn $op(&mut self) -> Self::Output; )*
+        };
+    }
+
+    pub trait Visit {
+        type Output;
+        for_each_op!(define_ops);
+    }
+
+    pub struct Names;
+
+    macro_rules! define_ops {
+        ($($op:ident)*) => {
+            $( fn $op(&mut self) -> &'static str { stringify!($op) } )*
+        };
+    }
+
+    impl Visit for Names {
+        type Output = &'static str;
+        for_each_op!(define_ops);
+    }
+
+    fn visit<V: Visit>(visitor: &mut V, code: u8) -> Option<V::Output> {
+        Some(match code {
+            0 => visitor.nop(),
+            1 => {
+                let visitor = visitor;
+                visitor.unreachable()
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn run() -> [Option<&'static str>; 3] {
+        [visit(&mut Names, 0), visit(&mut Names, 1), visit(&mut Names, 2)]
+    }
+}

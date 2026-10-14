@@ -823,23 +823,27 @@ impl DefMap {
         while let Some(BlockInfo { block, parent }) = inner {
             let map = parent.def_map(db);
             let defined = map[parent].legacy_macro_in_scope(db, name).unwrap_or_default();
-            let visible = match defined {
-                [] => None,
-                [only] => Some(*only),
-                _ => {
-                    let ast_id = block.ast_id(db);
-                    let block = SourcePosition::new(db, ast_id.file_id, ast_id.to_range(db));
-                    defined.iter().rev().copied().find(|&it| {
-                        SourcePosition::of_macro(db, it).is_none_or(|it| it.precedes(&block))
-                    })
-                }
-            };
+            let visible = SourcePosition::latest_before(db, defined, block.ast_id(db).erase());
             if visible.is_some() {
                 return visible;
             }
             inner = map.block;
         }
         None
+    }
+
+    /// The `macro_rules!` of `module` that a call at `call` names by `name`, when the module
+    /// defines one before the call. Items of a trait or an impl are collected after the
+    /// module is, when a later `macro_rules!` of the same name has joined the scope.
+    pub(crate) fn legacy_macro_before<'db>(
+        &self,
+        db: &'db dyn SourceDatabase,
+        module: ModuleIdLt<'db>,
+        name: &Name,
+        call: ErasedAstId,
+    ) -> Option<MacroId> {
+        let defined = self[module].legacy_macro_in_scope(db, name)?;
+        SourcePosition::latest_before(db, defined, call)
     }
 }
 
@@ -856,6 +860,26 @@ impl SourcePosition {
             calls.push((file, node.value.text_range().start()));
         }
         SourcePosition(calls)
+    }
+
+    /// The last of `macros`, which are in definition order, that is defined before `node`.
+    fn latest_before(
+        db: &dyn SourceDatabase,
+        macros: &[MacroId],
+        node: ErasedAstId,
+    ) -> Option<MacroId> {
+        match macros {
+            [] => None,
+            [only] => Some(*only),
+            _ => {
+                let node = Self::new(db, node.file_id, node.to_range(db));
+                macros
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&it| Self::of_macro(db, it).is_none_or(|it| it.precedes(&node)))
+            }
+        }
     }
 
     fn of_macro(db: &dyn SourceDatabase, id: MacroId) -> Option<Self> {

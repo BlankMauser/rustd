@@ -241,6 +241,7 @@ fn main() {
     println!("dyn_statics {}", cases::dyn_statics::run());
     println!("included_files {:?}", cases::included_files::run());
     println!("nested_macro_self {:?}", cases::nested_macro_self::run());
+    println!("shadowed_item_macro {:?}", cases::shadowed_item_macro::run());
     println!("wide_float_casts {}", cases::wide_float_casts::run());
     println!("const_floats {}", cases::const_floats::run());
     println!("static_identity {}", cases::static_identity::run());

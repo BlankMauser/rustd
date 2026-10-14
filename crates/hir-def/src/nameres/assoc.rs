@@ -301,7 +301,14 @@ impl<'db> AssocItemCollector<'db> {
                 let path = Interned::new(path);
                 let ctxt = self.span_map.span_for_range(range).ctx;
 
-                let resolver = |path: &_| {
+                let resolver = |path: &ModPath| {
+                    let before = path.as_ident().and_then(|name| {
+                        let call = ast_id.erase();
+                        self.def_map.legacy_macro_before(self.db, self.module_id, name, call)
+                    });
+                    if let Some(before) = before {
+                        return Some(before.definition(self.db));
+                    }
                     self.def_map
                         .resolve_path(
                             self.local_def_map,
