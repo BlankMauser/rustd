@@ -1561,7 +1561,7 @@ pub fn include_macro_invoc(
     crate_def_map(db, krate)
         .modules
         .values()
-        .flat_map(|m| m.scope.iter_macro_invoc())
+        .flat_map(|m| m.scope(db).iter_macro_invoc())
         .filter_map(|(_, &invoc)| invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x)))
         .collect()
 }

@@ -260,7 +260,7 @@ impl TestDB {
             if file_id.file_id(self) != position.file_id.file_id(self) {
                 continue;
             }
-            for decl in module.scope.declarations() {
+            for decl in module.scope(self).declarations() {
                 if let ModuleDefId::FunctionId(it) = decl {
                     let range = it.lookup(self).source(self).value.syntax().text_range();
 

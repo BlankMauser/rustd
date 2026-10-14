@@ -632,7 +632,7 @@ impl<'db> InherentImpls<'db> {
             map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>,
         ) {
             for (_module_id, module_data) in def_map.modules() {
-                for impl_id in module_data.scope.inherent_impls() {
+                for impl_id in module_data.scope(db).inherent_impls() {
                     let interner = DbInterner::new_no_crate(db);
                     let self_ty = db.impl_self_ty(impl_id);
                     let self_ty = self_ty.instantiate_identity().skip_norm_wip();
@@ -645,7 +645,7 @@ impl<'db> InherentImpls<'db> {
 
                 // To better support custom derives, collect impls in all unnamed const items.
                 // const _: () = { ... };
-                for konst in module_data.scope.unnamed_consts() {
+                for konst in module_data.scope(db).unnamed_consts() {
                     let body = Body::of(db, konst.into());
                     for (_, block_def_map) in body.blocks(db) {
                         collect(db, block_def_map, map);
@@ -755,7 +755,7 @@ impl<'db> TraitImpls<'db> {
             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
         ) {
             for (_module_id, module_data) in def_map.modules() {
-                for impl_id in module_data.scope.trait_impls() {
+                for impl_id in module_data.scope(db).trait_impls() {
                     let trait_ref = match db.impl_trait(impl_id) {
                         Some(tr) => tr.instantiate_identity().skip_norm_wip(),
                         None => continue,
@@ -788,7 +788,7 @@ impl<'db> TraitImpls<'db> {
                     }
                 }
 
-                for impl_id in module_data.scope.builtin_derive_impls() {
+                for impl_id in module_data.scope(db).builtin_derive_impls() {
                     let loc = impl_id.loc(db);
                     let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
                     let entry = map.entry(trait_id).or_default();
@@ -801,7 +801,7 @@ impl<'db> TraitImpls<'db> {
 
                 // To better support custom derives, collect impls in all unnamed const items.
                 // const _: () = { ... };
-                for konst in module_data.scope.unnamed_consts() {
+                for konst in module_data.scope(db).unnamed_consts() {
                     let body = Body::of(db, konst.into());
                     for (_, block_def_map) in body.blocks(db) {
                         collect(db, block_def_map, lang_items, map);

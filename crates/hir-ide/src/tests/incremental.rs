@@ -289,7 +289,6 @@ pub struct NewStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
-                "crate_lang_items",
             ]
         "#]],
     );
@@ -365,7 +364,6 @@ pub enum SomeEnum {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
-                "crate_lang_items",
             ]
         "#]],
     );
@@ -523,7 +521,6 @@ impl SomeStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
-                "crate_lang_items",
             ]
         "#]],
     );
@@ -681,7 +678,6 @@ fn main() {
                 "AttrFlags::query_",
                 "Body::of_",
                 "ImplItems::of_",
-                "InferenceResult < 'db >::for_body_",
                 "AttrFlags::query_",
                 "TraitSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -689,27 +685,19 @@ fn main() {
                 "FunctionSignature::of_",
                 "Body::with_source_map_",
                 "Body::of_",
-                "crate_lang_items",
-                "GenericPredicates::query_with_diagnostics_",
-                "GenericPredicates::query_with_diagnostics_",
-                "fn_sig_for_fn",
-                "body_upvars_mentioned",
                 "InferenceResult < 'db >::for_body_",
                 "FunctionSignature::with_source_map_",
-                "GenericPredicates::query_with_diagnostics_",
-                "fn_sig_for_fn",
+                "InferenceResult < 'db >::for_body_",
                 "ExprScopes::body_expr_scopes_",
                 "StructSignature::with_source_map_",
                 "AttrFlags::query_",
-                "GenericPredicates::query_with_diagnostics_",
                 "InherentImpls < 'db >::for_crate_",
                 "TraitImpls < 'db >::for_crate_",
                 "ImplSignature::with_source_map_",
                 "ImplSignature::of_",
-                "impl_trait_with_diagnostics",
                 "impl_self_ty_with_diagnostics",
+                "impl_trait_with_diagnostics",
                 "AttrFlags::query_",
-                "GenericPredicates::query_with_diagnostics_",
                 "body_upvars_mentioned",
             ]
         "#]],

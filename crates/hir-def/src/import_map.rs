@@ -155,7 +155,7 @@ impl ImportMap {
                 &module.def_map(db)[module]
             };
 
-            let visible_items = mod_data.scope.entries().filter_map(|(name, per_ns)| {
+            let visible_items = mod_data.scope(db).entries().filter_map(|(name, per_ns)| {
                 let per_ns = per_ns.filter_visibility(|vis| vis == Visibility::Public);
                 if per_ns.is_none() { None } else { Some((name, per_ns)) }
             });

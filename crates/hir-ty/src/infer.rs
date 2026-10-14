@@ -2600,7 +2600,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     pub(crate) fn get_traits_in_scope(&self) -> Either<FxHashSet<TraitId>, &FxHashSet<TraitId>> {
-        let mut b_traits = self.resolver.traits_in_scope_from_block_scopes().peekable();
+        let mut b_traits = self.resolver.traits_in_scope_from_block_scopes(self.db).peekable();
         if b_traits.peek().is_some() {
             Either::Left(self.traits_in_scope.iter().copied().chain(b_traits).collect())
         } else {

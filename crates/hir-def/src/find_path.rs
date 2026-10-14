@@ -208,7 +208,7 @@ fn find_path_for_module<'db>(
                 .from_def_map
                 .with_ancestor_maps(ctx.db, ctx.from, &mut |def_map, local_id| {
                     def_map[local_id]
-                        .scope
+                        .scope(ctx.db)
                         .type_(name)
                         .filter(|&(id, _)| id != ModuleDefId::ModuleId(def_id))
                 })
@@ -278,7 +278,7 @@ fn find_in_scope<'db>(
 ) -> Option<Name> {
     // FIXME: We could have multiple applicable names here, but we currently only return the first
     def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
-        def_map[local_id].scope.names_of(item, |name, _, declared| {
+        def_map[local_id].scope(db).names_of(item, |name, _, declared| {
             (declared || !ignore_local_imports).then(|| name.clone())
         })
     })
@@ -294,7 +294,7 @@ fn find_in_prelude(
 ) -> Option<Choice> {
     let (prelude_module, _) = local_def_map.prelude()?;
     let prelude_def_map = prelude_module.def_map(db);
-    let prelude_scope = &prelude_def_map[prelude_module].scope;
+    let prelude_scope = &prelude_def_map[prelude_module].scope(db);
     let (name, vis, _declared) = prelude_scope.name_of(item)?;
     if !vis.is_visible_from(db, from) {
         return None;
@@ -303,7 +303,7 @@ fn find_in_prelude(
     // Check if the name is in current scope and it points to the same def.
     let found_and_same_def =
         local_def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
-            let per_ns = def_map[local_id].scope.get(name);
+            let per_ns = def_map[local_id].scope(db).get(name);
             let same_def = match item {
                 ItemInNs::Types(it) => per_ns.take_types()? == it,
                 ItemInNs::Values(it) => per_ns.take_values()? == it,
@@ -618,7 +618,7 @@ fn find_local_import_locations<'db>(
             &def_map[module]
         };
 
-        if let Some((name, vis, declared)) = data.scope.name_of(item)
+        if let Some((name, vis, declared)) = data.scope(db).name_of(item)
             && vis.is_visible_from(db, ctx.from)
         {
             let is_pub_or_explicit = match vis {
@@ -645,7 +645,7 @@ fn find_local_import_locations<'db>(
         }
 
         // Descend into all modules visible from `from`.
-        for (module, vis) in data.scope.modules_in_scope() {
+        for (module, vis) in data.scope(db).modules_in_scope() {
             if module.krate(db) != ctx.from.krate(db) {
                 // We don't need to look at modules from other crates as our item has to be in the
                 // current crate

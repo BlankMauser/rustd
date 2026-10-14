@@ -113,7 +113,7 @@ impl ChildBySource for ModuleId {
     fn child_by_source_to(&self, db: &dyn SourceDatabase, res: &mut DynMap, file_id: HirFileId) {
         let def_map = self.def_map(db);
         let module_data = &def_map[*self];
-        module_data.scope.child_by_source_to(db, res, file_id);
+        module_data.scope(db).child_by_source_to(db, res, file_id);
 
         AttrDefId::from(*self).child_by_source_to(db, res, file_id);
     }
@@ -261,7 +261,7 @@ impl ChildBySource for DefWithBodyId {
         for (block, def_map) in body.blocks(db) {
             // All block expressions are merged into the same map, because they logically all add
             // inner items to the containing `DefWithBodyId`.
-            def_map[def_map.root].scope.child_by_source_to(db, res, file_id);
+            def_map[def_map.root].scope(db).child_by_source_to(db, res, file_id);
             res[keys::BLOCK].insert(block.ast_id(db).to_ptr(db), block);
         }
     }

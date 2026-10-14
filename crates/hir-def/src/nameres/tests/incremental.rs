@@ -516,7 +516,7 @@ m!(Z);
             let crate_def_map = crate_def_map(&db, krate);
             let module_data = &crate_def_map
                 [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
-            assert_eq!(module_data.scope.resolutions().count(), 4);
+            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
         expect![[r#"
@@ -566,7 +566,7 @@ m!(Z);
             let crate_def_map = crate_def_map(&db, krate);
             let module_data = &crate_def_map
                 [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
-            assert_eq!(module_data.scope.resolutions().count(), 4);
+            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
         expect![[r#"

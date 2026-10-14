@@ -419,13 +419,13 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
     while let Some(module) = modules.pop() {
         modules.extend(module.children(db));
         let id = hir_def::ModuleId::from(module);
-        scope(&id.def_map(db)[id].scope, &mut bodies);
+        scope(&id.def_map(db)[id].scope(db), &mut bodies);
     }
     // A body's blocks include those of the blocks in it, but not those of the items in them.
     while let Some(body) = bodies.pop() {
         for (_, def_map) in Body::of(db, body).blocks(db) {
             for (_, module) in def_map.modules() {
-                scope(&module.scope, &mut bodies);
+                scope(module.scope(db), &mut bodies);
             }
         }
     }

@@ -14,7 +14,7 @@ fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
     crate::attach_db(&db, || {
         let mut trait_refs = Vec::new();
         for (_, module) in def_map.modules() {
-            for derive in module.scope.builtin_derive_impls() {
+            for derive in module.scope(&db).builtin_derive_impls() {
                 let trait_ref = impl_trait(interner, derive).skip_binder();
                 trait_refs.push(format!("{trait_ref:?}"));
             }
@@ -31,7 +31,7 @@ fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
     crate::attach_db(&db, || {
         let mut predicates = String::new();
         for (_, module) in def_map.modules() {
-            for derive in module.scope.builtin_derive_impls() {
+            for derive in module.scope(&db).builtin_derive_impls() {
                 let preds =
                     crate::builtin_derive::predicates(&db, derive).all_predicates().skip_binder();
                 format_to!(

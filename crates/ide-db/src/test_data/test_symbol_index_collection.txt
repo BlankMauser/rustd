@@ -11,7 +11,7 @@
                 def: EnumVariant(
                     EnumVariant {
                         id: EnumVariantId(
-                            0e00,
+                            0e80,
                         ),
                     },
                 ),
@@ -81,7 +81,7 @@
                 def: EnumVariant(
                     EnumVariant {
                         id: EnumVariantId(
-                            0e01,
+                            0e81,
                         ),
                     },
                 ),

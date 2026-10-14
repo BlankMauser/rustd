@@ -642,7 +642,7 @@ impl Module {
 
     pub fn modules_in_scope(&self, db: &dyn HirDatabase, pub_only: bool) -> Vec<(Name, Module)> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map[self.id].scope(db);
 
         let mut res = Vec::new();
 
@@ -664,7 +664,7 @@ impl Module {
         visible_from: Option<Module>,
     ) -> Vec<(Name, ScopeDef<'_>)> {
         self.id.def_map(db)[self.id]
-            .scope
+            .scope(db)
             .entries()
             .filter_map(|(name, def)| {
                 if let Some(m) = visible_from {
@@ -704,7 +704,7 @@ impl Module {
 
     pub fn declarations(self, db: &dyn HirDatabase) -> Vec<ModuleDef> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map[self.id].scope(db);
         scope
             .declarations()
             .map(ModuleDef::from)
@@ -714,13 +714,13 @@ impl Module {
 
     pub fn legacy_macros(self, db: &dyn HirDatabase) -> Vec<Macro> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map[self.id].scope(db);
         scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into()).collect()
     }
 
     pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map[self.id].scope(db);
         scope.impls().map(Impl::from).chain(scope.builtin_derive_impls().map(Impl::from)).collect()
     }
 
@@ -3795,10 +3795,10 @@ impl Impl {
 
         fn extend_with_def_map(db: &dyn HirDatabase, def_map: &DefMap, result: &mut Vec<Impl>) {
             for (_, module) in def_map.modules() {
-                result.extend(module.scope.impls().map(Impl::from));
-                result.extend(module.scope.builtin_derive_impls().map(Impl::from));
+                result.extend(module.scope(db).impls().map(Impl::from));
+                result.extend(module.scope(db).builtin_derive_impls().map(Impl::from));
 
-                for unnamed_const in module.scope.unnamed_consts() {
+                for unnamed_const in module.scope(db).unnamed_consts() {
                     for (_, block_def_map) in Body::of(db, unnamed_const.into()).blocks(db) {
                         extend_with_def_map(db, block_def_map, result);
                     }
@@ -6520,7 +6520,7 @@ pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
                         segments.next_if(|&(position, _)| !position.is_last)
                     {
                         let res = module
-                            .scope
+                            .scope(db)
                             .get(&Name::new_symbol_root(segment))
                             .take_types()
                             .and_then(|res| match res {
@@ -6531,7 +6531,7 @@ pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
                         module = &def_map[res];
                     }
                     let (_, item_name) = segments.next()?;
-                    let res = module.scope.get(&Name::new_symbol_root(item_name));
+                    let res = module.scope(db).get(&Name::new_symbol_root(item_name));
                     Some(res.iter_items().map(|(item, _)| item.into()))
                 })
                 .collect::<Vec<_>>()

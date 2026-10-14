@@ -14,11 +14,11 @@ use crate::{
 
 fn compute_crate_def_map(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
-    cb: impl FnOnce(&DefMap),
+    cb: impl FnOnce(&TestDB, &DefMap),
 ) {
     let db = TestDB::with_files(ra_fixture);
     let krate = db.fetch_test_crate();
-    cb(crate_def_map(&db, krate));
+    cb(&db, crate_def_map(&db, krate));
 }
 
 fn render_crate_def_map(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {

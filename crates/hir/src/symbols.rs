@@ -344,7 +344,7 @@ impl<'a> SymbolCollector<'a> {
             };
 
         let def_map = module_id.def_map(self.db);
-        let scope = &def_map[module_id].scope;
+        let scope = def_map[module_id].scope(self.db);
 
         for impl_id in scope.impls() {
             self.collect_from_impl(impl_id);

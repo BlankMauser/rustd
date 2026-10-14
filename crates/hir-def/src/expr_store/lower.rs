@@ -2664,7 +2664,7 @@ impl<'db> ExprCollector<'db> {
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
 
-        let block_call = self.def_map.modules[self.module].scope.macro_invoc(
+        let block_call = self.def_map.modules[self.module].scope(self.db).macro_invoc(
             self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
         );
         let res = match block_call {
@@ -2805,7 +2805,7 @@ impl<'db> ExprCollector<'db> {
                 };
                 let name = name.as_name();
                 let macro_id =
-                    self.def_map.modules[self.def_map.root].scope.get(&name).take_macros();
+                    self.def_map.modules[self.def_map.root].scope(self.db).get(&name).take_macros();
                 self.collect_macro_def(statements, macro_id);
             }
             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
@@ -2820,7 +2820,7 @@ impl<'db> ExprCollector<'db> {
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name.clone()).or_insert(0);
                 let macro_id = self.def_map.modules[self.def_map.root]
-                    .scope
+                    .scope(self.db)
                     .get_legacy_macro(&name)
                     .and_then(|it| it.get(*macro_defs_count))
                     .copied();

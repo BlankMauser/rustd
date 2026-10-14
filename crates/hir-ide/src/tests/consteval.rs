@@ -123,7 +123,7 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
     let _tracing = setup_tracing();
     let module_id = db.module_for_file(file_id.file_id(db));
     let def_map = module_id.def_map(db);
-    let scope = &def_map[module_id].scope;
+    let scope = &def_map[module_id].scope(db);
     let const_id = scope
         .declarations()
         .find_map(|x| match x {

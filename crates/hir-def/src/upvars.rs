@@ -241,18 +241,20 @@ mod tests {
         let def_map = crate_def_map(&db, db.test_crate());
         let func = def_map
             .modules()
-            .flat_map(|(_, module)| module.scope.declarations())
+            .flat_map(|(_, module)| module.scope(&db).declarations())
             .filter_map(|decl| match decl {
                 ModuleDefId::FunctionId(func) => Some(func),
                 _ => None,
             })
             .chain(def_map.modules().flat_map(|(_, module)| {
-                module.scope.impls().flat_map(|impl_| &*impl_.impl_items(&db).items).filter_map(
-                    |&(_, item)| match item {
+                module
+                    .scope(&db)
+                    .impls()
+                    .flat_map(|impl_| &*impl_.impl_items(&db).items)
+                    .filter_map(|&(_, item)| match item {
                         AssocItemId::FunctionId(it) => Some(it),
                         _ => None,
-                    },
-                )
+                    })
             }))
             .exactly_one()
             .unwrap_or_else(|_| panic!("expected one function"));

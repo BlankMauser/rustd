@@ -510,7 +510,7 @@ impl DefMap {
                     };
 
                     // Since it is a qualified path here, it should not contains legacy macros
-                    module_data.scope.get(segment)
+                    module_data.scope(db).get(segment)
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     // enum variant
@@ -635,14 +635,14 @@ impl DefMap {
         //  - extern prelude / macro_use prelude
         //  - std prelude
         let from_legacy_macro = self[module]
-            .scope
+            .scope(db)
             .get_legacy_macro(name)
             // FIXME: shadowing
             .and_then(|it| it.last())
             .copied()
             .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
             .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None));
-        let from_scope = self[module].scope.get(name).filter_macro(db, expected_macro_subns);
+        let from_scope = self[module].scope(db).get(name).filter_macro(db, expected_macro_subns);
         let from_builtin = match self.block {
             Some(_) => {
                 // Only resolve to builtins in the root `DefMap`.
@@ -727,9 +727,9 @@ impl DefMap {
         let from_crate_root = match self.block {
             Some(_) => {
                 let def_map = self.crate_root(db).def_map(db);
-                def_map[def_map.root].scope.get(name)
+                def_map[def_map.root].scope(db).get(name)
             }
-            None => self[self.root].scope.get(name),
+            None => self[self.root].scope(db).get(name),
         };
         let from_extern_prelude = || {
             if self.block.is_some() && module == self.root {
@@ -745,7 +745,7 @@ impl DefMap {
     fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
         if let Some((prelude, _use)) = self.prelude {
             let def_map = if prelude.krate(db) == self.krate { self } else { prelude.def_map(db) };
-            def_map[prelude].scope.get(name)
+            def_map[prelude].scope(db).get(name)
         } else {
             PerNs::none()
         }

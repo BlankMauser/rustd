@@ -473,7 +473,7 @@ impl<'db> DefCollector<'db> {
             // in the crate root that aren't proc macros.
             let module_id = self.def_map.root_module_id();
             let root = &mut self.def_map.modules[module_id];
-            root.scope.censor_non_proc_macros(self.def_map.krate);
+            root.scope_mut().censor_non_proc_macros(self.def_map.krate);
         }
     }
 
@@ -689,7 +689,7 @@ impl<'db> DefCollector<'db> {
         // crate root, even if the parent modules is **not** visible.
         if export {
             let module_id = self.def_map.root;
-            self.def_map.modules[module_id].scope.declare(macro_.into());
+            self.def_map.modules[module_id].scope_mut().declare(macro_.into());
             self.update(
                 module_id,
                 &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
@@ -708,7 +708,7 @@ impl<'db> DefCollector<'db> {
     /// current legacy scope, with possible shadowing.
     fn define_legacy_macro(&mut self, module_id: ModuleId, name: Name, mac: MacroId) {
         // Always shadowing
-        self.def_map.modules[module_id].scope.define_legacy_macro(name, mac);
+        self.def_map.modules[module_id].scope_mut().define_legacy_macro(name, mac);
     }
 
     /// Define a macro 2.0 macro
@@ -731,7 +731,7 @@ impl<'db> DefCollector<'db> {
                 false,
             )
             .unwrap_or(Visibility::Public);
-        self.def_map.modules[module_id].scope.declare(macro_.into());
+        self.def_map.modules[module_id].scope_mut().declare(macro_.into());
         self.update(
             module_id,
             &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
@@ -746,7 +746,7 @@ impl<'db> DefCollector<'db> {
     /// And unconditionally exported.
     fn define_proc_macro(&mut self, name: Name, macro_: ProcMacroId) {
         let module_id = self.def_map.root;
-        self.def_map.modules[module_id].scope.declare(macro_.into());
+        self.def_map.modules[module_id].scope_mut().declare(macro_.into());
         self.update(
             module_id,
             &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
@@ -770,7 +770,7 @@ impl<'db> DefCollector<'db> {
         let def_map = crate_def_map(self.db, krate);
         // `#[macro_use]` brings macros into macro_use prelude. Yes, even non-`macro_rules!`
         // macros.
-        let root_scope = &def_map[def_map.root].scope;
+        let root_scope = &def_map[def_map.root].scope(self.db);
         match names {
             Some(names) => {
                 for name in names {
@@ -959,7 +959,7 @@ impl<'db> DefCollector<'db> {
                         } else if m.krate(self.db) != self.def_map.krate {
                             cov_mark::hit!(glob_across_crates);
                             // glob import from other crate => we can just import everything once
-                            let scope = &m.def_map(self.db)[m].scope;
+                            let scope = &m.def_map(self.db)[m].scope(self.db);
 
                             // Module scoped macros is included
                             let items = scope
@@ -982,9 +982,9 @@ impl<'db> DefCollector<'db> {
                             // import, and then need to propagate any further
                             // additions
                             let scope = if m.block(self.db) == self.def_map.block_id() {
-                                &self.def_map[m].scope
+                                self.def_map[m].scope(self.db)
                             } else {
-                                &m.def_map(self.db)[m].scope
+                                m.def_map(self.db)[m].scope(self.db)
                             };
 
                             // Module scoped macros is included
@@ -1142,7 +1142,8 @@ impl<'db> DefCollector<'db> {
                         }
                         None => continue,
                     };
-                    let old_vis = self.def_map.modules[module_id].scope.unnamed_trait_vis(tr);
+                    let old_vis =
+                        self.def_map.modules[module_id].scope(self.db).unnamed_trait_vis(tr);
                     let should_update = match old_vis {
                         None => true,
                         Some(old_vis) => {
@@ -1161,7 +1162,7 @@ impl<'db> DefCollector<'db> {
 
                     if should_update {
                         changed = true;
-                        self.def_map.modules[module_id].scope.push_unnamed_trait(
+                        self.def_map.modules[module_id].scope_mut().push_unnamed_trait(
                             tr,
                             vis,
                             import.and_then(ImportOrExternCrate::import),
@@ -1220,7 +1221,7 @@ impl<'db> DefCollector<'db> {
         let mut changed = false;
 
         if let Some(ImportOrExternCrate::Glob(_)) = def_import_type {
-            let prev_defs = self.def_map[module_id].scope.get(name);
+            let prev_defs = self.def_map[module_id].scope(self.db).get(name);
 
             // Multiple globs may import the same item and they may override visibility from
             // previously resolved globs. Handle overrides here and leave the rest to
@@ -1237,7 +1238,9 @@ impl<'db> DefCollector<'db> {
                     // This import is being handled here, don't pass it down to
                     // `ItemScope::push_res_with_import()`.
                     defs.types = None;
-                    self.def_map.modules[module_id].scope.update_visibility_types(name, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_visibility_types(name, def.vis);
                 }
                 // When the source module's definition changed (e.g., due to an explicit import
                 // shadowing a glob), propagate the new definition to modules that glob-import from it.
@@ -1250,7 +1253,9 @@ impl<'db> DefCollector<'db> {
                 else if def.def != prev_def.def && prev_def.import == def_import_type {
                     changed = true;
                     defs.types = None;
-                    self.def_map.modules[module_id].scope.update_def_types(name, def.def, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_def_types(name, def.def, def.vis);
                 }
             }
 
@@ -1264,13 +1269,17 @@ impl<'db> DefCollector<'db> {
                 {
                     changed = true;
                     defs.values = None;
-                    self.def_map.modules[module_id].scope.update_visibility_values(name, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_visibility_values(name, def.vis);
                 } else if def.def != prev_def.def
                     && prev_def.import.map(ImportOrExternCrate::from) == def_import_type
                 {
                     changed = true;
                     defs.values = None;
-                    self.def_map.modules[module_id].scope.update_def_values(name, def.def, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_def_values(name, def.def, def.vis);
                 }
             }
 
@@ -1284,16 +1293,20 @@ impl<'db> DefCollector<'db> {
                 {
                     changed = true;
                     defs.macros = None;
-                    self.def_map.modules[module_id].scope.update_visibility_macros(name, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_visibility_macros(name, def.vis);
                 } else if def.def != prev_def.def && prev_def.import == def_import_type {
                     changed = true;
                     defs.macros = None;
-                    self.def_map.modules[module_id].scope.update_def_macros(name, def.def, def.vis);
+                    self.def_map.modules[module_id]
+                        .scope_mut()
+                        .update_def_macros(name, def.def, def.vis);
                 }
             }
         }
 
-        changed |= self.def_map.modules[module_id].scope.push_res_with_import(
+        changed |= self.def_map.modules[module_id].scope_mut().push_res_with_import(
             &mut self.from_glob_import,
             (module_id, name.clone()),
             defs,
@@ -1370,7 +1383,7 @@ impl<'db> DefCollector<'db> {
                         // FIXME: Expansion error
                         if let Some(call_id) = call_id.value {
                             self.def_map.modules[directive.module_id]
-                                .scope
+                                .scope_mut()
                                 .add_macro_invoc(ast_id.ast_id, call_id);
 
                             push_resolved(&mut resolved, directive, call_id);
@@ -1401,12 +1414,14 @@ impl<'db> DefCollector<'db> {
                     );
 
                     if let Ok((macro_id, def_id, call_id)) = id {
-                        self.def_map.modules[directive.module_id].scope.set_derive_macro_invoc(
-                            ast_id.ast_id,
-                            Either::Left(call_id),
-                            *derive_attr,
-                            *derive_pos,
-                        );
+                        self.def_map.modules[directive.module_id]
+                            .scope_mut()
+                            .set_derive_macro_invoc(
+                                ast_id.ast_id,
+                                Either::Left(call_id),
+                                *derive_attr,
+                                *derive_pos,
+                            );
                         // Record its helper attributes.
                         if def_id.krate != self.def_map.krate {
                             let def_map = crate_def_map(self.db, def_id.krate);
@@ -1631,7 +1646,7 @@ impl<'db> DefCollector<'db> {
                                 // as proper paths in `Semantics`.
                                 // Check the comment in [`builtin_attr_macro`].
                                 self.def_map.modules[directive.module_id]
-                                    .scope
+                                    .scope_mut()
                                     .init_derive_attribute(
                                         ast_id,
                                         *attr_id,
@@ -1683,7 +1698,7 @@ impl<'db> DefCollector<'db> {
 
                     let call_id = call_id();
                     self.def_map.modules[directive.module_id]
-                        .scope
+                        .scope_mut()
                         .add_attr_macro_invoc(ast_id, call_id);
 
                     push_resolved(&mut resolved, directive, call_id);
@@ -1700,7 +1715,9 @@ impl<'db> DefCollector<'db> {
         self.unresolved_macros = macros;
 
         for (module_id, ptr, call_id) in eager_callback_buffer {
-            self.def_map.modules[module_id].scope.add_macro_invoc(ptr.map(|(_, it)| it), call_id);
+            self.def_map.modules[module_id]
+                .scope_mut()
+                .add_macro_invoc(ptr.map(|(_, it)| it), call_id);
         }
 
         for (module_id, depth, container, macro_call_id, attr_macro_item) in resolved {
@@ -1927,8 +1944,8 @@ impl ModCollector<'_, '_> {
                                 derive_index: deferred_derive.derive_index,
                             },
                         );
-                        module.scope.define_builtin_derive_impl(impl_id);
-                        module.scope.set_derive_macro_invoc(
+                        module.scope_mut().define_builtin_derive_impl(impl_id);
+                        module.scope_mut().set_derive_macro_invoc(
                             ast_id,
                             Either::Right(impl_id),
                             deferred_derive.derive_attr_id,
@@ -1949,7 +1966,7 @@ impl ModCollector<'_, '_> {
             };
         let update_def =
             |def_collector: &mut DefCollector<'_>, id, name: &Name, vis, value_ns_ctor_vis| {
-                def_collector.def_map.modules[module_id].scope.declare(id);
+                def_collector.def_map.modules[module_id].scope_mut().declare(id);
                 def_collector.update(
                     module_id,
                     &[(Some(name.clone()), PerNs::from_def(id, vis, value_ns_ctor_vis, None))],
@@ -2009,7 +2026,7 @@ impl ModCollector<'_, '_> {
                         id: InFile::new(self.tree_id.file_id(), ast_id),
                     }
                     .intern(db);
-                    def_map.modules[self.module_id].scope.define_extern_crate_decl(id);
+                    def_map.modules[self.module_id].scope_mut().define_extern_crate_decl(id);
 
                     let is_self = *name == sym::self_;
                     let resolved = if is_self {
@@ -2081,7 +2098,7 @@ impl ModCollector<'_, '_> {
                     }
                     .intern(db);
                     self.def_collector.def_map.modules[self.module_id]
-                        .scope
+                        .scope_mut()
                         .define_extern_block(extern_block_id);
                     self.collect(&block.children, ItemContainerId::ExternBlockId(extern_block_id))
                 }
@@ -2099,7 +2116,7 @@ impl ModCollector<'_, '_> {
                         ImplLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
                             .intern(db);
                     self.def_collector.def_map.modules[self.module_id]
-                        .scope
+                        .scope_mut()
                         .define_impl(impl_id, imp.is_trait_impl)
                 }
                 ModItemKind::Function(ast_id, it) => {
@@ -2126,7 +2143,7 @@ impl ModCollector<'_, '_> {
                         // You cannot call it like a function, for example, except in its defining crate.
                         // So we keep the function definition, but remove it from the scope, leaving only the macro.
                         self.def_collector.def_map[module_id]
-                            .scope
+                            .scope_mut()
                             .remove_from_value_ns(&it.name, fn_id.into());
                     }
                 }
@@ -2209,7 +2226,7 @@ impl ModCollector<'_, '_> {
                         None => {
                             // const _: T = ...;
                             self.def_collector.def_map.modules[self.module_id]
-                                .scope
+                                .scope_mut()
                                 .define_unnamed_const(const_id);
                         }
                     }
@@ -2445,9 +2462,9 @@ impl ModCollector<'_, '_> {
         let def_map = &mut self.def_collector.def_map;
         let modules = &mut def_map.modules;
         let mut data = ModuleData::new(origin, vis, Some(self.module_id));
-        for (name, macs) in modules[self.module_id].scope.legacy_macros() {
+        for (name, macs) in modules[self.module_id].scope(self.def_collector.db).legacy_macros() {
             for &mac in macs {
-                data.scope.define_legacy_macro(name.clone(), mac);
+                data.scope_mut().define_legacy_macro(name.clone(), mac);
             }
         }
         modules[self.module_id].children.insert(name.clone(), module);
@@ -2455,7 +2472,7 @@ impl ModCollector<'_, '_> {
 
         let def = ModuleDefId::from(module);
 
-        def_map.modules[self.module_id].scope.declare(def);
+        def_map.modules[self.module_id].scope_mut().declare(def);
         self.def_collector.update(
             self.module_id,
             &[(Some(name), PerNs::from_def(def, vis, None, None))],
@@ -2706,9 +2723,18 @@ impl ModCollector<'_, '_> {
                     let def_map = &self.def_collector.def_map;
                     def_map
                         .with_ancestor_maps(db, self.module_id, &mut |map, module| {
-                            map[module].scope.get_legacy_macro(name)?.last().copied()
+                            map[module]
+                                .scope(self.def_collector.db)
+                                .get_legacy_macro(name)?
+                                .last()
+                                .copied()
                         })
-                        .or_else(|| def_map[self.module_id].scope.get(name).take_macros())
+                        .or_else(|| {
+                            def_map[self.module_id]
+                                .scope(self.def_collector.db)
+                                .get(name)
+                                .take_macros()
+                        })
                         .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
                         .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
                         .map(|it| it.definition(self.def_collector.db))
@@ -2718,7 +2744,7 @@ impl ModCollector<'_, '_> {
         ) {
             for (ptr, call_id) in eager_callback_buffer {
                 self.def_collector.def_map.modules[self.module_id]
-                    .scope
+                    .scope_mut()
                     .add_macro_invoc(ptr.map(|(_, it)| it), call_id);
             }
             // FIXME: if there were errors, this might've been in the eager expansion from an
@@ -2728,7 +2754,7 @@ impl ModCollector<'_, '_> {
                 // are in scope.
                 if let Some(call_id) = res.value {
                     self.def_collector.def_map.modules[self.module_id]
-                        .scope
+                        .scope_mut()
                         .add_macro_invoc(ast_id.ast_id, call_id);
                     self.def_collector.collect_macro_expansion(
                         self.module_id,
@@ -2759,9 +2785,9 @@ impl ModCollector<'_, '_> {
             return;
         };
 
-        for (name, macs) in source.scope.legacy_macros() {
+        for (name, macs) in source.scope(self.def_collector.db).legacy_macros() {
             if let Some(&mac) = macs.last() {
-                target.scope.define_legacy_macro(name.clone(), mac);
+                target.scope_mut().define_legacy_macro(name.clone(), mac);
             }
         }
     }

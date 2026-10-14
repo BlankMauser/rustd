@@ -379,7 +379,26 @@ pub struct ModuleData {
     /// [`None`] for block modules because they are always its `DefMap`'s root.
     pub parent: Option<ModuleId>,
     pub children: FxIndexMap<Name, ModuleId>,
-    pub scope: ItemScope,
+    scope: ScopeSlot,
+}
+
+/// The items of one module, held by the database on their own. A query that reads the scope of
+/// a module then depends on that scope and not on the whole `DefMap`, so adding an item to one
+/// module leaves what was resolved through the others alone.
+#[salsa::tracked]
+struct ModuleScope<'db> {
+    module: ModuleIdLt<'db>,
+    #[tracked]
+    #[returns(ref)]
+    scope: ItemScope,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScopeSlot {
+    /// While the `DefMap` is being collected.
+    Building(ItemScope),
+    /// A `ModuleScope`, once it is.
+    Collected(salsa::Id),
 }
 
 #[inline]
@@ -424,8 +443,9 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
         module_data,
         None,
     );
-    let (def_map, local_def_map) =
+    let (mut def_map, local_def_map) =
         collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
+    def_map.hand_over_scopes(db);
 
     DefMapPair::new(db, def_map, local_def_map)
 }
@@ -450,12 +470,13 @@ pub fn block_def_map<'db>(db: &'db dyn SourceDatabase, block_id: BlockIdLt<'db>)
         Some(BlockInfo { block: block_id, parent: module }),
     );
 
-    let (def_map, _) = collector::collect_defs(
+    let (mut def_map, _) = collector::collect_defs(
         db,
         def_map,
         TreeId::new(ast_id.file_id, Some(block_id)),
         Some(local_def_map.local(db)),
     );
+    def_map.hand_over_scopes(db);
     def_map
 }
 
@@ -519,7 +540,17 @@ impl DefMap {
         derive_helpers_in_scope.shrink_to_fit();
         for (_, module) in modules.iter_mut() {
             module.children.shrink_to_fit();
-            module.scope.shrink_to_fit();
+            module.scope_mut().shrink_to_fit();
+        }
+    }
+
+    /// Hands the scope of every module to the database. Called once, when collection is done.
+    fn hand_over_scopes(&mut self, db: &dyn SourceDatabase) {
+        for (id, module) in self.modules.iter_mut() {
+            if let ScopeSlot::Building(scope) = &mut module.scope {
+                let scope = ModuleScope::new(db, id, std::mem::take(scope));
+                module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
+            }
         }
     }
 }
@@ -661,7 +692,7 @@ impl DefMap {
         ) {
             format_to!(buf, "{}\n", path);
 
-            map[module].scope.dump(db, buf);
+            map[module].scope(db).dump(db, buf);
 
             for (name, child) in map[module].children.iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
             {
@@ -766,7 +797,24 @@ impl ModuleData {
             visibility,
             parent,
             children: Default::default(),
-            scope: ItemScope::default(),
+            scope: ScopeSlot::Building(ItemScope::default()),
+        }
+    }
+
+    pub fn scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
+        match &self.scope {
+            ScopeSlot::Building(scope) => scope,
+            ScopeSlot::Collected(id) => {
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
+            }
+        }
+    }
+
+    /// The scope of a module of the `DefMap` being collected.
+    pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
+        match &mut self.scope {
+            ScopeSlot::Building(scope) => scope,
+            ScopeSlot::Collected(_) => panic!("the scope of a collected module is read-only"),
         }
     }
 

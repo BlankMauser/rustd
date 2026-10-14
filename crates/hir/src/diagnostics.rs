@@ -1127,7 +1127,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         let _p = tracing::info_span!("diagnostics", name = ?def.name(self.db)).entered();
 
         let def_map = def.def_map(self.db);
-        let scope = &def_map[def].scope;
+        let scope = def_map[def].scope(self.db);
 
         for diag in def_map.diagnostics() {
             if diag.in_module != def {

@@ -9,7 +9,7 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
-        let scope = &def_map[module_id].scope;
+        let scope = &def_map[module_id].scope(&db);
         let funcs = scope.declarations().filter_map(|x| match x {
             hir_def::ModuleDefId::FunctionId(it) => Some(it),
             _ => None,
@@ -83,7 +83,7 @@ fn main() {
     );
     crate::attach_db(db.as_dyn(), || {
         let module_id = db.module_for_file(file_id.file_id(&db));
-        let scope = &module_id.def_map(&db)[module_id].scope;
+        let scope = &module_id.def_map(&db)[module_id].scope(&db);
         for decl in scope.declarations() {
             if let hir_def::ModuleDefId::FunctionId(func) = decl {
                 let mut closures = db.mir_body(func.into()).unwrap().closures.clone();
