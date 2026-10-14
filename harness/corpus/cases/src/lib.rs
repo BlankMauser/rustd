@@ -4442,3 +4442,67 @@ pub mod included_files {
         (BLOB.len(), BLOB[2], &local[4..9], NOTE, include_str!("note.txt").lines().count())
     }
 }
+
+pub mod nested_macro_self {
+    #[derive(Default, PartialEq, Clone)]
+    pub struct Side {
+        pub width: Option<u32>,
+        pub style: Option<u8>,
+    }
+
+    #[derive(Default)]
+    pub struct Handler {
+        top: Side,
+        bottom: Side,
+        start: Side,
+        end: Side,
+        out: Vec<u32>,
+    }
+
+    impl Handler {
+        pub fn flush(&mut self) {
+            macro_rules! flush_category {
+                ($a: expr, $b: expr, $is_logical: expr) => {
+                    macro_rules! shorthand {
+                        ($key: ident) => {{
+                            let has_prop = $a.$key.is_some() && $b.$key.is_some();
+                            if has_prop {
+                                self.out.push(std::mem::take(&mut $a.$key).unwrap() as u32);
+                            }
+                        }};
+                    }
+                    macro_rules! logical_shorthand {
+                        ($key: ident, $start: expr, $end: expr) => {{
+                            let has_prop = $start.$key.is_some() && $end.$key.is_some();
+                            if has_prop {
+                                self.out.push(std::mem::take(&mut $end.$key).unwrap() as u32 + 100);
+                            }
+                        }};
+                    }
+                    if $is_logical && $a == $b {
+                        logical_shorthand!(style, $a, $b);
+                        logical_shorthand!(width, $a, $b);
+                    } else {
+                        shorthand!(style);
+                        shorthand!(width);
+                    }
+                };
+            }
+            flush_category!(self.top, self.bottom, false);
+            flush_category!(self.start, self.end, true);
+        }
+    }
+
+    pub fn run() -> Vec<u32> {
+        let side = Side { width: Some(3), style: Some(4) };
+        let mut handler = Handler {
+            top: side.clone(),
+            bottom: side.clone(),
+            start: side.clone(),
+            end: side,
+            out: Vec::new(),
+        };
+        handler.flush();
+        handler.out
+    }
+}

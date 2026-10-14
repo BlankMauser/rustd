@@ -2671,7 +2671,18 @@ impl<'db> ExprCollector<'db> {
             // fast path, macro call is in a block module
             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
             None => {
-                let resolver = |path: &_| {
+                let resolver = |path: &ModPath| {
+                    // The latest `macro_rules!` of that name before the call, which is not
+                    // the last one of the block when a later statement defines it again.
+                    let shadowing = path.as_ident().and_then(|name| {
+                        let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
+                        let defs = self.def_map.modules[self.def_map.root]
+                            .legacy_macro_in_scope(self.db, name)?;
+                        defs.get(seen.checked_sub(1)?).copied()
+                    });
+                    if shadowing.is_some() {
+                        return shadowing;
+                    }
                     self.def_map
                         .resolve_path(
                             self.local_def_map,
@@ -2874,7 +2885,11 @@ impl<'db> ExprCollector<'db> {
             };
         let prev_def_map = mem::replace(&mut self.def_map, def_map);
         let prev_local_module = mem::replace(&mut self.module, module);
-        let prev_legacy_macros_count = mem::take(&mut self.current_block_legacy_macro_defs_count);
+        // A block without items of its own is still in the scope the count is of.
+        let prev_legacy_macros_count = match block_id {
+            Some(_) => mem::take(&mut self.current_block_legacy_macro_defs_count),
+            None => self.current_block_legacy_macro_defs_count.clone(),
+        };
 
         let mut statements = Vec::new();
         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));

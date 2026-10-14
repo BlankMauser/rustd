@@ -2722,13 +2722,7 @@ impl ModCollector<'_, '_> {
                 path.as_ident().and_then(|name| {
                     let def_map = &self.def_collector.def_map;
                     def_map
-                        .with_ancestor_maps(db, self.module_id, &mut |map, module| {
-                            map[module]
-                                .scope(self.def_collector.db)
-                                .get_legacy_macro(name)?
-                                .last()
-                                .copied()
-                        })
+                        .legacy_macro_in_textual_scope(db, self.module_id, name)
                         .or_else(|| {
                             def_map[self.module_id]
                                 .scope(self.def_collector.db)

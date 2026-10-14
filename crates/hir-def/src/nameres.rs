@@ -69,9 +69,10 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
-use syntax::{AstNode, SmolStr, SyntaxNode, ToSmolStr, ast};
+use syntax::{AstNode, SmolStr, SyntaxNode, TextSize, ToSmolStr, ast};
 use triomphe::Arc;
 use tt::TextRange;
 
@@ -803,6 +804,72 @@ impl DefMap {
         }
 
         None
+    }
+}
+
+impl DefMap {
+    /// The `macro_rules!` that `name` is in the textual scope of `module`: the latest one of
+    /// this map, or the latest one an enclosing block defines before the block inside it.
+    pub(crate) fn legacy_macro_in_textual_scope<'db>(
+        &self,
+        db: &'db dyn SourceDatabase,
+        module: ModuleIdLt<'db>,
+        name: &Name,
+    ) -> Option<MacroId> {
+        if let Some(&latest) = self[module].legacy_macro_in_scope(db, name).and_then(<[_]>::last) {
+            return Some(latest);
+        }
+        let mut inner = self.block;
+        while let Some(BlockInfo { block, parent }) = inner {
+            let map = parent.def_map(db);
+            let defined = map[parent].legacy_macro_in_scope(db, name).unwrap_or_default();
+            let visible = match defined {
+                [] => None,
+                [only] => Some(*only),
+                _ => {
+                    let ast_id = block.ast_id(db);
+                    let block = SourcePosition::new(db, ast_id.file_id, ast_id.to_range(db));
+                    defined.iter().rev().copied().find(|&it| {
+                        SourcePosition::of_macro(db, it).is_none_or(|it| it.precedes(&block))
+                    })
+                }
+            };
+            if visible.is_some() {
+                return visible;
+            }
+            inner = map.block;
+        }
+        None
+    }
+}
+
+/// Where a node starts in its file and, inside a macro expansion, where each call that led
+/// to that expansion starts.
+struct SourcePosition(SmallVec<[(HirFileId, TextSize); 2]>);
+
+impl SourcePosition {
+    fn new(db: &dyn SourceDatabase, mut file: HirFileId, range: TextRange) -> Self {
+        let mut calls = SmallVec::from_iter([(file, range.start())]);
+        while let Some(call) = file.macro_file() {
+            let node = call.call_node(db);
+            file = node.file_id;
+            calls.push((file, node.value.text_range().start()));
+        }
+        SourcePosition(calls)
+    }
+
+    fn of_macro(db: &dyn SourceDatabase, id: MacroId) -> Option<Self> {
+        let MacroId::MacroRulesId(id) = id else { return None };
+        let ast_id = id.lookup(db).id;
+        Some(Self::new(db, ast_id.file_id, ast_id.to_range(db)))
+    }
+
+    /// Whether this is before `other` in the innermost file both are in.
+    fn precedes(&self, other: &Self) -> bool {
+        let shared = self.0.iter().find_map(|(file, offset)| {
+            other.0.iter().find(|it| it.0 == *file).map(|it| *offset < it.1)
+        });
+        shared.unwrap_or(true)
     }
 }
 
