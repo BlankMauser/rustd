@@ -10,7 +10,7 @@ use cranelift_codegen::{
         },
     },
     ir::{AbiParam, Signature, types},
-    isa::unwind::UnwindInfo,
+    isa::{TargetIsa, unwind::UnwindInfo},
 };
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{
@@ -40,6 +40,65 @@ fn address_for_func(func: FuncId) -> Address {
 
 fn address_for_data(data: DataId) -> Address {
     Address::Symbol { symbol: data.as_u32() as usize | DATA_SYMBOL, addend: 0 }
+}
+
+/// The frame layout and the landing pads of one compiled function, which do not depend on
+/// where the function ends up.
+pub(super) struct FunctionUnwind {
+    info: cranelift_codegen::isa::unwind::systemv::UnwindInfo,
+    /// The function's `.gcc_except_table` entry.
+    landing_pads: Vec<u8>,
+}
+
+impl FunctionUnwind {
+    pub(super) fn of(isa: &dyn TargetIsa, context: &Context) -> Result<Option<Self>, String> {
+        let Some(code) = context.compiled_code() else { return Ok(None) };
+        let Some(UnwindInfo::SystemV(info)) =
+            code.create_unwind_info(isa).map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        let mut table = GccExceptTable {
+            call_sites: CallSiteTable(vec![]),
+            actions: ActionTable::new(),
+            type_info: TypeInfoTable::new(gimli::DW_EH_PE_udata4),
+        };
+        let catch_type = table.type_info.add(Address::Constant(0));
+        let catch_action =
+            table.actions.add(Action { kind: ActionKind::Catch(catch_type), next_action: None });
+        for call_site in code.buffer.call_sites() {
+            let start = u64::from(call_site.ret_addr - 1);
+            if call_site.exception_handlers.is_empty() {
+                table.call_sites.0.push(CallSite {
+                    start,
+                    length: 1,
+                    landing_pad: 0,
+                    action_entry: None,
+                });
+            }
+            for handler in call_site.exception_handlers {
+                let &FinalizedMachExceptionHandler::Tag(tag, landing_pad) = handler else {
+                    return Err("unexpected exception handler".to_owned());
+                };
+                table.call_sites.0.push(CallSite {
+                    start,
+                    length: 1,
+                    landing_pad: u64::from(landing_pad),
+                    action_entry: (tag.as_u32() == CATCH).then_some(catch_action),
+                });
+            }
+        }
+        let encoding = Encoding {
+            format: Format::Dwarf32,
+            version: 1,
+            address_size: isa.frontend_config().pointer_bytes(),
+        };
+        let mut writer = WriterRelocate::new();
+        table.write(&mut writer, encoding).map_err(|e| e.to_string())?;
+        debug_assert!(writer.relocs.is_empty());
+        Ok(Some(FunctionUnwind { info, landing_pads: writer.writer.into_vec() }))
+    }
 }
 
 pub(super) struct UnwindContext {
@@ -102,58 +161,13 @@ impl UnwindContext {
         &mut self,
         module: &mut dyn Module,
         func: FuncId,
-        context: &Context,
+        unwind: &FunctionUnwind,
     ) -> Result<(), String> {
-        let (Some(cie), Some(code)) = (self.cie, context.compiled_code()) else { return Ok(()) };
-        let Some(UnwindInfo::SystemV(unwind_info)) =
-            code.create_unwind_info(module.isa()).map_err(|e| e.to_string())?
-        else {
-            return Ok(());
-        };
-        let mut fde = unwind_info.to_fde(address_for_func(func));
-
-        let mut table = GccExceptTable {
-            call_sites: CallSiteTable(vec![]),
-            actions: ActionTable::new(),
-            type_info: TypeInfoTable::new(gimli::DW_EH_PE_udata4),
-        };
-        let catch_type = table.type_info.add(Address::Constant(0));
-        let catch_action =
-            table.actions.add(Action { kind: ActionKind::Catch(catch_type), next_action: None });
-        for call_site in code.buffer.call_sites() {
-            let start = u64::from(call_site.ret_addr - 1);
-            if call_site.exception_handlers.is_empty() {
-                table.call_sites.0.push(CallSite {
-                    start,
-                    length: 1,
-                    landing_pad: 0,
-                    action_entry: None,
-                });
-            }
-            for handler in call_site.exception_handlers {
-                let &FinalizedMachExceptionHandler::Tag(tag, landing_pad) = handler else {
-                    return Err("unexpected exception handler".to_owned());
-                };
-                table.call_sites.0.push(CallSite {
-                    start,
-                    length: 1,
-                    landing_pad: u64::from(landing_pad),
-                    action_entry: (tag.as_u32() == CATCH).then_some(catch_action),
-                });
-            }
-        }
-        let encoding = Encoding {
-            format: Format::Dwarf32,
-            version: 1,
-            address_size: module.isa().frontend_config().pointer_bytes(),
-        };
-        let mut writer = WriterRelocate::new();
-        table.write(&mut writer, encoding).map_err(|e| e.to_string())?;
-        debug_assert!(writer.relocs.is_empty());
-
+        let Some(cie) = self.cie else { return Ok(()) };
+        let mut fde = unwind.info.to_fde(address_for_func(func));
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
-        data.define(writer.writer.into_vec().into_boxed_slice());
+        data.define(unwind.landing_pads.clone().into_boxed_slice());
         data.set_custom_section(".gcc_except_table");
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
         fde.lsda = Some(address_for_data(lsda));

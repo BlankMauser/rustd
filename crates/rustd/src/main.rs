@@ -665,7 +665,7 @@ fn main() -> anyhow::Result<()> {
     let cold = build(&db, &table, &args, &mut known)?;
     eprint!("cold: ");
     report(&cold);
-    eprintln!("stats: mir {:.1?}, {} bodies", known.stats.mir, known.stats.bodies);
+    report_stats(&known.stats);
     link(&args)?;
     if !args.watch {
         return Ok(());
@@ -706,19 +706,7 @@ fn main() -> anyhow::Result<()> {
         let warm = build(&db, &table, &args, &mut known)?;
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
-        let stats = known.stats;
-        if stats.bodies > 0 {
-            eprintln!(
-                "stats: mir {:.1?}, {} of {} bodies changed",
-                stats.mir, stats.changed, stats.bodies
-            );
-            eprintln!("code: {} reused, {} compiled", stats.reused, stats.compiled);
-            let phases = stats.phases;
-            eprintln!(
-                "phases: fingerprint {:.1?}, ir {:.1?}, emit {:.1?}, object {:.1?}, {} rounds",
-                phases.fingerprint, phases.ir, phases.emit, phases.object, stats.rounds
-            );
-        }
+        report_stats(&known.stats);
         link(&args)?;
         eprintln!("edit-to-binary: {:.1?}", start.elapsed());
     }
@@ -727,4 +715,19 @@ fn main() -> anyhow::Result<()> {
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
     Ok(VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?)))
+}
+
+fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
+    if stats.bodies == 0 {
+        return;
+    }
+    eprintln!(
+        "stats: {} of {} functions compiled, {} reused",
+        stats.compiled, stats.bodies, stats.reused
+    );
+    let phases = stats.phases;
+    eprintln!(
+        "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, object {:.1?}, {} rounds",
+        phases.compile, phases.resolve, phases.define, phases.object, stats.rounds
+    );
 }

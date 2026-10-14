@@ -1158,7 +1158,7 @@ impl MirBody<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
 pub enum MirSpan {
     ExprId(ExprId),
     PatId(PatId),
