@@ -582,6 +582,13 @@ pub fn simplified_type_module(db: &dyn HirDatabase, ty: &SimplifiedType<'_>) -> 
     }
 }
 
+/// A `SimplifiedType` as the argument of a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct SelfTyKey<'db>(
+    // SAFETY: as for the maps below, it only contains `SolverDefId<'db>`.
+    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))] pub SimplifiedType<'db>,
+);
+
 #[derive(Debug, PartialEq, Eq, SalsaValue)]
 pub struct InherentImpls<'db> {
     // SAFETY: necessary due to `SimplifiedType<'db>`.
@@ -600,6 +607,17 @@ impl<'db> InherentImpls<'db> {
         let crate_def_map = crate_def_map(db, krate);
 
         Self::collect_def_map(db, crate_def_map)
+    }
+
+    /// The inherent impls of `krate` for one type. An impl added for another type changes
+    /// `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_self_ty(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_crate(db, krate).for_self_ty(&self_ty.0).into()
     }
 
     #[salsa::tracked(returns(ref))]
@@ -733,6 +751,38 @@ impl<'db> TraitImpls<'db> {
     #[salsa::tracked(returns(deref))]
     pub fn for_crate_and_deps(db: &'db dyn HirDatabase, krate: Crate) -> Box<[Arc<Self>]> {
         krate.transitive_deps(db).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
+    }
+
+    /// The impls of one trait for one type in `krate` and its dependencies. An impl added for
+    /// another trait or type changes `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_and_deps_for_trait_and_self_ty(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        let mut found = Vec::new();
+        for impls in Self::for_crate_and_deps(db, krate) {
+            let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
+            found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
+            found.extend(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)));
+        }
+        found.into()
+    }
+
+    /// The blanket impls of one trait in `krate` and its dependencies.
+    #[salsa::tracked(returns(deref))]
+    pub fn blanket_in_crate_and_deps(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> Box<[ImplId]> {
+        Self::for_crate_and_deps(db, krate)
+            .iter()
+            .flat_map(|impls| impls.blanket_impls(trait_))
+            .copied()
+            .collect()
     }
 }
 
@@ -872,11 +922,21 @@ impl<'db> TraitImpls<'db> {
         block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
-        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
-        for impl_ in blocks.filter_map(|block| Self::for_block(db, block)) {
+        try_visit!(Self::for_each_block(db, block, for_each));
+        for impl_ in Self::for_crate_and_deps(db, krate) {
             try_visit!(for_each(impl_));
         }
-        for impl_ in Self::for_crate_and_deps(db, krate) {
+        R::output()
+    }
+
+    /// The impls of `block` and of the blocks around it.
+    pub fn for_each_block<R: VisitorResult>(
+        db: &'db dyn HirDatabase,
+        block: Option<BlockIdLt<'db>>,
+        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+    ) -> R {
+        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
+        for impl_ in blocks.filter_map(|block| Self::for_block(db, block)) {
             try_visit!(for_each(impl_));
         }
         R::output()
@@ -894,7 +954,17 @@ impl<'db> TraitImpls<'db> {
         for impl_ in in_self_and_deps {
             try_visit!(for_each(impl_));
         }
+        Self::for_each_block_trait_and_type(db, type_block, trait_block, for_each)
+    }
 
+    /// The impls of two blocks and of the blocks around them, one for a trait and one for a
+    /// self type.
+    pub fn for_each_block_trait_and_type<R: VisitorResult>(
+        db: &'db dyn HirDatabase,
+        type_block: Option<BlockIdLt<'db>>,
+        trait_block: Option<BlockIdLt<'db>>,
+        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+    ) -> R {
         // We must not provide duplicate impls to the solver. Therefore we work with the following strategy:
         // start from each block, and walk ancestors until you meet the other block. If they never meet,
         // that means there can't be duplicate impls; if they meet, we stop the search of the deeper block.

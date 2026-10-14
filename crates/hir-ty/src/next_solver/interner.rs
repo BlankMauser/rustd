@@ -41,7 +41,7 @@ use crate::{
     InferBodyId, Span,
     db::{HirDatabase, InternedClosure, InternedCoroutineId},
     lower::GenericPredicates,
-    method_resolution::TraitImpls,
+    method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
         AdtIdWrapper, AliasTermKind, AliasTyKind, AnyImplId, BoundConst, CallableIdWrapper,
         CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper,
@@ -1632,9 +1632,22 @@ impl<'db> Interner for DbInterner<'db> {
             });
             let in_block = type_block.is_some() || trait_block.is_some();
             let mut seen = Vec::new();
-            TraitImpls::for_each_crate_and_block_trait_and_type(
+            let in_crates = TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
                 self.db,
                 krate,
+                trait_def_id.0,
+                SelfTyKey(simp),
+            );
+            for &impl_ in in_crates {
+                // The impls of a `const _` block are among those of its crate as well
+                // as its own, and the solver takes a second copy for an ambiguity.
+                if in_block {
+                    seen.push(impl_);
+                }
+                try_visit!(f(impl_));
+            }
+            TraitImpls::for_each_block_trait_and_type(
+                self.db,
                 type_block,
                 trait_block,
                 &mut |impls| {
@@ -1645,14 +1658,10 @@ impl<'db> Interner for DbInterner<'db> {
                         .map(|&it| AnyImplId::from(it))
                         .chain(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)))
                     {
-                        // The impls of a `const _` block are among those of its crate as well
-                        // as its own, and the solver takes a second copy for an ambiguity.
-                        if in_block {
-                            if seen.contains(&impl_) {
-                                continue;
-                            }
-                            seen.push(impl_);
+                        if seen.contains(&impl_) {
+                            continue;
                         }
+                        seen.push(impl_);
                         try_visit!(f(impl_));
                     }
                     R::output()
@@ -1768,12 +1777,16 @@ impl<'db> Interner for DbInterner<'db> {
         };
         let block = trait_def_id.0.loc(self.db).container.block(self.db);
 
-        TraitImpls::for_each_crate_and_block(self.db, krate, block, &mut |impls| {
+        try_visit!(TraitImpls::for_each_block(self.db, block, &mut |impls| {
             for &impl_ in impls.blanket_impls(trait_def_id.0) {
                 try_visit!(f(impl_.into()));
             }
             R::output()
-        })
+        }));
+        for &impl_ in TraitImpls::blanket_in_crate_and_deps(self.db, krate, trait_def_id.0) {
+            try_visit!(f(impl_.into()));
+        }
+        R::output()
     }
 
     fn has_item_definition(self, _def_id: Self::ImplOrTraitAssocTermId) -> bool {

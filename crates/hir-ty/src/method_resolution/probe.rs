@@ -31,7 +31,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        simplified_type_module, with_incoherent_inherent_impls,
+        SelfTyKey, simplified_type_module, with_incoherent_inherent_impls,
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
@@ -1013,16 +1013,18 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         let Some(module) = simplified_type_module(self.db(), self_ty) else {
             return;
         };
-        InherentImpls::for_each_crate_and_block(
-            self.db(),
-            module.krate(self.db()),
-            module.block(self.db()),
-            &mut |impls| {
-                for &impl_def_id in impls.for_self_ty(self_ty) {
-                    self.assemble_inherent_impl_probe(impl_def_id, receiver_steps);
-                }
-            },
-        );
+        let db = self.db();
+        let blocks = std::iter::successors(module.block(db), |block| block.module(db).block(db));
+        for impls in blocks.filter_map(|block| InherentImpls::for_block(db, block).as_deref()) {
+            for &impl_def_id in impls.for_self_ty(self_ty) {
+                self.assemble_inherent_impl_probe(impl_def_id, receiver_steps);
+            }
+        }
+        for &impl_def_id in
+            InherentImpls::in_crate_for_self_ty(db, module.krate(db), SelfTyKey(*self_ty))
+        {
+            self.assemble_inherent_impl_probe(impl_def_id, receiver_steps);
+        }
     }
 
     #[instrument(level = "debug", skip(self))]

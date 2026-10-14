@@ -609,7 +609,9 @@ fn main() {
                 "StructSignature::with_source_map_",
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
+                "InherentImpls < 'db >::in_crate_for_self_ty_",
                 "InherentImpls < 'db >::for_crate_",
+                "TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_",
                 "TraitImpls < 'db >::for_crate_and_deps_",
                 "TraitImpls < 'db >::for_crate_",
                 "impl_trait_with_diagnostics",
@@ -619,6 +621,7 @@ fn main() {
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
                 "impl_super_outlives",
+                "TraitImpls < 'db >::blanket_in_crate_and_deps_",
                 "body_upvars_mentioned",
             ]
         "#]],

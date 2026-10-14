@@ -74,6 +74,11 @@ SCENARIOS = {
         insert_after(f"{S}/hir/mod.rs", 10**9, NEW_FN),
         substitute(f"{B}/main.rs", "    let re = Regex::new(",
                    '    println!("{}", regex_syntax::hir::rustd_new_item(41));\n    let re = Regex::new(')],
+    "derive added to a struct (Span: Debug is hand-written, add PartialOrd)": [
+        substitute(f"{A}/util/search.rs", "#[derive(Clone, Copy, Eq, Hash, PartialEq)]\npub struct Span {",
+                   "#[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd)]\npub struct Span {")],
+    "attribute added to a function (#[inline(never)])": [
+        substitute(f"{A}/util/prefilter/mod.rs", "    fn is_fast(&self) -> bool {", "    #[inline(never)]\n    fn is_fast(&self) -> bool {")],
     "field added to a struct used everywhere (Input)": [
         substitute(f"{A}/util/search.rs", "    earliest: bool,\n}", "    earliest: bool,\n    extra: u64,\n}"),
         substitute(f"{A}/util/search.rs", "            earliest: false,\n        }", "            earliest: false,\n            extra: 0,\n        }")],
@@ -119,11 +124,14 @@ def main():
     if a.cargo:
         cargo_build()
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    log = open(os.path.join(fx.work, "daemon.log"), "w+")
+    # The daemon appends through its own handle: a shared one would share the reader's offset.
+    log_path = os.path.join(fx.work, "daemon.log")
+    log_out = open(log_path, "a")
+    log = open(log_path)
     obj = os.path.join(fx.work, "rustd.o")
     mismatches = 0
     daemon = subprocess.Popen([RUSTD, ws, *crates, "--out", obj, "--watch", *link, *symbols],
-                              stderr=log, stdout=log)
+                              stderr=log_out, stdout=log_out)
 
     def wait(pattern, seen):
         while True:
