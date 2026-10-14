@@ -1804,7 +1804,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 return self.constant_type_id(instance.clone(), sig, hash);
             }
             let Some(ty) = self.symbol_type(of) else {
-                unsupported!("`TypeId` of a type neither hashed nor named by a rustc symbol");
+                unsupported!("`TypeId` of `{of:?}`, neither hashed nor named by a rustc symbol");
             };
             if let Some(symbol) = self.symbols.path(&format!("<core::any::TypeId>::of::<{ty}>")) {
                 return self.import(&symbol, sig);

@@ -8,13 +8,13 @@ use std::hash::Hasher;
 
 use base_db::Crate;
 use hir_def::{
-    AdtId, EnumVariantId, HasModule, ItemContainerId, Lookup, ModuleIdLt, TraitId, TypeAliasId,
-    VariantId,
+    AdtId, CallableDefId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup,
+    ModuleIdLt, TraitId, TypeAliasId, VariantId,
     attrs::AttrFlags,
     item_tree::FieldsShape,
     signatures::{
-        EnumSignature, StructSignature, TraitFlags, TraitSignature, TypeAliasSignature,
-        UnionSignature,
+        EnumSignature, FunctionSignature, StructSignature, TraitFlags, TraitSignature,
+        TypeAliasSignature, UnionSignature,
     },
     src::HasSource,
     visibility::{Visibility, visibility_from_ast},
@@ -161,6 +161,19 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Some(self.module(trait_.module(self.db))?.child(DefPathData::TypeNs(name.as_str())))
     }
 
+    /// A function of a module or a trait. One of an `impl` is under the `impl`'s disambiguator,
+    /// which counts the `impl`s before it as rustc saw them.
+    fn function_path(&self, func: FunctionId) -> Option<Fingerprint> {
+        let db = self.db;
+        let parent = match func.lookup(db).container {
+            ItemContainerId::ModuleId(module) => self.module(module)?,
+            ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
+            ItemContainerId::ImplId(_) | ItemContainerId::ExternBlockId(_) => return None,
+        };
+        let name = &FunctionSignature::of(db, func).name;
+        Some(parent.child(DefPathData::ValueNs(name.as_str())))
+    }
+
     fn ty(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
         let mutability = |hasher: &mut StableSipHasher128, it| {
             hasher.write_isize(match it {
@@ -227,6 +240,16 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 self.region(hasher, region)?;
                 self.ty(hasher, pointee)?;
                 mutability(hasher, mutbl);
+            }
+            TyKind::FnDef(def, args) => {
+                hasher.write_isize(13);
+                let CallableDefId::FunctionId(func) = def.0 else { return None };
+                // A lifetime of a function is mostly late bound, and then no argument to rustc.
+                if args.iter().any(|arg| matches!(arg.kind(), GenericArgKind::Lifetime(_))) {
+                    return None;
+                }
+                self.function_path(func)?.hash(hasher);
+                self.args(args)?.hash(hasher);
             }
             TyKind::FnPtr(signature, header) => {
                 hasher.write_isize(14);
@@ -308,7 +331,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 hasher.write_isize(22);
                 self.list(hasher, tys.iter(), |this, list, ty| this.ty(list, ty))?;
             }
-            // Closures and function items are named by a disambiguator only rustc knows.
+            // A closure is named by a disambiguator only rustc knows.
             _ => return None,
         }
         Some(())

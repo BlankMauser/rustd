@@ -3065,6 +3065,27 @@ pub mod type_id_hashes {
         ]
     }
 
+    fn of_value<T: 'static>(_: &T) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    fn generic_item<T, const N: usize>(_: T) {}
+
+    /// Function items, which are named by their path and what they were instantiated with.
+    pub fn function_items() -> Vec<TypeId> {
+        vec![
+            of_value(&id::<u8>),
+            of_value(&id::<dyn Shape>),
+            of_value(&primitives),
+            of_value(&generic_item::<Unit, 3>),
+            of_value(&std::io::stdout),
+            of_value(&std::mem::drop::<String>),
+            of_value(&<u8 as Clone>::clone),
+            of_value(&<Vec<u8> as Default>::default),
+            id::<Option<Generic<u8, 1>>>(),
+        ]
+    }
+
     pub fn projections() -> Vec<TypeId> {
         vec![
             id::<dyn Iterator<Item = u8>>(),
