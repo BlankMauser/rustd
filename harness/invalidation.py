@@ -25,6 +25,8 @@ V = os.path.join(HERE, "vendor")
 A, S = os.path.join(V, "regex-automata/src"), os.path.join(V, "regex-syntax/src")
 B = os.path.join(HERE, "bench2/src")
 BODY = "let _rustd_edit = 1u32;"
+# Edited files are read and written byte for byte: one of them is not text.
+RAW = {"encoding": "latin-1", "newline": ""}
 
 
 def insert_after(path, line, text):
@@ -83,6 +85,8 @@ SCENARIOS = {
     "closure body": [substitute(f"{B}/main.rs", "map(|n| n * 2)", "map(|n| n * 3)")],
     "const value": [substitute(f"{B}/main.rs", "const LIMIT: usize = 3;", "const LIMIT: usize = 1;")],
     "static initializer": [substitute(f"{B}/main.rs", 'static GREETING: &str = "matches";', 'static GREETING: &str = "hits";')],
+    "file of an include_str! (not a source file)": [substitute(f"{B}/motto.txt", "quick", "slow")],
+    "file of an include_bytes! (binary)": [substitute(f"{B}/blob.bin", "\x02", "\x03\x04")],
     "string literal in a body": [substitute(f"{B}/main.rs", '"on 2026-10 the quick', '"in 2026-10 the quick')],
     "println! added to a body": [
         substitute(f"{B}/main.rs", "    let twice = ", '    println!("counted {count}");\n    let twice = ')],
@@ -193,19 +197,19 @@ def main():
         nonlocal edits
         files = {}
         for path, apply in changes:
-            originals.setdefault(path, open(path).read())
+            originals.setdefault(path, open(path, **RAW).read())
             lines = files.setdefault(path, originals[path].splitlines(keepends=True))
             apply(lines)
         time.sleep(0.2)
         for path, lines in files.items():
-            open(path, "w").write("".join(lines))
+            open(path, "w", **RAW).write("".join(lines))
         settle()
 
     def restore(paths):
         nonlocal edits
         time.sleep(0.2)
         for path in paths:
-            open(path, "w").write(originals[path])
+            open(path, "w", **RAW).write(originals[path])
         settle()
 
     try:
@@ -257,7 +261,7 @@ def main():
     finally:
         daemon.kill()
         for path, text_ in originals.items():
-            open(path, "w").write(text_)
+            open(path, "w", **RAW).write(text_)
     cold = re.search(r"cold: compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled", text)
     load = re.search(r"load workspace: (\S+)", text)
     load = load[1] if load else "?"

@@ -881,17 +881,41 @@ pub fn include_input_to_file_id(
 }
 
 fn include_bytes_expand(
-    _db: &dyn SourceDatabase,
-    _arg_id: MacroCallId,
-    _tt: &tt::TopSubtree,
+    db: &dyn SourceDatabase,
+    arg_id: MacroCallId,
+    tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // FIXME: actually read the file here if the user asked for macro expansion
-    let pound = mk_pound(span);
-    let res = quote! {span =>
-        builtin #pound include_bytes
-    };
-    ExpandResult::ok(res)
+    let read = parse_string(tt, false).and_then(|(path, input_span)| {
+        included_bytes(db, arg_id, path.as_str())
+            .ok_or_else(|| ExpandError::other(input_span, format!("failed to load file `{path}`")))
+    });
+    match read {
+        Ok(bytes) => {
+            let text = bytes.escape_ascii().to_string();
+            let literal = tt::Literal::new_no_suffix(&text, span, tt::LitKind::ByteStr);
+            ExpandResult::ok(quote!(span =>#literal))
+        }
+        // The length is not known, so the type is `&[u8; _]`.
+        Err(e) => {
+            let pound = mk_pound(span);
+            ExpandResult::new(quote! {span => builtin #pound include_bytes }, e)
+        }
+    }
+}
+
+/// The contents of the file an `include_bytes!` or `include_str!` at `call_id` names.
+fn included_bytes<'db>(
+    db: &'db dyn SourceDatabase,
+    call_id: MacroCallId,
+    path: &str,
+) -> Option<&'db [u8]> {
+    let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
+    let path = AnchoredPath { anchor, path };
+    if let Some(file) = db.resolve_path(path) {
+        return Some(db.file_text(file).text(db).as_bytes());
+    }
+    db.included_file(path)?.bytes(db).as_deref()
 }
 
 fn include_str_expand(
@@ -910,21 +934,15 @@ fn include_str_expand(
         }
     };
 
-    // FIXME: we're not able to read excluded files (which is most of them because
-    // it's unusual to `include_str!` a Rust file), but we can return an empty string.
-    // Ideally, we'd be able to offer a precise expansion if the user asks for macro
-    // expansion.
-    let file_id = match relative_file(db, arg_id, path.as_str(), true, input_span) {
-        Ok(file_id) => file_id,
-        Err(_) => {
-            return ExpandResult::ok(quote!(call_site =>""));
-        }
-    };
-
-    let text = db.file_text(file_id.file_id(db));
-    let text = &**text.text(db);
-
-    ExpandResult::ok(quote!(call_site =>#text))
+    let text = included_bytes(db, arg_id, path.as_str())
+        .map(|it| String::from_utf8_lossy(it).into_owned());
+    match text {
+        Some(text) => ExpandResult::ok(quote!(call_site =>#text)),
+        None => ExpandResult::new(
+            quote!(call_site =>""),
+            ExpandError::other(input_span, format!("failed to load file `{path}`")),
+        ),
+    }
 }
 
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {

@@ -4432,3 +4432,13 @@ pub mod const_pointer_into_const {
         (local.first(), Table::<u8, u64>::with_hasher(3).first())
     }
 }
+
+pub mod included_files {
+    static BLOB: &[u8] = include_bytes!("blob.bin");
+    const NOTE: &str = include_str!("note.txt");
+
+    pub fn run() -> (usize, u8, &'static [u8], &'static str, usize) {
+        let local: &[u8; 11] = include_bytes!("blob.bin");
+        (BLOB.len(), BLOB[2], &local[4..9], NOTE, include_str!("note.txt").lines().count())
+    }
+}

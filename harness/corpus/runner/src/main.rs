@@ -239,6 +239,7 @@ fn main() {
     println!("closure_layout {}", cases::closure_layout::run());
     println!("in_place_collect {}", cases::in_place_collect::run());
     println!("dyn_statics {}", cases::dyn_statics::run());
+    println!("included_files {:?}", cases::included_files::run());
     println!("wide_float_casts {}", cases::wide_float_casts::run());
     println!("const_floats {}", cases::const_floats::run());
     println!("static_identity {}", cases::static_identity::run());

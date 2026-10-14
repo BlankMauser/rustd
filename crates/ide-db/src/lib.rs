@@ -120,6 +120,19 @@ impl fmt::Debug for RootDatabase {
     }
 }
 
+impl RootDatabase {
+    /// The files outside the VFS that an `include_bytes!` or `include_str!` has read.
+    pub fn included_files(&self) -> Vec<vfs::AbsPathBuf> {
+        self.files.included_files()
+    }
+
+    /// Reads such a file again, after it changed on disk.
+    pub fn reload_included_file(&mut self, path: &vfs::AbsPath) {
+        let files = Arc::clone(&self.files);
+        files.reload_included_file(self, path);
+    }
+}
+
 #[salsa::db]
 impl SourceDatabase for RootDatabase {
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
@@ -154,6 +167,15 @@ impl SourceDatabase for RootDatabase {
     ) {
         let files = Arc::clone(&self.files);
         files.set_source_root_with_durability(self, source_root_id, source_root, durability);
+    }
+
+    fn included_file(&self, path: base_db::AnchoredPath<'_>) -> Option<base_db::IncludedFile> {
+        let root = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root).source_root(self);
+        let anchor = root.path_for_file(&path.anchor)?.as_path()?;
+        let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
+        let path = anchor.parent()?.absolutize(path.path);
+        Some(self.files.included_file(self, &path, durability))
     }
 
     fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {

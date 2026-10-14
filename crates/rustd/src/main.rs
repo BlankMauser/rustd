@@ -719,21 +719,56 @@ fn link(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn source_files(vfs: &Vfs, _root: &Path) -> Vec<(vfs::FileId, PathBuf, SystemTime)> {
-    vfs.iter()
-        .filter_map(|(id, path)| {
-            let path: &Path = path.as_path()?.as_ref();
-            // Everything but the sysroot and the registry: path dependencies live outside `root`.
-            let immutable = path
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")));
-            if immutable {
-                return None;
+/// A file whose changes the daemon picks up.
+enum Watched {
+    Source(vfs::FileId),
+    /// Named by an `include_bytes!` or `include_str!`, and not a source file.
+    Included(AbsPathBuf),
+}
+
+struct WatchedFile {
+    file: Watched,
+    path: PathBuf,
+    mtime: SystemTime,
+}
+
+impl WatchedFile {
+    fn new(file: Watched, path: &Path) -> Option<WatchedFile> {
+        // Everything but the sysroot and the registry: path dependencies live outside the project.
+        let immutable = path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")));
+        if immutable {
+            return None;
+        }
+        let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+        Some(WatchedFile { file, path: path.to_owned(), mtime })
+    }
+
+    fn sources(vfs: &Vfs) -> Vec<WatchedFile> {
+        vfs.iter()
+            .filter_map(|(id, path)| {
+                WatchedFile::new(Watched::Source(id), path.as_path()?.as_ref())
+            })
+            .collect()
+    }
+
+    /// Adds the files the last build included that are not watched yet. One is read again once
+    /// its timestamp is taken, so a write between the build's read and now is not lost.
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) {
+        let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
+        let new: Vec<AbsPathBuf> = db
+            .included_files()
+            .into_iter()
+            .filter(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
+            .collect();
+        for path in new {
+            if let Some(file) = WatchedFile::new(Watched::Included(path.clone()), path.as_ref()) {
+                files.push(file);
+                db.reload_included_file(&path);
             }
-            let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-            Some((id, path.to_owned(), mtime))
-        })
-        .collect()
+        }
+    }
 }
 
 /// Compiles every crate asked for, each as it would be alone.
@@ -847,10 +882,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let root = std::fs::canonicalize(&args.project)?;
-    let mut files = source_files(&vfs, &root);
+    let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
     loop {
+        WatchedFile::watch_included(&mut files, &mut db);
         std::thread::sleep(Duration::from_millis(5));
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -859,12 +894,12 @@ fn main() -> anyhow::Result<()> {
         let mut touched = FxHashSet::default();
         loop {
             let before = touched.len();
-            for (index, (_, path, mtime)) in files.iter_mut().enumerate() {
-                let Ok(now) = std::fs::metadata(&*path).and_then(|m| m.modified()) else {
+            for (index, file) in files.iter_mut().enumerate() {
+                let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
                     continue;
                 };
-                if now != *mtime {
-                    *mtime = now;
+                if now != file.mtime {
+                    file.mtime = now;
                     touched.insert(index);
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
@@ -879,14 +914,23 @@ fn main() -> anyhow::Result<()> {
         let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
         let changed = touched.len();
+        let mut included = Vec::new();
         for index in touched {
-            let (id, path, _) = &files[index];
-            change.change_file(*id, Some(std::fs::read_to_string(path)?));
+            let WatchedFile { file, path, .. } = &files[index];
+            match file {
+                Watched::Source(id) => {
+                    change.change_file(*id, Some(std::fs::read_to_string(path)?))
+                }
+                Watched::Included(path) => included.push(path),
+            }
         }
         let read = read.elapsed();
         eprintln!("change: {changed} files");
         let start = Instant::now();
         db.apply_change(change);
+        for path in included {
+            db.reload_included_file(path);
+        }
         let apply = start.elapsed();
         let warm = build(&db, &table, &args, &mut known)?;
         let built = start.elapsed();

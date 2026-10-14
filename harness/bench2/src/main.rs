@@ -38,6 +38,7 @@ fn tally(hay: &str, re: &Regex) {
     let count = re.find_iter(hay).take(LIMIT).count();
     let twice = (0..count).map(|n| n * 2).sum::<usize>();
     println!("{GREETING}: {} {twice} {}", label!(count), Hit(count).describe());
+    println!("{} {:?}", include_str!("motto.txt").trim(), include_bytes!("blob.bin"));
 }
 
 fn show<T: std::fmt::Debug>(value: T, text: &str) {

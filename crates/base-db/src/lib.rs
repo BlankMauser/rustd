@@ -38,6 +38,7 @@ use rustc_hash::{FxHashSet, FxHasher};
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
+use vfs::AbsPath;
 pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
@@ -74,6 +75,7 @@ pub struct Files {
     files: Arc<DashMap<vfs::FileId, FileText, BuildHasherDefault<FxHasher>>>,
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
+    included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
 }
 
 impl Files {
@@ -115,6 +117,32 @@ impl Files {
                 vacant.insert(text);
             }
         };
+    }
+
+    /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
+    /// first time it is asked for. Whoever watches the disk keeps it current with
+    /// [`Files::reload_included_file`].
+    pub fn included_file(
+        &self,
+        db: &dyn SourceDatabase,
+        path: &AbsPath,
+        durability: Durability,
+    ) -> IncludedFile {
+        *self.included.entry(path.to_path_buf()).or_insert_with(|| {
+            IncludedFile::builder(read_included(path)).durability(durability).new(db)
+        })
+    }
+
+    pub fn included_files(&self) -> Vec<AbsPathBuf> {
+        self.included.iter().map(|it| it.key().clone()).collect()
+    }
+
+    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) {
+        let Some(file) = self.included.get(path).map(|it| *it) else { return };
+        let bytes = read_included(path);
+        if *file.bytes(db) != bytes {
+            file.set_bytes(db).to(bytes);
+        }
     }
 
     /// Source root of the file.
@@ -221,6 +249,17 @@ pub struct FileText {
     pub file_id: vfs::FileId,
 }
 
+/// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
+#[salsa::input(debug)]
+pub struct IncludedFile {
+    #[returns(ref)]
+    pub bytes: Option<std::sync::Arc<[u8]>>,
+}
+
+fn read_included(path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
+    std::fs::read(path).ok().map(Into::into)
+}
+
 #[salsa::input(debug)]
 pub struct FileSourceRootInput {
     #[returns(copy)]
@@ -272,6 +311,11 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         let source_root = self.file_source_root(path.anchor);
         let source_root = self.source_root(source_root.source_root_id(self));
         source_root.source_root(self).resolve_path(path)
+    }
+
+    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS.
+    fn included_file(&self, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
+        None
     }
 
     #[doc(hidden)]
