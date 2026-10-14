@@ -178,6 +178,47 @@ impl Resolver<'_> {
         Some(path)
     }
 
+    /// The function written at `func`, which holds the block that `scope` is the module of.
+    ///
+    /// `Semantics::to_def` answers the same, but starts from every crate the file is part of,
+    /// which for a package with tests and examples analyses all its dev-dependencies.
+    fn function_at(
+        &self,
+        sema: &hir::Semantics<'_, RootDatabase>,
+        scope: Module,
+        func: &ast::Fn,
+    ) -> Option<hir::Function> {
+        use hir::HasSource;
+        let db = self.db;
+        let file = sema.hir_file_for(func.syntax());
+        let range = func.syntax().text_range();
+        let is_it = |it: &hir::Function| {
+            it.source(db).is_some_and(|source| {
+                source.file_id == file && source.value.syntax().text_range() == range
+            })
+        };
+        let among = |items: Vec<hir::AssocItem>| {
+            items.into_iter().filter_map(hir::AssocItem::as_function).find(is_it)
+        };
+        let mut module = Some(scope);
+        while let Some(it) = module {
+            let found = it
+                .declarations(db)
+                .into_iter()
+                .find_map(|def| match def {
+                    ModuleDef::Function(func) => Some(func).filter(is_it),
+                    ModuleDef::Trait(trait_) => among(trait_.items(db)),
+                    _ => None,
+                })
+                .or_else(|| it.impl_defs(db).into_iter().find_map(|imp| among(imp.items(db))));
+            if found.is_some() || it.nearest_non_block_module(db) == it {
+                return found;
+            }
+            module = it.parent(db);
+        }
+        None
+    }
+
     /// The path of what holds a module's items: the module, or for the items of a block the
     /// function, closure, constant or static the block is in, which only the syntax knows.
     fn scope_path(&self, module: Module) -> Option<String> {
@@ -206,7 +247,7 @@ impl Resolver<'_> {
         let mut owner = None;
         for node in sema.ancestors_with_macros(block) {
             if let Some(func) = ast::Fn::cast(node.clone()) {
-                let func: hir::Function = sema.to_def(&func)?;
+                let func = self.function_at(&sema, module, &func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
@@ -317,7 +358,7 @@ impl SymbolResolver for Resolver<'_> {
                 continue;
             }
             if let Some(func) = ast::Fn::cast(node.clone()) {
-                let func: hir::Function = sema.to_def(&func)?;
+                let func = self.function_at(&sema, module, &func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
@@ -376,13 +417,50 @@ fn closure_number(closure: &ast::ClosureExpr) -> u32 {
     earlier.count() as u32
 }
 
-fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {
-    let krate = Crate::all(db)
+fn crate_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Crate> {
+    Crate::all(db)
         .into_iter()
         .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
         // A dependency may be another version of the crate being built.
         .min_by_key(|it| !it.origin(db).is_local())
-        .with_context(|| format!("crate {krate} not found in workspace"))?;
+        .with_context(|| format!("crate {krate} not found in workspace"))
+}
+
+/// Resolves the names and collects the impls of the crates being built and of everything they
+/// depend on, a crate per thread. Every build needs them, and one thread would do them in turn.
+fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
+    let mut seen = FxHashSet::default();
+    let mut crates = Vec::new();
+    for name in std::iter::once(&args.krate).chain(&args.batch) {
+        let krate: ide_db::base_db::Crate = crate_named(db, name)?.into();
+        crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
+    }
+    // A crate comes before its dependencies in the list, and a thread that starts on one
+    // waits for the threads working on what it depends on.
+    crates.reverse();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let db = db.clone();
+            let (crates, next) = (&crates, &next);
+            scope.spawn(move || {
+                while let Some(&krate) =
+                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    hir::attach_db(&db, || {
+                        _ = hir::crate_def_map(&db, krate);
+                        _ = hir::TraitImpls::for_crate(&db, krate);
+                    });
+                }
+            });
+        }
+    });
+    Ok(crates.len())
+}
+
+fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {
+    let krate = crate_named(db, krate)?;
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
     // Each scope's functions, and the bodies whose blocks declare more scopes.
@@ -663,6 +741,10 @@ fn main() -> anyhow::Result<()> {
     if args.out.is_dir() {
         return build_batch(&db, args);
     }
+
+    let start = Instant::now();
+    let resolved = resolve_crates(&db, &args)?;
+    eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
 
     let mut known = Rejections::default();
     let cold = build(&db, &table, &args, &mut known)?;
