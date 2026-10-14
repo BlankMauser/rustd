@@ -6,7 +6,7 @@ usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--bisect] [--
 Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects for the crate in
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
-import argparse, json, os, re, sys
+import argparse, json, os, re, subprocess, sys
 from difftest import Fixture, compare, discard
 
 
@@ -14,11 +14,11 @@ UNIT = "(unit tests)"
 
 
 class TestFixture(Fixture):
-    def __init__(self, crate_dir, crate, test, shared, features=None):
+    def __init__(self, crate_dir, crate, test, shared, features=None, lib=None):
         if test == UNIT:
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
-                             touch=os.path.join(crate_dir, "src", "lib.rs"))
+                             touch=lib)
             self.rustd_args = ["--cfg-test"]
         else:
             path = os.path.join(crate_dir, "tests", f"{test}.rs")
@@ -48,7 +48,6 @@ class TestFixture(Fixture):
 
 def differing_tests(fx):
     """Runs every test on its own in both binaries: one that aborts hides the ones after it."""
-    import subprocess
     listed = subprocess.run([fx.reference, "--list"], capture_output=True, text=True).stdout
     names = [l[:-len(": test")] for l in listed.splitlines() if l.endswith(": test")]
     differing = []
@@ -75,13 +74,18 @@ def main():
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
     tests_dir = os.path.join(a.crate_dir, "tests")
     tests = sorted(f[:-3] for f in os.listdir(tests_dir) if f.endswith(".rs")) if os.path.isdir(tests_dir) else []
-    if os.path.exists(os.path.join(a.crate_dir, "src", "lib.rs")):
+    meta = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=a.crate_dir))
+    package = next(p for p in meta["packages"] if p["name"].replace("-", "_") == crate
+                   or any(t["name"].replace("-", "_") == crate for t in p["targets"]))
+    lib = next((t["src_path"] for t in package["targets"] if "lib" in t["kind"]), None)
+    if lib:
         tests.append(UNIT)
     tests = [t for t in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
     results, shared = [], {}
     for test in tests:
         print(f"--- {test}", flush=True)
-        fx = TestFixture(a.crate_dir, crate, test, shared, a.features)
+        fx = TestFixture(a.crate_dir, crate, test, shared, a.features, lib)
         try:
             result = compare(fx, test, a.bisect)
         except SystemExit as e:

@@ -182,14 +182,14 @@ impl SymbolTable {
     }
 }
 
-/// The name of the crate in `libname-hash.rlib`, or in the `name-hash.unit.rcgu.o` of a crate
+/// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
 /// built as a test binary, and the file its source starts at, which the dep-info file cargo
 /// leaves next to it lists first.
 fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     let file = rlib.file_name()?.to_str()?;
     let stem = match file.strip_suffix(".rlib") {
         Some(stem) => stem.strip_prefix("lib")?,
-        None => file.strip_suffix(".rcgu.o")?.rsplit_once('.')?.0,
+        None => file.strip_suffix(".rcgu.o")?.split_once('.')?.0,
     };
     let (name, _) = stem.rsplit_once('-')?;
     let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
