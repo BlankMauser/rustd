@@ -5674,7 +5674,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("builtin derive method in a vtable");
         };
         if !FunctionSignature::of(db, callee).has_body() {
-            unsupported!("vtable of {self_ty:?}: no impl found for a method");
+            let method = FunctionSignature::of(db, callee).name.as_str();
+            unsupported!("no impl of `{method}` found for the vtable of {self_ty:?}");
         }
         let body = self.body_types(InstanceDef::Fn(callee), callee_args)?;
         let Some(receiver) = body.params.first() else {
