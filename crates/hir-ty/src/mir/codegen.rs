@@ -276,6 +276,7 @@ impl CodegenUnit {
                     break;
                 }
             }
+            let fallback_start = std::time::Instant::now();
             let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
             // A function left to rustc keeps using rustc's copy of a private static, so we
             // can't bring our own.
@@ -326,7 +327,7 @@ impl CodegenUnit {
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
-                    phases: cg.phases,
+                    phases: Phases { fallback: fallback_start.elapsed(), ..cg.phases },
                     rounds,
                 };
                 if let Some(path) = std::env::var_os("RUSTD_LAYOUTS") {
@@ -415,6 +416,8 @@ pub struct Phases {
     pub define: std::time::Duration,
     /// Writing the object file.
     pub object: std::time::Duration,
+    /// Working out what the functions left to rustc keep the rest from compiling.
+    pub fallback: std::time::Duration,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.

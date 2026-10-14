@@ -548,6 +548,7 @@ fn build(
         (functions, Vec::new())
     };
     let roots = Roots { entries: &entries, on_demand: &on_demand };
+    let setup = start.elapsed();
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
     let mut denied = FxHashSet::default();
     if let Some(deny) = &args.deny {
@@ -565,6 +566,9 @@ fn build(
             .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!("roots: {setup:.1?}, compile: {:.1?}", codegen - setup);
+    }
     let start = Instant::now();
     std::fs::write(&args.out, &unit.object)?;
     let build = Build {
@@ -835,7 +839,7 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
     );
     let phases = stats.phases;
     eprintln!(
-        "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, object {:.1?}, {} rounds",
-        phases.compile, phases.resolve, phases.define, phases.object, stats.rounds
+        "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, fallback {:.1?}, object {:.1?}, {} rounds",
+        phases.compile, phases.resolve, phases.define, phases.fallback, phases.object, stats.rounds
     );
 }

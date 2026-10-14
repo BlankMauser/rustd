@@ -393,6 +393,26 @@ struct ModuleScope<'db> {
     scope: ItemScope,
 }
 
+#[salsa::tracked]
+impl<'db> ModuleScope<'db> {
+    /// What one name means in the module. Adding or removing another item leaves this equal,
+    /// so a query that only looked names up is not re-run.
+    #[salsa::tracked]
+    fn name(self, db: &'db dyn SourceDatabase, name: Name) -> PerNs {
+        self.scope(db).get(&name)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn legacy_macro(self, db: &'db dyn SourceDatabase, name: Name) -> Option<Box<[MacroId]>> {
+        self.scope(db).get_legacy_macro(&name).map(Box::from)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn traits(self, db: &'db dyn SourceDatabase) -> Box<[crate::TraitId]> {
+        self.scope(db).traits().collect()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ScopeSlot {
     /// While the `DefMap` is being collected.
@@ -808,6 +828,49 @@ impl ModuleData {
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
             }
         }
+    }
+
+    /// What `name` means in this module; depends on that name only.
+    pub fn name_in_scope(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
+        match &self.scope {
+            ScopeSlot::Building(scope) => scope.get(name),
+            ScopeSlot::Collected(id) => {
+                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*id).name(db, name.clone())
+            }
+        }
+    }
+
+    pub(crate) fn legacy_macro_in_scope<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+        name: &Name,
+    ) -> Option<&'a [MacroId]> {
+        match &self.scope {
+            ScopeSlot::Building(scope) => scope.get_legacy_macro(name),
+            ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
+                .legacy_macro(db, name.clone())
+                .as_deref(),
+        }
+    }
+
+    /// The traits in scope in this module; depends on those only.
+    pub fn traits_in_scope<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+    ) -> impl Iterator<Item = crate::TraitId> + 'a {
+        let (building, collected) = match &self.scope {
+            ScopeSlot::Building(scope) => (Some(scope.traits()), None),
+            ScopeSlot::Collected(id) => (
+                None,
+                Some(
+                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
+                        .traits(db)
+                        .iter()
+                        .copied(),
+                ),
+            ),
+        };
+        building.into_iter().flatten().chain(collected.into_iter().flatten())
     }
 
     /// The scope of a module of the `DefMap` being collected.

@@ -700,7 +700,7 @@ impl<'db> Resolver<'db> {
 
         for scope in self.scopes() {
             match scope {
-                Scope::BlockScope(m) => traits.extend(m.def_map[m.module_id].scope(db).traits()),
+                Scope::BlockScope(m) => traits.extend(m.def_map[m.module_id].traits_in_scope(db)),
                 &Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                     let impl_data = ImplSignature::of(db, impl_);
                     if let Some(target_trait) = impl_data.target_trait
@@ -717,10 +717,10 @@ impl<'db> Resolver<'db> {
         // Fill in the prelude traits
         if let Some((prelude, _use)) = self.module_scope.def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            traits.extend(prelude_def_map[prelude].scope(db).traits());
+            traits.extend(prelude_def_map[prelude].traits_in_scope(db));
         }
         // Fill in module visible traits
-        traits.extend(self.module_scope.def_map[self.module_scope.module_id].scope(db).traits());
+        traits.extend(self.module_scope.def_map[self.module_scope.module_id].traits_in_scope(db));
         traits
     }
 
@@ -730,7 +730,7 @@ impl<'db> Resolver<'db> {
     ) -> impl Iterator<Item = TraitId> + 'a {
         self.scopes()
             .filter_map(|scope| match scope {
-                Scope::BlockScope(m) => Some(m.def_map[m.module_id].scope(db).traits()),
+                Scope::BlockScope(m) => Some(m.def_map[m.module_id].traits_in_scope(db)),
                 _ => None,
             })
             .flatten()

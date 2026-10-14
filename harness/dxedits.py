@@ -67,7 +67,13 @@ def main():
         print(f"warmup: {time.time() - start:.1f}s, {rss} MB")
         log.seek(0)
         print(re.search(r"cold: .*", log.read())[0])
+        only = os.environ.get("DXEDITS_ONLY")
+        if perf_out := os.environ.get("DXEDITS_PERF"):
+            perf = subprocess.Popen(["perf", "record", "-F", "499", "-g", "-o", perf_out, "-p", str(daemon.pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for name, path, apply in edits:
+            if only and only not in name:
+                continue
             original = open(path).read()
             edited = apply(original)
             assert edited != original, name
@@ -79,6 +85,9 @@ def main():
                 print(f"{label:38} edit-to-object {b[7]:>8}  recompiled {b[5]:>5} of {b[6]}")
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
         print(f"rss after edits: {rss} MB")
+        if perf_out:
+            perf.send_signal(2)
+            perf.wait()
     finally:
         daemon.kill()
 
