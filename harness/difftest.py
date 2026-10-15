@@ -72,7 +72,7 @@ class Fixture:
             obj, report = (os.path.join(self.work, f"{crate}.{ext}") for ext in ("o", "tsv"))
             try:
                 run = subprocess.run(
-                    [RUSTD, self.ws, "--crate", crate, "--out", obj, "--report", report,
+                    [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj, "--report", report,
                      "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"),
                      *self.rustd_args, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,

@@ -124,7 +124,7 @@ def main():
                 if request:
                     reply = subprocess.check_output([RUSTD, request, socket], text=True)
                     print(f"    {reply.strip()}  round trip {(time.time() - saved) * 1000:.0f}ms")
-                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)", done)
+                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)", done)
                 done = len(found)
                 b = found[-1]
                 wall = (os.path.getmtime(binary) - saved) * 1000 if "--patch" in args else None

@@ -993,6 +993,13 @@ fn report(build: &Build) {
         build.codegen,
         build.emit,
     );
+    if let Some(path) = std::env::var_os("RUSTD_SKIPPED") {
+        let all: String =
+            build.skipped.iter().map(|(name, error)| format!("{name}: {error}\n")).collect();
+        if let Err(error) = std::fs::write(&path, all) {
+            eprintln!("rustd: cannot write {path:?}: {error}");
+        }
+    }
     if build.skipped.len() <= 8 {
         for (name, error) in &build.skipped {
             eprintln!("  left to rustc: {name}: {error}");
