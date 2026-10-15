@@ -540,9 +540,15 @@ impl OwnStatics {
 
 /// Instances already found impossible to compile, kept between builds so a warm build does
 /// not rediscover them one restart at a time.
+/// An instance that could not be compiled, and what it was compiled for.
+pub(in crate::mir) struct Rejected {
+    env: StoredParamEnvAndCrate,
+    why: String,
+}
+
 #[derive(Default)]
 pub struct Rejections {
-    rejected: FxHashMap<Instance, String>,
+    rejected: FxHashMap<Instance, Rejected>,
     /// The statics that functions left to rustc refer to, and the crates where that is unknown.
     theirs: FxHashSet<StaticId>,
     unknown: FxHashSet<Crate>,
@@ -739,7 +745,7 @@ struct ObjectCodegen<'a, 'db> {
     wanted: Vec<FunctionId>,
     on_demand_crates: FxHashSet<Crate>,
     /// Instances that failed in an earlier round, with the reason.
-    rejected: &'a FxHashMap<Instance, String>,
+    rejected: &'a FxHashMap<Instance, Rejected>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` names a file
     /// to write them to. The harness compares them with rustc's.
     layouts: FxHashMap<String, (u64, u64)>,
@@ -1412,7 +1418,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn new(
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
-        rejected: &'a FxHashMap<Instance, String>,
+        rejected: &'a FxHashMap<Instance, Rejected>,
         own_statics: OwnStatics,
         on_demand: &'a FxHashSet<FunctionId>,
         base: Option<&'a patch::Base>,
@@ -1533,7 +1539,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
-    fn define_instances(&mut self) -> Vec<(Instance, String)> {
+    fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
         while !self.pending.is_empty() {
             // Each wave is compiled on every core, and then put in the object one by one.
@@ -1549,7 +1555,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     if self.forward_to_rustc(&instance, id).is_some() {
                         self.forwarded.insert(instance);
                     } else {
-                        failed.push((instance, e.to_string()));
+                        failed.push((instance, Rejected { env, why: e.to_string() }));
                     }
                 }
             }
@@ -1920,8 +1926,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
             InstanceDef::ReifyShim { .. } => "{reify}",
         };
-        if let Some(reason) = self.rejected.get(instance) {
-            unsupported!("callee `{name}`: {reason}");
+        if let Some(Rejected { why, .. }) = self.rejected.get(instance) {
+            unsupported!("callee `{name}`: {why}");
         }
         if let Some(&id) = self.instances.get(instance) {
             return Ok(id);

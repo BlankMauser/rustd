@@ -255,6 +255,9 @@ pub(super) struct Base {
     their_walk: TheirWalk,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
+    /// The instances that did not compile when the base was built. What called them was left
+    /// to rustc, and stays there for as long as the base does.
+    rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
     pub(super) bodies: usize,
 }
 
@@ -466,7 +469,16 @@ impl Base {
             .collect();
         let (their_statics, walked) = TheirStatics::walk(db, left_to_rustc(skipped));
         let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
+        let rejected = cg
+            .rejected
+            .iter()
+            .filter(|(instance, it)| {
+                compiled_instance(db, (*instance).clone(), it.env.clone()).is_err()
+            })
+            .map(|(instance, it)| (instance.clone(), it.env.clone()))
+            .collect();
         Some(Base {
+            rejected,
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
             marks,
@@ -542,6 +554,13 @@ impl Base {
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
         let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
+        for i in every(self.rejected.len()) {
+            let (instance, env) = &self.rejected[i];
+            let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
+            if compiles != Some(false) {
+                return stale.declined("an instance that did not compile is another now");
+            }
+        }
         for i in every(self.compiled.len()) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
