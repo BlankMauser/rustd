@@ -55,12 +55,15 @@ def measure(name, spec, repeat):
     if (ld := os.environ.get("SCALING_LD")) and "-fuse-ld=lld" in link:
         link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
         link[link.index("-fuse-ld=lld")] = "-B" + ld
+    # SCALING_SYNC: each build is asked for once the file is written, as `rustd sync` does.
+    socket = os.path.join(fx.work, "rustd.sock") if os.environ.get("SCALING_SYNC") else None
+    trigger = ["--socket", socket] if socket else ["--watch"]
     log_path = os.path.join(fx.work, "daemon.log")
     out, log = open(log_path, "a"), open(log_path)
     start = time.time()
     daemon = subprocess.Popen(
         [RUSTD, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
-         "--out", obj, "--watch", "--patch", patch, "--link-cmd", shlex.join(link), *symbols],
+         "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *symbols],
         stderr=out, stdout=out)
 
     def wait(pattern, seen):
@@ -91,6 +94,8 @@ def measure(name, spec, repeat):
                 for revert, new in ((False, edited), (True, original)):
                     time.sleep(0.3)
                     open(fx.touch, "w").write(new)
+                    if socket:
+                        subprocess.check_call([RUSTD, "sync", socket], stdout=subprocess.DEVNULL)
                     found = wait(BUILD.pattern, done)
                     done = len(found)
                     b = found[-1]

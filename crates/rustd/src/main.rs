@@ -5,6 +5,8 @@ mod symbols;
 
 use ide_db::base_db::SourceDatabase as _;
 use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime},
@@ -45,6 +47,8 @@ struct Args {
     out: PathBuf,
     symbol_files: Vec<PathBuf>,
     watch: bool,
+    /// A Unix socket to take build requests on, instead of building when a file changes.
+    socket: Option<PathBuf>,
     link_cmd: Option<String>,
     /// Where to write the object that amends `out` after an edit, for the link to take ahead of
     /// `out`. Without it every edit writes `out` again.
@@ -79,6 +83,7 @@ impl Args {
         let mut out = None;
         let mut symbol_files = Vec::new();
         let mut watch = false;
+        let mut socket = None;
         let mut link_cmd = None;
         let mut patch = None;
         let mut report = None;
@@ -99,6 +104,7 @@ impl Args {
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
+                "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
@@ -112,6 +118,7 @@ impl Args {
             out: out.context("missing --out")?,
             symbol_files,
             watch,
+            socket,
             link_cmd,
             patch,
             report,
@@ -682,6 +689,10 @@ impl Listed {
 }
 
 fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+    let start = Instant::now();
+    // The first thing asked of a crate after an edit: name resolution is redone here.
+    hir_def::nameres::crate_def_map(db, krate.into());
+    let resolved = start.elapsed();
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
     // Each scope's functions, and the bodies whose blocks declare more scopes.
@@ -720,6 +731,8 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
         let id = hir_def::ModuleId::from(module);
         scope(&id.def_map(db)[id].scope(db), &mut bodies);
     }
+    let scopes = start.elapsed();
+    let count = bodies.len();
     // A body's blocks include those of the blocks in it, but not those of the items in them.
     // An edit to a file has every body in it lowered again, which is most of the work here, so
     // each round of bodies is lowered on all threads before it is read.
@@ -747,6 +760,13 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
                 }
             }
         }
+    }
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!(
+            "listing: name resolution {resolved:.1?}, scopes {:.1?}, {count} bodies {:.1?}",
+            scopes - resolved,
+            start.elapsed() - scopes
+        );
     }
     functions
 }
@@ -784,6 +804,7 @@ fn build(
     for krate in std::iter::once(&args.krate).chain(&args.batch) {
         functions.extend_from_slice(listed.of(db, crate_named(db, krate)?));
     }
+    let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
     let is_main = |&func: &FunctionId| hir::Function::from(func).is_main(db);
@@ -796,6 +817,9 @@ fn build(
     };
     let roots = Roots { entries: &entries, on_demand: &on_demand };
     let setup = start.elapsed();
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!("entries: {:.1?}", setup - list);
+    }
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
     let mut denied = FxHashSet::default();
     if let Some(deny) = &args.deny {
@@ -1015,6 +1039,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             out: out.join(format!("{krate}.o")),
             symbol_files: Vec::new(),
             watch: false,
+            socket: None,
             link_cmd: None,
             patch: None,
             report: Some(report.join(format!("{krate}.tsv"))),
@@ -1043,7 +1068,40 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Asks the daemon listening on `socket` to bring its output up to date with the files on disk,
+/// and waits for it.
+fn sync(socket: &Path) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("no daemon at {}", socket.display()))?;
+    stream.write_all(b"sync\n")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    let reply = reply.trim_end();
+    anyhow::ensure!(reply.starts_with("ok"), "daemon: {reply}");
+    println!("{reply}");
+    Ok(())
+}
+
+/// Waits for a build request on `listener`. The result is where to send the outcome.
+fn requested(listener: &UnixListener) -> anyhow::Result<UnixStream> {
+    loop {
+        let (stream, _) = listener.accept()?;
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request)?;
+        if request.trim_end() == "sync" {
+            return Ok(stream);
+        }
+        // A client that hangs up before the answer is not the daemon's problem.
+        let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    if let Some(("sync", socket)) =
+        std::env::args().nth(1).as_deref().zip(std::env::args().nth(2).as_deref())
+    {
+        return sync(Path::new(socket));
+    }
     let args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1094,9 +1152,15 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     report_stats(&known.stats);
     link(&args)?;
-    if !args.watch {
-        return Ok(());
-    }
+    let listener = match &args.socket {
+        Some(path) => {
+            // A socket file left by a daemon that is gone can't be bound again.
+            let _ = std::fs::remove_file(path);
+            Some(UnixListener::bind(path)?)
+        }
+        None if args.watch => None,
+        None => return Ok(()),
+    };
 
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
@@ -1104,11 +1168,18 @@ fn main() -> anyhow::Result<()> {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
         }
-        std::thread::sleep(Duration::from_millis(5));
+        let client = match &listener {
+            Some(listener) => Some(requested(listener)?),
+            None => {
+                std::thread::sleep(Duration::from_millis(5));
+                None
+            }
+        };
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
-        // the rest of that write may not change it again.
+        // the rest of that write may not change it again. Whoever asks for a build has finished
+        // writing, so one pass is enough then.
         let mut touched = FxHashSet::default();
         loop {
             let before = touched.len();
@@ -1122,12 +1193,17 @@ fn main() -> anyhow::Result<()> {
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
-            if touched.len() == before {
+            if touched.len() == before || client.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let Some((noticed, age)) = noticed else { continue };
+        let Some((noticed, age)) = noticed else {
+            if let Some(client) = client {
+                let _ = writeln!(&client, "ok: nothing changed");
+            }
+            continue;
+        };
         let settled = noticed.elapsed();
         let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
@@ -1214,6 +1290,9 @@ fn main() -> anyhow::Result<()> {
             eprintln!("timeline-us: {}", steps.join(" "));
         }
         eprintln!("edit-to-binary: {total:.1?}");
+        if let Some(client) = client {
+            let _ = writeln!(&client, "ok: {changed} files changed, built in {total:.1?}");
+        }
     }
 }
 
