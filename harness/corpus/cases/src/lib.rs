@@ -4943,3 +4943,101 @@ pub mod tail_temporaries {
         LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
     }
 }
+
+/// A derived ordering over an enum whose variants carry fields of several types.
+pub mod enum_ordering {
+    use std::path::PathBuf;
+
+    #[non_exhaustive]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Stage {
+        Initializing,
+        Starting { crate_count: usize, patch: bool },
+        Compiling { current: usize, total: usize, krate: String, fresh: bool },
+        Copying { current: usize, total: usize, path: PathBuf },
+        Native { detail: String },
+        Success,
+    }
+
+    pub fn run(seed: usize) -> Vec<(Option<std::cmp::Ordering>, std::cmp::Ordering, bool)> {
+        let stages = [
+            Stage::Initializing,
+            Stage::Starting { crate_count: seed, patch: seed % 2 == 0 },
+            Stage::Starting { crate_count: seed, patch: true },
+            Stage::Compiling { current: 1, total: seed, krate: "a".into(), fresh: false },
+            Stage::Compiling { current: 1, total: seed, krate: "b".into(), fresh: false },
+            Stage::Copying { current: 0, total: 1, path: PathBuf::from("x/y") },
+            Stage::Copying { current: 0, total: 1, path: PathBuf::from("x/z") },
+            Stage::Native { detail: format!("{seed}") },
+            Stage::Success,
+        ];
+        let mut out = Vec::new();
+        for a in &stages {
+            for b in &stages {
+                out.push((a.partial_cmp(b), a.cmp(b), a < b));
+            }
+        }
+        out
+    }
+}
+
+/// `String + &String`, where the right side only fits the one `Add` impl after a deref, in
+/// a closure whose return type is inferred from it.
+pub mod added_strings {
+    pub enum Segment {
+        Literal(String),
+        Other(u8),
+    }
+
+    pub fn joined(raw: Vec<u32>) -> String {
+        raw.into_iter().map(|ident| ident.to_string()).collect::<Vec<_>>().join("-")
+    }
+
+    pub struct Word(String);
+    impl core::borrow::Borrow<str> for Word {
+        fn borrow(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// An instance of `join` rustc has no copy of.
+    pub fn joined_words(raw: Vec<u32>) -> String {
+        raw.into_iter().map(|ident| Word(ident.to_string())).collect::<Vec<_>>().join("-")
+    }
+
+    pub fn run(segments: &[Segment]) -> Option<String> {
+        segments.iter().try_fold(String::new(), |acc, segment| {
+            if let Segment::Literal(seg) = segment { Some(acc + seg) } else { None }
+        })
+    }
+}
+
+/// A macro call as a generic argument of a path expression.
+pub mod macro_type_arguments {
+    pub struct Minus;
+    pub struct Plus;
+    macro_rules! Tok {
+        [-] => { Minus };
+        [+] => { Plus };
+    }
+    pub trait Named {
+        const NAME: &'static str;
+    }
+    impl Named for Minus {
+        const NAME: &'static str = "minus";
+    }
+    impl Named for Plus {
+        const NAME: &'static str = "plus";
+    }
+    pub struct Pair<A, B>(core::marker::PhantomData<(A, B)>);
+    impl<A: Named, B: Named> Pair<A, B> {
+        pub fn names(extra: &str) -> Result<String, String> {
+            Ok(format!("{}{}{extra}", A::NAME, B::NAME))
+        }
+    }
+
+    pub fn run(extra: &str) -> Result<usize, String> {
+        let raw = Pair::<Tok![+], Tok![-]>::names(extra)?;
+        if raw.len() == 1 { Ok(0) } else { Ok(raw.len()) }
+    }
+}

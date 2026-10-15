@@ -95,7 +95,13 @@ impl DefMap {
                 return true;
             }
 
-            if segments.len() == 1 && find_builtin_attr_idx(name).is_some() {
+            // rustc keeps every name that starts with `rustc_` to itself, and gives the standard
+            // library new ones faster than a list of them keeps up with. One taken for a macro
+            // that never resolves holds its item back until all else is collected, which for
+            // a `macro_rules!` is after the calls it is in scope of.
+            if segments.len() == 1
+                && (find_builtin_attr_idx(name).is_some() || name.as_str().starts_with("rustc_"))
+            {
                 return true;
             }
         }

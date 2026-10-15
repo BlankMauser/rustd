@@ -292,4 +292,13 @@ fn main() {
         cases::variadic::string(c"text")
     );
     println!("const_pointer_into_const {:?}", cases::const_pointer_into_const::run());
+    println!("enum_ordering {:?}", cases::enum_ordering::run(7));
+    {
+        use cases::added_strings::Segment;
+        let all = [Segment::Literal("a".into()), Segment::Literal("b".into())];
+        println!("added_strings {:?} {:?}", cases::added_strings::run(&all), cases::added_strings::run(&[Segment::Other(1)]));
+    }
+    println!("joined {:?}", cases::added_strings::joined(vec![1, 2, 3]));
+    println!("joined_words {:?}", cases::added_strings::joined_words(vec![1, 2, 3]));
+    println!("macro_type_arguments {:?}", cases::macro_type_arguments::run("x"));
 }

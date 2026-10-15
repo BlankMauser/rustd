@@ -346,9 +346,9 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
                     , Command::Move {
                         x: x_other, y: y_other,
                     }
-                    )=>match x_self.partial_cmp(&x_other) {
+                    )=>match x_self.partial_cmp(x_other) {
                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
-                            match y_self.partial_cmp(&y_other) {
+                            match y_self.partial_cmp(y_other) {
                                 $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
                                     $crate::option::Option::Some($crate::cmp::Ordering::Equal)
                                 }
@@ -357,7 +357,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
                         }
                         c=>return c,
                     }
-                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.partial_cmp(&f0_other) {
+                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.partial_cmp(f0_other) {
                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
                             $crate::option::Option::Some($crate::cmp::Ordering::Equal)
                         }

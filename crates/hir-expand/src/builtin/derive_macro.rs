@@ -1171,7 +1171,7 @@ fn partial_ord_expand(
             let fat_arrow1 = fat_arrow(span);
             let fat_arrow2 = fat_arrow(span);
             quote! {span =>
-                match #left.partial_cmp(&#right) {
+                match #left.partial_cmp(#right) {
                     #krate::option::Option::Some(#krate::cmp::Ordering::Equal) #fat_arrow1 {
                         #rest
                     }
@@ -1180,7 +1180,7 @@ fn partial_ord_expand(
             }
         }
         let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
-        let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
+        let right = quote!(span =>&#krate::intrinsics::discriminant_value(other));
 
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
         let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span)).map(
@@ -1190,7 +1190,9 @@ fn partial_ord_expand(
                 for f in fields.into_iter().rev() {
                     let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
                     let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                    body = compare(krate, quote!(span =>#t1), quote!(span =>#t2), body, span);
+                    // Fields are bound by reference, and by value in a packed type.
+                    let t2 = if adt.packed { quote!(span =>&#t2) } else { quote!(span =>#t2) };
+                    body = compare(krate, quote!(span =>#t1), t2, body, span);
                 }
                 let fat_arrow = fat_arrow(span);
                 quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
