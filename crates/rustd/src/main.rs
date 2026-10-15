@@ -26,7 +26,7 @@ use hir_def::{
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty::mir::codegen::{
-    CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
+    CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
@@ -360,7 +360,7 @@ fn rustc_commit(toolchain: &str) -> Option<String> {
 }
 
 impl SymbolResolver for Resolver<'_> {
-    fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
+    fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
         if threads < 2 {
             return;
@@ -369,15 +369,17 @@ impl SymbolResolver for Resolver<'_> {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let db = self.db.clone();
-                let next = &next;
+                let (next, table, root) = (&next, self.table, self.root.clone());
+                let rustc_commit = self.rustc_commit.clone();
                 scope.spawn(move || {
+                    let resolver = Resolver { db: &db, table, root, rustc_commit };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if at >= count {
                                 break;
                             }
-                            work(&db, at);
+                            work(&db, &resolver, at);
                         }
                     })
                 });
@@ -403,6 +405,10 @@ impl SymbolResolver for Resolver<'_> {
             return Some(symbol);
         }
         self.table.get(&self.path(func)?).map(str::to_owned)
+    }
+
+    fn defines(&self, symbol: &str) -> bool {
+        self.table.defines(symbol)
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {

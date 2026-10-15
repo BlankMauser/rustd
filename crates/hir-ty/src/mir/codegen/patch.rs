@@ -5,7 +5,10 @@
 //! defines under a name of the base replaces it there, for the linker takes the first
 //! definition it sees. Whatever the patch can't express starts a full build over.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
@@ -255,6 +258,9 @@ pub(super) struct Base {
     their_walk: TheirWalk,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
+    /// The symbols of the functions built from entries of the store, by their stable names.
+    /// No edit reaches what those are compiled from.
+    pub(super) found: FxHashMap<Arc<str>, String>,
     /// The instances that did not compile when the base was built. What called them was left
     /// to rustc, and stays there for as long as the base does.
     rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
@@ -491,6 +497,13 @@ impl Base {
             their_walk,
             instances,
             statics,
+            found: cg
+                .found
+                .iter()
+                .map(|(name, id)| {
+                    (name.clone(), decls.get_function_decl(*id).linkage_name(*id).into_owned())
+                })
+                .collect(),
             bodies: cg.bodies,
         })
     }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
 pub(crate) struct SymbolTable {
@@ -21,6 +21,8 @@ pub(crate) struct SymbolTable {
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
     by_root: FxHashMap<PathBuf, u64>,
+    /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
+    names: FxHashSet<u64>,
 }
 
 struct NestedSymbol {
@@ -109,6 +111,15 @@ impl SymbolTable {
         Ok(table)
     }
 
+    fn hashed(symbol: &str) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(symbol)
+    }
+
+    pub(crate) fn defines(&self, symbol: &str) -> bool {
+        self.names.contains(&Self::hashed(symbol))
+    }
+
     fn add_object(&mut self, data: &[u8], symbols: &mut Vec<Symbol>) {
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
@@ -121,6 +132,7 @@ impl SymbolTable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
+            self.names.insert(Self::hashed(name));
             // The memory a static points to is a symbol that demangles to the static's path.
             if name.starts_with("_RNn") {
                 continue;

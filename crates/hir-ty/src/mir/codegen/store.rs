@@ -19,17 +19,23 @@ use std::{
 };
 
 use cranelift_codegen::incremental_cache::CacheKvStore;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-const KEY: usize = 32;
+pub(super) const KEY: usize = 32;
 
 pub(super) struct Store {
     packs: Vec<Vec<u8>>,
     /// Where the value of a key is: the pack, and the range in it.
     index: FxHashMap<[u8; KEY], (u32, u32, u32)>,
-    new: Mutex<BufWriter<File>>,
+    new: Mutex<New>,
     hits: AtomicUsize,
     misses: AtomicUsize,
+}
+
+/// The pack this process appends to. What is in it is found by the next run, not this one.
+struct New {
+    pack: BufWriter<File>,
+    keys: FxHashSet<[u8; KEY]>,
 }
 
 impl Store {
@@ -73,7 +79,8 @@ impl Store {
             std::process::id(),
             std::time::UNIX_EPOCH.elapsed().map_or(0, |it| it.as_nanos())
         );
-        let new = Mutex::new(BufWriter::new(File::create(dir.join(name))?));
+        let pack = BufWriter::new(File::create(dir.join(name))?);
+        let new = Mutex::new(New { pack, keys: FxHashSet::default() });
         Ok(Store { packs, index, new, hits: AtomicUsize::new(0), misses: AtomicUsize::new(0) })
     }
 
@@ -81,8 +88,33 @@ impl Store {
     /// compiled again by the next.
     pub(super) fn flush(&self) {
         if let Ok(mut new) = self.new.lock() {
-            _ = new.flush();
+            _ = new.pack.flush();
         }
+    }
+
+    pub(super) fn get(&self, key: &[u8; KEY]) -> Option<&[u8]> {
+        let &(pack, start, len) = self.index.get(key)?;
+        let (start, len) = (start as usize, len as usize);
+        Some(&self.packs[pack as usize][start..start + len])
+    }
+
+    /// Adds a value, unless the key has one.
+    pub(super) fn insert(&self, key: &[u8; KEY], value: &[u8]) {
+        if self.index.contains_key(key) {
+            return;
+        }
+        let (Ok(mut new), Ok(len)) = (self.new.lock(), u32::try_from(value.len())) else {
+            return;
+        };
+        if !new.keys.insert(*key) {
+            return;
+        }
+        // One write a record: a pack cut short loses its last record and no other.
+        let mut record = Vec::with_capacity(KEY + 4 + value.len());
+        record.extend_from_slice(key);
+        record.extend_from_slice(&len.to_le_bytes());
+        record.extend_from_slice(value);
+        _ = new.pack.write_all(&record);
     }
 
     /// How many functions were found, and how many were not, since the last call.
@@ -96,25 +128,15 @@ pub(super) struct Lookup(pub(super) &'static Store);
 
 impl CacheKvStore for Lookup {
     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        let found = <&[u8; KEY]>::try_from(key).ok().and_then(|key| self.0.index.get(key));
-        let Some(&(pack, start, len)) = found else {
-            self.0.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        self.0.hits.fetch_add(1, Ordering::Relaxed);
-        let (start, len) = (start as usize, len as usize);
-        Some(Cow::Borrowed(&self.0.packs[pack as usize][start..start + len]))
+        let found = <&[u8; KEY]>::try_from(key).ok().and_then(|key| self.0.get(key));
+        let counted = if found.is_some() { &self.0.hits } else { &self.0.misses };
+        counted.fetch_add(1, Ordering::Relaxed);
+        found.map(Cow::Borrowed)
     }
 
     fn insert(&mut self, key: &[u8], val: Vec<u8>) {
-        let (Ok(mut new), Ok(len)) = (self.0.new.lock(), u32::try_from(val.len())) else {
-            return;
-        };
-        // One write a record: a pack cut short loses its last record and no other.
-        let mut record = Vec::with_capacity(KEY + 4 + val.len());
-        record.extend_from_slice(key);
-        record.extend_from_slice(&len.to_le_bytes());
-        record.extend_from_slice(&val);
-        _ = new.write_all(&record);
+        if let Ok(key) = <&[u8; KEY]>::try_from(key) {
+            self.0.insert(key, &val);
+        }
     }
 }

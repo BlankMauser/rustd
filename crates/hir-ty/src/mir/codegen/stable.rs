@@ -29,7 +29,7 @@ pub(super) struct StableNames<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     /// The crates whose code changes under the daemon.
-    owned: &'a FxHashSet<Crate>,
+    owned: FxHashSet<Crate>,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
 }
 
@@ -37,7 +37,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
     pub(super) fn new(
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
-        owned: &'a FxHashSet<Crate>,
+        owned: FxHashSet<Crate>,
     ) -> Self {
         StableNames { db, symbols, owned, files: RefCell::default() }
     }
@@ -68,6 +68,22 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
+    /// The vtable of a type for a trait object, or the one with no methods.
+    pub(super) fn vtable(
+        &self,
+        ty: Ty<'db>,
+        trait_ref: Option<(TraitId, GenericArgs<'db>)>,
+    ) -> Option<String> {
+        let mut out = String::from("vtable ");
+        self.ty(&mut out, ty)?;
+        if let Some((trait_, args)) = trait_ref {
+            out.push_str(" as ");
+            self.trait_(&mut out, trait_)?;
+            self.args(&mut out, args)?;
+        }
+        Some(out)
+    }
+
     /// An item by where it is written: names do not tell two `impl`s apart.
     fn item(
         &self,
@@ -76,7 +92,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
         file: HirFileId,
         id: ErasedFileAstId,
     ) -> Option<()> {
-        if self.owned.contains(&krate) {
+        // The source of a crate of the workspace changes too, built by the daemon or not.
+        if self.owned.contains(&krate) || krate.data(self.db).origin.is_local() {
             return None;
         }
         write!(out, "{:x}:", self.symbols.stable_crate_id(krate)?).ok()?;

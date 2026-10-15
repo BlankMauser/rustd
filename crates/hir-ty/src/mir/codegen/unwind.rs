@@ -42,7 +42,7 @@ fn address_for_data(data: DataId) -> Address {
 
 /// The frame layout and the landing pads of one compiled function, which do not depend on
 /// where the function ends up.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct FunctionUnwind {
     info: cranelift_codegen::isa::unwind::systemv::UnwindInfo,
     /// The function's `.gcc_except_table` entry.

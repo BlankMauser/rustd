@@ -75,6 +75,7 @@ use super::{
     eval::interpret_mir, monomorphized_promoted_mir_body_query, return_slot,
 };
 
+mod cached;
 mod fragment;
 mod home;
 pub use home::body_file;
@@ -127,6 +128,10 @@ pub trait SymbolResolver {
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    /// Whether the program's rustc build has the symbol, defined or referred to.
+    fn defines(&self, _symbol: &str) -> bool {
+        false
+    }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
     /// The function a type is declared in the body of, when nothing else is around it there
@@ -141,11 +146,17 @@ pub trait SymbolResolver {
         None
     }
     /// Runs `work` for each of `0..count`, on as many threads as there are, each with a
-    /// database of its own. What `work` computes is kept by the queries it asks.
-    fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
+    /// database of its own and this resolver over it. What `work` computes is kept by the
+    /// queries it asks.
+    fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
         _ = (count, work);
     }
 }
+
+/// What an instance is called in every run of the daemon, if anything.
+type StableName = std::sync::Arc<str>;
+
+pub type ParallelWork<'a> = dyn Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OverflowOp {
@@ -335,7 +346,7 @@ impl CodegenUnit {
                     .filter(|root| !denied.contains(root) && !left.contains(root))
                     .filter(|&root| symbols.function(root).is_some())
                     .collect();
-                symbols.in_parallel(ours.len(), &|db, at| _ = compiled_root(db, ours[at]));
+                symbols.in_parallel(ours.len(), &|db, _, at| _ = compiled_root(db, ours[at]));
                 while let Some(&root) = queue.get(next) {
                     next += 1;
                     let result = if denied.contains(&root) {
@@ -369,6 +380,10 @@ impl CodegenUnit {
                 if next == queue.len() {
                     break;
                 }
+            }
+            if cg.misfit {
+                rejected.extend(failed);
+                continue;
             }
             let fallback_start = std::time::Instant::now();
             let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
@@ -412,26 +427,13 @@ impl CodegenUnit {
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
-                if let Some(path) = std::env::var_os("RUSTD_STABLE_NAMES") {
-                    let names = stable::StableNames::new(db, cg.symbols, &cg.own_statics.crates);
-                    let mut all: Vec<String> =
-                        cg.envs.iter().filter_map(|(it, _)| names.instance(it)).collect();
-                    let named = all.len();
-                    all.sort();
-                    all.dedup();
-                    eprintln!(
-                        "stable names: {named} of {} instances, {} distinct",
-                        cg.envs.len(),
-                        all.len()
-                    );
-                    std::fs::write(path, all.join("\n")).ok();
-                }
                 if let Some(store) = store::Store::global() {
                     store.flush();
                     let (hits, misses) = store.take_counts();
                     if hits + misses != 0 {
                         eprintln!("store: {hits} functions found, {misses} compiled and added");
                     }
+                    cg.kept.report();
                 }
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
@@ -783,6 +785,45 @@ struct ObjectCodegen<'a, 'db> {
     source_paths: FxHashMap<base_db::FileId, Option<String>>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
+    names: stable::StableNames<'a, 'db>,
+    stable_names: FxHashMap<Instance, Option<StableName>>,
+    kept: Kept,
+    /// The entries of the store to build from in place of compiling, if any.
+    entries: Option<std::sync::Arc<cached::Entries>>,
+    /// The functions of this object by their stable names.
+    named: FxHashMap<StableName, FuncId>,
+    /// The ones declared for an entry, and those of them yet to be put in the object.
+    found: Vec<(StableName, FuncId)>,
+    found_pending: Vec<(StableName, FuncId)>,
+    named_vtables: FxHashMap<String, DataId>,
+    /// An entry did not fit the object, which now lacks a function it declares.
+    misfit: bool,
+}
+
+/// What became of the instances an object was built from, as entries of the store.
+#[derive(Default)]
+struct Kept {
+    added: usize,
+    found: usize,
+    /// Instances that name something an edit can reach.
+    unnamed: usize,
+    /// Instances that refer to something an entry has no name for.
+    unnamed_requests: usize,
+    /// Entries of the store that differ from what was compiled, with `RUSTD_CACHE_CHECK`.
+    differing: usize,
+    same: usize,
+}
+
+impl Kept {
+    fn report(&self) {
+        let Kept { added, found, unnamed, unnamed_requests, differing, same } = self;
+        if added + found + unnamed + unnamed_requests + differing + same != 0 {
+            eprintln!(
+                "entries: {found} found, {added} added, {same} as stored, {differing} not as stored, \
+                 {unnamed} instances and {unnamed_requests} requests without a stable name"
+            );
+        }
+    }
 }
 
 /// The ids in a module of what a compiled function or static asked for.
@@ -1503,7 +1544,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .map(std::io::BufWriter::new),
             bodies: 0,
             vtables: FxHashMap::default(),
-            own_statics,
             statics: FxHashMap::default(),
             frozen_statics: FxHashMap::default(),
             imported_statics: FxHashMap::default(),
@@ -1511,6 +1551,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             source_paths: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
+            names: stable::StableNames::new(db, symbols, own_statics.crates.clone()),
+            stable_names: FxHashMap::default(),
+            kept: Kept::default(),
+            // A patch gets these from its base, and a check compiles them to compare.
+            entries: store::Store::global()
+                .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
+                .map(|store| std::sync::Arc::new(cached::Entries::new(store))),
+            named: FxHashMap::default(),
+            found: Vec::new(),
+            found_pending: Vec::new(),
+            named_vtables: FxHashMap::default(),
+            misfit: false,
+            own_statics,
         })
     }
 
@@ -1589,11 +1642,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let start = std::time::Instant::now();
         self.compile_ahead();
         self.phases.compile += start.elapsed();
-        while !self.pending.is_empty() {
+        while !self.pending.is_empty() || !self.found_pending.is_empty() {
             // Each wave is compiled on every core, and then put in the object one by one.
             let wave = std::mem::take(&mut self.pending);
             let start = std::time::Instant::now();
-            self.symbols.in_parallel(wave.len(), &|db, at| {
+            self.symbols.in_parallel(wave.len(), &|db, _, at| {
                 let (instance, env, _) = &wave[at];
                 _ = compiled_instance(db, instance.clone(), env.clone());
             });
@@ -1607,6 +1660,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
             }
+            let start = std::time::Instant::now();
+            while let Some((name, id)) = self.found_pending.pop() {
+                if let Err(e) = self.stitch_entry(&name, id) {
+                    eprintln!("entry of `{name}` does not fit: {e}");
+                    cached::Entries::ban(&name);
+                    self.misfit = true;
+                }
+            }
+            self.phases.define += start.elapsed();
         }
         failed
     }
@@ -1636,7 +1698,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let idle = std::sync::Condvar::new();
         let rejected = self.rejected;
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        self.symbols.in_parallel(threads, &|db, _| {
+        let (entries, owned) = (self.entries.as_deref(), &self.own_statics.crates);
+        self.symbols.in_parallel(threads, &|db, symbols, _| {
+            let names = stable::StableNames::new(db, symbols, owned.clone());
+            // What the store has is not compiled, nor looked into for what it calls.
+            let in_store = |callee: &Instance| {
+                let Some(entries) = entries else { return false };
+                names
+                    .instance(callee)
+                    .is_some_and(|name| entries.usable(&name, &|symbol| symbols.defines(symbol)))
+            };
             let mut homes = home::Homes::default();
             let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -1659,7 +1730,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         // A function without generic arguments is a root, called by its symbol.
                         let root = matches!(callee.def, InstanceDef::Fn(_))
                             && callee.args.as_ref().is_empty();
-                        if !root && !rejected.contains_key(callee) {
+                        if !root && !rejected.contains_key(callee) && !in_store(callee) {
                             found.push((callee.clone(), homes.home(db, callee, asked)));
                         }
                     }
@@ -1702,11 +1773,193 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 compiled.code.signature
             );
         }
-        self.stitch(id, compiled)
+        let ids = self.stitch(id, compiled)?;
+        self.keep(instance, compiled, &ids);
+        Ok(())
+    }
+
+    fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
+        if let Some(known) = self.stable_names.get(instance) {
+            return known.clone();
+        }
+        let name = self.names.instance(instance).map(StableName::from);
+        self.stable_names.insert(instance.clone(), name.clone());
+        name
+    }
+
+    /// Adds a stitched instance to the store, when everything it is and refers to has a name
+    /// that another run of the daemon can find it by.
+    fn keep(&mut self, instance: &Instance, compiled: &CompiledFunction, ids: &Resolved) {
+        // What a patch refers to is in its base under names of that one object.
+        let Some(store) = store::Store::global().filter(|_| self.base.is_none()) else { return };
+        let Some(name) = self.stable_name(instance) else {
+            self.kept.unnamed += 1;
+            return;
+        };
+        let Some(key) = cached::Entry::key(&name) else { return };
+        let stored = store.get(&key);
+        let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
+        if stored.is_some() && !check {
+            return;
+        }
+        let Some(entry) = self.entry(instance, compiled, ids) else {
+            self.kept.unnamed_requests += 1;
+            return;
+        };
+        let Some(bytes) = entry.encode() else { return };
+        match stored {
+            None => {
+                store.insert(&key, &bytes);
+                self.kept.added += 1;
+            }
+            Some(stored) if stored == bytes => self.kept.same += 1,
+            Some(stored) => {
+                self.kept.differing += 1;
+                eprintln!("entry of `{name}` is not what was compiled");
+                if let Some(path) = std::env::var_os("RUSTD_CACHE_CHECK").filter(|it| it != "1") {
+                    let at = std::path::Path::new(&path).join(self.kept.differing.to_string());
+                    let was = cached::Entry::decode(stored);
+                    _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
+                }
+            }
+        }
+    }
+
+    fn entry(
+        &mut self,
+        instance: &Instance,
+        compiled: &CompiledFunction,
+        ids: &Resolved,
+    ) -> Option<cached::Entry> {
+        use cached::{CachedData, CachedFunc, CachedTarget};
+        let mut funcs = Vec::with_capacity(ids.funcs.len());
+        for (request, &id) in compiled.requests.funcs.iter().zip(&ids.funcs) {
+            let decl = self.module.declarations().get_function_decl(id);
+            let target = if decl.linkage == Linkage::Import {
+                let symbol = decl.linkage_name(id).into_owned();
+                let checked = self.symbols.defines(&symbol);
+                CachedTarget::Import { symbol, checked }
+            } else if let FuncTarget::Instance(callee, _) = &request.target {
+                CachedTarget::Named(self.stable_name(callee)?.as_ref().to_owned())
+            } else {
+                return None;
+            };
+            funcs.push(CachedFunc { target, sig: request.sig.clone() });
+        }
+        let mut datas = Vec::with_capacity(ids.datas.len());
+        for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
+            datas.push(match request {
+                DataRequest::Blob { blob, identity } => {
+                    CachedData::Blob { blob: blob.clone(), identity: *identity }
+                }
+                DataRequest::Vtable { ty, trait_ref, blob } => {
+                    let trait_ref = trait_ref.as_ref().map(|(id, args)| (*id, args.as_ref()));
+                    let key = self.names.vtable(ty.as_ref(), trait_ref)?;
+                    CachedData::Vtable { key, blob: blob.clone() }
+                }
+                DataRequest::Static(_) => {
+                    let decl = self.module.declarations().get_data_decl(id);
+                    if decl.linkage != Linkage::Import {
+                        return None;
+                    }
+                    CachedData::Static {
+                        symbol: decl.linkage_name(id).into_owned(),
+                        thread_local: decl.tls,
+                    }
+                }
+                DataRequest::Location(at) => CachedData::Location(self.location_at(*at)),
+                DataRequest::FilePath(file) => CachedData::FilePath(self.source_path(*file)?),
+            });
+        }
+        Some(cached::Entry {
+            label: self.callee_name(instance.def).to_owned(),
+            funcs,
+            datas,
+            code: cached::CachedCode::from(&compiled.code),
+        })
+    }
+
+    /// The function of an entry and everything it calls, declared here and to be defined from
+    /// the store. `None` when the store does not have all of it, or `body` is given and is
+    /// not the signature the entry was compiled with.
+    fn found_callee(&mut self, name: &str, body: Option<&Signature>) -> Result<Option<FuncId>> {
+        if let Some(&id) = self.named.get(name) {
+            return Ok(Some(id));
+        }
+        let Some(entries) = self.entries.clone() else { return Ok(None) };
+        let symbols = self.symbols;
+        if !entries.usable(name, &|symbol| symbols.defines(symbol)) {
+            return Ok(None);
+        }
+        let Some(entry) = entries.get(name) else { return Ok(None) };
+        if body.is_some_and(|it| it != entry.code.signature()) {
+            return Ok(None);
+        }
+        let symbol = format!("rustd::{}::n{}", entry.label, self.found.len());
+        let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
+        let id = self
+            .module
+            .declare_function(&symbol, linkage, entry.code.signature())
+            .map_err(|e| CodegenError::Backend(e.to_string()))?;
+        let name = StableName::from(name);
+        self.named.insert(name.clone(), id);
+        self.found.push((name.clone(), id));
+        self.found_pending.push((name, id));
+        Ok(Some(id))
+    }
+
+    /// Defines `id` as the function of an entry, and declares what the entry refers to.
+    fn stitch_entry(&mut self, name: &str, id: FuncId) -> Result<()> {
+        use cached::{CachedData, CachedTarget};
+        let Some(entry) = self.entries.as_ref().and_then(|it| it.get(name)) else {
+            unsupported!("an entry that was in the store is not");
+        };
+        let mut ids = Resolved {
+            funcs: Vec::with_capacity(entry.funcs.len()),
+            datas: Vec::with_capacity(entry.datas.len()),
+        };
+        for func in &entry.funcs {
+            ids.funcs.push(match &func.target {
+                CachedTarget::Import { symbol, .. } => self.import(symbol, &func.sig)?,
+                CachedTarget::Named(callee) => {
+                    let Some(id) = self.found_callee(callee, None)? else {
+                        unsupported!("an entry calls `{callee}`, which the store lacks");
+                    };
+                    id
+                }
+            });
+        }
+        for data in &entry.datas {
+            let id = match data {
+                CachedData::Blob { blob, identity } => {
+                    self.define_data_as(ids.blob(blob), *identity)?
+                }
+                CachedData::Vtable { key, blob } => match self.named_vtables.get(key) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.define_data_as(ids.blob(blob), DataIdentity::Own)?;
+                        self.named_vtables.insert(key.clone(), id);
+                        id
+                    }
+                },
+                CachedData::Static { symbol, thread_local } => {
+                    self.module.declare_data(symbol, Linkage::Import, false, *thread_local)?
+                }
+                CachedData::Location(at) => self.define_location(at.clone())?,
+                CachedData::FilePath(path) => self.define_file_path(path.clone())?,
+            };
+            ids.datas.push(id);
+        }
+        let code = entry.code.code();
+        let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
+        self.define_code(id, &code, &relocs)?;
+        self.bodies += 1;
+        self.kept.found += 1;
+        Ok(())
     }
 
     /// Defines `id` as a compiled function, and declares everything the function refers to.
-    fn stitch(&mut self, id: FuncId, compiled: &CompiledFunction) -> Result<()> {
+    fn stitch(&mut self, id: FuncId, compiled: &CompiledFunction) -> Result<Resolved> {
         let start = std::time::Instant::now();
         let ids = self.resolve(&compiled.requests);
         self.phases.resolve += start.elapsed();
@@ -1720,7 +1973,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.bodies += 1;
         self.phases.define += start.elapsed();
-        Ok(())
+        Ok(ids)
     }
 
     fn shape_origin(
@@ -1876,24 +2129,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let Some(path) = self.source_path(*file) else {
                     unsupported!("`file!()` in a file without a path");
                 };
-                let len = path.len();
-                let path = self.define_const(ConstBlob {
-                    bytes: path.into_bytes(),
-                    relocs: Vec::new(),
-                    fn_relocs: Vec::new(),
-                    align: 1,
-                })?;
-                let mut fat = ConstBlob {
-                    bytes: vec![0; 16],
-                    relocs: Vec::new(),
-                    fn_relocs: Vec::new(),
-                    align: 8,
-                };
-                fat.point_to(0, path, 0);
-                fat.bytes[8..].copy_from_slice(&(len as u64).to_le_bytes());
-                self.define_const(fat)
+                self.define_file_path(path)
             }
         }
+    }
+
+    /// The `&str` that `file!()` is.
+    fn define_file_path(&mut self, path: String) -> Result<DataId> {
+        let len = path.len();
+        let path = self.define_const(ConstBlob {
+            bytes: path.into_bytes(),
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align: 1,
+        })?;
+        let mut fat =
+            ConstBlob { bytes: vec![0; 16], relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
+        fat.point_to(0, path, 0);
+        fat.bytes[8..].copy_from_slice(&(len as u64).to_le_bytes());
+        self.define_const(fat)
     }
 
     fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
@@ -1981,9 +2235,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`).
     // FIXME: the layout of `Location` should come from `layout_of_ty`.
     fn location(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> Result<DataId> {
-        let found = at
-            .and_then(|(owner, span)| *source_location(self.db, owner, span))
-            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)));
+        let found = self.location_at(at);
+        self.define_location(found)
+    }
+
+    fn location_at(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> Option<(String, u32, u32)> {
+        at.and_then(|(owner, span)| *source_location(self.db, owner, span))
+            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
+    }
+
+    /// A `core::panic::Location`, of no place in particular when the place is not known.
+    fn define_location(&mut self, found: Option<(String, u32, u32)>) -> Result<DataId> {
         let (file, line, col) = found.unwrap_or_else(|| ("<rustd>".to_owned(), 0u32, 0u32));
         let mut bytes = vec![0u8; 24];
         bytes[8..16].copy_from_slice(&(file.len() as u64).to_le_bytes());
@@ -2133,6 +2395,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
+        let from_store = self.entries.is_some() || self.base.is_some_and(|it| !it.found.is_empty());
+        let stable = if from_store { self.stable_name(instance) } else { None };
+        if let Some(name) = &stable {
+            if let Some(symbol) = self.base.and_then(|base| base.found.get(name)) {
+                return self.import(symbol, sig);
+            }
+            let body = signature.is_some().then_some(sig);
+            if let Some(id) = self.found_callee(name, body)? {
+                self.instances.insert(instance.clone(), id);
+                return Ok(id);
+            }
+        }
         // A patch is linked with its base, whose names these must not take.
         let env = &self.homes.home(self.db, instance, env);
         let prefix = if self.base.is_some() { "rustd.patch" } else { "rustd" };
@@ -2145,6 +2419,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.instances.insert(instance.clone(), id);
         self.pending.push((instance.clone(), env.clone(), id));
         self.envs.push((instance.clone(), env.clone()));
+        if let Some(name) = stable {
+            self.named.insert(name, id);
+        }
         Ok(id)
     }
 
@@ -2530,7 +2807,7 @@ struct Relocations<'a, 'db> {
 }
 
 /// Whether a data object can be the same object as another with the same content.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum DataIdentity {
     /// Read-only and one object with every equal constant, as the same constant is for rustc
     /// wherever it is named.
@@ -2541,7 +2818,7 @@ enum DataIdentity {
 }
 
 /// Read-only data whose pointers refer to other data objects.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde_derive::Serialize, serde_derive::Deserialize)]
 struct ConstBlob {
     bytes: Vec<u8>,
     relocs: Vec<(u32, DataId, i64)>,

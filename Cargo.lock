@@ -477,6 +477,8 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-control",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1191,6 +1193,7 @@ dependencies = [
  "macros",
  "oorandom",
  "petgraph",
+ "postcard",
  "ra-ap-rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
@@ -1202,6 +1205,7 @@ dependencies = [
  "salsa",
  "serde",
  "serde_derive",
+ "sha2",
  "smallvec",
  "span",
  "stdx",
