@@ -44,6 +44,7 @@ use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 use crate::symbols::SymbolTable;
 
+#[derive(Clone)]
 struct Args {
     project: PathBuf,
     krate: String,
@@ -1315,22 +1316,137 @@ impl Request {
         }
     }
 
-    fn line(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Request::Sync => "sync\n",
-            Request::Patch => "patch\n",
+            Request::Sync => "sync",
+            Request::Patch => "patch",
         }
     }
+}
+
+/// The program of the workspace a request is for, and where its objects go.
+#[derive(Clone)]
+struct Target {
+    krate: String,
+    out: PathBuf,
+    patch: Option<PathBuf>,
+    link_cmd: Option<String>,
+    /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
+    /// that program's own objects, so another has to be told where its copies are. Empty for
+    /// the files the daemon was started with.
+    symbol_files: Vec<PathBuf>,
+}
+
+impl Target {
+    fn of(args: &Args) -> Target {
+        Target {
+            krate: args.krate.clone(),
+            out: args.out.clone(),
+            patch: args.patch.clone(),
+            link_cmd: args.link_cmd.clone(),
+            symbol_files: args.symbol_files.clone(),
+        }
+    }
+
+    fn is(&self, args: &Args) -> bool {
+        self.krate == args.krate && self.out == args.out
+    }
+
+    /// The daemon's arguments, were it started for this program.
+    fn args(self, daemon: &Args) -> Args {
+        let Target { krate, out, patch, link_cmd, symbol_files } = self;
+        let symbol_files =
+            if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
+        let batch = std::iter::once(&daemon.krate)
+            .chain(&daemon.batch)
+            .filter(|&it| *it != krate)
+            .cloned()
+            .collect();
+        Args { krate, batch, out, patch, link_cmd, symbol_files, ..daemon.clone() }
+    }
+
+    /// From what follows the socket on the command line of a client.
+    fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
+        let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
+        let mut symbol_files = Vec::new();
+        while let Some(flag) = flags.next() {
+            let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
+            match flag.as_str() {
+                "--crate" => krate = Some(value),
+                "--out" => out = Some(PathBuf::from(value)),
+                "--patch" => patch = Some(PathBuf::from(value)),
+                "--link-cmd" => link_cmd = Some(value),
+                "--symbols" => symbol_files.push(PathBuf::from(value)),
+                _ => bail!("unexpected argument {flag}"),
+            }
+        }
+        match (krate, out) {
+            (Some(krate), Some(out)) => {
+                Ok(Some(Target { krate, out, patch, link_cmd, symbol_files }))
+            }
+            (None, None) if patch.is_none() && link_cmd.is_none() && symbol_files.is_empty() => {
+                Ok(None)
+            }
+            _ => bail!("a program is named by --crate and --out together"),
+        }
+    }
+
+    /// The fields after the request's name on its line, each after a tab. Empty is absent.
+    fn parse(fields: &[&str]) -> Option<Target> {
+        let &[krate, out, patch, link_cmd, ref symbol_files @ ..] = fields else { return None };
+        let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
+        Some(Target {
+            krate: krate.to_owned(),
+            out: PathBuf::from(out),
+            patch: given(patch).map(PathBuf::from),
+            link_cmd: given(link_cmd),
+            symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    fn fields(&self) -> String {
+        let mut fields = format!(
+            "\t{}\t{}\t{}\t{}",
+            self.krate,
+            self.out.display(),
+            self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.link_cmd.as_deref().unwrap_or_default()
+        );
+        for file in &self.symbol_files {
+            fields.push('\t');
+            fields.push_str(&file.display().to_string());
+        }
+        fields
+    }
+}
+
+/// What the daemon keeps for a program it is not building right now. The code compiled for
+/// one program is there for the others: only the objects and what went into them are its own.
+struct Parked {
+    args: Args,
+    table: SymbolTable,
+    known: Rejections,
+    unbuilt: Unbuilt,
+}
+
+/// What a program's objects are behind by.
+#[derive(Default)]
+struct Unbuilt {
+    /// Files edited since the last build that was not refused.
+    edited: Vec<vfs::FileId>,
+    /// Whether there is anything to build even when no file has changed since.
+    stale: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
 /// line: `ok unchanged`, or `ok patch=PATH ...` when the object at PATH holds the functions that
 /// differ from the first build's, or `ok object=PATH ...` when the whole object was written
 /// again.
-fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
+fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no daemon at {}", socket.display()))?;
-    stream.write_all(request.line().as_bytes())?;
+    let target = target.map(|it| it.fields()).unwrap_or_default();
+    stream.write_all(format!("{}{target}\n", request.name()).as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
@@ -1340,13 +1456,17 @@ fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
 }
 
 /// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<(Request, UnixStream)> {
+fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>, UnixStream)> {
     loop {
         let (stream, _) = listener.accept()?;
         let mut request = String::new();
         BufReader::new(&stream).read_line(&mut request)?;
-        if let Some(request) = Request::parse(request.trim_end()) {
-            return Ok((request, stream));
+        let fields: Vec<&str> = request.trim_end_matches('\n').split('\t').collect();
+        let target = Target::parse(&fields[1..]);
+        if let Some(request) = Request::parse(fields[0])
+            && (fields.len() == 1 || target.is_some())
+        {
+            return Ok((request, target, stream));
         }
         // A client that hangs up before the answer is not the daemon's problem.
         let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
@@ -1357,9 +1477,9 @@ fn main() -> anyhow::Result<()> {
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
     {
-        return ask(request, Path::new(&socket));
+        return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
-    let args = Args::parse()?;
+    let mut args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
@@ -1412,7 +1532,7 @@ fn main() -> anyhow::Result<()> {
     known.patching = args.patch.is_some();
     let mut listed = Listed::default();
     let mut outlines = outline::Outlines::default();
-    let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let cold = build(&db, &table, &args, &mut known, &mut listed)?;
     eprint!("cold: ");
     report(&cold);
@@ -1446,12 +1566,42 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let mut tree = tree::Tree::new(&db, vfs, &sources);
+    // The program asked for when a request names none.
+    let first = Target::of(&args);
+    let mut parked: Vec<Parked> = Vec::new();
+    let mut unbuilt = Unbuilt::default();
     loop {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
+            parked.iter_mut().for_each(|it| it.known.touch(&db, None));
         }
         let client = match &listener {
-            Some(listener) => Some(requested(listener)?),
+            Some(listener) => {
+                let (request, target, stream) = requested(listener)?;
+                let target = target.unwrap_or_else(|| first.clone());
+                if !target.is(&args) {
+                    let next = match parked.iter().position(|it| target.is(&it.args)) {
+                        Some(at) => parked.swap_remove(at),
+                        None => {
+                            let mut known = Rejections::default();
+                            known.patching = target.patch.is_some();
+                            // Never built: every file is as good as edited, but those were
+                            // checked when the programs before it were built.
+                            let unbuilt = Unbuilt { edited: unbuilt.edited.clone(), stale: true };
+                            let args = target.args(&args);
+                            let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                            Parked { args, table, known, unbuilt }
+                        }
+                    };
+                    parked.push(Parked {
+                        args: std::mem::replace(&mut args, next.args),
+                        table: std::mem::replace(&mut table, next.table),
+                        known: std::mem::replace(&mut known, next.known),
+                        unbuilt: std::mem::replace(&mut unbuilt, next.unbuilt),
+                    });
+                }
+                Some((request, stream))
+            }
             None => {
                 std::thread::sleep(Duration::from_millis(5));
                 None
@@ -1495,6 +1645,7 @@ fn main() -> anyhow::Result<()> {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let noticed = noticed.or_else(|| unbuilt.stale.then(|| (Instant::now(), Duration::ZERO)));
         let Some((noticed, age)) = noticed else {
             if let Some((_, client)) = client {
                 let _ = writeln!(&client, "ok unchanged");
@@ -1542,13 +1693,22 @@ fn main() -> anyhow::Result<()> {
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
             known.touch(&db, None);
+            parked.iter_mut().for_each(|it| it.known.touch(&db, None));
             listed.touch(&db, None);
         }
         for path in included {
             db.reload_included_file(&path);
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
-        let edited = sources.clone();
+        for unbuilt in
+            std::iter::once(&mut unbuilt).chain(parked.iter_mut().map(|it| &mut it.unbuilt))
+        {
+            unbuilt.stale |= changed != 0;
+            unbuilt.edited.extend(&sources);
+            unbuilt.edited.sort_unstable();
+            unbuilt.edited.dedup();
+        }
+        let edited = unbuilt.edited.clone();
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
@@ -1556,11 +1716,13 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("bodies only: {file:?}");
                 }
                 known.touch_bodies(file);
+                parked.iter_mut().for_each(|it| it.known.touch_bodies(file));
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
             known.touch(&db, crates);
+            parked.iter_mut().for_each(|it| it.known.touch(&db, crates));
             listed.touch(&db, crates);
         }
         let apply = start.elapsed();
@@ -1593,6 +1755,8 @@ fn main() -> anyhow::Result<()> {
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
+        } else {
+            unbuilt = Unbuilt::default();
         }
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
