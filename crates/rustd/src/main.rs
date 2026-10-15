@@ -754,24 +754,17 @@ struct Listed {
 
 struct ListedCrate {
     functions: Vec<FunctionId>,
-    /// For each, whether it is `main` or something a runtime looks up by name.
-    starts: Vec<bool>,
-    has_main: bool,
+    /// For each, whether a runtime looks it up by name.
+    exported: Vec<bool>,
+    main: Option<FunctionId>,
 }
 
 impl ListedCrate {
     fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
         let functions = functions_of(db, krate);
-        let mut has_main = false;
-        let starts = functions
-            .iter()
-            .map(|&func| {
-                let is_main = hir::Function::from(func).is_main(db);
-                has_main |= is_main;
-                is_main || exported_symbol(db, func).is_some()
-            })
-            .collect();
-        ListedCrate { functions, starts, has_main }
+        let main = functions.iter().copied().find(|&it| hir::Function::from(it).is_main(db));
+        let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
+        ListedCrate { functions, exported, main }
     }
 }
 
@@ -911,21 +904,26 @@ fn build(
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
-    let mut has_main = false;
+    // The `main` of the crate asked for: another program of the workspace among the crates
+    // is only here for what this one uses of it.
+    let mut main = None;
     let mut local = Vec::new();
-    for krate in std::iter::once(&args.krate).chain(&args.batch) {
+    for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
         for krate in crates_named(db, krate)? {
             local.push(krate);
             let listed = listed.of(db, krate);
-            has_main |= listed.has_main;
-            functions.extend(listed.functions.iter().copied().zip(listed.starts.iter().copied()));
+            if at == 0 {
+                main = main.or(listed.main);
+            }
+            functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
         }
     }
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
-    let (entries, on_demand): (Vec<_>, Vec<_>) =
-        functions.into_iter().partition(|&(_, starts)| starts || !has_main);
+    let (entries, on_demand): (Vec<_>, Vec<_>) = functions
+        .into_iter()
+        .partition(|&(func, exported)| exported || main.is_none() || main == Some(func));
     let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
     let (entries, on_demand) = (unzip(entries), unzip(on_demand));
     let roots = Roots { entries: &entries, on_demand: &on_demand };
