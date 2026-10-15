@@ -1069,7 +1069,9 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
 }
 
 /// Asks the daemon listening on `socket` to bring its output up to date with the files on disk,
-/// and waits for it.
+/// and waits for it. The answer is one line: `ok unchanged`, or `ok patch=PATH ...` when the
+/// object at PATH holds the functions that differ from the first build's, or `ok object=PATH
+/// ...` when the whole object was written again.
 fn sync(socket: &Path) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no daemon at {}", socket.display()))?;
@@ -1200,7 +1202,7 @@ fn main() -> anyhow::Result<()> {
         }
         let Some((noticed, age)) = noticed else {
             if let Some(client) = client {
-                let _ = writeln!(&client, "ok: nothing changed");
+                let _ = writeln!(&client, "ok unchanged");
             }
             continue;
         };
@@ -1291,7 +1293,19 @@ fn main() -> anyhow::Result<()> {
         }
         eprintln!("edit-to-binary: {total:.1?}");
         if let Some(client) = client {
-            let _ = writeln!(&client, "ok: {changed} files changed, built in {total:.1?}");
+            // What the caller has to load to be up to date: the functions that differ from the
+            // first object when the edit could be a patch, and all of them when it could not.
+            let (kind, object) = match (&args.patch, known.stats.patched) {
+                (Some(patch), Some(_)) => ("patch", patch),
+                _ => ("object", &args.out),
+            };
+            let _ = writeln!(
+                &client,
+                "ok {kind}={} functions={} files={changed} ms={}",
+                object.display(),
+                known.stats.patched.unwrap_or(known.stats.compiled),
+                total.as_millis()
+            );
         }
     }
 }
