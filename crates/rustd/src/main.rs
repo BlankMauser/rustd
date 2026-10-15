@@ -4,6 +4,11 @@
 mod outline;
 mod symbols;
 
+/// The daemon holds millions of small allocations and frees a file's worth of them on each
+/// edit, which the system allocator is slow at.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use ide_db::base_db::SourceDatabase as _;
 use std::{
     io::{BufRead as _, BufReader, Write as _},

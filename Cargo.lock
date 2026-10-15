@@ -2722,6 +2722,7 @@ dependencies = [
  "hir-ty",
  "ide-db",
  "load-cargo",
+ "mimalloc",
  "object 0.37.3",
  "paths",
  "project-model",
