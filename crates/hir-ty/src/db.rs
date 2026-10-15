@@ -386,14 +386,56 @@ pub struct InternedClosure<'db> {
     pub kind: ClosureKind,
 }
 
+/// What a closure is interned by: its place among the closures of its body. Its expression
+/// moves with every edit of the body before it, and a closure that moved would be another
+/// type, with everything generic over it instantiated again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct ClosureKey<'db> {
+    owner: InferBodyId<'db>,
+    nth: u32,
+    kind: ClosureKind,
+}
+
+impl<'db> ClosureKey<'db> {
+    fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
+        let closures = closure_exprs(db, loc.owner.expression_store_owner(db), ());
+        let nth = closures.partition_point(|&it| it < loc.expr) as u32;
+        ClosureKey { owner: loc.owner, nth, kind: loc.kind }
+    }
+
+    fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+        let closures = closure_exprs(db, self.owner.expression_store_owner(db), ());
+        // A key from before an edit that took closures out of the body names none of them.
+        // Whatever asks about it is not asked for its answer.
+        let expr = closures.get(self.nth as usize).or(closures.last()).copied();
+        let expr = expr.unwrap_or_else(|| ExprId::from_raw(la_arena::RawIdx::from_u32(0)));
+        InternedClosure { owner: self.owner, expr, kind: self.kind }
+    }
+}
+
+/// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
+// The unit makes the arguments something salsa interns: the owner alone is no salsa struct.
+#[salsa::tracked(returns(deref))]
+fn closure_exprs(db: &dyn HirDatabase, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
+    ExpressionStore::of(db, owner)
+        .exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
+        .map(|(id, _)| id)
+        .collect()
+}
+
 #[salsa::interned(constructor = new_impl, debug, revisions = usize::MAX)]
 #[derive(PartialOrd, Ord)]
 pub struct InternedClosureId<'db> {
     #[returns(copy)]
-    pub loc: InternedClosure<'db>,
+    key: ClosureKey<'db>,
 }
 
 impl<'db> InternedClosureId<'db> {
+    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+        self.key(db).loc(db)
+    }
+
     #[inline]
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
@@ -411,7 +453,7 @@ impl<'db> InternedClosureId<'db> {
             );
         }
 
-        Self::new_impl(db, loc)
+        Self::new_impl(db, ClosureKey::new(db, loc))
     }
 }
 
@@ -419,10 +461,14 @@ impl<'db> InternedClosureId<'db> {
 #[derive(PartialOrd, Ord)]
 pub struct InternedCoroutineId<'db> {
     #[returns(copy)]
-    pub loc: InternedClosure<'db>,
+    key: ClosureKey<'db>,
 }
 
 impl<'db> InternedCoroutineId<'db> {
+    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+        self.key(db).loc(db)
+    }
+
     #[inline]
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
@@ -441,7 +487,7 @@ impl<'db> InternedCoroutineId<'db> {
             );
         }
 
-        Self::new_impl(db, loc)
+        Self::new_impl(db, ClosureKey::new(db, loc))
     }
 }
 
@@ -449,10 +495,14 @@ impl<'db> InternedCoroutineId<'db> {
 #[derive(PartialOrd, Ord)]
 pub struct InternedCoroutineClosureId<'db> {
     #[returns(copy)]
-    pub loc: InternedClosure<'db>,
+    key: ClosureKey<'db>,
 }
 
 impl<'db> InternedCoroutineClosureId<'db> {
+    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+        self.key(db).loc(db)
+    }
+
     #[inline]
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
@@ -470,7 +520,7 @@ impl<'db> InternedCoroutineClosureId<'db> {
             );
         }
 
-        Self::new_impl(db, loc)
+        Self::new_impl(db, ClosureKey::new(db, loc))
     }
 }
 
