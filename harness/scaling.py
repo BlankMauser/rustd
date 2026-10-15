@@ -96,7 +96,7 @@ def measure(name, spec, repeat):
                     open(fx.touch, "w").write(new)
                     if socket:
                         reply = subprocess.check_output([RUSTD, os.environ.get("SCALING_REQUEST", "sync"), socket], text=True)
-                        assert reply.startswith("ok patch=" + patch), reply
+                        assert reply.startswith(("ok patch=" + patch, "ok object=" + obj)), reply
                     found = wait(BUILD.pattern, done)
                     done = len(found)
                     b = found[-1]

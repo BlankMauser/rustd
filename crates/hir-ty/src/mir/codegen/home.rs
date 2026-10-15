@@ -6,8 +6,8 @@
 //! on every file of the workspace crate that happened to use it, and give it one cache entry
 //! per crate that does.
 
-use base_db::Crate;
-use hir_def::{CallableDefId, DefWithBodyId, HasModule};
+use base_db::{Crate, FileId};
+use hir_def::{CallableDefId, DefWithBodyId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeSuperVisitable, TypeVisitable, TypeVisitor,
@@ -28,16 +28,20 @@ use super::{Instance, InstanceDef};
 struct Mentions<'db> {
     db: &'db dyn HirDatabase,
     crates: FxHashSet<Crate>,
+    /// The bodies it has the code of or mentions a type of.
+    bodies: Vec<DefWithBodyId>,
     /// It mentions something whose crate we can't tell.
     opaque: bool,
 }
 
 impl<'db> Mentions<'db> {
     fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db> {
-        let mut mentions = Mentions { db, crates: FxHashSet::default(), opaque: false };
+        let mut mentions =
+            Mentions { db, crates: FxHashSet::default(), bodies: Vec::new(), opaque: false };
         match instance.def {
             InstanceDef::Fn(func) => {
                 mentions.crates.insert(func.krate(db));
+                mentions.bodies.push(func.into());
             }
             InstanceDef::Closure(id) => {
                 mentions.owner(InternedClosureId::from_id(id).loc(db).owner)
@@ -68,7 +72,33 @@ impl<'db> Mentions<'db> {
             DefWithBodyId::VariantId(it) => it.krate(self.db),
         };
         self.crates.insert(krate);
+        self.bodies.push(owner);
     }
+}
+
+/// The files with the bodies an instance has the code of or mentions a type of: those of its
+/// function and of the closures, futures and functions it is instantiated with. `None` when
+/// that can't be told.
+pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[FileId]>> {
+    let mentions = Mentions::of(db, instance);
+    if mentions.opaque {
+        return None;
+    }
+    let mut files: Vec<FileId> = mentions.bodies.into_iter().map(|it| body_file(db, it)).collect();
+    files.sort_unstable();
+    files.dedup();
+    Some(files.into())
+}
+
+/// The file a body is written in, which for one a macro makes is where the macro is called.
+pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
+    let file = match body {
+        DefWithBodyId::FunctionId(it) => it.lookup(db).id.file_id,
+        DefWithBodyId::ConstId(it) => it.lookup(db).id.file_id,
+        DefWithBodyId::StaticId(it) => it.lookup(db).id.file_id,
+        DefWithBodyId::VariantId(it) => it.lookup(db).parent.lookup(db).id.file_id,
+    };
+    file.original_file_respecting_includes(db).file_id(db)
 }
 
 impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
@@ -81,7 +111,10 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
             }
             TyKind::FnDef(def, _) => {
                 let krate = match def.0 {
-                    CallableDefId::FunctionId(it) => it.krate(self.db),
+                    CallableDefId::FunctionId(it) => {
+                        self.bodies.push(it.into());
+                        it.krate(self.db)
+                    }
                     CallableDefId::StructId(it) => it.krate(self.db),
                     CallableDefId::EnumVariantId(it) => it.krate(self.db),
                 };

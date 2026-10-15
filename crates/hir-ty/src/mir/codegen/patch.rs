@@ -7,7 +7,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use base_db::Crate;
+use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{FunctionId, HasModule, StaticId};
@@ -19,6 +19,7 @@ use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
     SymbolResolver, TheirStatics, async_blocks, compiled_instance, compiled_root, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
+    home::{body_file, body_files},
     left_to_rustc, source_location, target,
 };
 
@@ -77,6 +78,8 @@ pub(super) struct BaseInstance {
     /// `None` when the base calls rustc's copy and compiling the instance failed.
     mark: Option<Mark>,
     forwarded: bool,
+    /// The files whose bodies it comes from, or `None` when any may be one.
+    files: Option<Box<[FileId]>>,
     /// What in the base refers to it.
     parents: Vec<Node>,
 }
@@ -112,8 +115,9 @@ pub(super) struct Base {
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
     marks: Vec<Mark>,
-    /// The crate of each of `compiled`.
+    /// The crate of each of `compiled`, and the file it is written in.
     crates: Vec<Crate>,
+    files: Vec<FileId>,
     touched: Touched,
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
@@ -124,19 +128,53 @@ pub(super) struct Base {
     pub(super) bodies: usize,
 }
 
-/// The crates an edit since the base was built can have changed the code of. Code compiled as
-/// a crate depends on nothing but the files of that crate and of the ones it depends on.
+/// What an edit since the base was last looked at can have changed the code of, and what
+/// differed from the base then, which does until an edit changes it back. Code compiled as a
+/// crate depends on nothing but the files of that crate and of the ones it depends on. Of a
+/// file where only the bodies of functions changed, and none of them is one that the rest of
+/// the program sees into, it depends on no more than the bodies it comes from.
 #[derive(Default)]
 struct Touched {
     /// The crates that see a file that changed.
     crates: FxHashSet<Crate>,
+    /// The files that changed in the bodies of functions alone.
+    bodies: FxHashSet<FileId>,
     /// A file changed that we can't tell the crates of.
     any: bool,
+    /// What the last look found changed.
+    roots: FxHashSet<FunctionId>,
+    instances: FxHashSet<Instance>,
 }
 
 impl Touched {
     fn reaches(&self, krate: Crate) -> bool {
         self.any || self.crates.contains(&krate)
+    }
+
+    /// Starts over from what a look at the whole base found: the edits before it can have
+    /// changed nothing else.
+    fn settle(&mut self, found: &[Stale]) {
+        // A look that gave up, or that a thread did not come back from, did not get to
+        // everything.
+        if found.is_empty() || found.iter().any(|it| it.declined.is_some()) {
+            return;
+        }
+        *self = Touched::default();
+        for stale in found {
+            self.roots.extend(&stale.roots);
+            self.instances.extend(stale.instances.iter().cloned());
+            self.instances.extend(stale.broken.iter().filter_map(|(node, _)| match node {
+                Node::Instance(instance) => Some(instance.clone()),
+                Node::Root(_) | Node::Static(_) => None,
+            }));
+        }
+    }
+
+    fn reaches_bodies(&self, files: Option<&[FileId]>) -> bool {
+        if self.bodies.is_empty() {
+            return false;
+        }
+        files.is_none_or(|files| files.iter().any(|it| self.bodies.contains(it)))
     }
 }
 
@@ -225,6 +263,7 @@ impl Base {
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark: compiled.map(|it| Mark::new(db, it.serial, &it.requests)),
                     forwarded: cg.forwarded.contains(instance),
+                    files: body_files(db, instance),
                     parents: Vec::new(),
                 };
                 (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
@@ -288,6 +327,7 @@ impl Base {
             compiled: compiled.to_vec(),
             marks,
             crates: compiled.iter().map(|&(root, _)| root.krate(db)).collect(),
+            files: compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect(),
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
@@ -311,6 +351,17 @@ impl Base {
         }
     }
 
+    /// Notes that a file changed in the bodies of functions alone, none of which the rest of
+    /// the program sees into.
+    pub(super) fn touch_bodies(&mut self, file: FileId) {
+        self.touched.bodies.insert(file);
+    }
+
+    /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
+    pub(super) fn settle(&mut self, found: &[Stale]) {
+        self.touched.settle(found);
+    }
+
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
@@ -322,7 +373,9 @@ impl Base {
         let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
         for i in every(self.compiled.len()) {
             let root = self.compiled[i].0;
-            let touched = self.touched.reaches(self.crates[i]);
+            let touched = self.touched.reaches(self.crates[i])
+                || self.touched.reaches_bodies(Some(&[self.files[i]]))
+                || self.touched.roots.contains(&root);
             if !touched && !check_all {
                 continue;
             }
@@ -343,7 +396,9 @@ impl Base {
         }
         stale.steps.roots = start.elapsed();
         for (instance, was) in self.instances.iter().skip(part).step_by(parts) {
-            let touched = self.touched.reaches(was.env.krate);
+            let touched = self.touched.reaches(was.env.krate)
+                || self.touched.reaches_bodies(was.files.as_deref())
+                || self.touched.instances.contains(instance);
             if !touched && !check_all {
                 continue;
             }

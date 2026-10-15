@@ -77,6 +77,7 @@ use super::{
 
 mod fragment;
 mod home;
+pub use home::body_file;
 mod patch;
 mod stable;
 pub use patch::{Stale, StaleSteps};
@@ -575,9 +576,21 @@ impl Rejections {
         }
     }
 
+    /// Notes that a file changed in the bodies of functions alone, none of which the rest of
+    /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
+    /// items, and not handed to a macro.
+    pub fn touch_bodies(&mut self, file: base_db::FileId) {
+        if let Some(base) = &mut self.base {
+            base.touch_bodies(file);
+        }
+    }
+
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
     /// edit in between.
     pub fn set_stale(&mut self, stale: Vec<Stale>) {
+        if let Some(base) = &mut self.base {
+            base.settle(&stale);
+        }
         self.stale = stale;
     }
 

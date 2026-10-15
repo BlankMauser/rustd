@@ -1,6 +1,7 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod outline;
 mod symbols;
 
 use ide_db::base_db::SourceDatabase as _;
@@ -789,25 +790,8 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     let scopes = start.elapsed();
     let count = bodies.len();
     // A body's blocks include those of the blocks in it, but not those of the items in them.
-    // An edit to a file has every body in it lowered again, which is most of the work here, so
-    // each round of bodies is lowered on all threads before it is read.
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     while !bodies.is_empty() {
-        let round = std::mem::take(&mut bodies);
-        std::thread::scope(|threads_scope| {
-            // The bodies of one file are next to each other, and the edited file's are the slow
-            // ones: each thread takes every nth, so that they are spread over all of them.
-            for part in 0..threads.min(round.len()) {
-                let (db, round) = (db.clone(), &round);
-                threads_scope.spawn(move || {
-                    hir::attach_db(&db, || {
-                        for &body in round.iter().skip(part).step_by(threads) {
-                            Body::of(&db, body);
-                        }
-                    })
-                });
-            }
-        });
+        let round = lower(db, std::mem::take(&mut bodies));
         for body in round {
             for (_, def_map) in Body::of(db, body).blocks(db) {
                 for (_, module) in def_map.modules() {
@@ -824,6 +808,27 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
         );
     }
     functions
+}
+
+/// Lowers the bodies on all threads and hands them back. An edit to a file has every body in
+/// it lowered again, which is most of the work of looking through them.
+fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        // The bodies of one file are next to each other, and the edited file's are the slow
+        // ones: each thread takes every nth, so that they are spread over all of them.
+        for part in 0..threads.min(bodies.len()) {
+            let (db, bodies) = (db.clone(), &bodies);
+            scope.spawn(move || {
+                hir::attach_db(&db, || {
+                    for &body in bodies.iter().skip(part).step_by(threads) {
+                        Body::of(&db, body);
+                    }
+                })
+            });
+        }
+    });
+    bodies
 }
 
 struct Build {
@@ -1233,6 +1238,7 @@ fn main() -> anyhow::Result<()> {
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
     let mut listed = Listed::default();
+    let mut outlines = outline::Outlines::default();
     let cold = build(&db, &table, &args, &mut known, &mut listed)?;
     eprint!("cold: ");
     report(&cold);
@@ -1300,6 +1306,7 @@ fn main() -> anyhow::Result<()> {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
+                    outlines.before_edit(&db, &listed, *id);
                     change.change_file(*id, Some(std::fs::read_to_string(path)?));
                     sources.push(*id);
                 }
@@ -1318,7 +1325,16 @@ fn main() -> anyhow::Result<()> {
         for path in included {
             db.reload_included_file(path);
         }
-        for file in sources {
+        // Asked of every file before any is noted: noting one forgets the functions listed.
+        let sources = outlines.after_edit(&db, &listed, sources);
+        for (file, bodies_only) in sources {
+            if bodies_only {
+                if std::env::var_os("RUSTD_STATS").is_some() {
+                    eprintln!("bodies only: {file:?}");
+                }
+                known.touch_bodies(file);
+                continue;
+            }
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
             known.touch(&db, crates);
