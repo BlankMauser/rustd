@@ -304,6 +304,7 @@ impl CodegenUnit {
             patching: _,
             counted,
             stale: _,
+            frozen: _,
         } = known;
         let mut own_statics = OwnStatics::new(
             db,
@@ -550,6 +551,7 @@ pub struct Rejections {
     /// Whether to answer an edit with a patch for the object of the last full build.
     pub patching: bool,
     base: Option<patch::Base>,
+    frozen: patch::Frozen,
     stale: Vec<Stale>,
     /// How many functions had been compiled when the last build finished.
     counted: usize,
@@ -571,6 +573,12 @@ impl Rejections {
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
     /// change since the last build has to be noted before [`Rejections::stale`] looks.
     pub fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+        match crates {
+            Some(crates) => {
+                self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)))
+            }
+            None => self.frozen.edit(base_db::all_crates(db).iter().copied()),
+        }
         if let Some(base) = &mut self.base {
             base.touch(db, crates);
         }
@@ -579,10 +587,18 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, file: base_db::FileId) {
+    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+        self.frozen.edit(base_db::relevant_crates(db, file).iter().copied());
         if let Some(base) = &mut self.base {
             base.touch_bodies(file);
         }
+    }
+
+    /// A function the last build left to rustc that is not what rustc compiled, and why it was
+    /// left. rustc's copies are those of the build the daemon started from: the first call, to
+    /// be made after that build, notes what they are copies of.
+    pub fn out_of_date(&mut self, db: &dyn HirDatabase) -> Option<(FunctionId, String)> {
+        self.frozen.out_of_date(db, self.base.as_ref()?)
     }
 
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
@@ -701,8 +717,9 @@ struct ObjectCodegen<'a, 'db> {
     forwarded: FxHashSet<Instance>,
     /// Whether instances and statics get names another object can refer to.
     patching: bool,
-    /// The object this one is a patch for.
+    /// The object this one is a patch for, and what of it is no longer what the source says.
     base: Option<&'a patch::Base>,
+    replaced: patch::Unchanged,
     /// The statics given a value here, in the order their values were asked for.
     own_static_order: Vec<StaticId>,
     /// Functions compiled only once something refers to them, and the ones referred to since
@@ -844,7 +861,11 @@ fn compiled_instance<'db>(
             });
         }
         InstanceDef::CallOnceShim => {
-            return compile(db, env, None, false, |fx| fx.call_once_shim(ty()));
+            let args = instance.args.as_ref();
+            return compile(db, env, None, false, |fx| match args.len() {
+                1 => fx.call_once_shim(ty()),
+                _ => fx.call_once_by_pointer(args),
+            });
         }
         InstanceDef::FnPointerShim => {
             return compile(db, env, None, false, |fx| fx.fn_pointer_shim(ty()));
@@ -1381,6 +1402,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             forwarded: FxHashSet::default(),
             patching: false,
             base,
+            replaced: Default::default(),
             own_static_order: Vec::new(),
             on_demand,
             wanted: Vec::new(),
@@ -1754,6 +1776,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         if let Some(known) = self.base.and_then(|base| base.statics.get(&id)) {
+            if self.replaced.broken.contains(&patch::Node::Static(id)) {
+                unsupported!("a static of the base changed");
+            }
             let data =
                 self.module.declare_data(&known.symbol, Linkage::Import, known.writable, false)?;
             self.imported_statics.insert(id, data);
@@ -1869,6 +1894,23 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         if let Some(known) = self.base.and_then(|base| base.instances.get(instance)) {
+            let node = patch::Node::Instance(instance.clone());
+            if self.replaced.broken.contains(&node) {
+                unsupported!("callee `{name}`: an instance of the base gained or lost code");
+            }
+            // The base's copy is of the source before the edit.
+            if self.replaced.changed.contains(&node) {
+                let compiled = compiled_instance(self.db, instance.clone(), known.env.clone());
+                let compiled = compiled.as_ref().map_err(Clone::clone)?;
+                let id = self.module.declare_function(
+                    &known.symbol,
+                    Linkage::Hidden,
+                    &compiled.code.signature,
+                )?;
+                self.instances.insert(instance.clone(), id);
+                self.pending.push((instance.clone(), known.env.clone(), id));
+                return Ok(id);
+            }
             return self.import(&known.symbol, sig);
         }
         if let InstanceDef::Fn(func) = def
@@ -5779,8 +5821,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let lang_items = interner.lang_items();
         let fn_methods =
             [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once];
-        if fn_methods.contains(&Some(func)) {
-            return self.vtable_fn_method(self_ty, Some(func) == lang_items.FnOnce_call_once);
+        let once = Some(func) == lang_items.FnOnce_call_once;
+        let written =
+            !matches!(self_ty.kind(), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..));
+        if fn_methods.contains(&Some(func)) && !written {
+            return self.vtable_fn_method(self_ty, once);
+        }
+        // A type with an impl of the trait, as `Box<dyn Fn()>` has: `call_once` takes it by
+        // value, and the slot is called with a pointer to it.
+        if once {
+            let (callee, callee_args, sig, mode) = self.call_once_impl(trait_ref.args)?;
+            if matches!(mode, PassMode::Indirect) {
+                return self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig);
+            }
+            let sig = Self::by_pointer(&sig, mode);
+            return self.cg.callee(InstanceDef::CallOnceShim, trait_ref.args, self.env, &sig);
         }
         if Some(func) == lang_items.FuturePoll
             && let TyKind::Coroutine(id, args) = self_ty.kind()
@@ -6010,6 +6065,56 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let callee =
             self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let results = self.invoke(callee, &params);
+        self.builder.ins().return_(&results);
+        Ok(())
+    }
+
+    /// The `FnOnce::call_once` written for a type, given the type and the tuple of what it
+    /// is called with, and how the function takes the type.
+    fn call_once_impl(
+        &mut self,
+        args: GenericArgs<'db>,
+    ) -> Result<(FunctionId, GenericArgs<'db>, Signature, PassMode)> {
+        let Some(func) = self.interner.lang_items().FnOnce_call_once else {
+            unsupported!("no `FnOnce::call_once`");
+        };
+        let (callee, callee_args) = self.cg.db.lookup_impl_method(self.env, func, args);
+        let either::Either::Left(callee) = callee else {
+            unsupported!("builtin derive method in a vtable");
+        };
+        if !FunctionSignature::of(self.cg.db, callee).has_body() {
+            unsupported!("no impl of `call_once` found for {:?}", args.type_at(0));
+        }
+        let body = self.body_types(InstanceDef::Fn(callee), callee_args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
+            unsupported!("`call_once` without a receiver");
+        };
+        let layout = self.layout(receiver.as_ref())?;
+        let mode = self.pass_mode(&layout, false)?;
+        Ok((callee, callee_args, sig, mode))
+    }
+
+    /// The body of a `CallOnceShim` for a type with an impl of `FnOnce`: calls it with the
+    /// value the shim is handed a pointer to.
+    fn call_once_by_pointer(&mut self, args: GenericArgs<'db>) -> Result<()> {
+        let (callee, callee_args, sig, mode) = self.call_once_impl(args)?;
+        let layout = self.layout(args.type_at(0))?;
+        self.builder.func.signature = Self::by_pointer(&sig, mode);
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let mut params = self.builder.block_params(entry).to_vec();
+        let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
+        let Some(&receiver) = params.get(sret as usize) else {
+            unsupported!("call_once shim for a receiver that is not passed");
+        };
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let mut values = Vec::new();
+        self.pass(mode, receiver, &layout, &mut values);
+        params.splice(sret as usize..sret as usize + 1, values);
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
         Ok(())

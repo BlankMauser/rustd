@@ -46,7 +46,7 @@ impl Mark {
 
 /// Something in the base that an edit can change or take away.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum Node {
+pub(super) enum Node {
     Root(FunctionId),
     Instance(Instance),
     Static(StaticId),
@@ -74,7 +74,7 @@ fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
 }
 
 pub(super) struct BaseInstance {
-    env: StoredParamEnvAndCrate,
+    pub(super) env: StoredParamEnvAndCrate,
     pub(super) symbol: String,
     /// `None` when the base calls rustc's copy and compiling the instance failed.
     mark: Option<Mark>,
@@ -186,6 +186,46 @@ impl Left {
             code: code.map(|it| Mark::new(db, it.serial, &it.requests)),
             async_blocks: async_blocks(db, root).clone(),
         }
+    }
+}
+
+/// The functions left to rustc as rustc compiled them: its copies are not built again while
+/// the daemon runs, so one is only good for as long as its function is what it was then.
+#[derive(Default)]
+pub(in crate::mir) struct Frozen {
+    left: Option<FxHashMap<FunctionId, Left>>,
+    /// The crates that have seen an edit since.
+    edited: FxHashSet<Crate>,
+}
+
+impl Frozen {
+    pub(in crate::mir) fn edit(&mut self, crates: impl IntoIterator<Item = Crate>) {
+        self.edited.extend(crates);
+    }
+
+    /// A function of `base` that rustc's copy is no longer right for, and why.
+    pub(in crate::mir) fn out_of_date(
+        &mut self,
+        db: &dyn HirDatabase,
+        base: &Base,
+    ) -> Option<(FunctionId, String)> {
+        let now = || {
+            let theirs = base.skipped.iter().filter(|it| !matches!(it.1, CodegenError::NoSymbol));
+            theirs.map(|(root, why)| (*root, why))
+        };
+        let Some(left) = &self.left else {
+            self.left = Some(now().map(|(root, _)| (root, Left::of(db, root))).collect());
+            return None;
+        };
+        now().find_map(|(root, why)| {
+            let fresh = match left.get(&root) {
+                // Nothing to tell a change by: any edit that it can see may be one.
+                Some(Left { code: None, .. }) => !self.edited.contains(&root.krate(db)),
+                Some(was) => probe(|| Left::of(db, root)).as_ref() == Some(was),
+                None => false,
+            };
+            (!fresh).then(|| (root, why.to_string()))
+        })
     }
 }
 
@@ -301,9 +341,10 @@ impl Stale {
 }
 
 /// What of the base an edit left as it was: everything but these.
-struct Unchanged {
-    changed: FxHashSet<Node>,
-    broken: FxHashSet<Node>,
+#[derive(Default)]
+pub(super) struct Unchanged {
+    pub(super) changed: FxHashSet<Node>,
+    pub(super) broken: FxHashSet<Node>,
 }
 
 pub(super) struct Patch {
@@ -726,6 +767,8 @@ impl Base {
         let mut cg =
             ObjectCodegen::new(db, symbols, &known.rejected, own_statics, on_demand, Some(self))?;
         cg.phases.compile = verify;
+        // What nothing reached any more can be reached again by the code compiled now.
+        cg.replaced = unchanged;
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];

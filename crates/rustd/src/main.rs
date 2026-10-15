@@ -3,6 +3,7 @@
 
 mod outline;
 mod symbols;
+mod tree;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at.
@@ -1063,7 +1064,36 @@ fn link(args: &Args) -> anyhow::Result<()> {
     let start = Instant::now();
     let status = Command::new("sh").arg("-c").arg(cmd).status()?;
     eprintln!("link: {:.1?} ({status})", start.elapsed());
+    anyhow::ensure!(status.success(), "the link failed ({status})");
     Ok(())
+}
+
+/// Why the source as it is can't be built by the daemon, when it can't.
+fn refusal(
+    db: &RootDatabase,
+    sources: &[vfs::FileId],
+    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    out_of_date: Option<(FunctionId, String)>,
+) -> Option<String> {
+    for &file in sources {
+        let edition = ide_db::base_db::relevant_crates(db, file)
+            .first()
+            .map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
+        let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
+        if let Some(error) = parse.errors().first() {
+            let path = paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
+            let line = db.file_text(file).text(db)[..usize::from(error.range().start())]
+                .matches('\n')
+                .count();
+            return Some(format!("{path}:{}: {error}", line + 1));
+        }
+    }
+    let (func, why) = out_of_date?;
+    let name = hir::Function::from(func).name(db).display(db, syntax::Edition::CURRENT).to_string();
+    Some(format!(
+        "`{name}` is not compiled by rustd and rustc's copy is from before the edit, \
+         build with cargo: {why}"
+    ))
 }
 
 /// A file whose changes the daemon picks up.
@@ -1292,6 +1322,7 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     report_stats(&known.stats);
     link(&args)?;
+    hir::attach_db(&db, || known.out_of_date(&db));
     let listener = match &args.socket {
         Some(path) => {
             // A socket file left by a daemon that is gone can't be bound again.
@@ -1304,6 +1335,14 @@ fn main() -> anyhow::Result<()> {
 
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
+    let sources: Vec<_> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut tree = tree::Tree::new(&db, vfs, &sources);
     loop {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
@@ -1321,19 +1360,34 @@ fn main() -> anyhow::Result<()> {
         // the rest of that write may not change it again. Whoever asks for a build has finished
         // writing, so one pass is enough then.
         let mut touched = FxHashSet::default();
+        // Source files that are no longer there.
+        let mut gone = FxHashSet::default();
         loop {
-            let before = touched.len();
+            // A new file has no timestamp yet, so the pass below takes it for a changed one.
+            for (file, path) in tree.added(&mut db).added {
+                files.push(WatchedFile {
+                    file: Watched::Source(file),
+                    path,
+                    mtime: SystemTime::UNIX_EPOCH,
+                });
+            }
+            let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
                 let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
+                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
+                        touched.remove(&index);
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                    }
                     continue;
                 };
+                gone.remove(&index);
                 if now != file.mtime {
                     file.mtime = now;
                     touched.insert(index);
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
-            if touched.len() == before || client.is_some() {
+            if touched.len() + gone.len() == before || client.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1347,9 +1401,18 @@ fn main() -> anyhow::Result<()> {
         let settled = noticed.elapsed();
         let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
-        let changed = touched.len();
+        let changed = touched.len() + gone.len();
         let mut included = Vec::new();
         let mut sources = Vec::new();
+        let mut removed = Vec::new();
+        for &index in &gone {
+            if let Watched::Source(id) = files[index].file {
+                outlines.before_edit(&db, &listed, id);
+                change.change_file(id, None);
+                sources.push(id);
+                removed.push(id);
+            }
+        }
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
@@ -1358,29 +1421,38 @@ fn main() -> anyhow::Result<()> {
                     change.change_file(*id, Some(std::fs::read_to_string(path)?));
                     sources.push(*id);
                 }
-                Watched::Included(path) => included.push(path),
+                Watched::Included(path) => included.push(path.clone()),
             }
         }
         let read = read.elapsed();
         eprintln!("change: {changed} files");
         let start = Instant::now();
         db.apply_change(change);
+        if !removed.is_empty() {
+            tree.remove(&mut db, &removed);
+            let mut index = 0;
+            files.retain(|_| {
+                index += 1;
+                !gone.contains(&(index - 1))
+            });
+        }
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
             known.touch(&db, None);
             listed.touch(&db, None);
         }
         for path in included {
-            db.reload_included_file(path);
+            db.reload_included_file(&path);
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
+        let edited = sources.clone();
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
-                known.touch_bodies(file);
+                known.touch_bodies(&db, file);
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
@@ -1395,8 +1467,20 @@ fn main() -> anyhow::Result<()> {
         report(&warm);
         report_stats(&known.stats);
         let reported = start.elapsed();
-        if !matches!(client, Some((Request::Patch, _))) {
-            link(&args)?;
+        let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
+        let paths = files
+            .iter()
+            .filter_map(|it| match it.file {
+                Watched::Source(id) => Some((id, it.path.clone())),
+                Watched::Included(_) => None,
+            })
+            .collect();
+        let mut failed = refusal(&db, &edited, &paths, out_of_date);
+        if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
+            failed = link(&args).err().map(|it| it.to_string());
+        }
+        if let Some(why) = &failed {
+            eprintln!("refused: {why}");
         }
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
@@ -1443,6 +1527,10 @@ fn main() -> anyhow::Result<()> {
                 warm.looked.statics,
                 warm.looked.left,
             );
+        }
+        if let (Some((_, client)), Some(why)) = (&client, &failed) {
+            let _ = writeln!(&mut &*client, "error: {}", why.replace('\n', " "));
+            continue;
         }
         if let Some((_, client)) = client {
             // What the caller has to load to be up to date: the functions that differ from the
