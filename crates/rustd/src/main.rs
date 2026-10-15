@@ -941,20 +941,23 @@ impl WatchedFile {
     }
 
     /// Adds the files the last build included that are not watched yet. One is read again once
-    /// its timestamp is taken, so a write between the build's read and now is not lost.
-    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) {
+    /// its timestamp is taken, so a write between the build's read and now is not lost: the
+    /// result is whether there was one.
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
             .included_files()
             .into_iter()
             .filter(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
             .collect();
+        let mut changed = false;
         for path in new {
             if let Some(file) = WatchedFile::new(Watched::Included(path.clone()), path.as_ref()) {
                 files.push(file);
-                db.reload_included_file(&path);
+                changed |= db.reload_included_file(&path);
             }
         }
+        changed
     }
 }
 
@@ -1071,7 +1074,9 @@ fn main() -> anyhow::Result<()> {
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
     loop {
-        WatchedFile::watch_included(&mut files, &mut db);
+        if WatchedFile::watch_included(&mut files, &mut db) {
+            known.touch(&db, None);
+        }
         std::thread::sleep(Duration::from_millis(5));
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -1101,11 +1106,13 @@ fn main() -> anyhow::Result<()> {
         let mut change = ChangeWithProcMacros::default();
         let changed = touched.len();
         let mut included = Vec::new();
+        let mut sources = Vec::new();
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
-                    change.change_file(*id, Some(std::fs::read_to_string(path)?))
+                    change.change_file(*id, Some(std::fs::read_to_string(path)?));
+                    sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path),
             }
@@ -1114,8 +1121,16 @@ fn main() -> anyhow::Result<()> {
         eprintln!("change: {changed} files");
         let start = Instant::now();
         db.apply_change(change);
+        // Asked after the change: a file can have joined a crate with it.
+        if !included.is_empty() {
+            known.touch(&db, None);
+        }
         for path in included {
             db.reload_included_file(path);
+        }
+        for file in sources {
+            let crates = ide_db::base_db::relevant_crates(&db, file);
+            known.touch(&db, (!crates.is_empty()).then_some(crates));
         }
         let apply = start.elapsed();
         let warm = build(&db, &table, &args, &mut known)?;

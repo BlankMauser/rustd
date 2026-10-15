@@ -76,6 +76,7 @@ use super::{
 };
 
 mod fragment;
+mod home;
 mod patch;
 mod stable;
 pub use patch::{Stale, StaleSteps};
@@ -555,6 +556,14 @@ impl Rejections {
         Some(self.base.as_ref()?.stale(db, part, parts))
     }
 
+    /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
+    /// change since the last build has to be noted before [`Rejections::stale`] looks.
+    pub fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+        if let Some(base) = &mut self.base {
+            base.touch(db, crates);
+        }
+    }
+
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
     /// edit in between.
     pub fn set_stale(&mut self, stale: Vec<Stale>) {
@@ -660,6 +669,7 @@ struct ObjectCodegen<'a, 'db> {
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     /// Every instance that went through `pending`.
     envs: Vec<(Instance, StoredParamEnvAndCrate)>,
+    homes: home::Homes,
     /// The instances that call rustc's copy instead of having code of their own.
     forwarded: FxHashSet<Instance>,
     /// Whether instances and statics get names another object can refer to.
@@ -1327,6 +1337,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             instances: FxHashMap::default(),
             pending: Vec::new(),
             envs: Vec::new(),
+            homes: home::Homes::default(),
             forwarded: FxHashSet::default(),
             patching: false,
             base,
@@ -1896,6 +1907,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         // A patch is linked with its base, whose names these must not take.
+        let env = &self.homes.home(self.db, instance, env);
         let prefix = if self.base.is_some() { "rustd.patch" } else { "rustd" };
         let symbol = format!("{prefix}::{name}::{}", self.instances.len());
         let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };

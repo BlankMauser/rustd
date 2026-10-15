@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Edit latency by phase on programs of different sizes, one daemon per program.
+
+usage: scaling.py OUT.json name=WORKSPACE:PACKAGE:CRATE[,CRATE...][:RUN_ARG] ...
+
+For each program: builds it with cargo, starts the daemon on the crates with a patch object and a
+link command, and throws the same edits at it SCALING_REPEAT times each (default 5), every one
+followed by its revert. Edits are made to the file holding `fn main`. The edit that prints is
+checked by running the program. Appends one record per program to OUT.json.
+
+SCALING_LD: a directory holding the `ld` to link with. SCALING_FIXTURE_<name>: a JSON file with
+the `link_args` of a build made elsewhere, with SCALING_SYMBOLS_<name> the symbol arguments.
+"""
+import json, os, re, shlex, statistics, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
+os.environ["RUSTD_STATS"] = "1"
+from difftest import Fixture, RUSTD, sysroot_rlibs
+
+MARK = "rustd-scaling-edit"
+MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
+NEW_FN = "\nfn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
+EDITS = [
+    ("blank line at top", lambda t: "\n" + t),
+    ("comment appended", lambda t: t + "// edit\n"),
+    ("new private fn", lambda t: t + NEW_FN),
+    ("body: unused let", lambda t: MAIN.sub(lambda m: m[0] + "let _rustd_edit = 1u32;\n", t, 1)),
+    ("body: println", lambda t: MAIN.sub(lambda m: m[0] + f'println!("{MARK}");\n', t, 1)),
+]
+BUILD = re.compile(
+    r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*"
+    r"stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?"
+    r"(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)")
+
+
+def measure(name, spec, repeat):
+    ws, package, crates, *run_arg = spec.split(":")
+    crates = crates.split(",")
+    fx = Fixture(ws, crates, ["-p", package])
+    meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=fx.ws))
+    fx.target_args += ["--bin", next(t["name"] for p in meta["packages"] if p["name"] == package
+                                     for t in p["targets"] if "bin" in t["kind"])]
+    if fixture := os.environ.get(f"SCALING_FIXTURE_{name}"):
+        fx.link_args = json.load(open(fixture))["link_args"]
+        symbols = open(os.environ[f"SCALING_SYMBOLS_{name}"]).read().split()
+    else:
+        fx.rustc_build()
+        symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
+    link = list(fx.link_args)
+    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
+    obj, patch, binary = (os.path.join(fx.work, n) for n in ("rustd.o", "rustd.patch.o", "bin-rustd"))
+    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link[link.index("-o") + 1] = binary
+    if (ld := os.environ.get("SCALING_LD")) and "-fuse-ld=lld" in link:
+        link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
+        link[link.index("-fuse-ld=lld")] = "-B" + ld
+    log_path = os.path.join(fx.work, "daemon.log")
+    out, log = open(log_path, "a"), open(log_path)
+    start = time.time()
+    daemon = subprocess.Popen(
+        [RUSTD, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
+         "--out", obj, "--watch", "--patch", patch, "--link-cmd", shlex.join(link), *symbols],
+        stderr=out, stdout=out)
+
+    def wait(pattern, seen):
+        while True:
+            log.seek(0)
+            found = re.findall(pattern, log.read())
+            if len(found) > seen:
+                return found
+            if daemon.poll() is not None:
+                log.seek(0)
+                raise SystemExit(f"{name}: daemon died:\n{log.read()[-3000:]}")
+            time.sleep(0.01)
+
+    original = open(fx.touch).read()
+    samples, done, wrong = [], 0, []
+    try:
+        wait(r"watching \d+ files", 0)
+        warmup = time.time() - start
+        log.seek(0)
+        text = log.read()
+        cold = re.search(r"cold: compiled (\d+) of (\d+) fns \(\+(\d+) instances\)", text)
+        rounds = re.search(r"(\d+) rounds", text)
+        print(f"{name}: warm in {warmup:.1f}s, {cold[1]} of {cold[2]} fns, {cold[3]} instances", flush=True)
+        for turn in range(repeat):
+            for kind, apply in EDITS:
+                edited = apply(original)
+                assert edited != original, (name, kind)
+                for revert, new in ((False, edited), (True, original)):
+                    time.sleep(0.3)
+                    open(fx.touch, "w").write(new)
+                    found = wait(BUILD.pattern, done)
+                    done = len(found)
+                    b = found[-1]
+                    patched = "\npatch: " in log_tail(log)
+                    steps = {k: int(v) / 1000 for k, v in (kv.split("=") for kv in b[7].split())}
+                    samples.append({"edit": kind, "revert": revert, "turn": turn, "steps_ms": steps,
+                                    "recompiled": int(b[5]), "cached": int(b[6]), "patched": patched})
+                    if kind == "body: println":
+                        ran = subprocess.run([binary, *run_arg], capture_output=True, text=True, timeout=60)
+                        if (MARK in ran.stdout) == revert:
+                            wrong.append((turn, revert, ran.stdout[:200]))
+        rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
+    finally:
+        daemon.kill()
+        open(fx.touch, "w").write(original)
+    record = {"name": name, "fns": int(cold[1]), "of": int(cold[2]), "instances": int(cold[3]),
+              "rounds": int(rounds[1]) if rounds else None, "warmup_s": warmup, "rss_mb": rss,
+              "cached": samples[-1]["cached"], "wrong": wrong, "samples": samples, "log": log_path}
+    edits = [s for s in samples if not s["revert"]]
+    ours = [sum(v for k, v in s["steps_ms"].items() if k != "link") for s in edits]
+    print(f"{name}: cached {record['cached']}, non-link median {statistics.median(ours):.0f} ms, "
+          f"link median {statistics.median(s['steps_ms'].get('link', 0) for s in edits):.0f} ms, "
+          f"patched {sum(s['patched'] for s in samples)}/{len(samples)}, wrong output {len(wrong)}", flush=True)
+    return record
+
+
+def log_tail(log):
+    log.seek(0)
+    text = log.read()
+    return text[text.rfind("\nedit (apply"):]
+
+
+def main():
+    out, repeat = sys.argv[1], int(os.environ.get("SCALING_REPEAT", "5"))
+    records = json.load(open(out)) if os.path.exists(out) else []
+    for arg in sys.argv[2:]:
+        name, spec = arg.split("=", 1)
+        records = [r for r in records if r["name"] != name] + [measure(name, spec, repeat)]
+        json.dump(records, open(out, "w"), indent=1)
+
+
+main()

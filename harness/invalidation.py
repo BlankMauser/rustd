@@ -257,6 +257,9 @@ def main():
                 cargo_build()
         log.seek(0)
         text = log.read()
+        # INVALIDATION_LOG: where to keep what the daemon printed.
+        if keep := os.environ.get("INVALIDATION_LOG"):
+            open(keep, "w").write(text)
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
     finally:
         daemon.kill()

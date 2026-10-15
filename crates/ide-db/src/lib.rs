@@ -127,9 +127,9 @@ impl RootDatabase {
     }
 
     /// Reads such a file again, after it changed on disk.
-    pub fn reload_included_file(&mut self, path: &vfs::AbsPath) {
+    pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);
-        files.reload_included_file(self, path);
+        files.reload_included_file(self, path)
     }
 }
 

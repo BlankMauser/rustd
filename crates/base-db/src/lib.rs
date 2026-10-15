@@ -137,12 +137,15 @@ impl Files {
         self.included.iter().map(|it| it.key().clone()).collect()
     }
 
-    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return };
+    /// Reads the file again, and says whether it changed.
+    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
+        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
         let bytes = read_included(path);
-        if *file.bytes(db) != bytes {
+        let changed = *file.bytes(db) != bytes;
+        if changed {
             file.set_bytes(db).to(bytes);
         }
+        changed
     }
 
     /// Source root of the file.

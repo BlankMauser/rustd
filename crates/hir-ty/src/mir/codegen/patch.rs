@@ -7,9 +7,10 @@
 
 use std::hash::{Hash, Hasher};
 
+use base_db::Crate;
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{FunctionId, StaticId};
+use hir_def::{FunctionId, HasModule, StaticId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
@@ -111,6 +112,9 @@ pub(super) struct Base {
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
     marks: Vec<Mark>,
+    /// The crate of each of `compiled`.
+    crates: Vec<Crate>,
+    touched: Touched,
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
     left: Vec<Option<Left>>,
@@ -118,6 +122,22 @@ pub(super) struct Base {
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     pub(super) bodies: usize,
+}
+
+/// The crates an edit since the base was built can have changed the code of. Code compiled as
+/// a crate depends on nothing but the files of that crate and of the ones it depends on.
+#[derive(Default)]
+struct Touched {
+    /// The crates that see a file that changed.
+    crates: FxHashSet<Crate>,
+    /// A file changed that we can't tell the crates of.
+    any: bool,
+}
+
+impl Touched {
+    fn reaches(&self, krate: Crate) -> bool {
+        self.any || self.crates.contains(&krate)
+    }
 }
 
 /// What a look at a part of the base found changed.
@@ -267,6 +287,8 @@ impl Base {
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
             marks,
+            crates: compiled.iter().map(|&(root, _)| root.krate(db)).collect(),
+            touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
             their_statics: TheirStatics::of(db, left_to_rustc(skipped)),
@@ -276,20 +298,44 @@ impl Base {
         })
     }
 
+    /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
+    pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+        let Some(crates) = crates else {
+            self.touched.any = true;
+            return;
+        };
+        for &krate in crates {
+            if !self.touched.crates.contains(&krate) {
+                self.touched.crates.extend(krate.transitive_rev_deps(db));
+            }
+        }
+    }
+
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
         let start = std::time::Instant::now();
         let mut stale = Stale::default();
         let every = |len: usize| (part..len).step_by(parts);
+        // A check of the skipping below: looks at what no edit can have changed too, and says
+        // so if one did.
+        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
         for i in every(self.compiled.len()) {
             let root = self.compiled[i].0;
+            let touched = self.touched.reaches(self.crates[i]);
+            if !touched && !check_all {
+                continue;
+            }
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
                 Some(Mark::new(db, compiled.serial, &compiled.requests))
             });
             match mark {
                 Some(Some(mark)) if mark == self.marks[i] => {}
+                _ if !touched => {
+                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    continue;
+                }
                 Some(Some(_)) => stale.roots.push(root),
                 Some(None) => return stale.declined("a root of the base no longer compiles"),
                 None => return stale.declined("a root of the base is gone"),
@@ -297,12 +343,19 @@ impl Base {
         }
         stale.steps.roots = start.elapsed();
         for (instance, was) in self.instances.iter().skip(part).step_by(parts) {
+            let touched = self.touched.reaches(was.env.krate);
+            if !touched && !check_all {
+                continue;
+            }
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| Mark::new(db, it.serial, &it.requests))
             });
             match mark {
                 Some(mark) if mark == was.mark => {}
+                _ if !touched => {
+                    eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
+                }
                 Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
                 // One that had no code of its own might have now.
                 _ => stale.broken.push((
