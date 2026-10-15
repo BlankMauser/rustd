@@ -17,7 +17,8 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
-    SymbolResolver, TheirStatics, async_blocks, compiled_instance, compiled_root, compiled_static,
+    SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance, compiled_root,
+    compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
     left_to_rustc, source_location, target,
@@ -82,13 +83,91 @@ pub(super) struct BaseInstance {
     files: Option<Box<[FileId]>>,
     /// What in the base refers to it.
     parents: Vec<Node>,
+    /// The functions left to rustc reach it.
+    theirs: bool,
+}
+
+/// An instance the functions left to rustc reach that the base has no code for.
+struct TheirInstance {
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    serial: Option<u64>,
+    files: Option<Box<[FileId]>>,
+}
+
+/// A static the functions left to rustc reach that is rustc's.
+struct TheirStatic {
+    id: StaticId,
+    serial: Option<u64>,
+    krate: Crate,
+    file: FileId,
+}
+
+/// What the walk for [`TheirStatics`] went through, apart from the functions it starts at.
+/// What it finds only changes with the code of one of these.
+#[derive(Default)]
+struct TheirWalk {
+    instances: Vec<TheirInstance>,
+    statics: Vec<TheirStatic>,
+}
+
+impl TheirWalk {
+    /// Marks what of the base the walk went through, and keeps the rest.
+    fn new(
+        db: &dyn HirDatabase,
+        found: &TheirStatics,
+        walked: Walked,
+        instances: &mut FxHashMap<Instance, BaseInstance>,
+        statics: &mut FxHashMap<StaticId, BaseStatic>,
+    ) -> TheirWalk {
+        instances.values_mut().for_each(|it| it.theirs = false);
+        statics.values_mut().for_each(|it| it.theirs = false);
+        let mut walk = TheirWalk::default();
+        let mut seen = FxHashSet::default();
+        for (instance, env) in walked {
+            if let Some(known) = instances.get_mut(&instance)
+                && known.env == env
+            {
+                known.theirs = true;
+                continue;
+            }
+            if !seen.insert((instance.clone(), env.clone())) {
+                continue;
+            }
+            let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+            walk.instances.push(TheirInstance {
+                serial: compiled.map(|it| it.serial),
+                files: body_files(db, &instance),
+                instance,
+                env,
+            });
+        }
+        for &id in &found.statics {
+            if let Some(known) = statics.get_mut(&id) {
+                known.theirs = true;
+                continue;
+            }
+            walk.statics.push(TheirStatic {
+                id,
+                serial: compiled_static(db, id).as_ref().ok().map(|it| it.serial),
+                krate: id.krate(db),
+                file: body_file(db, id.into()),
+            });
+        }
+        walk
+    }
 }
 
 pub(super) struct BaseStatic {
     pub(super) symbol: String,
     pub(super) writable: bool,
     mark: Mark,
+    krate: Crate,
+    /// The file its value is written in.
+    file: FileId,
     parents: Vec<Node>,
+    /// The functions left to rustc reach it.
+    theirs: bool,
 }
 
 /// What a function left to rustc keeps the rest of the build from doing.
@@ -123,6 +202,7 @@ pub(super) struct Base {
     /// For each of `skipped` that rustc has a copy of.
     left: Vec<Option<Left>>,
     their_statics: TheirStatics,
+    their_walk: TheirWalk,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     pub(super) bodies: usize,
@@ -144,6 +224,7 @@ struct Touched {
     /// What the last look found changed.
     roots: FxHashSet<FunctionId>,
     instances: FxHashSet<Instance>,
+    statics: FxHashSet<StaticId>,
 }
 
 impl Touched {
@@ -163,10 +244,13 @@ impl Touched {
         for stale in found {
             self.roots.extend(&stale.roots);
             self.instances.extend(stale.instances.iter().cloned());
-            self.instances.extend(stale.broken.iter().filter_map(|(node, _)| match node {
-                Node::Instance(instance) => Some(instance.clone()),
-                Node::Root(_) | Node::Static(_) => None,
-            }));
+            for (node, _) in &stale.broken {
+                match node {
+                    Node::Instance(instance) => _ = self.instances.insert(instance.clone()),
+                    Node::Static(id) => _ = self.statics.insert(*id),
+                    Node::Root(_) => {}
+                }
+            }
         }
     }
 
@@ -188,6 +272,8 @@ pub struct Stale {
     broken: Vec<(Node, &'static str)>,
     /// Why no patch can hold the change.
     declined: Option<&'static str>,
+    /// Something the functions left to rustc reach changed, so what they reach may have.
+    their_walk_changed: bool,
     pub steps: StaleSteps,
 }
 
@@ -203,13 +289,6 @@ pub struct StaleSteps {
 
 impl Stale {
     /// Declines when the functions the base left to rustc reach other statics than they did.
-    fn their_statics(&mut self, base: &Base, db: &dyn HirDatabase) {
-        let now = probe(|| TheirStatics::of(db, left_to_rustc(&base.skipped)));
-        if now.as_ref() != Some(&base.their_statics) {
-            self.declined = Some("the statics of a function left to rustc changed");
-        }
-    }
-
     fn declined(mut self, why: &'static str) -> Stale {
         self.declined = Some(why);
         self
@@ -265,6 +344,7 @@ impl Base {
                     forwarded: cg.forwarded.contains(instance),
                     files: body_files(db, instance),
                     parents: Vec::new(),
+                    theirs: false,
                 };
                 (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
             })
@@ -279,7 +359,10 @@ impl Base {
                     symbol: decls.get_data_decl(data).linkage_name(data).into_owned(),
                     writable: compiled.writable,
                     mark: Mark::new(db, compiled.serial, &compiled.requests),
+                    krate: id.krate(db),
+                    file: body_file(db, id.into()),
                     parents: Vec::new(),
+                    theirs: false,
                 };
                 Some((id, known))
             })
@@ -322,6 +405,8 @@ impl Base {
             .iter()
             .map(|(root, e)| (!matches!(e, CodegenError::NoSymbol)).then(|| Left::of(db, *root)))
             .collect();
+        let (their_statics, walked) = TheirStatics::walk(db, left_to_rustc(skipped));
+        let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
         Some(Base {
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
@@ -331,7 +416,8 @@ impl Base {
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
-            their_statics: TheirStatics::of(db, left_to_rustc(skipped)),
+            their_statics,
+            their_walk,
             instances,
             statics,
             bodies: cg.bodies,
@@ -358,8 +444,34 @@ impl Base {
     }
 
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
-    pub(super) fn settle(&mut self, found: &[Stale]) {
+    pub(super) fn settle(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
+        self.their_statics(db, found);
         self.touched.settle(found);
+    }
+
+    /// Declines when the functions the base left to rustc reach other statics than they did.
+    /// Walking to them is slow, and nothing changes where the walk goes but the code of what
+    /// it went through.
+    fn their_statics(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
+        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
+        let changed = found.iter().any(|it| it.their_walk_changed);
+        let Some(first) = found.first_mut() else { return };
+        if !changed && !check_all {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let now = probe(|| TheirStatics::walk(db, left_to_rustc(&self.skipped)));
+        match now {
+            Some((now, walked)) if now == self.their_statics => {
+                if changed {
+                    self.their_walk =
+                        TheirWalk::new(db, &now, walked, &mut self.instances, &mut self.statics);
+                }
+            }
+            _ if !changed => eprintln!("check-all: MISSED statics of the functions left to rustc"),
+            _ => first.declined = Some("the statics of a function left to rustc changed"),
+        }
+        first.steps.left += start.elapsed();
     }
 
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
@@ -406,10 +518,14 @@ impl Base {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| Mark::new(db, it.serial, &it.requests))
             });
+            stale.their_walk_changed |= touched
+                && was.theirs
+                && mark.flatten().map(|it| it.serial) != was.mark.map(|it| it.serial);
             match mark {
                 Some(mark) if mark == was.mark => {}
                 _ if !touched => {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
+                    continue;
                 }
                 Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
                 // One that had no code of its own might have now.
@@ -421,23 +537,63 @@ impl Base {
         }
         stale.steps.instances = start.elapsed() - stale.steps.roots;
         for (&id, was) in self.statics.iter().skip(part).step_by(parts) {
+            let touched = self.touched.reaches(was.krate)
+                || self.touched.reaches_bodies(Some(&[was.file]))
+                || self.touched.statics.contains(&id);
+            if !touched && !check_all {
+                continue;
+            }
             let mark = probe(|| {
                 let compiled = compiled_static(db, id).as_ref().ok()?;
                 Some(Mark::new(db, compiled.serial, &compiled.requests))
             });
-            if mark != Some(Some(was.mark)) {
-                stale.broken.push((Node::Static(id), "a static of the base changed"));
+            if mark == Some(Some(was.mark)) {
+                continue;
             }
+            if !touched {
+                eprintln!("check-all: MISSED static {id:?} of {:?}", was.krate);
+                continue;
+            }
+            stale.their_walk_changed |= was.theirs;
+            stale.broken.push((Node::Static(id), "a static of the base changed"));
         }
         stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
         for i in every(self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
-            if probe(|| Left::of(db, self.skipped[i].0)).as_ref() != Some(was) {
+            let root = self.skipped[i].0;
+            let touched = self.touched.reaches(root.krate(db))
+                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]));
+            if !touched && !check_all {
+                continue;
+            }
+            if probe(|| Left::of(db, root)).as_ref() != Some(was) {
+                if !touched {
+                    eprintln!("check-all: MISSED function left to rustc {root:?}");
+                    continue;
+                }
                 return stale.declined("a function left to rustc changed");
             }
         }
-        if part == 0 {
-            stale.their_statics(self, db);
+        for i in every(self.their_walk.instances.len()) {
+            let was = &self.their_walk.instances[i];
+            if !self.touched.reaches(was.env.krate)
+                && !self.touched.reaches_bodies(was.files.as_deref())
+            {
+                continue;
+            }
+            let serial = probe(|| {
+                let compiled = compiled_instance(db, was.instance.clone(), was.env.clone());
+                compiled.as_ref().ok().map(|it| it.serial)
+            });
+            stale.their_walk_changed |= serial != Some(was.serial);
+        }
+        for i in every(self.their_walk.statics.len()) {
+            let was = &self.their_walk.statics[i];
+            if !self.touched.reaches(was.krate) && !self.touched.reaches_bodies(Some(&[was.file])) {
+                continue;
+            }
+            let serial = probe(|| compiled_static(db, was.id).as_ref().ok().map(|it| it.serial));
+            stale.their_walk_changed |= serial != Some(was.serial);
         }
         stale.steps.left =
             start.elapsed() - stale.steps.roots - stale.steps.instances - stale.steps.statics;

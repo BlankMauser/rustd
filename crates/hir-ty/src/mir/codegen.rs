@@ -587,9 +587,9 @@ impl Rejections {
 
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
     /// edit in between.
-    pub fn set_stale(&mut self, stale: Vec<Stale>) {
+    pub fn set_stale(&mut self, db: &dyn HirDatabase, mut stale: Vec<Stale>) {
         if let Some(base) = &mut self.base {
-            base.settle(&stale);
+            base.settle(db, &mut stale);
         }
         self.stale = stale;
     }
@@ -1024,14 +1024,26 @@ struct TheirStatics {
     unknown: FxHashSet<Crate>,
 }
 
+/// The instances the walk for [`TheirStatics`] went through. What it found stays as it is
+/// until the code of one of them, or of a static it found, changes.
+type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
+
 impl TheirStatics {
     /// The functions of a crate are walked together: they mostly reach the same instances.
     fn of(db: &dyn HirDatabase, funcs: impl IntoIterator<Item = FunctionId>) -> TheirStatics {
+        TheirStatics::walk(db, funcs).0
+    }
+
+    fn walk(
+        db: &dyn HirDatabase,
+        funcs: impl IntoIterator<Item = FunctionId>,
+    ) -> (TheirStatics, Walked) {
         let mut by_crate = FxHashMap::<Crate, Vec<FunctionId>>::default();
         for func in funcs {
             by_crate.entry(func.krate(db)).or_default().push(func);
         }
         let mut theirs = TheirStatics::default();
+        let mut walked = Walked::new();
         for (krate, funcs) in by_crate {
             let (mut seen, mut statics) = (FxHashSet::default(), FxHashSet::default());
             let mut complete = true;
@@ -1051,6 +1063,7 @@ impl TheirStatics {
                     {
                         continue;
                     }
+                    walked.push((instance.clone(), env.clone()));
                     match compiled_instance(db, instance.clone(), env.clone()).as_ref() {
                         Ok(compiled) => stack.push(&compiled.requests),
                         Err(_) => complete = false,
@@ -1072,7 +1085,7 @@ impl TheirStatics {
                 theirs.unknown.insert(krate);
             }
         }
-        theirs
+        (theirs, walked)
     }
 }
 

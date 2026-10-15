@@ -14,6 +14,8 @@ os.environ["RUSTD_STATS"] = "1"
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "../target/release/rustd")
 BODY = "let _rustd_edit = 1u32;"
 NEW_FN = "\nfn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
+# The first function in a file that is written plainly.
+PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", re.M)
 
 
 def main():
@@ -40,6 +42,18 @@ def main():
             ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
             ("what `dx doctor --help` prints", f"{cli}/cli/mod.rs", lambda t: t.replace("/// Diagnose installed", "/// Diagnose (edited) installed", 1)),
         ]
+    if "dx" in crates and len(crates) > 1:
+        # The crates of the workspace that dx is built from: edits far from the program's top.
+        def body(t):
+            return PLAIN_FN.sub(lambda m: m[0] + BODY + "\n", t, 1)
+        packages = os.path.join(root, "packages")
+        elsewhere = [("core", f"{core}/virtual_dom.rs"), ("rsx", f"{packages}/rsx/src/element.rs"),
+                     ("autofmt", f"{packages}/autofmt/src/writer.rs"), ("generational-box", f"{packages}/generational-box/src/lib.rs"),
+                     ("html", f"{packages}/html/src/events/mod.rs")]
+        for crate, path in elsewhere:
+            edits.append((f"{crate}: 1 function body", path, body))
+            edits.append((f"{crate}: new private fn", path, lambda t: t + NEW_FN))
+        edits.append(("5 crates and dx: 1 function body each", [path for _, path in elsewhere] + [f"{cli}/rustcwrapper.rs"], body))
     work = os.path.join(root, "work")
     log_path = os.path.join(work, "dxedits.log")
     open(log_path, "w").close()
@@ -93,10 +107,11 @@ def main():
         for turn, (name, path, apply) in enumerate(edits * repeat):
             if only and not any(o in name for o in only.split(",")):
                 continue
-            original = open(path).read()
-            edited = apply(original)
-            assert edited != original, name
-            for label, text in ((name, edited), ("  (revert)", original)):
+            paths = path if isinstance(path, list) else [path]
+            originals = [open(p).read() for p in paths]
+            editeds = [apply(o) for o in originals]
+            assert all(e != o for e, o in zip(editeds, originals)), name
+            for label, texts in ((name, editeds), ("  (revert)", originals)):
                 perf = None
                 if perf_dir and label == name and turn >= len(edits) * (repeat - 1):
                     slug = re.sub(r"\W+", "-", name).strip("-")
@@ -104,7 +119,8 @@ def main():
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
                     time.sleep(1.5)
                 saved = time.time()
-                open(path, "w").write(text)
+                for p, text in zip(paths, texts):
+                    open(p, "w").write(text)
                 if request:
                     reply = subprocess.check_output([RUSTD, request, socket], text=True)
                     print(f"    {reply.strip()}  round trip {(time.time() - saved) * 1000:.0f}ms")
@@ -118,7 +134,7 @@ def main():
                 print(f"{label:38} {'edit-to-binary' if '--patch' in args else 'edit-to-object'} {b[8]:>8}  recompiled {b[5]:>5} of {b[6]}"
                       + (f"  save-to-binary-on-disk {wall:.0f}ms" if wall else ""), flush=True)
                 steps = dict((k, int(v) / 1000) for k, v in (kv.split("=") for kv in b[7].split()))
-                samples.append({"edit": name, "revert": label != name, "wall_ms": wall, "steps_ms": steps, "recompiled": int(b[5]), "profiled": perf is not None})
+                samples.append({"edit": name, "files": len(paths), "revert": label != name, "wall_ms": wall, "steps_ms": steps, "recompiled": int(b[5]), "profiled": perf is not None})
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
                     print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])

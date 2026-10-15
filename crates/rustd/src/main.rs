@@ -911,7 +911,7 @@ fn build(
             .collect();
         parts.into_iter().map(|it| it.join().ok().flatten()).collect()
     });
-    known.set_stale(stale.unwrap_or_default());
+    hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
