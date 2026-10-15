@@ -59,7 +59,7 @@ pub mod proc_macro;
 mod tests;
 
 use std::{
-    hash::{Hash, Hasher},
+    hash::Hash,
     ops::{Deref, DerefMut, Index, IndexMut},
 };
 
@@ -188,8 +188,6 @@ pub struct DefMap {
     pub root: ModuleId,
     /// The modules and their data declared in this crate.
     modules: ModulesSlot,
-    /// A hash of which modules there are.
-    module_set: u64,
     /// The prelude module for this crate. This either comes from an import
     /// marked with the `prelude_import` attribute, or (in the normal case) from
     /// a dependency (`std` or `core`).
@@ -559,7 +557,6 @@ impl DefMap {
             block,
             root,
             modules: ModulesSlot::Building(modules),
-            module_set: 0,
             krate,
             prelude: None,
             macro_use_prelude: FxHashMap::default(),
@@ -580,7 +577,6 @@ impl DefMap {
             krate: _,
             prelude: _,
             data: _,
-            module_set: _,
         } = self;
 
         macro_use_prelude.shrink_to_fit();
@@ -608,15 +604,6 @@ impl DefMap {
                 );
                 module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
             }
-        }
-        // FIXME: with this left out, adding a module leaves everything resolved through the
-        // `DefMap` alone, and `harness/stress.py` then ends on a trait method that is not
-        // resolved to its impl. Until what reads the modules past the database is found, a
-        // `DefMap` is another one when its modules are.
-        if std::env::var_os("RUSTD_FINE_MODULES").is_none() {
-            let mut hasher = rustc_hash::FxHasher::default();
-            modules.iter().for_each(|(id, _)| id.hash(&mut hasher));
-            self.module_set = hasher.finish();
         }
         let modules = Modules::new(db, self.root, std::mem::replace(modules, ModulesMap::new()));
         self.modules = ModulesSlot::Collected(salsa::plumbing::AsId::as_id(&modules));

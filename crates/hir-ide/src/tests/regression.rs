@@ -2392,7 +2392,6 @@ fn test() {
 }
 "#,
         expect![[r#"
-            46..49 'Foo': Foo<_>
             93..97 'self': Foo<N>
             108..125 '{     ...     }': usize
             118..119 'N': usize

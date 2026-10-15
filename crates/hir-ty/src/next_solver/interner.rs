@@ -353,6 +353,8 @@ pub struct DbInterner<'db> {
     pub db: &'db dyn HirDatabase,
     krate: Option<Crate>,
     lang_items: Option<&'db LangItems>,
+    /// Which of the thread's solver caches is this interner's, see [`tls_cache`].
+    solved: tls_cache::Solved,
 }
 
 // FIXME: very wrong, see https://github.com/rust-lang/rust/pull/144808
@@ -368,6 +370,7 @@ impl<'db> DbInterner<'db> {
             db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
             krate: None,
             lang_items: None,
+            solved: tls_cache::Solved::new(),
         })
     }
 
@@ -378,7 +381,7 @@ impl<'db> DbInterner<'db> {
     pub fn new_no_crate(db: &'db dyn HirDatabase) -> Self {
         // We do not reinit the cache here, since anything accessing the cache needs an InferCtxt,
         // and we panic when trying to construct an InferCtxt for an Interner without a crate.
-        DbInterner { db, krate: None, lang_items: None }
+        DbInterner { db, krate: None, lang_items: None, solved: tls_cache::Solved::new() }
     }
 
     pub fn new_with(db: &'db dyn HirDatabase, krate: Crate) -> DbInterner<'db> {
@@ -389,6 +392,7 @@ impl<'db> DbInterner<'db> {
             // As an approximation, when we call `new_with` we're trait solving, therefore we need the lang items.
             // This is also convenient since here we have a starting crate but not in `new_no_crate`.
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
+            solved: tls_cache::Solved::new(),
         }
     }
 
@@ -1049,7 +1053,7 @@ impl<'db> Interner for DbInterner<'db> {
         f: impl FnOnce(&mut rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
     ) -> R {
         // We make sure to reinit the cache when constructing the Interner.
-        tls_cache::borrow_assume_valid(self.db, self.krate, f)
+        tls_cache::borrow_assume_valid(self.db, self.solved, f)
     }
 
     fn canonical_param_env_cache_get_or_insert<R>(
@@ -2519,27 +2523,60 @@ mod tls_cache {
     use crate::db::HirDatabase;
 
     use super::DbInterner;
-    use base_db::{Crate, Nonce};
-    use rustc_hash::FxHashMap;
+    use base_db::Nonce;
     use rustc_type_ir::search_graph::GlobalCache;
     use salsa::Revision;
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    /// Names the cache of one interner. A solved goal is only good for where it was solved:
+    /// which impls there are to pick from depends on the crate, and what was read to solve it
+    /// was noted for the query that asked. Another query handed the answer would not be run
+    /// again when an impl changes. An interner does not leave the query that made it, so the
+    /// goals solved through it are kept for it alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Solved(u64);
+
+    impl Solved {
+        pub(super) fn new() -> Solved {
+            // Not one count per thread: an interner can be sent to another.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            Solved(NEXT.fetch_add(1, Ordering::Relaxed))
+        }
+    }
+
+    /// How many interners have their goals kept: the ones of the queries under way, as a
+    /// query that solves makes one and asks other queries that make theirs.
+    const KEPT: usize = 32;
 
     struct Cache {
-        /// One per crate solved in: which impls there are to pick from depends on the crate,
-        /// and nothing in a goal says which it is.
-        caches: FxHashMap<Option<Crate>, GlobalCache<DbInterner<'static>>>,
+        /// The last to be used is the last.
+        caches: Vec<(Solved, GlobalCache<DbInterner<'static>>)>,
         revision: Revision,
         db_nonce: Nonce,
     }
 
     impl Cache {
         fn default() -> Cache {
-            Cache {
-                caches: FxHashMap::default(),
-                revision: Revision::max(),
-                db_nonce: Nonce::invalid(),
+            Cache { caches: Vec::new(), revision: Revision::max(), db_nonce: Nonce::invalid() }
+        }
+
+        fn of(&mut self, solved: Solved) -> &mut GlobalCache<DbInterner<'static>> {
+            match self.caches.iter().rposition(|it| it.0 == solved) {
+                Some(at) => {
+                    let found = self.caches.remove(at);
+                    self.caches.push(found);
+                }
+                None => {
+                    if self.caches.len() == KEPT {
+                        self.caches.remove(0);
+                    }
+                    self.caches.push((solved, GlobalCache::default()));
+                }
             }
+            &mut self.caches.last_mut().expect("one was just put there").1
         }
     }
 
@@ -2551,7 +2588,7 @@ mod tls_cache {
         GLOBAL_CACHE.with_borrow_mut(|handle| {
             let (db_nonce, revision) = db.nonce_and_revision();
             if handle.revision != revision || db_nonce != handle.db_nonce {
-                *handle = Cache { caches: FxHashMap::default(), revision, db_nonce };
+                *handle = Cache { caches: Vec::new(), revision, db_nonce };
             }
         })
     }
@@ -2559,7 +2596,7 @@ mod tls_cache {
     #[inline]
     pub(super) fn borrow_assume_valid<'db, T>(
         db: &'db dyn HirDatabase,
-        krate: Option<Crate>,
+        solved: Solved,
         f: impl FnOnce(&mut GlobalCache<DbInterner<'db>>) -> T,
     ) -> T {
         if cfg!(debug_assertions) {
@@ -2577,7 +2614,7 @@ mod tls_cache {
                 std::mem::transmute::<
                     &mut GlobalCache<DbInterner<'static>>,
                     &mut GlobalCache<DbInterner<'db>>,
-                >(handle.caches.entry(krate).or_default())
+                >(handle.of(solved))
             })
         })
     }
