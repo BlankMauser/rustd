@@ -326,6 +326,15 @@ impl CodegenUnit {
             let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
             let mut next = 0;
             loop {
+                // Every core compiles the roots found so far, before they are put in the
+                // object one by one.
+                let ours: Vec<FunctionId> = queue[next..]
+                    .iter()
+                    .copied()
+                    .filter(|root| !denied.contains(root) && !left.contains(root))
+                    .filter(|&root| symbols.function(root).is_some())
+                    .collect();
+                symbols.in_parallel(ours.len(), &|db, at| _ = compiled_root(db, ours[at]));
                 while let Some(&root) = queue.get(next) {
                     next += 1;
                     let result = if denied.contains(&root) {
@@ -457,6 +466,7 @@ impl CodegenUnit {
                     instances,
                 });
             }
+            cg.poison_callers(&mut failed);
             rejected.extend(failed);
         }
     }
@@ -730,6 +740,8 @@ struct ObjectCodegen<'a, 'db> {
     /// Every instance that went through `pending`.
     envs: Vec<(Instance, StoredParamEnvAndCrate)>,
     homes: home::Homes,
+    /// What [`Self::compile_ahead`] has compiled or tried to.
+    ahead: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
     /// The instances that call rustc's copy instead of having code of their own.
     forwarded: FxHashSet<Instance>,
     /// Whether instances and statics get names another object can refer to.
@@ -814,19 +826,36 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| {
-            let mut flags = settings::builder();
-            flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-            flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
-            flags.set("opt_level", "none").map_err(|e| e.to_string())?;
-            flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
-            isa::lookup_by_name("x86_64-unknown-linux-gnu")
-                .map_err(|e| e.to_string())?
-                .finish(settings::Flags::new(flags))
-                .map_err(|e| e.to_string())
-        })
+        .get_or_init(|| target_with("backtracking"))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
+}
+
+/// The same target for a function of more than [`LARGE`] instructions. The usual register
+/// allocator takes more than linear time: ten seconds for one of 150 000 instructions, which
+/// a whole build then waits for.
+fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
+    static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
+        std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| target_with("single_pass"))
+        .as_ref()
+        .map_err(|e| CodegenError::Backend(e.clone()))
+}
+
+const LARGE: usize = 50_000;
+
+fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
+    let mut flags = settings::builder();
+    flags.set("is_pic", "true").map_err(|e| e.to_string())?;
+    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
+    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+    flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
+    flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
+    isa::lookup_by_name("x86_64-unknown-linux-gnu")
+        .map_err(|e| e.to_string())?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| e.to_string())
 }
 
 /// How many functions went through Cranelift since the process started.
@@ -1296,7 +1325,7 @@ fn compile<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-    let code = emit(isa, &mut ctx)?;
+    let code = emit(&mut ctx)?;
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(CompiledFunction { requests, code, layouts })
@@ -1350,7 +1379,9 @@ fn build<'db>(
 
 /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
 /// (i128 corners, for one); that must cost us one function, not the process.
-fn emit(isa: &dyn isa::TargetIsa, ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    let large = ctx.func.dfg.num_insts() > LARGE;
+    let isa = &**if large { target_for_large()? } else { target()? };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.compile(isa, &mut Default::default()).map_err(|e| format!("{:?}", e.inner))?;
         let Some(compiled) = ctx.compiled_code() else {
@@ -1436,6 +1467,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             pending: Vec::new(),
             envs: Vec::new(),
             homes: home::Homes::default(),
+            ahead: FxHashSet::default(),
             forwarded: FxHashSet::default(),
             patching: false,
             base,
@@ -1541,6 +1573,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
     fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
+        let start = std::time::Instant::now();
+        self.compile_ahead();
+        self.phases.compile += start.elapsed();
         while !self.pending.is_empty() {
             // Each wave is compiled on every core, and then put in the object one by one.
             let wave = std::mem::take(&mut self.pending);
@@ -1561,6 +1596,72 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
         }
         failed
+    }
+
+    /// Compiles what is pending and everything it calls, on every core. A thread goes on to
+    /// what an instance calls as soon as that instance is compiled, where the waves of
+    /// [`Self::define_instances`] each wait for their slowest function. What this compiles
+    /// that the object has no use for is only wasted.
+    fn compile_ahead(&mut self) {
+        // A patch calls the base's copy of most of what it reaches.
+        if self.base.is_some() || self.pending.is_empty() {
+            return;
+        }
+        struct Ahead {
+            queue: Vec<(Instance, StoredParamEnvAndCrate)>,
+            seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
+            working: usize,
+        }
+        let mut seen = std::mem::take(&mut self.ahead);
+        let queue: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(instance, env, _)| (instance.clone(), env.clone()))
+            .filter(|it| seen.insert(it.clone()))
+            .collect();
+        let ahead = std::sync::Mutex::new(Ahead { queue, seen, working: 0 });
+        let idle = std::sync::Condvar::new();
+        let rejected = self.rejected;
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        self.symbols.in_parallel(threads, &|db, _| {
+            let mut homes = home::Homes::default();
+            let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                let Some((instance, env)) = state.queue.pop() else {
+                    if state.working == 0 {
+                        idle.notify_all();
+                        return;
+                    }
+                    state = idle.wait(state).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                state.working += 1;
+                drop(state);
+                let mut found = Vec::new();
+                if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
+                    for request in &compiled.requests.funcs {
+                        let FuncTarget::Instance(callee, asked) = &request.target else {
+                            continue;
+                        };
+                        // A function without generic arguments is a root, called by its symbol.
+                        let root = matches!(callee.def, InstanceDef::Fn(_))
+                            && callee.args.as_ref().is_empty();
+                        if !root && !rejected.contains_key(callee) {
+                            found.push((callee.clone(), homes.home(db, callee, asked)));
+                        }
+                    }
+                }
+                state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                state.working -= 1;
+                for it in found {
+                    if state.seen.insert(it.clone()) {
+                        state.queue.push(it);
+                    }
+                }
+                idle.notify_all();
+            }
+        });
+        self.ahead = ahead.into_inner().unwrap_or_else(|e| e.into_inner()).seen;
     }
 
     fn define_instance(
@@ -1705,7 +1806,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Compiles a function built here, whose IR names what it uses by the ids of the module.
     fn define_shim(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
-        let mut code = emit(self.module.isa(), ctx)?;
+        let mut code = emit(ctx)?;
         for reloc in &mut code.relocs {
             if let ModuleRelocTarget::FunctionOffset(_, offset) = reloc.name {
                 reloc.name = ModuleRelocTarget::FunctionOffset(id, offset);
@@ -1917,15 +2018,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
-        let name = match def {
-            InstanceDef::Fn(_) => signature.map_or("", |it| it.name.as_str()),
-            InstanceDef::Closure(_) => "{closure}",
-            InstanceDef::Coroutine(_) => "{async}",
-            InstanceDef::DropGlue => "drop_in_place",
-            InstanceDef::CallOnceShim => "call_once",
-            InstanceDef::FnPointerShim => "{closure}::fn_pointer",
-            InstanceDef::ReifyShim { .. } => "{reify}",
-        };
+        let name = self.callee_name(def);
         if let Some(Rejected { why, .. }) = self.rejected.get(instance) {
             unsupported!("callee `{name}`: {why}");
         }
@@ -2040,6 +2133,56 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.pending.push((instance.clone(), env.clone(), id));
         self.envs.push((instance.clone(), env.clone()));
         Ok(id)
+    }
+
+    fn callee_name(&self, def: InstanceDef) -> &'db str {
+        match def {
+            InstanceDef::Fn(func) => FunctionSignature::of(self.db, func).name.as_str(),
+            InstanceDef::Closure(_) => "{closure}",
+            InstanceDef::Coroutine(_) => "{async}",
+            InstanceDef::DropGlue => "drop_in_place",
+            InstanceDef::CallOnceShim => "call_once",
+            InstanceDef::FnPointerShim => "{closure}::fn_pointer",
+            InstanceDef::ReifyShim { .. } => "{reify}",
+        }
+    }
+
+    /// Adds to `failed` the instances that call one of them, and so on up: the next round
+    /// would reject those, and the round after it their callers. One missed here only costs
+    /// that round.
+    fn poison_callers(&self, failed: &mut Vec<(Instance, Rejected)>) {
+        if failed.is_empty() {
+            return;
+        }
+        let mut callers: FxHashMap<&Instance, Vec<usize>> = FxHashMap::default();
+        for (at, (instance, env)) in self.envs.iter().enumerate() {
+            let Ok(compiled) = compiled_instance(self.db, instance.clone(), env.clone()).as_ref()
+            else {
+                continue;
+            };
+            for request in &compiled.requests.funcs {
+                if let FuncTarget::Instance(callee, _) = &request.target {
+                    callers.entry(callee).or_default().push(at);
+                }
+            }
+        }
+        let mut seen: FxHashSet<Instance> = failed.iter().map(|it| it.0.clone()).collect();
+        let mut next = 0;
+        while let Some((callee, Rejected { why, .. })) = failed.get(next) {
+            next += 1;
+            let why = format!("callee `{}`: {why}", self.callee_name(callee.def));
+            for &at in callers.get(callee).into_iter().flatten() {
+                let (caller, env) = &self.envs[at];
+                // rustc's copy stands in for one of these, which its callers then call.
+                let forwarded = self.forwarded.contains(caller)
+                    || matches!(caller.def, InstanceDef::Fn(func) if self
+                        .instance_path(func, caller.args.as_ref())
+                        .is_some_and(|path| self.symbols.path(&path).is_some()));
+                if !forwarded && seen.insert(caller.clone()) {
+                    failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
+                }
+            }
+        }
     }
 
     /// Makes `id` a call of the copy of `instance` rustc compiled, when there is one: an
