@@ -3344,22 +3344,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("async body of {ty:?}");
                 };
                 let upvars = args.as_coroutine().tupled_upvars_ty().tuple_fields().len();
-                let frame = CoroutineFrame { upvars, locals: body.locals.len() };
+                let held = body.locals_held_across_yields(|local| {
+                    has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
+                        != DropGlue::None
+                });
+                let frame = CoroutineFrame { upvars, locals: held.locals.len() };
                 let addr = self.builder.ins().load(PTR, MEM, self.locals[receiver].addr, 0);
-                Some((frame, self.layout(ty)?, addr, ty))
+                Some((frame, self.layout(ty)?, addr, ty, held))
             }
             None => None,
         };
         let in_frame = |this: &mut Self, field: usize| {
-            let (_, layout, addr, _) = frame.as_ref().expect("frame");
+            let (_, layout, addr, ..) = frame.as_ref().expect("frame");
             this.builder.ins().iadd_imm(*addr, layout.fields.offset(field).bytes() as i64)
         };
-        let held = match &frame {
-            Some(_) => Some(body.locals_held_across_yields(|local| {
-                has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
-                    != DropGlue::None
-            })),
-            None => None,
+        // Where a local is among the ones the future keeps, when it is one.
+        let held_at = |local: LocalId| {
+            let (.., held) = frame.as_ref()?;
+            held.locals.binary_search(&local).ok()
         };
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local) {
@@ -3367,9 +3369,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             let layout = self.layout(data.ty.as_ref())?;
             if let Some((frame, ..)) = &frame
-                && held.as_ref().is_some_and(|it| it.contains(local))
+                && let Some(at) = held_at(local)
             {
-                let addr = in_frame(self, frame.local(local.into_raw().into_u32() as usize));
+                let addr = in_frame(self, frame.local(at));
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 continue;
             }
@@ -3405,10 +3407,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let is_param = body.param_locals.contains(&local);
-            let flag = match &frame {
-                Some((frame, ..)) if !is_param => {
-                    let flag =
-                        in_frame(self, frame.drop_flag(local.into_raw().into_u32() as usize));
+            // A local that holds nothing when the body yields is not live then either: its
+            // flag starts cleared at every `poll`.
+            let flag = match (&frame, held_at(local)) {
+                (Some((frame, ..)), Some(at)) if !is_param => {
+                    let flag = in_frame(self, frame.drop_flag(at));
                     frame_flags.push(flag);
                     flag
                 }
@@ -3462,7 +3465,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let state = frame.as_ref().map(|(frame, ..)| frame.state()).map(|it| in_frame(self, it));
         match (frame, state) {
-            (Some((_, layout, addr, ty)), Some(state)) => {
+            (Some((_, layout, addr, ty, _)), Some(state)) => {
                 let resumes: Vec<BasicBlockId> = body
                     .basic_blocks
                     .iter()

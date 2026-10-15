@@ -13,6 +13,7 @@ os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).
 os.environ["RUSTD_STATS"] = "1"
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "../target/release/rustd")
 BODY = "let _rustd_edit = 1u32;"
+ASYNC_MAIN = "async fn main() -> ExitCode {\n"
 NEW_FN = "\nfn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
 # The first function in a file that is written plainly.
 PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", re.M)
@@ -41,6 +42,9 @@ def main():
             ("new private fn", f"{cli}/build/builder.rs", lambda t: t + NEW_FN),
             ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
             ("what `dx doctor --help` prints", f"{cli}/cli/mod.rs", lambda t: t.replace("/// Diagnose installed", "/// Diagnose (edited) installed", 1)),
+            # `main` is an `async fn`: tokio's functions are instantiated with its future.
+            ("async main: a statement", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    std::hint::black_box(1u32);\n", 1)),
+            ("async main: a local", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    " + BODY + "\n", 1)),
         ]
     if "dx" in crates and len(crates) > 1:
         # The crates of the workspace that dx is built from: edits far from the program's top.

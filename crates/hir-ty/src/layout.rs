@@ -392,14 +392,16 @@ pub fn layout_of_ty_query(
                 if used.contains(&id) {
                     let layout = db.layout_of_ty(body.locals[id].ty.clone(), trait_env.clone())?;
                     if layout.size.bytes() != 0 {
-                        in_frame.push((at, id, layout.size, layout.align));
+                        in_frame.push((at, layout.size, layout.align));
                     }
                 }
             }
-            for _ in body.locals.iter() {
+            // Only the held locals have a part in the layout: a body that changes in what it
+            // does between two yields keeps its layout, and so does everything that holds it.
+            for _ in &held.locals {
                 fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
             }
-            fields.extend(body.locals.iter().map(|_| word.clone()));
+            fields.extend(held.locals.iter().map(|_| word.clone()));
             fields.push(word);
             let fields = fields.iter().collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
@@ -409,7 +411,7 @@ pub fn layout_of_ty_query(
             layout.backend_repr = BackendRepr::Memory { sized: true };
             // The largest first, each at the lowest offset clear of the ones it can't share
             // memory with.
-            in_frame.sort_by_key(|&(at, _, size, align)| {
+            in_frame.sort_by_key(|&(at, size, align)| {
                 (std::cmp::Reverse(size), std::cmp::Reverse(align.abi), at)
             });
             let FieldsShape::Arbitrary { offsets, .. } = &mut layout.fields else {
@@ -417,7 +419,7 @@ pub fn layout_of_ty_query(
             };
             let start = layout.size;
             let mut placed: Vec<(usize, Size, Size)> = Vec::new();
-            for &(at, id, size, align) in &in_frame {
+            for &(at, size, align) in &in_frame {
                 let mut taken: Vec<(Size, Size)> = placed
                     .iter()
                     .filter(|&&(other, ..)| held.conflict(at, other))
@@ -431,8 +433,7 @@ pub fn layout_of_ty_query(
                     }
                 }
                 placed.push((at, offset, offset + size));
-                let field = first_local + id.into_raw().into_u32() as usize;
-                offsets[RustcFieldIdx::new(field)] = offset;
+                offsets[RustcFieldIdx::new(first_local + at)] = offset;
                 layout.size = layout.size.max(offset + size);
                 layout.align = layout.align.max(align);
             }
@@ -675,8 +676,9 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
 }
 
 /// Where an `async` block keeps what has to survive from one `poll` to the next, as fields of
-/// its layout that follow the captures: every local of its body, a word of drop flags for each
-/// of those, and a word saying where the body left off.
+/// its layout that follow the captures: the locals of its body that may hold a value when it
+/// yields, in the order of `HeldLocals`, a word of drop flags for each of those, and a word
+/// saying where the body left off.
 #[derive(Debug, Clone, Copy)]
 pub struct CoroutineFrame {
     pub upvars: usize,
