@@ -405,6 +405,53 @@ impl SymbolResolver for Resolver<'_> {
         self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
     }
 
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+        let adt = hir::Adt::from(adt);
+        let sema = hir::Semantics::new(self.db);
+        let source = sema.source(adt)?;
+        let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
+        let func = ast::Fn::cast(around.find(is_definition)?)?;
+        // The body of an `async fn` is a closure to rustc.
+        if func.async_token().is_some() {
+            return None;
+        }
+        let name = adt.name(self.db);
+        let named_so = func.syntax().descendants().filter_map(ast::Name::cast).filter(|it| {
+            it.text() == name.as_str()
+                && it.syntax().parent().is_some_and(|it| {
+                    ast::Adt::can_cast(it.kind())
+                        || ast::Trait::can_cast(it.kind())
+                        || ast::TypeAlias::can_cast(it.kind())
+                        || ast::Module::can_cast(it.kind())
+                })
+        });
+        if named_so.count() != 1 {
+            return None;
+        }
+        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+    }
+
+    fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
+        use hir::HasSource;
+        let db = self.db;
+        let it = hir::Impl::from(id);
+        let source = it.source(db)?;
+        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
+        if source.file_id.is_macro() {
+            return None;
+        }
+        let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
+        let mut earlier = 0;
+        for other in it.module(db).impl_defs(db) {
+            let other = other.source(db)?;
+            if other.file_id != source.file_id {
+                return None;
+            }
+            earlier += u32::from(start(&other) < start(&source));
+        }
+        Some(earlier)
+    }
+
     fn static_(&self, id: StaticId) -> Option<String> {
         let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
             return None;

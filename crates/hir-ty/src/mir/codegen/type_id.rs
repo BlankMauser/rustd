@@ -54,6 +54,7 @@ impl FromStableHash for Fingerprint {
 /// rustc's `DefPathData`, as far as types are named through it.
 #[derive(Clone, Copy)]
 enum DefPathData<'a> {
+    Impl,
     TypeNs(&'a str),
     ValueNs(&'a str),
     Ctor,
@@ -67,9 +68,16 @@ impl Fingerprint {
 
     /// `DefKey::compute_stable_hash`, for a child no sibling shares its name with.
     fn child(self, data: DefPathData<'_>) -> Self {
+        self.child_at(data, 0)
+    }
+
+    /// `DefKey::compute_stable_hash`, for the child that `earlier` siblings of the same name
+    /// come before.
+    fn child_at(self, data: DefPathData<'_>, earlier: u32) -> Self {
         let mut hasher = StableSipHasher128::new();
         hasher.write_u64(self.1);
         let (discriminant, name) = match data {
+            DefPathData::Impl => (1, None),
             DefPathData::TypeNs(name) => (5, Some(name)),
             DefPathData::ValueNs(name) => (6, Some(name)),
             DefPathData::Ctor => (10, None),
@@ -80,7 +88,7 @@ impl Fingerprint {
             hasher.write(name.as_bytes());
             hasher.write_u8(0xff);
         }
-        hasher.write_u32(0);
+        hasher.write_u32(earlier);
         let Fingerprint(local, _) = hasher.finish();
         Fingerprint(self.0, local)
     }
@@ -154,7 +162,29 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             AdtId::UnionId(it) => &UnionSignature::of(db, it).name,
             AdtId::EnumId(it) => &EnumSignature::of(db, it).name,
         };
-        Some(self.module(adt.module(db))?.child(DefPathData::TypeNs(name.as_str())))
+        let module = adt.module(db);
+        let parent = if module.is_block_module(db) {
+            self.body_path(self.symbols.declared_in(adt)?)?
+        } else {
+            self.module(module)?
+        };
+        Some(parent.child(DefPathData::TypeNs(name.as_str())))
+    }
+
+    /// A function that the items of its body are children of.
+    fn body_path(&self, func: FunctionId) -> Option<Fingerprint> {
+        let db = self.db;
+        let parent = match func.lookup(db).container {
+            ItemContainerId::ImplId(id) => {
+                let earlier = self.symbols.impl_place(id)?;
+                self.module(id.lookup(db).container)?.child_at(DefPathData::Impl, earlier)
+            }
+            ItemContainerId::ModuleId(module) => self.module(module)?,
+            ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
+            ItemContainerId::ExternBlockId(_) => return None,
+        };
+        let name = &FunctionSignature::of(db, func).name;
+        Some(parent.child(DefPathData::ValueNs(name.as_str())))
     }
 
     fn assoc_type_path(&self, alias: TypeAliasId) -> Option<Fingerprint> {
@@ -675,8 +705,12 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     hasher.write_isize(1);
                     self.crate_root(krate)?.hash(hasher);
                 }
-                Visibility::Module(module, _) => {
+                Visibility::Module(mut module, _) => {
                     hasher.write_isize(1);
+                    // What is private to a body is to rustc private to the module around it.
+                    while module.is_block_module(db) {
+                        module = module.containing_module(db)?;
+                    }
                     self.module(module)?.hash(hasher);
                 }
             }

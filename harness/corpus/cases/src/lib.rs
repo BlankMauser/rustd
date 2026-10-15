@@ -3257,6 +3257,45 @@ pub mod type_id_hashes {
         ]
     }
 
+    pub struct BodyHolder;
+    pub trait BodyMaker {
+        fn make() -> TypeId;
+    }
+    impl BodyHolder {
+        fn inherent() -> TypeId {
+            struct Local(#[allow(dead_code)] u8);
+            TypeId::of::<Local>()
+        }
+    }
+    impl BodyMaker for BodyHolder {
+        fn make() -> TypeId {
+            struct Local;
+            TypeId::of::<Local>()
+        }
+    }
+    impl BodyMaker for u8 {
+        fn make() -> TypeId {
+            enum Local {
+                #[allow(dead_code)]
+                A,
+            }
+            TypeId::of::<Local>()
+        }
+    }
+
+    /// Types declared in bodies, and one of the standard library's that only a body names.
+    pub fn in_bodies() -> (Vec<TypeId>, bool, String) {
+        struct InFn(#[allow(dead_code)] u8);
+        let ids = vec![
+            TypeId::of::<InFn>(),
+            BodyHolder::inherent(),
+            <BodyHolder as BodyMaker>::make(),
+            <u8 as BodyMaker>::make(),
+        ];
+        let error: Box<dyn std::error::Error + Send + Sync> = String::from("boxed").into();
+        (ids, error.is::<std::fmt::Error>(), error.to_string())
+    }
+
     pub fn downcasts() -> (Option<u8>, Option<String>, bool, bool) {
         let boxed: Box<dyn Any> = Box::new(7u8);
         let error: Box<dyn std::error::Error + Send + Sync> = Box::new(std::fmt::Error);

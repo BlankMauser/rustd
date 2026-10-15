@@ -127,6 +127,17 @@ pub trait SymbolResolver {
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
+    /// The function a type is declared in the body of, when nothing else is around it there
+    /// and no other type of the body has its name.
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+        _ = adt;
+        None
+    }
+    /// How many `impl`s of its module rustc numbers before this one.
+    fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
+        _ = id;
+        None
+    }
     /// Runs `work` for each of `0..count`, on as many threads as there are, each with a
     /// database of its own. What `work` computes is kept by the queries it asks.
     fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
@@ -3968,7 +3979,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
-        let writable = flags.contains(StaticFlags::MUTABLE) || !self.is_freeze(allocation.ty);
+        // Nothing can be written to a static of no size.
+        let writable = !allocation.memory.is_empty()
+            && (flags.contains(StaticFlags::MUTABLE) || !self.is_freeze(allocation.ty));
         Ok((self.allocation_blob(allocation, true)?, writable))
     }
 

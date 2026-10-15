@@ -236,6 +236,7 @@ fn main() {
     println!("type_names {:?}", cases::type_id_hashes::type_names());
     println!("type_ids projections {:?}", cases::type_id_hashes::projections());
     println!("type_ids more_std_types {:?}", cases::type_id_hashes::more_std_types());
+    println!("type_ids in_bodies {:?}", cases::type_id_hashes::in_bodies());
     println!("type_names {:?}", cases::type_names::run());
     println!("type_names nested {:#?}", cases::type_names::nested());
     println!("repeated statics {:?}", cases::repeated_statics::twice());
