@@ -554,13 +554,19 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
     place_in_definition(sema, closure, &is_closure)
 }
 
-fn crate_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Crate> {
-    Crate::all(db)
+/// The crates called `krate`: a package's library and its binary may share the name, and both
+/// are being built.
+fn crates_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<Crate>> {
+    let mut found: Vec<_> = Crate::all(db)
         .into_iter()
         .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
-        // A dependency may be another version of the crate being built.
-        .min_by_key(|it| !it.origin(db).is_local())
-        .with_context(|| format!("crate {krate} not found in workspace"))
+        .collect();
+    // A dependency may be another version of the crate being built.
+    if found.iter().any(|it| it.origin(db).is_local()) {
+        found.retain(|it| it.origin(db).is_local());
+    }
+    anyhow::ensure!(!found.is_empty(), "crate {krate} not found in workspace");
+    Ok(found)
 }
 
 /// Resolves the names and collects the impls of the crates being built and of everything they
@@ -635,8 +641,10 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
     for name in std::iter::once(&args.krate).chain(&args.batch) {
-        let krate: ide_db::base_db::Crate = crate_named(db, name)?.into();
-        crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
+        for krate in crates_named(db, name)? {
+            let krate: ide_db::base_db::Crate = krate.into();
+            crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
+        }
     }
     // A crate comes before its dependencies in the list, and a thread that starts on one
     // waits for the threads working on what it depends on.
@@ -802,7 +810,9 @@ fn build(
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     for krate in std::iter::once(&args.krate).chain(&args.batch) {
-        functions.extend_from_slice(listed.of(db, crate_named(db, krate)?));
+        for krate in crates_named(db, krate)? {
+            functions.extend_from_slice(listed.of(db, krate));
+        }
     }
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
@@ -1068,14 +1078,41 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Asks the daemon listening on `socket` to bring its output up to date with the files on disk,
-/// and waits for it. The answer is one line: `ok unchanged`, or `ok patch=PATH ...` when the
-/// object at PATH holds the functions that differ from the first build's, or `ok object=PATH
-/// ...` when the whole object was written again.
-fn sync(socket: &Path) -> anyhow::Result<()> {
+/// What a client asks of the daemon, as the one line it sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// Bring the objects and the linked program up to date with the files on disk.
+    Sync,
+    /// Bring the objects up to date and leave the linking to the client, which loads the
+    /// patch object into a program that is running.
+    Patch,
+}
+
+impl Request {
+    fn parse(line: &str) -> Option<Request> {
+        match line {
+            "sync" => Some(Request::Sync),
+            "patch" => Some(Request::Patch),
+            _ => None,
+        }
+    }
+
+    fn line(self) -> &'static str {
+        match self {
+            Request::Sync => "sync\n",
+            Request::Patch => "patch\n",
+        }
+    }
+}
+
+/// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
+/// line: `ok unchanged`, or `ok patch=PATH ...` when the object at PATH holds the functions that
+/// differ from the first build's, or `ok object=PATH ...` when the whole object was written
+/// again.
+fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no daemon at {}", socket.display()))?;
-    stream.write_all(b"sync\n")?;
+    stream.write_all(request.line().as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
@@ -1085,13 +1122,13 @@ fn sync(socket: &Path) -> anyhow::Result<()> {
 }
 
 /// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<UnixStream> {
+fn requested(listener: &UnixListener) -> anyhow::Result<(Request, UnixStream)> {
     loop {
         let (stream, _) = listener.accept()?;
         let mut request = String::new();
         BufReader::new(&stream).read_line(&mut request)?;
-        if request.trim_end() == "sync" {
-            return Ok(stream);
+        if let Some(request) = Request::parse(request.trim_end()) {
+            return Ok((request, stream));
         }
         // A client that hangs up before the answer is not the daemon's problem.
         let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
@@ -1099,10 +1136,10 @@ fn requested(listener: &UnixListener) -> anyhow::Result<UnixStream> {
 }
 
 fn main() -> anyhow::Result<()> {
-    if let Some(("sync", socket)) =
-        std::env::args().nth(1).as_deref().zip(std::env::args().nth(2).as_deref())
+    if let Some((request, socket)) =
+        std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
     {
-        return sync(Path::new(socket));
+        return ask(request, Path::new(&socket));
     }
     let args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1201,7 +1238,7 @@ fn main() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
         let Some((noticed, age)) = noticed else {
-            if let Some(client) = client {
+            if let Some((_, client)) = client {
                 let _ = writeln!(&client, "ok unchanged");
             }
             continue;
@@ -1247,7 +1284,9 @@ fn main() -> anyhow::Result<()> {
         report(&warm);
         report_stats(&known.stats);
         let reported = start.elapsed();
-        link(&args)?;
+        if !matches!(client, Some((Request::Patch, _))) {
+            link(&args)?;
+        }
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
             let [roots, revalidate, compile] = warm.steps;
@@ -1292,7 +1331,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("timeline-us: {}", steps.join(" "));
         }
         eprintln!("edit-to-binary: {total:.1?}");
-        if let Some(client) = client {
+        if let Some((_, client)) = client {
             // What the caller has to load to be up to date: the functions that differ from the
             // first object when the edit could be a patch, and all of them when it could not.
             let (kind, object) = match (&args.patch, known.stats.patched) {
