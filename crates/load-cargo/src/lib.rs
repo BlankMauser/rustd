@@ -100,6 +100,20 @@ pub fn load_workspace_into_db(
     load_config: &LoadCargoConfig,
     db: &mut RootDatabase,
 ) -> anyhow::Result<(vfs::Vfs, Option<ProcMacroClient>)> {
+    load_workspaces_into_db(vec![ws], extra_env, load_config, db)
+}
+
+/// Loads several workspaces into one database. A crate that is the same in two of them, as
+/// the dependencies of two checkouts of a project are, is one crate of the database.
+///
+/// The proc-macro server is that of the first workspace's toolchain.
+pub fn load_workspaces_into_db(
+    workspaces: Vec<ProjectWorkspace>,
+    extra_env: &FxHashMap<String, Option<String>>,
+    load_config: &LoadCargoConfig,
+    db: &mut RootDatabase,
+) -> anyhow::Result<(vfs::Vfs, Option<ProcMacroClient>)> {
+    let ws = workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
@@ -144,17 +158,23 @@ pub fn load_workspace_into_db(
         }
     }
 
-    let (crate_graph, proc_macros) = ws.to_crate_graph(
-        &mut |path: &AbsPath| {
-            let contents = loader.load_sync(path);
-            let path = vfs::VfsPath::from(path.to_path_buf());
-            vfs.set_file_contents(path.clone(), contents);
-            vfs.file_id(&path).and_then(|(file_id, excluded)| {
-                (excluded == vfs::FileExcluded::No).then_some(file_id)
-            })
-        },
-        extra_env,
-    );
+    let mut crate_graph = CrateGraphBuilder::default();
+    let mut proc_macros = FxHashMap::default();
+    for ws in &workspaces {
+        let (other, mut paths) = ws.to_crate_graph(
+            &mut |path: &AbsPath| {
+                let contents = loader.load_sync(path);
+                let path = vfs::VfsPath::from(path.to_path_buf());
+                vfs.set_file_contents(path.clone(), contents);
+                vfs.file_id(&path).and_then(|(file_id, excluded)| {
+                    (excluded == vfs::FileExcluded::No).then_some(file_id)
+                })
+            },
+            extra_env,
+        );
+        crate_graph.extend(other, &mut paths);
+        proc_macros.extend(paths);
+    }
     let proc_macros = {
         let proc_macro_server = match &proc_macro_server {
             Some(Ok(it)) => Ok(it),
@@ -180,7 +200,7 @@ pub fn load_workspace_into_db(
             .collect()
     };
 
-    let project_folders = ProjectFolders::new(std::slice::from_ref(&ws), &[], None);
+    let project_folders = ProjectFolders::new(&workspaces, &[], None);
     loader.set_config(vfs::loader::Config {
         load: project_folders.load,
         watch: vec![],

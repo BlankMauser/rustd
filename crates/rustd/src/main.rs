@@ -30,10 +30,10 @@ use hir_ty::mir::codegen::{
     CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspaces_into_db};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource,
+    RustLibSource, TargetDirectoryConfig,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -72,6 +72,12 @@ struct Args {
     cfg_test: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
+    /// Other checkouts of projects to load into the same database, for requests that name
+    /// one as their `--project`. What they have in common with `project` is there once.
+    also: Vec<PathBuf>,
+    /// The root of the workspace `project` is in. Another checkout has crates of the same
+    /// names, and the ones to build are the ones below this.
+    checkout: PathBuf,
 }
 
 impl Args {
@@ -100,6 +106,7 @@ impl Args {
         let mut isolate = None;
         let mut cfg_test = false;
         let mut features = Vec::new();
+        let mut also = Vec::new();
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -115,6 +122,7 @@ impl Args {
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
+                "--also" => also.push(PathBuf::from(value()?)),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
@@ -135,6 +143,8 @@ impl Args {
             isolate,
             cfg_test,
             features,
+            also,
+            checkout: PathBuf::new(),
         })
     }
 }
@@ -192,10 +202,7 @@ impl Resolver<'_> {
 
     /// The file the crate's source starts at.
     fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
-        let file = krate.root_file(self.db);
-        let source_root = self.db.file_source_root(file).source_root_id(self.db);
-        let source_root = self.db.source_root(source_root).source_root(self.db);
-        Some(PathBuf::from(source_root.path_for_file(&file)?.as_path()?.to_string()))
+        crate_root_file(self.db, krate)
     }
 
     fn item_path(&self, module: Module, name: &str) -> Option<String> {
@@ -626,17 +633,30 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 
 /// The crates called `krate`: a package's library and its binary may share the name, and both
 /// are being built.
-fn crates_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<Crate>> {
+/// The crates called `krate` that a build of the checkout at `checkout` compiles.
+fn crates_named(db: &RootDatabase, krate: &str, checkout: &Path) -> anyhow::Result<Vec<Crate>> {
     let mut found: Vec<_> = Crate::all(db)
         .into_iter()
         .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
         .collect();
-    // A dependency may be another version of the crate being built.
-    if found.iter().any(|it| it.origin(db).is_local()) {
-        found.retain(|it| it.origin(db).is_local());
+    // A dependency may be another version of the crate being built, and another checkout
+    // has a crate of its name too.
+    let of_checkout = |krate: &Crate| {
+        krate.origin(db).is_local()
+            && crate_root_file(db, *krate).is_some_and(|it| it.starts_with(checkout))
+    };
+    if found.iter().any(of_checkout) {
+        found.retain(of_checkout);
     }
     anyhow::ensure!(!found.is_empty(), "crate {krate} not found in workspace");
     Ok(found)
+}
+
+fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
+    let file = krate.root_file(db);
+    let source_root = db.file_source_root(file).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    Some(PathBuf::from(source_root.path_for_file(&file)?.as_path()?.to_string()))
 }
 
 /// Resolves the names and collects the impls of the crates being built and of everything they
@@ -644,10 +664,55 @@ fn crates_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<Crate>> {
 /// `load_workspace_at`, with each package's features those of a build of the package at
 /// `project` alone, as the artifacts we link against were built.
 fn load(
+    projects: &[&Path],
+    cargo_config: &CargoConfig,
+    load_config: &LoadCargoConfig,
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts, impl Sized + use<>)> {
+    // The checkouts after the first run their build scripts where the first did. A dependency
+    // is then told the same `OUT_DIR` in each, which it has to be to be one crate for all.
+    let mut cargo_config = cargo_config.clone();
+    let mut workspaces = Vec::new();
+    for project in projects {
+        let workspace = workspace_at(project, &cargo_config, load_config)?;
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
+            && cargo_config.target_dir_config == TargetDirectoryConfig::None
+        {
+            let target: &paths::Utf8Path = cargo.target_directory().as_ref();
+            cargo_config.target_dir_config = TargetDirectoryConfig::Directory(target.to_owned());
+        }
+        workspaces.push(workspace);
+    }
+    let mut checkouts = Checkouts::default();
+    for (project, workspace) in projects.iter().zip(&workspaces) {
+        let root = PathBuf::from(workspace.workspace_root().to_string());
+        checkouts.roots.push((std::fs::canonicalize(project)?, root));
+    }
+    let mut db = RootDatabase::new(None);
+    let (vfs, proc_macros) =
+        load_workspaces_into_db(workspaces, &cargo_config.extra_env, load_config, &mut db)?;
+    Ok((db, vfs, checkouts, proc_macros))
+}
+
+/// The checkouts the daemon has loaded.
+#[derive(Default)]
+struct Checkouts {
+    /// The project a build names, and the root of the workspace it is in.
+    roots: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Checkouts {
+    fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
+        let project = std::fs::canonicalize(project)?;
+        let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
+        root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
+    }
+}
+
+fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, impl Sized + use<>)> {
+) -> anyhow::Result<ProjectWorkspace> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
@@ -668,7 +733,22 @@ fn load(
         let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
         workspace.set_build_scripts(build_scripts);
     }
-    load_workspace(workspace, &cargo_config.extra_env, load_config)
+    Ok(workspace)
+}
+
+/// What the checkouts loaded have in common, and what holding them costs.
+fn report_sharing(db: &RootDatabase) {
+    let crates = Crate::all(db);
+    let local = crates.iter().filter(|it| it.origin(db).is_local()).count();
+    let resident = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+        let line = status.lines().find_map(|it| it.strip_prefix("VmRSS:"))?;
+        line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()
+    });
+    eprintln!(
+        "sharing: {} crates, {local} of the checkouts' own, {} MB",
+        crates.len(),
+        resident.map_or(0, |it| it / 1024)
+    );
 }
 
 /// The features of each package, by name and version, in a build of the package of `manifest`.
@@ -714,7 +794,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
     for name in std::iter::once(&args.krate).chain(&args.batch) {
-        for krate in crates_named(db, name)? {
+        for krate in crates_named(db, name, &args.checkout)? {
             let krate: ide_db::base_db::Crate = krate.into();
             crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
         }
@@ -917,7 +997,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        for krate in crates_named(db, krate)? {
+        for krate in crates_named(db, krate, &args.checkout)? {
             local.push(krate);
             let listed = listed.of(db, krate);
             if at == 0 {
@@ -1283,6 +1363,8 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             isolate: None,
             cfg_test: args.cfg_test,
             features: args.features.clone(),
+            also: Vec::new(),
+            checkout: args.checkout.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
@@ -1334,6 +1416,8 @@ impl Request {
 /// The program of the workspace a request is for, and where its objects go.
 #[derive(Clone)]
 struct Target {
+    /// The checkout it is a program of. `None` is the one the daemon was started in.
+    project: Option<PathBuf>,
     krate: String,
     out: PathBuf,
     patch: Option<PathBuf>,
@@ -1347,6 +1431,7 @@ struct Target {
 impl Target {
     fn of(args: &Args) -> Target {
         Target {
+            project: Some(args.project.clone()),
             krate: args.krate.clone(),
             out: args.out.clone(),
             patch: args.patch.clone(),
@@ -1360,8 +1445,10 @@ impl Target {
     }
 
     /// The daemon's arguments, were it started for this program.
-    fn args(self, daemon: &Args) -> Args {
-        let Target { krate, out, patch, link_cmd, symbol_files } = self;
+    fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
+        let Target { project, krate, out, patch, link_cmd, symbol_files } = self;
+        let project = project.unwrap_or_else(|| daemon.project.clone());
+        let checkout = checkouts.root_of(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = std::iter::once(&daemon.krate)
@@ -1369,17 +1456,29 @@ impl Target {
             .filter(|&it| *it != krate)
             .cloned()
             .collect();
-        Args { krate, batch, out, patch, link_cmd, symbol_files, ..daemon.clone() }
+        Ok(Args {
+            project,
+            checkout,
+            krate,
+            batch,
+            out,
+            patch,
+            link_cmd,
+            symbol_files,
+            ..daemon.clone()
+        })
     }
 
     /// From what follows the socket on the command line of a client.
     fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
+        let mut project = None;
         let mut symbol_files = Vec::new();
         while let Some(flag) = flags.next() {
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--crate" => krate = Some(value),
+                "--project" => project = Some(PathBuf::from(value)),
                 "--out" => out = Some(PathBuf::from(value)),
                 "--patch" => patch = Some(PathBuf::from(value)),
                 "--link-cmd" => link_cmd = Some(value),
@@ -1389,9 +1488,14 @@ impl Target {
         }
         match (krate, out) {
             (Some(krate), Some(out)) => {
-                Ok(Some(Target { krate, out, patch, link_cmd, symbol_files }))
+                Ok(Some(Target { project, krate, out, patch, link_cmd, symbol_files }))
             }
-            (None, None) if patch.is_none() && link_cmd.is_none() && symbol_files.is_empty() => {
+            (None, None)
+                if patch.is_none()
+                    && link_cmd.is_none()
+                    && symbol_files.is_empty()
+                    && project.is_none() =>
+            {
                 Ok(None)
             }
             _ => bail!("a program is named by --crate and --out together"),
@@ -1400,9 +1504,12 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[krate, out, patch, link_cmd, ref symbol_files @ ..] = fields else { return None };
+        let &[project, krate, out, patch, link_cmd, ref symbol_files @ ..] = fields else {
+            return None;
+        };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
         Some(Target {
+            project: given(project).map(PathBuf::from),
             krate: krate.to_owned(),
             out: PathBuf::from(out),
             patch: given(patch).map(PathBuf::from),
@@ -1413,7 +1520,8 @@ impl Target {
 
     fn fields(&self) -> String {
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}",
+            self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.krate,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
@@ -1529,7 +1637,10 @@ fn main() -> anyhow::Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (mut db, vfs, _proc_macro) = load(&args.project, &cargo_config, &load_config)?;
+    let projects: Vec<&Path> =
+        std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
+    let (mut db, vfs, checkouts, _proc_macro) = load(&projects, &cargo_config, &load_config)?;
+    args.checkout = checkouts.root_of(&args.project)?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
     if args.out.is_dir() {
@@ -1539,6 +1650,16 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let resolved = resolve_crates(&db, &args)?;
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    // What the other checkouts don't share with this one, before a request waits for it.
+    for also in &args.also {
+        let start = Instant::now();
+        let checkout = checkouts.root_of(also)?;
+        let resolved = resolve_crates(&db, &Args { checkout, ..args.clone() })?;
+        eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
+    }
+    if !args.also.is_empty() {
+        report_sharing(&db);
+    }
 
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
     let report_panic = std::panic::take_hook();
@@ -1614,8 +1735,18 @@ fn main() -> anyhow::Result<()> {
                             // Never built: every file is as good as edited, but those were
                             // checked when the programs before it were built.
                             let unbuilt = Unbuilt { edited: unbuilt.edited.clone(), stale: true };
-                            let args = target.args(&args);
-                            let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                            // A request for what can't be built is the client's mistake.
+                            let loaded = target.args(&args, &checkouts).and_then(|args| {
+                                let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                                Ok((args, table))
+                            });
+                            let (args, table) = match loaded {
+                                Ok(loaded) => loaded,
+                                Err(e) => {
+                                    let _ = writeln!(&stream, "error: {e:#}");
+                                    continue;
+                                }
+                            };
                             Parked { args, table, known, unbuilt }
                         }
                     };
@@ -1734,7 +1865,16 @@ fn main() -> anyhow::Result<()> {
             unbuilt.edited.sort_unstable();
             unbuilt.edited.dedup();
         }
-        let edited = unbuilt.edited.clone();
+        let paths: FxHashMap<_, _> = files
+            .iter()
+            .filter_map(|it| match it.file {
+                Watched::Source(id) => Some((id, it.path.clone())),
+                Watched::Included(_) => None,
+            })
+            .collect();
+        // Another checkout's files are not this program's to be refused for.
+        let mut edited = unbuilt.edited.clone();
+        edited.retain(|file| paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
@@ -1768,13 +1908,6 @@ fn main() -> anyhow::Result<()> {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
-        let paths = files
-            .iter()
-            .filter_map(|it| match it.file {
-                Watched::Source(id) => Some((id, it.path.clone())),
-                Watched::Included(_) => None,
-            })
-            .collect();
         let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
         if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
             failed = link(&args).err().map(|it| it.to_string());
