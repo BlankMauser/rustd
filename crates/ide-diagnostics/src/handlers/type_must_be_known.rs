@@ -163,10 +163,12 @@ fn bar() {
         check_diagnostics(
             r#"
 //- minicore: include_bytes
-
+//- /main.rs
+mod bytes;
 fn foo() {
-    include_bytes!("./foo.txt");
+    include_bytes!("./bytes.rs");
 }
+//- /bytes.rs
         "#,
         );
     }
