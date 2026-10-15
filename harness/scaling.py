@@ -28,6 +28,13 @@ EDITS = [
     ("body: unused let", lambda t: MAIN.sub(lambda m: m[0] + "let _rustd_edit = 1u32;\n", t, 1)),
     ("body: println", lambda t: MAIN.sub(lambda m: m[0] + f'println!("{MARK}");\n', t, 1)),
 ]
+# The first function in a file that is written plainly: an edit to its body is seen by nothing else.
+PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", re.M)
+ELSEWHERE = [
+    ("comment appended", lambda t: t + "// edit\n"),
+    ("new private fn", lambda t: t + NEW_FN),
+    ("body: unused let", lambda t: PLAIN_FN.sub(lambda m: m[0] + "let _rustd_edit = 1u32;\n", t, 1)),
+]
 BUILD = re.compile(
     r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*"
     r"stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?"
@@ -78,6 +85,16 @@ def measure(name, spec, repeat):
             time.sleep(0.01)
 
     original = open(fx.touch).read()
+    # What to write for each edit: the file with `fn main`, then SCALING_FILES (paths in the
+    # workspace) one at a time, then a body in each of them at once.
+    jobs = [(kind, fx.touch, {fx.touch: (apply(original), original)}) for kind, apply in EDITS]
+    others = [os.path.join(fx.ws, f) for f in os.environ.get("SCALING_FILES", "").split(",") if f]
+    texts = {path: open(path).read() for path in others}
+    for path in others:
+        jobs += [(kind, path, {path: (apply(texts[path]), texts[path])}) for kind, apply in ELSEWHERE]
+    if others:
+        body = ELSEWHERE[-1][1]
+        jobs.append(("body: unused let", "all", {path: (body(texts[path]), texts[path]) for path in others}))
     samples, done, wrong = [], 0, []
     try:
         wait(r"watching \d+ files", 0)
@@ -88,12 +105,12 @@ def measure(name, spec, repeat):
         rounds = re.search(r"(\d+) rounds", text)
         print(f"{name}: warm in {warmup:.1f}s, {cold[1]} of {cold[2]} fns, {cold[3]} instances", flush=True)
         for turn in range(repeat):
-            for kind, apply in EDITS:
-                edited = apply(original)
-                assert edited != original, (name, kind)
-                for revert, new in ((False, edited), (True, original)):
+            for kind, where, writes in jobs:
+                assert all(new != old for new, old in writes.values()), (name, kind, where)
+                for revert in (False, True):
                     time.sleep(0.3)
-                    open(fx.touch, "w").write(new)
+                    for path, texts_ in writes.items():
+                        open(path, "w").write(texts_[revert])
                     if socket:
                         reply = subprocess.check_output([RUSTD, os.environ.get("SCALING_REQUEST", "sync"), socket], text=True)
                         assert reply.startswith(("ok patch=" + patch, "ok object=" + obj)), reply
@@ -102,9 +119,9 @@ def measure(name, spec, repeat):
                     b = found[-1]
                     patched = "\npatch: " in log_tail(log)
                     steps = {k: int(v) / 1000 for k, v in (kv.split("=") for kv in b[7].split())}
-                    samples.append({"edit": kind, "revert": revert, "turn": turn, "steps_ms": steps,
+                    samples.append({"edit": kind, "file": os.path.relpath(where, fx.ws) if where != "all" else where, "revert": revert, "turn": turn, "steps_ms": steps,
                                     "recompiled": int(b[5]), "cached": int(b[6]), "patched": patched})
-                    if kind == "body: println":
+                    if kind == "body: println" and where == fx.touch:
                         ran = subprocess.run([binary, *run_arg], capture_output=True, text=True, timeout=60)
                         if (MARK in ran.stdout) == revert:
                             wrong.append((turn, revert, ran.stdout[:200]))
@@ -112,6 +129,8 @@ def measure(name, spec, repeat):
     finally:
         daemon.kill()
         open(fx.touch, "w").write(original)
+        for path, text in texts.items():
+            open(path, "w").write(text)
     record = {"name": name, "fns": int(cold[1]), "of": int(cold[2]), "instances": int(cold[3]),
               "rounds": int(rounds[1]) if rounds else None, "warmup_s": warmup, "rss_mb": rss,
               "cached": samples[-1]["cached"], "wrong": wrong, "samples": samples, "log": log_path}
