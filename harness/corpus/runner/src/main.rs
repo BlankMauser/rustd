@@ -301,4 +301,17 @@ fn main() {
     println!("joined {:?}", cases::added_strings::joined(vec![1, 2, 3]));
     println!("joined_words {:?}", cases::added_strings::joined_words(vec![1, 2, 3]));
     println!("macro_type_arguments {:?}", cases::macro_type_arguments::run("x"));
+    println!("downstream_add {}", String::from("a") + Tail(3));
+}
+
+/// An `Add` impl for `String` that the crates below this one cannot see: what they add to
+/// a `String` still has only the one impl to fit.
+struct Tail(u8);
+
+impl std::ops::Add<Tail> for String {
+    type Output = String;
+    fn add(mut self, rhs: Tail) -> String {
+        self.push_str(&rhs.0.to_string());
+        self
+    }
 }

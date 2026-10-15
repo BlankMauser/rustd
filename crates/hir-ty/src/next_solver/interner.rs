@@ -1049,7 +1049,7 @@ impl<'db> Interner for DbInterner<'db> {
         f: impl FnOnce(&mut rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
     ) -> R {
         // We make sure to reinit the cache when constructing the Interner.
-        tls_cache::borrow_assume_valid(self.db, f)
+        tls_cache::borrow_assume_valid(self.db, self.krate, f)
     }
 
     fn canonical_param_env_cache_get_or_insert<R>(
@@ -2519,21 +2519,24 @@ mod tls_cache {
     use crate::db::HirDatabase;
 
     use super::DbInterner;
-    use base_db::Nonce;
+    use base_db::{Crate, Nonce};
+    use rustc_hash::FxHashMap;
     use rustc_type_ir::search_graph::GlobalCache;
     use salsa::Revision;
     use std::cell::RefCell;
 
     struct Cache {
-        cache: GlobalCache<DbInterner<'static>>,
+        /// One per crate solved in: which impls there are to pick from depends on the crate,
+        /// and nothing in a goal says which it is.
+        caches: FxHashMap<Option<Crate>, GlobalCache<DbInterner<'static>>>,
         revision: Revision,
         db_nonce: Nonce,
     }
 
     impl Cache {
-        const fn default() -> Cache {
+        fn default() -> Cache {
             Cache {
-                cache: GlobalCache::new(),
+                caches: FxHashMap::default(),
                 revision: Revision::max(),
                 db_nonce: Nonce::invalid(),
             }
@@ -2541,14 +2544,14 @@ mod tls_cache {
     }
 
     thread_local! {
-        static GLOBAL_CACHE: RefCell<Cache> = const { RefCell::new(Cache::default()) };
+        static GLOBAL_CACHE: RefCell<Cache> = RefCell::new(Cache::default());
     }
 
     pub(super) fn reinit_cache(db: &dyn HirDatabase) {
         GLOBAL_CACHE.with_borrow_mut(|handle| {
             let (db_nonce, revision) = db.nonce_and_revision();
             if handle.revision != revision || db_nonce != handle.db_nonce {
-                *handle = Cache { cache: GlobalCache::default(), revision, db_nonce };
+                *handle = Cache { caches: FxHashMap::default(), revision, db_nonce };
             }
         })
     }
@@ -2556,6 +2559,7 @@ mod tls_cache {
     #[inline]
     pub(super) fn borrow_assume_valid<'db, T>(
         db: &'db dyn HirDatabase,
+        krate: Option<Crate>,
         f: impl FnOnce(&mut GlobalCache<DbInterner<'db>>) -> T,
     ) -> T {
         if cfg!(debug_assertions) {
@@ -2573,7 +2577,7 @@ mod tls_cache {
                 std::mem::transmute::<
                     &mut GlobalCache<DbInterner<'static>>,
                     &mut GlobalCache<DbInterner<'db>>,
-                >(&mut handle.cache)
+                >(handle.caches.entry(krate).or_default())
             })
         })
     }
