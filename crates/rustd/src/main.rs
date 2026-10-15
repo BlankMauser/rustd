@@ -2,6 +2,7 @@
 //! functions to native code that links against rustc-built artifacts.
 
 mod outline;
+mod remote;
 mod symbols;
 mod tree;
 
@@ -1480,6 +1481,9 @@ fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        return remote::command(std::env::args().skip(2));
+    }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
     {
@@ -1497,6 +1501,15 @@ fn main() -> anyhow::Result<()> {
             eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
         }
         table
+    });
+
+    // What other machines compiled is fetched next to the workspace too.
+    let shared = std::thread::spawn(|| {
+        let shared = remote::Shared::from_env();
+        if let Some(shared) = &shared {
+            shared.pull();
+        }
+        shared
     });
 
     let start = Instant::now();
@@ -1539,11 +1552,18 @@ fn main() -> anyhow::Result<()> {
     let mut listed = Listed::default();
     let mut outlines = outline::Outlines::default();
     let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     let cold = build(&db, &table, &args, &mut known, &mut listed)?;
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
     link(&args)?;
+    // What this build added goes to the other machines while the daemon waits for edits; a
+    // build that is not a daemon's has nothing to wait for but this.
+    let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
+    if let Some(sending) = sending.filter(|_| args.socket.is_none() && !args.watch) {
+        _ = sending.join();
+    }
     hir::attach_db(&db, || known.out_of_date(&db));
     let listener = match &args.socket {
         Some(path) => {

@@ -82,7 +82,9 @@ pub use home::body_file;
 mod patch;
 mod stable;
 mod store;
+
 pub use patch::{Stale, StaleSteps};
+pub use store::{pack_name, seal_left_open};
 mod type_id;
 mod unwind;
 mod vtable;
