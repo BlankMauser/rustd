@@ -108,7 +108,7 @@ fn fixes(
         // FIXME: This shouldnt need to access the crate def map directly
         let crate_def_map = crate_def_map(ctx.sema.db, krate);
 
-        let root_module = &crate_def_map[crate_def_map.root_module_id()];
+        let root_module = crate_def_map.module(ctx.sema.db, crate_def_map.root_module_id());
         let Some(root_file_id) = root_module.origin.file_id() else { continue };
         let Some(crate_root_path) = source_root.path_for_file(&root_file_id.file_id(ctx.sema.db))
         else {
@@ -125,8 +125,8 @@ fn fixes(
                 // shouldn't occur
                 _ => continue 'crates,
             };
-            match current.children.iter().find(|(name, _)| name.as_str() == seg) {
-                Some((_, &child)) => current = &crate_def_map[child],
+            match current.children(ctx.sema.db).iter().find(|(name, _)| name.as_str() == seg) {
+                Some((_, &child)) => current = crate_def_map.module(ctx.sema.db, child),
                 None => continue 'crates,
             }
             if !current.origin.is_inline() {
@@ -163,7 +163,7 @@ fn fixes(
     let relevant_crates = base_db::relevant_crates(db, parent_id);
     'crates: for &krate in relevant_crates.iter() {
         let crate_def_map = crate_def_map(ctx.sema.db, krate);
-        let Some((_, module)) = crate_def_map.modules().find(|(_, module)| {
+        let Some((_, module)) = crate_def_map.modules(db).find(|(_, module)| {
             module.origin.file_id().map(|file_id| file_id.file_id(ctx.sema.db)) == Some(parent_id)
                 && !module.origin.is_inline()
         }) else {
@@ -183,9 +183,9 @@ fn fixes(
             // try finding a parent that has an inline tree from here on
             let mut current = module;
             for s in stack.iter().rev() {
-                match module.children.iter().find(|(name, _)| name.as_str() == s) {
+                match module.children(ctx.sema.db).iter().find(|(name, _)| name.as_str() == s) {
                     Some((_, child)) => {
-                        current = &crate_def_map[*child];
+                        current = crate_def_map.module(ctx.sema.db, *child);
                     }
                     None => continue 'crates,
                 }

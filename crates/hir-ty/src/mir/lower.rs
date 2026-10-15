@@ -3272,6 +3272,13 @@ pub fn lower_to_mir_with_store<'db>(
         }
         return Err(MirLowerError::HasErrors);
     }
+    // A call with too many or too few arguments still has a type for everything in it.
+    let miscounted = |it: &crate::infer::InferenceDiagnostic| {
+        matches!(it, crate::infer::InferenceDiagnostic::MismatchedArgCount { .. })
+    };
+    if infer.diagnostics().iter().any(miscounted) {
+        return Err(MirLowerError::HasErrors);
+    }
     let mut ctx = MirLowerCtx::new(db, owner, store, infer);
     // 0 is return local
     ctx.result.locals.alloc(Local { ty: ctx.expr_ty_after_adjustments(root_expr).store() });

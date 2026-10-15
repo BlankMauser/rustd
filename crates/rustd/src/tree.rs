@@ -71,14 +71,16 @@ impl Tree {
             dir.listed = std::fs::metadata(&path).and_then(|it| it.modified()).ok();
             let Ok(entries) = std::fs::read_dir(&path) else { continue };
             // A package's directory holds much that is not source: only the directories
-            // that had source in them are looked into there.
+            // with source right in them are looked into there.
             let package = path.join("Cargo.toml").exists();
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 let Ok(kind) = entry.file_type() else { continue };
                 let hidden = entry.file_name().to_str().is_none_or(|it| it.starts_with('.'));
                 if kind.is_dir() {
-                    if !package && !hidden && !self.directories.contains_key(&entry_path) {
+                    let source = !hidden
+                        && (!package || entry.file_name() != "target" && holds_source(&entry_path));
+                    if source && !self.directories.contains_key(&entry_path) {
                         self.directories
                             .insert(entry_path.clone(), Directory { root, listed: None });
                         stale.push(entry_path);
@@ -155,4 +157,13 @@ impl Tree {
             Durability::LOW,
         );
     }
+}
+
+fn holds_source(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else { return false };
+    // Another package has a source root of its own.
+    if directory.join("Cargo.toml").exists() {
+        return false;
+    }
+    entries.flatten().any(|it| it.path().extension().is_some_and(|it| it == "rs"))
 }

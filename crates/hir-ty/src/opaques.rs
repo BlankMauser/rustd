@@ -252,7 +252,7 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
             result.push(func);
         }
     };
-    for (_, module) in crate_def_map(db, krate).modules() {
+    for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
             if let ModuleDefId::FunctionId(func) = def {
                 add(func);

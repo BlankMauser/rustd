@@ -148,7 +148,7 @@ impl TestDB {
         let file_id = file_id.into();
         for &krate in relevant_crates(self, file_id).iter() {
             let crate_def_map = crate_def_map(self, krate);
-            for (module_id, data) in crate_def_map.modules() {
+            for (module_id, data) in crate_def_map.modules(self) {
                 if data.origin.file_id().map(|file_id| file_id.file_id(self)) == Some(file_id) {
                     return Some(module_id);
                 }
@@ -167,8 +167,8 @@ impl TestDB {
         let mut files = Vec::new();
         for &krate in all_crates(self).iter() {
             let crate_def_map = crate_def_map(self, krate);
-            for (module_id, _) in crate_def_map.modules() {
-                let file_id = crate_def_map[module_id].origin.file_id();
+            for (module_id, _) in crate_def_map.modules(self) {
+                let file_id = crate_def_map.module(self, module_id).origin.file_id();
                 files.extend(file_id)
             }
         }

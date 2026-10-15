@@ -16,7 +16,7 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let mut defs = vec![];
-    for (_, module) in def_map.modules() {
+    for (_, module) in def_map.modules(&db) {
         for decl in module.scope(&db).declarations() {
             let def: GenericDefId = match decl {
                 ModuleDefId::ModuleId(_) => continue,

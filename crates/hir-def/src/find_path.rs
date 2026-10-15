@@ -207,7 +207,8 @@ fn find_path_for_module<'db>(
             let name_already_occupied_in_type_ns = ctx
                 .from_def_map
                 .with_ancestor_maps(ctx.db, ctx.from, &mut |def_map, local_id| {
-                    def_map[local_id]
+                    def_map
+                        .module(ctx.db, local_id)
                         .scope(ctx.db)
                         .type_(name)
                         .filter(|&(id, _)| id != ModuleDefId::ModuleId(def_id))
@@ -278,7 +279,7 @@ fn find_in_scope<'db>(
 ) -> Option<Name> {
     // FIXME: We could have multiple applicable names here, but we currently only return the first
     def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
-        def_map[local_id].scope(db).names_of(item, |name, _, declared| {
+        def_map.module(db, local_id).scope(db).names_of(item, |name, _, declared| {
             (declared || !ignore_local_imports).then(|| name.clone())
         })
     })
@@ -294,7 +295,7 @@ fn find_in_prelude(
 ) -> Option<Choice> {
     let (prelude_module, _) = local_def_map.prelude()?;
     let prelude_def_map = prelude_module.def_map(db);
-    let prelude_scope = &prelude_def_map[prelude_module].scope(db);
+    let prelude_scope = &prelude_def_map.module(db, prelude_module).scope(db);
     let (name, vis, _declared) = prelude_scope.name_of(item)?;
     if !vis.is_visible_from(db, from) {
         return None;
@@ -303,7 +304,7 @@ fn find_in_prelude(
     // Check if the name is in current scope and it points to the same def.
     let found_and_same_def =
         local_def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
-            let per_ns = def_map[local_id].scope(db).get(name);
+            let per_ns = def_map.module(db, local_id).scope(db).get(name);
             let same_def = match item {
                 ItemInNs::Types(it) => per_ns.take_types()? == it,
                 ItemInNs::Values(it) => per_ns.take_values()? == it,
@@ -331,7 +332,7 @@ fn is_kw_kind_relative_to_from(
     if item == from {
         // - if the item is the module we're in, use `self`
         Some(PathKind::SELF)
-    } else if let Some(parent_id) = def_map[from].parent {
+    } else if let Some(parent_id) = def_map.module(db, from).parent {
         if item == parent_id {
             // - if the item is the parent module, use `super` (this is not used recursively, since `super::super` is ugly)
             Some(if parent_id == def_map.root { PathKind::Crate } else { PathKind::Super(1) })
@@ -589,8 +590,10 @@ fn find_local_import_locations<'db>(
 
     // Compute the initial worklist. We start with all direct child modules of `from` as well as all
     // of its (recursive) parent modules.
-    let mut worklist = ctx.from_def_map[ctx.from]
-        .children
+    let mut worklist = ctx
+        .from_def_map
+        .module(db, ctx.from)
+        .children(db)
         .values()
         .copied()
         .chain(iter::successors(ctx.from.containing_module(db), |m| m.containing_module(db)))
@@ -612,10 +615,10 @@ fn find_local_import_locations<'db>(
         let data = if module.block(db).is_some() {
             // Re-query the block's DefMap
             block_def_map = module.def_map(db);
-            &block_def_map[module]
+            &block_def_map.module(db, module)
         } else {
             // Reuse the root DefMap
-            &def_map[module]
+            &def_map.module(db, module)
         };
 
         if let Some((name, vis, declared)) = data.scope(db).name_of(item)

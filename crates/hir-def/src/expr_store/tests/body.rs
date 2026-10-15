@@ -13,7 +13,7 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let mut fn_def = None;
-    'outer: for (_, module) in def_map.modules() {
+    'outer: for (_, module) in def_map.modules(&db) {
         for decl in module.scope(&db).declarations() {
             if let ModuleDefId::FunctionId(it) = decl {
                 fn_def = Some(it);
@@ -33,7 +33,7 @@ fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let mut fn_def = None;
-    'outer: for (_, module) in def_map.modules() {
+    'outer: for (_, module) in def_map.modules(&db) {
         for decl in module.scope(&db).declarations() {
             if let ModuleDefId::FunctionId(it) = decl {
                 fn_def = Some(it);

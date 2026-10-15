@@ -299,6 +299,7 @@ fn f() { foo }
                 "HirFileId::ast_id_map_",
                 "EditionedFileId::parse_",
                 "real_span_map",
+                "Modules < 'db >::module_",
                 "ModuleScope < 'db >::name_",
                 "MacroId::definition_",
                 "file_item_tree_query",
@@ -436,6 +437,7 @@ pub struct S {}
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
                 "MacroCallId::macro_arg_",
+                "Modules < 'db >::module_",
                 "ModuleScope < 'db >::name_",
                 "MacroId::definition_",
                 "file_item_tree_query",
@@ -516,8 +518,10 @@ m!(Z);
         &db,
         || {
             let crate_def_map = crate_def_map(&db, krate);
-            let module_data = &crate_def_map
-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
+            let module_data = &crate_def_map.module(
+                &db,
+                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
+            );
             assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
@@ -550,6 +554,7 @@ m!(Z);
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
                 "MacroCallId::macro_arg_",
+                "Modules < 'db >::module_",
             ]
         "#]],
     );
@@ -566,8 +571,10 @@ m!(Z);
         &db,
         || {
             let crate_def_map = crate_def_map(&db, krate);
-            let module_data = &crate_def_map
-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
+            let module_data = &crate_def_map.module(
+                &db,
+                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
+            );
             assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],

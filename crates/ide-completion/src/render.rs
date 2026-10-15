@@ -3685,7 +3685,6 @@ fn main() {
             expect![[r#"
                 st S S []
                 st &S [type]
-                ex core::ops::Deref::deref(&t)  [type_could_unify]
                 lc m i32 [local]
                 lc t T [local]
                 lc &t [type+local]
@@ -3732,7 +3731,6 @@ fn main() {
             expect![[r#"
                 st S S []
                 st &mut S [type]
-                ex core::ops::DerefMut::deref_mut(&mut t)  [type_could_unify]
                 lc m i32 [local]
                 lc t T [local]
                 lc &mut t [type+local]
@@ -3833,7 +3831,6 @@ fn main() {
             expect![[r#"
                 st S S []
                 st &S [type]
-                ex core::ops::Deref::deref(&bar())  [type_could_unify]
                 st S S []
                 st T T []
                 fn bar() fn() -> T []

@@ -149,10 +149,10 @@ impl ImportMap {
                 continue;
             }
             let mod_data = if module.krate(db) == krate {
-                &def_map[module]
+                &def_map.module(db, module)
             } else {
                 // The crate might reexport a module defined in another crate.
-                &module.def_map(db)[module]
+                &module.def_map(db).module(db, module)
             };
 
             let visible_items = mod_data.scope(db).entries().filter_map(|(name, per_ns)| {
@@ -672,8 +672,8 @@ mod tests {
         assert!(def_map.block_id().is_none(), "block local items should not be in `ImportMap`");
 
         while let Some(parent) = module.containing_module(db) {
-            let parent_data = &def_map[parent];
-            let (name, _) = parent_data.children.iter().find(|(_, id)| **id == module).unwrap();
+            let parent_data = &def_map.module(db, parent);
+            let (name, _) = parent_data.children(db).iter().find(|(_, id)| **id == module).unwrap();
             segments.push(name);
             module = parent;
         }

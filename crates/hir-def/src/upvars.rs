@@ -240,13 +240,13 @@ mod tests {
         let db = TestDB::with_files(ra_fixture);
         let def_map = crate_def_map(&db, db.test_crate());
         let func = def_map
-            .modules()
+            .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations())
             .filter_map(|decl| match decl {
                 ModuleDefId::FunctionId(func) => Some(func),
                 _ => None,
             })
-            .chain(def_map.modules().flat_map(|(_, module)| {
+            .chain(def_map.modules(&db).flat_map(|(_, module)| {
                 module
                     .scope(&db)
                     .impls()

@@ -207,6 +207,50 @@ impl SourceDatabase for RootDatabase {
 
 hir::impl_hir_database!(RootDatabase);
 
+/// Counts how often each query ran, when `RUSTD_TRACE` is set.
+pub mod executions {
+    use std::sync::Mutex;
+
+    use rustc_hash::FxHashMap;
+    use salsa::{Database, Event, EventKind, IngredientIndex};
+
+    static RAN: Mutex<Option<FxHashMap<IngredientIndex, u32>>> = Mutex::new(None);
+
+    pub(super) fn callback() -> Option<Box<dyn Fn(Event) + Send + Sync>> {
+        std::env::var_os("RUSTD_TRACE")?;
+        Some(Box::new(|event| {
+            if let EventKind::WillExecute { database_key } = event.kind {
+                let mut ran = RAN.lock().unwrap_or_else(|it| it.into_inner());
+                *ran.get_or_insert_default().entry(database_key.ingredient_index()).or_default() +=
+                    1;
+                let mut order = ORDER.lock().unwrap_or_else(|it| it.into_inner());
+                if order.len() < 300 {
+                    order.push(database_key.ingredient_index());
+                }
+            }
+        }))
+    }
+
+    static ORDER: Mutex<Vec<IngredientIndex>> = Mutex::new(Vec::new());
+
+    /// The first queries that ran since the last call, in the order they started.
+    pub fn order(db: &dyn Database) -> Vec<String> {
+        let order = std::mem::take(&mut *ORDER.lock().unwrap_or_else(|it| it.into_inner()));
+        order.into_iter().map(|query| db.ingredient_debug_name(query).into_owned()).collect()
+    }
+
+    /// The queries that ran since the last call, most often first.
+    pub fn take(db: &dyn Database) -> Vec<(String, u32)> {
+        let ran = RAN.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default();
+        let mut ran: Vec<_> = ran
+            .into_iter()
+            .map(|(query, count)| (db.ingredient_debug_name(query).into_owned(), count))
+            .collect();
+        ran.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ran
+    }
+}
+
 impl Default for RootDatabase {
     fn default() -> RootDatabase {
         RootDatabase::new(None)
@@ -216,7 +260,7 @@ impl Default for RootDatabase {
 impl RootDatabase {
     pub fn new(lru_capacity: Option<u16>) -> RootDatabase {
         let mut db = RootDatabase {
-            storage: ManuallyDrop::new(salsa::Storage::default()),
+            storage: ManuallyDrop::new(salsa::Storage::new(executions::callback())),
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),

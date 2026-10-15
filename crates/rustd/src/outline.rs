@@ -150,7 +150,7 @@ impl Written {
 
 fn declares_items(db: &RootDatabase, func: FunctionId) -> bool {
     Body::of(db, func.into()).blocks(db).any(|(_, def_map)| {
-        def_map.modules().any(|(_, module)| {
+        def_map.modules(db).any(|(_, module)| {
             let scope = module.scope(db);
             // A static or constant is the body's own: only its code names it, and neither is
             // a function to list. Macros that log declare them.
@@ -212,6 +212,14 @@ fn is_unseen_body(node: &SyntaxNode) -> bool {
     if names_its_type || !is_inert(func.syntax()) {
         return false;
     }
+    // rustc copies the body into the callers, also the ones it compiled for us.
+    let always_inlined = func.attrs().any(|attr| {
+        attr.simple_name().is_some_and(|name| name == "inline")
+            && attr.syntax().text().to_string().contains("always")
+    });
+    if always_inlined {
+        return false;
+    }
     // An attribute written inside the body is the function's, and a macro declared in it can
     // be exported from the crate.
     let reaches_out = node.descendants().any(|it| match it.kind() {
@@ -240,7 +248,7 @@ fn is_inert(item: &SyntaxNode) -> bool {
 impl Listed {
     /// The functions written in the file, or `None` when it has some that are not listed: it
     /// belongs to a crate that the ones being built use and that is not one of them.
-    fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
+    pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
         for &krate in relevant_crates(db, file).iter() {
             match self.functions.get(&krate.into()) {
@@ -320,6 +328,7 @@ mod tests {
         seen("fn f() -> impl Sized { 1u8 }", "fn f() -> impl Sized { 1u16 }");
         seen("fn f() -> Box<impl Sized> { a() }", "fn f() -> Box<impl Sized> { b() }");
         seen("#[test]\nfn f() { 1; }", "#[test]\nfn f() { 2; }");
+        seen("#[inline(always)]\nfn f() { 1; }", "#[inline(always)]\nfn f() { 2; }");
         seen("#[tokio::main]\nfn f() { 1; }", "#[tokio::main]\nfn f() { 2; }");
         seen("#[imp]\nimpl S { fn f() { 1; } }", "#[imp]\nimpl S { fn f() { 2; } }");
         seen("fn f() { #![attr] 1; }", "fn f() { #![attr] 2; }");

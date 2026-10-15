@@ -69,7 +69,7 @@ impl Visibility {
         from_module: ModuleIdLt<'db>,
     ) -> bool {
         if cfg!(debug_assertions) {
-            _ = def_map.modules[from_module];
+            _ = def_map.module(db, from_module);
         }
         let to_module = match self {
             Visibility::Module(m, _) => m,
@@ -130,7 +130,7 @@ impl Visibility {
             if from_module == to_module {
                 return true;
             }
-            match def_map[from_module].parent {
+            match def_map.module(db, from_module).parent {
                 Some(parent) => from_module = parent,
                 None => {
                     match def_map.parent() {
@@ -195,14 +195,16 @@ impl Visibility {
                     return None;
                 }
 
-                let mut a_ancestors = iter::successors(Some(mod_a), |&m| def_map[m].parent);
+                let mut a_ancestors =
+                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
 
                 if a_ancestors.any(|m| m == mod_b) {
                     // B is above A
                     return Some(Visibility::Module(mod_b, expl_b));
                 }
 
-                let mut b_ancestors = iter::successors(Some(mod_b), |&m| def_map[m].parent);
+                let mut b_ancestors =
+                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
                 if b_ancestors.any(|m| m == mod_a) {
                     // A is above B
                     return Some(Visibility::Module(mod_a, expl_a));
@@ -261,14 +263,16 @@ impl Visibility {
                     return None;
                 }
 
-                let mut a_ancestors = iter::successors(Some(mod_a), |&m| def_map[m].parent);
+                let mut a_ancestors =
+                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
 
                 if a_ancestors.any(|m| m == mod_b) {
                     // B is above A
                     return Some(Visibility::Module(mod_a, expl_a));
                 }
 
-                let mut b_ancestors = iter::successors(Some(mod_b), |&m| def_map[m].parent);
+                let mut b_ancestors =
+                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
                 if b_ancestors.any(|m| m == mod_a) {
                     // A is above B
                     return Some(Visibility::Module(mod_b, expl_b));

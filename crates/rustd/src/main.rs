@@ -713,9 +713,19 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
+                    let start = Instant::now();
                     hir::attach_db(&db, || {
                         _ = hir::crate_def_map(&db, krate);
+                        let names = start.elapsed();
                         _ = hir::TraitImpls::for_crate(&db, krate);
+                        if std::env::var_os("RUSTD_STATS").is_some() {
+                            let name = krate.extra_data(&db).display_name.as_ref();
+                            let name = name.map(|it| it.to_string()).unwrap_or_default();
+                            eprintln!(
+                                "resolved {name}: names {names:.1?}, impls {:.1?}",
+                                start.elapsed() - names
+                            );
+                        }
                     });
                 }
             });
@@ -814,7 +824,7 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     while let Some(module) = modules.pop() {
         modules.extend(module.children(db));
         let id = hir_def::ModuleId::from(module);
-        scope(&id.def_map(db)[id].scope(db), &mut bodies);
+        scope(id.def_map(db).module(db, id).scope(db), &mut bodies);
     }
     let scopes = start.elapsed();
     let count = bodies.len();
@@ -823,7 +833,7 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
         let round = lower(db, std::mem::take(&mut bodies));
         for body in round {
             for (_, def_map) in Body::of(db, body).blocks(db) {
-                for (_, module) in def_map.modules() {
+                for (_, module) in def_map.modules(db) {
                     scope(module.scope(db), &mut bodies);
                 }
             }
@@ -1090,10 +1100,56 @@ fn refusal(
     }
     let (func, why) = out_of_date?;
     let name = hir::Function::from(func).name(db).display(db, syntax::Edition::CURRENT).to_string();
+    // What the frontend turns down is as a rule code that does not compile.
+    if why.starts_with("frontend:") {
+        return Some(format!("`{name}` has errors, `cargo check` shows them: {why}"));
+    }
     Some(format!(
         "`{name}` is not compiled by rustd and rustc's copy is from before the edit, \
          build with cargo: {why}"
     ))
+}
+
+/// A function written in one of the edited files that does not type-check. Nothing may reach
+/// it, so the build never looks at it, and cargo still turns the crate down for it.
+fn broken_in(db: &RootDatabase, listed: &Listed, edited: &[vfs::FileId]) -> Option<String> {
+    use hir_ty::InferenceDiagnostic as Diagnostic;
+    let functions: Vec<FunctionId> =
+        edited.iter().filter_map(|&file| listed.in_file(db, file)).flatten().collect();
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let broken = std::thread::scope(|scope| {
+        let checks: Vec<_> = (0..threads.min(functions.len()))
+            .map(|part| {
+                let (db, functions) = (db.clone(), &functions);
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        functions.iter().skip(part).step_by(threads).find_map(|&func| {
+                            if !hir_def::signatures::FunctionSignature::of(&db, func).has_body() {
+                                return None;
+                            }
+                            let infer = hir_ty::InferenceResult::of(&db, DefWithBodyId::from(func));
+                            let why = if infer.has_type_mismatches() {
+                                "mismatched types"
+                            } else {
+                                infer.diagnostics().iter().find_map(|it| match it {
+                                    Diagnostic::UnresolvedIdent { .. } => Some("unresolved name"),
+                                    Diagnostic::MismatchedArgCount { .. } => {
+                                        Some("wrong number of arguments")
+                                    }
+                                    _ => None,
+                                })?
+                            };
+                            Some((func, why))
+                        })
+                    })
+                })
+            })
+            .collect();
+        checks.into_iter().find_map(|it| it.join().ok().flatten())
+    });
+    let (func, why) = broken?;
+    let name = hir::Function::from(func).name(db).display(db, syntax::Edition::CURRENT).to_string();
+    Some(format!("`{name}` has errors, `cargo check` shows them: {why}"))
 }
 
 /// A file whose changes the daemon picks up.
@@ -1335,6 +1391,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
+    ide_db::executions::take(&db);
     let sources: Vec<_> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -1452,7 +1509,7 @@ fn main() -> anyhow::Result<()> {
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
-                known.touch_bodies(&db, file);
+                known.touch_bodies(file);
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
@@ -1475,7 +1532,8 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
-        let mut failed = refusal(&db, &edited, &paths, out_of_date);
+        let mut failed =
+            refusal(&db, &edited, &paths, out_of_date).or_else(|| broken_in(&db, &listed, &edited));
         if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
             failed = link(&args).err().map(|it| it.to_string());
         }
@@ -1515,6 +1573,15 @@ fn main() -> anyhow::Result<()> {
             eprintln!("timeline-us: {}", steps.join(" "));
         }
         eprintln!("edit-to-binary: {total:.1?}");
+        if std::env::var_os("RUSTD_TRACE").is_some() {
+            let ran: Vec<String> = ide_db::executions::take(&db)
+                .iter()
+                .take(400)
+                .map(|(query, count)| format!("{query}={count}"))
+                .collect();
+            eprintln!("ran: {}", ran.join(" "));
+            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
+        }
         if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!(
                 "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \

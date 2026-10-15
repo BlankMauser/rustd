@@ -163,7 +163,7 @@ impl TestDB {
     pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
         for &krate in relevant_crates(self, file_id).iter() {
             let crate_def_map = crate_def_map(self, krate);
-            for (local_id, data) in crate_def_map.modules() {
+            for (local_id, data) in crate_def_map.modules(self) {
                 if data.origin.file_id().map(|file_id| file_id.file_id(self)) == Some(file_id) {
                     return local_id;
                 }
@@ -199,7 +199,7 @@ impl TestDB {
     fn mod_at_position(&self, def_map: &DefMap, position: FilePosition) -> ModuleId {
         let mut size = None;
         let mut res = def_map.root;
-        for (module, data) in def_map.modules() {
+        for (module, data) in def_map.modules(self) {
             let src = data.definition_source(self);
             // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
             // `position.file_id` is created before the def map, causing it to have to wrong crate
@@ -247,7 +247,7 @@ impl TestDB {
         // Find the smallest (innermost) function in `def_map` containing the cursor.
         let mut size = None;
         let mut fn_def = None;
-        for (_, module) in def_map.modules() {
+        for (_, module) in def_map.modules(self) {
             let file_id = module.definition_source(self).file_id;
             // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
             // `position.file_id` is created before the def map, causing it to have to wrong crate

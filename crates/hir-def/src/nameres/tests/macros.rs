@@ -761,7 +761,7 @@ macro_rules! foo {
 
 pub use core::clone::Clone;
 "#,
-        |db, map| assert_eq!(map.modules[map.root].scope(db).builtin_derive_impls().len(), 1),
+        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
     );
 }
 
@@ -783,7 +783,7 @@ pub macro Copy {}
 #[rustc_builtin_macro]
 pub macro Clone {}
 "#,
-        |db, map| assert_eq!(map.modules[map.root].scope(db).builtin_derive_impls().len(), 2),
+        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 2),
     );
 }
 
@@ -826,7 +826,7 @@ pub macro derive($item:item) {}
 #[rustc_builtin_macro]
 pub macro Clone {}
 "#,
-        |db, map| assert_eq!(map.modules[map.root].scope(db).builtin_derive_impls().len(), 1),
+        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
     );
 }
 
@@ -1477,7 +1477,7 @@ fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
     let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
-    let root_module = &def_map[def_map.root].scope(&db);
+    let root_module = &def_map.module(&db, def_map.root).scope(&db);
     assert!(
         root_module.legacy_macros().count() == 0,
         "`#[macro_use]` shouldn't bring macros into textual macro scope",
@@ -1584,7 +1584,7 @@ macro_rules! derive { () => {} }
 #[derive(Clone)]
 struct S;
     "#,
-        |db, map| assert_eq!(map.modules[map.root].scope(db).builtin_derive_impls().len(), 1),
+        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
     );
 }
 

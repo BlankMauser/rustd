@@ -21,7 +21,7 @@ use super::{
     compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    left_to_rustc, source_location, target,
+    instance_serial, left_to_rustc, root_serial, source_location, static_serial, target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -136,7 +136,7 @@ impl TheirWalk {
             }
             let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
             walk.instances.push(TheirInstance {
-                serial: compiled.map(|it| it.serial),
+                serial: compiled.map(|_| instance_serial(db, instance.clone(), env.clone())),
                 files: body_files(db, &instance),
                 instance,
                 env,
@@ -149,7 +149,7 @@ impl TheirWalk {
             }
             walk.statics.push(TheirStatic {
                 id,
-                serial: compiled_static(db, id).as_ref().ok().map(|it| it.serial),
+                serial: compiled_static(db, id).as_ref().ok().map(|_| static_serial(db, id)),
                 krate: id.krate(db),
                 file: body_file(db, id.into()),
             });
@@ -183,7 +183,7 @@ impl Left {
     fn of(db: &dyn HirDatabase, root: FunctionId) -> Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
-            code: code.map(|it| Mark::new(db, it.serial, &it.requests)),
+            code: code.map(|it| Mark::new(db, root_serial(db, root), &it.requests)),
             async_blocks: async_blocks(db, root).clone(),
         }
     }
@@ -196,9 +196,16 @@ pub(in crate::mir) struct Frozen {
     left: Option<FxHashMap<FunctionId, Left>>,
     /// The crates that have seen an edit since.
     edited: FxHashSet<Crate>,
+    /// The files that have seen an edit to the bodies of functions alone, which can change
+    /// no function written elsewhere.
+    edited_bodies: FxHashSet<FileId>,
 }
 
 impl Frozen {
+    pub(in crate::mir) fn edit_bodies(&mut self, file: FileId) {
+        self.edited_bodies.insert(file);
+    }
+
     pub(in crate::mir) fn edit(&mut self, crates: impl IntoIterator<Item = Crate>) {
         self.edited.extend(crates);
     }
@@ -220,7 +227,10 @@ impl Frozen {
         now().find_map(|(root, why)| {
             let fresh = match left.get(&root) {
                 // Nothing to tell a change by: any edit that it can see may be one.
-                Some(Left { code: None, .. }) => !self.edited.contains(&root.krate(db)),
+                Some(Left { code: None, .. }) => {
+                    !self.edited.contains(&root.krate(db))
+                        && !self.edited_bodies.contains(&body_file(db, root.into()))
+                }
                 Some(was) => probe(|| Left::of(db, root)).as_ref() == Some(was),
                 None => false,
             };
@@ -374,7 +384,7 @@ impl Base {
             .iter()
             .map(|&(root, _)| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::new(db, compiled.serial, &compiled.requests))
+                Some(Mark::new(db, root_serial(db, root), &compiled.requests))
             })
             .collect::<Option<Vec<_>>>()?;
         let mut instances = cg
@@ -386,7 +396,10 @@ impl Base {
                 let known = BaseInstance {
                     env: env.clone(),
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
-                    mark: compiled.map(|it| Mark::new(db, it.serial, &it.requests)),
+                    mark: compiled.map(|it| {
+                        let serial = instance_serial(db, instance.clone(), env.clone());
+                        Mark::new(db, serial, &it.requests)
+                    }),
                     forwarded: cg.forwarded.contains(instance),
                     files: body_files(db, instance),
                     parents: Vec::new(),
@@ -404,7 +417,7 @@ impl Base {
                 let known = BaseStatic {
                     symbol: decls.get_data_decl(data).linkage_name(data).into_owned(),
                     writable: compiled.writable,
-                    mark: Mark::new(db, compiled.serial, &compiled.requests),
+                    mark: Mark::new(db, static_serial(db, id), &compiled.requests),
                     krate: id.krate(db),
                     file: body_file(db, id.into()),
                     parents: Vec::new(),
@@ -540,7 +553,7 @@ impl Base {
             let asked = std::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::new(db, compiled.serial, &compiled.requests))
+                Some(Mark::new(db, root_serial(db, root), &compiled.requests))
             });
             stale.steps.roots_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
@@ -566,7 +579,10 @@ impl Base {
             let asked = std::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
-                compiled.as_ref().ok().map(|it| Mark::new(db, it.serial, &it.requests))
+                compiled.as_ref().ok().map(|it| {
+                    let serial = instance_serial(db, instance.clone(), was.env.clone());
+                    Mark::new(db, serial, &it.requests)
+                })
             });
             stale.steps.instances_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
@@ -597,7 +613,7 @@ impl Base {
             }
             let mark = probe(|| {
                 let compiled = compiled_static(db, id).as_ref().ok()?;
-                Some(Mark::new(db, compiled.serial, &compiled.requests))
+                Some(Mark::new(db, static_serial(db, id), &compiled.requests))
             });
             if mark == Some(Some(was.mark)) {
                 continue;
@@ -635,7 +651,10 @@ impl Base {
             }
             let serial = probe(|| {
                 let compiled = compiled_instance(db, was.instance.clone(), was.env.clone());
-                compiled.as_ref().ok().map(|it| it.serial)
+                compiled
+                    .as_ref()
+                    .ok()
+                    .map(|_| instance_serial(db, was.instance.clone(), was.env.clone()))
             });
             stale.their_walk_changed |= serial != Some(was.serial);
         }
@@ -644,7 +663,9 @@ impl Base {
             if !self.touched.reaches(was.krate) && !self.touched.reaches_bodies(Some(&[was.file])) {
                 continue;
             }
-            let serial = probe(|| compiled_static(db, was.id).as_ref().ok().map(|it| it.serial));
+            let serial = probe(|| {
+                compiled_static(db, was.id).as_ref().ok().map(|_| static_serial(db, was.id))
+            });
             stale.their_walk_changed |= serial != Some(was.serial);
         }
         stale.steps.left =

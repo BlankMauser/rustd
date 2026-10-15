@@ -253,7 +253,7 @@ def main():
     daemon = start()
     first_state, rows, restarts = files(), [], 0
     for index, (name, ops, broken) in enumerate(STEPS):
-        if only and only not in name:
+        if only and not re.search(only, name):
             continue
         time.sleep(0.05)
         if ops and isinstance(ops[0], str):

@@ -582,16 +582,27 @@ impl Rejections {
         if let Some(base) = &mut self.base {
             base.touch(db, crates);
         }
+        self.forget();
+    }
+
+    /// What was found impossible to compile was found so in the source before the edit, and
+    /// the edit can be what mends it.
+    fn forget(&mut self) {
+        self.rejected.clear();
+        self.theirs.clear();
+        self.unknown.clear();
+        self.left.clear();
     }
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
-        self.frozen.edit(base_db::relevant_crates(db, file).iter().copied());
+    pub fn touch_bodies(&mut self, file: base_db::FileId) {
+        self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
             base.touch_bodies(file);
         }
+        self.forget();
     }
 
     /// A function the last build left to rustc that is not what rustc compiled, and why it was
@@ -815,14 +826,34 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
 /// How many functions went through Cranelift since the process started.
 static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A number no other compiled function or static has: a query that ran again gives another.
+/// A number no other compiled function or static has.
 fn next_serial() -> u64 {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A number that is another once the code of the function is. The database runs this again
+/// only when compiling gave something else, not each time it compiled.
+#[salsa::tracked(returns(copy))]
+fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
+    compiled_root(db, func);
+    next_serial()
+}
+
+#[salsa::tracked(returns(copy))]
+fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u64 {
+    compiled_instance(db, instance, env);
+    next_serial()
+}
+
+#[salsa::tracked(returns(copy))]
+fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u64 {
+    compiled_static(db, id);
+    next_serial()
+}
+
 /// The code of a non-generic function.
-#[salsa::tracked(returns(ref), no_eq)]
+#[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let (body, env) = root_body(db, func)?;
     if std::env::var("RUSTD_DUMP_MIR")
@@ -840,7 +871,7 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
-#[salsa::tracked(returns(ref), no_eq)]
+#[salsa::tracked(returns(ref))]
 fn compiled_instance<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
@@ -1114,7 +1145,7 @@ impl TheirStatics {
 }
 
 /// The value of a static that rustc exports no symbol for.
-#[salsa::tracked(returns(ref), no_eq)]
+#[salsa::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
     let mut cg = Recorder::new(db, &**target()?);
     let env =
@@ -1125,7 +1156,7 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
         Ok(())
     })?;
     let (blob, writable) = value.expect("`build` ran the closure");
-    Ok(CompiledStatic { requests: cg.finish().0, blob, writable, serial: next_serial() })
+    Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
@@ -1262,7 +1293,7 @@ fn compile<'db>(
     let code = emit(isa, &mut ctx)?;
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, layouts, serial: next_serial() })
+    Ok(CompiledFunction { requests, code, layouts })
 }
 
 fn build<'db>(
@@ -1791,10 +1822,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
-        let data = if self.patching {
+        let thread_local = is_thread_local(db, id);
+        let data = if self.patching || thread_local {
             let name = format!("rustd::static::{}", self.location_counter);
             self.location_counter += 1;
-            self.module.declare_data(&name, Linkage::Hidden, compiled.writable, false)?
+            let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
+            self.module.declare_data(&name, linkage, compiled.writable, thread_local)?
         } else {
             self.declare_local_data(compiled.writable)?
         };
@@ -4044,15 +4077,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
-        if is_thread_local(db, id) {
-            unsupported!("thread local without a rustc symbol");
-        }
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()
-            && (flags.contains(StaticFlags::MUTABLE) || !self.is_freeze(allocation.ty));
+            && (flags.contains(StaticFlags::MUTABLE)
+                || is_thread_local(db, id)
+                || !self.is_freeze(allocation.ty));
         Ok((self.allocation_blob(allocation, true)?, writable))
     }
 

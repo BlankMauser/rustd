@@ -5041,3 +5041,15 @@ pub mod macro_type_arguments {
         if raw.len() == 1 { Ok(0) } else { Ok(raw.len()) }
     }
 }
+
+pub mod cfg_macro_arguments {
+    pub fn run(extra: &str) -> Vec<String> {
+        vec![
+            #[cfg(unix)]
+            "unix".parse().unwrap(),
+            #[cfg(windows)]
+            "windows".parse().unwrap(),
+            extra.parse().unwrap(),
+        ]
+    }
+}

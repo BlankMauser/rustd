@@ -2,7 +2,7 @@
 //! by what they are, not by where an object file put them. That makes the result a function of
 //! the database alone, so it is a query, and a build stitches the results into an object.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, iter};
 
 use base_db::FileId;
 use cranelift_codegen::{
@@ -10,7 +10,7 @@ use cranelift_codegen::{
     isa::TargetIsa,
 };
 use cranelift_frontend::FunctionBuilderContext;
-use cranelift_module::{DataId, FuncId, ModuleReloc};
+use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
 use hir_def::{DefWithBodyId, StaticId, TraitId};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
@@ -46,6 +46,7 @@ pub(super) struct FuncRequest {
 
 /// A data object that compiled code or other data points to. The ids inside a blob index the
 /// requests of the same [`Requests`].
+#[derive(PartialEq, Eq)]
 pub(super) enum DataRequest {
     Blob {
         blob: ConstBlob,
@@ -67,7 +68,7 @@ pub(super) enum DataRequest {
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
 /// until the stitcher replaces them with the ids of its module.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub(super) struct Requests {
     pub(super) funcs: Vec<FuncRequest>,
     pub(super) datas: Vec<DataRequest>,
@@ -81,20 +82,51 @@ pub(super) struct Code {
     pub(super) unwind: Option<FunctionUnwind>,
 }
 
+impl PartialEq for Code {
+    fn eq(&self, other: &Code) -> bool {
+        let same_target = |a: &ModuleRelocTarget, b: &ModuleRelocTarget| match (a, b) {
+            (
+                ModuleRelocTarget::User { namespace, index },
+                ModuleRelocTarget::User { namespace: other_namespace, index: other_index },
+            ) => namespace == other_namespace && index == other_index,
+            (ModuleRelocTarget::LibCall(a), ModuleRelocTarget::LibCall(b)) => a == b,
+            (ModuleRelocTarget::KnownSymbol(a), ModuleRelocTarget::KnownSymbol(b)) => a == b,
+            (
+                ModuleRelocTarget::FunctionOffset(func, offset),
+                ModuleRelocTarget::FunctionOffset(other_func, other_offset),
+            ) => func == other_func && offset == other_offset,
+            _ => false,
+        };
+        self.bytes == other.bytes
+            && self.align == other.align
+            && self.signature == other.signature
+            && self.unwind == other.unwind
+            && self.relocs.len() == other.relocs.len()
+            && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
+                a.offset == b.offset
+                    && a.kind == b.kind
+                    && a.addend == b.addend
+                    && same_target(&a.name, &b.name)
+            })
+    }
+}
+
+/// Compared by the database when a function is compiled again: one that came out the same
+/// leaves what was built from it alone.
+#[derive(PartialEq)]
 pub struct CompiledFunction {
     pub(super) requests: Requests,
     pub(super) code: Code,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
-    pub(super) serial: u64,
 }
 
 /// The value of a static rustc exports no symbol for.
+#[derive(PartialEq)]
 pub struct CompiledStatic {
     pub(super) requests: Requests,
     pub(super) blob: ConstBlob,
     pub(super) writable: bool,
-    pub(super) serial: u64,
 }
 
 /// Collects the requests of one function while its IR is built.

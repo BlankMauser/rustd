@@ -121,7 +121,7 @@ impl PerNsGlobImports {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ItemScope {
     /// Defs visible in this scope. This includes `declarations`, but also
     /// imports. The imports belong to this module and can be resolved by using them on
@@ -171,7 +171,7 @@ pub struct ItemScope {
     derive_macros: FxHashMap<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeriveMacroInvocation {
     attr_id: AttrId,
     /// The `#[derive]` call
@@ -244,7 +244,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope(db);
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(ModuleDefId::MacroId(def)) => {
@@ -259,7 +259,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope(db);
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(def) => {
@@ -274,7 +274,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope(db);
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(def) => {

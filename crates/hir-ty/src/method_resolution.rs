@@ -649,7 +649,7 @@ impl<'db> InherentImpls<'db> {
             def_map: &DefMap,
             map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>,
         ) {
-            for (_module_id, module_data) in def_map.modules() {
+            for (_module_id, module_data) in def_map.modules(db) {
                 for impl_id in module_data.scope(db).inherent_impls() {
                     let interner = DbInterner::new_no_crate(db);
                     let self_ty = db.impl_self_ty(impl_id);
@@ -804,7 +804,7 @@ impl<'db> TraitImpls<'db> {
             lang_items: &LangItems,
             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
         ) {
-            for (_module_id, module_data) in def_map.modules() {
+            for (_module_id, module_data) in def_map.modules(db) {
                 for impl_id in module_data.scope(db).trait_impls() {
                     let trait_ref = match db.impl_trait(impl_id) {
                         Some(tr) => tr.instantiate_identity().skip_norm_wip(),

@@ -1631,7 +1631,12 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
             }
             ast::Expr::ParenExpr(e) => {
-                let inner = self.collect_expr_opt(e.expr());
+                // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
+                // those go with it.
+                let inner = match e.expr() {
+                    Some(inner) => self.maybe_collect_expr(inner)?,
+                    None => self.missing_expr(),
+                };
                 // make the paren expr point to the inner expression as well for IDE resolution
                 let src = self.expander.in_file(syntax_ptr);
                 self.store.expr_map.insert(src, inner.into());
@@ -2664,7 +2669,7 @@ impl<'db> ExprCollector<'db> {
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
 
-        let block_call = self.def_map.modules[self.module].scope(self.db).macro_invoc(
+        let block_call = self.def_map.module(self.db, self.module).scope(self.db).macro_invoc(
             self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
         );
         let res = match block_call {
@@ -2676,7 +2681,9 @@ impl<'db> ExprCollector<'db> {
                     // the last one of the block when a later statement defines it again.
                     let shadowing = path.as_ident().and_then(|name| {
                         let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
-                        let defs = self.def_map.modules[self.def_map.root]
+                        let defs = self
+                            .def_map
+                            .module(self.db, self.def_map.root)
                             .legacy_macro_in_scope(self.db, name)?;
                         defs.get(seen.checked_sub(1)?).copied()
                     });
@@ -2815,7 +2822,9 @@ impl<'db> ExprCollector<'db> {
                     return;
                 };
                 let name = name.as_name();
-                let macro_id = self.def_map.modules[self.def_map.root]
+                let macro_id = self
+                    .def_map
+                    .module(self.db, self.def_map.root)
                     .name_in_scope(self.db, &name)
                     .take_macros();
                 self.collect_macro_def(statements, macro_id);
@@ -2831,7 +2840,9 @@ impl<'db> ExprCollector<'db> {
                 let name = name.as_name();
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name.clone()).or_insert(0);
-                let macro_id = self.def_map.modules[self.def_map.root]
+                let macro_id = self
+                    .def_map
+                    .module(self.db, self.def_map.root)
                     .legacy_macro_in_scope(self.db, &name)
                     .and_then(|it| it.get(*macro_defs_count))
                     .copied();

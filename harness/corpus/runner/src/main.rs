@@ -301,6 +301,7 @@ fn main() {
     println!("joined {:?}", cases::added_strings::joined(vec![1, 2, 3]));
     println!("joined_words {:?}", cases::added_strings::joined_words(vec![1, 2, 3]));
     println!("macro_type_arguments {:?}", cases::macro_type_arguments::run("x"));
+    println!("cfg_macro_arguments {:?}", cases::cfg_macro_arguments::run("x"));
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 
