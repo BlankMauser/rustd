@@ -80,6 +80,7 @@ mod home;
 pub use home::body_file;
 mod patch;
 mod stable;
+mod store;
 pub use patch::{Stale, StaleSteps};
 mod type_id;
 mod unwind;
@@ -424,6 +425,13 @@ impl CodegenUnit {
                         all.len()
                     );
                     std::fs::write(path, all.join("\n")).ok();
+                }
+                if let Some(store) = store::Store::global() {
+                    store.flush();
+                    let (hits, misses) = store.take_counts();
+                    if hits + misses != 0 {
+                        eprintln!("store: {hits} functions found, {misses} compiled and added");
+                    }
                 }
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
@@ -1382,7 +1390,13 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     let large = ctx.func.dfg.num_insts() > LARGE;
     let isa = &**if large { target_for_large()? } else { target()? };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.compile(isa, &mut Default::default()).map_err(|e| format!("{:?}", e.inner))?;
+        match store::Store::global() {
+            Some(store) => ctx
+                .compile_with_cache(isa, &mut store::Lookup(store), &mut Default::default())
+                .map(drop),
+            None => ctx.compile(isa, &mut Default::default()).map(drop),
+        }
+        .map_err(|e| format!("{:?}", e.inner))?;
         let Some(compiled) = ctx.compiled_code() else {
             return Err("no compiled code".to_owned());
         };
