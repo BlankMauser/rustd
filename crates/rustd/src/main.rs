@@ -655,8 +655,33 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     Ok(crates.len())
 }
 
-fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId>> {
-    let krate = crate_named(db, krate)?;
+/// The functions of the crates being built, listed once and again for the crates an edit can
+/// have changed the items of.
+#[derive(Default)]
+struct Listed {
+    functions: FxHashMap<Crate, Vec<FunctionId>>,
+}
+
+impl Listed {
+    fn of(&mut self, db: &RootDatabase, krate: Crate) -> &[FunctionId] {
+        self.functions.entry(krate).or_insert_with(|| functions_of(db, krate))
+    }
+
+    /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
+    fn touch(&mut self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
+        let Some(crates) = crates else {
+            self.functions.clear();
+            return;
+        };
+        for &krate in crates {
+            for seeing in krate.transitive_rev_deps(db) {
+                self.functions.remove(&Crate::from(seeing));
+            }
+        }
+    }
+}
+
+fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
     // Each scope's functions, and the bodies whose blocks declare more scopes.
@@ -723,7 +748,7 @@ fn functions_of(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<FunctionId
             }
         }
     }
-    Ok(functions)
+    functions
 }
 
 struct Build {
@@ -749,14 +774,15 @@ fn build(
     table: &SymbolTable,
     args: &Args,
     known: &mut Rejections,
+    listed: &mut Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
     let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
-    let mut functions = functions_of(db, &args.krate)?;
-    for krate in &args.batch {
-        functions.extend(functions_of(db, krate)?);
+    let mut functions = Vec::new();
+    for krate in std::iter::once(&args.krate).chain(&args.batch) {
+        functions.extend_from_slice(listed.of(db, crate_named(db, krate)?));
     }
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
@@ -998,7 +1024,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             features: args.features.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(db, table, &args, &mut Rejections::default())
+            build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
         }));
         let error = match built {
             Ok(Ok(_)) => continue,
@@ -1062,7 +1088,8 @@ fn main() -> anyhow::Result<()> {
     }));
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
-    let cold = build(&db, &table, &args, &mut known)?;
+    let mut listed = Listed::default();
+    let cold = build(&db, &table, &args, &mut known, &mut listed)?;
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
@@ -1124,16 +1151,19 @@ fn main() -> anyhow::Result<()> {
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
             known.touch(&db, None);
+            listed.touch(&db, None);
         }
         for path in included {
             db.reload_included_file(path);
         }
         for file in sources {
             let crates = ide_db::base_db::relevant_crates(&db, file);
-            known.touch(&db, (!crates.is_empty()).then_some(crates));
+            let crates = (!crates.is_empty()).then_some(crates);
+            known.touch(&db, crates);
+            listed.touch(&db, crates);
         }
         let apply = start.elapsed();
-        let warm = build(&db, &table, &args, &mut known)?;
+        let warm = build(&db, &table, &args, &mut known, &mut listed)?;
         let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
