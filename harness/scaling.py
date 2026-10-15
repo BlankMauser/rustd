@@ -95,6 +95,23 @@ def measure(name, spec, repeat):
     if others:
         body = ELSEWHERE[-1][1]
         jobs.append(("body: unused let", "all", {path: (body(texts[path]), texts[path]) for path in others}))
+    # SCALING_KEEP: instead, this many body edits that stay, each in another function, going
+    # round the files: what an edit costs with the earlier ones still in the patch.
+    keep = int(os.environ.get("SCALING_KEEP", "0"))
+    if keep:
+        jobs, now = [], dict(texts)
+        spots = {path: [m.end() for m in PLAIN_FN.finditer(text)] for path, text in texts.items()}
+        for k in range(keep):
+            path = others[k % len(others)]
+            nth = k // len(others)
+            if nth >= len(spots[path]):
+                continue
+            # Earlier edits to the file sit above this one or below it: count those above.
+            at = spots[path][nth] + sum(len(f"let _rustd_edit = {j}u32;\n") for j in range(k) if others[j % len(others)] == path and j // len(others) < nth)
+            new = now[path][:at] + f"let _rustd_edit = {k}u32;\n" + now[path][at:]
+            jobs.append((f"kept body edit {k}", path, {path: (new, now[path])}))
+            now[path] = new
+        repeat = 1
     samples, done, wrong = [], 0, []
     try:
         wait(r"watching \d+ files", 0)
@@ -107,7 +124,7 @@ def measure(name, spec, repeat):
         for turn in range(repeat):
             for kind, where, writes in jobs:
                 assert all(new != old for new, old in writes.values()), (name, kind, where)
-                for revert in (False, True):
+                for revert in (False,) if keep else (False, True):
                     time.sleep(0.3)
                     for path, texts_ in writes.items():
                         open(path, "w").write(texts_[revert])

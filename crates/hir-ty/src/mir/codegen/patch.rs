@@ -285,6 +285,11 @@ pub struct StaleSteps {
     pub statics: std::time::Duration,
     /// The functions left to rustc.
     pub left: std::time::Duration,
+    /// How many roots and instances an edit could have changed, and so were asked about.
+    pub roots_asked: usize,
+    pub instances_asked: usize,
+    /// The longest any one of them took to answer.
+    pub slowest: std::time::Duration,
 }
 
 impl Stale {
@@ -491,10 +496,13 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
+            let asked = std::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
                 Some(Mark::new(db, compiled.serial, &compiled.requests))
             });
+            stale.steps.roots_asked += 1;
+            stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
             match mark {
                 Some(Some(mark)) if mark == self.marks[i] => {}
                 _ if !touched => {
@@ -514,10 +522,13 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
+            let asked = std::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| Mark::new(db, it.serial, &it.requests))
             });
+            stale.steps.instances_asked += 1;
+            stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
             stale.their_walk_changed |= touched
                 && was.theirs
                 && mark.flatten().map(|it| it.serial) != was.mark.map(|it| it.serial);

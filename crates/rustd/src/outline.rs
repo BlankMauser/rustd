@@ -12,11 +12,11 @@ use std::hash::{Hash, Hasher};
 use hir_def::{FunctionId, Lookup, ModuleDefId, expr_store::Body};
 use ide_db::{
     RootDatabase,
-    base_db::{SourceDatabase as _, relevant_crates},
+    base_db::{EditionedFileId, relevant_crates},
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use syntax::{
-    AstNode, Edition, SourceFile, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
+    AstNode, Edition, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
     ast::{self, HasAttrs},
 };
 use vfs::FileId;
@@ -108,8 +108,10 @@ fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
             return None;
         }
     };
-    let text = db.file_text(file).text(db);
-    let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();
+    // As the crate reads it, so that the file is parsed once for both.
+    let edition =
+        relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
+    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
     let (hash, found) = hash_outside_bodies(&tree, &seen.declaring);
     // Each of them has to be one of the bodies that were kept in.
     (found == seen.declaring.len()).then_some(hash)
@@ -244,6 +246,7 @@ impl Listed {
             match self.functions.get(&krate.into()) {
                 Some(listed) => functions.extend(
                     listed
+                        .functions
                         .iter()
                         .copied()
                         .filter(|&it| hir_ty::mir::codegen::body_file(db, it.into()) == file),
@@ -265,6 +268,7 @@ impl Listed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syntax::SourceFile;
 
     fn hash(text: &str) -> u64 {
         let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();

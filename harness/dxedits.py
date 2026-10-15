@@ -104,6 +104,12 @@ def main():
         perf_dir = os.environ.get("DXEDITS_PERF")
         repeat = int(os.environ.get("DXEDITS_REPEAT", "1"))
         samples = []
+        # DXEDITS_PERF_WHOLE: one profile of the daemon over every edit, at this path.
+        whole = None
+        if whole_path := os.environ.get("DXEDITS_PERF_WHOLE"):
+            whole = subprocess.Popen(["perf", "record", "-F", "4999", "-g", "-o", whole_path, "-p", str(daemon.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.5)
         for turn, (name, path, apply) in enumerate(edits * repeat):
             if only and not any(o in name for o in only.split(",")):
                 continue
@@ -124,7 +130,7 @@ def main():
                 if request:
                     reply = subprocess.check_output([RUSTD, request, socket], text=True)
                     print(f"    {reply.strip()}  round trip {(time.time() - saved) * 1000:.0f}ms")
-                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)", done)
+                found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?(?:asked: .*\n)?edit-to-binary: (\S+)", done)
                 done = len(found)
                 b = found[-1]
                 wall = (os.path.getmtime(binary) - saved) * 1000 if "--patch" in args else None
@@ -138,6 +144,9 @@ def main():
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
                     print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])
+        if whole:
+            whole.send_signal(2)
+            whole.wait()
         rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
         print(f"rss after edits: {rss} MB")
         json.dump(samples, open(os.path.join(work, "timeline.json"), "w"), indent=1)

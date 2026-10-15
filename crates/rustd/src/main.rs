@@ -727,12 +727,35 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
 /// have changed the items of.
 #[derive(Default)]
 struct Listed {
-    functions: FxHashMap<Crate, Vec<FunctionId>>,
+    functions: FxHashMap<Crate, ListedCrate>,
+}
+
+struct ListedCrate {
+    functions: Vec<FunctionId>,
+    /// For each, whether it is `main` or something a runtime looks up by name.
+    starts: Vec<bool>,
+    has_main: bool,
+}
+
+impl ListedCrate {
+    fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
+        let functions = functions_of(db, krate);
+        let mut has_main = false;
+        let starts = functions
+            .iter()
+            .map(|&func| {
+                let is_main = hir::Function::from(func).is_main(db);
+                has_main |= is_main;
+                is_main || exported_symbol(db, func).is_some()
+            })
+            .collect();
+        ListedCrate { functions, starts, has_main }
+    }
 }
 
 impl Listed {
-    fn of(&mut self, db: &RootDatabase, krate: Crate) -> &[FunctionId] {
-        self.functions.entry(krate).or_insert_with(|| functions_of(db, krate))
+    fn of(&mut self, db: &RootDatabase, krate: Crate) -> &ListedCrate {
+        self.functions.entry(krate).or_insert_with(|| ListedCrate::new(db, krate))
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
@@ -837,7 +860,7 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
 }
 
 struct Build {
-    compiled: Vec<String>,
+    compiled: usize,
     skipped: Vec<(String, CodegenError)>,
     instances: usize,
     codegen: Duration,
@@ -866,22 +889,23 @@ fn build(
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
+    let mut has_main = false;
+    let mut local = Vec::new();
     for krate in std::iter::once(&args.krate).chain(&args.batch) {
         for krate in crates_named(db, krate)? {
-            functions.extend_from_slice(listed.of(db, krate));
+            local.push(krate);
+            let listed = listed.of(db, krate);
+            has_main |= listed.has_main;
+            functions.extend(listed.functions.iter().copied().zip(listed.starts.iter().copied()));
         }
     }
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
-    let is_main = |&func: &FunctionId| hir::Function::from(func).is_main(db);
-    let (entries, on_demand): (Vec<_>, Vec<_>) = if functions.iter().any(is_main) {
-        functions
-            .into_iter()
-            .partition(|func| is_main(func) || exported_symbol(db, *func).is_some())
-    } else {
-        (functions, Vec::new())
-    };
+    let (entries, on_demand): (Vec<_>, Vec<_>) =
+        functions.into_iter().partition(|&(_, starts)| starts || !has_main);
+    let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
+    let (entries, on_demand) = (unzip(entries), unzip(on_demand));
     let roots = Roots { entries: &entries, on_demand: &on_demand };
     let setup = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -899,13 +923,24 @@ fn build(
         );
     }
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    // What every question about a crate's code comes down to first, asked one crate to a
+    // thread: left to the questions, whichever gets there has the others wait for all of it.
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known) = (db.clone(), &*known);
+                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
                 scope.spawn(move || {
                     PROBING.set(true);
-                    hir::attach_db(&db, || known.stale(&db, part, threads))
+                    hir::attach_db(&db, || {
+                        while let Some(&krate) =
+                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                        {
+                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
+                        }
+                        known.stale(&db, part, threads)
+                    })
                 })
             })
             .collect();
@@ -935,7 +970,7 @@ fn build(
         std::fs::write(path, patch)?;
     }
     let build = Build {
-        compiled: unit.compiled.iter().map(|&(func, _)| name(func)).collect(),
+        compiled: unit.compiled.len(),
         skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
         instances: unit.instances,
         codegen,
@@ -944,7 +979,8 @@ fn build(
         looked,
     };
     if let Some(path) = &args.report {
-        build.write_report(path)?;
+        let compiled: Vec<String> = unit.compiled.iter().map(|&(func, _)| name(func)).collect();
+        build.write_report(path, &compiled)?;
     }
     if let Some(dir) = &args.isolate {
         std::fs::create_dir_all(dir)?;
@@ -964,7 +1000,7 @@ fn build(
 }
 
 impl Build {
-    fn write_report(&self, path: &Path) -> anyhow::Result<()> {
+    fn write_report(&self, path: &Path, compiled: &[String]) -> anyhow::Result<()> {
         use std::fmt::Write;
         let mut out = String::new();
         writeln!(
@@ -973,7 +1009,7 @@ impl Build {
             self.instances,
             self.codegen.as_micros()
         )?;
-        for name in &self.compiled {
+        for name in compiled {
             writeln!(out, "compiled\t{name}\t")?;
         }
         for (name, error) in &self.skipped {
@@ -987,8 +1023,8 @@ impl Build {
 fn report(build: &Build) {
     eprintln!(
         "compiled {} of {} fns (+{} instances) in {:.1?} (+{:.1?} emit)",
-        build.compiled.len(),
-        build.compiled.len() + build.skipped.len(),
+        build.compiled,
+        build.compiled + build.skipped.len(),
         build.instances,
         build.codegen,
         build.emit,
@@ -1373,19 +1409,8 @@ fn main() -> anyhow::Result<()> {
                 ("read", read),
                 ("apply", apply),
                 ("roots", roots),
-                ("check-roots", warm.looked.roots),
-                ("check-instances", warm.looked.instances),
-                ("check-statics", warm.looked.statics),
-                ("check-left", warm.looked.left),
-                (
-                    "check-rest",
-                    revalidate.saturating_sub(
-                        warm.looked.roots
-                            + warm.looked.instances
-                            + warm.looked.statics
-                            + warm.looked.left,
-                    ),
-                ),
+                // All of the checking: threads look at the kinds one after another.
+                ("check", revalidate),
                 ("reach", phases.compile),
                 ("resolve", phases.resolve),
                 ("define", phases.define),
@@ -1406,6 +1431,19 @@ fn main() -> anyhow::Result<()> {
             eprintln!("timeline-us: {}", steps.join(" "));
         }
         eprintln!("edit-to-binary: {total:.1?}");
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
+                 instances {:.1?}, statics {:.1?}, left {:.1?}",
+                warm.looked.roots_asked,
+                warm.looked.instances_asked,
+                warm.looked.slowest,
+                warm.looked.roots,
+                warm.looked.instances,
+                warm.looked.statics,
+                warm.looked.left,
+            );
+        }
         if let Some((_, client)) = client {
             // What the caller has to load to be up to date: the functions that differ from the
             // first object when the edit could be a patch, and all of them when it could not.
