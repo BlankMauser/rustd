@@ -289,7 +289,8 @@ def main():
     def run(path):
         try:
             p = subprocess.run([path, *run_args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
-            return f"{p.stdout}\n--\n{p.stderr}\n[exit {p.returncode}]".replace(path, "BIN")
+            # A usage line names the program by its file name, which is not the same for the two.
+            return f"{p.stdout}\n--\n{p.stderr}\n[exit {p.returncode}]".replace(path, "BIN").replace("bin-rustd", bin_name)
         except Exception as error:
             return f"[{type(error).__name__}]"
 
