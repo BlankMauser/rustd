@@ -1330,9 +1330,16 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
-    let start = Instant::now();
-    let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
-    eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
+    // Nothing asks for a symbol before the first build, so they load next to the workspace.
+    let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
+    let table = std::thread::spawn(move || {
+        let start = Instant::now();
+        let table = SymbolTable::load(&symbol_files, &root);
+        if let Ok(table) = &table {
+            eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
+        }
+        table
+    });
 
     let start = Instant::now();
     let cargo_config = CargoConfig {
@@ -1373,6 +1380,7 @@ fn main() -> anyhow::Result<()> {
     known.patching = args.patch.is_some();
     let mut listed = Listed::default();
     let mut outlines = outline::Outlines::default();
+    let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let cold = build(&db, &table, &args, &mut known, &mut listed)?;
     eprint!("cold: ");
     report(&cold);
