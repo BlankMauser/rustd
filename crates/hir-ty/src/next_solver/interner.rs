@@ -353,6 +353,9 @@ pub struct DbInterner<'db> {
     pub db: &'db dyn HirDatabase,
     krate: Option<Crate>,
     lang_items: Option<&'db LangItems>,
+    /// The crate's `#![recursion_limit]`, or rustc's default. The solver asks for it with every
+    /// goal, so it is read once.
+    recursion_limit: u32,
     /// Which of the thread's solver caches is this interner's, see [`tls_cache`].
     solved: tls_cache::Solved,
 }
@@ -370,6 +373,7 @@ impl<'db> DbInterner<'db> {
             db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
             krate: None,
             lang_items: None,
+            recursion_limit: 128,
             solved: tls_cache::Solved::new(),
         })
     }
@@ -381,7 +385,13 @@ impl<'db> DbInterner<'db> {
     pub fn new_no_crate(db: &'db dyn HirDatabase) -> Self {
         // We do not reinit the cache here, since anything accessing the cache needs an InferCtxt,
         // and we panic when trying to construct an InferCtxt for an Interner without a crate.
-        DbInterner { db, krate: None, lang_items: None, solved: tls_cache::Solved::new() }
+        DbInterner {
+            db,
+            krate: None,
+            lang_items: None,
+            recursion_limit: 128,
+            solved: tls_cache::Solved::new(),
+        }
     }
 
     pub fn new_with(db: &'db dyn HirDatabase, krate: Crate) -> DbInterner<'db> {
@@ -392,6 +402,7 @@ impl<'db> DbInterner<'db> {
             // As an approximation, when we call `new_with` we're trait solving, therefore we need the lang items.
             // This is also convenient since here we have a starting crate but not in `new_no_crate`.
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
+            recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
             solved: tls_cache::Solved::new(),
         }
     }
@@ -1250,11 +1261,9 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn recursion_limit(self) -> usize {
-        // The crate's `#![recursion_limit]`, or rustc's default. A lower limit makes deeply
-        // nested but valid obligations (tower's future types) ambiguous.
-        let limit = self
-            .krate
-            .map_or(128, |krate| hir_def::nameres::crate_def_map(self.db, krate).recursion_limit());
+        // A lower limit than the crate's makes deeply nested but valid obligations (tower's
+        // future types) ambiguous.
+        let limit = self.recursion_limit;
         // FIXME: an unoptimized build overflows a 2 MB stack at that depth; grow the stack
         // instead, as rustc does.
         if cfg!(debug_assertions) { limit.min(50) as usize } else { limit as usize }
