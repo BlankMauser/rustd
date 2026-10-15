@@ -59,8 +59,12 @@ def main():
             link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
             link[link.index("-fuse-ld=lld")] = "-B" + ld
         args += ["--patch", patch, "--link-cmd", shlex.join(link)]
+    # DXEDITS_REQUEST: `sync` or `patch`; each build is then asked for once the file is written.
+    request = os.environ.get("DXEDITS_REQUEST")
+    socket = os.path.join(work, "rustd.sock")
+    trigger = ["--socket", socket] if request else ["--watch"]
     start = time.time()
-    daemon = subprocess.Popen([RUSTD, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), "--watch", *symbols],
+    daemon = subprocess.Popen([RUSTD, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), *trigger, *symbols],
                               stderr=out, stdout=out)
 
     def wait(pattern, seen):
@@ -101,6 +105,9 @@ def main():
                     time.sleep(1.5)
                 saved = time.time()
                 open(path, "w").write(text)
+                if request:
+                    reply = subprocess.check_output([RUSTD, request, socket], text=True)
+                    print(f"    {reply.strip()}  round trip {(time.time() - saved) * 1000:.0f}ms")
                 found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:   .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)", done)
                 done = len(found)
                 b = found[-1]
