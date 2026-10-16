@@ -1,7 +1,7 @@
-//! OPEN, by design. A future is laid out by rustd, not as rustc lays it out: a word of drop
-//! flags for every local held across an await and a word of state, where rustc has a byte. Its
-//! size is what a program sees of that: futures' `join_size`, `select_size`, `try_join_size`
-//! and `select_on_non_unpin_size` assert the size of an `async` block.
+//! The size of a future is what a program sees of how it is laid out: futures' `join_size`,
+//! `select_size`, `try_join_size` and `select_on_non_unpin_size` assert the size of an `async`
+//! block. rustd laid one out with a word of drop flags for every local held across an await and
+//! a word of state; it lays it out as rustc does now, a variant for each await.
 
 use std::future::{ready, Future, Ready};
 use std::mem::size_of_val;

@@ -3072,11 +3072,24 @@ struct FunctionCx<'cx, 'db> {
     constant_locals: Vec<LocalId>,
     /// What the body's generic parameters stand for, when it is the body of an instance.
     args: Option<StoredGenericArgs>,
-    /// While compiling an `async` body: the address of the word that says where it left off,
-    /// and the blocks it can be resumed in.
-    suspended: Option<(Value, Vec<BasicBlockId>)>,
+    /// While compiling an `async` body: where it says where it left off.
+    suspended: Option<SuspendedState>,
     /// Where a suspended future is dropped, and where that carries on.
     suspended_drop: Option<(ir::Block, ir::Block)>,
+}
+
+/// Where an `async` body says where it left off, and what that says of its locals.
+struct SuspendedState {
+    addr: Value,
+    ty: Type,
+    held: crate::mir::HeldLocals,
+}
+
+/// The drop flags of the locals an `async` body keeps: the ones in the future, and of the rest
+/// which held local each is the flag of.
+struct FrameFlags {
+    in_frame: Vec<Value>,
+    kept: Vec<(usize, Value)>,
 }
 
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
@@ -3769,7 +3782,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
                         != DropGlue::None
                 });
-                let frame = CoroutineFrame { upvars, locals: held.locals.len() };
+                let frame = CoroutineFrame { upvars, flags: held.flagged().count() };
                 let addr = self.builder.ins().load(PTR, MEM, self.locals[receiver].addr, 0);
                 Some((frame, self.layout(ty)?, addr, ty, held))
             }
@@ -3790,10 +3803,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
-            if let Some((frame, ..)) = &frame
+            if let Some((_, frame_layout, frame_addr, _, held)) = &frame
                 && let Some(at) = held_at(local)
             {
-                let addr = in_frame(self, frame.local(at));
+                let Some(offset) = CoroutineFrame::local_offset(frame_layout, held, at) else {
+                    unsupported!("a held local that is kept nowhere");
+                };
+                let addr = self.builder.ins().iadd_imm(*frame_addr, offset.bytes() as i64);
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 continue;
             }
@@ -3824,6 +3840,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.locals.insert(temp, self.locals[to]);
         }
         let mut frame_flags = Vec::new();
+        let mut kept_flags = Vec::new();
         for (local, data) in body.locals.iter() {
             let ty = data.ty.as_ref();
             if local == returned_local(body)
@@ -3833,17 +3850,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             let is_param = body.param_locals.contains(&local);
             // A local that holds nothing when the body yields is not live then either: its
-            // flag starts cleared at every `poll`.
-            let flag = match (&frame, held_at(local)) {
-                (Some((frame, ..)), Some(at)) if !is_param => {
-                    let flag = in_frame(self, frame.drop_flag(at));
+            // flag starts cleared at every `poll`. One that is kept has a flag in the future if
+            // where the body yielded does not say whether it holds a value, and is set from
+            // that otherwise.
+            let flagged = match (&frame, held_at(local)) {
+                (Some((frame, .., held)), Some(at)) if !is_param && held.is_flagged(at) => {
+                    let nth = held.flagged().position(|it| it == at).expect("a flagged local");
+                    Some(frame.drop_flag(nth))
+                }
+                _ => None,
+            };
+            let flag = match flagged {
+                Some(field) => {
+                    let flag = in_frame(self, field);
                     frame_flags.push(flag);
                     flag
                 }
-                _ => {
+                None => {
                     let flag = self.scratch();
                     let live = self.builder.ins().iconst(types::I64, is_param as i64);
                     self.builder.ins().store(MEM, live, flag, 0);
+                    if let Some(at) = held_at(local) {
+                        kept_flags.push((at, flag));
+                    }
                     flag
                 }
             };
@@ -3890,18 +3919,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let state = frame.as_ref().map(|(frame, ..)| frame.state()).map(|it| in_frame(self, it));
         match (frame, state) {
-            (Some((_, layout, addr, ty, _)), Some(state)) => {
-                let resumes: Vec<BasicBlockId> = body
-                    .basic_blocks
-                    .iter()
-                    .filter(|(id, _)| reachable.contains(id))
-                    .filter_map(|(_, block)| match block.terminator.as_ref()?.kind {
-                        TerminatorKind::Yield { resume, .. } => Some(resume),
-                        _ => None,
-                    })
-                    .collect();
-                self.enter_coroutine(body, state, &resumes, &frame_flags, addr, ty, &layout)?;
-                self.suspended = Some((state, resumes));
+            (Some((_, layout, addr, ty, held)), Some(state)) => {
+                let Some(tag) = CoroutineFrame::state_of(&layout) else {
+                    unsupported!("an async block without a state");
+                };
+                let state = SuspendedState { addr: state, ty: self.scalar(tag)?.ty, held };
+                let flags = FrameFlags { in_frame: frame_flags, kept: kept_flags };
+                self.enter_coroutine(body, &state, &flags, addr, ty, &layout)?;
+                self.suspended = Some(state);
             }
             _ => {
                 self.builder.ins().jump(self.blocks[body.start_block], &[]);
@@ -4435,6 +4460,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             Size::ZERO
                         }
                         Variants::Single { .. } | Variants::Empty => {
+                            layout.fields.offset(field.0 as usize)
+                        }
+                        // What an `async` block captured: its variants are its own affair.
+                        Variants::Multiple { .. }
+                            if matches!(prev.ty.kind(), TyKind::Coroutine(..)) =>
+                        {
                             layout.fields.offset(field.0 as usize)
                         }
                         Variants::Multiple { variants, .. } => {
@@ -5358,9 +5389,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.write_fields(dst, &layout, operands)?;
                     if let TyKind::Coroutine(..) = ty.as_ref().kind() {
                         // The last field says where the body left off.
+                        let Some(tag) = CoroutineFrame::state_of(&layout) else {
+                            unsupported!("an async block without a state");
+                        };
+                        let tag = self.scalar(tag)?.ty;
                         let state = layout.fields.offset(layout.fields.count() - 1).bytes();
                         let state = self.builder.ins().iadd_imm(dst, state as i64);
-                        self.store_state(state, UNRESUMED);
+                        self.store_state(state, tag, UNRESUMED);
                     }
                 }
             },
@@ -5988,19 +6023,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 switch.emit(&mut self.builder, value, self.blocks[targets.otherwise()]);
             }
             TerminatorKind::Return => {
-                if let Some((state, _)) = self.suspended {
-                    self.store_state(state, RETURNED);
+                if let Some(state) = &self.suspended {
+                    let (addr, ty) = (state.addr, state.ty);
+                    self.store_state(addr, ty, RETURNED);
                 }
                 self.return_()?;
             }
             TerminatorKind::Yield { resume, .. } => {
-                let Some((state, resumes)) = &self.suspended else {
+                let Some(state) = &self.suspended else {
                     unsupported!("yield outside of an async body");
                 };
-                let Some(index) = resumes.iter().position(|it| it == resume) else {
+                let Some(index) = state.held.yields.iter().position(|it| it.resume == *resume)
+                else {
                     unsupported!("yield to a block that is not resumed in");
                 };
-                self.store_state(*state, SUSPENDED + index as i64);
+                let (addr, ty) = (state.addr, state.ty);
+                self.store_state(addr, ty, SUSPENDED + index as i64);
                 self.return_()?;
             }
             TerminatorKind::Unreachable => {
@@ -8063,8 +8101,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
         self.drop_live_locals()?;
-        if let Some((state, _)) = self.suspended {
-            self.store_state(state, PANICKED);
+        if let Some(state) = &self.suspended {
+            let (addr, ty) = (state.addr, state.ty);
+            self.store_state(addr, ty, PANICKED);
         }
         self.resume_unwinding(exception)
     }
@@ -8092,8 +8131,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    fn store_state(&mut self, state: Value, value: i64) {
-        let value = self.builder.ins().iconst(types::I64, value);
+    fn store_state(&mut self, state: Value, ty: Type, value: i64) {
+        let value = self.builder.ins().iconst(ty, value);
         self.builder.ins().store(MEM, value, state, 0);
     }
 
@@ -8117,9 +8156,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn enter_coroutine(
         &mut self,
         body: &MirBody<'db>,
-        state: Value,
-        resumes: &[BasicBlockId],
-        flags: &[Value],
+        state: &SuspendedState,
+        flags: &FrameFlags,
         addr: Value,
         ty: Ty<'db>,
         layout: &Layout,
@@ -8128,21 +8166,52 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("async body without a context");
         };
         let context = self.builder.ins().load(PTR, MEM, self.locals[context].addr, 0);
-        let at = self.builder.ins().load(types::I64, MEM, state, 0);
+        let at = self.builder.ins().load(state.ty, MEM, state.addr, 0);
+        let at = match state.ty {
+            types::I64 => at,
+            _ => self.builder.ins().uextend(types::I64, at),
+        };
         let (poll, drop) = (self.builder.create_block(), self.builder.create_block());
+        // What is kept where the body yielded holds a value, to be used or to be dropped.
+        let entered = self.builder.create_block();
+        let mut kept = Switch::new();
+        let live = self.builder.ins().iconst(types::I64, 1);
+        let mut restores = Vec::new();
+        for (index, point) in state.held.yields.iter().enumerate() {
+            let flags: Vec<Value> = flags
+                .kept
+                .iter()
+                .filter(|(local, _)| point.kept.contains(local))
+                .map(|&(_, flag)| flag)
+                .collect();
+            if !flags.is_empty() {
+                let restore = self.builder.create_block();
+                kept.set_entry(SUSPENDED as u128 + index as u128, restore);
+                restores.push((restore, flags));
+            }
+        }
+        kept.emit(&mut self.builder, at, entered);
+        for (restore, flags) in restores {
+            self.builder.switch_to_block(restore);
+            for flag in flags {
+                self.builder.ins().store(MEM, live, flag, 0);
+            }
+            self.builder.ins().jump(entered, &[]);
+        }
+        self.builder.switch_to_block(entered);
         self.builder.ins().brif(context, poll, &[], drop, &[]);
 
         let (first, finished) = (self.builder.create_block(), self.builder.create_block());
         self.builder.switch_to_block(poll);
         let mut switch = Switch::new();
         switch.set_entry(UNRESUMED as u128, first);
-        for (index, resume) in resumes.iter().enumerate() {
-            switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[*resume]);
+        for (index, point) in state.held.yields.iter().enumerate() {
+            switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[point.resume]);
         }
         switch.emit(&mut self.builder, at, finished);
         self.builder.switch_to_block(first);
         let dead = self.builder.ins().iconst(types::I64, 0);
-        for &flag in flags {
+        for &flag in &flags.in_frame {
             self.builder.ins().store(MEM, dead, flag, 0);
         }
         self.builder.ins().jump(self.blocks[body.start_block], &[]);
@@ -8157,7 +8226,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.create_block(),
         );
         self.builder.switch_to_block(drop);
-        self.store_state(state, RETURNED);
+        self.store_state(state.addr, state.ty, RETURNED);
         self.builder.ins().brif(at, resumed, &[], unresumed, &[]);
         self.builder.switch_to_block(resumed);
         let is_suspended =

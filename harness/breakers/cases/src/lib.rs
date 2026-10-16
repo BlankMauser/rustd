@@ -20,6 +20,7 @@ cases![
     big_frame,
     big_promoted,
     future_size,
+    future_states,
     macro_item_location,
     clmul,
     cast_then_shift,

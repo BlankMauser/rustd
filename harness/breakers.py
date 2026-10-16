@@ -14,7 +14,7 @@ from difftest import Fixture
 
 CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = {"future_size"}
+OPEN = set()
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
 LEFT = set()
 
@@ -39,9 +39,12 @@ def main():
         state = "left     " if name in left else "same     " if same else "open     " if name in OPEN else "DIFFERENT"
         print(f"{state} {name}", flush=True)
         if not same:
-            print(f"    rustc: status {want[0]} {want[1].decode(errors='replace').strip()[:300]}")
+            ours, theirs = (it[1].decode(errors="replace").strip() for it in (got, want))
+            # Where the two part, not where they start.
+            at = max(0, next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b), 0) - 60)
+            print(f"    rustc: status {want[0]} {theirs[at:at + 300]}")
             tail = got[2].decode(errors="replace").strip().splitlines()[-1:]
-            print(f"    rustd: status {got[0]} {got[1].decode(errors='replace').strip()[:300]} {' '.join(tail)[:200]}")
+            print(f"    rustd: status {got[0]} {ours[at:at + 300]} {' '.join(tail)[:200]}")
     if not sys.argv[1:]:
         # What breaks in a crate's tests and not in a program: each a crate for cratetest.py.
         for crate in CRATES:
