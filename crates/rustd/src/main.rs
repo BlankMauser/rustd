@@ -2653,6 +2653,15 @@ fn main() -> anyhow::Result<()> {
         _ = sending.join();
     }
     hir::attach_db(&db, || known.out_of_date(&db));
+    // What rustc compiled, by where in the checkout it is: the files as this build read them.
+    let as_compiled: FxHashMap<PathBuf, triomphe::Arc<str>> = files
+        .iter()
+        .filter_map(|it| {
+            let Watched::Source(id) = it.file else { return None };
+            let inside = it.path.strip_prefix(&args.checkout).ok()?;
+            Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
+        })
+        .collect();
     let listener = match &args.socket {
         Some(path) => {
             // A socket file left by a daemon that is gone can't be bound again.
@@ -2928,6 +2937,8 @@ fn main() -> anyhow::Result<()> {
                                 program.unbuilt.stale = false;
                                 program.whole = built.whole.clone();
                             }
+                            let first = program.args.symbol_files == programs[0].args.symbol_files;
+                            program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
                             clients.push((programs.len(), (request, asked, stream)));
                             outputs.insert(programs.len(), wanted);
                             programs.push(program);
@@ -3441,6 +3452,44 @@ struct Edit {
 }
 
 impl Program {
+    /// Notes the crates rustc did not compile from the files this program is of, when it joins
+    /// linked with what rustc built: of the first checkout, whose files as the daemon read them
+    /// are `as_compiled`, or of its own checkout as it was when rustc built it.
+    fn distrust_rustc(
+        &mut self,
+        db: &RootDatabase,
+        files: &[WatchedFile],
+        as_compiled: Option<&FxHashMap<PathBuf, triomphe::Arc<str>>>,
+    ) {
+        let built = self
+            .args
+            .symbol_files
+            .iter()
+            .filter(|it| !it.components().any(|it| it.as_os_str() == "rustlib"))
+            .filter_map(|it| std::fs::metadata(it).ok()?.modified().ok())
+            .max();
+        let compiled_from = |file: &WatchedFile, id: vfs::FileId| {
+            let inside = file.path.strip_prefix(&self.args.checkout).ok()?;
+            Some(match as_compiled {
+                Some(as_compiled) => {
+                    let text = db.file_text(id).text(db);
+                    as_compiled.get(inside).is_some_and(|was| **was == **text)
+                }
+                None => file.mtime <= built?,
+            })
+        };
+        let other: Vec<_> = files
+            .iter()
+            .filter_map(|it| {
+                let Watched::Source(id) = it.file else { return None };
+                let fresh = compiled_from(it, id)?;
+                (!fresh).then(|| ide_db::base_db::relevant_crates(db, id).to_vec())
+            })
+            .flatten()
+            .collect();
+        self.known.distrust(db, &other);
+    }
+
     /// Whether the last build of this program is one of `other`, which has had none: the two
     /// are of the same crates, as checkouts that share them have it. What `other` is then
     /// asked for is a patch of that build.

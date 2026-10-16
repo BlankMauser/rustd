@@ -211,9 +211,16 @@ pub(in crate::mir) struct Frozen {
     /// The files that have seen an edit to the bodies of functions alone, which can change
     /// no function written elsewhere.
     edited_bodies: FxHashSet<FileId>,
+    /// The crates rustc compiled from other source than the daemon first saw them with: no
+    /// copy of a function of theirs is good.
+    distrusted: FxHashSet<Crate>,
 }
 
 impl Frozen {
+    pub(in crate::mir) fn distrust(&mut self, crates: impl IntoIterator<Item = Crate>) {
+        self.distrusted.extend(crates);
+    }
+
     pub(in crate::mir) fn edit_bodies(&mut self, file: FileId) {
         self.edited_bodies.insert(file);
     }
@@ -232,12 +239,16 @@ impl Frozen {
             let theirs = base.skipped.iter().filter(|it| !matches!(it.1, CodegenError::NoSymbol));
             theirs.map(|(root, why)| (*root, why))
         };
+        let distrusted = |root: FunctionId| self.distrusted.contains(&root.krate(db));
         let Some(left) = &self.left else {
+            let other =
+                now().find(|it| distrusted(it.0)).map(|(root, why)| (root, why.to_string()));
             self.left = Some(now().map(|(root, _)| (root, Left::of(db, root))).collect());
-            return None;
+            return other;
         };
         now().find_map(|(root, why)| {
             let fresh = match left.get(&root) {
+                _ if distrusted(root) => false,
                 // Nothing to tell a change by: any edit that it can see may be one.
                 Some(Left { code: None, .. }) => {
                     !self.edited.contains(&root.krate(db))

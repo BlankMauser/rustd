@@ -645,6 +645,12 @@ impl Rejections {
         self.base.is_some()
     }
 
+    /// Notes that rustc compiled `crates` from other source than they are first built from
+    /// here, so that what it compiled of them and of those that see them is not to be linked.
+    pub fn distrust(&mut self, db: &dyn HirDatabase, crates: &[Crate]) {
+        self.frozen.distrust(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+    }
+
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
     /// change since the last build has to be noted before [`Rejections::stale`] looks.
     pub fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
