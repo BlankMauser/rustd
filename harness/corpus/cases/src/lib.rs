@@ -5472,6 +5472,14 @@ pub mod local_type_names {
             }
             (name_of(deeper), deeper())
         };
-        (name_of(inner), std::any::type_name::<Local>(), nested, name_of(run))
+        let in_closure = (|| {
+            fn enclosed() {}
+            let twice = || {
+                struct Twice;
+                std::any::type_name::<Twice>()
+            };
+            (name_of(enclosed), twice())
+        })();
+        (name_of(inner), std::any::type_name::<Local>(), nested, in_closure, name_of(run))
     }
 }

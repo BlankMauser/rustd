@@ -35,25 +35,36 @@ fn write_module<'db>(
     out: &mut String,
     module: ModuleIdLt<'db>,
 ) -> Option<()> {
-    // rustc names an item in a body after the function the body is of.
+    // rustc names an item in a body after the function the body is of, and the closures of
+    // it the item is written in.
     if module.is_block_module(db) {
         let block = module.block(db)?;
-        let around = block.module(db);
-        let owner = around.def_map(db).module(db, around).scope(db).declarations().find_map(
-            |def| match def {
+        let mut around = block.module(db);
+        // FIXME: a method's body is named after the `impl`, which is not looked through here.
+        let owner = loop {
+            let scope = around.def_map(db).module(db, around).scope(db);
+            let owner = scope.declarations().find_map(|def| match def {
                 ModuleDefId::FunctionId(it) => {
                     Body::of(db, it.into()).blocks(db).any(|(id, _)| id == block).then_some(it)
                 }
                 _ => None,
-            },
-        );
-        // FIXME: a method's body is named after the `impl`, which is not looked through here.
-        write_module(db, out, around)?;
-        return match owner {
-            Some(owner) => write!(out, "::{}", FunctionSignature::of(db, owner).name.as_str()).ok(),
-            // A block in a block is of the same body, and no part of the name.
-            None => around.is_block_module(db).then_some(()),
+            });
+            match owner {
+                Some(owner) => break owner,
+                // A block in a block, of the same body.
+                None => around = around.block(db)?.module(db),
+            }
         };
+        let body = Body::of(db, owner.into());
+        let (at, _) = body
+            .exprs()
+            .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
+        write_module(db, out, around)?;
+        write!(out, "::{}", FunctionSignature::of(db, owner).name.as_str()).ok()?;
+        for _ in 0..closures_around(body, body.root_expr(), at)? {
+            out.push_str("::{{closure}}");
+        }
+        return Some(());
     }
     match module.containing_module(db) {
         Some(parent) => {
