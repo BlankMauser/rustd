@@ -69,7 +69,10 @@ if "--overlay" in sys.argv:
 OVERLAY = "--overlay" in sys.argv
 # With `--split` the others join the first and share the packages that are the same in both.
 SPLIT = "--split" in sys.argv
-JOIN = "--join" in sys.argv or SPLIT
+# With `--thin` the checkouts start out with the same included file, so that the others are
+# read as the first with other function bodies for as long as nothing else differs.
+THIN = "--thin" in sys.argv
+JOIN = "--join" in sys.argv or SPLIT or THIN
 
 
 def main():
@@ -80,7 +83,7 @@ def main():
     for at in range(COUNT):
         ws = os.path.join(work, f"checkout{at}")
         shutil.copytree(os.path.join(HERE, "stress"), ws, ignore=shutil.ignore_patterns("target"))
-        open(os.path.join(ws, NOTE), "w").write(f"note of {at}\n")
+        open(os.path.join(ws, NOTE), "w").write(f"note of {1 if THIN else at}\n")
         main_rs = os.path.join(ws, APP)
         text = open(main_rs).read()
         assert "fn main() {" in text

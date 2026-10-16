@@ -794,6 +794,7 @@ fn load(
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         compared: Default::default(),
+        light: Default::default(),
         roots: Vec::new(),
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
@@ -815,6 +816,9 @@ type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, Sy
 /// The checkouts the daemon has loaded.
 struct Checkouts {
     compared: Compared,
+    /// The files of other checkouts that differ from those of a loaded one, and whether in a
+    /// way that [`Checkouts::light`] counts.
+    light: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
@@ -947,15 +951,22 @@ impl Checkouts {
     /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
     /// place in a loaded checkout with the files of its own when `overlay` allows that and
     /// the two lock the same dependencies. `None` when its checkout has to be loaded.
-    fn view_of(&self, project: &Path, overlay: bool) -> Option<View> {
+    fn view_of(
+        &self,
+        project: &Path,
+        overlay: Overlay,
+        heavy: &dyn Fn(&Path, &Path) -> bool,
+    ) -> Option<View> {
         let project = std::fs::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
             return Some(View { base: root.clone(), over: root.clone(), project });
         }
-        if !overlay {
+        if overlay == Overlay::Never {
             return None;
         }
-        self.roots.iter().find_map(|(loaded, base)| {
+        // One that shares packages with another has those where the other is.
+        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        whole.into_iter().find_map(|(loaded, base)| {
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
             for part in inside.components().rev() {
@@ -964,12 +975,57 @@ impl Checkouts {
                 }
                 over.pop();
             }
-            self.builds_alike(base, &over).then(|| View {
-                base: base.clone(),
-                over,
-                project: loaded.clone(),
-            })
+            let alike = self.builds_alike(base, &over)
+                && (overlay == Overlay::Always || self.light(base, base, &over, heavy));
+            alike.then(|| View { base: base.clone(), over, project: loaded.clone() })
         })
+    }
+
+    /// Whether reading the checkout at `base` from `over` is an edit that is quick to take
+    /// in: none of the files under `dir` that differ is one `heavy` says takes long.
+    fn light(
+        &self,
+        dir: &Path,
+        base: &Path,
+        over: &Path,
+        heavy: &dyn Fn(&Path, &Path) -> bool,
+    ) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return true };
+        entries.filter_map(|it| it.ok()).all(|entry| {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { return true };
+            if kind.is_dir() {
+                return entry.file_name() == ".git"
+                    || path.join("CACHEDIR.TAG").exists()
+                    || self.light(&path, base, over, heavy);
+            }
+            let Ok(inside) = path.strip_prefix(base) else { return true };
+            let their = over.join(inside);
+            let written = |path: &Path| {
+                let file = std::fs::metadata(path).ok()?;
+                Some((file.len(), file.modified().ok()?))
+            };
+            // A file that is gone is no longer named by one that is there, or the build fails.
+            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
+                return true;
+            };
+            let known = self.light.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
+            if let Some((_, _, light)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
+                return light;
+            }
+            let light = !heavy(&path, &their);
+            self.light
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(their, (ours, theirs, light));
+            light
+        })
+    }
+
+    /// The checkout that the one at `root` has packages of, when it has.
+    fn shares_with(&self, root: &Path) -> Option<&Path> {
+        let at = self.roots.iter().position(|it| it.1 == root)?;
+        self.splits[at].as_ref().map(|it| &*it.base)
     }
 
     /// Whether what cargo and rustc did for the checkout at `base` is what they would do for
@@ -1160,6 +1216,16 @@ struct Split {
     own: BTreeSet<PathBuf>,
 }
 
+/// When a checkout that is not loaded is read as a loaded one with other files.
+#[derive(Clone, Copy, PartialEq)]
+enum Overlay {
+    Never,
+    /// When taking in what differs is quick: the checkouts read as one are built in turn, so
+    /// one that takes long is loaded with its own crates instead.
+    Light,
+    Always,
+}
+
 /// A checkout as the daemon looks at it.
 struct View {
     /// The loaded checkout it is built as.
@@ -1306,6 +1372,8 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
 #[derive(Default)]
 struct Listed {
     functions: std::sync::Mutex<FxHashMap<Crate, std::sync::Arc<ListedCrate>>>,
+    /// Every crate that was listed, also once an edit has it listed again.
+    built: std::sync::Mutex<FxHashSet<Crate>>,
 }
 
 struct ListedCrate {
@@ -1327,6 +1395,7 @@ impl ListedCrate {
 impl Listed {
     /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
     fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
+        self.built.lock().unwrap().insert(krate);
         if let Some(listed) = self.functions.lock().unwrap().get(&krate) {
             return listed.clone();
         }
@@ -2553,9 +2622,11 @@ fn main() -> anyhow::Result<()> {
         interrupted: 0,
         moved: false,
     }];
-    let overlay = std::env::var_os("RUSTD_OVERLAY").is_some();
-    // A checkout read as another is read so by every build, so those are waited for.
-    let background = serving && !overlay;
+    let overlay = match std::env::var("RUSTD_OVERLAY").as_deref() {
+        Ok("0") => Overlay::Never,
+        Ok(_) => Overlay::Always,
+        Err(_) => Overlay::Light,
+    };
     let mut builds =
         Builds { events, running: FxHashMap::default(), waiting: Default::default(), stuck: false };
     // The checkout each loaded one is read from, when that is not itself.
@@ -2598,16 +2669,69 @@ fn main() -> anyhow::Result<()> {
                     let asked = target.clone();
                     let mut target = target;
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
-                        Some(project) => checkouts.view_of(project, overlay),
+                        Some(project) => {
+                            let included: FxHashSet<&Path> = files
+                                .iter()
+                                .filter(|it| matches!(it.file, Watched::Included(_)))
+                                .map(|it| &*it.path)
+                                .collect();
+                            let vfs = &*tree.vfs();
+                            // What a checkout reads is known once a build of it is over.
+                            let pending = WatchedFile::unwatched(&files, &db);
+                            let built: Vec<&Path> = programs
+                                .iter()
+                                .enumerate()
+                                .filter(|(at, it)| {
+                                    it.whole.is_some() && !builds.running.contains_key(at)
+                                })
+                                .map(|(_, it)| &*it.args.checkout)
+                                .collect();
+                            // Bodies that nothing else sees into are compiled again and no
+                            // more. Anything else a build reads has it look at every crate
+                            // that can see the file.
+                            let heavy = |ours: &Path, theirs: &Path| {
+                                if pending || !built.iter().any(|it| ours.starts_with(it)) {
+                                    return true;
+                                }
+                                if ours.extension().is_none_or(|it| it != "rs") {
+                                    return included.contains(ours)
+                                        && std::fs::read(ours).ok() != std::fs::read(theirs).ok();
+                                }
+                                let path = VfsPath::from(AbsPathBuf::assert_utf8(ours.to_owned()));
+                                let Some((file, _)) = vfs.file_id(&path) else { return false };
+                                if !listed.sees(&db, file) {
+                                    return false;
+                                }
+                                match (
+                                    std::fs::read_to_string(ours),
+                                    std::fs::read_to_string(theirs),
+                                ) {
+                                    (Ok(ours), Ok(theirs)) => {
+                                        ours != theirs
+                                            && !outline::alike_outside_bodies(&ours, &theirs)
+                                    }
+                                    _ => true,
+                                }
+                            };
+                            checkouts.view_of(project, overlay, &heavy)
+                        }
                         None => {
                             let base = programs[0].args.checkout.clone();
                             let project = programs[0].args.project.clone();
                             Some(View { over: base.clone(), base, project })
                         }
                     };
-                    // One build reads a checkout from one place.
+                    // One build reads a checkout from one place, and one that has packages of
+                    // another reads that one as it is.
+                    let shares = view
+                        .as_ref()
+                        .and_then(|it| checkouts.shares_with(&it.base))
+                        .map(Path::to_owned);
                     if let Some(view) = &view
-                        && looked.get(&view.base).is_some_and(|over| *over != view.over)
+                        && (looked.get(&view.base).is_some_and(|over| *over != view.over)
+                            || shares.as_ref().is_some_and(|base| {
+                                looked.get(base).is_some_and(|over| over != base)
+                            }))
                     {
                         later.push((request, target, stream));
                         continue;
@@ -2650,6 +2774,9 @@ fn main() -> anyhow::Result<()> {
                         if let Some(view) = view {
                             looked.insert(view.base, view.over);
                         }
+                        if let Some(base) = shares {
+                            looked.insert(base.clone(), base);
+                        }
                         clients.push((at, (request, asked, stream)));
                         continue;
                     }
@@ -2668,6 +2795,19 @@ fn main() -> anyhow::Result<()> {
                     };
                     if let Some(view) = view {
                         looked.insert(view.base, view.over);
+                    }
+                    let shares = target
+                        .project
+                        .as_ref()
+                        .and_then(|it| checkouts.parts(it).ok())
+                        .and_then(|it| checkouts.shares_with(&it.root).map(Path::to_owned));
+                    if let Some(base) = shares {
+                        // Whoever else reads it in this build reads it so.
+                        if looked.get(&base).is_some_and(|over| *over != base) {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        looked.insert(base.clone(), base);
                     }
                     let mut known = Rejections::default();
                     known.patching = target.patch.is_some();
@@ -2755,6 +2895,7 @@ fn main() -> anyhow::Result<()> {
         for (base, over) in looked {
             if *viewed.get(&base).unwrap_or(&base) != over {
                 eprintln!("view: {} as {}", over.display(), base.display());
+                builds.settle(&mut db, &mut programs)?;
                 db.set_view(&base, &over, built_in(&db, &base));
                 moved.extend(place(&mut db, &base, &over, &mut placed));
                 tree.relist(&base);
@@ -2766,6 +2907,8 @@ fn main() -> anyhow::Result<()> {
                 switched.push(base);
             }
         }
+        // A checkout read as another is read so by every build, so those are waited for.
+        let background = serving && overlay != Overlay::Always && viewed.is_empty();
         for (&at, wanted) in &outputs {
             let program = &mut programs[at];
             program.unbuilt.stale |= program.wrote.as_ref() != Some(&wanted.out);
@@ -3115,6 +3258,8 @@ impl Program {
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
+        // Neither is what no crate that is built reads: an example, or a test.
+        edited.retain(|&file| listed.sees(db, file));
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
             let check = {

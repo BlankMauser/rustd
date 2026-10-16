@@ -163,6 +163,16 @@ fn declares_items(db: &RootDatabase, func: FunctionId) -> bool {
     })
 }
 
+/// Whether two texts of a file differ in no more than bodies that are written as ones nothing
+/// else sees into. What those bodies declare is not looked at.
+pub(crate) fn alike_outside_bodies(ours: &str, theirs: &str) -> bool {
+    let hash = |text: &str| {
+        let tree = syntax::SourceFile::parse(text, Edition::CURRENT).syntax_node();
+        hash_outside_bodies(&tree, &FxHashSet::default()).0
+    };
+    hash(ours) == hash(theirs)
+}
+
 /// The hash, and how many of the `declaring` functions were come by.
 fn hash_outside_bodies(file: &SyntaxNode, declaring: &FxHashSet<TextRange>) -> (u64, usize) {
     let mut hasher = FxHasher::default();
@@ -246,6 +256,24 @@ fn is_inert(item: &SyntaxNode) -> bool {
 }
 
 impl Listed {
+    /// Whether the file is a module of a crate that is built, or of one that such a crate uses.
+    /// Any file may be one before a crate is listed.
+    pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
+        let built = self.built.lock().unwrap();
+        // Before the first build there is no telling.
+        built.is_empty()
+            || relevant_crates(db, file).iter().any(|&krate| {
+                let read = built.iter().any(|&built| {
+                    let built = ide_db::base_db::Crate::from(built);
+                    built == krate || built.transitive_deps(db).contains(&krate)
+                });
+                read && hir_def::nameres::crate_def_map(db, krate)
+                    .modules_for_file(db, file)
+                    .next()
+                    .is_some()
+            })
+    }
+
     /// The functions written in the file, or `None` when it has some that are not listed: it
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
