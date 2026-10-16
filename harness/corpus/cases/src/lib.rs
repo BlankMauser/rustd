@@ -5483,3 +5483,24 @@ pub mod local_type_names {
         (name_of(inner), std::any::type_name::<Local>(), nested, in_closure, name_of(run))
     }
 }
+
+/// Unsizing a value that holds its pointer somewhere other than first, as a hook's
+/// `RefCell<Box<dyn FnMut>>` is made.
+pub mod unsized_in_struct {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    pub fn run() -> impl std::fmt::Debug {
+        let mut count = 3;
+        let boxed: RefCell<Box<dyn FnMut() -> i32>> = RefCell::new(Box::new(move || {
+            count += 1;
+            count
+        }));
+        let first = (boxed.borrow_mut())();
+        let cell: Cell<&[u8]> = Cell::new(&[1u8, 2, 3]);
+        let shared: Rc<RefCell<Box<dyn Fn(i32) -> i32>>> =
+            Rc::new(RefCell::new(Box::new(move |it| it * first)));
+        let slices: RefCell<Box<[u16]>> = RefCell::new(Box::new([7u16, 8]));
+        (first, (boxed.borrow_mut())(), cell.get().len(), (shared.borrow())(5), slices.borrow().len())
+    }
+}

@@ -5528,22 +5528,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(dst, src, to.size)
             }
             CastKind::PointerCoercion(PointerCast::Unsize) => {
-                let (Some(from_pointee), Some(to_pointee)) =
-                    (self.coerced_pointee(from_ty, to_ty), self.coerced_pointee(to_ty, from_ty))
-                else {
-                    unsupported!("unsizing {from_ty:?} into {to_ty:?}");
-                };
-                // The pointer comes first and the metadata right after it in everything that
-                // can be unsized: references, raw pointers, and the smart pointers around them.
-                if to.size.bytes() != 16 || !matches!(from.size.bytes(), 8 | 16) {
-                    unsupported!("unsizing {from_ty:?} to {to_ty:?}");
-                }
-                let old =
-                    (from.size.bytes() == 16).then(|| self.builder.ins().load(PTR, MEM, src, 8));
-                let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
-                let ptr = self.builder.ins().load(PTR, MEM, src, 0);
-                self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, meta, dst, 8);
+                self.unsize(src, from_ty, dst, to_ty)?
             }
             CastKind::PointerCoercion(
                 PointerCast::ReifyFnPointer | PointerCast::ClosureFnPointer(_),
@@ -6532,43 +6517,56 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(self.interner.instantiate_bound_regions_with_erased(principal))
     }
 
-    /// The type behind the pointer that an unsizing coercion from `ty` to `other` changes.
-    fn coerced_pointee(&self, ty: Ty<'db>, other: Ty<'db>) -> Option<Ty<'db>> {
-        match (ty.kind(), other.kind()) {
-            (TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _), _) => Some(pointee),
+    /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a
+    /// pointer gets its metadata, and a struct around one is unsized through its fields.
+    fn unsize(&mut self, src: Value, from_ty: Ty<'db>, dst: Value, to_ty: Ty<'db>) -> Result<()> {
+        let (from, to) = (self.layout(from_ty)?, self.layout(to_ty)?);
+        if from_ty == to_ty {
+            self.copy(dst, src, to.size);
+            return Ok(());
+        }
+        match (from_ty.kind(), to_ty.kind()) {
+            (
+                TyKind::RawPtr(from_pointee, _) | TyKind::Ref(_, from_pointee, _),
+                TyKind::RawPtr(to_pointee, _) | TyKind::Ref(_, to_pointee, _),
+            ) => {
+                let old =
+                    (from.size.bytes() == 16).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+                let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
+                let ptr = self.builder.ins().load(PTR, MEM, src, 0);
+                self.builder.ins().store(MEM, ptr, dst, 0);
+                self.builder.ins().store(MEM, meta, dst, 8);
+            }
             // `NonNull` holds its pointer as a pattern type.
-            (TyKind::Pat(ty, _), TyKind::Pat(other, _)) => self.coerced_pointee(ty, other),
-            (TyKind::Adt(def, args), TyKind::Adt(other_def, other_args))
-                if def.def_id() == other_def.def_id() =>
+            (TyKind::Pat(from_ty, _), TyKind::Pat(to_ty, _)) => {
+                self.unsize(src, from_ty, dst, to_ty)?
+            }
+            (TyKind::Adt(def, args), TyKind::Adt(to_def, to_args))
+                if def.def_id() == to_def.def_id() =>
             {
                 let AdtId::StructId(id) = def.def_id() else {
-                    return None;
+                    unsupported!("unsizing {from_ty:?} to {to_ty:?}");
                 };
-                // `CoerceUnsized` allows one field to change, `PhantomData` aside.
-                let db = self.cg.db;
-                let field_types = db.field_types(id.into());
-                let mut coerced = field_types.iter().filter_map(|(_, field)| {
-                    let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                    let other = field.ty().instantiate(self.interner, other_args).skip_norm_wip();
-                    let phantom = match ty.kind() {
-                        TyKind::Adt(def, _) => match def.def_id() {
-                            AdtId::StructId(id) => StructSignature::of(db, id)
-                                .flags
-                                .contains(StructFlags::IS_PHANTOM_DATA),
-                            _ => false,
-                        },
-                        _ => false,
-                    };
-                    (ty != other && !phantom).then_some((ty, other))
-                });
-                let (ty, other) = coerced.next()?;
-                if coerced.next().is_some() {
-                    return None;
+                // `CoerceUnsized` changes one field, `PhantomData` aside, and where the others
+                // are may change with it.
+                let field_types = self.cg.db.field_types(id.into());
+                for (i, (_, field)) in field_types.iter().enumerate() {
+                    let from_field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    let to_field = field.ty().instantiate(self.interner, to_args).skip_norm_wip();
+                    let (from_field, to_field) =
+                        (self.normalize(from_field), self.normalize(to_field));
+                    if self.layout(to_field)?.size.bytes() == 0 {
+                        continue;
+                    }
+                    let src =
+                        self.builder.ins().iadd_imm(src, from.fields.offset(i).bytes() as i64);
+                    let dst = self.builder.ins().iadd_imm(dst, to.fields.offset(i).bytes() as i64);
+                    self.unsize(src, from_field, dst, to_field)?;
                 }
-                self.coerced_pointee(ty, other)
             }
-            _ => None,
+            _ => unsupported!("unsizing {from_ty:?} to {to_ty:?}"),
         }
+        Ok(())
     }
 
     /// The metadata of a pointer to `from` after unsizing its pointee to `to`. `old` is the
