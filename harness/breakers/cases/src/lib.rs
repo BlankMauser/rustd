@@ -36,4 +36,5 @@ cases![
     path_where_clause,
     impl_in_fn,
     fragment_token,
+    blanket_in_fn,
 ];
