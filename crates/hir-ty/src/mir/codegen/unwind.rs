@@ -89,6 +89,7 @@ impl FrameRule {
     /// What holds where a function of the System V x86-64 ABI is entered, which the entry
     /// every function shares says: the frame is eight bytes above the stack pointer, and
     /// the return address is at its bottom.
+    #[cfg(feature = "llvm")]
     pub(super) const ON_ENTRY: [FrameRule; 2] = [FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)];
 
     fn instruction(self) -> CallFrameInstruction {
@@ -162,7 +163,7 @@ impl FunctionUnwind {
     }
 
     /// The unwind information of code that came with its own.
-    #[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+    #[cfg(feature = "llvm")]
     pub(super) fn from_rows(rows: FrameRows, landing_pads: Option<Vec<u8>>) -> Self {
         FunctionUnwind { frame: Frame::Rows(rows), landing_pads }
     }

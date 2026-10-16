@@ -145,6 +145,113 @@ impl CachedCode {
     }
 }
 
+/// What LLVM made of a function, kept by the IR it was made from. Cranelift keeps its own
+/// code the same way, through its incremental cache.
+///
+/// LLVM asks for things the IR did not name: library functions it calls of its own accord,
+/// and tables of addresses. Those are kept here, and relocations against them say which one
+/// by its place among them, in a namespace of their own.
+#[cfg(feature = "llvm")]
+#[derive(Serialize, Deserialize)]
+pub(super) struct StoredCode {
+    code: CachedCode,
+    imports: Vec<String>,
+    blobs: Vec<super::ConstBlob>,
+}
+
+#[cfg(feature = "llvm")]
+impl StoredCode {
+    const IMPORTS: u32 = 2;
+    const BLOBS: u32 = 3;
+
+    /// The key for `func` compiled at `optimization`. Cranelift's key of the IR leaves out
+    /// which requests the IR's names stand for, which LLVM's code has in it.
+    pub(super) fn key(
+        optimization: super::backend::Optimization,
+        func: &cranelift_codegen::ir::Function,
+    ) -> Option<[u8; KEY]> {
+        let isa = super::target().ok()?;
+        let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
+        let mut hasher = Sha256::new();
+        hasher.update(b"rustd llvm 1");
+        hasher.update(super::Backend::Llvm(optimization).to_string());
+        hasher.update(ir.to_string());
+        for (_, name) in func.params.user_named_funcs().iter() {
+            hasher.update(name.namespace.to_le_bytes());
+            hasher.update(name.index.to_le_bytes());
+        }
+        Some(hasher.finalize().into())
+    }
+
+    /// `code` as it can be kept, if everything asked for since `mark` is of a kind that is.
+    pub(super) fn of(
+        code: &Code,
+        recorder: &super::fragment::Recorder<'_>,
+        mark: super::fragment::Mark,
+    ) -> Option<StoredCode> {
+        use super::fragment::{DataRequest, FuncTarget};
+        let (funcs, datas) = recorder.since(mark);
+        let imports = funcs.iter().map(|it| match &it.target {
+            FuncTarget::Symbol(symbol) => Some(symbol.clone()),
+            _ => None,
+        });
+        let blobs = datas.iter().map(|it| match it {
+            DataRequest::Blob { blob, identity: DataIdentity::Shared } => Some(blob.clone()),
+            _ => None,
+        });
+        let mut stored = StoredCode {
+            code: CachedCode::from(code),
+            imports: imports.collect::<Option<_>>()?,
+            blobs: blobs.collect::<Option<_>>()?,
+        };
+        for reloc in &mut stored.code.relocs {
+            reloc.name = match reloc.name {
+                ModuleRelocTarget::User { namespace: 0, index } if index as usize >= mark.funcs => {
+                    ModuleRelocTarget::user(Self::IMPORTS, index - mark.funcs as u32)
+                }
+                ModuleRelocTarget::User { namespace: 1, index } if index as usize >= mark.datas => {
+                    ModuleRelocTarget::user(Self::BLOBS, index - mark.datas as u32)
+                }
+                ref other => other.clone(),
+            };
+        }
+        Some(stored)
+    }
+
+    /// The code, with what LLVM asked for asked of `recorder` again.
+    pub(super) fn restore(self, recorder: &mut super::fragment::Recorder<'_>) -> Option<Code> {
+        let sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        let imports: Vec<_> =
+            self.imports.iter().map(|it| recorder.import(it, &sig).ok()).collect::<Option<_>>()?;
+        let blobs: Vec<_> = self
+            .blobs
+            .into_iter()
+            .map(|it| recorder.define_const(it).ok())
+            .collect::<Option<_>>()?;
+        let mut code = self.code.code();
+        for reloc in &mut code.relocs {
+            reloc.name = match reloc.name {
+                ModuleRelocTarget::User { namespace: Self::IMPORTS, index } => {
+                    ModuleRelocTarget::user(0, imports.get(index as usize)?.as_u32())
+                }
+                ModuleRelocTarget::User { namespace: Self::BLOBS, index } => {
+                    ModuleRelocTarget::user(1, blobs.get(index as usize)?.as_u32())
+                }
+                ref other => other.clone(),
+            };
+        }
+        Some(code)
+    }
+
+    pub(super) fn encode(&self) -> Option<Vec<u8>> {
+        postcard::to_allocvec(self).ok()
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> Option<StoredCode> {
+        postcard::from_bytes(bytes).ok()
+    }
+}
+
 impl Entry {
     /// The key of the entry for `name`, or `None` when this build of the compiler cannot be
     /// told from another, whose entries would then be taken for its own.

@@ -205,6 +205,14 @@ impl Store {
         (crc32fast::hash(value.bytes) == value.checksum).then_some(value.bytes)
     }
 
+    /// The code of a function by what it was compiled from, counted as found or not.
+    pub(super) fn lookup(&self, key: &[u8; KEY]) -> Option<&'static [u8]> {
+        let found = self.get(key);
+        let counted = if found.is_some() { &self.hits } else { &self.misses };
+        counted.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
     /// Adds a value, unless the key has one.
     pub(super) fn insert(&self, key: &[u8; KEY], value: &[u8]) {
         if self.sealed.read().is_ok_and(|it| it.index.contains_key(key)) {
@@ -284,10 +292,8 @@ pub(super) struct Lookup(pub(super) &'static Store);
 
 impl CacheKvStore for Lookup {
     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        let found = <&[u8; KEY]>::try_from(key).ok().and_then(|key| self.0.get(key));
-        let counted = if found.is_some() { &self.0.hits } else { &self.0.misses };
-        counted.fetch_add(1, Ordering::Relaxed);
-        found.map(Cow::Borrowed)
+        let key = <&[u8; KEY]>::try_from(key).ok()?;
+        self.0.lookup(key).map(Cow::Borrowed)
     }
 
     fn insert(&mut self, key: &[u8], val: Vec<u8>) {

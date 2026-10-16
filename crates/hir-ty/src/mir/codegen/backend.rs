@@ -72,7 +72,7 @@ impl Backend {
             #[cfg(feature = "llvm")]
             Backend::Llvm(optimization) => {
                 let start = Instant::now();
-                match super::llvm::emit(recorder, &context.func, optimization) {
+                match Self::emit_with_llvm(recorder, &context.func, optimization) {
                     Ok(code) => {
                         tally.llvm.add(start.elapsed(), code.bytes.len());
                         return Ok(code);
@@ -87,6 +87,33 @@ impl Backend {
         let start = Instant::now();
         let code = super::emit(context)?;
         tally.cranelift.add(start.elapsed(), code.bytes.len());
+        Ok(code)
+    }
+}
+
+#[cfg(feature = "llvm")]
+impl Backend {
+    /// What LLVM makes of the function, from the store if the same IR was compiled at the
+    /// same level before.
+    fn emit_with_llvm(
+        recorder: &mut Recorder<'_>,
+        func: &cranelift_codegen::ir::Function,
+        optimization: Optimization,
+    ) -> std::result::Result<Code, super::llvm::Unhandled> {
+        use super::{cached::StoredCode, store::Store};
+        let Some((store, key)) = Store::global().zip(StoredCode::key(optimization, func)) else {
+            return super::llvm::emit(recorder, func, optimization);
+        };
+        if let Some(stored) = store.lookup(&key).and_then(StoredCode::decode)
+            && let Some(code) = stored.restore(recorder)
+        {
+            return Ok(code);
+        }
+        let mark = recorder.mark();
+        let code = super::llvm::emit(recorder, func, optimization)?;
+        if let Some(stored) = StoredCode::of(&code, recorder, mark).and_then(|it| it.encode()) {
+            store.insert(&key, &stored);
+        }
         Ok(code)
     }
 }
@@ -113,8 +140,7 @@ pub(super) struct Tally {
     wasted: AtomicU64,
     /// Why LLVM left a function to Cranelift, and how often.
     fallbacks: Mutex<BTreeMap<String, usize>>,
-    /// Where LLVM's time went, when it is asked to say.
-    #[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+    /// Where LLVM's time went.
     pub(super) phases: [AtomicU64; Phase::COUNT],
 }
 
@@ -127,7 +153,6 @@ struct Produced {
 
 /// The steps of compiling one function with LLVM.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(feature = "llvm"), expect(dead_code))]
 pub(super) enum Phase {
     Lower,
     Verify,
@@ -166,13 +191,14 @@ impl Tally {
         TALLY.get_or_init(Tally::default)
     }
 
+    #[cfg(feature = "llvm")]
     fn fell_back(&self, took: Duration, reason: &str) {
         self.wasted.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
         let mut fallbacks = self.fallbacks.lock().unwrap_or_else(|e| e.into_inner());
         *fallbacks.entry(reason.to_owned()).or_default() += 1;
     }
 
-    #[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+    #[cfg(feature = "llvm")]
     pub(super) fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = work();
