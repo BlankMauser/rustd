@@ -492,8 +492,8 @@ pub fn layout_of_ty_query(
                     }
                 }
                 PatternKind::NotNull => {
-                    if let BackendRepr::Scalar(scalar) | BackendRepr::ScalarPair(scalar, _) =
-                        &mut layout.backend_repr
+                    if let BackendRepr::Scalar(scalar)
+                    | BackendRepr::ScalarPair { a: scalar, b: _, .. } = &mut layout.backend_repr
                     {
                         scalar.valid_range_mut().start = 1;
                         let niche = Niche {

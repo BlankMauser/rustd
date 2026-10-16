@@ -164,10 +164,20 @@ deserves its own check: compare RA's computed layout for every type in a target 
 `rustc -Zprint-type-sizes` and count disagreements. Any disagreement is a silent miscompile
 waiting to happen, and today we do not measure it.
 
-The pin is `harness/toolchain`, a stable release, and it has to be the rustc that rust-analyzer's `ra-ap-rustc_abi`
-was cut from. This is not hypothetical: with stable 1.99 and `ra-ap-rustc_abi` 0.166 the two
-picked different niche values for `Result<(Comparator, ..), Error>` in semver, and every `?` on
-it took the wrong branch.
+The pin is `harness/toolchain`, a stable release, and the layout code has to be that release's.
+rustd computes layouts with rustc's `rustc_abi`, and the `ra-ap-rustc_abi` snapshots on crates.io
+are cut from rustc's master weekly, so none is the code of a stable release. With 0.166 (master
+of 2026-05-10) against stable 1.97.1 and 1.99.0, `None` of an `Option` around a struct holding two
+`Option<u64>` was 2 to rustc and `u64::MAX` to us, as was `Err` of semver's
+`Result<(Comparator, ..), Error>`, so every `?` on it took the wrong branch; and against 1.99.0 an
+`Option` of `#[repr(i8)] enum { A = -128, B = 127, C = 5 }` was one byte to rustc and two to us.
+So `lib/rustc_abi` is `compiler/rustc_abi/src` of the pinned tag, unchanged, patched in for the
+crates.io crate, and a toolchain bump copies that directory again. Sizes alone do not show such
+a difference: the corpus case `niche_values` makes these values on one side of the crate
+boundary and reads them on the other.
+
+What a bump has also moved so far: how rustc hashes a type into its `TypeId`
+(`codegen/type_id.rs` follows 1.99.0), and what std's constants ask of the const evaluator.
 
 **cargo.** The daemon needs the unit graph, the rustc command line for each crate and the final
 link line. Today that is scraped from `cargo rustc -- --print link-args`. The cleaner source is

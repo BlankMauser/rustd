@@ -52,7 +52,7 @@ use crate::{
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
-    layout::{CoroutineFrame, Layout, RustcEnumVariantIdx},
+    layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
@@ -3480,8 +3480,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         Ok(match layout.backend_repr {
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
-            BackendRepr::ScalarPair(a, b) => {
-                let offset = a.size(&self.dl()).align_to(b.align(&self.dl()).abi);
+            BackendRepr::ScalarPair { a, b, b_offset: offset } => {
                 let (a, b) = (self.scalar(a)?, self.scalar(b)?);
                 if is_ret && (a.ty == types::I128 || b.ty == types::I128) {
                     // More than the two return registers hold, so LLVM returns it in memory.
@@ -3714,9 +3713,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         match layout.backend_repr {
             BackendRepr::Scalar(a) => leaves.push((offset, a)),
-            BackendRepr::ScalarPair(a, b) => {
-                let second = a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes();
-                leaves.extend([(offset, a), (offset + second, b)]);
+            BackendRepr::ScalarPair { a, b, b_offset } => {
+                leaves.extend([(offset, a), (offset + b_offset.bytes(), b)]);
             }
             BackendRepr::Memory { sized: true } => match ty.kind() {
                 TyKind::Tuple(tys) => {
@@ -3821,9 +3819,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         match layout.backend_repr {
             BackendRepr::Scalar(a) => scalar(a, offset),
-            BackendRepr::ScalarPair(a, b) => {
+            BackendRepr::ScalarPair { a, b, b_offset } => {
                 scalar(a, offset);
-                scalar(b, offset + a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes());
+                scalar(b, offset + b_offset.bytes());
             }
             BackendRepr::Memory { sized: true } => match ty.kind() {
                 TyKind::Tuple(tys) => {
@@ -4660,8 +4658,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.builder.switch_to_block(block);
                         let index = variant.index(db);
                         let variant_layout = match &layout.variants {
-                            Variants::Multiple { variants, .. } => {
-                                variants[RustcEnumVariantIdx(index)].clone()
+                            Variants::Multiple { .. } => {
+                                Layout::for_variant(&layout, RustcEnumVariantIdx(index))
                             }
                             _ => (*layout).clone(),
                         };
@@ -4823,7 +4821,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         addr = self.builder.ins().load(PTR, MEM, addr, 0);
                         meta = None;
                     }
-                    BackendRepr::ScalarPair(..) => {
+                    BackendRepr::ScalarPair { .. } => {
                         meta = Some(self.builder.ins().load(PTR, MEM, addr, 8));
                         addr = self.builder.ins().load(PTR, MEM, addr, 0);
                     }
@@ -4846,9 +4844,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             let Some(VariantId::EnumVariantId(variant)) = prev.variant_id else {
                                 unsupported!("field of enum without downcast");
                             };
-                            variants[RustcEnumVariantIdx(variant.index(self.cg.db))]
-                                .fields
-                                .offset(field.0 as usize)
+                            variants[RustcEnumVariantIdx(variant.index(self.cg.db))].field_offsets
+                                [RustcFieldIdx::new(field.0 as usize)]
                         }
                     };
                     addr = self.unsized_field_addr(addr, meta, prev.ty, offset, ty.ty)?;
@@ -5649,7 +5646,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Rvalue::Ref(_, place) => {
                 let place = self.place_ref(place)?;
                 store(self, place.addr);
-                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty.ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(dst_ty.ty)?.backend_repr {
                     let Some(meta) = place.meta else {
                         unsupported!("fat reference to a place without metadata");
                     };
@@ -5818,8 +5815,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 // Fat to fat keeps the metadata, fat to thin drops it.
                 (
-                    BackendRepr::ScalarPair(..),
-                    BackendRepr::ScalarPair(..) | BackendRepr::Scalar(_),
+                    BackendRepr::ScalarPair { .. },
+                    BackendRepr::ScalarPair { .. } | BackendRepr::Scalar(_),
                 ) => self.copy(dst, src, to.size),
                 _ => unsupported!("cast from {from_ty:?} to {to_ty:?}"),
             },
@@ -5901,8 +5898,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 unsupported!("niche enum with explicit discriminants");
                             }
                         }
-                        let first = niche_variants.start().0;
-                        let count = niche_variants.end().0 - first;
+                        let first = niche_variants.start.0;
+                        let count = niche_variants.last.0 - first;
                         let start = self.iconst(tag.ty, *niche_start);
                         let relative = self.builder.ins().isub(value, start);
                         let is_niche = self.builder.ins().icmp_imm(
@@ -5933,9 +5930,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let db = self.cg.db;
         let adt: AdtId = variant.adt_id(db);
         let layout = self.layout(Ty::new_adt(self.interner, adt, args))?;
-        let (tag, tag_encoding, tag_field, variants) = match &layout.variants {
-            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
-                (tag, tag_encoding, tag_field, variants)
+        let (tag, tag_encoding, tag_field) = match &layout.variants {
+            Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
+                (tag, tag_encoding, tag_field)
             }
             Variants::Single { index } => {
                 let inhabited = match variant {
@@ -5961,14 +5958,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             TagEncoding::Niche { untagged_variant, .. } if untagged_variant.0 == index => None,
             TagEncoding::Niche { niche_variants, niche_start, .. } => {
-                Some(((index - niche_variants.start().0) as u128).wrapping_add(*niche_start))
+                Some(((index - niche_variants.start.0) as u128).wrapping_add(*niche_start))
             }
         };
         if let Some(tag_value) = tag_value {
             let value = self.iconst(tag_ty, tag_value);
             self.builder.ins().store(MEM, value, dst, offset);
         }
-        Ok(Some(Arc::new(variants[RustcEnumVariantIdx(index)].clone())))
+        Ok(Some(Arc::new(Layout::for_variant(&layout, RustcEnumVariantIdx(index)))))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
@@ -6031,7 +6028,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(self.builder.block_params(done)[0]);
         }
         if matches!(ty.kind(), TyKind::RawPtr(..))
-            && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair(..))
+            && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair { .. })
         {
             // Wide pointers compare by address, then by metadata.
             let cc = match op {
@@ -6747,7 +6744,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         let receiver_layout = self.layout(receiver_ty)?;
-        if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair(..))
+        if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair { .. })
             || receiver_layout.size.bytes() != 16
         {
             unsupported!("vtable call with receiver {receiver_ty:?}");
@@ -8118,7 +8115,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("ptr_metadata", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
-                if let BackendRepr::ScalarPair(..) = self.layout(ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(ty)?.backend_repr {
                     let meta = self.builder.ins().load(PTR, MEM, src, 8);
                     self.builder.ins().store(MEM, meta, dst, 0);
                 }
@@ -8127,7 +8124,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (data, _) = self.operand(data)?;
                 let data = self.builder.ins().load(PTR, MEM, data, 0);
                 self.builder.ins().store(MEM, data, dst, 0);
-                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(dst_ty)?.backend_repr {
                     let (meta, _) = self.load_scalar(meta)?;
                     self.builder.ins().store(MEM, meta, dst, 8);
                 }
@@ -8305,7 +8302,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// The lane type and lane count of a vector type. Lanes sit in memory in order.
     fn simd_lanes(&self, ty: Ty<'db>) -> Result<(AbiScalar, u64)> {
         match self.layout(ty)?.backend_repr {
-            BackendRepr::SimdVector { element, count } => Ok((self.scalar(element)?, count)),
+            BackendRepr::SimdVector { element, count } => {
+                Ok((self.scalar(element)?, count.as_u64()))
+            }
             _ => unsupported!("vector operation on {ty:?}"),
         }
     }
@@ -8854,7 +8853,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 );
                             }
                         };
-                        let Variants::Multiple { variants, .. } = &layout.variants else {
+                        let Variants::Multiple { .. } = &layout.variants else {
                             return Ok(());
                         };
                         let l_discr = self.discriminant(l, ty, wide.scalar())?;
@@ -8878,7 +8877,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         switch.emit(&mut self.builder, l_discr, done);
                         for (block, variant) in arms {
                             self.builder.switch_to_block(block);
-                            let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                            let index = RustcEnumVariantIdx(variant.index(db));
+                            let layout = &Layout::for_variant(&layout, index);
                             self.branch_unless_fields_equal(
                                 l,
                                 r,
@@ -8965,7 +8965,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 self.drop_fields(addr, &layout, variant.into(), subst, ty, meta)?;
                             }
                         }
-                        Variants::Multiple { variants, tag, .. } => {
+                        Variants::Multiple { tag, .. } => {
                             let wide = DiscriminantWidth::of(tag);
                             let discr = self.discriminant(addr, ty, wide.scalar())?;
                             let done = self.builder.create_block();
@@ -8982,7 +8982,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             switch.emit(&mut self.builder, discr, done);
                             for (block, variant) in arms {
                                 self.builder.switch_to_block(block);
-                                let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                                let index = RustcEnumVariantIdx(variant.index(db));
+                                let layout = &Layout::for_variant(&layout, index);
                                 self.drop_fields(addr, layout, variant.into(), subst, ty, meta)?;
                                 self.builder.ins().jump(done, &[]);
                             }

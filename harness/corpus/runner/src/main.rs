@@ -336,6 +336,64 @@ fn main() {
     println!("track_caller_in_vtable {:?}", cases::track_caller_in_vtable::run());
     println!("static_in_defaulted_impl {:?}", cases::static_in_defaulted_impl::run());
     println!("downstream_add {}", String::from("a") + Tail(3));
+    {
+        use cases::niche_values::*;
+        // The depths as this crate reads what `cases` made, then as `cases` reads what this
+        // crate made.
+        macro_rules! probes {
+            ($($value:ident $make:ident $depth:ident;)*) => {$(
+                println!(
+                    "niche_values {} {:?} {:?}",
+                    stringify!($value),
+                    [0, 1, 2].map(|it| depth(&$make(it))),
+                    [0, 1, 2].map(|it| $depth(&nest(it, $value()))),
+                );
+            )*};
+        }
+        probes! {
+        parsed_err make_parsed_err depth_parsed_err;
+        parsed_ok make_parsed_ok depth_parsed_ok;
+        error make_error depth_error;
+        kind make_kind depth_kind;
+        signed make_signed depth_signed;
+        wrap make_wrap depth_wrap;
+        high make_high depth_high;
+        gap make_gap depth_gap;
+        two make_two depth_two;
+        ends make_ends depth_ends;
+        data make_data depth_data;
+        nested make_nested depth_nested;
+        nested_data make_nested_data depth_nested_data;
+        pair make_pair depth_pair;
+        triple make_triple depth_triple;
+        letter make_letter depth_letter;
+        ordering make_ordering depth_ordering;
+        nonzero make_nonzero depth_nonzero;
+        flag make_flag depth_flag;
+        text make_text depth_text;
+        boxed make_boxed depth_boxed;
+        }
+        println!(
+            "niche_values is_ok {:?}",
+            (is_ok(&parsed_ok()), is_ok(&parsed_err()), parsed_ok().is_ok(), parsed_err().is_ok())
+        );
+    }
+}
+
+fn nest<T>(depth: u8, value: T) -> Option<Option<T>> {
+    match depth {
+        0 => None,
+        1 => Some(None),
+        _ => Some(Some(value)),
+    }
+}
+
+fn depth<T>(value: &Option<Option<T>>) -> u8 {
+    match value {
+        None => 0,
+        Some(None) => 1,
+        Some(Some(_)) => 2,
+    }
 }
 
 /// An `Add` impl for `String` that the crates below this one cannot see: what they add to

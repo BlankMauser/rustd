@@ -2646,8 +2646,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "ra-ap-rustc_abi"
 version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2cf1b1ffe31b6226c00b40cddfda65002b7729f9f4ed2d547b5856cdab0011c"
 dependencies = [
  "bitflags 2.12.1",
  "ra-ap-rustc_hashes",

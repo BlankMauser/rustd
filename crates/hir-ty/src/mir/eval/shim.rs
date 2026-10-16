@@ -5,7 +5,10 @@ use std::cmp::{self, Ordering};
 
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
+use rustc_type_ir::{
+    TypeVisitableExt,
+    inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
+};
 use stdx::never;
 
 use crate::{
@@ -778,6 +781,22 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     let (_, align) = self.size_align_of_unsized(ty, metadata, locals)?;
                     destination.write_from_bytes(self, &align.to_le_bytes())
                 }
+            }
+            "type_id" => {
+                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "type_id generic arg is not provided".into(),
+                    ));
+                };
+                // Two spellings of one type may differ in their lifetimes.
+                if ty.has_free_regions() || ty.has_bound_regions() {
+                    not_supported!("`type_id` of a type with lifetimes");
+                }
+                let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
+                    self.type_ids.push(ty);
+                    self.type_ids.len() - 1
+                });
+                destination.write_from_bytes(self, &(id as u128 + 1).to_le_bytes())
             }
             "type_name" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {

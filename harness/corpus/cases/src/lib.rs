@@ -6019,3 +6019,166 @@ pub mod track_caller_in_vtable {
         (through, Tracked(6).here(7), Tracked(1).provided())
     }
 }
+
+/// Values whose variant is told by a niche, made on one side of the crate boundary and read
+/// on the other: the two sides must agree on which value of the niche means which variant.
+pub mod niche_values {
+    use std::ptr::NonNull;
+
+    #[derive(Copy, Clone)]
+    pub enum Position {
+        Major,
+        Minor,
+        Patch,
+        Pre,
+        Build,
+    }
+    #[derive(Copy, Clone)]
+    pub enum Op {
+        Exact,
+        Greater,
+        GreaterEq,
+        Less,
+        LessEq,
+        Tilde,
+        Caret,
+        Wildcard,
+    }
+    pub struct Prerelease {
+        pub head: NonNull<u8>,
+    }
+    pub struct Comparator {
+        pub op: Op,
+        pub major: u64,
+        pub minor: Option<u64>,
+        pub patch: Option<u64>,
+        pub pre: Prerelease,
+    }
+    pub enum ErrorKind {
+        Empty,
+        UnexpectedEnd(Position),
+        UnexpectedChar(Position, char),
+        UnexpectedCharAfter(Position, char),
+        ExpectedCommaFound(Position, char),
+        LeadingZero(Position),
+        Overflow(Position),
+        EmptySegment(Position),
+        IllegalCharacter(Position),
+        WildcardNotTheOnlyComparator(char),
+        UnexpectedAfterWildcard,
+        ExcessiveComparators,
+    }
+    pub struct Error {
+        pub kind: ErrorKind,
+    }
+    /// What semver's parser of a comparator returns.
+    pub type Parsed = Result<(Comparator, Position, &'static str), Error>;
+
+    pub enum Signed {
+        A = -3,
+        B = -1,
+        C = 2,
+    }
+    #[repr(i8)]
+    pub enum Wrap {
+        A = -128,
+        B = 127,
+        C = 5,
+    }
+    #[repr(u8)]
+    pub enum High {
+        A = 200,
+        B = 255,
+        C = 0,
+    }
+    pub enum Gap {
+        A = 0,
+        B = 1,
+        C = 250,
+        D = 255,
+    }
+    pub struct Two {
+        pub a: Option<u64>,
+        pub b: Option<u64>,
+        pub c: bool,
+        pub d: Position,
+    }
+    pub struct Ends {
+        pub a: bool,
+        pub b: u64,
+        pub c: bool,
+    }
+    pub enum Data {
+        A(u32, Position),
+        B(u8),
+        C,
+    }
+    pub enum Nested {
+        X(Data),
+        Y(Position),
+        Z,
+    }
+
+    /// For each type: a value, that value under `depth` of two `Option`s, and the depth read
+    /// back.
+    macro_rules! probes {
+        ($($value:ident $make:ident $depth:ident: $ty:ty = $it:expr;)*) => {$(
+            pub fn $value() -> $ty {
+                $it
+            }
+            pub fn $make(depth: u8) -> Option<Option<$ty>> {
+                match depth {
+                    0 => None,
+                    1 => Some(None),
+                    _ => Some(Some($value())),
+                }
+            }
+            pub fn $depth(value: &Option<Option<$ty>>) -> u8 {
+                match value {
+                    None => 0,
+                    Some(None) => 1,
+                    Some(Some(_)) => 2,
+                }
+            }
+        )*};
+    }
+
+    probes! {
+        parsed_err make_parsed_err depth_parsed_err: Parsed =
+            Err(Error { kind: ErrorKind::UnexpectedChar(Position::Pre, 'x') });
+        parsed_ok make_parsed_ok depth_parsed_ok: Parsed = Ok((
+            Comparator {
+                op: Op::Caret,
+                major: 1,
+                minor: Some(2),
+                patch: None,
+                pre: Prerelease { head: NonNull::dangling() },
+            },
+            Position::Patch,
+            "",
+        ));
+        error make_error depth_error: Error = Error { kind: ErrorKind::ExcessiveComparators };
+        kind make_kind depth_kind: ErrorKind = ErrorKind::Overflow(Position::Build);
+        signed make_signed depth_signed: Signed = Signed::B;
+        wrap make_wrap depth_wrap: Wrap = Wrap::C;
+        high make_high depth_high: High = High::B;
+        gap make_gap depth_gap: Gap = Gap::C;
+        two make_two depth_two: Two = Two { a: None, b: Some(7), c: true, d: Position::Minor };
+        ends make_ends depth_ends: Ends = Ends { a: true, b: 9, c: false };
+        data make_data depth_data: Data = Data::C;
+        nested make_nested depth_nested: Nested = Nested::Y(Position::Pre);
+        nested_data make_nested_data depth_nested_data: Nested = Nested::X(Data::B(3));
+        pair make_pair depth_pair: (bool, Op) = (true, Op::Tilde);
+        triple make_triple depth_triple: (Position, Op, char) = (Position::Pre, Op::Less, 'q');
+        letter make_letter depth_letter: char = 'z';
+        ordering make_ordering depth_ordering: std::cmp::Ordering = std::cmp::Ordering::Less;
+        nonzero make_nonzero depth_nonzero: std::num::NonZeroI8 = std::num::NonZeroI8::MIN;
+        flag make_flag depth_flag: bool = true;
+        text make_text depth_text: String = String::from("text");
+        boxed make_boxed depth_boxed: Box<u8> = Box::new(4);
+    }
+
+    pub fn is_ok(parsed: &Parsed) -> bool {
+        parsed.is_ok()
+    }
+}

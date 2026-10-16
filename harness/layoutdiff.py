@@ -5,7 +5,7 @@ backend laid out. The two print types differently, so both are reduced to a comm
 and only types that reduce to one unambiguous rustc layout are compared. A mismatch here is a
 miscompile found without running anything.
 """
-import os, re, subprocess
+import os, re, subprocess, time
 
 DEFAULTS = (", Global", ", RandomState", ", BuildHasherDefault<DefaultHasher>")
 
@@ -23,7 +23,11 @@ def spell(name):
 def rustc_layouts(workspace, crate):
     # Crate names have underscores where the package may have hyphens.
     for package in (crate, crate.replace("_", "-")):
-        out = subprocess.run(["cargo", "rustc", "-p", package, "--lib", "--", "-Zprint-type-sizes"],
+        # cargo runs rustc again only for arguments it has not seen, and a crate it finds fresh
+        # prints nothing.
+        again = f"layouts_{time.time_ns()}"
+        out = subprocess.run(["cargo", "rustc", "-p", package, "--lib", "--", "-Zprint-type-sizes",
+                              "--cfg", again],
                              cwd=workspace, capture_output=True, text=True,
                              # The one unstable flag the harness uses, on the stable pin.
                              env={**os.environ, "RUSTC_BOOTSTRAP": "1", "CARGO_INCREMENTAL": "0"})
