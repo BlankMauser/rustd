@@ -41,6 +41,16 @@ pub(super) fn emit(
     optimization: Optimization,
 ) -> Result<Code, Unhandled> {
     let tally = Tally::global();
+    // LLVM's optimizing register allocator takes more than linear time, as Cranelift's does:
+    // one function of dx kept it busy for minutes. Such a function is compiled without
+    // optimization, and counted.
+    let optimization = if func.dfg.num_insts() > super::LARGE && optimization != Optimization::None
+    {
+        tally.large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Optimization::None
+    } else {
+        optimization
+    };
     let context = Context::create();
     let module = context.create_module("rustd");
     Machine::with(optimization, |machine| {
@@ -68,6 +78,26 @@ pub(super) fn emit(
             emitted::Emitted::code(object.as_slice(), func.signature.clone(), recorder)
         })
     })
+}
+
+/// The object file LLVM's assembler makes of `text`, which is assembly in the syntax
+/// `asm!` is written in.
+///
+/// FIXME: assembly LLVM rejects ends the process: its default diagnostic handler exits on an
+/// error, and inkwell has no way to set another.
+pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
+    let context = Context::create();
+    let module = context.create_module("rustd_asm");
+    Machine::with(Optimization::None, |machine| {
+        module.set_triple(&machine.get_triple());
+        // What rustc wraps `global_asm!` in.
+        module.set_inline_assembly(&format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"));
+        let object = machine
+            .write_to_memory_buffer(&module, FileType::Object)
+            .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+        Ok(object.as_slice().to_vec())
+    })
+    .map_err(|e| format!("inline assembly: {e}"))
 }
 
 impl Optimization {

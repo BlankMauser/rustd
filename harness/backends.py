@@ -48,6 +48,7 @@ class Compiled:
             r"^backend: (\w+) compiled (\d+) functions, (\d+) bytes, (\S+) ", self.stderr, re.M)}
         self.phases = re.search(r"^backend: llvm compiled .*: (.*)$", self.stderr, re.M)
         self.fallbacks = re.findall(r"^  (\d+)\t(.*)$", self.stderr, re.M)
+        self.large = re.search(r"^backend: llvm compiled (\d+) large functions", self.stderr, re.M)
         self.cold = re.search(r"^cold: .*$", self.stderr, re.M)
 
     def row(self):
@@ -67,8 +68,9 @@ def seconds(text):
 
 
 def run(binary, args):
+    """What a program does. A usage line names the program by its file, which differs between builds."""
     done = subprocess.run([binary, *args], capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL)
-    return done.returncode, done.stdout, done.stderr
+    return done.returncode, done.stdout.replace(os.path.basename(binary), "PROGRAM"), done.stderr
 
 
 def kernel_times(binary, runs):
@@ -110,6 +112,8 @@ def main():
     for it in built:
         if it.phases:
             lines.append(f"- {it.name} phases (all threads): {it.phases[1]}")
+        if it.large:
+            lines.append(f"- {it.name} compiled {it.large[1]} large functions at -O0")
         for count, reason in it.fallbacks:
             lines.append(f"- {it.name} left {count} to Cranelift: {reason}")
         if it.cold:

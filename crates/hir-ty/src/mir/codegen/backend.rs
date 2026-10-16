@@ -140,6 +140,8 @@ pub(super) struct Tally {
     wasted: AtomicU64,
     /// Why LLVM left a function to Cranelift, and how often.
     fallbacks: Mutex<BTreeMap<String, usize>>,
+    /// Functions too large for LLVM to optimize in reasonable time, compiled at `-O0`.
+    pub(super) large: AtomicUsize,
     /// Where LLVM's time went.
     pub(super) phases: [AtomicU64; Phase::COUNT],
 }
@@ -216,6 +218,7 @@ impl Tally {
             Duration::from_nanos(self.phases[phase as usize].swap(0, Ordering::Relaxed))
         });
         let (llvm, cranelift) = (self.llvm.take(), self.cranelift.take());
+        let large = self.large.swap(0, Ordering::Relaxed);
         let selected = Self::selected_llvm();
         if !selected && std::env::var_os("RUSTD_STATS").is_none() {
             return;
@@ -226,6 +229,9 @@ impl Tally {
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!("backend: llvm compiled {llvm}: {phases}");
+        }
+        if large != 0 {
+            eprintln!("backend: llvm compiled {large} large functions without optimization");
         }
         if let Some(cranelift) = cranelift {
             eprintln!("backend: cranelift compiled {cranelift}");
