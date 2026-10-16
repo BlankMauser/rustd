@@ -5083,7 +5083,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     _ => unsupported!("fn pointer in a constant"),
                 };
                 let target = self.fn_item(fn_ty)?;
-                blob.bytes[offset..offset + 8].fill(0);
+                blob.bytes[offset..offset + WORD].fill(0);
                 blob.fn_relocs.push((offset as u32, target));
             }
             TyKind::Adt(def, args) => {
@@ -5116,7 +5116,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                     )
                                 {
                                     let target = self.fn_item(fn_ty)?;
-                                    blob.bytes[at..at + 8].fill(0);
+                                    blob.bytes[at..at + WORD].fill(0);
                                     blob.fn_relocs.push((at as u32, target));
                                     continue;
                                 }

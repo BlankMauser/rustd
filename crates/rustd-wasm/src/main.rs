@@ -11,7 +11,7 @@
 
 use std::{error::Error, fs, path::Path};
 
-use rustd_wasm::{Compiler, MAIN, bundle};
+use rustd_wasm::{Compiler, MAIN, bundle, pack};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,6 +38,59 @@ fn main() -> Result<(), Box<dyn Error>> {
                 fs::write(format!("{out}/{at}.wasm"), &build.patch.module)?;
                 fs::write(format!("{out}/{at}.json"), build.report())?;
                 eprintln!("{source}: {}", build.report());
+            }
+        }
+        ["pack", project, main, out] => {
+            let pack =
+                pack::record(Path::new(project), "wasm32-unknown-unknown", main, |db, crates| {
+                    for &krate in crates {
+                        hir_def::nameres::crate_def_map(db, krate);
+                    }
+                    hir::attach_db(db, || {
+                        for function in
+                            rustd_wasm::functions_of(db, crates[crates.len() - 1].into())
+                        {
+                            hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(function));
+                        }
+                    });
+                })?;
+            eprintln!(
+                "{} crates, {} files, {} expansions",
+                pack.crates.len(),
+                pack.files.len(),
+                pack.expansions.len()
+            );
+            fs::write(out, serde_json::to_vec(&pack)?)?;
+        }
+        ["analyze", pack] => {
+            let mut compiler = Compiler::default();
+            let pack: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
+            let start = std::time::Instant::now();
+            compiler.set_pack(pack, |_| None)?;
+            eprintln!("load: {:.1?}", start.elapsed());
+            let (crates, resolve, infer) = compiler.analyze();
+            eprintln!("{crates} crates: names {resolve:.1?}, types of the program {infer:.1?}");
+            let missed = compiler.missed();
+            eprintln!("{} expansions missed", missed.len());
+            for call in missed.iter().take(20) {
+                eprintln!("  {}", call.chars().take(200).collect::<String>());
+            }
+            if std::env::var_os("RUSTD_EXPANDED").is_some() {
+                eprintln!("{}", compiler.expanded());
+            }
+            let start = std::time::Instant::now();
+            let build = compiler.build()?;
+            eprintln!(
+                "build: {:.1?}, {} functions, {} bytes, {} of {} bodies compiled, {} skipped",
+                start.elapsed(),
+                build.patch.functions.len(),
+                build.patch.module.len(),
+                build.compiled,
+                build.bodies,
+                build.skipped.len()
+            );
+            for (name, why) in build.skipped.iter().take(20) {
+                eprintln!("  {name}: {why}");
             }
         }
         _ => {

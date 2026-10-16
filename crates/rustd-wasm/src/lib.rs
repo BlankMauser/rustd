@@ -11,6 +11,7 @@ pub mod bundle;
 #[cfg(target_family = "wasm")]
 mod exports;
 pub mod link;
+pub mod pack;
 
 use std::time::Duration;
 
@@ -58,6 +59,8 @@ pub struct Compiler {
     by_path: Vec<FunctionId>,
     /// The object of the last build that was not a patch.
     base: Vec<u8>,
+    /// Proc macro calls of a pack that it had no expansion for.
+    missed: std::sync::Arc<std::sync::Mutex<Vec<pack::Call>>>,
 }
 
 /// What one build did.
@@ -129,6 +132,7 @@ impl Default for Compiler {
             library: None,
             by_path: Vec::new(),
             base: Vec::new(),
+            missed: Default::default(),
         }
     }
 }
@@ -163,6 +167,67 @@ impl Compiler {
             let crates = ide_db::base_db::relevant_crates(&self.db, file);
             self.known.touch(&self.db, (!crates.is_empty()).then_some(crates));
         }
+    }
+
+    /// Sets the workspace of a pack as what there is to compile. The file its program starts
+    /// at is [`MAIN`] from then on.
+    pub fn set_pack(&mut self, pack: pack::Pack, fallback: pack::Fallback) -> Result<(), String> {
+        let project = pack.project(fallback)?;
+        let mut change = ChangeWithProcMacros::default();
+        for (id, path, text) in project.files {
+            let path = if id == project.main { MAIN.to_owned() } else { path };
+            self.files.insert(path, id);
+            change.change_file(id, Some(text));
+        }
+        change.set_roots(project.roots);
+        change.set_crate_graph(project.graph);
+        change.set_proc_macros(project.macros);
+        self.db.apply_change(change);
+        self.missed = project.missed;
+        Ok(())
+    }
+
+    /// Resolves the names of every crate and infers the types of the program, for how long
+    /// each takes: (the number of crates, name resolution, inference).
+    pub fn analyze(&self) -> (usize, Duration, Duration) {
+        let db = &self.db;
+        let start = stdx::time::Instant::now();
+        let crates = ide_db::base_db::all_crates(db);
+        for &krate in crates.iter() {
+            hir_def::nameres::crate_def_map(db, krate);
+        }
+        let resolved = start.elapsed();
+        hir::attach_db(db, || {
+            for &krate in crates.iter().filter(|it| it.data(db).origin.is_local()) {
+                for function in functions_of(db, krate.into()) {
+                    hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(function));
+                }
+            }
+        });
+        (crates.len(), resolved, start.elapsed() - resolved)
+    }
+
+    /// The bodies of the program's functions as the compiler sees them, macros expanded.
+    pub fn expanded(&self) -> String {
+        let db = &self.db;
+        let mut text = String::new();
+        for &krate in ide_db::base_db::all_crates(db).iter() {
+            if krate.data(db).origin.is_local() {
+                for function in functions_of(db, krate.into()) {
+                    text.push_str(
+                        &hir::DefWithBody::from(hir::Function::from(function)).debug_hir(db),
+                    );
+                    text.push('\n');
+                }
+            }
+        }
+        text
+    }
+
+    /// Proc macro calls that had no recorded expansion, as `crate::name(input)`.
+    pub fn missed(&self) -> Vec<String> {
+        let missed = self.missed.lock().unwrap_or_else(|it| it.into_inner());
+        missed.iter().map(|it| format!("{}::{}({})", it.krate, it.name, it.input)).collect()
     }
 
     /// The source roots and crates of the files there are: the program, and `core` under it.
@@ -322,7 +387,7 @@ impl Compiler {
 
 /// The functions of a crate's modules and `impl`s that have a body.
 // FIXME: those declared inside a body are not listed, as `rustd` lists them.
-fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+pub fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
     while let Some(module) = modules.pop() {

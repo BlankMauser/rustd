@@ -64,6 +64,40 @@ pub unsafe extern "C" fn rustd_add_bundle(ptr: *mut u8, len: usize) -> bool {
     })
 }
 
+/// Sets the workspace of a pack, see [`crate::pack`], as what there is to compile.
+///
+/// # Safety
+///
+/// As [`argument`] asks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustd_set_pack(ptr: *mut u8, len: usize) -> bool {
+    // SAFETY: the caller's promise.
+    let bytes = unsafe { argument(ptr, len) };
+    PAGE.with_borrow_mut(|page| {
+        let pack = serde_json::from_slice(&bytes).map_err(|e| e.to_string());
+        drop(bytes);
+        match pack.and_then(|pack| page.compiler.set_pack(pack, |_| None)) {
+            Ok(()) => true,
+            Err(e) => {
+                page.report = e;
+                false
+            }
+        }
+    })
+}
+
+/// Resolves names and infers the program's types, leaving how long that took as the report.
+#[unsafe(no_mangle)]
+pub extern "C" fn rustd_analyze() {
+    PAGE.with_borrow_mut(|page| {
+        let (crates, names, types) = page.compiler.analyze();
+        page.report = format!(
+            "{crates} crates: names {names:.1?}, types of the program {types:.1?}, {} expansions missed",
+            page.compiler.missed().len()
+        );
+    })
+}
+
 /// Sets the text of a file.
 ///
 /// # Safety

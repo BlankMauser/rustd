@@ -17,7 +17,7 @@ export class Compiler {
     const instance = await WebAssembly.instantiate(wasm, { rustd });
     memory = instance.exports.memory;
     const compiler = new Compiler(instance.exports);
-    if (!compiler.rustd.rustd_add_bundle(...compiler.argument(core))) {
+    if (core && !compiler.rustd.rustd_add_bundle(...compiler.argument(core))) {
       throw new Error(compiler.report());
     }
     return compiler;
@@ -33,6 +33,18 @@ export class Compiler {
     const pointer = this.rustd.rustd_alloc(bytes.length);
     new Uint8Array(this.rustd.memory.buffer, pointer >>> 0, bytes.length).set(bytes);
     return [pointer, bytes.length];
+  }
+
+  // Sets a packed cargo workspace as what there is to compile.
+  setPack(pack) {
+    if (!this.rustd.rustd_set_pack(...this.argument(pack))) {
+      throw new Error(this.report());
+    }
+  }
+
+  analyze() {
+    this.rustd.rustd_analyze();
+    return this.report();
   }
 
   setFile(path, text) {
