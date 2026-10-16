@@ -7853,7 +7853,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("discriminant_value", [arg]) => {
-                let (ptr, _) = self.load_scalar(arg)?;
+                // The reference may be a wide one, of a struct that ends in a slice.
+                let (reference, _) = self.operand(arg)?;
+                let ptr = self.builder.ins().load(PTR, MEM, reference, 0);
                 let to = self.scalar_of(dst_ty)?;
                 let value = self.discriminant(ptr, generic_args.type_at(0), to)?;
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -7990,6 +7992,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let call = self.builder.ins().call(callee, &[register]);
                 let value = self.builder.inst_results(call)[0];
                 self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
+                let (singles, _) = self.operand(singles)?;
+                let (rounding, _) = self.load_scalar(rounding)?;
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.extend([AbiParam::new(PTR), AbiParam::new(PTR)]);
+                sig.params.push(AbiParam::new(types::I32));
+                let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
+                let callee = self.cg.assembly(asm::vcvtps2ph(register), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &[singles, dst, rounding]);
             }
             ("x86.pclmulqdq" | "x86.pclmulqdq.256" | "x86.pclmulqdq.512", [a, b, halves]) => {
                 let (a, ty) = self.operand(a)?;

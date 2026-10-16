@@ -25,6 +25,21 @@ pub(super) fn xgetbv() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, edi\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n")
 }
 
+/// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
+/// argument and writes them to its second. The rounding is part of the instruction, so there
+/// is one for each of the eight, and the third argument says which runs.
+pub(super) fn vcvtps2ph(register: &str) -> String {
+    let mut text = format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [rdi]\nand edx, 7\nshl edx, 4\n\
+         lea rax, [rip + .Lrounding]\nadd rax, rdx\njmp rax\n.p2align 4\n.Lrounding:\n"
+    );
+    for rounding in 0..8 {
+        _ = write!(text, ".p2align 4\nvcvtps2ph xmm0, {register}, {rounding}\njmp .Lconverted\n");
+    }
+    text.push_str(".Lconverted:\nvmovdqu [rsi], xmm0\nvzeroupper\nret\n");
+    text
+}
+
 /// One operand of a block, as the function around it sees it.
 pub(super) enum Operand<'a> {
     Reg {
