@@ -72,7 +72,9 @@ def follow(files, steps):
     link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
     link[link.index("-o") + 1] = binary
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *symbols]
+    # RUSTD_SPLICE: edits are added to the linked binary where that can be done.
+    splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
+    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
     out = open(log_path, "a")
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():

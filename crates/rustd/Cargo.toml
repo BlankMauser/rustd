@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 memchr = "2"
 anyhow.workspace = true
+memmap2 = "0.9"
 mimalloc = { version = "0.1.46", default-features = false }
 object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf"] }
 rustc-demangle = "0.1.28"

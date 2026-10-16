@@ -6,6 +6,7 @@ mod deps;
 mod memory;
 mod outline;
 mod remote;
+mod splice;
 mod stub;
 mod symbols;
 mod tree;
@@ -57,7 +58,10 @@ use syntax::{
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
-use crate::symbols::SymbolTable;
+use crate::{
+    splice::{Baseline, Linked, Spliced},
+    symbols::SymbolTable,
+};
 
 #[derive(Clone)]
 struct Args {
@@ -76,6 +80,9 @@ struct Args {
     /// Where to write the object that amends `out` after an edit, for the link to take ahead of
     /// `out`. Without it every edit writes `out` again.
     patch: Option<PathBuf>,
+    /// The executable `link_cmd` writes. With it an edit that fits a patch is added to the
+    /// executable where it is, and `link_cmd` only runs when that can't be done.
+    splice: Option<PathBuf>,
     /// Tab-separated per-function outcome, for the harness.
     report: Option<PathBuf>,
     /// File of function paths to leave to rustc, for bisecting miscompiles.
@@ -140,6 +147,7 @@ impl Args {
         let mut socket = None;
         let mut link_cmd = None;
         let mut patch = None;
+        let mut splice = None;
         let mut report = None;
         let mut deny = None;
         let mut isolate = None;
@@ -156,6 +164,7 @@ impl Args {
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
+                "--splice" => splice = Some(PathBuf::from(value()?)),
                 "--report" => report = Some(PathBuf::from(value()?)),
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
@@ -179,6 +188,7 @@ impl Args {
             socket,
             link_cmd,
             patch,
+            splice,
             report,
             deny,
             isolate,
@@ -1682,13 +1692,80 @@ fn report(build: &Build) {
     }
 }
 
-fn link(cmd: Option<&str>) -> anyhow::Result<()> {
+/// The executables that edits are spliced into, by where each is. One program has as many as
+/// there are checkouts read as its own, and a link may run after the build that asked for it.
+static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executable>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Brings an executable up to date with its objects. An edit that left the whole object alone
+/// is spliced into the executable at `splice`, when that is known from its last link; anything
+/// else, and whatever the splice declines, runs the link command, whose result is then known.
+fn link(
+    cmd: Option<&str>,
+    splice: Option<&Path>,
+    patch: Option<&Path>,
+    patched: bool,
+) -> anyhow::Result<()> {
+    // An executable linked with the object as it was is not one to add to, also when the
+    // object was written for a request that does not link.
+    let rewritten = match splice {
+        Some(binary) if !patched => LINKED.lock().unwrap().remove(binary).is_some(),
+        _ => false,
+    };
     let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
+    let mut declined = String::new();
+    if let (Some(binary), Some(patch)) = (splice, patch) {
+        let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
+        let spliced = match known {
+            _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
+            Some(Ok(mut baseline)) if baseline.is_of(binary) => {
+                let spliced = std::fs::read(patch)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|patch| baseline.splice(&patch));
+                spliced.map(|spliced| (baseline, spliced))
+            }
+            Some(Ok(_)) => Err(anyhow::anyhow!("another executable is asked for")),
+            Some(Err(why)) => Err(why),
+            None => Err(anyhow::anyhow!("no executable to add to")),
+        };
+        match spliced {
+            Ok((baseline, Spliced { redirected, appended })) => {
+                let read = Executable::Read(Box::new(baseline));
+                LINKED.lock().unwrap().insert(binary.to_owned(), read);
+                eprintln!(
+                    "link: {:.1?} (spliced: {redirected} functions redirected, {appended} bytes)",
+                    start.elapsed()
+                );
+                return Ok(());
+            }
+            Err(why) => declined = format!("; not spliced: {why:#}"),
+        }
+    }
     let status = Command::new("sh").arg("-c").arg(cmd).status()?;
-    eprintln!("link: {:.1?} ({status})", start.elapsed());
+    eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status})");
+    if let (Some(binary), Some(patch)) = (splice, patch) {
+        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch));
+        LINKED.lock().unwrap().insert(binary.to_owned(), linked);
+    }
     Ok(())
+}
+
+/// The executable of the last full link, for splicing edits into.
+enum Executable {
+    /// Just linked, and being read.
+    Linked(Linked),
+    Read(Box<Baseline>),
+}
+
+impl Executable {
+    fn baseline(self) -> anyhow::Result<Baseline> {
+        match self {
+            Executable::Linked(linked) => linked.baseline(),
+            Executable::Read(baseline) => Ok(*baseline),
+        }
+    }
 }
 
 /// The directories of the checkout at `base` that builds write to. They are not part of the
@@ -2007,6 +2084,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             socket: None,
             link_cmd: None,
             patch: None,
+            splice: None,
             report: Some(report.join(format!("{krate}.tsv"))),
             deny: None,
             isolate: None,
@@ -2074,6 +2152,7 @@ struct Target {
     out: PathBuf,
     patch: Option<PathBuf>,
     link_cmd: Option<String>,
+    splice: Option<PathBuf>,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
     /// that program's own objects, so another has to be told where its copies are. Empty for
     /// the files the daemon was started with.
@@ -2087,7 +2166,7 @@ impl Target {
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, out, patch, link_cmd, symbol_files } = self;
+        let Target { project, krate, out, patch, link_cmd, splice, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
         let symbol_files =
@@ -2107,6 +2186,7 @@ impl Target {
             out,
             patch,
             link_cmd,
+            splice,
             symbol_files,
             ..daemon.clone()
         })
@@ -2115,7 +2195,7 @@ impl Target {
     /// From what follows the socket on the command line of a client.
     fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
-        let mut project = None;
+        let (mut project, mut splice) = (None, None);
         let mut symbol_files = Vec::new();
         while let Some(flag) = flags.next() {
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
@@ -2125,17 +2205,19 @@ impl Target {
                 "--out" => out = Some(PathBuf::from(value)),
                 "--patch" => patch = Some(PathBuf::from(value)),
                 "--link-cmd" => link_cmd = Some(value),
+                "--splice" => splice = Some(PathBuf::from(value)),
                 "--symbols" => symbol_files.push(PathBuf::from(value)),
                 _ => bail!("unexpected argument {flag}"),
             }
         }
         match (krate, out) {
             (Some(krate), Some(out)) => {
-                Ok(Some(Target { project, krate, out, patch, link_cmd, symbol_files }))
+                Ok(Some(Target { project, krate, out, patch, link_cmd, splice, symbol_files }))
             }
             (None, None)
                 if patch.is_none()
                     && link_cmd.is_none()
+                    && splice.is_none()
                     && symbol_files.is_empty()
                     && project.is_none() =>
             {
@@ -2147,7 +2229,7 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, ref symbol_files @ ..] = fields else {
+        let &[project, krate, out, patch, link_cmd, splice, ref symbol_files @ ..] = fields else {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
@@ -2157,18 +2239,20 @@ impl Target {
             out: PathBuf::from(out),
             patch: given(patch).map(PathBuf::from),
             link_cmd: given(link_cmd),
+            splice: given(splice).map(PathBuf::from),
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
     }
 
     fn fields(&self) -> String {
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.krate,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            self.link_cmd.as_deref().unwrap_or_default()
+            self.link_cmd.as_deref().unwrap_or_default(),
+            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default()
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -2312,6 +2396,7 @@ struct Outputs {
     out: PathBuf,
     patch: Option<PathBuf>,
     link_cmd: Option<String>,
+    splice: Option<PathBuf>,
 }
 
 impl Outputs {
@@ -2320,6 +2405,7 @@ impl Outputs {
             out: args.out.clone(),
             patch: args.patch.clone(),
             link_cmd: args.link_cmd.clone(),
+            splice: args.splice.clone(),
         }
     }
 }
@@ -2516,6 +2602,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
+    anyhow::ensure!(
+        args.splice.is_none() || (args.patch.is_some() && args.link_cmd.is_some()),
+        "--splice without --patch and --link-cmd"
+    );
     let report_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if !PROBING.get() && !INTERRUPTING.load(Ordering::SeqCst) {
@@ -2538,7 +2628,7 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     memory::report(&mut db, "build")?;
     report_stats(&known.stats);
-    link(args.link_cmd.as_deref())?;
+    link(args.link_cmd.as_deref(), args.splice.as_deref(), args.patch.as_deref(), false)?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
@@ -2725,6 +2815,7 @@ fn main() -> anyhow::Result<()> {
                             out: target.out.clone(),
                             patch: target.patch.clone(),
                             link_cmd: target.link_cmd.clone(),
+                            splice: target.splice.clone(),
                         },
                         None => Outputs::of(&programs[0].args),
                     };
@@ -3199,8 +3290,11 @@ fn main() -> anyhow::Result<()> {
         }
         for (at, clients) in linking {
             let Some(Ok(built)) = replies.remove(&at) else { continue };
-            let Outputs { out, link_cmd, patch } =
+            let Outputs { out, link_cmd, patch, splice } =
                 outputs.remove(&at).unwrap_or_else(|| Outputs::of(&programs[at].args));
+            // The answer names a patch when the whole object is as it was.
+            let patched = built.starts_with("patch=");
+            let spliced = patch.clone();
             let link_cmd = link_cmd.filter(|_| clients.iter().any(|it| it.0 != Request::Patch));
             let sender = sender.clone();
             let base = &programs[at].args.checkout;
@@ -3208,7 +3302,8 @@ fn main() -> anyhow::Result<()> {
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let linked = std::thread::spawn(move || {
-                let failed = link(link_cmd.as_deref()).err();
+                let failed =
+                    link(link_cmd.as_deref(), splice.as_deref(), spliced.as_deref(), patched).err();
                 if failed.is_none() {
                     as_built.lock().unwrap().insert(object, from);
                 }
@@ -3352,8 +3447,9 @@ impl Program {
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
         let Program { args, table, known, unbuilt, wrote, whole, .. } = self;
-        let Outputs { out, patch, link_cmd } = wanted.cloned().unwrap_or_else(|| Outputs::of(args));
-        let args = &Args { out, patch, link_cmd, ..args.clone() };
+        let Outputs { out, patch, link_cmd, splice } =
+            wanted.cloned().unwrap_or_else(|| Outputs::of(args));
+        let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
@@ -3393,8 +3489,12 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
-        if failed.is_none() && link_it {
-            failed = link(args.link_cmd.as_deref()).err().map(|it| it.to_string());
+        if failed.is_none() || known.stats.patched.is_none() {
+            let patched = known.stats.patched.is_some();
+            let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
+            let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
+            let unlinked = link(cmd, splice, patch, patched).err().map(|it| it.to_string());
+            failed = failed.or(unlinked);
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");

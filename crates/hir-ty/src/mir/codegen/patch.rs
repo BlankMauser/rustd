@@ -24,7 +24,8 @@ use super::{
     compiled_static, declaration_location,
     fragment::{DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    instance_serial, left_to_rustc, root_serial, source_location, static_serial, target,
+    instance_serial, is_thread_local, left_to_rustc, root_serial, source_location, static_serial,
+    target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -316,6 +317,7 @@ impl Touched {
         for stale in found {
             self.roots.extend(&stale.roots);
             self.instances.extend(stale.instances.iter().cloned());
+            self.statics.extend(&stale.statics);
             for (node, _) in &stale.broken {
                 match node {
                     Node::Instance(instance) => _ = self.instances.insert(instance.clone()),
@@ -339,6 +341,8 @@ impl Touched {
 pub struct Stale {
     roots: Vec<FunctionId>,
     instances: Vec<Instance>,
+    /// The statics with another value, which a patch defines again under their name.
+    statics: Vec<StaticId>,
     /// What a patch can't replace, and why. That only matters for what the program still
     /// reaches.
     broken: Vec<(Node, &'static str)>,
@@ -684,7 +688,13 @@ impl Base {
                 continue;
             }
             stale.their_walk_changed |= was.theirs;
-            stale.broken.push((Node::Static(id), "a static of the base changed"));
+            // rustc's code has rustc's copy, and a thread's copy is laid out by the linker.
+            let writable = probe(|| compiled_static(db, id).as_ref().ok().map(|it| it.writable));
+            if writable == Some(Some(was.writable)) && !was.theirs && !is_thread_local(db, id) {
+                stale.statics.push(id);
+            } else {
+                stale.broken.push((Node::Static(id), "a static of the base changed"));
+            }
         }
         stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
         for i in every(self.skipped.len()) {
@@ -775,7 +785,7 @@ impl Base {
                 let compiled = compiled_instance(db, instance.clone(), known.env.clone());
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
-            Node::Static(_) => None,
+            Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
         };
         requests.is_some_and(|requests| node.is_asked_for_by(requests))
     }
@@ -822,6 +832,7 @@ impl Base {
 
         let mut changed_roots = Vec::new();
         let mut changed_instances = Vec::new();
+        let mut changed_statics = Vec::new();
         let mut broken = Vec::new();
         for part in stale {
             if let Some(why) = part.declined {
@@ -829,6 +840,7 @@ impl Base {
             }
             changed_roots.extend(part.roots);
             changed_instances.extend(part.instances);
+            changed_statics.extend(part.statics);
             broken.extend(part.broken);
         }
         // What the edit took away is still in the base, where nothing refers to it any more.
@@ -837,6 +849,7 @@ impl Base {
                 .iter()
                 .map(|&root| Node::Root(root))
                 .chain(changed_instances.iter().cloned().map(Node::Instance))
+                .chain(changed_statics.iter().map(|&id| Node::Static(id)))
                 .collect(),
             broken: broken.iter().map(|it| it.0.clone()).collect(),
         };
@@ -844,6 +857,7 @@ impl Base {
             return Ok(Err(why));
         }
         changed_instances.retain(|it| self.reaches(db, &Node::Instance(it.clone()), &unchanged));
+        changed_statics.retain(|&it| self.reaches(db, &Node::Static(it), &unchanged));
         let verify = start.elapsed();
 
         let mut cg = ObjectCodegen::new(
@@ -872,6 +886,11 @@ impl Base {
             )?;
             cg.instances.insert(instance.clone(), id);
             cg.pending.push((instance.clone(), was.env.clone(), id));
+        }
+        for &id in &changed_statics {
+            if cg.static_data(id).is_err() {
+                return Ok(Err("a static of the base no longer has a value"));
+            }
         }
         let mut queued: FxHashSet<FunctionId> = known_roots().collect();
         let mut queue = changed_roots;
