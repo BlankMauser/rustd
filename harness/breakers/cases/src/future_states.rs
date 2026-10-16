@@ -3,8 +3,8 @@
 //! not at all, one read from memory another has taken. Each future here is polled a number of
 //! times and then dropped, and says what it dropped.
 //!
-//! The sizes are left to `future_size`. One still differs: a local a part of which is moved out
-//! (`in_parts`) has a word of drop flags in rustd's future, where rustc has a byte for each part.
+//! The size of each is told too. A local a part of which is moved out (`in_parts`) had a word
+//! of drop flags in rustd's future, where a byte holds the few bits it needs.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -122,9 +122,10 @@ fn drive<F: Future<Output = usize>>(name: &str, polls: usize, make: impl FnOnce(
             }
         }
     }
+    let size = std::mem::size_of_val(&*future);
     drop(future);
     let log = log.borrow();
-    format!("{name}/{polls}: {}", log.join(", "))
+    format!("{name}/{polls} ({size} bytes): {}", log.join(", "))
 }
 
 pub fn run() -> Vec<String> {

@@ -9,7 +9,7 @@ use hir_def::{
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -1075,6 +1075,8 @@ pub struct HeldLocals {
     pub yields: Vec<YieldPoint>,
     conflicts: Vec<bool>,
     flagged: Vec<bool>,
+    /// How many parts of each may be moved out on their own.
+    parts: Vec<u32>,
 }
 
 /// One `await`: where the body goes on from, and which of the held locals are kept over it.
@@ -1101,6 +1103,17 @@ impl HeldLocals {
         self.flagged[at]
     }
 
+    /// The size of the flag of a flagged local: a bit for the whole and one for each part that
+    /// may be gone.
+    pub fn flag_bytes(&self, at: usize) -> u64 {
+        match self.parts[at] {
+            0..8 => 1,
+            8..16 => 2,
+            16..32 => 4,
+            _ => 8,
+        }
+    }
+
     /// The held locals whose flag is in the future, in order.
     pub fn flagged(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.locals.len()).filter(|&at| self.flagged[at])
@@ -1114,7 +1127,7 @@ enum Access {
     Write,
     Borrow,
     /// A part of it is used as an operand, and so perhaps moved out.
-    Part,
+    Part(StoredProjection),
 }
 
 impl MirBody<'_> {
@@ -1323,7 +1336,18 @@ impl MirBody<'_> {
             .collect();
         let flagged = locals
             .iter()
-            .map(|&it| moved[index(it)] && (unsure[index(it)] || parted[index(it)]))
+            .map(|&it| moved[index(it)] && (unsure[index(it)] || !parted[index(it)].is_empty()))
+            .collect();
+        // Each of the elements of a subslice is a part.
+        let parts = locals
+            .iter()
+            .map(|&it| {
+                let parts = parted[index(it)].iter().map(|part| match part.as_slice().last() {
+                    Some(ProjectionElem::Subslice { .. }) => u64::BITS,
+                    _ => 1,
+                });
+                parts.sum()
+            })
             .collect();
         // Two of them that may hold a value at once can't share memory. With what is held on
         // entry to each block known, one more pass over the blocks finds every such pair.
@@ -1371,15 +1395,17 @@ impl MirBody<'_> {
                 }
             }
         }
-        HeldLocals { locals, yields, conflicts, flagged }
+        HeldLocals { locals, yields, conflicts, flagged, parts }
     }
 
     /// The locals read after the start of each block before they are written, the ones
-    /// borrowed anywhere, and the ones a part of which is used as an operand.
-    fn liveness(&self) -> (ArenaMap<BasicBlockId, Vec<bool>>, Vec<bool>, Vec<bool>) {
+    /// borrowed anywhere, and the parts of each that are used as an operand.
+    fn liveness(
+        &self,
+    ) -> (ArenaMap<BasicBlockId, Vec<bool>>, Vec<bool>, Vec<FxHashSet<StoredProjection>>) {
         let index = |local: LocalId| local.into_raw().into_u32() as usize;
         let count = self.locals.len();
-        let (mut borrowed, mut parted) = (vec![false; count], vec![false; count]);
+        let (mut borrowed, mut parted) = (vec![false; count], vec![FxHashSet::default(); count]);
         let mut live: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
         let mut written: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
         let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
@@ -1389,7 +1415,9 @@ impl MirBody<'_> {
                 Access::Read => reads[index(local)] |= !writes[index(local)],
                 Access::Write => writes[index(local)] = true,
                 Access::Borrow => borrowed[index(local)] = true,
-                Access::Part => parted[index(local)] = true,
+                Access::Part(part) => {
+                    parted[index(local)].insert(part);
+                }
             });
             live.insert(id, reads);
             written.insert(id, writes);
@@ -1443,7 +1471,7 @@ impl MirBody<'_> {
             if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
                 read(place, f);
                 if !place.projection.as_slice().is_empty() && is_within(place) {
-                    f(place.local, Access::Part);
+                    f(place.local, Access::Part(place.projection.clone()));
                 }
             }
         }

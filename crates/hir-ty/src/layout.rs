@@ -380,10 +380,16 @@ pub fn layout_of_ty_query(
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, LayoutError>>()?;
-            let flag = Layout::scalar(dl, scalar_unit(dl, Primitive::Int(Integer::I64, false)));
-            let frame = CoroutineFrame { upvars: upvars.len(), flags: held.flagged().count() };
+            let flags: Vec<Layout> = held
+                .flagged()
+                .map(|at| {
+                    let bits = Integer::from_size(Size::from_bytes(held.flag_bytes(at)))
+                        .expect("a flag of one to eight bytes");
+                    Layout::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false)))
+                })
+                .collect();
             let mut prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
-            prefix.extend(std::iter::repeat_n(&flag, frame.flags));
+            prefix.extend(&flags);
             let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
             let locals = locals.iter().collect::<Vec<_>>();
             let locals = locals.iter().collect::<IndexVec<usize, _>>();
@@ -639,7 +645,7 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
 }
 
 /// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of
-/// its layout are the captures, a word of drop flags for each held local that needs one, and
+/// its layout are the captures, the drop flags of each held local that needs them, and
 /// the state: where the body left off. The held locals are fields of its variants, one for
 /// each place the body yields at.
 #[derive(Debug, Clone, Copy)]
