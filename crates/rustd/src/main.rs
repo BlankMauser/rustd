@@ -1180,7 +1180,18 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        for krate in crates_named(db, krate, &args.checkout)? {
+        let mut named = crates_named(db, krate, &args.checkout)?;
+        // Of the crates of the name, the ones rustc built into this program, when it built any.
+        let linked = |krate: &Crate| {
+            let name = krate.display_name(db);
+            let root = crate_root_file(db, *krate);
+            name.zip(root)
+                .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+        };
+        if named.iter().any(linked) {
+            named.retain(linked);
+        }
+        for krate in named {
             local.push(krate);
             let listed = listed.of(db, krate);
             if at == 0 {

@@ -21,6 +21,8 @@ pub(crate) struct SymbolTable {
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
     by_root: FxHashMap<PathBuf, u64>,
+    /// The crates of the link, each by its name and the file it starts at.
+    linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
 }
@@ -74,6 +76,7 @@ impl SymbolTable {
         // several files, when it is linked from its objects.
         let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
+            table.linked.insert((name.clone(), source.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
@@ -199,6 +202,12 @@ impl SymbolTable {
                 self.by_root.insert(source, id);
             }
         }
+    }
+
+    /// Whether the crate named `name` whose source starts at `root` is one of the link. A
+    /// bench may be named as the library, start where a test does, and be another program.
+    pub(crate) fn links(&self, name: &str, root: &Path) -> bool {
+        self.linked.contains(&(name.to_owned(), root.to_owned()))
     }
 
     pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {

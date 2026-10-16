@@ -8,3 +8,9 @@ publish = false
 helper = { path = "helper" }
 
 [workspace]
+
+# A bench named as the library, of the source of a test.
+[[bench]]
+name = "devdep"
+path = "tests/only_main.rs"
+harness = false
