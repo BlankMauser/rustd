@@ -16,5 +16,5 @@ linker = "arm-linux-gnueabihf-gcc-8"
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
 # The compiler in a browser, `crates/rustd-wasm`: there are no threads to drop syntax trees on.
-[target.wasm64-unknown-unknown]
+[target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "no_salsa_async_drops"]

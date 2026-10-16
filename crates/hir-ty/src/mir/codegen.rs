@@ -2424,10 +2424,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             fn_relocs: Vec::new(),
             align: 1,
         })?;
-        let mut fat =
-            ConstBlob { bytes: vec![0; 16], relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
+        let mut fat = ConstBlob {
+            bytes: vec![0; 2 * WORD],
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align: WORD as u64,
+        };
         fat.point_to(0, path, 0);
-        fat.bytes[8..].copy_from_slice(&(len as u64).to_le_bytes());
+        fat.bytes[WORD..].copy_from_slice(&(len as u64).to_le_bytes()[..WORD]);
         self.define_const(fat)
     }
 
@@ -2539,10 +2543,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// A `core::panic::Location`, of no place in particular when the place is not known.
     fn define_location(&mut self, found: Option<(String, u32, u32)>) -> Result<DataId> {
         let (file, line, col) = found.unwrap_or_else(|| ("<rustd>".to_owned(), 0u32, 0u32));
-        let mut bytes = vec![0u8; 24];
-        bytes[8..16].copy_from_slice(&(file.len() as u64).to_le_bytes());
-        bytes[16..20].copy_from_slice(&line.to_le_bytes());
-        bytes[20..24].copy_from_slice(&col.to_le_bytes());
+        let mut bytes = vec![0u8; 2 * WORD + 8];
+        bytes[WORD..2 * WORD].copy_from_slice(&(file.len() as u64).to_le_bytes()[..WORD]);
+        bytes[2 * WORD..2 * WORD + 4].copy_from_slice(&line.to_le_bytes());
+        bytes[2 * WORD + 4..].copy_from_slice(&col.to_le_bytes());
         // The name is followed by a NUL that its length leaves out.
         let mut name = file.into_bytes();
         name.push(0);
@@ -2552,7 +2556,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             fn_relocs: Vec::new(),
             align: 1,
         })?;
-        let mut location = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
+        let mut location =
+            ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: WORD as u64 };
         location.point_to(0, name, 0);
         self.define_const(location)
     }
@@ -3132,13 +3137,13 @@ struct ConstBlob {
 impl ConstBlob {
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
     fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
-        self.bytes[offset..offset + 8].fill(0);
+        self.bytes[offset..offset + WORD].fill(0);
         self.relocs.push((offset as u32, target, at as i64));
     }
 
     fn usize_at(&self, offset: usize) -> Option<usize> {
-        let bytes = self.bytes.get(offset..offset + 8)?;
-        Some(u64::from_le_bytes(bytes.try_into().ok()?) as usize)
+        let bytes = self.bytes.get(offset..offset + WORD)?;
+        Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | usize::from(byte)))
     }
 }
 
@@ -3270,7 +3275,10 @@ fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
     trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }
 
-const PTR: Type = types::I64;
+/// The integer an address is, and how many bytes it takes.
+const PTR: Type = if cfg!(feature = "wasm") { types::I32 } else { types::I64 };
+const WORD: usize = if cfg!(feature = "wasm") { 4 } else { 8 };
+const META: i32 = WORD as i32;
 
 /// Where an `async` body left off: before its first statement, after its last, part of the way
 /// through unwinding, or at the await with the index that is added to `SUSPENDED`.
@@ -3353,8 +3361,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             // Size and align are the vtable's second and third words.
             TyKind::Dynamic(..) => Ok((
-                self.builder.ins().load(PTR, MEM, meta, 8),
-                self.builder.ins().load(PTR, MEM, meta, 16),
+                self.builder.ins().load(PTR, MEM, meta, META),
+                self.builder.ins().load(PTR, MEM, meta, 2 * META),
             )),
             _ => {
                 let (field, field_ty) = self.last_field(ty)?;
@@ -3485,7 +3493,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
             BackendRepr::Memory { sized: true } => {
-                let max = 8;
+                let max = WORD as u64;
                 match layout.size.bytes() {
                     size if size > max => PassMode::Indirect,
                     1 => PassMode::Cast(types::I8),
@@ -4357,7 +4365,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
                     let pointee_meta = self
                         .is_unsized(pointee)
-                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                        .then(|| self.builder.ins().load(PTR, MEM, addr, META));
                     self.drop_ladder(2, |this, at| {
                         if at == 0 {
                             path.push(BOX_CONTENTS);
@@ -4575,7 +4583,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let LocalSlot { mut addr, borrowed } = self.locals[place.local];
         let mut meta = None;
         if borrowed {
-            meta = Some(self.builder.ins().load(PTR, MEM, addr, 8));
+            meta = Some(self.builder.ins().load(PTR, MEM, addr, META));
             addr = self.builder.ins().load(PTR, MEM, addr, 0);
         }
         let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
@@ -4592,7 +4600,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         meta = None;
                     }
                     BackendRepr::ScalarPair(..) => {
-                        meta = Some(self.builder.ins().load(PTR, MEM, addr, 8));
+                        meta = Some(self.builder.ins().load(PTR, MEM, addr, META));
                         addr = self.builder.ins().load(PTR, MEM, addr, 0);
                     }
                     _ => unsupported!("deref of {:?}", prev.ty),
@@ -4939,7 +4947,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     target.align = target.align.max(item.align);
                     target.bytes.extend(item.bytes);
                 }
-                bytes[8..16].copy_from_slice(&(items.len() as u64).to_le_bytes());
+                bytes[WORD..2 * WORD].copy_from_slice(&(items.len() as u64).to_le_bytes()[..WORD]);
                 target
             }
             TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
@@ -5001,13 +5009,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let pointee = match pointee.kind() {
                     TyKind::Dynamic(..) => {
                         let erased =
-                            blob.usize_at(offset + 8).and_then(|id| map.map.vtable_ty(id).ok());
+                            blob.usize_at(offset + WORD).and_then(|id| map.map.vtable_ty(id).ok());
                         let Some(erased) = erased else {
                             unsupported!("`dyn` constant without a known type");
                         };
                         let trait_ref = self.principal(pointee, erased);
                         let vtable = self.vtable(erased, trait_ref)?;
-                        blob.point_to(offset + 8, vtable, 0);
+                        blob.point_to(offset + WORD, vtable, 0);
                         erased
                     }
                     _ => pointee,
@@ -5029,7 +5037,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         Some(elem) => self.layout(elem)?.align.abi.bytes(),
                         None => 1,
                     };
-                    blob.bytes[offset..offset + 8].copy_from_slice(&align.to_le_bytes());
+                    blob.bytes[offset..offset + WORD].copy_from_slice(&align.to_le_bytes()[..WORD]);
                     return Ok(());
                 }
                 if let Some(&target) = map.defined.get(&start) {
@@ -5046,7 +5054,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 match pointee.kind() {
                     TyKind::Str => (),
                     TyKind::Slice(elem) => {
-                        let Some(len) = blob.usize_at(offset + 8) else {
+                        let Some(len) = blob.usize_at(offset + WORD) else {
                             unsupported!("constant slice length out of bounds");
                         };
                         let size = self.layout(elem)?.size.bytes_usize();
@@ -5099,9 +5107,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     AdtId::UnionId(_) => {
                         let align = layout.align.abi.bytes_usize();
                         let mut may_hold_fn = None;
-                        if align.is_multiple_of(8) {
-                            for word in 0..layout.size.bytes_usize() / 8 {
-                                let at = offset + word * 8;
+                        if align.is_multiple_of(WORD) {
+                            for word in 0..layout.size.bytes_usize() / WORD {
+                                let at = offset + word * WORD;
                                 let Some(id) = blob.usize_at(at) else { continue };
                                 // And every word that is the id of a function is taken to
                                 // be that function, in a union that may hold one, as the
@@ -5397,7 +5405,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.operand(operand)?;
             let slot = self.locals[place.local].addr;
             self.builder.ins().store(MEM, addr, slot, 0);
-            self.builder.ins().store(MEM, meta, slot, 8);
+            self.builder.ins().store(MEM, meta, slot, META);
             return Ok(());
         }
         let (dst, dst_ty) = self.place(place)?;
@@ -5422,7 +5430,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let Some(meta) = place.meta else {
                         unsupported!("fat reference to a place without metadata");
                     };
-                    self.builder.ins().store(MEM, meta, dst, 8);
+                    self.builder.ins().store(MEM, meta, dst, META);
                 }
             }
             Rvalue::Len(place) => {
@@ -5783,8 +5791,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         {
             let metas = match (l_ref, r_ref) {
                 (Some(l_ref), Some(r_ref)) if self.is_unsized(ty) => Some((
-                    self.builder.ins().load(PTR, MEM, l_ref, 8),
-                    self.builder.ins().load(PTR, MEM, r_ref, 8),
+                    self.builder.ins().load(PTR, MEM, l_ref, META),
+                    self.builder.ins().load(PTR, MEM, r_ref, META),
                 )),
                 _ => None,
             };
@@ -5815,7 +5823,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let [l_ptr, r_ptr] =
                 [l_addr, r_addr].map(|it| self.builder.ins().load(PTR, MEM, it, 0));
             let [l_meta, r_meta] =
-                [l_addr, r_addr].map(|it| self.builder.ins().load(PTR, MEM, it, 8));
+                [l_addr, r_addr].map(|it| self.builder.ins().load(PTR, MEM, it, META));
             let same_ptr = self.builder.ins().icmp(IntCC::Equal, l_ptr, r_ptr);
             let by_meta = self.builder.ins().icmp(cc, l_meta, r_meta);
             let by_ptr = self.builder.ins().icmp(cc, l_ptr, r_ptr);
@@ -6228,7 +6236,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = generic_args.type_at(0);
             let (src, _) = self.operand(pointer)?;
             let addr = self.builder.ins().load(PTR, MEM, src, 0);
-            let meta = self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+            let meta = self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, META));
             self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
@@ -6327,7 +6335,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(method) else {
                     unsupported!("method missing from the vtable of {dyn_ty:?}");
                 };
-                let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8);
+                let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * META);
                 let thin = self.scratch();
                 self.builder.ins().store(MEM, place.addr, thin, 0);
                 let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
@@ -6528,8 +6536,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("method missing from the vtable of {dyn_ty:?}");
         };
         let data = self.builder.ins().load(PTR, MEM, receiver, 0);
-        let vtable = self.builder.ins().load(PTR, MEM, receiver, 8);
-        let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8);
+        let vtable = self.builder.ins().load(PTR, MEM, receiver, META);
+        let pointer = self.builder.ins().load(PTR, MEM, vtable, slot as i32 * META);
         // The method takes the data pointer alone where the caller holds a fat pointer.
         let thin = self.scratch();
         self.builder.ins().store(MEM, data, thin, 0);
@@ -6567,12 +6575,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 TyKind::RawPtr(from_pointee, _) | TyKind::Ref(_, from_pointee, _),
                 TyKind::RawPtr(to_pointee, _) | TyKind::Ref(_, to_pointee, _),
             ) => {
-                let old =
-                    (from.size.bytes() == 16).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+                let old = (from.size.bytes() == 2 * WORD as u64)
+                    .then(|| self.builder.ins().load(PTR, MEM, src, META));
                 let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
                 let ptr = self.builder.ins().load(PTR, MEM, src, 0);
                 self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, meta, dst, 8);
+                self.builder.ins().store(MEM, meta, dst, META);
             }
             // `NonNull` holds its pointer as a pattern type.
             (TyKind::Pat(from_ty, _), TyKind::Pat(to_ty, _)) => {
@@ -6633,7 +6641,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 match VtableLayout::of(self.interner, trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
                     Some(Upcast::Load(slot)) => {
-                        Ok(self.builder.ins().load(PTR, MEM, vtable, slot as i32 * 8))
+                        Ok(self.builder.ins().load(PTR, MEM, vtable, slot as i32 * META))
                     }
                     None => unsupported!("upcast of {from:?} to {to:?}"),
                 }
@@ -6678,10 +6686,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let layout = self.layout(ty)?;
         let slots = trait_ref.map_or_else(Vec::new, |it| VtableLayout::of(self.interner, it).slots);
-        let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * 8];
-        bytes[8..16].copy_from_slice(&layout.size.bytes().to_le_bytes());
-        bytes[16..24].copy_from_slice(&layout.align.abi.bytes().to_le_bytes());
-        let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
+        let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * WORD];
+        bytes[WORD..2 * WORD].copy_from_slice(&layout.size.bytes().to_le_bytes()[..WORD]);
+        bytes[2 * WORD..3 * WORD].copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..WORD]);
+        let mut blob =
+            ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: WORD as u64 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
             let mut sig = Signature::new(CallConv::SystemV);
             sig.params.push(AbiParam::new(PTR));
@@ -6690,7 +6699,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             blob.fn_relocs.push((0, glue));
         }
         for (index, slot) in slots.into_iter().enumerate() {
-            let offset = ((vtable::HEADER + index) * 8) as u32;
+            let offset = ((vtable::HEADER + index) * WORD) as u32;
             match slot {
                 Slot::Method(func, trait_ref) => {
                     let method = self.vtable_method(func, trait_ref)?;
@@ -7440,7 +7449,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let data = self.cg.declare_data_in_func(data, self.builder.func);
                 let ptr = self.builder.ins().symbol_value(PTR, data);
                 self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, len, dst, 8);
+                self.builder.ins().store(MEM, len, dst, META);
             }
             ("needs_drop", []) => {
                 let ty = generic_args.type_at(0);
@@ -7888,7 +7897,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("ptr_metadata", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 if let BackendRepr::ScalarPair(..) = self.layout(ty)?.backend_repr {
-                    let meta = self.builder.ins().load(PTR, MEM, src, 8);
+                    let meta = self.builder.ins().load(PTR, MEM, src, META);
                     self.builder.ins().store(MEM, meta, dst, 0);
                 }
             }
@@ -7898,7 +7907,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, data, dst, 0);
                 if let BackendRepr::ScalarPair(..) = self.layout(dst_ty)?.backend_repr {
                     let (meta, _) = self.load_scalar(meta)?;
-                    self.builder.ins().store(MEM, meta, dst, 8);
+                    self.builder.ins().store(MEM, meta, dst, META);
                 }
             }
             ("slice_get_unchecked", [slice, index]) => {
@@ -7919,7 +7928,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("size_of_val" | "align_of_val", [arg]) => {
                 let (src, _) = self.operand(arg)?;
                 let ty = generic_args.type_at(0);
-                let meta = self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, 8));
+                let meta =
+                    self.is_unsized(ty).then(|| self.builder.ins().load(PTR, MEM, src, META));
                 let (size, align) = self.size_and_align_of_val(ty, meta)?;
                 let value = if name == "size_of_val" { size } else { align };
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -8524,8 +8534,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Ref(_, pointee, _) => {
                 let metas = self.is_unsized(pointee).then(|| {
                     (
-                        self.builder.ins().load(PTR, MEM, l, 8),
-                        self.builder.ins().load(PTR, MEM, r, 8),
+                        self.builder.ins().load(PTR, MEM, l, META),
+                        self.builder.ins().load(PTR, MEM, r, META),
                     )
                 });
                 let l = self.builder.ins().load(PTR, MEM, l, 0);
@@ -8776,7 +8786,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let pointer = self.builder.ins().load(PTR, MEM, addr, 0);
                     let pointee_meta = self
                         .is_unsized(pointee)
-                        .then(|| self.builder.ins().load(PTR, MEM, addr, 8));
+                        .then(|| self.builder.ins().load(PTR, MEM, addr, META));
                     // The memory is freed even if dropping what it holds unwinds.
                     self.guarded(
                         |this| this.drop_value(pointer, pointee_meta, pointee),

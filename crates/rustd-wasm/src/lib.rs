@@ -42,10 +42,8 @@ pub const MAIN: &str = "/app/main.rs";
 /// Where `core` starts, when its source is there.
 pub const CORE: &str = "/core/src/lib.rs";
 
-/// x86-64's layout, which the code generator's ABI is written against. The backend is the
-/// only thing that knows the code runs on wasm64.
-const DATA_LAYOUT: &str =
-    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128";
+/// The layout of `wasm32-unknown-unknown`.
+const DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20";
 
 pub struct Compiler {
     db: RootDatabase,
@@ -180,8 +178,8 @@ impl Compiler {
             value: Symbol::intern(value),
         };
         cfg.extend([
-            key("target_arch", "wasm64"),
-            key("target_pointer_width", "64"),
+            key("target_arch", "wasm32"),
+            key("target_pointer_width", "32"),
             key("target_endian", "little"),
             key("target_os", "unknown"),
             key("target_family", "wasm"),
@@ -195,7 +193,7 @@ impl Compiler {
             ]);
         }
         let workspace = Arc::new(CrateWorkspaceData {
-            target: Ok(TargetData { data_layout: DATA_LAYOUT.into(), arch: Arch::Wasm64 }),
+            target: Ok(TargetData { data_layout: DATA_LAYOUT.into(), arch: Arch::Wasm32 }),
             toolchain: None,
         });
         let cwd = Arc::new(AbsPathBuf::assert("/".into()));

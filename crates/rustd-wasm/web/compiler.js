@@ -5,7 +5,7 @@ export class Compiler {
   static async load(wasm, core) {
     let memory;
     const text = (pointer, length) =>
-      new TextDecoder().decode(new Uint8Array(memory.buffer, Number(pointer), Number(length)).slice());
+      new TextDecoder().decode(new Uint8Array(memory.buffer, pointer >>> 0, length >>> 0).slice());
     // What the compiler needs of the page: a clock, and somewhere to say why it panicked.
     const rustd = {
       now: () => performance.now(),
@@ -27,10 +27,9 @@ export class Compiler {
   // Copies bytes or text into the compiler, which frees them once it has read them.
   argument(value) {
     const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-    // The compiler is a 64-bit program, as the programs it compiles are.
-    const pointer = this.rustd.rustd_alloc(BigInt(bytes.length));
-    new Uint8Array(this.rustd.memory.buffer, Number(pointer), bytes.length).set(bytes);
-    return [pointer, BigInt(bytes.length)];
+    const pointer = this.rustd.rustd_alloc(bytes.length);
+    new Uint8Array(this.rustd.memory.buffer, pointer >>> 0, bytes.length).set(bytes);
+    return [pointer, bytes.length];
   }
 
   setFile(path, text) {
@@ -39,7 +38,7 @@ export class Compiler {
 
   report() {
     const { memory, rustd_report, rustd_report_len } = this.rustd;
-    const bytes = new Uint8Array(memory.buffer, Number(rustd_report()), Number(rustd_report_len()));
+    const bytes = new Uint8Array(memory.buffer, rustd_report() >>> 0, rustd_report_len());
     return new TextDecoder().decode(bytes.slice());
   }
 
@@ -50,7 +49,7 @@ export class Compiler {
       throw new Error(this.report());
     }
     const { memory, rustd_module, rustd_module_len } = this.rustd;
-    const module = new Uint8Array(memory.buffer, Number(rustd_module()), Number(rustd_module_len())).slice();
+    const module = new Uint8Array(memory.buffer, rustd_module() >>> 0, rustd_module_len()).slice();
     return { module, report: JSON.parse(this.report()) };
   }
 
