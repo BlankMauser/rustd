@@ -1145,6 +1145,35 @@ pub mod foreign {
         Two { a: a + b + c + d + e + two.a, b: two.b * last }
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Quad {
+        pub at: [f64; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Five {
+        pub at: [f32; 5],
+    }
+
+    /// Two of four floats fill the float registers a target has eight of, so the third goes
+    /// to the stack whole, and the float after it follows it there.
+    pub extern "C" fn quads(a: Quad, b: Quad, c: Quad, last: f64) -> Quad {
+        Quad { at: [a.at[0] + b.at[1], b.at[2] - c.at[3], c.at[0] * last, a.at[3] + c.at[1]] }
+    }
+
+    /// Five floats are one too many to come back in registers.
+    pub extern "C" fn five(x: Five, by: f32) -> Five {
+        Five { at: [x.at[4] * by, x.at[3], x.at[2] + by, x.at[1], x.at[0]] }
+    }
+
+    /// A 128-bit integer starts at an even register, and at an aligned slot once on the stack.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn wides(a: u64, b: u128, c: u64, d: i128, e: u64, f: u128, g: u8, h: i128) -> u128 {
+        (a as u128 + b + c as u128).wrapping_add(d as u128) + e as u128 + f + g as u128 + h as u128
+    }
+
     pub fn through_pointer(f: extern "C" fn(Floats, f32) -> Floats, g: extern "C" fn(u64) -> Big) -> f32 {
         let x = f(Floats { a: 1.0, b: [2.0, 3.0] }, 0.5);
         x.a + x.b[0] + x.b[1] + g(3).c as f32

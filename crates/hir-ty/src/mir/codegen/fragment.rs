@@ -24,8 +24,8 @@ use crate::{
 };
 
 use super::{
-    Target,
-    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, unwind::FunctionUnwind,
+    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.

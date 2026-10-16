@@ -69,11 +69,17 @@ impl Reg {
             (Reg::Vector(_), 4) => 's',
             (Reg::Vector(_), 8) => 'd',
             (Reg::Vector(_), 16) => 'q',
-            _ => return Err(format!("an inline assembly operand of {size} bytes in such a register")),
+            _ => {
+                return Err(format!(
+                    "an inline assembly operand of {size} bytes in such a register"
+                ));
+            }
         };
         match self {
             Reg::Gpr(number) | Reg::Vector(number) => Ok(format!("{prefix}{number}")),
-            Reg::Scratch => Err("an inline assembly operand in a register with no value".to_owned()),
+            Reg::Scratch => {
+                Err("an inline assembly operand in a register with no value".to_owned())
+            }
         }
     }
 

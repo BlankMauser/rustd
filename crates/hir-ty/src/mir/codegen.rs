@@ -208,7 +208,11 @@ enum PassMode {
     /// `unit` bytes of it. `skipped` registers of that kind go unused first: the convention
     /// leaves them out when the value has to start at an even register, and takes them all
     /// out of use when the value has to go to the stack, where the units then land.
-    Uniform { unit: Type, count: u8, skipped: u8 },
+    Uniform {
+        unit: Type,
+        count: u8,
+        skipped: u8,
+    },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -226,9 +230,15 @@ enum Aapcs64 {
     Ignore,
     Scalar(AbiScalar),
     /// A homogeneous aggregate of `count` floats of the type `unit`.
-    Floats { unit: Type, count: u8 },
+    Floats {
+        unit: Type,
+        count: u8,
+    },
     /// Any other aggregate of at most sixteen bytes.
-    Ints { size: u64, align: u64 },
+    Ints {
+        size: u64,
+        align: u64,
+    },
     /// A larger one, which the caller copies and passes the address of.
     Memory,
 }

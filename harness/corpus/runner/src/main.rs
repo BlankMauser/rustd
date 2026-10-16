@@ -169,6 +169,10 @@ fn main() {
     case!(floats.a, floats.b[0], floats.b[1], nested.tag, nested.inner.0, nested.inner.1);
     let two = foreign::spill(1, 2, 3, 4, 5, foreign::Two { a: 6, b: 7 }, 8);
     case!(two.a, two.b, foreign::through_pointer(foreign::floats, foreign::make_big));
+    let quad = |x: f64| foreign::Quad { at: [x, x + 0.5, x * 2.0, x - 1.0] };
+    let five = foreign::five(foreign::Five { at: [1.0, 2.0, 3.0, 4.0, 5.0] }, 1.5);
+    case!(foreign::quads(quad(1.0), quad(2.0), quad(3.0), 0.25).at, five.at);
+    case!(foreign::wides(1, 1 << 70, 2, -5, 3, 1 << 90, 4, 1 << 100));
     let map = shapes::byte_map();
     case!(map.map[b'a' as usize], map.map[10], map.map[0]);
     let (a, b) = (shapes::state(b"abc"), shapes::state(b"abd"));
