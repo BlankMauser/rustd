@@ -40,6 +40,8 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod macho;
+
 /// The executable of the last full link, which is read on a thread of its own while the
 /// daemon waits for the next edit.
 pub(crate) struct Linked(JoinHandle<anyhow::Result<Baseline>>);
@@ -60,7 +62,7 @@ impl Linked {
 /// An executable as the linker wrote it, and what the last splice changed of it.
 pub(crate) struct Baseline {
     path: PathBuf,
-    image: Image,
+    image: Executable,
     /// The functions of the patch the executable was linked with. A patch without one of
     /// them means the function is as it first was again, which the executable no longer has.
     baked: Vec<Box<[u8]>>,
@@ -68,6 +70,12 @@ pub(crate) struct Baseline {
     undo: Vec<(u64, Vec<u8>)>,
     /// What the file was when we last left it: someone else may have written it since.
     stamp: Stamp,
+}
+
+/// An executable by the format it is in, which is what its splice depends on.
+enum Executable {
+    Elf(Image),
+    MachO(macho::Image),
 }
 
 /// What a splice did, for the log.
@@ -83,8 +91,11 @@ impl Baseline {
         // SAFETY: the daemon is the one that has the link write the file, and it does not
         // start another while this reads.
         let bytes = unsafe { memmap2::Mmap::map(&file)? };
-        let image = Image::read(&bytes)?;
-        let patch = ElfFile64::<Endianness>::parse(patch)?;
+        let image = match object::FileKind::parse(&*bytes)? {
+            object::FileKind::MachO64 => Executable::MachO(macho::Image::read(&bytes)?),
+            _ => Executable::Elf(Image::read(&bytes)?),
+        };
+        let patch = object::File::parse(patch)?;
         let baked = patch
             .symbols()
             .filter(|it| it.is_definition() && !it.is_local())
@@ -100,20 +111,27 @@ impl Baseline {
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
     pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {
-        let patch = Patch::read(patch, &self.image)?;
+        let image = match &self.image {
+            Executable::Elf(image) => image,
+            Executable::MachO(image) => {
+                let Baseline { path, baked, undo, stamp, .. } = self;
+                return macho::splice(image, path, baked, undo, stamp, patch);
+            }
+        };
+        let patch = Patch::read(patch, image)?;
         let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
         ensure!(
             self.baked.iter().all(|it| defined.contains(&**it)),
             "a function the executable was linked with a patch of is as it first was"
         );
-        let addition = patch.place(&self.image)?;
+        let addition = patch.place(image)?;
 
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         ensure!(Stamp::of(&file)? == self.stamp, "the executable was written by someone else");
         for (offset, bytes) in self.undo.drain(..).rev() {
             file.write_all_at(&bytes, offset)?;
         }
-        file.set_len(self.image.len)?;
+        file.set_len(image.len)?;
         file.write_all_at(&addition.appended, addition.offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];

@@ -29,5 +29,6 @@ def ahead(link, objects, rustd):
     copies = subprocess.check_output([rustd, "weaken", *(link[i] for i in theirs)], text=True).splitlines()
     for i, copy in zip(theirs, copies):
         link[i] = copy
-    link[first:first] = objects
+    # A splice adds two segments to the header, which the linker leaves no room for.
+    link[first:first] = [*objects, "-Wl,-headerpad,0x200"]
     return link
