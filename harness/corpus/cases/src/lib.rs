@@ -5660,3 +5660,38 @@ pub mod static_in_defaulted_impl {
         )
     }
 }
+
+/// A `#[track_caller]` method called through a vtable reports where it is declared.
+pub mod track_caller_in_vtable {
+    pub trait Here {
+        fn here(&self, by: u32) -> (u32, u32, u32);
+        #[track_caller]
+        fn provided(&self) -> u32 {
+            std::panic::Location::caller().line()
+        }
+    }
+
+    pub struct Tracked(u32);
+    pub struct Plain(u32);
+
+    impl Here for Tracked {
+        #[track_caller]
+        fn here(&self, by: u32) -> (u32, u32, u32) {
+            let caller = std::panic::Location::caller();
+            (self.0 * by, caller.line(), caller.column())
+        }
+    }
+
+    impl Here for Plain {
+        fn here(&self, by: u32) -> (u32, u32, u32) {
+            let caller = std::panic::Location::caller();
+            (self.0 + by, caller.line(), caller.column())
+        }
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let all: [&dyn Here; 2] = [&Tracked(3), &Plain(4)];
+        let through: Vec<_> = all.iter().map(|it| (it.here(5), it.provided())).collect();
+        (through, Tracked(6).here(7), Tracked(1).provided())
+    }
+}

@@ -6505,6 +6505,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
         let mut values = vec![(thin, thin_ty)];
         values.extend_from_slice(rest);
+        if track_caller(self.cg.db, func) {
+            let location = self.caller_location()?;
+            let slot = self.scratch();
+            self.builder.ins().store(MEM, location, slot, 0);
+            values.push((slot, thin_ty));
+        }
         self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust), &values, dst, dst_ty)
     }
 
@@ -6731,11 +6737,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !thin {
             unsupported!("vtable method taking `self` by value");
         }
-        if track_caller(db, callee) {
-            // FIXME: rustc puts a shim in the vtable that supplies the location.
-            unsupported!("`#[track_caller]` method in a vtable");
+        // A method declared `#[track_caller]` in the trait is given a location by the call. One
+        // that is so only in the impl is called without, and the shim supplies it.
+        if track_caller(db, callee) && !track_caller(db, func) {
+            let def = CallableDefId::FunctionId(callee).into();
+            return self.reified(Ty::new_fn_def(interner, def, callee_args), false);
         }
-        let sig = self.body_signature(body)?;
+        let mut sig = self.body_signature(body)?;
+        if track_caller(db, callee) {
+            sig.params.push(AbiParam::new(PTR));
+        }
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
 
