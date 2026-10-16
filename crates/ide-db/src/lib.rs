@@ -132,6 +132,26 @@ impl RootDatabase {
         self.files.included_sources()
     }
 
+    /// See [`base_db::Files::set_view`].
+    pub fn set_view(
+        &self,
+        base: &std::path::Path,
+        over: &std::path::Path,
+        built: Vec<std::path::PathBuf>,
+    ) {
+        self.files.set_view(base, over, built);
+    }
+
+    /// See [`base_db::Files::on_disk`].
+    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        self.files.on_disk(path)
+    }
+
+    /// Whether such a file is on disk what was read of it.
+    pub fn included_is_read(&self, path: &vfs::AbsPath) -> bool {
+        self.files.included_is_read(self, path)
+    }
+
     /// Reads such a file again, after it changed on disk.
     pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);

@@ -38,6 +38,10 @@ STEPS = [
 ]
 
 
+# With `--overlay` the others are not loaded at all: each is read as the first with other files.
+OVERLAY = "--overlay" in sys.argv
+
+
 def main():
     work = tempfile.mkdtemp(prefix="rustd-worktrees-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -46,8 +50,10 @@ def main():
     for at in range(COUNT):
         ws = os.path.join(work, f"checkout{at}")
         shutil.copytree(os.path.join(HERE, "stress"), ws, ignore=shutil.ignore_patterns("target"))
-        fx = Fixture(ws, crates, ["-p", "sapp"])
-        fx.rustc_build()
+        # A checkout read as the first one links what rustc built of the first.
+        if not (OVERLAY and checkouts):
+            fx = Fixture(ws, crates, ["-p", "sapp"])
+            fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
         first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
@@ -61,8 +67,8 @@ def main():
     daemon = subprocess.Popen(
         [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
-         *[x for other in checkouts[1:] if "--join" not in sys.argv for x in ("--also", other["ws"])]],
-        stderr=out, stdout=out)
+         *[x for other in checkouts[1:] if "--join" not in sys.argv and not OVERLAY for x in ("--also", other["ws"])]],
+        stderr=out, stdout=out, env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {})})
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")

@@ -56,6 +56,15 @@ impl Tree {
         }
     }
 
+    /// Has the directories under `base` listed again: they are read from somewhere else now.
+    pub(crate) fn relist(&mut self, base: &Path) {
+        for (path, dir) in &mut self.directories {
+            if path.starts_with(base) {
+                dir.listed = None;
+            }
+        }
+    }
+
     pub(crate) fn vfs(&mut self) -> &mut Vfs {
         &mut self.vfs
     }
@@ -67,7 +76,7 @@ impl Tree {
             .directories
             .iter()
             .filter(|(path, dir)| {
-                let now = std::fs::metadata(path).and_then(|it| it.modified()).ok();
+                let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
                 now.is_some() && now != dir.listed
             })
             .map(|(path, _)| path.clone())
@@ -77,18 +86,20 @@ impl Tree {
         while let Some(path) = stale.pop() {
             let Some(dir) = self.directories.get_mut(&path) else { continue };
             let root = dir.root;
-            dir.listed = std::fs::metadata(&path).and_then(|it| it.modified()).ok();
-            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            let on_disk = db.on_disk(&path);
+            dir.listed = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
+            let Ok(entries) = std::fs::read_dir(&on_disk) else { continue };
             // A package's directory holds much that is not source: only the directories
             // with source right in them are looked into there.
-            let package = path.join("Cargo.toml").exists();
+            let package = on_disk.join("Cargo.toml").exists();
             for entry in entries.flatten() {
-                let entry_path = entry.path();
+                let (entry_on_disk, entry_path) = (entry.path(), path.join(entry.file_name()));
                 let Ok(kind) = entry.file_type() else { continue };
                 let hidden = entry.file_name().to_str().is_none_or(|it| it.starts_with('.'));
                 if kind.is_dir() {
                     let source = !hidden
-                        && (!package || entry.file_name() != "target" && holds_source(&entry_path));
+                        && (!package
+                            || entry.file_name() != "target" && holds_source(&entry_on_disk));
                     if source && !self.directories.contains_key(&entry_path) {
                         self.directories
                             .insert(entry_path.clone(), Directory { root, listed: None });
@@ -143,7 +154,7 @@ impl Tree {
             {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(db.on_disk(path.as_ref())) else { continue };
             self.vfs.set_file_contents(vfs_path.clone(), Some(text.clone().into_bytes()));
             let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
             let durability =

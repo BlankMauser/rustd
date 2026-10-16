@@ -711,6 +711,37 @@ impl Checkouts {
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
     }
 
+    /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
+    /// place in a loaded checkout with the files of its own when `overlay` allows that and
+    /// the two lock the same dependencies. `None` when its checkout has to be loaded.
+    fn view_of(&self, project: &Path, overlay: bool) -> Option<View> {
+        let project = std::fs::canonicalize(project).ok()?;
+        if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
+            return Some(View { base: root.clone(), over: root.clone(), project });
+        }
+        if !overlay {
+            return None;
+        }
+        self.roots.iter().find_map(|(loaded, base)| {
+            let inside = loaded.strip_prefix(base).ok()?;
+            let mut over = project.clone();
+            for part in inside.components().rev() {
+                if over.file_name() != Some(part.as_os_str()) {
+                    return None;
+                }
+                over.pop();
+            }
+            // FIXME: a manifest that differs with the lock file the same (a feature turned on,
+            // a new member) is not noticed.
+            let lock = |root: &Path| std::fs::read(root.join("Cargo.lock")).ok();
+            (lock(&over)? == lock(base)?).then(|| View {
+                base: base.clone(),
+                over,
+                project: loaded.clone(),
+            })
+        })
+    }
+
     /// Loads the checkouts of `projects` into `db`, next to those there are.
     fn add(
         &mut self,
@@ -740,6 +771,16 @@ impl Checkouts {
         self.roots.extend(roots);
         Ok(())
     }
+}
+
+/// A checkout as the daemon looks at it.
+struct View {
+    /// The loaded checkout it is built as.
+    base: PathBuf,
+    /// Where its files are read from: `base`, or a checkout that is `base` with other contents.
+    over: PathBuf,
+    /// The project asked for, in `base`.
+    project: PathBuf,
 }
 
 fn workspace_at(
@@ -1216,6 +1257,27 @@ fn link(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The directories of the checkout at `base` that builds write to. They are not part of the
+/// checkout: another checkout read in its place has the same ones.
+fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
+    let crates = ide_db::base_db::all_crates(db);
+    let scripts = crates.iter().filter_map(|krate| {
+        let out = krate.env(db).get("OUT_DIR")?;
+        let below = Path::new(&out).strip_prefix(base).ok()?.components().next()?;
+        Some(base.join(below))
+    });
+    // Cargo tags the directories it builds in.
+    let tagged = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .filter_map(|it| Some(it.ok()?.path()))
+        .filter(|it| it.join("CACHEDIR.TAG").exists());
+    let mut built: Vec<PathBuf> = scripts.chain(tagged).collect();
+    built.sort_unstable();
+    built.dedup();
+    built
+}
+
 /// Why the source as it is can't be built by the daemon, when it can't.
 fn refusal(
     db: &RootDatabase,
@@ -1327,7 +1389,8 @@ struct WatchedFile {
 }
 
 impl WatchedFile {
-    fn new(file: Watched, path: &Path) -> Option<WatchedFile> {
+    /// `path` is what the file is known as, `on_disk` where it is read from.
+    fn new(file: Watched, path: &Path, on_disk: &Path) -> Option<WatchedFile> {
         // Everything but the sysroot and the registry: path dependencies live outside the project.
         let immutable = path
             .components()
@@ -1335,14 +1398,15 @@ impl WatchedFile {
         if immutable {
             return None;
         }
-        let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+        let mtime = std::fs::metadata(on_disk).ok()?.modified().ok()?;
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
     fn sources(vfs: &Vfs) -> Vec<WatchedFile> {
         vfs.iter()
             .filter_map(|(id, path)| {
-                WatchedFile::new(Watched::Source(id), path.as_path()?.as_ref())
+                let path: &Path = path.as_path()?.as_ref();
+                WatchedFile::new(Watched::Source(id), path, path)
             })
             .collect()
     }
@@ -1356,7 +1420,7 @@ impl WatchedFile {
     ) -> bool {
         let added = tree.included(db);
         for (file, path) in &added {
-            files.extend(WatchedFile::new(Watched::Source(*file), path));
+            files.extend(WatchedFile::new(Watched::Source(*file), path, &db.on_disk(path)));
         }
         !added.is_empty()
     }
@@ -1373,7 +1437,10 @@ impl WatchedFile {
             .collect();
         let mut changed = false;
         for path in new {
-            if let Some(file) = WatchedFile::new(Watched::Included(path.clone()), path.as_ref()) {
+            let on_disk = db.on_disk(path.as_ref());
+            if let Some(file) =
+                WatchedFile::new(Watched::Included(path.clone()), path.as_ref(), &on_disk)
+            {
                 files.push(file);
                 changed |= db.reload_included_file(&path);
             }
@@ -1586,6 +1653,29 @@ struct Program {
     table: SymbolTable,
     known: Rejections,
     unbuilt: Unbuilt,
+    /// The object the last build was asked for.
+    wrote: Option<PathBuf>,
+    /// The object with all of the program, which a patch is the difference from.
+    whole: Option<PathBuf>,
+}
+
+/// Where a build of a program goes. A checkout looked at as another has files of its own for
+/// the program they share.
+#[derive(Clone, PartialEq)]
+struct Outputs {
+    out: PathBuf,
+    patch: Option<PathBuf>,
+    link_cmd: Option<String>,
+}
+
+impl Outputs {
+    fn of(args: &Args) -> Outputs {
+        Outputs {
+            out: args.out.clone(),
+            patch: args.patch.clone(),
+            link_cmd: args.link_cmd.clone(),
+        }
+    }
 }
 
 /// What a program's objects are behind by.
@@ -1815,7 +1905,14 @@ fn main() -> anyhow::Result<()> {
         requests
     });
     // The first is the program asked for when a request names none.
-    let mut programs = vec![Program { args, table, known, unbuilt: Unbuilt::default() }];
+    let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
+    let mut programs =
+        vec![Program { args, table, known, unbuilt: Unbuilt::default(), wrote, whole }];
+    let overlay = std::env::var_os("RUSTD_OVERLAY").is_some();
+    // The checkout each loaded one is read from, when that is not itself.
+    let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
+    // Requests that could not be built with the ones before them.
+    let mut waiting = std::collections::VecDeque::new();
     loop {
         if WatchedFile::watch_included(&mut files, &mut db)
             | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
@@ -1824,26 +1921,80 @@ fn main() -> anyhow::Result<()> {
         }
         // The program each client asks for.
         let mut clients: Vec<(usize, Request, UnixStream)> = Vec::new();
+        // Where each of those programs is to be written.
+        let mut outputs: FxHashMap<usize, Outputs> = FxHashMap::default();
+        // The checkout each loaded one has to be read from for them.
+        let mut looked: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
         match &requests {
             Some(requests) => {
-                let mut next = Some(requests.recv()?);
+                let mut later = Vec::new();
+                let mut next = match waiting.pop_front() {
+                    Some(request) => Some(request),
+                    None => Some(requests.recv()?),
+                };
                 // Asked again after each: a checkout that joins takes long enough for the
                 // requests sent with its own to arrive.
-                while let Some((request, target, stream)) =
-                    next.take().or_else(|| requests.try_recv().ok())
+                while let Some((request, mut target, stream)) =
+                    next.take().or_else(|| waiting.pop_front()).or_else(|| requests.try_recv().ok())
                 {
-                    let known = match &target {
-                        Some(target) => programs.iter().position(|it| target.is(&it.args)),
-                        None => Some(0),
+                    let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
+                        Some(project) => checkouts.view_of(project, overlay),
+                        None => {
+                            let base = programs[0].args.checkout.clone();
+                            let project = programs[0].args.project.clone();
+                            Some(View { over: base.clone(), base, project })
+                        }
+                    };
+                    // One build reads a checkout from one place.
+                    if let Some(view) = &view
+                        && looked.get(&view.base).is_some_and(|over| *over != view.over)
+                    {
+                        later.push((request, target, stream));
+                        continue;
+                    }
+                    if let (Some(view), Some(target)) = (&view, &mut target)
+                        && target.project.is_some()
+                    {
+                        target.project = Some(view.project.clone());
+                    }
+                    let shared = view.as_ref().is_some_and(|view| {
+                        view.base != view.over || viewed.contains_key(&view.base)
+                    });
+                    let known = match (&target, &view) {
+                        (Some(target), _) if programs.iter().any(|it| target.is(&it.args)) => {
+                            programs.iter().position(|it| target.is(&it.args))
+                        }
+                        // The checkouts read as one share its programs.
+                        (Some(target), Some(view)) if shared => programs.iter().position(|it| {
+                            it.args.krate == target.krate && it.args.checkout == view.base
+                        }),
+                        (Some(_), _) => None,
+                        (None, _) => Some(0),
+                    };
+                    let wanted = match &target {
+                        Some(target) => Outputs {
+                            out: target.out.clone(),
+                            patch: target.patch.clone(),
+                            link_cmd: target.link_cmd.clone(),
+                        },
+                        None => Outputs::of(&programs[0].args),
                     };
                     if let Some(at) = known {
+                        if outputs.get(&at).is_some_and(|it| *it != wanted) {
+                            later.push((request, target, stream));
+                            continue;
+                        }
+                        outputs.insert(at, wanted);
+                        if let Some(view) = view {
+                            looked.insert(view.base, view.over);
+                        }
                         clients.push((at, request, stream));
                         continue;
                     }
                     let Some(target) = target else { continue };
                     // A checkout the daemon has not seen joins the ones it has.
                     let joined = match &target.project {
-                        Some(project) if checkouts.root_of(project).is_err() => {
+                        Some(project) if view.is_none() => {
                             let start = Instant::now();
                             let joined =
                                 join(project, &mut checkouts, &mut db, &mut tree, &mut files);
@@ -1852,6 +2003,9 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => Ok(()),
                     };
+                    if let Some(view) = view {
+                        looked.insert(view.base, view.over);
+                    }
                     let mut known = Rejections::default();
                     known.patching = target.patch.is_some();
                     let loaded = joined
@@ -1867,7 +2021,15 @@ fn main() -> anyhow::Result<()> {
                             let unbuilt =
                                 Unbuilt { edited: programs[0].unbuilt.edited.clone(), stale: true };
                             clients.push((programs.len(), request, stream));
-                            programs.push(Program { args, table, known, unbuilt });
+                            outputs.insert(programs.len(), wanted);
+                            programs.push(Program {
+                                args,
+                                table,
+                                known,
+                                unbuilt,
+                                wrote: None,
+                                whole: None,
+                            });
                         }
                         // A request for what can't be built is the client's mistake.
                         Err(e) => {
@@ -1875,11 +2037,32 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                waiting.extend(later);
                 if clients.is_empty() {
                     continue;
                 }
             }
             None => std::thread::sleep(Duration::from_millis(5)),
+        }
+        // The checkouts that are read from somewhere else than for the last build. Their files
+        // have the times of another checkout, so they are compared by what is in them.
+        let mut switched = Vec::new();
+        for (base, over) in looked {
+            if *viewed.get(&base).unwrap_or(&base) != over {
+                eprintln!("view: {} as {}", over.display(), base.display());
+                db.set_view(&base, &over, built_in(&db, &base));
+                tree.relist(&base);
+                if base == over {
+                    viewed.remove(&base);
+                } else {
+                    viewed.insert(base.clone(), over);
+                }
+                switched.push(base);
+            }
+        }
+        for (&at, wanted) in &outputs {
+            let program = &mut programs[at];
+            program.unbuilt.stale |= program.wrote.as_ref() != Some(&wanted.out);
         }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -1900,7 +2083,8 @@ fn main() -> anyhow::Result<()> {
             }
             let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
-                let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
+                let on_disk = db.on_disk(&file.path);
+                let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
                     if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
                         touched.remove(&index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
@@ -1908,12 +2092,24 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 };
                 gone.remove(&index);
-                if now != file.mtime {
+                if switched.iter().any(|base| file.path.starts_with(base)) {
+                    file.mtime = now;
+                    let same = match file.file {
+                        Watched::Source(id) => std::fs::read_to_string(&on_disk)
+                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
+                        Watched::Included(ref path) => db.included_is_read(path),
+                    };
+                    if !same {
+                        touched.insert(index);
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                    }
+                } else if now != file.mtime {
                     file.mtime = now;
                     touched.insert(index);
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
+            switched.clear();
             if touched.len() + gone.len() == before || !clients.is_empty() {
                 break;
             }
@@ -1955,7 +2151,7 @@ fn main() -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(std::fs::read_to_string(path)?));
+                    change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),
@@ -2024,8 +2220,9 @@ fn main() -> anyhow::Result<()> {
                         let link = !clients.iter().any(|it| it.0 == at)
                             || clients.iter().any(|it| it.0 == at && it.1 != Request::Patch);
                         let (db, listed, paths, edit) = (db.clone(), &listed, &paths, &edit);
-                        let build =
-                            scope.spawn(move || program.sync(&db, listed, paths, edit, link));
+                        let wanted = outputs.get(&at);
+                        let build = scope
+                            .spawn(move || program.sync(&db, listed, paths, edit, wanted, link));
                         (at, build)
                     })
                     .collect();
@@ -2083,9 +2280,24 @@ impl Program {
         listed: &Listed,
         paths: &FxHashMap<vfs::FileId, PathBuf>,
         edit: &Edit,
+        wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
-        let Program { args, table, known, unbuilt } = self;
+        let Program { args, table, known, unbuilt, wrote, whole } = self;
+        let Outputs { out, patch, link_cmd } = wanted.cloned().unwrap_or_else(|| Outputs::of(args));
+        let args = &Args { out, patch, link_cmd, ..args.clone() };
+        // A patch is for the object with all of the program, which this build may be the
+        // first to be asked for at this place.
+        if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
+            use std::os::unix::fs::MetadataExt;
+            let inode = |path: &Path| std::fs::metadata(path).ok().map(|it| (it.dev(), it.ino()));
+            if inode(whole) != inode(&args.out) {
+                _ = std::fs::remove_file(&args.out);
+                if std::fs::hard_link(whole, &args.out).is_err() {
+                    std::fs::copy(whole, &args.out)?;
+                }
+            }
+        }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
@@ -2100,6 +2312,10 @@ impl Program {
             (warm, check.join().ok().flatten())
         });
         let warm = warm?;
+        if known.stats.patched.is_none() {
+            *whole = Some(args.out.clone());
+        }
+        *wrote = Some(args.out.clone());
         let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);

@@ -79,6 +79,16 @@ pub struct Files {
     /// Files an `include!` named that are not in the VFS, with the source root of the file
     /// that includes them.
     included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
+    /// Directories whose files are read from another directory: a checkout that is looked at
+    /// as the one it was loaded as with other contents.
+    views: Arc<std::sync::RwLock<Vec<View>>>,
+}
+
+#[derive(Debug)]
+struct View {
+    base: std::path::PathBuf,
+    over: std::path::PathBuf,
+    built: Vec<std::path::PathBuf>,
 }
 
 impl Files {
@@ -122,6 +132,33 @@ impl Files {
         };
     }
 
+    /// Has the files under `base` read from where they are under `over` from now on, but for
+    /// those under one of `built`: what a build writes is not part of a checkout. Nothing is
+    /// read again for it: whoever watches the disk does that.
+    pub fn set_view(
+        &self,
+        base: &std::path::Path,
+        over: &std::path::Path,
+        built: Vec<std::path::PathBuf>,
+    ) {
+        let mut views = self.views.write().unwrap_or_else(|it| it.into_inner());
+        views.retain(|it| it.base != base);
+        if base != over {
+            let (base, over) = (base.to_owned(), over.to_owned());
+            views.push(View { base, over, built });
+        }
+    }
+
+    /// Where the file known as `path` is read from.
+    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        let views = self.views.read().unwrap_or_else(|it| it.into_inner());
+        let over = views
+            .iter()
+            .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
+            .find_map(|it| Some(it.over.join(path.strip_prefix(&it.base).ok()?)));
+        over.unwrap_or_else(|| path.to_owned())
+    }
+
     /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
     /// first time it is asked for. Whoever watches the disk keeps it current with
     /// [`Files::reload_included_file`].
@@ -132,8 +169,12 @@ impl Files {
         durability: Durability,
     ) -> IncludedFile {
         *self.included.entry(path.to_path_buf()).or_insert_with(|| {
-            IncludedFile::builder(read_included(path)).durability(durability).new(db)
+            IncludedFile::builder(self.read_included(path)).durability(durability).new(db)
         })
+    }
+
+    fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
+        std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
     }
 
     /// Notes a file an `include!` names that the VFS has not: whoever owns the VFS puts it
@@ -150,10 +191,16 @@ impl Files {
         self.included.iter().map(|it| it.key().clone()).collect()
     }
 
+    /// Whether the file on disk is what was read of it.
+    pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
+        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
+        *file.bytes(db) == self.read_included(path)
+    }
+
     /// Reads the file again, and says whether it changed.
     pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
         let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        let bytes = read_included(path);
+        let bytes = self.read_included(path);
         let changed = *file.bytes(db) != bytes;
         if changed {
             file.set_bytes(db).to(bytes);
@@ -270,10 +317,6 @@ pub struct FileText {
 pub struct IncludedFile {
     #[returns(ref)]
     pub bytes: Option<std::sync::Arc<[u8]>>,
-}
-
-fn read_included(path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
-    std::fs::read(path).ok().map(Into::into)
 }
 
 #[salsa::input(debug)]
