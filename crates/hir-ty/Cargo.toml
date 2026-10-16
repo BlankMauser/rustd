@@ -65,8 +65,12 @@ crc32fast = "1"
 memmap2 = "0.9"
 cranelift-object = "0.136"
 object = { version = "0.37", default-features = false, features = ["read", "std", "elf", "macho"] }
+wasm-encoder = { version = "0.244", default-features = false, features = ["std"], optional = true }
 
 [features]
+# rustd in a browser: functions are lowered to WebAssembly instead of machine code, see
+# `mir/codegen/wasm.rs`. The x86-64 backend stays in for what the IR is built against.
+wasm = ["dep:wasm-encoder", "cranelift-codegen/x86"]
 in-rust-tree = ["hir-expand/in-rust-tree"]
 
 [lints]

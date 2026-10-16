@@ -68,7 +68,9 @@ use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
     Requests,
 };
-use self::unwind::{FunctionUnwind, UnwindContext};
+#[cfg(not(feature = "wasm"))]
+use self::unwind::FunctionUnwind;
+use self::unwind::UnwindContext;
 use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
@@ -91,6 +93,8 @@ pub use store::{pack_name, seal_left_open};
 mod type_id;
 mod unwind;
 mod vtable;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodegenError {
@@ -392,8 +396,10 @@ impl CodegenUnit {
                     match result {
                         Ok(symbol) => compiled.push((root, symbol)),
                         Err(e) => {
-                            // rustc's copy calls what ours would have.
-                            if !on_demand.is_empty()
+                            // rustc's copy calls what ours would have. There is no such
+                            // copy of a program compiled to WebAssembly.
+                            if cfg!(not(feature = "wasm"))
+                                && !on_demand.is_empty()
                                 && !matches!(e, CodegenError::NoSymbol)
                                 && !cg.want_reachable_from(root)
                             {
@@ -417,7 +423,7 @@ impl CodegenUnit {
                 rejected.extend(failed);
                 continue;
             }
-            let fallback_start = std::time::Instant::now();
+            let fallback_start = stdx::time::Instant::now();
             let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
             // A function left to rustc keeps using rustc's copy of a private static, so we
             // can't bring our own.
@@ -500,7 +506,7 @@ impl CodegenUnit {
                         .and_then(|mut file| std::io::Write::write_all(&mut file, lines.as_bytes()))
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
-                let start = std::time::Instant::now();
+                let start = stdx::time::Instant::now();
                 let object = cg.finish()?;
                 stats.phases.object = start.elapsed();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
@@ -1545,6 +1551,7 @@ fn build<'db>(
 
 /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
 /// (i128 corners, for one); that must cost us one function, not the process.
+#[cfg(not(feature = "wasm"))]
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     let large = ctx.func.dfg.num_insts() > LARGE;
     let isa = &**if large { target_for_large()? } else { target()? };
@@ -1586,6 +1593,18 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
             Err(CodegenError::Backend(format!("backend panic: {message}")))
         }
     }
+}
+
+/// Lowers a finished function to WebAssembly. The bytes are a [`wasm::WasmFunction`], which
+/// goes through the object like machine code and is made a module of by a linker.
+#[cfg(feature = "wasm")]
+fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    let (function, mut relocs) = wasm::lower(&ctx.func).map_err(CodegenError::Unsupported)?;
+    let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
+    for reloc in &mut relocs {
+        reloc.offset += body;
+    }
+    Ok(Code { signature: ctx.func.signature.clone(), bytes, align: 1, relocs, unwind: None })
 }
 
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
@@ -1747,7 +1766,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let Some(symbol) = self.symbols.function(func) else {
             return Err(CodegenError::NoSymbol);
         };
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let compiled = compiled_root(db, func);
         let took = start.elapsed();
         self.phases.compile += took;
@@ -1770,13 +1789,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
     fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         self.compile_ahead();
         self.phases.compile += start.elapsed();
         while !self.pending.is_empty() || !self.found_pending.is_empty() {
             // Each wave is compiled on every core, and then put in the object one by one.
             let wave = std::mem::take(&mut self.pending);
-            let start = std::time::Instant::now();
+            let start = stdx::time::Instant::now();
             self.symbols.in_parallel(wave.len(), &|db, _, at| {
                 let (instance, env, _) = &wave[at];
                 _ = compiled_instance(db, instance.clone(), env.clone());
@@ -1791,7 +1810,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
             }
-            let start = std::time::Instant::now();
+            let start = stdx::time::Instant::now();
             while let Some((name, id)) = self.found_pending.pop() {
                 if let Err(e) = self.stitch_entry(&name, id) {
                     eprintln!("entry of `{name}` does not fit: {e}");
@@ -1903,7 +1922,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: &StoredParamEnvAndCrate,
         id: FuncId,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let compiled = compiled_instance(self.db, instance.clone(), env.clone());
         let took = start.elapsed();
         self.phases.compile += took;
@@ -2194,11 +2213,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Defines `id` as a compiled function, and declares everything the function refers to.
     fn stitch(&mut self, id: FuncId, compiled: &CompiledFunction) -> Result<Resolved> {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let ids = self.resolve(&compiled.requests);
         self.phases.resolve += start.elapsed();
         let ids = ids?;
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let relocs: Vec<_> = compiled.code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.shape_code(id, &compiled.code, &relocs);
         self.define_code(id, &compiled.code, &relocs)?;
@@ -2454,7 +2473,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // value is: what the value points to may point back at the static.
         let thread_local = is_thread_local(db, id);
         let data = if self.patching || thread_local {
-            let name = format!("rustd::static::{}", self.location_counter);
+            // Nothing else defines the statics of a program compiled to WebAssembly, and
+            // under its own name a static is the same one after a build in full.
+            let own = if cfg!(feature = "wasm") { self.symbols.static_(id) } else { None };
+            let name = own.unwrap_or_else(|| format!("rustd::static::{}", self.location_counter));
             self.location_counter += 1;
             let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
             self.module.declare_data(&name, linkage, compiled.writable, thread_local)?

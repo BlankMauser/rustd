@@ -572,7 +572,7 @@ impl Base {
         if !changed && !check_all {
             return;
         }
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let now = probe(|| TheirStatics::walk(db, left_to_rustc(&self.skipped)));
         match now {
             Some((now, walked)) if now == self.their_statics => {
@@ -590,7 +590,7 @@ impl Base {
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
         let every = |len: usize| (part..len).step_by(parts);
         // A check of the skipping below: looks at what no edit can have changed too, and says
@@ -611,7 +611,7 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
-            let asked = std::time::Instant::now();
+            let asked = stdx::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
                 Some(Mark::new(db, root_serial(db, root), &compiled.requests))
@@ -637,7 +637,7 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
-            let asked = std::time::Instant::now();
+            let asked = stdx::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| {
@@ -808,7 +808,7 @@ impl Base {
         own_statics: OwnStatics,
         stale: Vec<Stale>,
     ) -> Result<std::result::Result<Patch, &'static str>> {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         if roots.entries != self.entries {
             return Ok(Err("the roots compiled whether called or not changed"));
         }
@@ -909,7 +909,7 @@ impl Base {
             }
         }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let object = cg.finish()?;
         phases.object = start.elapsed();
         Ok(Ok(Patch { object, bodies, phases }))

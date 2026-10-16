@@ -1,0 +1,33 @@
+[package]
+name = "rustd-wasm"
+version = "0.0.0"
+description = "Spike: rustd's compiler as a library that emits WebAssembly, to run in a browser"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# A workspace of its own: the `wasm` feature of `hir-ty` swaps what the code generator
+# emits, and in the main workspace cargo would turn it on for native `rustd` as well.
+[workspace]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+object = { version = "0.37", default-features = false, features = ["read", "std", "elf"] }
+rustc-hash = "2.1.1"
+wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
+triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
+
+hir = { path = "../hir", version = "0.0.0" }
+hir-def = { path = "../hir-def", version = "0.0.0" }
+hir-ty = { path = "../hir-ty", version = "0.0.0", features = ["wasm"] }
+ide-db = { path = "../ide-db", version = "0.0.0" }
+vfs = { path = "../vfs", version = "0.0.0" }
+cfg = { path = "../cfg", version = "0.0.0", features = ["tt", "syntax"] }
+intern = { path = "../intern", version = "0.0.0" }
+span = { path = "../span", version = "0.0.0" }
+stdx = { path = "../stdx", version = "0.0.0" }
+
+[profile.release]
+debug = 0
