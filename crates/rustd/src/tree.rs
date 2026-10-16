@@ -38,7 +38,13 @@ pub(crate) struct Moved {
 
 impl Tree {
     pub(crate) fn new(db: &RootDatabase, vfs: Vfs, watched: &[(FileId, &Path)]) -> Tree {
-        let mut directories = FxHashMap::default();
+        let mut tree = Tree { vfs, directories: FxHashMap::default() };
+        tree.watch(db, watched);
+        tree
+    }
+
+    /// Looks for new files next to `watched` too.
+    pub(crate) fn watch(&mut self, db: &RootDatabase, watched: &[(FileId, &Path)]) {
         for &(file, path) in watched {
             let root = db.file_source_root(file).source_root_id(db);
             if db.source_root(root).source_root(db).is_library {
@@ -46,9 +52,12 @@ impl Tree {
             }
             let Some(parent) = path.parent() else { continue };
             let listed = std::fs::metadata(parent).and_then(|it| it.modified()).ok();
-            directories.entry(parent.to_owned()).or_insert(Directory { root, listed });
+            self.directories.entry(parent.to_owned()).or_insert(Directory { root, listed });
         }
-        Tree { vfs, directories }
+    }
+
+    pub(crate) fn vfs(&mut self) -> &mut Vfs {
+        &mut self.vfs
     }
 
     /// The source files that are new since the last look. Each is in its source root once

@@ -31,7 +31,7 @@ use hir_ty::mir::codegen::{
     CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspaces_into_db};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
     RustLibSource, TargetDirectoryConfig,
@@ -681,38 +681,27 @@ fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
 fn load(
     projects: &[&Path],
     cargo_config: &CargoConfig,
-    load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts, impl Sized + use<>)> {
-    // The checkouts after the first run their build scripts where the first did. A dependency
-    // is then told the same `OUT_DIR` in each, which it has to be to be one crate for all.
-    let mut cargo_config = cargo_config.clone();
-    let mut workspaces = Vec::new();
-    for project in projects {
-        let workspace = workspace_at(project, &cargo_config, load_config)?;
-        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-            && cargo_config.target_dir_config == TargetDirectoryConfig::None
-        {
-            let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-            cargo_config.target_dir_config = TargetDirectoryConfig::Directory(target.to_owned());
-        }
-        workspaces.push(workspace);
-    }
-    let mut checkouts = Checkouts::default();
-    for (project, workspace) in projects.iter().zip(&workspaces) {
-        let root = PathBuf::from(workspace.workspace_root().to_string());
-        checkouts.roots.push((std::fs::canonicalize(project)?, root));
-    }
+    load_config: LoadCargoConfig,
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
+    let mut checkouts = Checkouts {
+        roots: Vec::new(),
+        loaded: load_cargo::Loaded::default(),
+        cargo_config: cargo_config.clone(),
+        load_config,
+    };
     let mut db = RootDatabase::new(None);
-    let (vfs, proc_macros) =
-        load_workspaces_into_db(workspaces, &cargo_config.extra_env, load_config, &mut db)?;
-    Ok((db, vfs, checkouts, proc_macros))
+    let mut vfs = vfs::Vfs::default();
+    checkouts.add(projects, &mut db, &mut vfs)?;
+    Ok((db, vfs, checkouts))
 }
 
 /// The checkouts the daemon has loaded.
-#[derive(Default)]
 struct Checkouts {
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
+    loaded: load_cargo::Loaded,
+    cargo_config: CargoConfig,
+    load_config: LoadCargoConfig,
 }
 
 impl Checkouts {
@@ -720,6 +709,36 @@ impl Checkouts {
         let project = std::fs::canonicalize(project)?;
         let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
+    }
+
+    /// Loads the checkouts of `projects` into `db`, next to those there are.
+    fn add(
+        &mut self,
+        projects: &[&Path],
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<()> {
+        let mut workspaces = Vec::new();
+        let mut roots = Vec::new();
+        for project in projects {
+            let workspace = workspace_at(project, &self.cargo_config, &self.load_config)?;
+            // The checkouts after the first run their build scripts where the first did. A
+            // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
+            // crate for all.
+            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
+                && self.cargo_config.target_dir_config == TargetDirectoryConfig::None
+            {
+                let target: &paths::Utf8Path = cargo.target_directory().as_ref();
+                self.cargo_config.target_dir_config =
+                    TargetDirectoryConfig::Directory(target.to_owned());
+            }
+            let root = PathBuf::from(workspace.workspace_root().to_string());
+            roots.push((std::fs::canonicalize(project)?, root));
+            workspaces.push(workspace);
+        }
+        self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.roots.extend(roots);
+        Ok(())
     }
 }
 
@@ -1600,6 +1619,39 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     Ok(())
 }
 
+/// Loads the checkout of `project` into the database of a daemon that is running, and
+/// watches its files.
+fn join(
+    project: &Path,
+    checkouts: &mut Checkouts,
+    db: &mut RootDatabase,
+    tree: &mut tree::Tree,
+    files: &mut Vec<WatchedFile>,
+) -> anyhow::Result<()> {
+    checkouts.add(&[project], db, tree.vfs())?;
+    let watched: FxHashSet<vfs::FileId> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some(id),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs())
+        .into_iter()
+        .filter(|it| !matches!(it.file, Watched::Source(id) if watched.contains(&id)))
+        .collect();
+    let sources: Vec<_> = new
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    tree.watch(db, &sources);
+    files.extend(new);
+    Ok(())
+}
+
 /// Waits for a build request on `listener`. The result is where to send the outcome.
 fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>, UnixStream)> {
     loop {
@@ -1669,7 +1721,7 @@ fn main() -> anyhow::Result<()> {
     };
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
-    let (mut db, vfs, checkouts, _proc_macro) = load(&projects, &cargo_config, &load_config)?;
+    let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config)?;
     args.checkout = checkouts.root_of(&args.project)?;
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
@@ -1779,10 +1831,33 @@ fn main() -> anyhow::Result<()> {
                             // checked when the programs before it were built.
                             let unbuilt = Unbuilt { edited: unbuilt.edited.clone(), stale: true };
                             // A request for what can't be built is the client's mistake.
-                            let loaded = target.args(&args, &checkouts).and_then(|args| {
-                                let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
-                                Ok((args, table))
-                            });
+                            // A checkout the daemon has not seen joins the ones it has.
+                            let joined = match &target.project {
+                                Some(project) if checkouts.root_of(project).is_err() => {
+                                    let start = Instant::now();
+                                    let joined = join(
+                                        project,
+                                        &mut checkouts,
+                                        &mut db,
+                                        &mut tree,
+                                        &mut files,
+                                    );
+                                    eprintln!(
+                                        "join {}: {:.1?}",
+                                        project.display(),
+                                        start.elapsed()
+                                    );
+                                    joined
+                                }
+                                _ => Ok(()),
+                            };
+                            let loaded = joined
+                                .and_then(|()| target.args(&args, &checkouts))
+                                .and_then(|args| {
+                                    let table =
+                                        SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                                    Ok((args, table))
+                                });
                             let (args, table) = match loaded {
                                 Ok(loaded) => loaded,
                                 Err(e) => {

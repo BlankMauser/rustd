@@ -5,6 +5,9 @@ The stress workspace is copied COUNT times. The daemon is started in the first c
 others as `--also`; each step edits files of some checkouts and asks for the program of some by
 `rustd sync SOCKET --project ...`. Every program asked for is run and compared with what
 `cargo build` of that checkout prints.
+
+With `--join` the daemon is started in the first copy alone, and the others join it when they
+are first asked for.
 """
 import os, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -58,7 +61,8 @@ def main():
     daemon = subprocess.Popen(
         [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
-         *[x for other in checkouts[1:] for x in ("--also", other["ws"])]], stderr=out, stdout=out)
+         *[x for other in checkouts[1:] if "--join" not in sys.argv for x in ("--also", other["ws"])]],
+        stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
