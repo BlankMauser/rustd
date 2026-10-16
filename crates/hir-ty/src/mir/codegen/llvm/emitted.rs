@@ -272,6 +272,8 @@ impl<'data> Emitted<'data> {
         Ok(Some(FunctionUnwind::from_rows(rows, landing_pads)))
     }
 
+    const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");
+
     fn rules<R: gimli::Reader>(
         mut instructions: gimli::CallFrameInstructionIter<'_, R>,
         cie: &gimli::CommonInformationEntry<R>,
@@ -280,10 +282,9 @@ impl<'data> Emitted<'data> {
         let scale = cie.data_alignment_factor();
         let factored =
             |offset: i64| offset.checked_mul(scale).and_then(|it| i32::try_from(it).ok());
-        let unknown = Unhandled::Shape("an unwind rule there is no answer for");
         let mut at = 0u32;
         let mut rules = Vec::new();
-        while let Some(instruction) = instructions.next().map_err(|_| unknown_rule())? {
+        while let Some(instruction) = instructions.next().map_err(|_| Self::UNKNOWN_RULE)? {
             let rule = match instruction {
                 Cfi::AdvanceLoc { delta } => {
                     at += delta * cie.code_alignment_factor() as u32;
@@ -292,36 +293,33 @@ impl<'data> Emitted<'data> {
                 Cfi::Nop => continue,
                 Cfi::DefCfa { register, offset } => FrameRule::Cfa(register.0, offset as i32),
                 Cfi::DefCfaSf { register, factored_offset } => {
-                    FrameRule::Cfa(register.0, factored(factored_offset).ok_or(unknown_rule())?)
+                    FrameRule::Cfa(register.0, factored(factored_offset).ok_or(Self::UNKNOWN_RULE)?)
                 }
                 Cfi::DefCfaRegister { register } => FrameRule::CfaRegister(register.0),
                 Cfi::DefCfaOffset { offset } => FrameRule::CfaOffset(offset as i32),
                 Cfi::DefCfaOffsetSf { factored_offset } => {
-                    FrameRule::CfaOffset(factored(factored_offset).ok_or(unknown_rule())?)
+                    FrameRule::CfaOffset(factored(factored_offset).ok_or(Self::UNKNOWN_RULE)?)
                 }
                 Cfi::Offset { register, factored_offset } => FrameRule::Offset(
                     register.0,
-                    factored(factored_offset as i64).ok_or(unknown_rule())?,
+                    factored(factored_offset as i64).ok_or(Self::UNKNOWN_RULE)?,
                 ),
-                Cfi::OffsetExtendedSf { register, factored_offset } => {
-                    FrameRule::Offset(register.0, factored(factored_offset).ok_or(unknown_rule())?)
-                }
+                Cfi::OffsetExtendedSf { register, factored_offset } => FrameRule::Offset(
+                    register.0,
+                    factored(factored_offset).ok_or(Self::UNKNOWN_RULE)?,
+                ),
                 Cfi::Restore { register } => FrameRule::Restore(register.0),
                 Cfi::SameValue { register } => FrameRule::SameValue(register.0),
                 Cfi::Undefined { register } => FrameRule::Undefined(register.0),
                 Cfi::RememberState => FrameRule::RememberState,
                 Cfi::RestoreState => FrameRule::RestoreState,
                 Cfi::ArgsSize { size } => FrameRule::ArgsSize(size as u32),
-                _ => return Err(unknown),
+                _ => return Err(Self::UNKNOWN_RULE),
             };
             rules.push((at, rule));
         }
         Ok(rules)
     }
-}
-
-fn unknown_rule() -> Unhandled {
-    Unhandled::Shape("an unwind rule there is no answer for")
 }
 
 impl From<object::Error> for Unhandled {
