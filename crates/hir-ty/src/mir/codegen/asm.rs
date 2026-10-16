@@ -22,21 +22,28 @@ const SYMBOL: &str = "rustd_asm_block";
 /// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
 /// control register its argument numbers.
 pub(super) fn xgetbv() -> String {
-    format!(".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, edi\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n")
+    let [number, ..] = Convention::of_target().arguments;
+    let number = GPR[number][1];
+    format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, {number}\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n"
+    )
 }
 
 /// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
 /// argument and writes them to its second. The rounding is part of the instruction, so there
 /// is one for each of the eight, and the third argument says which runs.
 pub(super) fn vcvtps2ph(register: &str) -> String {
+    let [[from, ..], [to, ..], [which, which_low, ..]] =
+        Convention::of_target().arguments.map(|row| GPR[row]);
     let mut text = format!(
-        ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [rdi]\nand edx, 7\nshl edx, 4\n\
-         lea rax, [rip + .Lrounding]\nadd rax, rdx\njmp rax\n.p2align 4\n.Lrounding:\n"
+        ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [{from}]\nand {which_low}, 7\n\
+         shl {which_low}, 4\nlea rax, [rip + .Lrounding]\nadd rax, {which}\njmp rax\n\
+         .p2align 4\n.Lrounding:\n"
     );
     for rounding in 0..8 {
         _ = write!(text, ".p2align 4\nvcvtps2ph xmm0, {register}, {rounding}\njmp .Lconverted\n");
     }
-    text.push_str(".Lconverted:\nvmovdqu [rsi], xmm0\nvzeroupper\nret\n");
+    _ = write!(text, ".Lconverted:\nvmovdqu [{to}], xmm0\nvzeroupper\nret\n");
     text
 }
 
@@ -89,8 +96,30 @@ const GPR: [[&str; 4]; 16] = [
     ["rbp", "ebp", "bp", "bpl"],
     ["rsp", "esp", "sp", "spl"],
 ];
-/// The rows of `GPR` a function has to leave as it found them.
-const KEPT: std::ops::Range<usize> = 9..13;
+/// What a calling convention says of the registers a block may name.
+struct Convention {
+    /// The rows of `GPR` the first three arguments are in.
+    arguments: [usize; 3],
+    /// The rows of `GPR` a function has to leave as it found them.
+    kept: &'static [usize],
+    /// The vector registers a function has to leave the low sixteen bytes of as it found
+    /// them.
+    kept_vectors: std::ops::Range<usize>,
+}
+
+impl Convention {
+    fn of_target() -> Convention {
+        match super::call_conv() {
+            cranelift_codegen::isa::CallConv::WindowsFastcall => Convention {
+                arguments: [1, 2, 5],
+                kept: &[3, 4, 9, 10, 11, 12],
+                kept_vectors: 6..16,
+            },
+            _ => Convention { arguments: [4, 3, 2], kept: &[9, 10, 11, 12], kept_vectors: 0..0 },
+        }
+    }
+}
+
 const OPERANDS: usize = 13;
 const HIGH: [&str; 3] = ["ah", "ch", "dh"];
 
@@ -197,8 +226,17 @@ pub(super) fn wrapper(
         regs[index] = Some(found);
     }
 
-    let kept: Vec<usize> = KEPT.filter(|&row| regs.contains(&Some(Reg::Gpr(row)))).collect();
-    let mut slot_size = kept.len() as u32 * 8;
+    let convention = Convention::of_target();
+    let kept: Vec<usize> = convention
+        .kept
+        .iter()
+        .copied()
+        .filter(|&row| regs.contains(&Some(Reg::Gpr(row))))
+        .collect();
+    let kept_vectors: Vec<usize> =
+        convention.kept_vectors.filter(|&it| regs.contains(&Some(Reg::Vector(it)))).collect();
+    let kept_at = kept_vectors.len() * 16;
+    let mut slot_size = (kept_at + kept.len() * 8) as u32;
     let mut offsets = vec![None; operands.len()];
     for (index, operand) in operands.iter().enumerate() {
         let Operand::Reg { size: Some(size), .. } = *operand else { continue };
@@ -218,9 +256,13 @@ pub(super) fn wrapper(
         })
     };
 
-    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\npush rbx\nmov rbx, rdi\n");
+    let slot = GPR[convention.arguments[0]][0];
+    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\npush rbx\nmov rbx, {slot}\n");
     for (at, &row) in kept.iter().enumerate() {
-        _ = writeln!(text, "mov qword ptr [rbx + {}], {}", at * 8, GPR[row][0]);
+        _ = writeln!(text, "mov qword ptr [rbx + {}], {}", kept_at + at * 8, GPR[row][0]);
+    }
+    for (at, &number) in kept_vectors.iter().enumerate() {
+        _ = writeln!(text, "movups xmmword ptr [rbx + {}], xmm{number}", at * 16);
     }
     for (reg, size, offset, input, _) in values() {
         if input {
@@ -287,7 +329,10 @@ pub(super) fn wrapper(
             }
         }
         for (at, &row) in kept.iter().enumerate() {
-            _ = writeln!(text, "mov {}, qword ptr [rbx + {}]", GPR[row][0], at * 8);
+            _ = writeln!(text, "mov {}, qword ptr [rbx + {}]", GPR[row][0], kept_at + at * 8);
+        }
+        for (at, &number) in kept_vectors.iter().enumerate() {
+            _ = writeln!(text, "movups xmm{number}, xmmword ptr [rbx + {}]", at * 16);
         }
         text.push_str("pop rbx\nret\n");
     }

@@ -21,12 +21,77 @@ os.environ.setdefault("CARGO_INCREMENTAL", "0")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # A sweep runs against a copy, so rebuilding rustd meanwhile does not change it under the sweep.
-RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
+WINDOWS = os.name == "nt"
+RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd" + (".exe" if WINDOWS else ""))
+
+
+def toolchain():
+    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+    host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
+    return sysroot, host
+
+
+def link_line(output):
+    """The linker's command line in what `rustc --print link-args` wrote, as arguments.
+
+    The linker is `cc` where the C compiler drives it, and a linker of the `link.exe` kind
+    (rustc's own `rust-lld`, or MSVC's) for the MSVC target."""
+    for line in output.splitlines():
+        if '"' not in line:
+            continue
+        try:
+            args = shlex.split(line)
+        except ValueError:
+            continue
+        for at, arg in enumerate(args[:8]):
+            if arg == "cc":
+                return args[at:]
+            if os.path.basename(arg).lower().removesuffix(".exe") in ("rust-lld", "lld-link", "link") and "/NOLOGO" in args:
+                if arg == "rust-lld":
+                    # rustc finds its own linker beside itself rather than on PATH.
+                    sysroot, host = toolchain()
+                    arg = os.path.join(sysroot, "lib", "rustlib", host, "bin", "rust-lld.exe")
+                return [arg, *args[at + 1:]]
+    raise SystemExit(f"no linker line:\n{output[-3000:]}")
+
+
+def msvc(args):
+    """Whether the line is one of a linker of the `link.exe` kind."""
+    return "/NOLOGO" in args
+
+
+def output_of(args):
+    if msvc(args):
+        return next(a for a in args if a.upper().startswith("/OUT:"))[len("/OUT:"):]
+    return args[args.index("-o") + 1]
+
+
+def with_output(args, path):
+    """The line with the linked file written to `path`."""
+    if msvc(args):
+        return [f"/OUT:{path}" if a.upper().startswith("/OUT:") else a for a in args]
+    args = list(args)
+    args[args.index("-o") + 1] = path
+    return args
+
+
+def with_objects(args, objects, multiple=True):
+    """The line with rustd's `objects` ahead of everything rustc compiled. `multiple` lets
+    them define what rustc's define too: the first definition is the one linked."""
+    args = list(args)
+    first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
+    allow = ["/FORCE:MULTIPLE", "/IGNORE:4006"] if msvc(args) else ["-Wl,--allow-multiple-definition"]
+    args[first:first] = list(objects) + (allow if multiple else [])
+    return args
+
+
+def join(args):
+    """The line as `--link-cmd` takes it: what the platform's shell would run."""
+    return subprocess.list2cmdline(args) if WINDOWS else shlex.join(args)
 
 
 def sysroot_rlibs():
-    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-    host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
+    sysroot, host = toolchain()
     lib = f"{sysroot}/lib/rustlib/{host}/lib"
     return [p for n in ("core", "alloc", "std") for p in glob.glob(f"{lib}/lib{n}-*.rlib")]
 
@@ -68,10 +133,8 @@ class Fixture:
             cwd=self.ws, capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
-        line = next(l for l in (out.stdout + out.stderr).splitlines() if '"cc"' in l)
-        args = shlex.split(line)
-        self.link_args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
-        self.reference = self.link_args[self.link_args.index("-o") + 1]
+        self.link_args = [a for a in link_line(out.stdout + out.stderr) if not a.endswith("symbols.o")]
+        self.reference = output_of(self.link_args)
         # The target's own objects too: a crate rustd rebuilds may be the one being linked.
         self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
 
@@ -102,18 +165,12 @@ class Fixture:
         self.link(objects)
 
     def link(self, objects):
-        args = list(self.link_args)
-        first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
-        if self.alone:
-            # Nothing of the workspace is rustc's for rustd's to be defined a second time.
-            args[first:first] = objects
-        else:
-            args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
+        # Alone, nothing of the workspace is rustc's for rustd's to be defined a second time.
         self.binary = os.path.join(self.work, "bin-rustd")
-        args[args.index("-o") + 1] = self.binary
+        args = with_output(with_objects(self.link_args, objects, multiple=not self.alone), self.binary)
         run = subprocess.run(args, capture_output=True, text=True)
         if run.returncode != 0:
-            raise SystemExit(f"link failed:\n{run.stderr[-3000:]}")
+            raise SystemExit(f"link failed:\n{(run.stderr + run.stdout)[-3000:]}")
 
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]

@@ -228,7 +228,7 @@ impl StoredCode {
 
     /// The code, with what LLVM asked for asked of `recorder` again.
     pub(super) fn restore(self, recorder: &mut super::fragment::Recorder<'_>) -> Option<Code> {
-        let sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        let sig = Signature::new(super::call_conv());
         let imports: Vec<_> =
             self.imports.iter().map(|it| recorder.import(it, &sig).ok()).collect::<Option<_>>()?;
         let blobs: Vec<_> = self

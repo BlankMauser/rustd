@@ -76,6 +76,7 @@ use super::{
     eval::interpret_mir, monomorphization::monomorphized, monomorphized_promoted_mir_body_query,
     return_slot,
 };
+use target_lexicon::BinaryFormat;
 
 mod asm;
 mod backend;
@@ -975,17 +976,46 @@ fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
 
 const LARGE: usize = 50_000;
 
+/// The machine the daemon runs on, which is the one it builds for.
+const TRIPLE: &str = if cfg!(all(windows, target_env = "msvc")) {
+    "x86_64-pc-windows-msvc"
+} else {
+    "x86_64-unknown-linux-gnu"
+};
+
 fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
+    let target = isa::lookup_by_name(TRIPLE).map_err(|e| e.to_string())?;
+    let coff = target.triple().binary_format == BinaryFormat::Coff;
     let mut flags = settings::builder();
-    flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
+    // An image of PE reaches all of itself relative to the instruction, what it imports
+    // through the stubs the linker adds: there is no table of addresses to go through.
+    flags.set("is_pic", if coff { "false" } else { "true" }).map_err(|e| e.to_string())?;
+    flags.set("tls_model", if coff { "coff" } else { "elf_gd" }).map_err(|e| e.to_string())?;
     flags.set("opt_level", "none").map_err(|e| e.to_string())?;
     flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
     flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-    isa::lookup_by_name("x86_64-unknown-linux-gnu")
-        .map_err(|e| e.to_string())?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| e.to_string())
+    if !CallConv::triple_default(target.triple()).supports_exceptions() {
+        // Cranelift has landing pads for the calling conventions it can hand the exception
+        // to in a register. The pads of any other take it from the frame (see
+        // `unwind::seh`), which the frame pointer finds.
+        flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
+    }
+    target.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+}
+
+/// Whether a call can name its landing pad and the pad is entered with the exception in a
+/// register, as Cranelift has it for the calling conventions it knows the register of.
+fn exception_in_register() -> bool {
+    call_conv().supports_exceptions()
+}
+
+/// The calling convention of the target, which is rustc's for Rust's own as well.
+fn call_conv() -> CallConv {
+    static CONV: std::sync::OnceLock<CallConv> = std::sync::OnceLock::new();
+    *CONV.get_or_init(|| match isa::lookup_by_name(TRIPLE) {
+        Ok(target) => CallConv::triple_default(target.triple()),
+        Err(_) => CallConv::SystemV,
+    })
 }
 
 /// How many functions went through Cranelift since the process started.
@@ -1531,6 +1561,7 @@ fn build<'db>(
         drop_order: Vec::new(),
         operand_temps: Default::default(),
         in_cleanup: false,
+        guarded: false,
         deferred_clears: Vec::new(),
         ret_mode: PassMode::Ignore,
         tracked,
@@ -1545,7 +1576,16 @@ fn build<'db>(
     fill(&mut fx)?;
     fx.builder.seal_all_blocks();
     let config = fx.cg.target_config();
+    let guarded = fx.guarded;
     fx.builder.finalize(config);
+    if guarded && let Some(entry) = ctx.func.layout.entry_block() {
+        // The slot a guarded call looks for an exception in starts empty.
+        use cranelift_codegen::cursor::{Cursor as _, FuncCursor};
+        let mut cursor = FuncCursor::new(&mut ctx.func).at_first_insertion_point(entry);
+        let frame = cursor.ins().get_frame_pointer(PTR);
+        let none = cursor.ins().iconst(PTR, 0);
+        cursor.ins().store(MEM, none, frame, unwind::seh::ARRIVAL);
+    }
     Ok(ctx)
 }
 
@@ -2340,7 +2380,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     fn func(&mut self, request: &FuncRequest) -> Result<FuncId> {
         match &request.target {
-            FuncTarget::Symbol(symbol) => self.import(symbol, &request.sig),
+            FuncTarget::Symbol(symbol) => {
+                let own = self.unwind.runtime(&mut self.module, symbol);
+                match own.map_err(CodegenError::Backend)? {
+                    Some(id) => Ok(id),
+                    None => self.import(symbol, &request.sig),
+                }
+            }
             FuncTarget::Path(path) => {
                 let Some(symbol) = self.symbols.path(path) else {
                     unsupported!("call to `{path}`, which rustc has no symbol for");
@@ -3212,6 +3258,8 @@ struct FunctionCx<'cx, 'db> {
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
     in_cleanup: bool,
+    /// Whether a call was made by [`Self::guarded_call`].
+    guarded: bool,
     deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
     ret_mode: PassMode,
     /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
@@ -3503,6 +3551,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         {
             unsupported!("calling convention {abi:?}");
         }
+        if call_conv() == CallConv::WindowsFastcall {
+            if matches!(abi, ExternAbi::SysV64 { .. }) {
+                unsupported!("calling convention {abi:?}");
+            }
+            let ret = self.win64_pass_mode(ret, true)?;
+            let args = args
+                .into_iter()
+                .map(|ty| self.win64_pass_mode(ty, false))
+                .collect::<Result<_>>()?;
+            return Ok(FnAbi { ret, args });
+        }
         let (mut int_regs, mut sse_regs) = (6usize, 8usize);
         let ret = match self.c_pass_mode(ret)? {
             PassMode::OnStack(_) => {
@@ -3541,6 +3600,30 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let floats = types.iter().filter(|ty| ty.is_float()).count();
         let ints = types.iter().filter(|ty| !ty.is_float()).map(|ty| ty.bytes().div_ceil(8));
         (ints.sum::<u32>() as usize, floats)
+    }
+
+    /// How the C ABI of 64-bit Windows passes one value. Mirrors rustc's
+    /// `callconv/x86_win64.rs`: what is not the size of a register goes by reference.
+    fn win64_pass_mode(&self, ty: Ty<'db>, is_ret: bool) -> Result<PassMode> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            // MSVC passes an argument of no size by reference.
+            return Ok(if is_ret { PassMode::Ignore } else { PassMode::Indirect });
+        }
+        Ok(match (layout.backend_repr, layout.size.bytes()) {
+            (BackendRepr::SimdVector { .. }, _) => unsupported!("vector in the C ABI"),
+            (BackendRepr::Scalar(scalar), size) if size <= 8 => {
+                PassMode::Direct(self.scalar(scalar)?)
+            }
+            // A 128-bit integer is returned in `xmm0`.
+            (BackendRepr::Scalar(_), 16) if is_ret => PassMode::Cast(types::I64X2),
+            (BackendRepr::Scalar(_), _) => PassMode::Indirect,
+            (_, 1) => PassMode::Cast(types::I8),
+            (_, 2) => PassMode::Cast(types::I16),
+            (_, 4) => PassMode::Cast(types::I32),
+            (_, 8) => PassMode::Cast(types::I64),
+            _ => PassMode::Indirect,
+        })
     }
 
     /// How the C ABI passes one value when registers are left for it.
@@ -3665,7 +3748,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         match ret {
             PassMode::Indirect => {
                 sig.params.push(AbiParam::special(PTR, ArgumentPurpose::StructReturn))
@@ -3763,6 +3846,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             StackSlotKind::ExplicitSlot,
             8,
             3,
+        ));
+        self.builder.ins().stack_addr(PTR, slot, 0)
+    }
+
+    /// Storage for an integer of 128 bits.
+    fn scratch_wide(&mut self) -> Value {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            4,
         ));
         self.builder.ins().stack_addr(PTR, slot, 0)
     }
@@ -4681,7 +4774,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.extend([AbiParam::new(PTR); 3]);
         let callee = self.cg.import_path("core::panicking::panic_bounds_check", &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5314,7 +5407,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(to, addr, size);
             }
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.assembly(wrapper.text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5924,7 +6017,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
         sig.returns.push(AbiParam::new(ty));
         let callee = self.cg.import(name, &sig)?;
@@ -5947,12 +6040,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 (_, false, types::F64, _) => "__floatuntidf",
                 _ => unsupported!("cast from {} to {}", from.ty, to.ty),
             };
-            let mut sig = Signature::new(CallConv::SystemV);
-            sig.params.push(AbiParam::new(from.ty));
-            sig.returns.push(AbiParam::new(to.ty));
-            let callee = self.cg.import(name, &sig)?;
-            let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-            return Ok(self.invoke(callee, &[value])[0]);
+            return self.builtin(name, &[from.ty], to.ty, &[value]);
         }
         let ins = self.builder.ins();
         Ok(match (from.ty.is_float(), to.ty.is_float()) {
@@ -6024,7 +6112,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.import_path(&path, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -6664,7 +6752,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         bytes[16..24].copy_from_slice(&layout.align.abi.bytes().to_le_bytes());
         let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = Signature::new(call_conv());
             sig.params.push(AbiParam::new(PTR));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
@@ -7920,17 +8008,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let done = self.builder.create_block();
                 self.builder.append_block_param(caught, PTR);
                 self.builder.append_block_param(done, types::I32);
-                let normal = self.builder.func.dfg.block_call(returned, &[]);
-                let unwound =
-                    self.builder.func.dfg.block_call(caught, &[ir::BlockArg::TryCallExn(0)]);
-                let tag = ir::ExceptionTag::with_number(unwind::CATCH).expect("a small tag");
-                let table =
-                    self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
-                        try_sig,
-                        normal,
-                        [ir::ExceptionTableItem::Tag(tag, unwound)],
-                    ));
-                self.builder.ins().try_call_indirect(try_fn, &[data], table);
+                if exception_in_register() {
+                    let normal = self.builder.func.dfg.block_call(returned, &[]);
+                    let unwound =
+                        self.builder.func.dfg.block_call(caught, &[ir::BlockArg::TryCallExn(0)]);
+                    let tag = ir::ExceptionTag::with_number(unwind::CATCH).expect("a small tag");
+                    let table =
+                        self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
+                            try_sig,
+                            normal,
+                            [ir::ExceptionTableItem::Tag(tag, unwound)],
+                        ));
+                    self.builder.ins().try_call_indirect(try_fn, &[data], table);
+                } else {
+                    self.guarded_call(caught, |builder| {
+                        builder.ins().call_indirect(try_sig, try_fn, &[data])
+                    });
+                    self.builder.ins().jump(returned, &[]);
+                }
 
                 self.builder.switch_to_block(returned);
                 let zero = self.builder.ins().iconst(types::I32, 0);
@@ -7939,7 +8034,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.switch_to_block(caught);
                 self.builder.set_cold_block(caught);
                 let exception = self.builder.block_params(caught)[0];
-                self.invoke_indirect(catch_sig, catch_fn, &[data, exception]);
+                if exception_in_register() {
+                    self.invoke_indirect(catch_sig, catch_fn, &[data, exception]);
+                } else {
+                    // The handler takes the thrown object, and what it was brought in is ours.
+                    let object = self.builder.ins().iadd_imm(exception, unwind::seh::OBJECT);
+                    self.invoke_indirect(catch_sig, catch_fn, &[data, object]);
+                    let mut sig = self.cg.make_signature();
+                    sig.params.push(AbiParam::new(PTR));
+                    let release = self.cg.import(unwind::seh::RELEASE, &sig)?;
+                    let release = self.cg.declare_func_in_func(release, self.builder.func);
+                    self.builder.ins().call(release, &[exception]);
+                }
                 let one = self.builder.ins().iconst(types::I32, 1);
                 self.builder.ins().jump(done, &[one.into()]);
 
@@ -7990,7 +8096,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(call_conv());
                 sig.params.push(AbiParam::new(types::I32));
                 sig.returns.push(AbiParam::new(types::I64));
                 let callee = self.cg.assembly(asm::xgetbv(), &sig);
@@ -8002,7 +8108,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(call_conv());
                 sig.params.extend([AbiParam::new(PTR), AbiParam::new(PTR)]);
                 sig.params.push(AbiParam::new(types::I32));
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
@@ -8060,22 +8166,47 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
     }
 
+    /// Calls a function of compiler-builtins, which are C's by convention.
+    fn builtin(&mut self, name: &str, params: &[Type], ret: Type, args: &[Value]) -> Result<Value> {
+        // 64-bit Windows takes an integer of 128 bits by reference and returns it as a
+        // vector.
+        let windows = call_conv() == CallConv::WindowsFastcall;
+        let wide = |ty: Type| windows && ty == types::I128;
+        let mut sig = Signature::new(call_conv());
+        sig.params.extend(params.iter().map(|&ty| AbiParam::new(if wide(ty) { PTR } else { ty })));
+        sig.returns.push(AbiParam::new(if wide(ret) { types::I64X2 } else { ret }));
+        let callee = self.cg.import(name, &sig)?;
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let mut passed = Vec::with_capacity(args.len());
+        for (&value, &ty) in args.iter().zip(params) {
+            passed.push(if wide(ty) {
+                let slot = self.scratch_wide();
+                self.builder.ins().store(MEM, value, slot, 0);
+                slot
+            } else {
+                value
+            });
+        }
+        let value = self.invoke(callee, &passed)[0];
+        if !wide(ret) {
+            return Ok(value);
+        }
+        let slot = self.scratch_wide();
+        self.builder.ins().store(MEM, value, slot, 0);
+        Ok(self.builder.ins().load(types::I128, MEM, slot, 0))
+    }
+
     /// The quotient of two integers, or the remainder. Cranelift has neither for 128 bits, so
     /// those call compiler-builtins.
     fn divide(&mut self, l: Value, r: Value, div: bool, signed: bool) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::I128 {
-            let mut sig = Signature::new(CallConv::SystemV);
-            sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
-            sig.returns.push(AbiParam::new(types::I128));
             let name = match (div, signed) {
                 (true, true) => "__divti3",
                 (true, false) => "__udivti3",
                 (false, true) => "__modti3",
                 (false, false) => "__umodti3",
             };
-            let callee = self.cg.import(name, &sig)?;
-            let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-            return Ok(self.invoke(callee, &[l, r])[0]);
+            return self.builtin(name, &[types::I128; 2], types::I128, &[l, r]);
         }
         let ins = self.builder.ins();
         Ok(match (div, signed) {
@@ -8089,22 +8220,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in
     /// `compiler_builtins`.
     fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
-        sig.params.push(AbiParam::new(PTR));
-        sig.returns.push(AbiParam::new(types::I128));
         let name = if signed { "__rust_i128_mulo" } else { "__rust_u128_mulo" };
-        let callee = self.cg.import(name, &sig)?;
-        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let overflow = self.scratch();
-        let value = self.invoke(callee, &[l, r, overflow])[0];
+        let params = [types::I128, types::I128, PTR];
+        let value = self.builtin(name, &params, types::I128, &[l, r, overflow])?;
         let overflow = self.builder.ins().load(types::I32, MEM, overflow, 0);
         let overflow = self.builder.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
         Ok((value, overflow))
     }
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.extend([AbiParam::new(PTR); 3]);
         sig.returns.push(AbiParam::new(types::I32));
         let memcmp = self.cg.import("memcmp", &sig)?;
@@ -8155,6 +8281,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let call = self.builder.ins().call(callee, args);
             return self.builder.inst_results(call).to_vec();
         };
+        if !exception_in_register() {
+            return self.guarded_call(pad, |builder| builder.ins().call(callee, args));
+        }
         let sig = self.builder.func.dfg.ext_funcs[callee].signature;
         let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call(callee, args, table);
@@ -8167,6 +8296,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let call = self.builder.ins().call_indirect(sig, pointer, args);
             return self.builder.inst_results(call).to_vec();
         };
+        if !exception_in_register() {
+            return self
+                .guarded_call(pad, |builder| builder.ins().call_indirect(sig, pointer, args));
+        }
         let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call_indirect(pointer, args, table);
         self.builder.switch_to_block(after);
@@ -8215,6 +8348,32 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             [ir::ExceptionTableItem::Tag(tag, unwound)],
         ));
         (table, after)
+    }
+
+    /// Makes a call that goes to `pad` when it unwinds, where a call cannot name its pad:
+    /// the unwinder has the call return with the exception in a slot of the frame that is
+    /// empty otherwise, and the call is followed by a look at it.
+    fn guarded_call(
+        &mut self,
+        pad: ir::Block,
+        call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
+    ) -> Vec<Value> {
+        self.guarded = true;
+        self.builder.set_srcloc(unwind::seh::guarded());
+        let call = call(&mut self.builder);
+        self.builder.set_srcloc(ir::SourceLoc::default());
+        let results = self.builder.inst_results(call).to_vec();
+        let frame = self.builder.ins().get_frame_pointer(PTR);
+        let exception = self.builder.ins().load(PTR, MEM, frame, unwind::seh::ARRIVAL);
+        let (unwound, returned) = (self.builder.create_block(), self.builder.create_block());
+        self.builder.set_cold_block(unwound);
+        self.builder.ins().brif(exception, unwound, &[], returned, &[]);
+        self.builder.switch_to_block(unwound);
+        let none = self.builder.ins().iconst(PTR, 0);
+        self.builder.ins().store(MEM, none, frame, unwind::seh::ARRIVAL);
+        self.builder.ins().jump(pad, &[exception.into()]);
+        self.builder.switch_to_block(returned);
+        results
     }
 
     /// Fills in the landing pad: drops every local that holds a value, last declared first, and
@@ -8377,7 +8536,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
-        let resume = self.cg.import("_Unwind_Resume", &sig)?;
+        let resume = if exception_in_register() { "_Unwind_Resume" } else { unwind::seh::RESUME };
+        let resume = self.cg.import(resume, &sig)?;
         let resume = self.cg.declare_func_in_func(resume, self.builder.func);
         self.builder.ins().call(resume, &[exception]);
         self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
@@ -8453,7 +8613,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.push(AbiParam::new(PTR));
         let mut values = vec![addr];
         if self.is_unsized(ty) {
@@ -8472,7 +8632,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(call_conv());
         sig.params.push(AbiParam::new(PTR));
         if self.is_unsized(ty) {
             sig.params.push(AbiParam::new(PTR));
@@ -8803,7 +8963,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let done = self.builder.create_block();
                 self.builder.ins().brif(glue, call, &[], done, &[]);
                 self.builder.switch_to_block(call);
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(call_conv());
                 sig.params.push(AbiParam::new(PTR));
                 let sig = self.builder.import_signature(sig);
                 self.invoke_indirect(sig, glue, &[addr]);

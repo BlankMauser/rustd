@@ -26,7 +26,6 @@
 use std::{
     fs::{File, OpenOptions},
     mem::offset_of,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     thread::JoinHandle,
     time::SystemTime,
@@ -111,19 +110,43 @@ impl Baseline {
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         ensure!(Stamp::of(&file)? == self.stamp, "the executable was written by someone else");
         for (offset, bytes) in self.undo.drain(..).rev() {
-            file.write_all_at(&bytes, offset)?;
+            write_all_at(&file, &bytes, offset)?;
         }
         file.set_len(self.image.len)?;
-        file.write_all_at(&addition.appended, addition.offset)?;
+        write_all_at(&file, &addition.appended, addition.offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
-            file.read_exact_at(&mut old, *offset)?;
+            read_exact_at(&file, &mut old, *offset)?;
             self.undo.push((*offset, old));
-            file.write_all_at(bytes, *offset)?;
+            write_all_at(&file, bytes, *offset)?;
         }
         self.stamp = Stamp::of(&file)?;
         Ok(Spliced { redirected: addition.redirected, appended: addition.appended.len() })
     }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(mut file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+#[cfg(windows)]
+fn read_exact_at(mut file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
 }
 
 #[derive(PartialEq)]

@@ -25,7 +25,6 @@ use ide_db::base_db::SourceDatabase as _;
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -58,6 +57,12 @@ use syntax::{
     match_ast,
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+// The same sockets, which the standard library does not have on Windows.
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use crate::{
     splice::{Baseline, Linked, Spliced},
@@ -1748,7 +1753,7 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
-    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
+    let status = shell(cmd).status()?;
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status})");
     if let (Some(binary), Some(patch)) = (splice, patch) {
@@ -1756,6 +1761,29 @@ fn link(
         LINKED.lock().unwrap().insert(binary.to_owned(), linked);
     }
     Ok(())
+}
+
+/// The command that runs the line `cmd` as the platform's shell would.
+#[cfg(unix)]
+fn shell(cmd: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(cmd);
+    shell
+}
+
+/// The command that runs the line `cmd`. It is the command line of the process as it is:
+/// `cmd.exe` takes no line as long as the one a link has.
+#[cfg(windows)]
+fn shell(cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    let cmd = cmd.trim_start();
+    let (program, rest) = match cmd.strip_prefix('"').and_then(|it| it.split_once('"')) {
+        Some(quoted) => quoted,
+        None => cmd.split_once(char::is_whitespace).unwrap_or((cmd, "")),
+    };
+    let mut command = Command::new(program);
+    command.raw_arg(rest);
+    command
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -3473,9 +3501,7 @@ impl Program {
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
-            use std::os::unix::fs::MetadataExt;
-            let inode = |path: &Path| std::fs::metadata(path).ok().map(|it| (it.dev(), it.ino()));
-            if inode(whole) != inode(&args.out) {
+            if !same_file::is_same_file(whole, &args.out).unwrap_or(false) {
                 _ = std::fs::remove_file(&args.out);
                 if std::fs::hard_link(whole, &args.out).is_err() {
                     std::fs::copy(whole, &args.out)?;
