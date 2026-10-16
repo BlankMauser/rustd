@@ -157,7 +157,7 @@ fn with_saves(info: &[u8]) -> Result<Vec<u8>, String> {
             }
             UWOP_SAVE_XMM128 => out.extend(following.to_le_bytes()),
             UWOP_SET_FPREG if saved <= 128 => {
-                out.extend([offset, ((saved - 8) / 8) as u8 * 16 | UWOP_ALLOC_SMALL]);
+                out.extend([offset, (((saved - 8) / 8) as u8 * 16) | UWOP_ALLOC_SMALL]);
             }
             UWOP_SET_FPREG => {
                 out.extend([offset, UWOP_ALLOC_LARGE]);
@@ -168,7 +168,7 @@ fn with_saves(info: &[u8]) -> Result<Vec<u8>, String> {
     }
     let count = out.len() / 2;
     out.resize(out.len().next_multiple_of(4), 0);
-    let header = [info[0], info[1], count as u8, (saved / 16) as u8 * 16 | (info[3] & 0xf)];
+    let header = [info[0], info[1], count as u8, ((saved / 16) as u8 * 16) | (info[3] & 0xf)];
     Ok(header.into_iter().chain(out).collect())
 }
 
