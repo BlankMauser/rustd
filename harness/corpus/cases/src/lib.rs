@@ -5504,3 +5504,33 @@ pub mod unsized_in_struct {
         (first, (boxed.borrow_mut())(), cell.get().len(), (shared.borrow())(5), slices.borrow().len())
     }
 }
+
+/// `&(function as fn())` lives for `'static`, which a `Deref` to a function pointer returns.
+pub mod promoted_fn_cast {
+    use std::marker::PhantomData;
+    use std::ops::Deref;
+
+    struct Callable<T>(PhantomData<T>);
+    impl<T: std::fmt::Debug + Default> Callable<T> {
+        fn run(by: u32) -> String {
+            format!("{:?} by {by}", T::default())
+        }
+    }
+    impl<T: std::fmt::Debug + Default> Deref for Callable<T> {
+        type Target = fn(u32) -> String;
+        #[inline(never)]
+        fn deref(&self) -> &Self::Target {
+            &(Self::run as fn(u32) -> String)
+        }
+    }
+    #[inline(never)]
+    fn clobber() -> [u64; 16] {
+        std::hint::black_box([0x5555_5555_5555_5555; 16])
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        let callable = Callable::<u8>(PhantomData);
+        let function = callable.deref();
+        let clobbered = clobber();
+        (function(3), Callable::<bool>(PhantomData)(4), clobbered[3] as u8)
+    }
+}

@@ -2071,7 +2071,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
             } => scalar(self, expr) && self.is_promotable(expr),
             &Expr::Cast { expr: inner, .. } => {
-                scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
+                // `function as fn()` is the function's address, as the coercion to it is.
+                let is_fn_address = matches!(self.store[inner], Expr::Path(_))
+                    && matches!(self.expr_ty_without_adjust(inner).kind(), TyKind::FnDef(..))
+                    && matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnPtr(..));
+                is_fn_address
+                    || scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
             }
             // Division is left out: it is only promoted when the divisor is known not to be 0.
             &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
