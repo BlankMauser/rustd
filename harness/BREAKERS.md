@@ -3,21 +3,22 @@
 Branch `rustd-breakers`, off `rustd-spike`. Everything below was measured on one 8-core, 31 GB
 VM with `nightly-2026-05-10` (`harness/toolchain`). Each number is from a single run unless it
 says otherwise, and each is followed by the command that printed it. "rustd-14" is
-`cargo build -p rustd --release` at commit `4219d84566`; the later commits change only the
-harness and this report.
+`cargo build -p rustd --release` at commit `4219d84566`, the end of the first pass;
+"rustd-30" is the same at `1c293327c1`, the end of the second.
 
 ## Summary
 
-| | before (as found) | after (rustd-14) | command |
-|---|---|---|---|
-| crates with a result (the other 7 are under "Not tested") | | 86 of 93 | `cratesweep.sh ~/sweep/out6 $(cat versions.txt)` |
-| crates whose tests behave as rustc's | not measured on the whole list, see below | 84 of 86 | `sweepreport.py ~/sweep/out6` |
-| tests run and compared | | 10746 | same |
-| functions compiled by rustd | | 41597 of 41692 (95 left to rustc) | same |
-| binaries, command lines the same | 25 of 29 on the 3 that ran, 4 did not run | 68 of 68 over 7 binaries | `bintest.py <name>` |
-| `harness/corpus` | 661 of 662, MATCH | 661 of 662, MATCH | `difftest.py corpus --bin runner --crate cases` |
-| `harness/stress.py` | 99 of 99 | 99 of 99, 0 restarts | `stress.py` |
-| reduced breakers | | 13 of 13 right, 3 open | `breakers.py` |
+| | before (as found) | first pass (rustd-14) | second pass (rustd-30) | command |
+|---|---|---|---|---|
+| crates with a result (the other 7 are under "Not tested") | | 86 of 93 | 86 of 93 | `cratesweep.sh ~/sweep/out15 $(cat versions.txt)` |
+| crates whose tests behave as rustc's | not measured on the whole list, see below | 84 of 86 | 86 of 86 | `sweepreport.py ~/sweep/out15` |
+| tests run and compared | | 10746 | 10746 | same |
+| functions compiled by rustd | | 41597 of 41692 (95 left to rustc) | 41682 of 41697 (15 left, all generic-array) | same |
+| binaries, command lines the same | 25 of 29 on the 3 that ran, 4 did not run | 68 of 68 over 7 binaries | 68 of 68 | `bintest.py <name>` |
+| tokio `--features full`, tests differing | | 8 of 1018 | 0 of 1018 (2 of 3273 functions left) | `cratetest.py vendor/tokio --features full` |
+| `harness/corpus` | 661 of 662, MATCH | 661 of 662, MATCH | 661 of 662, MATCH | `difftest.py corpus --bin runner --crate cases` |
+| `harness/stress.py` | 99 of 99 | 99 of 99, 0 restarts | 99 of 99, 0 restarts | `stress.py` |
+| reduced breakers | | 13 of 13 right, 3 open | 25 of 25 right, 0 open | `breakers.py` |
 
 "Before" has no single number for the 93 crates: I stopped the first sweep with the
 unmodified rustd after 29 crates, to restart it with the first fixes in. In those 29, rustd
@@ -26,15 +27,9 @@ crashed on futures, pin-project-lite and tokio and failed to link serde_json. Of
 functions and 6 failing crates (`sweepreport.py ~/sweep/out2`); the final one is the table
 above.
 
-The two crates that still differ, both in tests that measure rustd's code rather than compute
-with it:
-
-- futures: `join_size`, `select_size`, `try_join_size`, `select_on_non_unpin_size` assert the
-  size of a future. rustd lays an `async` block out without overlapping the variables of
-  different await points, so its futures are larger (reduced: `future_size`, rustc
-  `[12, 20, 24, 112]`, rustd `[192, 288, 304, 288]`).
-- simd-json: `limit_fits_in_a_default_thread_stack` recurses to the parser's depth limit on a
-  default thread stack. rustd's frames are larger and the test overflows. Not reduced.
+The second pass took the 95 functions and the two differing crates of the first pass one by
+one; the rows "15 to 26" below are what came out of it. What is left is 15 functions of
+generic-array, in one cause, and 2 of tokio's with `--features full`.
 
 ## How it was run
 
@@ -42,10 +37,10 @@ with it:
   crates.io and runs `harness/cratetest.py` on it, which builds every test binary of the
   crate with cargo, builds it again with rustd's object linked in front, runs both and
   compares the result of every test by name. `sweepreport.py <out>` adds up the JSON files.
-  The final run: `RUSTD_BIN=~/sweep/rustd-14 CLEAN=1 JOBS=5 harness/cratesweep.sh ~/sweep/out6
-  $(cat ~/sweep/versions.txt)`, about 31 minutes of wall time for everything but base64
-  (start of the run to the last line of its log), with `stress.py` and the binaries running
-  beside it for part of that.
+  The final run: `RUSTD_BIN=~/sweep/rustd-30 CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out15
+  $(cat ~/sweep/versions.txt)`, 60 minutes of wall time including base64's 1800 s timeout
+  (`stat` of the log's birth and last write), with `breakers.py` just before it and nothing
+  else on the machine.
 - Binaries: `harness/bintest.py <name>` (new) clones the repository named in
   `harness/breakers/bins.json`, builds it with cargo and with rustd, runs each command line
   listed there with both and compares status, stdout and stderr.
@@ -83,17 +78,19 @@ already in `harness/corpus` (661 functions) and came up again only through the c
 
 | binary | command lines the same | functions from rustd | codegen ms |
 |---|---|---|---|
-| fd | 10 of 10 | 143 of 143 | 4664 |
-| just | 12 of 12 | 553 of 553 | 13124 |
-| hyperfine | 7 of 7 | 130 of 130 | 2915 |
-| zoxide | 9 of 9 | 102 of 102 | 2555 |
-| ripgrep | 12 of 12 | 1742 of 1742 | 5706 |
-| bat | 10 of 10 | 274 of 274 | 5593 |
-| tokei | 8 of 8 | 119 of 119 | 5778 |
+| fd | 10 of 10 | 148 of 148 | 3329 |
+| just | 12 of 12 | 822 of 822 | 8093 |
+| hyperfine | 7 of 7 | 161 of 161 | 1767 |
+| zoxide | 9 of 9 | 131 of 131 | 1381 |
+| ripgrep | 12 of 12 | 1820 of 1820 | 4113 |
+| bat | 10 of 10 | 321 of 321 | 5806 |
+| tokei | 8 of 8 | 141 of 141 | 4870 |
 
-`RUSTD_BIN=~/sweep/rustd-14 harness/bintest.py <name> --json <name>.json` for each; the
-function counts and times are the sums of `compiled`, `roots` and `codegen_ms` over the
-crates in that JSON.
+`RUSTD_BIN=~/sweep/rustd-30 harness/bintest.py <name> --json ~/sweep/bins30/<name>.json` for
+each (`~/sweep/bins30.log`); the function counts and times are the sums of `compiled`,
+`roots` and `codegen_ms` over the crates in that JSON. The counts are higher than with
+rustd-14 (fd 143, just 553, ripgrep 1742, ...) because the second pass stopped taking generic
+helpers in `const _` blocks for rustc's symbol, so more functions are rustd's to compile.
 
 The first run with the unmodified rustd (`~/sweep/bins1.log`) gave fd 9 of 10, ripgrep 9 of
 12, zoxide 9 of 9, hyperfine 7 of 7, and no result for just, tokei and bat. Two of those were
@@ -104,7 +101,8 @@ the two more finely than that.
 
 ## Root causes, by how many crates each touched
 
-Fixed. Each has a commit and a case that fails without it.
+Fixed. Each has a commit and a case that fails without it (27 has the sweep's async-channel
+entry instead). The first pass:
 
 | # | cause | crates | effect before | reduced case | commit |
 |---|---|---|---|---|---|
@@ -127,26 +125,36 @@ On 6: these methods are generic, they were never functions rustd could compile a
 them were listed, 10 failed and one happened to compile because it never touched `T`). The fix
 stops counting them as roots, which is why the total number of functions went from 41703
 (`sweepreport.py ~/sweep/out3`, the sweep before this fix) to 41692 while the number compiled
-went up. Their instances are
-compiled where they are used, as before.
+went up. Their instances are compiled where they are used, as before.
 
-Open. 95 functions in 11 crates, and 2 crates with differing tests.
+The second pass, in the order fixed. "crates" and "effect" are from the rustd-14 sweep
+(`sweepreport.py ~/sweep/out6`) and the focused reruns of each crate noted in the commits.
+
+| # | cause | crates | effect before | reduced case | commit |
+|---|---|---|---|---|---|
+| 15 | `llvm.x86.vcvtps2ph` (F16C) missing | half | 3 functions left | `f16c` | `ac5e2c9348` |
+| 16 | Comparing two references to a struct that ends in a slice read each as one scalar; it is a pointer and a length | triomphe | 2 functions left | `unsized_tail_cmp` | `ac5e2c9348` |
+| 17 | A generic helper in a `const _` block was taken for the function rustc has a symbol of, compiled with nothing for `T` and defined twice when two blocks shared a path | pin-project-lite | 9 functions left | `breakers/blanket` (`const_helpers`) | `ac5e2c9348` |
+| 18 | A future had a field and a word of drop flags for every local held across an await; it is laid out by rustc_abi's coroutine layout now, a variant per await, locals overlapping, flags as many bytes as they need | futures (4 tests), tokio `full` (8 tests) | size assertions differ | `future_size`, `future_states` | `ce3225e7c4`, `4a5fa659af` |
+| 19 | `safe` is a keyword only before `fn` and `static` in an extern block, and was taken for one before `!` too | bitvec | 21 functions left | `safe_macro` | `0ff9bec81b` |
+| 20 | A macro written by a macro can have several parameters of one spelling from different expansion steps; bindings were kept by name alone | petgraph (`defmac!`) | 3 functions left | `macro_same_name_vars` | `de38e5c594` |
+| 21 | An impl in a named `const` block (proptest-derive) was not an impl of the crate; and the impls of a dev-dependency nothing names were known where rustc never loads it (criterion's serde_json made `assert_eq!(1.5, s.parse().unwrap())` ambiguous) | im (6), ryu (2), itertools (9) | 17 functions left | `named_const_impl`, `breakers/devdep` (`unloaded`) | `efa3750e9c` |
+| 22 | A projection in a path's type (`OVector<T, D>::from_element`) was not known to be of a trait its self type implements by the where clause | nalgebra | 3 functions left | `path_where_clause` | `f9e0547f20` |
+| 23 | An impl in a function body of the workspace was an impl of its crate only where its type or trait was declared in the same block | zerocopy | 1 function left (`into` with no body) | `impl_in_fn` | `dd79e2f4ec` |
+| 24 | An `$e:expr`, `$t:ty` or `$p:path` passed on to another macro was spliced as its tokens, so `0` matched a literal rule and a type of several tokens was not one `$x:tt` | bitvec | 20 functions left | `fragment_token` | `ac42999014` |
+| 25 | A blanket impl in a function was given to the solver twice, through the block and through the crate: ambiguous, and the associated const fell back to the trait's declaration | zerocopy (`trailing_slice_layout`) | const eval `IncompleteExpr` | `blanket_in_fn` | `f395f5f19d` |
+| 26 | A function generic only over lifetimes was compiled by rustd instead of calling rustc's copy, with a frame several times the size: `Debug` for a nested value overflowed a 2 MiB stack | simd-json (1 test) | `limit_fits_in_a_default_thread_stack` aborts | `lifetime_only_callee` | `40992f988e` |
+| 27 | An instance that names types of two crates is compiled from the one that sees the other; "sees" was every transitive dependency, where the impls known are those of the crates the source names (as 21) | async-channel | 5 tests' functions left (`poll` with no body) | none reduced, see below | `1c293327c1` |
+
+On 27: a reduction in `breakers/devdep` (a dev-dependency's generic `block_on` polling the
+crate's future) compiled fine before the fix, so there is no case for it; async-channel's
+tests in the sweep are the regression test (`async_channel 54/54` in `~/sweep/out15`).
+
+Open. 15 functions in one crate in the sweep, and 2 in tokio with `full` (above).
 
 | cause | functions | crates | reduced | difficulty |
 |---|---|---|---|---|
-| rust-analyzer does not infer a type or resolve a method that rustc does (`UnresolvedMethod`, `HasErrors`, `{type error}` in a layout, `MissingFunctionDefinition`, `TypeError`, monomorphization errors) | 80 | bitvec 41, generic-array 15, itertools 9, im 6, nalgebra 3, petgraph 3, ryu 2, zerocopy 1 | no | Open-ended. Each is a separate inference bug in hir-ty, mostly around associated types of type-level numbers (typenum, bitvec's `BitStore`) and types known only from a later use. Days each, and upstream rust-analyzer work rather than codegen work. |
-| Generic function inside a `const _` block inside a function, twice in one function: compiled without its parameters, and both get one name | 9 | pin-project-lite | no, a plain copy of the pattern compiles | Small once reproduced, likely a day: the name needs the block's index, and the function is generic. |
-| `llvm.x86.vcvtps2ph` (F16C) missing | 3 | half | `f16c` | Small, half a day: the `xgetbv` way (a function of the one instruction) or the conversion in software. |
-| Comparing two references to a struct that ends in a slice reads each as one scalar | 2 | triomphe | `unsized_tail_cmp` | Small to medium, a day: the derive's comparison goes through a path in codegen that expects a thin pointer. |
-| A call resolved to a trait method with no body (`into`) | 1 | zerocopy | no | Unknown, probably the first row again. |
-| Futures are larger than rustc's: no overlap of variables across await points | 4 tests | futures | `future_size` | Large, a week or more: coroutine layout as rustc does it, with liveness across suspension points. Changes no behaviour other than size. |
-| Frames are larger than rustc's, a deep recursion overflows the stack | 1 test | simd-json | no | Medium to large: Cranelift without optimization gives each MIR local a slot. Fix 9 removed the worst case. |
-
-The first row is four fifths of what is left. I did not reduce those to cases: each of the
-functions I looked at (itertools `array_windows`, ryu `test_random`, bitvec `load`) fails for
-a different reason inside type inference, and the two reductions I tried (an empty `vec![]`
-in a destructured array, `parse()` typed by the other side of `assert_eq!`) compiled fine on
-their own.
+| The next trait solver does not resolve `into_array`/`fold` on `GenericArray<T, N>` with `N` a typenum (`UnresolvedMethod`, 13) or normalize `IntoIter`/`GenericArray<i32, _>` (`HasPlaceholder`, 2) | 15 | generic-array | no | Open-ended. rustc itself with `RUSTFLAGS=-Znext-solver cargo test --no-run` on generic-array fails with `E0275` overflow evaluating `<N as ArrayLength>`, so at least part of this is the next solver's, which rust-analyzer shares. Each reduction I tried (a `GenericArray<u8, U4>` built by `from_array`, `into_array` on it, `fold` over it) compiled fine on its own. Days, upstream. |
 
 ## Not tested, and why
 
@@ -160,15 +168,15 @@ their own.
 | static_assertions | has no functions and no tests that run | sweep log: 1 test binary, 0 tests |
 | base64 (unit tests only) | did not finish in the 1800 s the sweep allows; its integration tests are the same (107 of 107 functions) | see below |
 
-tokio with `--features full` (`RUSTD_BIN=~/sweep/rustd-14 cratetest.py harness/vendor/tokio
---features full --json ~/sweep/tokio-full.json`, one run, after the sweep): 155 test binaries,
-1018 tests, 3271 of 3273 functions from rustd. 8 tests differ, all of them assertions on the
-size of a future (`join_size`, `join_size_biased`, `try_join_size`, `try_join_size_biased`,
-`pointer_64_tests::struct_size_1..3`, `buffer_not_included_in_future`), the futures cause
-above. The 2 functions left are `io_join::method_delegation` and `io_split::method_delegation`
-(`layout of Runtime: HasErrorType`, the type inference row). 18 further test binaries,
-the library's unit tests among them, do not build with cargo under `full` alone (they want
-`test-util`), so tokio's unit tests are not covered. These numbers are not in the totals above.
+tokio with `--features full` (`RUSTD_BIN=~/sweep/rustd-30 cratetest.py harness/vendor/tokio
+--features full --json ~/sweep/tokio-full30.json`, one run, after the sweep): MATCH, 155 test
+binaries, 1018 tests, none differing (8 differed with rustd-14, all on the size of a future),
+3271 of 3273 functions from rustd (`sweepreport.py` on that JSON). The 2 functions left are
+`io_join::method_delegation` and `io_split::method_delegation` (`layout of Runtime:
+HasErrorType`: rust-analyzer does not infer a type in `Runtime` here; not reduced). 18
+further test binaries, the library's unit tests among them, do not build with cargo under
+`full` alone (they want `test-util`), so tokio's unit tests are not covered. These numbers
+are not in the totals above.
 
 base64: the sweep reports it as failed. Its two integration test binaries match; the unit
 test binary ran past the 1800 s limit of `cratetest.py` and was killed, so it has no result.
@@ -177,155 +185,135 @@ whether it would finish. It is counted among the 7 without a result, not among t
 
 ## Every crate
 
-`harness/sweepreport.py ~/sweep/out6 --md`. "codegen ms" is the time rustd spent in codegen
+`harness/sweepreport.py ~/sweep/out15 --md`. "codegen ms" is the time rustd spent in codegen
 over the crate's test binaries, not wall time.
 
 | crate | result | test binaries | tests | functions from rustd | codegen ms | left to rustc, or differing |
 |---|---|---|---|---|---|---|
-| adler2 | same | 1 | 6 | 23/23 | 164 |  |
-| ahash | same | 3 | 38 | 185/185 | 596 |  |
-| aho_corasick | same | 1 | 163 | 856/856 | 2406 |  |
-| anyhow | same | 15 | 73 | 215/215 | 8589 |  |
-| arc_swap | same | 4 | 52 | 123/123 | 3981 |  |
-| arrayvec | same | 4 | 52 | 66/66 | 1075 |  |
-| async_channel | same | 3 | 41 | 54/54 | 1853 |  |
-| bitflags | same | 1 | 54 | 824/824 | 1175 |  |
-| bitvec | same | 1 | 141 | 203/244 | 4677 | 16 mir: HasErrors; 15 mir: UnresolvedMethod; 6 mir: MissingFunctionDefinition |
-| bumpalo | same | 1 | 5 | 33/33 | 310 |  |
-| bytemuck | same | 10 | 33 | 73/73 | 750 |  |
-| byteorder | same | 1 | 680 | 1140/1140 | 1634 |  |
-| bytes | same | 13 | 1055 | 1561/1561 | 4329 |  |
-| camino | same | 2 | 9 | 713/713 | 549 |  |
-| chrono | same | 4 | 291 | 1847/1847 | 6700 |  |
-| crc32fast | same | 2 | 12 | 108/108 | 847 |  |
-| crossbeam_channel | same | 15 | 391 | 628/628 | 16021 |  |
-| crossbeam_epoch | same | 2 | 40 | 128/128 | 678 |  |
-| crossbeam_queue | same | 3 | 23 | 29/29 | 1046 |  |
-| crossbeam_utils | same | 7 | 62 | 423/423 | 3333 |  |
-| dashmap | same | 1 | 20 | 44/44 | 477 |  |
-| downcast_rs | same | 3 | 32 | 152/152 | 1349 |  |
-| either | same | 1 | 8 | 13/13 | 1057 |  |
-| fastrand | same | 3 | 32 | 77/77 | 740 |  |
-| flate2 | same | 6 | 80 | 369/369 | 1797 |  |
-| fnv | same | 1 | 1 | 8/8 | 327 |  |
-| futures_util | same | 1 | 1 | 50/50 | 1162 |  |
-| futures | DIFFERS | 31 | 84 | 106/106 | 11307 | differs: join_size select_on_non_unpin_size select_size try_join_size |
-| generic_array | same | 1 | 3 | 4/19 | 5490 | 13 mir: UnresolvedMethod; 1 layout of Alias; 1 layout of GenericArray<i32, |
-| half | same | 1 | 45 | 298/301 | 596 | 2 LLVM intrinsic `x86.vcvtps2ph.128`; 1 LLVM intrinsic `x86.vcvtps2ph.256` |
-| hashbrown | same | 7 | 113 | 406/406 | 3764 |  |
-| heapless | same | 3 | 227 | 431/431 | 3721 |  |
-| hex_literal | same | 2 | 8 | 11/11 | 113 |  |
-| im | same | 1 | 106 | 121/127 | 9137 | 3 layout of TestError<; 3 mir: TypeError |
-| indexmap | same | 5 | 183 | 281/281 | 6055 |  |
-| itertools | same | 14 | 450 | 800/809 | 22532 | 6 mir: NotSupported; 3 layout of [[ |
-| lazy_static | same | 3 | 1 | 1/1 | 138 |  |
-| libm | same | 1 | 116 | 1200/1200 | 1255 |  |
-| log | same | 3 | 33 | 243/243 | 890 |  |
-| lru | same | 1 | 59 | 68/68 | 720 |  |
-| memchr | same | 1 | 142 | 718/718 | 1288 |  |
-| memmap2 | same | 1 | 27 | 129/129 | 394 |  |
-| miniz_oxide | same | 1 | 29 | 237/237 | 524 |  |
-| nalgebra | same | 1 | 21 | 70/73 | 16077 | 3 mir: MissingFunctionDefinition |
-| nom | same | 16 | 268 | 899/899 | 21913 |  |
-| num_bigint | same | 9 | 168 | 3733/3733 | 4450 |  |
-| num_complex | same | 1 | 92 | 401/401 | 688 |  |
-| num_traits | same | 2 | 67 | 3985/3985 | 1913 |  |
-| once_cell | same | 1 | 5 | 25/25 | 700 |  |
-| ordered_float | same | 3 | 72 | 369/369 | 687 |  |
-| parking_lot | same | 3 | 91 | 325/325 | 1111 |  |
-| percent_encoding | same | 1 | 18 | 51/51 | 188 |  |
-| petgraph | same | 24 | 346 | 827/830 | 16528 | 3 mir: UnresolvedMethod |
-| pin_project_lite | same | 4 | 21 | 81/90 | 398 | 4 Duplicate definition of identifier: _RNvNvNvCs5zOgJOEO9oF_4t; 1 layout of Struct<#0, #1>: HasPlaceholder; 1 layout of PinRef<ReLateParam |
-| rand | same | 1 | 104 | 298/298 | 1565 |  |
-| rand_core | same | 4 | 11 | 36/36 | 475 |  |
-| rayon_core | same | 8 | 112 | 481/481 | 8325 |  |
-| rayon | same | 17 | 333 | 700/700 | 40674 |  |
-| regex_automata | same | 1 | 204 | 2265/2265 | 8872 |  |
-| regex_syntax | same | 1 | 147 | 985/985 | 2667 |  |
-| ryu | same | 9 | 47 | 167/169 | 850 | 2 layout of |
-| scopeguard | same | 1 | 8 | 14/14 | 164 |  |
-| serde_json | same | 8 | 144 | 765/765 | 9952 |  |
-| sha2 | same | 2 | 14 | 165/165 | 997 |  |
-| simd_json | DIFFERS | 8 | 473 | 1895/1895 | 11015 | differs: limit_fits_in_a_default_thread_stack |
-| siphasher | same | 1 | 13 | 148/148 | 216 |  |
-| slab | same | 3 | 47 | 102/102 | 1232 |  |
-| smallvec | same | 1 | 63 | 81/81 | 1369 |  |
-| smawk | same | 5 | 21 | 23/23 | 1109 |  |
-| smol_str | same | 3 | 26 | 162/162 | 2332 |  |
-| socket2 | same | 1 | 10 | 267/267 | 591 |  |
-| strsim | same | 2 | 96 | 133/133 | 890 |  |
-| textwrap | same | 3 | 163 | 312/312 | 4053 |  |
-| thiserror | same | 13 | 56 | 262/262 | 3159 |  |
-| thread_local | same | 1 | 9 | 26/26 | 380 |  |
-| time | same | 1 | 1 | 845/845 | 564 |  |
-| tinyvec | same | 2 | 19 | 25/25 | 865 |  |
-| triomphe | same | 1 | 63 | 77/79 | 1345 | 2 expected scalar |
-| typenum | same | 2 | 1762 | 2089/2089 | 8189 |  |
-| unicode_normalization | same | 1 | 13 | 62/62 | 651 |  |
-| unicode_segmentation | same | 2 | 23 | 351/351 | 1687 |  |
-| unicode_width | same | 2 | 35 | 107/107 | 1158 |  |
-| url | same | 2 | 67 | 487/487 | 3093 |  |
-| uuid | same | 1 | 62 | 323/323 | 306 |  |
-| winnow | same | 1 | 270 | 833/833 | 6761 |  |
-| zerocopy | same | 3 | 140 | 1346/1348 | 23135 | 1 call to `into`, which has no body and no rustc symbol; 1 mir: UnresolvedMethod |
-
-10746 tests, 41597/41692 functions from rustd
-
-    32  mir: UnresolvedMethod  (bitvec, generic_array, petgraph, zerocopy)
-    16  mir: HasErrors  (bitvec)
-     9  mir: MissingFunctionDefinition  (bitvec, nalgebra)
-     9  mir: NotSupported  (bitvec, itertools)
-     4  Duplicate definition of identifier: _RNvNvNvCs5zOgJOEO9oF_4t  (pin_project_lite)
-     3  layout of TestError<  (im)
-     3  mir: TypeError  (im)
-     3  layout of [[  (itertools)
-     2  LLVM intrinsic `x86.vcvtps2ph.128`  (half)
-     2  layout of  (ryu)
-     2  expected scalar  (triomphe)
-     1  const eval: MirEvalError  (bitvec)
-     1  layout of Alias  (generic_array)
-     1  layout of GenericArray<i32,  (generic_array)
-     1  LLVM intrinsic `x86.vcvtps2ph.256`  (half)
-     1  layout of Struct<#0, #1>: HasPlaceholder  (pin_project_lite)
-     1  layout of PinRef<ReLateParam  (pin_project_lite)
-     1  layout of NotUnpin<#0>: HasPlaceholder  (pin_project_lite)
-     1  layout of NotUnpinRef<ReLateParam  (pin_project_lite)
-     1  layout of Struct7<#0>: HasPlaceholder  (pin_project_lite)
-     1  call to `into`, which has no body and no rustc symbol  (zerocopy)
+| adler2 | same | 1 | 6 | 23/23 | 683 |  |
+| ahash | same | 3 | 38 | 185/185 | 2824 |  |
+| aho_corasick | same | 1 | 163 | 856/856 | 2675 |  |
+| anyhow | same | 15 | 73 | 215/215 | 27402 |  |
+| arc_swap | same | 4 | 52 | 123/123 | 15245 |  |
+| arrayvec | same | 4 | 52 | 66/66 | 1345 |  |
+| async_channel | same | 3 | 41 | 54/54 | 2039 |  |
+| bitflags | same | 1 | 54 | 824/824 | 2287 |  |
+| bitvec | same | 1 | 141 | 264/264 | 7635 |  |
+| bumpalo | same | 1 | 5 | 33/33 | 465 |  |
+| bytemuck | same | 10 | 33 | 73/73 | 3310 |  |
+| byteorder | same | 1 | 680 | 1140/1140 | 1932 |  |
+| bytes | same | 13 | 1055 | 1561/1561 | 11484 |  |
+| camino | same | 2 | 9 | 713/713 | 1890 |  |
+| chrono | same | 4 | 291 | 1847/1847 | 6204 |  |
+| crc32fast | same | 2 | 12 | 108/108 | 2928 |  |
+| crossbeam_channel | same | 15 | 391 | 628/628 | 21475 |  |
+| crossbeam_epoch | same | 2 | 40 | 128/128 | 1648 |  |
+| crossbeam_queue | same | 3 | 23 | 29/29 | 2075 |  |
+| crossbeam_utils | same | 7 | 62 | 423/423 | 14919 |  |
+| dashmap | same | 1 | 20 | 44/44 | 852 |  |
+| downcast_rs | same | 3 | 32 | 152/152 | 2210 |  |
+| either | same | 1 | 8 | 13/13 | 1482 |  |
+| fastrand | same | 3 | 32 | 77/77 | 3144 |  |
+| flate2 | same | 6 | 80 | 369/369 | 4363 |  |
+| fnv | same | 1 | 1 | 8/8 | 472 |  |
+| futures_util | same | 1 | 1 | 50/50 | 3675 |  |
+| futures | same | 31 | 84 | 106/106 | 16778 |  |
+| generic_array | same | 1 | 3 | 4/19 | 4500 | 13 mir: UnresolvedMethod; 1 layout of Alias; 1 layout of GenericArray<i32, |
+| half | same | 1 | 45 | 301/301 | 1503 |  |
+| hashbrown | same | 7 | 113 | 406/406 | 7122 |  |
+| heapless | same | 3 | 227 | 431/431 | 5228 |  |
+| hex_literal | same | 2 | 8 | 11/11 | 1052 |  |
+| im | same | 1 | 106 | 124/124 | 11933 |  |
+| indexmap | same | 5 | 183 | 281/281 | 9123 |  |
+| itertools | same | 14 | 450 | 809/809 | 27692 |  |
+| lazy_static | same | 3 | 1 | 1/1 | 909 |  |
+| libm | same | 1 | 116 | 1200/1200 | 2920 |  |
+| log | same | 3 | 33 | 243/243 | 2138 |  |
+| lru | same | 1 | 59 | 68/68 | 791 |  |
+| memchr | same | 1 | 142 | 718/718 | 3263 |  |
+| memmap2 | same | 1 | 27 | 129/129 | 1158 |  |
+| miniz_oxide | same | 1 | 29 | 237/237 | 1232 |  |
+| nalgebra | same | 1 | 21 | 70/70 | 11676 |  |
+| nom | same | 16 | 268 | 899/899 | 27030 |  |
+| num_bigint | same | 9 | 168 | 3733/3733 | 11579 |  |
+| num_complex | same | 1 | 92 | 401/401 | 1456 |  |
+| num_traits | same | 2 | 67 | 3985/3985 | 4169 |  |
+| once_cell | same | 1 | 5 | 25/25 | 1388 |  |
+| ordered_float | same | 3 | 72 | 369/369 | 3265 |  |
+| parking_lot | same | 3 | 91 | 325/325 | 2562 |  |
+| percent_encoding | same | 1 | 18 | 51/51 | 606 |  |
+| petgraph | same | 24 | 346 | 830/830 | 31381 |  |
+| pin_project_lite | same | 4 | 21 | 81/81 | 4578 |  |
+| rand | same | 1 | 104 | 298/298 | 1913 |  |
+| rand_core | same | 4 | 11 | 36/36 | 1521 |  |
+| rayon_core | same | 8 | 112 | 481/481 | 11188 |  |
+| rayon | same | 17 | 333 | 700/700 | 49835 |  |
+| regex_automata | same | 1 | 204 | 2265/2265 | 3403 |  |
+| regex_syntax | same | 1 | 147 | 985/985 | 3614 |  |
+| ryu | same | 9 | 47 | 169/169 | 4363 |  |
+| scopeguard | same | 1 | 8 | 14/14 | 423 |  |
+| serde_json | same | 8 | 144 | 765/765 | 19653 |  |
+| sha2 | same | 2 | 14 | 165/165 | 4165 |  |
+| simd_json | same | 8 | 473 | 1895/1895 | 25872 |  |
+| siphasher | same | 1 | 13 | 148/148 | 701 |  |
+| slab | same | 3 | 47 | 102/102 | 3297 |  |
+| smallvec | same | 1 | 63 | 81/81 | 1209 |  |
+| smawk | same | 5 | 21 | 23/23 | 4257 |  |
+| smol_str | same | 3 | 26 | 162/162 | 3379 |  |
+| socket2 | same | 1 | 10 | 267/267 | 1410 |  |
+| strsim | same | 2 | 96 | 133/133 | 1448 |  |
+| textwrap | same | 3 | 163 | 312/312 | 8134 |  |
+| thiserror | same | 13 | 56 | 262/262 | 19494 |  |
+| thread_local | same | 1 | 9 | 26/26 | 727 |  |
+| time | same | 1 | 1 | 845/845 | 1071 |  |
+| tinyvec | same | 2 | 19 | 25/25 | 2055 |  |
+| triomphe | same | 1 | 63 | 79/79 | 972 |  |
+| typenum | same | 2 | 1762 | 2089/2089 | 7670 |  |
+| unicode_normalization | same | 1 | 13 | 62/62 | 2050 |  |
+| unicode_segmentation | same | 2 | 23 | 351/351 | 3234 |  |
+| unicode_width | same | 2 | 35 | 107/107 | 2738 |  |
+| url | same | 2 | 67 | 487/487 | 4744 |  |
+| uuid | same | 1 | 62 | 323/323 | 1672 |  |
+| winnow | same | 1 | 270 | 833/833 | 10026 |  |
+| zerocopy | same | 3 | 140 | 1348/1348 | 13558 |  |
 
 ## Checks
 
+At `1c293327c1` unless it says otherwise.
+
 - `cargo fmt --all -- --check`: clean.
-- `cargo clippy -p hir-ty -p rustd --all-targets -- --cap-lints warn`: exit 0. It prints the
-  warnings the base branch already has; none is in the lines this branch adds to `probe.rs`,
-  `infer/path.rs`, `eval/shim.rs` or `codegen/asm.rs` (checked by filtering the output for
-  those files; I did not diff the whole warning list against the base).
+- `cargo clippy -p hir-ty -p rustd --all-targets -- --cap-lints warn`: exit 0, with the
+  warnings the base branch already has (deprecated `*_imm` Cranelift builders, `eprintln!`,
+  elidable `'db`); I did not diff the whole warning list against the base.
 - `cargo xtask tidy`: exit 0.
-- `cargo test -p hir-def -p hir-ty -p ide-diagnostics`: 510, 4 and 744 passed, 0 failed, at
-  `ffd6b4acd9`. hir-ty has only 4 unit tests in this fork. Earlier in the branch, `ide` passed
-  1342 tests after the macro changes; it was not rerun at the end.
-- `harness/stress.py` with rustd-14: 99 of 99 right, 0 restarts.
-- `harness/difftest.py corpus --bin runner --crate cases` with rustd-14: 661 of 662 functions,
-  MATCH. The one left is the `TypeId` of a function pointer type rustc has no symbol for, as
-  on the base branch.
-- `harness/breakers.py` with rustd-14: 13 of 13 right, 3 open (`future_size`, `f16c`,
-  `unsized_tail_cmp`), 0 functions skipped that are not listed as open.
+- `cargo test -p <crate>` at `40992f988e` (`~/sweep/tests29.log`; the one commit after
+  touches only `codegen/home.rs`): hir-ty 4, mbe 7 + 33, hir-def 511, syntax-bridge 9,
+  span 9, hir 0, ide 1342, ide-completion 764, ide-diagnostics 744, parser 330 passed,
+  0 failed. `tt`'s unit tests do not compile (`SyntaxContext::is_root` is not a method on
+  this branch), and do not on `rustd-spike` either (checked in a worktree of it): not this
+  branch's.
+- `harness/breakers.py` with rustd-30: 25 of 25 right, 0 open, 0 functions skipped
+  (`~/sweep/breakers30.log`).
+- `harness/difftest.py corpus --bin runner --crate cases` with rustd-30:
+  661 of 662 functions, MATCH. The one left is the `TypeId` of a function pointer type rustc
+  has no symbol for, as on the base branch.
+- `harness/stress.py` with rustd-30: 99 of 99 right, 0 restarts (`~/sweep/stress30.log`).
 
 ## Unverified or open
 
 - The dx benchmark (1839 of 1839 functions) was not rerun on this branch. The Dioxus target
-  directory was wiped for disk space, and a rebuild did not fit beside the sweeps. Fixes 2, 3
-  and 6 change which functions rustd names and how paths resolve, so that number should be
-  rechecked before this is merged anywhere.
+  directory was wiped for disk space, and a rebuild did not fit beside the sweeps. Causes 2,
+  3, 6, 17, 21 and 27 change which functions rustd names, which impls it knows and which
+  crate it compiles an instance from, so that number should be rechecked before this is
+  merged anywhere.
+- Cause 27 has no reduced case: the reduction I wrote compiled before the fix too. The
+  async-channel sweep entry is its only regression test.
 - Timing: only rustd's codegen time per crate was recorded. I did not measure rustd's wall
   time against cargo's per crate.
 - The crate versions are the ones listed at the end of this report. The binaries are the
   default branch of each repository as cloned during the session, not pinned to a commit.
 - macOS and aarch64 were not run. `xgetbv`, `clmul` and `f16c` are x86-64 only and return a
   constant elsewhere.
-- The final sweep ran while `stress.py` and the seven binaries were running on the same
-  machine, so the codegen times in the table are on a loaded machine.
-
 ## Versions
 
 serde_json-1.0.154 itertools-0.15.0 nalgebra-0.35.0 either-1.19.0 anyhow-1.0.104
