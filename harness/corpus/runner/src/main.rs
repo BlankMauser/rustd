@@ -136,7 +136,11 @@ fn main() {
     let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
     case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
 
-    if is_x86_feature_detected!("ssse3") {
+    #[cfg(target_arch = "x86_64")]
+    let shuffles = is_x86_feature_detected!("ssse3");
+    #[cfg(target_arch = "aarch64")]
+    let shuffles = std::arch::is_aarch64_feature_detected!("neon");
+    if shuffles {
         case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
     }
     case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
@@ -179,7 +183,6 @@ fn main() {
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
     println!("const_unsized_struct {:?}", cases::const_unsized_struct::run());
-    #[cfg(target_arch = "x86_64")]
     println!("inline_asm {:?}", cases::inline_asm::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
@@ -270,6 +273,8 @@ fn main() {
     println!("lifetime_impl_consts {}", cases::lifetime_impl_consts::run());
     #[cfg(target_arch = "x86_64")]
     println!("simd_x86 {}", cases::simd_x86::run());
+    #[cfg(target_arch = "aarch64")]
+    println!("simd_aarch64 {}", cases::simd_aarch64::run());
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
     println!("module_paths {}", cases::module_paths::run());
     println!("fn_thread_local {:?}", cases::fn_thread_local::run());

@@ -24,10 +24,40 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
 
 
+def host():
+    return subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
+
+
+# RUSTD_TARGET names the triple to build for when it is not the host. Cargo builds for it, rustd
+# emits for it, and the binaries run under what RUSTD_RUNNER names (for aarch64 Linux on another
+# machine, qemu's user mode with the sysroot the cross linker links against).
+TARGET = os.environ.get("RUSTD_TARGET") or None
+CROSS = {
+    "aarch64-unknown-linux-gnu": {"linker": "aarch64-linux-gnu-gcc", "runner": "qemu-aarch64 -L /usr/aarch64-linux-gnu"},
+}
+if TARGET and TARGET != host():
+    _cross, _env = CROSS.get(TARGET, {}), "CARGO_TARGET_" + TARGET.upper().replace("-", "_")
+    if "linker" in _cross:
+        os.environ.setdefault(_env + "_LINKER", _cross["linker"])
+    if "runner" in _cross:
+        os.environ.setdefault("RUSTD_RUNNER", _cross["runner"])
+        os.environ.setdefault(_env + "_RUNNER", os.environ["RUSTD_RUNNER"])
+# What a built binary is started with.
+RUNNER = shlex.split(os.environ.get("RUSTD_RUNNER", ""))
+# What cargo and rustd take to build for the target.
+TARGET_ARGS = ["--target", TARGET] if TARGET else []
+
+
+def linker_line(output):
+    """The line of `--print link-args`, as the arguments from the linker driver on."""
+    args = shlex.split(next(l for l in output.splitlines() if '"-o" "' in l))
+    # The environment the driver runs in comes first, as assignments.
+    return args[next(i for i, a in enumerate(args) if "=" not in a):]
+
+
 def sysroot_rlibs():
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-    host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
-    lib = f"{sysroot}/lib/rustlib/{host}/lib"
+    lib = f"{sysroot}/lib/rustlib/{TARGET or host()}/lib"
     return [p for n in ("core", "alloc", "std") for p in glob.glob(f"{lib}/lib{n}-*.rlib")]
 
 
@@ -61,16 +91,15 @@ class Fixture:
         if self.alone:
             env.update(RUSTC_WORKSPACE_WRAPPER=RUSTD, RUSTD_WRAPS_RUSTC="1",
                        CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
-            host = subprocess.check_output(["rustc", "-vV"], text=True, cwd=self.ws).split("host: ")[1].split()[0]
-            target = ["--target", host]
+            target = ["--target", TARGET or host()]
+        elif TARGET:
+            target = TARGET_ARGS
         out = subprocess.run(
             ["cargo", "rustc", *self.target_args, *target, "--", "--print", "link-args", "-C", "save-temps"],
             cwd=self.ws, capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
-        line = next(l for l in (out.stdout + out.stderr).splitlines() if '"cc"' in l)
-        args = shlex.split(line)
-        self.link_args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
+        self.link_args = [a for a in linker_line(out.stdout + out.stderr) if not a.endswith("symbols.o")]
         self.reference = self.link_args[self.link_args.index("-o") + 1]
         # The target's own objects too: a crate rustd rebuilds may be the one being linked.
         self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
@@ -87,7 +116,7 @@ class Fixture:
                 run = subprocess.run(
                     [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj, "--report", report,
                      "--deny", deny_file, "--isolate", os.path.join(self.work, f"{label(crate)}.isolated"),
-                     *self.rustd_args, *symbols],
+                     *self.rustd_args, *TARGET_ARGS, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,
                     env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:
@@ -123,7 +152,7 @@ class Fixture:
         allowed = 900 if binary == self.reference else max(120, 30 * getattr(self, "reference_secs", 0))
         start = time.monotonic()
         try:
-            run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=allowed)
+            run = subprocess.run([*RUNNER, binary, *self.run_args], capture_output=True, timeout=allowed)
             if binary == self.reference:
                 self.reference_secs = time.monotonic() - start
             # The thread id in a panic message differs from run to run.
@@ -206,7 +235,8 @@ def memcheck(fx):
     """Runs the rustd binary under valgrind: the first invalid access is usually the miscompile,
     where the crash or wrong output is only what it led to. Returns the error blocks."""
     import re, shutil
-    if not shutil.which("valgrind"):
+    # Valgrind runs what the machine runs, not what an emulator does.
+    if RUNNER or not shutil.which("valgrind"):
         return None
     log = os.path.join(fx.work, "valgrind.log")
     try:
