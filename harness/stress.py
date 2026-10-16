@@ -300,6 +300,9 @@ def main():
                     open(path, "a").write(op[2])
                 elif op[0] == "delete":
                     os.remove(path)
+        if os.environ.get("RUSTD_PATCH_FIRST"):
+            # The edit is first built for a request that does not link.
+            subprocess.run([RUSTD, "patch", socket], capture_output=True, text=True, timeout=120)
         asked = time.time()
         try:
             asked_for = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=120)

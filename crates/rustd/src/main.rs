@@ -2417,6 +2417,9 @@ struct Unbuilt {
     edited: Vec<vfs::FileId>,
     /// Whether there is anything to build even when no file has changed since.
     stale: bool,
+    /// Whether the last build was for a request that does not link, which leaves the
+    /// executable to the next that does.
+    unlinked: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
@@ -2889,8 +2892,11 @@ fn main() -> anyhow::Result<()> {
                         Ok((args, table)) => {
                             // Never built: every file is as good as edited, but those were
                             // checked when the programs before it were built.
-                            let unbuilt =
-                                Unbuilt { edited: programs[0].unbuilt.edited.clone(), stale: true };
+                            let unbuilt = Unbuilt {
+                                edited: programs[0].unbuilt.edited.clone(),
+                                stale: true,
+                                unlinked: false,
+                            };
                             let mut program = Program {
                                 args,
                                 table,
@@ -3039,6 +3045,10 @@ fn main() -> anyhow::Result<()> {
             true => clients.iter().map(|it| it.0).collect(),
             false => FxHashSet::from_iter([0]),
         };
+        for (at, (request, ..)) in &clients {
+            let unbuilt = &mut programs[*at].unbuilt;
+            unbuilt.stale |= unbuilt.unlinked && *request != Request::Patch;
+        }
         let stale = building.iter().any(|&at| programs[at].unbuilt.stale) || !moved.is_empty();
         let (noticed, age) = match noticed {
             Some(noticed) => noticed,
@@ -3499,7 +3509,8 @@ impl Program {
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
         } else {
-            *unbuilt = Unbuilt::default();
+            let unlinked = args.link_cmd.is_some() && !link_it;
+            *unbuilt = Unbuilt { unlinked, ..Unbuilt::default() };
         }
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
