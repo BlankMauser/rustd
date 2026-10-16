@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 
 use super::store::Store;
 
+mod aarch64;
+
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
 
@@ -157,13 +159,16 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
     }
 }
 
-/// The function for a block on x86-64.
+/// The function for a block, on the architectures that have one written: x86-64 here.
 pub(super) fn wrapper(
     arch: &str,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
+    if arch == "aarch64" {
+        return aarch64::wrapper(template, options, operands);
+    }
     if arch != "x86_64" {
         return Err(format!("inline assembly for {arch}"));
     }

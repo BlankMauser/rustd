@@ -86,7 +86,8 @@ def splice(program):
 
 
 def main():
-    work = tempfile.mkdtemp(prefix="rustd-worktrees-")
+    # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-worktrees-"))
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
     crates = ["sapp", "sbase", "smid"]
     checkouts = []
