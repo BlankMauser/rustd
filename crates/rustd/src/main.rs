@@ -42,7 +42,8 @@ use hir_def::{
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty::mir::codegen::{
-    CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver, exported_symbol,
+    Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
+    exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -2516,6 +2517,10 @@ fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     let mut args = Args::parse()?;
+    let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
+    if backend != Backend::Cranelift {
+        eprintln!("backend: {backend}");
+    }
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.

@@ -182,6 +182,17 @@ additions so the backend can sit in its own crate.
 
 **Cranelift.** Used as a library through `cranelift-object`. No changes needed so far.
 
+**LLVM.** An optional second producer of a function's machine code, built with
+`cargo build -p rustd --release --features llvm` (needs LLVM 20; set `LLVM_SYS_201_PREFIX` to
+its prefix) and chosen with `RUSTD_BACKEND=llvm`. `RUSTD_OPT=0..3` sets the level, 2 by
+default. It takes the Cranelift IR the front half builds, so layout and calling conventions
+are decided once for both, and gives back the same thing Cranelift does: bytes, relocations
+against the function's requests, and unwind rules (`codegen/backend.rs` says what a producer
+owes, `codegen/llvm.rs` how LLVM pays it). Each function is compiled alone, with nothing
+inlined across functions. A function LLVM has no answer for is compiled by Cranelift and
+counted with the reason on the `backend:` lines of the log. `harness/backends.py` compares
+the producers on a program.
+
 **CAS.** Keys are (toolchain, crate source hash, flags, dependency keys) for rustc artifacts and
 (function MIR hash, instance args, toolchain) for rustd objects. Independent of the backend
 and useful on its own for clean builds.

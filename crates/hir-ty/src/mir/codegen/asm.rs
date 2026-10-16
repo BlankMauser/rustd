@@ -312,7 +312,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
     let code: Arc<[u8]> = match store.and_then(|it| it.get(&key)) {
         Some(code) => code.into(),
         None => {
-            let code: Arc<[u8]> = run_assembler(triple, text, &key)?.into();
+            let code: Arc<[u8]> = Assembler::selected().assemble(triple, text, &key)?.into();
             if let Some(store) = store {
                 store.insert(&key, &code);
             }
@@ -323,6 +323,34 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         assembled.insert(key, code.clone());
     }
     Ok(code)
+}
+
+/// What turns the text of a block into an object file.
+#[derive(Clone, Copy)]
+enum Assembler {
+    /// rustc, run as a process: the one assembler sure to be there.
+    Rustc,
+    /// LLVM's, in this process, when LLVM is the producer of code.
+    #[cfg(feature = "llvm")]
+    Llvm,
+}
+
+impl Assembler {
+    fn selected() -> Assembler {
+        match super::Backend::from_env() {
+            #[cfg(feature = "llvm")]
+            Ok(super::Backend::Llvm(_)) => Assembler::Llvm,
+            _ => Assembler::Rustc,
+        }
+    }
+
+    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+        match self {
+            Assembler::Rustc => run_assembler(triple, text, key),
+            #[cfg(feature = "llvm")]
+            Assembler::Llvm => code(&super::llvm::assemble(text)?),
+        }
+    }
 }
 
 /// FIXME: this runs rustc, which is the one assembler sure to be there and to read what

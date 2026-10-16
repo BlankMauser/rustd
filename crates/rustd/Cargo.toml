@@ -40,5 +40,8 @@ tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
 # Allocate with jemalloc, which can profile the heap: see `memory.rs`.
 heap-profile = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
+# Adds LLVM as a code producer, chosen with `RUSTD_BACKEND=llvm`.
+llvm = ["hir-ty/llvm"]
+
 [lints]
 workspace = true

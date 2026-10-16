@@ -5,7 +5,10 @@ use cranelift_codegen::{
     Context, FinalizedMachExceptionHandler,
     gimli::{
         self, Encoding, Format, RunTimeEndian, SectionId,
-        write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Writer},
+        write::{
+            Address, CallFrameInstruction, CieId, EhFrame, EndianVec, FrameDescriptionEntry,
+            FrameTable, Result as WriteResult, Writer,
+        },
     },
     ir::{AbiParam, Signature, types},
     isa::{TargetIsa, unwind::UnwindInfo},
@@ -44,9 +47,66 @@ fn address_for_data(data: DataId) -> Address {
 /// where the function ends up.
 #[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct FunctionUnwind {
-    info: cranelift_codegen::isa::unwind::systemv::UnwindInfo,
-    /// The function's `.gcc_except_table` entry.
-    landing_pads: Vec<u8>,
+    frame: Frame,
+    /// The function's `.gcc_except_table` entry. A function without one has no call that
+    /// lands anywhere, and no personality to ask.
+    landing_pads: Option<Vec<u8>>,
+}
+
+/// How to find the caller's frame at each place in a function, as the producer of its code
+/// tells it.
+#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+enum Frame {
+    Cranelift(cranelift_codegen::isa::unwind::systemv::UnwindInfo),
+    Rows(FrameRows),
+}
+
+/// The rules of a function's `.eh_frame` entry, each with the offset in the function it
+/// holds from.
+#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub(super) struct FrameRows {
+    /// How many bytes of code the rules cover.
+    pub(super) len: u32,
+    pub(super) rows: Vec<(u32, FrameRule)>,
+}
+
+/// A DWARF call frame instruction. Registers are DWARF register numbers, offsets are bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub(super) enum FrameRule {
+    Cfa(u16, i32),
+    CfaRegister(u16),
+    CfaOffset(i32),
+    Offset(u16, i32),
+    Restore(u16),
+    SameValue(u16),
+    Undefined(u16),
+    RememberState,
+    RestoreState,
+    ArgsSize(u32),
+}
+
+impl FrameRule {
+    /// What holds where a function of the System V x86-64 ABI is entered, which the entry
+    /// every function shares says: the frame is eight bytes above the stack pointer, and
+    /// the return address is at its bottom.
+    #[cfg(feature = "llvm")]
+    pub(super) const ON_ENTRY: [FrameRule; 2] = [FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)];
+
+    fn instruction(self) -> CallFrameInstruction {
+        let register = gimli::Register;
+        match self {
+            FrameRule::Cfa(reg, offset) => CallFrameInstruction::Cfa(register(reg), offset),
+            FrameRule::CfaRegister(reg) => CallFrameInstruction::CfaRegister(register(reg)),
+            FrameRule::CfaOffset(offset) => CallFrameInstruction::CfaOffset(offset),
+            FrameRule::Offset(reg, offset) => CallFrameInstruction::Offset(register(reg), offset),
+            FrameRule::Restore(reg) => CallFrameInstruction::Restore(register(reg)),
+            FrameRule::SameValue(reg) => CallFrameInstruction::SameValue(register(reg)),
+            FrameRule::Undefined(reg) => CallFrameInstruction::Undefined(register(reg)),
+            FrameRule::RememberState => CallFrameInstruction::RememberState,
+            FrameRule::RestoreState => CallFrameInstruction::RestoreState,
+            FrameRule::ArgsSize(size) => CallFrameInstruction::ArgsSize(size),
+        }
+    }
 }
 
 impl FunctionUnwind {
@@ -96,23 +156,54 @@ impl FunctionUnwind {
         let mut writer = WriterRelocate::new();
         table.write(&mut writer, encoding).map_err(|e| e.to_string())?;
         debug_assert!(writer.relocs.is_empty());
-        Ok(Some(FunctionUnwind { info, landing_pads: writer.writer.into_vec() }))
+        Ok(Some(FunctionUnwind {
+            frame: Frame::Cranelift(info),
+            landing_pads: Some(writer.writer.into_vec()),
+        }))
+    }
+
+    /// The unwind information of code that came with its own.
+    #[cfg(feature = "llvm")]
+    pub(super) fn from_rows(rows: FrameRows, landing_pads: Option<Vec<u8>>) -> Self {
+        FunctionUnwind { frame: Frame::Rows(rows), landing_pads }
+    }
+
+    fn fde(&self, address: Address) -> FrameDescriptionEntry {
+        match &self.frame {
+            Frame::Cranelift(info) => info.to_fde(address),
+            Frame::Rows(FrameRows { len, rows }) => {
+                let mut fde = FrameDescriptionEntry::new(address, *len);
+                for &(offset, rule) in rows {
+                    fde.add_instruction(offset, rule.instruction());
+                }
+                fde
+            }
+        }
     }
 }
 
 pub(super) struct UnwindContext {
     frame_table: FrameTable,
-    cie: Option<CieId>,
+    cies: Option<Cies>,
+}
+
+/// The entries functions share: one that names the personality, for functions with landing
+/// pads, and one that does not.
+#[derive(Clone, Copy)]
+struct Cies {
+    with_landing_pads: CieId,
+    plain: CieId,
 }
 
 impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
         let Some(mut cie) = module.isa().create_systemv_cie() else {
-            return Ok(UnwindContext { frame_table, cie: None });
+            return Ok(UnwindContext { frame_table, cies: None });
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
+        let plain = frame_table.add_cie(cie.clone());
         cie.lsda_encoding = Some(pcrel);
 
         let pointer = module.target_config().pointer_type();
@@ -152,7 +243,8 @@ impl UnwindContext {
             address_for_data(personality_ref),
         ));
 
-        Ok(UnwindContext { cie: Some(frame_table.add_cie(cie)), frame_table })
+        let with_landing_pads = frame_table.add_cie(cie);
+        Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table })
     }
 
     /// Records the frame layout and the landing pads of a compiled function.
@@ -162,16 +254,20 @@ impl UnwindContext {
         func: FuncId,
         unwind: &FunctionUnwind,
     ) -> Result<(), String> {
-        let Some(cie) = self.cie else { return Ok(()) };
-        let mut fde = unwind.info.to_fde(address_for_func(func));
+        let Some(cies) = self.cies else { return Ok(()) };
+        let mut fde = unwind.fde(address_for_func(func));
+        let Some(landing_pads) = &unwind.landing_pads else {
+            self.frame_table.add_fde(cies.plain, fde);
+            return Ok(());
+        };
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
-        data.define(unwind.landing_pads.clone().into_boxed_slice());
+        data.define(landing_pads.clone().into_boxed_slice());
         data.set_custom_section(".gcc_except_table");
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
         fde.lsda = Some(address_for_data(lsda));
 
-        self.frame_table.add_fde(cie, fde);
+        self.frame_table.add_fde(cies.with_landing_pads, fde);
         Ok(())
     }
 
