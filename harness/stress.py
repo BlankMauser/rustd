@@ -13,7 +13,7 @@ import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs, ALLOW_DUPLICATES, TARGET_ARGS, built, command
+from difftest import Fixture, RUSTD, sysroot_rlibs, AHEAD, TARGET_ARGS, built, command
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -219,7 +219,7 @@ def main():
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
         first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, ALLOW_DUPLICATES]
+        link[first:first] = [patch, obj, *AHEAD]
         link[link.index("-o") + 1] = binary
         for path in (socket, binary):
             if os.path.exists(path):

@@ -1682,10 +1682,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .type_of_type_placeholder(offset.container)
             .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
         let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
-        let null = Operand::from_bytes(
-            word_bytes(0),
-            self.result.locals[base].ty.as_ref(),
-        );
+        let null = Operand::from_bytes(word_bytes(0), self.result.locals[base].ty.as_ref());
         self.push_assignment(current, base.into(), null.into(), span);
         let mut place = Place::from(base).project(ProjectionElem::Deref);
         let mut variant = None;

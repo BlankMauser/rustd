@@ -120,7 +120,13 @@ pub(super) fn from_elf(
     imports.import(
         ENV,
         "__linear_memory",
-        MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None },
+        MemoryType {
+            minimum: 0,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        },
     );
     imports.import(
         ENV,
@@ -177,8 +183,7 @@ pub(super) fn from_elf(
                 }
                 None => {
                     let flags = flags(&symbol) | UNDEFINED;
-                    let index =
-                        writer.symbol(SymbolType::Data, flags, |entry| name.encode(entry));
+                    let index = writer.symbol(SymbolType::Data, flags, |entry| name.encode(entry));
                     symbol_of.insert(symbol.index(), (index, false));
                 }
             },
@@ -270,11 +275,12 @@ pub(super) fn from_elf(
                 .ok_or_else(|| format!("wasm object: `{name}` out of range"))?;
             std::borrow::Cow::Borrowed(bytes)
         };
-        // The symbol is where its own alignment and its section's allow.
-        let align = match symbol.address() {
-            0 => section.align().max(1),
-            address => section.align().max(1).min(1 << address.trailing_zeros()),
-        };
+        // The symbol is where its own alignment and its section's allow, and no type is
+        // aligned to more than a power of two its size is a multiple of.
+        let align = [symbol.address(), size as u64]
+            .into_iter()
+            .filter(|&it| it != 0)
+            .fold(section.align().max(1), |align, it| align.min(1 << it.trailing_zeros()));
         address = address.next_multiple_of(align as u32);
         // An active segment of memory 0, at a constant address.
         0u32.encode(&mut writer.data);
@@ -317,7 +323,8 @@ pub(super) fn from_elf(
 
     defined.sort_by_key(|it| (it.section.0, it.address));
     let containing = |section: SectionIndex, address: u64| {
-        let after = defined.partition_point(|it| (it.section.0, it.address) <= (section.0, address));
+        let after =
+            defined.partition_point(|it| (it.section.0, it.address) <= (section.0, address));
         let found = &defined[after.checked_sub(1)?];
         // The address one past a symbol is the next one's, except past the last.
         (found.section == section && address <= found.address + found.size).then_some(found)
@@ -365,7 +372,8 @@ pub(super) fn from_elf(
             let Some(within) = within.checked_sub(place.skip) else {
                 return Err("wasm object: relocation in the header of a function".to_owned());
             };
-            let reloc = Reloc { ty, offset: place.at + within, index: symbol, addend: addend as i32 };
+            let reloc =
+                Reloc { ty, offset: place.at + within, index: symbol, addend: addend as i32 };
             if in_code { writer.code_relocs.push(reloc) } else { writer.data_relocs.push(reloc) }
         }
     }

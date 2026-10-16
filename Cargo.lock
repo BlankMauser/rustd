@@ -3061,6 +3061,8 @@ dependencies = [
  "triomphe",
  "ureq",
  "vfs",
+ "wasm-encoder",
+ "wasmparser 0.236.1",
  "zstd",
 ]
 
@@ -4134,6 +4136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9b1e81f3eb254cf7404a82cee6926a4a3ccc5aad80cc3d43608a070c67aa1d7"
 dependencies = [
  "bitflags 2.12.1",
+ "indexmap",
 ]
 
 [[package]]

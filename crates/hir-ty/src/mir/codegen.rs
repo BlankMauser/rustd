@@ -92,9 +92,9 @@ mod store;
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{pack_name, seal_left_open};
+mod target;
 mod type_id;
 mod unwind;
-mod target;
 pub use target::{Calls, Target};
 mod vtable;
 mod wasm;
@@ -4994,7 +4994,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     target.align = target.align.max(item.align);
                     target.bytes.extend(item.bytes);
                 }
-                bytes[word()..2 * word()].copy_from_slice(&(items.len() as u64).to_le_bytes()[..word()]);
+                bytes[word()..2 * word()]
+                    .copy_from_slice(&(items.len() as u64).to_le_bytes()[..word()]);
                 target
             }
             TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
@@ -5057,8 +5058,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // Const eval gives a vtable as an id into its table of types.
                 let pointee = match pointee.kind() {
                     TyKind::Dynamic(..) => {
-                        let erased =
-                            blob.usize_at(offset + word()).and_then(|id| map.map.vtable_ty(id).ok());
+                        let erased = blob
+                            .usize_at(offset + word())
+                            .and_then(|id| map.map.vtable_ty(id).ok());
                         let Some(erased) = erased else {
                             unsupported!("`dyn` constant without a known type");
                         };
@@ -5086,7 +5088,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         Some(elem) => self.layout(elem)?.align.abi.bytes(),
                         None => 1,
                     };
-                    blob.bytes[offset..offset + word()].copy_from_slice(&align.to_le_bytes()[..word()]);
+                    blob.bytes[offset..offset + word()]
+                        .copy_from_slice(&align.to_le_bytes()[..word()]);
                     return Ok(());
                 }
                 if let Some(&target) = map.defined.get(&start) {
@@ -6285,7 +6288,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = generic_args.type_at(0);
             let (src, _) = self.operand(pointer)?;
             let addr = self.builder.ins().load(ptr(), MEM, src, 0);
-            let meta = self.is_unsized(ty).then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
+            let meta =
+                self.is_unsized(ty).then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
             self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
@@ -6737,7 +6741,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let slots = trait_ref.map_or_else(Vec::new, |it| VtableLayout::of(self.interner, it).slots);
         let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * word()];
         bytes[word()..2 * word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..word()]);
-        bytes[2 * word()..3 * word()].copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..word()]);
+        bytes[2 * word()..3 * word()]
+            .copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..word()]);
         let mut blob =
             ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: word() as u64 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
@@ -8008,8 +8013,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("size_of_val" | "align_of_val", [arg]) => {
                 let (src, _) = self.operand(arg)?;
                 let ty = generic_args.type_at(0);
-                let meta =
-                    self.is_unsized(ty).then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
+                let meta = self
+                    .is_unsized(ty)
+                    .then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
                 let (size, align) = self.size_and_align_of_val(ty, meta)?;
                 let value = if name == "size_of_val" { size } else { align };
                 self.builder.ins().store(MEM, value, dst, 0);

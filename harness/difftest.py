@@ -5,6 +5,10 @@ usage: difftest.py <workspace> --bin <package> --crate <name> [--crate <name> ..
 
 Exit code 0 when stdout, stderr and exit status match. With --bisect, each rustd function is
 also linked in on its own to name the ones that change behaviour.
+
+RUSTD_TARGET=wasm32-wasip1 builds both sides for that target and runs them under wasmtime
+(RUSTD_WASM_RUNNER names another runner); the other harnesses take it the same way. See
+WASM32.md.
 """
 import re
 import argparse, glob, json, os, shlex, subprocess, sys, tempfile, time
@@ -31,6 +35,12 @@ WASM = bool(TARGET) and TARGET.startswith("wasm32")
 WASM_RUNNER = shlex.split(os.environ.get("RUSTD_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608 -S inherit-env"))
 # What a harness adds for the target: to a link line, and to a rustd or cargo command line.
 ALLOW_DUPLICATES = "--allow-multiple-definition" if WASM else "-Wl,--allow-multiple-definition"
+# What a link line gets after rustd's objects, which define again what rustc's do. A wasm
+# module that edits are spliced into has to keep its symbol table, as it names nothing but
+# its exports otherwise, and keeps what nothing calls yet, as an edit may. `RUSTD_LINK_ARGS`
+# is what it gets instead of those.
+SPLICED = "--emit-relocs --no-gc-sections" if WASM and os.environ.get("RUSTD_SPLICE") else ""
+AHEAD = [ALLOW_DUPLICATES, *shlex.split(os.environ.get("RUSTD_LINK_ARGS", SPLICED))]
 TARGET_ARGS = ["--target", TARGET] if TARGET else []
 
 

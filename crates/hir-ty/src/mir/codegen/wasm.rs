@@ -982,8 +982,8 @@ impl<'a> Lower<'a> {
                 let [value] = values else {
                     return Err("wasm: return and signature disagree".to_owned());
                 };
-                let signed = self.func.signature.returns[0].extension
-                    == ir::ArgumentExtension::Sext;
+                let signed =
+                    self.func.signature.returns[0].extension == ir::ArgumentExtension::Sext;
                 self.get_for(*value, signed)?;
             }
             Returned::Through(places) => {
