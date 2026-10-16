@@ -33,7 +33,8 @@ def host():
 # machine, qemu's user mode with the sysroot the cross linker links against).
 TARGET = os.environ.get("RUSTD_TARGET") or None
 CROSS = {
-    "aarch64-unknown-linux-gnu": {"linker": "aarch64-linux-gnu-gcc", "runner": "qemu-aarch64 -L /usr/aarch64-linux-gnu"},
+    "aarch64-unknown-linux-gnu": {"linker": "aarch64-linux-gnu-gcc", "runner": "qemu-aarch64 -L /usr/aarch64-linux-gnu",
+                                  "binutils": "aarch64-linux-gnu-"},
 }
 if TARGET and TARGET != host():
     _cross, _env = CROSS.get(TARGET, {}), "CARGO_TARGET_" + TARGET.upper().replace("-", "_")
@@ -45,6 +46,8 @@ if TARGET and TARGET != host():
 if TARGET:
     # Every cargo a harness runs builds for the target, and so does every rustd.
     os.environ["CARGO_BUILD_TARGET"] = TARGET
+# What the names of strip and the like begin with for the target.
+BINUTILS = os.environ.get("RUSTD_BINUTILS") or (CROSS.get(TARGET, {}).get("binutils", "") if TARGET and TARGET != host() else "")
 # What a built binary is started with.
 RUNNER = shlex.split(os.environ.get("RUSTD_RUNNER", ""))
 # What cargo and rustd take to build for the target.

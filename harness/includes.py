@@ -5,7 +5,7 @@ The file is not a `.rs` file, so nothing loads it until the macro is expanded. E
 it or the file that includes it, asks the daemon for the program and compares what it prints
 with what `cargo build` of the same source prints.
 """
-import os, shlex, subprocess, sys, tempfile, time
+import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -89,8 +89,18 @@ def follow(files, steps):
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
+    def linked(seen):
+        """How the daemon made the binary since the log was `seen` long."""
+        links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
+        if not links:
+            return "no link"
+        return "spliced" if links[-1].startswith("spliced") else \
+            "full: " + (re.search(r"not spliced: (.*)", links[-1]) or [None, "not asked to splice"])[1]
+
     wrong = 0
-    for what, edits, broken in steps:
+    # A step may say after `broken` what the way the binary was made has to contain.
+    for what, edits, broken, *how in steps:
+        seen = len(open(log_path).read())
         for path, old, new in edits:
             text = open(os.path.join(ws, path)).read()
             assert old in text, (what, old)
@@ -111,6 +121,9 @@ def follow(files, steps):
             verdict = "REFUSED"
         else:
             verdict = "same" if run(binary) == run(os.path.join(profile_dir(reference), "sinc")) else "DIFFERENT OUTPUT"
+        made = linked(seen)
+        if how and not verdict.isupper() and how[0] not in made:
+            verdict = f"NOT {how[0]}: {made}"[:60]
         wrong += verdict.isupper()
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()

@@ -13,7 +13,7 @@ use cranelift_codegen::{
         condcodes::{FloatCC, IntCC},
         types,
     },
-    isa::{self, CallConv},
+    isa,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{
