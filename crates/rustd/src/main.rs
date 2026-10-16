@@ -210,6 +210,12 @@ impl Resolver<'_> {
         }
     }
 
+    fn in_generic_impl(&self, func: FunctionId) -> bool {
+        let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
+        let imp = hir::GenericDef::from(hir::Impl::from(imp));
+        !imp.type_or_const_params(self.db).is_empty()
+    }
+
     /// rustc's `StableCrateId` of a crate it built something of.
     fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         let krate = Crate::from(krate);
@@ -442,6 +448,11 @@ impl SymbolResolver for Resolver<'_> {
     fn function(&self, func: FunctionId) -> Option<String> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
+        }
+        // Not a function until the `impl<T>` it is in is given its types: there is nothing to
+        // name, the more so in a crate of such `impl`s alone, which rustc builds nothing of.
+        if self.in_generic_impl(func) {
+            return None;
         }
         let path = self.path(func)?;
         if let Some(symbol) = self.table.get(&path) {
