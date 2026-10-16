@@ -55,9 +55,16 @@ class Fixture:
     def rustc_build(self):
         """Builds with cargo and captures the linker line so rustd objects can be spliced in."""
         os.utime(self.touch)
+        env, target = dict(os.environ), []
+        if os.environ.get("RUSTD_ALONE"):
+            # rustc builds stand-ins for the workspace's crates: all of their code is rustd's.
+            env.update(RUSTC_WORKSPACE_WRAPPER=RUSTD, RUSTD_WRAPS_RUSTC="1",
+                       CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
+            host = subprocess.check_output(["rustc", "-vV"], text=True, cwd=self.ws).split("host: ")[1].split()[0]
+            target = ["--target", host]
         out = subprocess.run(
-            ["cargo", "rustc", *self.target_args, "--", "--print", "link-args", "-C", "save-temps"],
-            cwd=self.ws, capture_output=True, text=True)
+            ["cargo", "rustc", *self.target_args, *target, "--", "--print", "link-args", "-C", "save-temps"],
+            cwd=self.ws, capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
         line = next(l for l in (out.stdout + out.stderr).splitlines() if '"cc"' in l)

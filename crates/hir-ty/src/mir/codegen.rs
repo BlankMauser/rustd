@@ -1936,15 +1936,23 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 // rustc's copy of a function of the checkout is of the checkout as rustc
                 // built it, and uses rustc's copies of the statics.
                 let symbol = decl.linkage_name(id).into_owned();
-                if let FuncTarget::Instance(callee, _) = &request.target
-                    && self
-                        .stable_name(callee)
-                        .is_none_or(|it| stable::StableNames::of_checkout(&it))
-                {
-                    return self.kept.unkept("rustc's copy of a function of the checkout");
-                }
                 let checked = self.symbols.defines(&symbol);
-                CachedTarget::Import { symbol, checked }
+                let callee = match &request.target {
+                    FuncTarget::Instance(callee, _) => Some(self.stable_name(callee)),
+                    _ => None,
+                };
+                match callee {
+                    // Ours to compile, though under a symbol: rustc built nothing of its crate.
+                    Some(Some(name)) if !checked && stable::StableNames::of_checkout(&name) => {
+                        CachedTarget::Named(name.as_ref().to_owned())
+                    }
+                    Some(name)
+                        if name.as_ref().is_none_or(|it| stable::StableNames::of_checkout(it)) =>
+                    {
+                        return self.kept.unkept("rustc's copy of a function of the checkout");
+                    }
+                    _ => CachedTarget::Import { symbol, checked },
+                }
             } else if let FuncTarget::Instance(callee, _) = &request.target {
                 let Some(name) = self.stable_name(callee) else {
                     return self.kept.unkept("unnamed callee");
