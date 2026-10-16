@@ -9,7 +9,7 @@ import os, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, ALLOW_DUPLICATES, TARGET_ARGS, built, command
 
 TOML = """[package]
 name = "sinc"
@@ -69,14 +69,14 @@ def follow(files, steps):
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
     first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link[first:first] = [patch, obj, ALLOW_DUPLICATES]
     link[link.index("-o") + 1] = binary
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     # RUSTD_SPLICE: edits are added to the linked binary where that can be done.
     splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
     ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([RUSTD, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -84,7 +84,7 @@ def follow(files, steps):
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run(command(path), capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -100,7 +100,7 @@ def follow(files, steps):
         reply = subprocess.run([RUSTD, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
         took = (time.time() - began) * 1000
         reply = (reply.stdout + reply.stderr).strip()
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
         if daemon.poll() is not None:
@@ -110,7 +110,7 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(os.path.join(reference, "debug", "sinc")) else "DIFFERENT OUTPUT"
+            verdict = "same" if run(binary) == run(built(reference, "sinc")) else "DIFFERENT OUTPUT"
         wrong += verdict.isupper()
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()

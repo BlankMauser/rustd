@@ -1,14 +1,17 @@
 //! `simd_cast` had no lowering: every function that reached one was left to rustc. serde_json
 //! gets there through zmij's `_mm_mulhi_epu16`, which widens its lanes to multiply them.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// The lanes of a vector, as numbers.
+#[cfg(target_arch = "x86_64")]
 fn lanes<const N: usize, T: Copy + Into<i64>>(vector: __m128i) -> [i64; N] {
     let lanes: [T; N] = unsafe { std::mem::transmute_copy(&vector) };
     lanes.map(Into::into)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn run() -> Vec<[i64; 8]> {
     unsafe {
         let a = _mm_setr_epi16(1, -2, 300, -400, 32767, -32768, 12345, 0);
@@ -28,4 +31,9 @@ pub fn run() -> Vec<[i64; 8]> {
         let bytes = _mm_setr_epi8(-1, 2, -3, 4, -5, 6, -7, 8, 0, 0, 0, 0, 0, 0, 0, 0);
         vec![widened[0], widened[1], rest, lanes::<8, i16>(_mm_cvtepi8_epi16(bytes)), lanes::<8, i16>(_mm_cvtepu8_epi16(bytes))]
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn run() -> Vec<[i64; 8]> {
+    Vec::new()
 }

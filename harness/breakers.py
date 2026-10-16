@@ -10,7 +10,7 @@ import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture
+from difftest import Fixture, command
 
 CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
@@ -28,7 +28,7 @@ def main():
     skipped = [row for row in skipped if not any(f"::{name}::" in row[1] for name in LEFT)]
     for row in skipped:
         print(f"  skipped {row[1]}: {row[2][:300]}")
-    names = sys.argv[1:] or subprocess.check_output([fx.reference], text=True).split()
+    names = sys.argv[1:] or subprocess.check_output(command(fx.reference), text=True).split()
     wrong = fixed = 0
     for name in names:
         fx.run_args = [name]

@@ -393,7 +393,15 @@ pub(super) struct Patch {
 pub(super) fn empty_object() -> Result<Vec<u8>> {
     let builder =
         ObjectBuilder::new(target()?.clone(), "rustd", cranelift_module::default_libcall_names())?;
-    ObjectModule::new(builder).finish().emit().map_err(|e| CodegenError::Backend(e.to_string()))
+    let object = ObjectModule::new(builder)
+        .finish()
+        .emit()
+        .map_err(|e| CodegenError::Backend(e.to_string()))?;
+    if super::Target::current().is_wasm() {
+        return super::wasm_object::from_elf(&object, &Default::default())
+            .map_err(CodegenError::Backend);
+    }
+    Ok(object)
 }
 
 impl Base {

@@ -28,7 +28,20 @@ RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd"
 TARGET = os.environ.get("RUSTD_TARGET")
 WASM = bool(TARGET) and TARGET.startswith("wasm32")
 # What runs a wasm program, which gets the program and its arguments after it.
-WASM_RUNNER = shlex.split(os.environ.get("RUSTD_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608"))
+WASM_RUNNER = shlex.split(os.environ.get("RUSTD_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608 -S inherit-env"))
+# What a harness adds for the target: to a link line, and to a rustd or cargo command line.
+ALLOW_DUPLICATES = "--allow-multiple-definition" if WASM else "-Wl,--allow-multiple-definition"
+TARGET_ARGS = ["--target", TARGET] if TARGET else []
+
+
+def command(binary):
+    """What runs a built program."""
+    return [*(WASM_RUNNER if WASM else []), binary]
+
+
+def built(target_dir, name):
+    """Where cargo leaves the program `name`."""
+    return os.path.join(target_dir, *([TARGET] if TARGET else []), "debug", name + (".wasm" if WASM else ""))
 
 
 def host():
@@ -105,7 +118,7 @@ class Fixture:
                 run = subprocess.run(
                     [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj, "--report", report,
                      "--deny", deny_file, "--isolate", os.path.join(self.work, f"{label(crate)}.isolated"),
-                     *(["--target", TARGET] if TARGET else []), *self.rustd_args, *symbols],
+                     *TARGET_ARGS, *self.rustd_args, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,
                     env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:
@@ -126,7 +139,7 @@ class Fixture:
             # Nothing of the workspace is rustc's for rustd's to be defined a second time.
             args[first:first] = objects
         else:
-            args[first:first] = objects + ["--allow-multiple-definition" if WASM else "-Wl,--allow-multiple-definition"]
+            args[first:first] = objects + [ALLOW_DUPLICATES]
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
         run = subprocess.run(args, capture_output=True, text=True)
@@ -141,11 +154,16 @@ class Fixture:
         allowed = 900 if binary == self.reference else max(120, 30 * getattr(self, "reference_secs", 0))
         start = time.monotonic()
         try:
-            run = subprocess.run([*(WASM_RUNNER if WASM else []), binary, *self.run_args], capture_output=True, timeout=allowed)
+            run = subprocess.run([*command(binary), *self.run_args], capture_output=True, timeout=allowed)
             if binary == self.reference:
                 self.reference_secs = time.monotonic() - start
             # The thread id in a panic message differs from run to run.
             stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
+            if WASM:
+                # After the program's own output the runtime says where in which file it
+                # trapped: only the kind of trap is the program's.
+                program, _, runtime = stderr.partition(b"Error: failed to run main module")
+                stderr = program + b"".join(re.findall(rb"wasm trap: [^\n]*\n?", runtime))
             # Loggers stamp their lines with the time, on either stream.
             stamp = rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?"
             # What prints an address prints another one in every run.

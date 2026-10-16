@@ -2,8 +2,10 @@
 //! instruction in Cranelift: crc32fast's and simd-json's functions that reach it were left to
 //! rustc. It is multiplied out in software now.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq")]
 fn products(a: __m128i, b: __m128i) -> [[u64; 2]; 4] {
     unsafe {
@@ -16,6 +18,7 @@ fn products(a: __m128i, b: __m128i) -> [[u64; 2]; 4] {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn run() -> Vec<[[u64; 2]; 4]> {
     if !is_x86_feature_detected!("pclmulqdq") {
         return Vec::new();
@@ -26,4 +29,9 @@ pub fn run() -> Vec<[[u64; 2]; 4]> {
         let ones = _mm_set1_epi8(-1);
         vec![products(a, b), products(b, ones), products(ones, ones), products(a, _mm_setzero_si128())]
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn run() -> Vec<[[u64; 2]; 4]> {
+    Vec::new()
 }

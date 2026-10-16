@@ -13,7 +13,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, ALLOW_DUPLICATES, TARGET_ARGS, built, command
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -105,7 +105,7 @@ def main():
         obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
         first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+        link[first:first] = [patch, obj, ALLOW_DUPLICATES]
         link[link.index("-o") + 1] = binary
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link),
@@ -113,7 +113,7 @@ def main():
     first = checkouts[0]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+        [RUSTD, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
@@ -125,7 +125,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run(command(path), capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -161,7 +161,7 @@ def main():
             began, reply = asking.pop(at, None) or ask(at)
             reply = reply.communicate(timeout=120)[0].strip()
             took = (time.time() - began) * 1000
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=checkout["ws"], capture_output=True,
+            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
             if daemon.poll() is not None:
@@ -171,7 +171,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(os.path.join(checkout["reference"], "debug", "sapp"))
+                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
                 verdict = "same" if same else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
