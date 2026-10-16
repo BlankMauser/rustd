@@ -82,6 +82,8 @@ pub struct Files {
     /// Directories whose files are read from another directory: a checkout that is looked at
     /// as the one it was loaded as with other contents.
     views: Arc<std::sync::RwLock<Vec<View>>>,
+    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
+    env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
 }
 
 #[derive(Debug)]
@@ -185,6 +187,16 @@ impl Files {
 
     pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
         self.included_sources.iter().map(|it| (it.key().clone(), *it.value())).collect()
+    }
+
+    pub fn env_is_read(&self, krate: Crate, key: &str) {
+        if !self.env_read.contains_key(&(krate, key.to_owned())) {
+            self.env_read.insert((krate, key.to_owned()), ());
+        }
+    }
+
+    pub fn env_read(&self) -> Vec<(Crate, String)> {
+        self.env_read.iter().map(|it| it.key().clone()).collect()
     }
 
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
@@ -380,6 +392,9 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// Notes that `include!` names a file `resolve_path` has nothing for: a file that is not
     /// source by its extension, say, which the VFS does not load until it is asked to.
     fn include_source(&self, _path: AnchoredPath<'_>) {}
+
+    /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
+    fn env_is_read(&self, _krate: Crate, _key: &str) {}
 
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;

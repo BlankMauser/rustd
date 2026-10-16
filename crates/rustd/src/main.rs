@@ -1337,6 +1337,65 @@ fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     built
 }
 
+/// The checkout a crate was loaded in, and the one its variables name now.
+type Placed = FxHashMap<ide_db::base_db::Crate, (PathBuf, PathBuf)>;
+
+/// Has the crates of the checkout at `base` that ask `env!` for a place in it be told the
+/// place in `over`: `CARGO_MANIFEST_DIR` is where the checkout read is. The result is the
+/// crates told another place than before.
+fn place(
+    db: &mut RootDatabase,
+    base: &Path,
+    over: &Path,
+    placed: &mut Placed,
+) -> Vec<ide_db::base_db::Crate> {
+    let built = built_in(db, base);
+    let mut asking: FxHashMap<_, Vec<String>> = FxHashMap::default();
+    for (krate, key) in db.env_read() {
+        asking.entry(krate).or_default().push(key);
+    }
+    let mut moved = Vec::new();
+    for (krate, keys) in asking {
+        let env = krate.env(db);
+        let Some(manifest) = env.get("CARGO_MANIFEST_DIR") else { continue };
+        let manifest = Path::new(&manifest);
+        // A checkout that joins has the crates there are loaded again, as they first were.
+        let from = match placed.get(&krate) {
+            Some((of, from)) if of == base && manifest.starts_with(from) => from.clone(),
+            Some((of, _)) if of != base => continue,
+            _ if manifest.starts_with(base) => base.to_owned(),
+            _ => continue,
+        };
+        if from == over {
+            continue;
+        }
+        let moved_to = |value: &str| {
+            let path = Path::new(value);
+            let inside = path.strip_prefix(&from).ok()?;
+            if built.iter().any(|it| path.starts_with(it)) {
+                return None;
+            }
+            Some(if inside.as_os_str().is_empty() { over.to_owned() } else { over.join(inside) })
+        };
+        if !keys.iter().any(|key| env.get(key).is_some_and(|it| moved_to(&it).is_some())) {
+            continue;
+        }
+        let mut new = env.clone();
+        for (key, value) in env {
+            if let Some(path) = moved_to(value) {
+                new.set(key, path.to_string_lossy());
+            }
+        }
+        db.set_env(krate, new);
+        placed.insert(krate, (base.to_owned(), over.to_owned()));
+        moved.push(krate);
+    }
+    if !moved.is_empty() {
+        eprintln!("placed: {} crates in {}", moved.len(), over.display());
+    }
+    moved
+}
+
 /// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
 /// it open or under another name: the object of a program can be that of another one too.
 fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1876,8 +1935,19 @@ fn main() -> anyhow::Result<()> {
     });
 
     let start = Instant::now();
+    // The library is read as the toolchain that built the program has it: one the directory
+    // would pick now may be another, whose library has names the built one does not.
+    let built_with = args.symbol_files.iter().find_map(|file| {
+        let name = file.file_name()?.to_str()?;
+        let (toolchain, _) = file.to_str()?.split_once("/lib/rustlib/")?;
+        (name.starts_with("libstd-") && name.ends_with(".rlib")).then_some(toolchain)
+    });
+    let sysroot = match built_with.map(AbsPathBuf::try_from) {
+        Some(Ok(toolchain)) => RustLibSource::Path(toolchain),
+        _ => RustLibSource::Discover,
+    };
     let cargo_config = CargoConfig {
-        sysroot: Some(RustLibSource::Discover),
+        sysroot: Some(sysroot),
         set_test: args.cfg_test,
         features: CargoFeatures::Selected {
             features: args.features.clone(),
@@ -2001,6 +2071,8 @@ fn main() -> anyhow::Result<()> {
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The manifests that have changed since they were loaded, as they were then.
     let mut manifests: FxHashMap<vfs::FileId, String> = FxHashMap::default();
+    // The crates whose variables name another checkout than the one they were loaded in.
+    let mut placed = Placed::default();
     // Requests that could not be built with the ones before them.
     let mut waiting = std::collections::VecDeque::new();
     loop {
@@ -2137,10 +2209,13 @@ fn main() -> anyhow::Result<()> {
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
         let mut switched = Vec::new();
+        // The crates that are told another place than for the last build.
+        let mut moved = Vec::new();
         for (base, over) in looked {
             if *viewed.get(&base).unwrap_or(&base) != over {
                 eprintln!("view: {} as {}", over.display(), base.display());
                 db.set_view(&base, &over, built_in(&db, &base));
+                moved.extend(place(&mut db, &base, &over, &mut placed));
                 tree.relist(&base);
                 if base == over {
                     viewed.remove(&base);
@@ -2210,7 +2285,7 @@ fn main() -> anyhow::Result<()> {
             Some(_) => clients.iter().map(|it| it.0).collect(),
             None => FxHashSet::from_iter([0]),
         };
-        let stale = building.iter().any(|&at| programs[at].unbuilt.stale);
+        let stale = building.iter().any(|&at| programs[at].unbuilt.stale) || !moved.is_empty();
         let (noticed, age) = match noticed {
             Some(noticed) => noticed,
             None if stale => (Instant::now(), Duration::ZERO),
@@ -2302,36 +2377,60 @@ fn main() -> anyhow::Result<()> {
             programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
             listed.touch(&db, crates);
         }
+        if !moved.is_empty() {
+            programs.iter_mut().for_each(|it| {
+                it.known.touch(&db, Some(&moved));
+                it.unbuilt.stale = true;
+            });
+            listed.touch(&db, Some(&moved));
+        }
         let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
         // The programs asked for are built side by side: nothing is written to the database
         // until all of them are done, so none is interrupted.
-        let answers: Vec<(usize, anyhow::Result<Result<String, String>>)> =
-            std::thread::scope(|scope| {
-                let builds: Vec<_> = programs
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(at, program)| building.contains(at) && program.unbuilt.stale)
-                    .map(|(at, program)| {
-                        // The program is linked unless every client of it loads the patch.
-                        let link = !clients.iter().any(|it| it.0 == at)
-                            || clients.iter().any(|it| it.0 == at && it.1 != Request::Patch);
-                        let (db, listed, paths, edit) = (db.clone(), &listed, &paths, &edit);
-                        let wanted = outputs.get(&at);
-                        let build = scope
-                            .spawn(move || program.sync(&db, listed, paths, edit, wanted, link));
-                        (at, build)
-                    })
-                    .collect();
-                builds
-                    .into_iter()
-                    .map(|(at, build)| {
-                        let answer = build
-                            .join()
-                            .unwrap_or_else(|_| Err(anyhow::anyhow!("a build panicked")));
-                        (at, answer)
-                    })
-                    .collect()
-            });
+        let answers = loop {
+            let answers: Vec<(usize, anyhow::Result<Result<String, String>>)> =
+                std::thread::scope(|scope| {
+                    let builds: Vec<_> = programs
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(at, program)| building.contains(at) && program.unbuilt.stale)
+                        .map(|(at, program)| {
+                            // The program is linked unless every client of it loads the patch.
+                            let link = !clients.iter().any(|it| it.0 == at)
+                                || clients.iter().any(|it| it.0 == at && it.1 != Request::Patch);
+                            let (db, listed, paths, edit) = (db.clone(), &listed, &paths, &edit);
+                            let wanted = outputs.get(&at);
+                            let build = scope.spawn(move || {
+                                program.sync(&db, listed, paths, edit, wanted, link)
+                            });
+                            (at, build)
+                        })
+                        .collect();
+                    builds
+                        .into_iter()
+                        .map(|(at, build)| {
+                            let answer = build
+                                .join()
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("a build panicked")));
+                            (at, answer)
+                        })
+                        .collect()
+                });
+            // An `env!` the builds were the first to see was told the place of the loaded
+            // checkout.
+            let late: Vec<_> = viewed
+                .iter()
+                .flat_map(|(base, over)| place(&mut db, base, over, &mut placed))
+                .collect();
+            if late.is_empty() {
+                break answers;
+            }
+            for program in &mut programs {
+                program.known.touch(&db, Some(&late));
+                program.unbuilt.stale = true;
+            }
+            listed.touch(&db, Some(&late));
+        };
         if std::env::var_os("RUSTD_TRACE").is_some() {
             let ran: Vec<String> = ide_db::executions::take(&db)
                 .iter()

@@ -48,6 +48,11 @@ STEPS = [
     ("and the module with it",
      [(1, APP, "mod more;\n\nfn main() {\n    println!(\"more {}\", more::more());", "fn main() {")],
      [1, 0, 2], []),
+    ("a place asked for in one, by a crate that had not",
+     [(1, MID, "pub fn seeded() -> u32 {",
+       "pub fn here() -> &'static str {\n    env!(\"CARGO_MANIFEST_DIR\")\n}\n\npub fn seeded() -> u32 {"),
+      (1, APP, 'println!("{}", HERE);', 'println!("{} {}", HERE, smid::here());')],
+     [1, 0, 2, 1], []),
 ]
 # Cargo may build that checkout another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
@@ -76,7 +81,8 @@ def main():
         main_rs = os.path.join(ws, APP)
         text = open(main_rs).read()
         assert "fn main() {" in text
-        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));', 1))
+        text += '\nconst HERE: &str = env!("CARGO_MANIFEST_DIR");\n'
+        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);', 1))
         # A checkout read as the first one links what rustc built of the first.
         if not (OVERLAY and checkouts):
             fx = Fixture(ws, crates, ["-p", "sapp"])

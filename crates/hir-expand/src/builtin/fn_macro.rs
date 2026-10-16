@@ -950,6 +950,7 @@ fn include_str_expand(
 
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
+    db.env_is_read(krate, key.as_str());
     krate.env(db).get(key.as_str())
 }
 

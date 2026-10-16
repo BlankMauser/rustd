@@ -142,6 +142,17 @@ impl RootDatabase {
         self.files.set_view(base, over, built);
     }
 
+    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
+    pub fn env_read(&self) -> Vec<(base_db::Crate, String)> {
+        self.files.env_read()
+    }
+
+    /// Has `krate` be compiled with `env`.
+    pub fn set_env(&mut self, krate: base_db::Crate, env: base_db::Env) {
+        use salsa::Setter as _;
+        krate.set_env(self).to(env);
+    }
+
     /// See [`base_db::Files::on_disk`].
     pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
         self.files.on_disk(path)
@@ -202,6 +213,10 @@ impl SourceDatabase for RootDatabase {
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
         let path = anchor.parent()?.absolutize(path.path);
         Some(self.files.included_file(self, &path, durability))
+    }
+
+    fn env_is_read(&self, krate: base_db::Crate, key: &str) {
+        self.files.env_is_read(krate, key);
     }
 
     fn include_source(&self, path: base_db::AnchoredPath<'_>) {
