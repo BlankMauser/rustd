@@ -17,7 +17,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{
     ObjectProduct,
     object::{
-        BinaryFormat, RelocationEncoding, macho, RelocationFlags, RelocationKind,
+        BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, macho,
         write::{Relocation, StandardSection},
     },
 };
@@ -229,14 +229,15 @@ impl UnwindContext {
         if module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho {
             cie.personality = Some((
                 gimli::DwEhPe(
-                    gimli::DW_EH_PE_indirect.0
-                        | gimli::DW_EH_PE_pcrel.0
-                        | gimli::DW_EH_PE_sdata4.0,
+                    gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
                 ),
                 address_for_func(personality),
             ));
             let with_landing_pads = frame_table.add_cie(cie);
-            return Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table });
+            return Ok(UnwindContext {
+                cies: Some(Cies { with_landing_pads, plain }),
+                frame_table,
+            });
         }
         // It must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
         let personality_ref = module

@@ -207,7 +207,11 @@ enum PassMode {
     /// holding what follows the one before. Before them come `skipped` registers of that kind
     /// that carry nothing: an aggregate goes to the stack whole once it no longer fits the
     /// registers, and nothing after it uses the ones it left.
-    Units { unit: Type, count: u8, skipped: u8 },
+    Units {
+        unit: Type,
+        count: u8,
+        skipped: u8,
+    },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -3565,7 +3569,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// The procedure call standard of AArch64, with what Apple changed of it. A value in memory
     /// is a pointer to the caller's copy, and one returned in memory is written where `x8`
     /// points, which is where Cranelift puts a struct return.
-    fn aarch64_c_abi(&self, ret: Ty<'db>, args: impl IntoIterator<Item = Ty<'db>>) -> Result<FnAbi> {
+    fn aarch64_c_abi(
+        &self,
+        ret: Ty<'db>,
+        args: impl IntoIterator<Item = Ty<'db>>,
+    ) -> Result<FnAbi> {
         let ret = self.aarch64_c_pass_mode(ret)?;
         // What is left of `x0` to `x7` and of `v0` to `v7`.
         let (mut ints, mut floats) = (8u8, 8u8);

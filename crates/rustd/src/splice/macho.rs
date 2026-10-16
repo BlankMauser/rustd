@@ -204,13 +204,22 @@ impl Signature {
 
     /// The signature of `file`, whose first `kept` bytes are what the linker wrote but for
     /// `dirty`, and `added` after them.
-    fn of(&self, file: &File, kept: u64, dirty: &[(u64, Vec<u8>)], added: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn of(
+        &self,
+        file: &File,
+        kept: u64,
+        dirty: &[(u64, Vec<u8>)],
+        added: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let limit = kept + added.len() as u64;
         let kept = kept as usize / Self::PAGE;
-        let mut hashes = self.hashes.get(..kept * Self::HASH).context("a short signature")?.to_vec();
+        let mut hashes =
+            self.hashes.get(..kept * Self::HASH).context("a short signature")?.to_vec();
         let mut page = vec![0; Self::PAGE];
         let pages: FxHashSet<usize> = (dirty.iter())
-            .flat_map(|(at, bytes)| *at as usize / Self::PAGE..=(*at as usize + bytes.len().max(1) - 1) / Self::PAGE)
+            .flat_map(|(at, bytes)| {
+                *at as usize / Self::PAGE..=(*at as usize + bytes.len().max(1) - 1) / Self::PAGE
+            })
             .filter(|page| *page < kept)
             .collect();
         for index in pages {
@@ -258,13 +267,19 @@ impl Rebases {
             match byte & 0xf0 {
                 macho::REBASE_OPCODE_DONE => break,
                 macho::REBASE_OPCODE_SET_TYPE_IMM => {
-                    ensure!(immediate == u64::from(macho::REBASE_TYPE_POINTER), "code the loader fixes up");
+                    ensure!(
+                        immediate == u64::from(macho::REBASE_TYPE_POINTER),
+                        "code the loader fixes up"
+                    );
                 }
                 macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
-                    let segment = segments.get(immediate as usize).context("a fixup in no segment")?;
+                    let segment =
+                        segments.get(immediate as usize).context("a fixup in no segment")?;
                     address = segment.address + uleb(stream, &mut at)?;
                 }
-                macho::REBASE_OPCODE_ADD_ADDR_ULEB => address = address.wrapping_add(uleb(stream, &mut at)?),
+                macho::REBASE_OPCODE_ADD_ADDR_ULEB => {
+                    address = address.wrapping_add(uleb(stream, &mut at)?)
+                }
                 macho::REBASE_OPCODE_ADD_ADDR_IMM_SCALED => address += immediate * 8,
                 macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES => rebase(&mut address, immediate, 0),
                 macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
@@ -315,7 +330,8 @@ impl Image {
         );
         ensure!(u32_at(bytes, 12)? == macho::MH_EXECUTE, "not an executable");
         let count = u32_at(bytes, 16)?;
-        let commands = bytes.get(..HEADER + u32_at(bytes, 20)? as usize).context("the file ends early")?;
+        let commands =
+            bytes.get(..HEADER + u32_at(bytes, 20)? as usize).context("the file ends early")?;
 
         let mut segments = Vec::new();
         // The address, size and flags of each, and which the indirect symbols start at.
@@ -340,7 +356,8 @@ impl Image {
                     };
                     for nth in 0..u32_at(commands, command + 64)? as usize {
                         let header = command + SEGMENT + nth * SECTION;
-                        let (address, len) = (u64_at(commands, header + 32)?, u64_at(commands, header + 40)?);
+                        let (address, len) =
+                            (u64_at(commands, header + 32)?, u64_at(commands, header + 40)?);
                         let offset = u32_at(commands, header + 48)? as usize;
                         let flags = u32_at(commands, header + 64)?;
                         if offset != 0 && len != 0 {
@@ -386,8 +403,14 @@ impl Image {
         }
         ensure!(command == commands.len(), "load commands of another length than the header says");
         let present = [at.linkedit, at.symbols, at.indirect, at.fixups, at.signature];
-        ensure!(present.iter().all(|it| *it != 0), "an executable without symbols, fixups or a signature, or with segments behind `__LINKEDIT`");
-        ensure!(!unwind.bytes.is_empty() && !frames.bytes.is_empty(), "the executable has no unwind tables");
+        ensure!(
+            present.iter().all(|it| *it != 0),
+            "an executable without symbols, fixups or a signature, or with segments behind `__LINKEDIT`"
+        );
+        ensure!(
+            !unwind.bytes.is_empty() && !frames.bytes.is_empty(),
+            "the executable has no unwind tables"
+        );
 
         let linkedit = segments.last().context("no segments")?;
         ensure!(linkedit.offset.is_multiple_of(PAGE), "`__LINKEDIT` is not at a page of the file");
@@ -402,14 +425,18 @@ impl Image {
         let linkedit_at = linkedit.offset as usize;
         let content = bytes[linkedit_at..signed].to_vec();
 
-        let (rebases, len) = (u32_at(commands, at.fixups + 8)? as usize, u32_at(commands, at.fixups + 12)? as usize);
+        let (rebases, len) =
+            (u32_at(commands, at.fixups + 8)? as usize, u32_at(commands, at.fixups + 12)? as usize);
         let stream = bytes.get(rebases..rebases + len).context("the file ends early")?;
         let rebases = Rebases::read(stream, &segments)?;
 
         let table = u32_at(commands, at.symbols + 8)? as usize;
-        let names = bytes.get(u32_at(commands, at.symbols + 16)? as usize..).context("the file ends early")?;
+        let names = bytes
+            .get(u32_at(commands, at.symbols + 16)? as usize..)
+            .context("the file ends early")?;
         let name = |entry: usize| -> anyhow::Result<&[u8]> {
-            let name = names.get(u32_at(bytes, entry)? as usize..).context("a symbol of no name")?;
+            let name =
+                names.get(u32_at(bytes, entry)? as usize..).context("a symbol of no name")?;
             Ok(name.split(|it| *it == 0).next().unwrap_or_default())
         };
         let mut defined = Vec::new();
@@ -423,8 +450,13 @@ impl Image {
             let &(start, len, flags, ..) =
                 section.and_then(|it| sections.get(it)).context("a symbol in no section")?;
             let kind = match flags & macho::SECTION_TYPE {
-                macho::S_THREAD_LOCAL_REGULAR..=macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => SymbolKind::Tls,
-                _ if flags & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS) != 0 => {
+                macho::S_THREAD_LOCAL_REGULAR..=macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => {
+                    SymbolKind::Tls
+                }
+                _ if flags
+                    & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS)
+                    != 0 =>
+                {
                     SymbolKind::Text
                 }
                 _ => SymbolKind::Data,
@@ -438,7 +470,8 @@ impl Image {
         for (address, section_end, kind, entry) in defined {
             let next = starts.get(starts.partition_point(|it| *it <= address));
             let end = next.map_or(section_end, |next| section_end.min(*next));
-            let defined = Defined { address, size: end.saturating_sub(address), kind, entry: entry as u64 };
+            let defined =
+                Defined { address, size: end.saturating_sub(address), kind, entry: entry as u64 };
             match symbols.get_mut(name(entry)?) {
                 None => _ = symbols.insert(name(entry)?.into(), Named::One(defined)),
                 Some(Named::One(known)) if *known == Defined { entry: known.entry, ..defined } => {}
@@ -460,13 +493,17 @@ impl Image {
                     continue;
                 }
                 let entry = table + symbol as usize * NLIST;
-                if *bytes.get(entry + 4).context("the file ends early")? & macho::N_TYPE != macho::N_UNDF {
+                if *bytes.get(entry + 4).context("the file ends early")? & macho::N_TYPE
+                    != macho::N_UNDF
+                {
                     continue;
                 }
                 let import = imports.entry(name(entry)?.into()).or_default();
                 let at = Some(address + nth * each);
                 match each {
-                    8 if flags & macho::SECTION_TYPE == macho::S_NON_LAZY_SYMBOL_POINTERS => import.slot = at,
+                    8 if flags & macho::SECTION_TYPE == macho::S_NON_LAZY_SYMBOL_POINTERS => {
+                        import.slot = at
+                    }
                     _ => import.stub = at,
                 }
             }
@@ -561,7 +598,8 @@ impl Pointer {
                 if augmentation.first() == Some(&b'z') {
                     uleb(section, &mut next)?;
                     for letter in &augmentation[1..] {
-                        let encoding = *section.get(next).context("a common entry that ends early")?;
+                        let encoding =
+                            *section.get(next).context("a common entry that ends early")?;
                         match letter {
                             b'R' => code = encoding,
                             b'L' => pads = Some(encoding),
@@ -609,7 +647,8 @@ fn unwind_table(old: &[u8], frames: &[(u32, u32)], end: u32) -> anyhow::Result<V
     ensure!(u32_at(old, 0)? == 1, "an unwind table of another version");
     let (index, count) = (u32_at(old, 20)? as usize, u32_at(old, 24)? as usize);
     ensure!(count != 0, "an unwind table of no functions");
-    let entries = old.get(index..index + count * INDEX).context("an unwind table that ends early")?;
+    let entries =
+        old.get(index..index + count * INDEX).context("an unwind table that ends early")?;
     // The last entry is of no page: it says where the functions end, and the landing pads.
     let (pages, last) = entries.split_at((count - 1) * INDEX);
 
@@ -813,10 +852,13 @@ impl<'a> Patch<'a> {
             in_place: FxHashMap::default(),
         };
         for section in patch.file.sections() {
-            let SectionFlags::MachO { flags } = section.flags() else { bail!("a patch that is not Mach-O") };
+            let SectionFlags::MachO { flags } = section.flags() else {
+                bail!("a patch that is not Mach-O")
+            };
             let kind = flags & macho::SECTION_TYPE;
             ensure!(
-                !(macho::S_THREAD_LOCAL_REGULAR..=macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS).contains(&kind),
+                !(macho::S_THREAD_LOCAL_REGULAR..=macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS)
+                    .contains(&kind),
                 "the patch has thread-local data"
             );
             if flags & macho::S_ATTR_DEBUG != 0 || section.size() == 0 {
@@ -824,11 +866,14 @@ impl<'a> Patch<'a> {
             }
             let relocations = Self::relocations(&section)?;
             let stores = relocations.iter().any(|it| it.fixup == Fixup::Absolute);
-            let writable = section.segment_name_bytes()?.is_some_and(|it| it.starts_with(b"__DATA"));
+            let writable =
+                section.segment_name_bytes()?.is_some_and(|it| it.starts_with(b"__DATA"));
             if section.name_bytes()? == b"__eh_frame" {
                 ensure!(!stores && patch.frames.is_none(), "frames that store addresses");
                 patch.frames = Some(section.index());
-            } else if flags & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS) != 0 {
+            } else if flags & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS)
+                != 0
+            {
                 ensure!(!stores, "code that stores addresses");
                 patch.code.insert(section.index());
                 patch.sections[TEXT].push(section.index());
@@ -841,7 +886,8 @@ impl<'a> Patch<'a> {
         }
 
         // No symbol has a size: one reaches to the next of its section.
-        let mut starts: Vec<u64> = patch.file.symbols().filter(|it| it.is_definition()).map(|it| it.address()).collect();
+        let mut starts: Vec<u64> =
+            patch.file.symbols().filter(|it| it.is_definition()).map(|it| it.address()).collect();
         starts.sort_unstable();
         starts.dedup();
         for symbol in patch.file.symbols() {
@@ -852,7 +898,11 @@ impl<'a> Patch<'a> {
             let shown = || String::from_utf8_lossy(name);
             let index = symbol.section_index().context("a symbol in no section")?;
             let section = patch.file.section_by_index(index)?;
-            ensure!(patch.relocations.contains_key(&index), "{} is in a section that is not loaded", shown());
+            ensure!(
+                patch.relocations.contains_key(&index),
+                "{} is in a section that is not loaded",
+                shown()
+            );
             let offset = symbol.address() - section.address();
             let code = patch.code.contains(&index);
             let old = match image.symbols.get(name) {
@@ -869,7 +919,9 @@ impl<'a> Patch<'a> {
                     patch.in_place.entry(index).or_default().push(new);
                     Some(*old)
                 }
-                Some(_) => bail!("the patch replaces {}, which is not one function or static", shown()),
+                Some(_) => {
+                    bail!("the patch replaces {}, which is not one function or static", shown())
+                }
             };
             patch.replaced.push(Replaced { name, section: index, offset, old });
         }
@@ -892,7 +944,10 @@ impl<'a> Patch<'a> {
                 symbol.ok().and_then(|it| it.name().ok()).unwrap_or_default().to_owned()
             };
             match (relocation.fixup, target) {
-                (Fixup::Absolute | Fixup::Distance(..) | Fixup::Page | Fixup::Offset, Target::Import(_)) => {
+                (
+                    Fixup::Absolute | Fixup::Distance(..) | Fixup::Page | Fixup::Offset,
+                    Target::Import(_),
+                ) => {
                     bail!("the address of {}, which is in another library", shown())
                 }
                 (fixup, Target::Import(Import { slot: None, .. })) if fixup.through_slot() => {
@@ -944,7 +999,10 @@ impl<'a> Patch<'a> {
                 (macho::ARM64_RELOC_GOT_LOAD_PAGE21, true, 2) => Fixup::SlotPage,
                 (macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12, false, 2) => Fixup::SlotOffset,
                 (macho::ARM64_RELOC_POINTER_TO_GOT, true, 2) => Fixup::SlotDistance,
-                (macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12, ..) => {
+                (
+                    macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+                    ..,
+                ) => {
                     bail!("code that uses a thread-local")
                 }
                 (other, ..) => bail!("a relocation of type {other}, which only the linker handles"),
@@ -957,13 +1015,20 @@ impl<'a> Patch<'a> {
 
     /// Whether a static can go where the executable has the one it replaces: what refers to
     /// it there is not looked for.
-    fn fits(&self, new: &InPlace, section: &object::Section<'_, '_>, image: &Image) -> anyhow::Result<()> {
+    fn fits(
+        &self,
+        new: &InPlace,
+        section: &object::Section<'_, '_>,
+        image: &Image,
+    ) -> anyhow::Result<()> {
         let old = &new.old;
         ensure!(new.size <= old.size, "that is larger: {} bytes after {}", new.size, old.size);
         let align = (new.offset | section.align().max(1) | 1 << 12).isolate_lowest_one();
         ensure!(old.address.is_multiple_of(align), "that may be aligned to {align}");
         let segment = (image.segments.iter())
-            .find(|it| it.address <= old.address && old.address + new.size <= it.address + it.file_size)
+            .find(|it| {
+                it.address <= old.address && old.address + new.size <= it.address + it.file_size
+            })
             .context("that the file has no bytes for")?;
         let writable = section.segment_name_bytes()?.is_some_and(|it| it.starts_with(b"__DATA"));
         ensure!(!writable || segment.writable, "that is written to, where the old one is not");
@@ -975,13 +1040,19 @@ impl<'a> Patch<'a> {
         let name = symbol.name_bytes()?;
         let shown = || String::from_utf8_lossy(name);
         if let Some(section) = symbol.section_index() {
-            ensure!(self.relocations.contains_key(&section), "{} is in a section that is not loaded", shown());
+            ensure!(
+                self.relocations.contains_key(&section),
+                "{} is in a section that is not loaded",
+                shown()
+            );
             let start = self.file.section_by_index(section)?.address();
             return Ok(Target::Ours(section, symbol.address() - start));
         }
         ensure!(symbol.is_undefined(), "{} is neither defined nor undefined", shown());
         match image.symbols.get(name) {
-            Some(Named::One(Defined { kind: SymbolKind::Tls, .. })) => bail!("{} is thread-local", shown()),
+            Some(Named::One(Defined { kind: SymbolKind::Tls, .. })) => {
+                bail!("{} is thread-local", shown())
+            }
             Some(Named::One(defined)) => Ok(Target::Theirs(defined.address)),
             Some(Named::Many) => bail!("{} names several things in the executable", shown()),
             None => match image.imports.get(name) {
@@ -1082,19 +1153,24 @@ impl<'a> Patch<'a> {
                 let target = self.targets[&relocation.symbol];
                 let at = (start + relocation.at) as usize;
                 let place = base + at as u64;
-                let field = |len: usize| appended.get(at..at + len).context("a relocation past its section");
+                let field = |len: usize| {
+                    appended.get(at..at + len).context("a relocation past its section")
+                };
                 if let Some(which) = in_place.iter().position(|it| it.holds(relocation.at)) {
                     ensure!(relocation.fixup == Fixup::Absolute, "a static that stores a distance");
                     let within = (relocation.at - in_place[which].offset) as usize;
                     let value = address(target, relocation.addend + u64_at(field(8)?, 0)? as i64)?;
                     let field = values[which].get_mut(within..within + 8);
-                    field.context("an address past its static")?.copy_from_slice(&value.to_le_bytes());
+                    field
+                        .context("an address past its static")?
+                        .copy_from_slice(&value.to_le_bytes());
                     restored.insert(in_place[which].old.address + within as u64);
                     continue;
                 }
                 match relocation.fixup {
                     Fixup::Absolute => {
-                        let value = address(target, relocation.addend + u64_at(field(8)?, 0)? as i64)?;
+                        let value =
+                            address(target, relocation.addend + u64_at(field(8)?, 0)? as i64)?;
                         put64(&mut appended, at, value);
                         stored.push(place);
                     }
@@ -1112,7 +1188,11 @@ impl<'a> Patch<'a> {
                         let written = i64::from(u32_at(field(4)?, 0)? as i32);
                         let to = slot(relocation).wrapping_add_signed(relocation.addend + written);
                         let distance = i32::try_from(to.wrapping_sub(place) as i64);
-                        put32(&mut appended, at, distance.context("the program is too large")? as u32);
+                        put32(
+                            &mut appended,
+                            at,
+                            distance.context("the program is too large")? as u32,
+                        );
                     }
                     fixup => {
                         let instruction = u32_at(field(4)?, 0)?;
@@ -1127,8 +1207,12 @@ impl<'a> Patch<'a> {
                                     .unwrap_or_else(|| stub_of[&relocation.symbol]);
                                 Code::branch(instruction, to, place)?
                             }
-                            Fixup::Page => Code::page(instruction, address(target, relocation.addend)?, place)?,
-                            Fixup::Offset => Code::offset(instruction, address(target, relocation.addend)?)?,
+                            Fixup::Page => {
+                                Code::page(instruction, address(target, relocation.addend)?, place)?
+                            }
+                            Fixup::Offset => {
+                                Code::offset(instruction, address(target, relocation.addend)?)?
+                            }
                             Fixup::SlotPage => Code::page(instruction, slot(relocation), place)?,
                             _ => Code::offset(instruction, slot(relocation))?,
                         };
@@ -1146,7 +1230,9 @@ impl<'a> Patch<'a> {
         }
         for (&index, &stub) in &stub_of {
             let code = match self.targets[&index] {
-                Target::Import(Import { stub: Some(theirs), .. }) => Code::stub(theirs, stub, false)?,
+                Target::Import(Import { stub: Some(theirs), .. }) => {
+                    Code::stub(theirs, stub, false)?
+                }
                 Target::Import(Import { slot: Some(slot), .. }) => Code::stub(slot, stub, true)?,
                 target => Code::stub(address(target, 0)?, stub, false)?,
             };
@@ -1164,7 +1250,11 @@ impl<'a> Patch<'a> {
             if pointer.relative {
                 let value = pointer.value(section)?.wrapping_sub(moved);
                 match pointer.len {
-                    4 => put32(section, pointer.at, i32::try_from(value).context("the program is too large")? as u32),
+                    4 => put32(
+                        section,
+                        pointer.at,
+                        i32::try_from(value).context("the program is too large")? as u32,
+                    ),
                     _ => put64(section, pointer.at, value as u64),
                 }
             }
@@ -1179,8 +1269,15 @@ impl<'a> Patch<'a> {
             entries.push((u32::try_from(code - image_base)?, u32::try_from(old_frames + frame)?));
         }
         entries.sort_unstable();
-        let unwind = unwind_table(&image.unwind.bytes, &entries, u32::try_from(base + code_end - image_base)?)?;
-        ensure!(unwind_at as usize + unwind.len() <= frames_at as usize, "an unwind table longer than planned");
+        let unwind = unwind_table(
+            &image.unwind.bytes,
+            &entries,
+            u32::try_from(base + code_end - image_base)?,
+        )?;
+        ensure!(
+            unwind_at as usize + unwind.len() <= frames_at as usize,
+            "an unwind table longer than planned"
+        );
         appended[unwind_at as usize..][..unwind.len()].copy_from_slice(&unwind);
 
         // The symbols of the functions name the new code, for whoever reads a backtrace.
@@ -1193,7 +1290,11 @@ impl<'a> Patch<'a> {
             let jump = if Code::reaches(new, old.address) {
                 Code::branch(0x1400_0000, new, old.address)?.to_le_bytes().to_vec()
             } else {
-                ensure!(old.size >= Code::STUB as u64, "{} is too short to jump so far from", shown());
+                ensure!(
+                    old.size >= Code::STUB as u64,
+                    "{} is too short to jump so far from",
+                    shown()
+                );
                 Code::stub(new, old.address, false)?.to_vec()
             };
             ensure!(old.size >= jump.len() as u64, "{} is too short to jump from", shown());
@@ -1204,7 +1305,8 @@ impl<'a> Patch<'a> {
 
         let mut rebases: Vec<u64> = image.rebases.clone();
         let statics: Vec<Defined> = self.in_place.values().flatten().map(|it| it.old).collect();
-        rebases.retain(|at| !statics.iter().any(|it| (it.address..it.address + it.size).contains(at)));
+        rebases
+            .retain(|at| !statics.iter().any(|it| (it.address..it.address + it.size).contains(at)));
         rebases.extend(restored);
         rebases.extend(stored);
         rebases.sort_unstable();
@@ -1253,7 +1355,9 @@ impl Layout {
             put32(&mut command, 0, macho::LC_SEGMENT_64);
             put32(&mut command, 4, (SEGMENT + sections as usize * SECTION) as u32);
             command[8..8 + name.len()].copy_from_slice(name);
-            for (at, field) in [address, len, address - old.address + old.offset, len].into_iter().enumerate() {
+            for (at, field) in
+                [address, len, address - old.address + old.offset, len].into_iter().enumerate()
+            {
                 put64(&mut command, 24 + at * 8, field);
             }
             put32(&mut command, 56, protection);
@@ -1271,16 +1375,23 @@ impl Layout {
             added.extend(section);
             commands[table.header + 2..table.header + 9].copy_from_slice(b"_rustd_");
         }
-        added.extend(segment(b"__RUSTD_DATA", self.data, macho::VM_PROT_READ | macho::VM_PROT_WRITE, 0));
+        added.extend(segment(
+            b"__RUSTD_DATA",
+            self.data,
+            macho::VM_PROT_READ | macho::VM_PROT_WRITE,
+            0,
+        ));
 
         // `__LINKEDIT`: the fixups are written again, and what is behind them moves by as
         // much as they grew.
         let fixups = image.at.fixups;
-        let (rebases, len) = (u32_at(&commands, fixups + 8)? as u64, u32_at(&commands, fixups + 12)? as u64);
+        let (rebases, len) =
+            (u32_at(&commands, fixups + 8)? as u64, u32_at(&commands, fixups + 12)? as u64);
         let rebases = if len == 0 { old.offset } else { rebases };
-        let starts: Vec<u64> = (image.segments[..image.segments.len() - 1].iter().map(|it| it.address))
-            .chain([self.text.0, self.data.0])
-            .collect();
+        let starts: Vec<u64> =
+            (image.segments[..image.segments.len() - 1].iter().map(|it| it.address))
+                .chain([self.text.0, self.data.0])
+                .collect();
         let stream = Rebases::written(&self.rebases, &starts)?;
         let within = (rebases - old.offset) as usize;
         let mut linkedit = image.linkedit[..within].to_vec();
@@ -1311,7 +1422,9 @@ impl Layout {
         put32(&mut commands, image.at.signature + 8, u32::try_from(signed)?);
         put32(&mut commands, image.at.signature + 12, u32::try_from(signature)?);
         let len = signed + signature - offset;
-        for (at, field) in [address, len.next_multiple_of(PAGE), offset, len].into_iter().enumerate() {
+        for (at, field) in
+            [address, len.next_multiple_of(PAGE), offset, len].into_iter().enumerate()
+        {
             put64(&mut commands, image.at.linkedit + 24 + at * 8, field);
         }
         let (count, size) = (u32_at(&commands, 16)?, u32_at(&commands, 20)?);
@@ -1368,8 +1481,12 @@ pub(super) fn splice(
             undo.push((*offset, old));
             file.write_all_at(bytes, *offset)?;
         }
-        let signature =
-            image.signature.of(&file, addition.offset, &addition.overwritten, &addition.appended)?;
+        let signature = image.signature.of(
+            &file,
+            addition.offset,
+            &addition.overwritten,
+            &addition.appended,
+        )?;
         file.write_all_at(&addition.appended, addition.offset)?;
         file.write_all_at(&signature, addition.offset + addition.appended.len() as u64)?;
         std::fs::rename(&copy, path)?;

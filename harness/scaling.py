@@ -39,7 +39,7 @@ ELSEWHERE = [
 BUILD = re.compile(
     r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*"
     r"stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?"
-    r"(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)")
+    r"(?:timeline-us: (.*)\n)?(?:asked: .*\n)?edit-to-binary: (\S+)")
 
 
 def measure(name, spec, repeat):
@@ -65,12 +65,14 @@ def measure(name, spec, repeat):
     # SCALING_SYNC: each build is asked for once the file is written, as `rustd sync` does.
     socket = os.path.join(fx.work, "rustd.sock") if os.environ.get("SCALING_SYNC") else None
     trigger = ["--socket", socket] if socket else ["--watch"]
+    # SCALING_SPLICE: edits are added to the linked binary where that can be done.
+    splice = ["--splice", binary] if os.environ.get("SCALING_SPLICE") else []
     log_path = os.path.join(fx.work, "daemon.log")
     out, log = open(log_path, "a"), open(log_path)
     start = time.time()
     daemon = subprocess.Popen(
         [RUSTD, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
-         "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *symbols],
+         "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols],
         stderr=out, stdout=out)
 
     def wait(pattern, seen):
@@ -142,7 +144,7 @@ def measure(name, spec, repeat):
                         ran = subprocess.run([binary, *run_arg], capture_output=True, text=True, timeout=60)
                         if (MARK in ran.stdout) == revert:
                             wrong.append((turn, revert, ran.stdout[:200]))
-        rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
+        rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(daemon.pid)])) // 1024
     finally:
         daemon.kill()
         open(fx.touch, "w").write(original)

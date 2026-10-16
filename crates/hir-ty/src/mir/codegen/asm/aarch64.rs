@@ -154,7 +154,12 @@ pub(super) fn wrapper(
     } else {
         for (reg, size, offset, _, output) in values() {
             if output {
-                _ = writeln!(text, "{} {}, [x19, #{offset}]", reg.transfer(size).1, reg.sized(size)?);
+                _ = writeln!(
+                    text,
+                    "{} {}, [x19, #{offset}]",
+                    reg.transfer(size).1,
+                    reg.sized(size)?
+                );
             }
         }
         for (at, reg) in kept.iter().enumerate() {

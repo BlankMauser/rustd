@@ -9,10 +9,7 @@
 //! the libraries it loads. Nothing else of a file changes, and a file that is no Mach-O
 //! object is copied as it is.
 
-use std::{
-    ops::Range,
-    path::Path,
-};
+use std::{ops::Range, path::Path};
 
 use anyhow::Context as _;
 use object::{
