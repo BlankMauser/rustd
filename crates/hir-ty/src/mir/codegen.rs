@@ -2405,7 +2405,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     ) -> Result<FuncId> {
         let (def, args) = (instance.def, instance.args.as_ref());
         if let InstanceDef::Fn(func) = def
-            && args.is_empty()
+            && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))

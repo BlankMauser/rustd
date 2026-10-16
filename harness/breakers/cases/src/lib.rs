@@ -37,4 +37,5 @@ cases![
     impl_in_fn,
     fragment_token,
     blanket_in_fn,
+    lifetime_only_callee,
 ];
