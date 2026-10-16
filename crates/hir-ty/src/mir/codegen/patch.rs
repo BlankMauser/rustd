@@ -80,6 +80,7 @@ fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)).ok()
 }
 
+#[derive(Clone)]
 pub(super) struct BaseInstance {
     pub(super) env: StoredParamEnvAndCrate,
     pub(super) symbol: String,
@@ -95,6 +96,7 @@ pub(super) struct BaseInstance {
 }
 
 /// An instance the functions left to rustc reach that the base has no code for.
+#[derive(Clone)]
 struct TheirInstance {
     instance: Instance,
     env: StoredParamEnvAndCrate,
@@ -103,6 +105,7 @@ struct TheirInstance {
 }
 
 /// A static the functions left to rustc reach that is rustc's.
+#[derive(Clone)]
 struct TheirStatic {
     id: StaticId,
     serial: Option<u64>,
@@ -112,7 +115,7 @@ struct TheirStatic {
 
 /// What the walk for [`TheirStatics`] went through, apart from the functions it starts at.
 /// What it finds only changes with the code of one of these.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TheirWalk {
     instances: Vec<TheirInstance>,
     statics: Vec<TheirStatic>,
@@ -165,6 +168,7 @@ impl TheirWalk {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct BaseStatic {
     pub(super) symbol: String,
     pub(super) writable: bool,
@@ -178,7 +182,7 @@ pub(super) struct BaseStatic {
 }
 
 /// What a function left to rustc keeps the rest of the build from doing.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Left {
     /// Its code, when the function compiles and something else keeps it from the object.
     /// A full build looks at it again once that changes.
@@ -198,7 +202,7 @@ impl Left {
 
 /// The functions left to rustc as rustc compiled them: its copies are not built again while
 /// the daemon runs, so one is only good for as long as its function is what it was then.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::mir) struct Frozen {
     left: Option<FxHashMap<FunctionId, Left>>,
     /// The crates that have seen an edit since.
@@ -247,6 +251,7 @@ impl Frozen {
 }
 
 /// The last object built in full, as far as patching it goes.
+#[derive(Clone)]
 pub(super) struct Base {
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
@@ -280,7 +285,7 @@ pub(super) struct Base {
 /// crate depends on nothing but the files of that crate and of the ones it depends on. Of a
 /// file where only the bodies of functions changed, and none of them is one that the rest of
 /// the program sees into, it depends on no more than the bodies it comes from.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Touched {
     /// The crates that see a file that changed.
     crates: FxHashSet<Crate>,
@@ -330,7 +335,7 @@ impl Touched {
 }
 
 /// What a look at a part of the base found changed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Stale {
     roots: Vec<FunctionId>,
     instances: Vec<Instance>,

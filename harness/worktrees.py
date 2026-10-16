@@ -67,6 +67,9 @@ if "--overlay" in sys.argv:
 
 # With `--overlay` the others are not loaded at all: each is read as the first with other files.
 OVERLAY = "--overlay" in sys.argv
+# With `--split` the others join the first and share the packages that are the same in both.
+SPLIT = "--split" in sys.argv
+JOIN = "--join" in sys.argv or SPLIT
 
 
 def main():
@@ -100,8 +103,9 @@ def main():
     daemon = subprocess.Popen(
         [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
-         *[x for other in checkouts[1:] if "--join" not in sys.argv and not OVERLAY for x in ("--also", other["ws"])]],
-        stderr=out, stdout=out, env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {})})
+         *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
+        stderr=out, stdout=out,
+        env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {}), **({"RUSTD_SPLIT": "1"} if SPLIT else {})})
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")

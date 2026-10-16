@@ -31,14 +31,14 @@ impl Contents {
     pub(crate) fn id(
         &self,
         db: &RootDatabase,
-        checkout: &Path,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
     ) -> Option<u64> {
         if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return known;
         }
-        let id = self.hash(db, checkout, krate, stable_crate_id);
+        let id = self.hash(db, checkouts, krate, stable_crate_id);
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
         id
     }
@@ -46,10 +46,11 @@ impl Contents {
     /// Whether data of a crate hashed here has in it where the checkout or the output of a
     /// build script is, as `env!("CARGO_MANIFEST_DIR")` puts it there: code with such data is
     /// of this checkout alone, whatever the crate is named by.
-    pub(crate) fn names_place(&self, checkout: &Path, bytes: &[u8]) -> bool {
+    pub(crate) fn names_place(&self, checkouts: (&Path, Option<&Path>), bytes: &[u8]) -> bool {
         let within =
             |place: &[u8]| !place.is_empty() && bytes.windows(place.len()).any(|it| it == place);
-        within(checkout.as_os_str().as_encoded_bytes())
+        within(checkouts.0.as_os_str().as_encoded_bytes())
+            || checkouts.1.is_some_and(|it| within(it.as_os_str().as_encoded_bytes()))
             || self
                 .places
                 .lock()
@@ -61,7 +62,7 @@ impl Contents {
     fn hash(
         &self,
         db: &RootDatabase,
-        checkout: &Path,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
     ) -> Option<u64> {
@@ -119,8 +120,10 @@ impl Contents {
         // The longer path first: the others are often what it starts with.
         let mut places = vec![(manifest.as_str(), "$PACKAGE")];
         places.extend(out.as_deref().map(|out| (out, "$OUT")));
-        let checkout_path = checkout.to_string_lossy();
-        places.push((&*checkout_path, "$CHECKOUT"));
+        let (checkout, base) =
+            (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
+        places.push((&*checkout, "$CHECKOUT"));
+        places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
         places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
         for (path, stands_for) in places {
             env = env.replace(path, stands_for);
@@ -136,7 +139,7 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             let id = match on.data(db).origin.is_local() {
-                true => self.id(db, checkout, on, stable_crate_id)?,
+                true => self.id(db, checkouts, on, stable_crate_id)?,
                 false => stable_crate_id(on).unwrap_or_else(|| Self::library(db, on)),
             };
             field(dependency.name.as_str().as_bytes());

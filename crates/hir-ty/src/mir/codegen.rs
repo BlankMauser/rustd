@@ -591,12 +591,13 @@ impl OwnStatics {
 /// Instances already found impossible to compile, kept between builds so a warm build does
 /// not rediscover them one restart at a time.
 /// An instance that could not be compiled, and what it was compiled for.
+#[derive(Clone)]
 pub(in crate::mir) struct Rejected {
     env: StoredParamEnvAndCrate,
     why: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Rejections {
     rejected: FxHashMap<Instance, Rejected>,
     /// The statics that functions left to rustc refer to, and the crates where that is unknown.
@@ -624,6 +625,12 @@ impl Rejections {
     /// changed, which threads can do a part each. `None` when no patch is to be made.
     pub fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Option<Stale> {
         Some(self.base.as_ref()?.stale(db, part, parts))
+    }
+
+    /// Whether the next build is a patch of the last one. A build that is interrupted leaves
+    /// nothing to patch.
+    pub fn patches(&self) -> bool {
+        self.base.is_some()
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
@@ -1197,7 +1204,7 @@ fn left_to_rustc(skipped: &[(FunctionId, CodegenError)]) -> impl Iterator<Item =
 
 /// The statics that functions left to rustc refer to, themselves or through the instances they
 /// name.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 struct TheirStatics {
     statics: FxHashSet<StaticId>,
     /// The crates with a function for which that is not all of them: what could not be

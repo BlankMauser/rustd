@@ -541,6 +541,36 @@ impl CargoWorkspace {
         }
     }
 
+    /// The workspace with each member package `moved` picks, by its directory, at the place
+    /// under `to` that it has under `from`. The workspace is told to be where it was.
+    pub fn placed(
+        &self,
+        from: &AbsPath,
+        to: &AbsPath,
+        moved: &dyn Fn(&AbsPath) -> bool,
+    ) -> CargoWorkspace {
+        let place = |path: &AbsPath| match path.strip_prefix(from) {
+            Some(inside) => to.join(inside),
+            None => path.to_path_buf(),
+        };
+        let mut placed = self.clone();
+        let mut targets = Vec::new();
+        for (_, package) in placed.packages.iter_mut() {
+            if !package.is_member || !moved(package.manifest.parent()) {
+                continue;
+            }
+            let manifest: &AbsPath = package.manifest.as_ref();
+            package.manifest =
+                ManifestPath::try_from(place(manifest)).expect("a manifest is in a directory");
+            targets.extend(package.targets.iter().copied());
+        }
+        for target in targets {
+            let root = place(&placed.targets[target].root);
+            placed.targets[target].root = root;
+        }
+        placed
+    }
+
     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
         self.packages.iter().map(|(id, _pkg)| id)
     }

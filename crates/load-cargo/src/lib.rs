@@ -17,9 +17,9 @@ use hir_expand::proc_macro::{
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, FxHashSet, RootDatabase,
     base_db::{
-        CrateGraphBuilder, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError, SourceDatabase,
-        SourceRoot, SourceRootId,
-        salsa::{Durability, Setter},
+        Crate, CrateGraphBuilder, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError,
+        SourceDatabase, SourceRoot, SourceRootId,
+        salsa::{Database as _, Durability, Setter},
     },
     prime_caches,
 };
@@ -133,12 +133,24 @@ pub struct Loaded {
     /// The path prefixes of each source root and whether it is local. A source root keeps
     /// its place here, and so its id, when workspaces are added.
     file_sets: Vec<(Vec<VfsPath>, bool)>,
+    /// The crates of each workspace. One that is the same in two of them is of both.
+    crates: Vec<Vec<Crate>>,
     proc_macro_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
 }
 
 impl Loaded {
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
         &self.workspaces
+    }
+
+    /// The crates of the workspace at `index` of [`Self::workspaces`].
+    pub fn crates(&self, index: usize) -> &[Crate] {
+        &self.crates[index]
+    }
+
+    /// Puts `workspace` where the one at `index` is. It is loaded by the next [`Self::add`].
+    pub fn replace(&mut self, index: usize, workspace: ProjectWorkspace) {
+        self.workspaces[index] = workspace;
     }
 
     /// Adds `workspaces` to those of `db`, whose files `vfs` holds. What the database has of
@@ -162,6 +174,7 @@ impl Loaded {
         // The graph of all of them: the database keeps the crates it has that are in it.
         let mut crate_graph = CrateGraphBuilder::default();
         let mut proc_macros = FxHashMap::default();
+        let mut members = Vec::new();
         for ws in &self.workspaces {
             let (other, mut paths) = ws.to_crate_graph(
                 &mut |path: &AbsPath| {
@@ -177,7 +190,8 @@ impl Loaded {
                 },
                 extra_env,
             );
-            crate_graph.extend(other, &mut paths);
+            let ids = crate_graph.extend(other, &mut paths);
+            members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
         let proc_macros = {
@@ -273,7 +287,9 @@ impl Loaded {
         }
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
-        db.apply_change(change);
+        db.trigger_cancellation();
+        let ids = change.apply(db).expect("the crate graph is set");
+        self.crates = members.into_iter().map(|it| it.iter().map(|id| ids[id]).collect()).collect();
         Ok(())
     }
 }

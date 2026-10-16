@@ -2997,6 +2997,7 @@ dependencies = [
  "hir-ty",
  "ide-db",
  "load-cargo",
+ "memchr",
  "mimalloc",
  "object 0.37.3",
  "paths",

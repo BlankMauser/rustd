@@ -10,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+memchr = "2"
 anyhow.workspace = true
 mimalloc = { version = "0.1.46", default-features = false }
 object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf"] }

@@ -16,10 +16,15 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ide_db::base_db::SourceDatabase as _;
 use std::{
+    collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -81,9 +86,31 @@ struct Args {
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
+    /// The loaded checkout that `checkout` reads the packages from that are the same in both.
+    base: Option<PathBuf>,
+    /// The crates of `checkout`. One that is the same in another checkout is of both.
+    members: Arc<FxHashSet<ide_db::base_db::Crate>>,
 }
 
 impl Args {
+    /// What `path` is called in the checkout, when it is a file of it.
+    fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
+        path.strip_prefix(&self.checkout).ok().or(base)
+    }
+
+    /// Whether the file is one the checkout is built from. A file of the checkout it shares
+    /// packages with is, when a crate of this one has it.
+    fn owns(&self, db: &RootDatabase, file: vfs::FileId, path: &Path) -> bool {
+        path.starts_with(&self.checkout)
+            || self.base.as_ref().is_some_and(|base| {
+                path.starts_with(base)
+                    && ide_db::base_db::relevant_crates(db, file)
+                        .iter()
+                        .any(|it| self.members.contains(it))
+            })
+    }
+
     /// The directory of the project, which cargo runs rustc in.
     fn root(&self) -> anyhow::Result<PathBuf> {
         let mut root = std::fs::canonicalize(&self.project)?;
@@ -148,6 +175,8 @@ impl Args {
             features,
             also,
             checkout: PathBuf::new(),
+            base: None,
+            members: Arc::default(),
         })
     }
 }
@@ -157,11 +186,19 @@ struct Resolver<'a> {
     table: &'a SymbolTable,
     /// What panic locations in the workspace are relative to.
     root: PathBuf,
+    /// The checkout that the packages which are the same in both are read from.
+    base: Option<PathBuf>,
     rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
 }
 
 impl Resolver<'_> {
+    /// What `path` is called in the checkout, when it is a file of it.
+    fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
+        path.strip_prefix(&self.root).ok().or(base)
+    }
+
     /// The function's path as `rustc-demangle` prints its v0 symbol.
     fn path(&self, func: FunctionId) -> Option<String> {
         let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
@@ -219,7 +256,7 @@ impl Resolver<'_> {
         }
         let name = Crate::from(krate).display_name(self.db)?;
         let root = self.crate_root(krate.into())?;
-        let root = root.strip_prefix(&self.root).unwrap_or(&root);
+        let root = self.inside(&root).unwrap_or(&root);
         let named = format!("rustd crate {} {}", name.crate_name(), root.display());
         let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
         Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
@@ -403,9 +440,10 @@ impl SymbolResolver for Resolver<'_> {
             for _ in 0..threads {
                 let db = self.db.clone();
                 let (next, table, root) = (&next, self.table, self.root.clone());
+                let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
                 scope.spawn(move || {
-                    let resolver = Resolver { db: &db, table, root, rustc_commit, contents };
+                    let resolver = Resolver { db: &db, table, root, base, rustc_commit, contents };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -429,7 +467,7 @@ impl SymbolResolver for Resolver<'_> {
         {
             return Some(format!("/rustc/{commit}/{file}"));
         }
-        let relative = Path::new(&path).strip_prefix(&self.root).ok();
+        let relative = self.inside(Path::new(&path));
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
     }
 
@@ -456,11 +494,12 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        self.contents.id(self.db, &self.root, krate, &|krate| self.stable_crate_id(krate))
+        let places = (&*self.root, self.base.as_deref());
+        self.contents.id(self.db, places, krate, &|krate| self.stable_crate_id(krate))
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
-        self.contents.names_place(&self.root, bytes)
+        self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
@@ -673,21 +712,19 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// library and its binary may share the name, and both are being built. A `krate` that is the
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
-fn crates_named(db: &RootDatabase, krate: &str, checkout: &Path) -> anyhow::Result<Vec<Crate>> {
-    let root_file = krate.ends_with(".rs").then(|| checkout.join(krate));
+fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
+    let is_file = krate.ends_with(".rs");
     let mut found: Vec<_> = Crate::all(db)
         .into_iter()
-        .filter(|it| match &root_file {
-            Some(root_file) => crate_root_file(db, *it).as_ref() == Some(root_file),
-            None => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        .filter(|it| match is_file {
+            true => crate_root_file(db, *it)
+                .is_some_and(|root| args.inside(&root) == Some(Path::new(krate))),
+            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
         .collect();
     // A dependency may be another version of the crate being built, and another checkout
     // has a crate of its name too.
-    let of_checkout = |krate: &Crate| {
-        krate.origin(db).is_local()
-            && crate_root_file(db, *krate).is_some_and(|it| it.starts_with(checkout))
-    };
+    let of_checkout = |krate: &Crate| args.members.contains(&(*krate).into());
     if found.iter().any(of_checkout) {
         found.retain(of_checkout);
     }
@@ -713,6 +750,7 @@ fn load(
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         roots: Vec::new(),
+        splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
         load_config,
@@ -727,6 +765,8 @@ fn load(
 struct Checkouts {
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
+    /// For each of `roots`, what it shares with another when it is not loaded in full.
+    splits: Vec<Option<Split>>,
     loaded: load_cargo::Loaded,
     cargo_config: CargoConfig,
     load_config: LoadCargoConfig,
@@ -737,6 +777,115 @@ impl Checkouts {
         let project = std::fs::canonicalize(project)?;
         let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
+    }
+
+    /// The checkout of `project`: its root, what it shares and its crates.
+    fn parts(&self, project: &Path) -> anyhow::Result<Parts> {
+        let root = self.root_of(project)?;
+        let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
+        let base = self.splits[at].as_ref().map(|it| it.base.clone());
+        let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
+        Ok(Parts { root, base, members })
+    }
+
+    /// The loaded checkout that `project` is a checkout of the same repository as, and the
+    /// root of its own. `None` when the two are not built alike.
+    fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
+        let project = std::fs::canonicalize(project).ok()?;
+        (0..self.roots.len()).find_map(|at| {
+            let (loaded, base) = &self.roots[at];
+            if self.splits[at].is_some() {
+                return None;
+            }
+            let inside = loaded.strip_prefix(base).ok()?;
+            let mut over = project.clone();
+            for part in inside.components().rev() {
+                if over.file_name() != Some(part.as_os_str()) {
+                    return None;
+                }
+                over.pop();
+            }
+            self.builds_alike(base, &over).then_some((at, over))
+        })
+    }
+
+    /// The directories of the member packages of the checkout at `at`, and whether each is
+    /// of a procedural macro.
+    fn packages(&self, at: usize) -> Vec<(PathBuf, bool)> {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
+            return Vec::new();
+        };
+        cargo
+            .packages()
+            .filter(|&it| cargo[it].is_member)
+            .map(|it| {
+                let package = &cargo[it];
+                let dir = AsRef::<Path>::as_ref(package.manifest.parent()).to_owned();
+                (dir, package.targets.iter().any(|&it| cargo[it].kind.is_proc_macro()))
+            })
+            .collect()
+    }
+
+    /// The packages of the checkout at `over` whose files are not those of the loaded one at
+    /// `base`.
+    fn differing(&self, base: usize, over: &Path) -> BTreeSet<PathBuf> {
+        let packages = self.packages(base);
+        let base = &self.roots[base].1;
+        let nested: FxHashSet<&Path> = packages.iter().map(|it| &*it.0).collect();
+        // A procedural macro is rustc's to build: one that is not the same is another build.
+        packages
+            .iter()
+            .filter(|(dir, proc_macro)| !proc_macro && !package_alike(dir, base, over, &nested))
+            .map(|it| &it.0)
+            .filter_map(|dir| Some(dir.strip_prefix(base).ok()?.to_owned()))
+            .collect()
+    }
+
+    /// The workspace of the checkout at `over`: that of the loaded one at `base`, with the
+    /// packages of `own` where `over` has them.
+    fn split(&self, base: usize, over: &Path, own: &BTreeSet<PathBuf>) -> ProjectWorkspace {
+        let mut workspace = self.loaded.workspaces()[base].clone();
+        let root = AbsPathBuf::assert_utf8(self.roots[base].1.clone());
+        let over = AbsPathBuf::assert_utf8(over.to_owned());
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
+            *cargo = cargo.placed(&root, &over, &|dir| {
+                dir.strip_prefix(&root).is_some_and(|it| own.contains(AsRef::<Path>::as_ref(&it)))
+            });
+        }
+        workspace
+    }
+
+    /// The checkouts that share other packages with a loaded one than the ones that are the
+    /// same in both now: each with the one it shares with and the packages of its own.
+    fn differences(&self) -> anyhow::Result<Vec<(usize, usize, BTreeSet<PathBuf>)>> {
+        let mut differences = Vec::new();
+        for (at, split) in self.splits.iter().enumerate() {
+            let Some(split) = split else { continue };
+            let base = self.roots.iter().position(|(_, it)| *it == split.base);
+            let base = base.context("a checkout shares with a loaded one")?;
+            let own = self.differing(base, &self.roots[at].1);
+            if own != split.own {
+                differences.push((at, base, own));
+            }
+        }
+        Ok(differences)
+    }
+
+    /// Gives the checkouts that share packages with a loaded one the packages of their own
+    /// that [`Checkouts::differences`] found.
+    fn share(
+        &mut self,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+        differences: Vec<(usize, usize, BTreeSet<PathBuf>)>,
+    ) -> anyhow::Result<()> {
+        for (at, base, own) in differences {
+            let over = self.roots[at].1.clone();
+            eprintln!("split {}: its own are {own:?}", over.display());
+            self.loaded.replace(at, self.split(base, &over, &own));
+            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+        }
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
     }
 
     /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
@@ -815,7 +964,18 @@ impl Checkouts {
     ) -> anyhow::Result<()> {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
+        let mut splits = Vec::new();
+        let share = std::env::var_os("RUSTD_SPLIT").is_some();
         for project in projects {
+            if share && let Some((base, over)) = self.alike(project) {
+                let own = self.differing(base, &over);
+                eprintln!("split {}: its own are {own:?}", over.display());
+                workspaces.push(self.split(base, &over, &own));
+                splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                roots.push((std::fs::canonicalize(project)?, over));
+                continue;
+            }
+            splits.push(None);
             let workspace = workspace_at(project, &self.cargo_config, &self.load_config)?;
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
@@ -833,8 +993,59 @@ impl Checkouts {
         }
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.roots.extend(roots);
+        self.splits.extend(splits);
         Ok(())
     }
+}
+
+/// The parts of a checkout that a build of it is told.
+struct Parts {
+    root: PathBuf,
+    base: Option<PathBuf>,
+    members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+}
+
+/// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
+/// those of the checkout at `over`. The packages in `nested` are not part of it,
+/// and neither is what a build wrote.
+fn package_alike(dir: &Path, base: &Path, over: &Path, nested: &FxHashSet<&Path>) -> bool {
+    let Ok(inside) = dir.strip_prefix(base) else { return true };
+    let theirs = over.join(inside);
+    let skipped = |inside: &Path, name: &std::ffi::OsStr| {
+        name == ".git"
+            || inside.join(name).join("CACHEDIR.TAG").exists()
+            || nested.contains(&*dir.join(name))
+    };
+    let names = |inside: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(inside)
+            .ok()?
+            .filter_map(|it| Some(it.ok()?.file_name()))
+            .filter(|name| !skipped(inside, name))
+            .collect();
+        names.sort_unstable();
+        Some(names)
+    };
+    let Some(ours) = names(dir) else { return false };
+    names(&theirs).is_some_and(|it| it == ours)
+        && ours.iter().all(|name| {
+            let (path, their) = (dir.join(name), theirs.join(name));
+            if path.is_dir() {
+                return package_alike(&path, base, over, nested);
+            }
+            let size = |path: &Path| std::fs::metadata(path).ok().map(|it| it.len());
+            if size(&path) != size(&their) {
+                return false;
+            }
+            let (Ok(ours), Ok(theirs)) = (std::fs::read(&path), std::fs::read(&their)) else {
+                return false;
+            };
+            // Code that asks where its package is does not say the same in two checkouts.
+            let asks = path.extension().is_some_and(|it| it == "rs")
+                && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
+                    ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
+                });
+            ours == theirs && !asks
+        })
 }
 
 /// Whether the files under `dir`, a directory of the checkout at `base`, are those of the
@@ -858,6 +1069,16 @@ fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
                 std::fs::read(&path).ok() == std::fs::read(theirs.join(name)).ok()
             }
         })
+}
+
+/// A checkout that is a loaded one where its files are the same: the packages that are the
+/// same in both are the crates of the loaded one, and only the others are crates of its own.
+#[derive(Clone, PartialEq)]
+struct Split {
+    /// The root of the loaded checkout.
+    base: PathBuf,
+    /// The directories of the packages it has other files in, as they are called in both.
+    own: BTreeSet<PathBuf>,
 }
 
 /// A checkout as the daemon looks at it.
@@ -956,7 +1177,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
     for name in std::iter::once(&args.krate).chain(&args.batch) {
-        for krate in crates_named(db, name, &args.checkout)? {
+        for krate in crates_named(db, name, args)? {
             let krate: ide_db::base_db::Crate = krate.into();
             crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
         }
@@ -1029,8 +1250,8 @@ impl Listed {
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
-    fn touch(&mut self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
-        let functions = self.functions.get_mut().unwrap();
+    fn touch(&self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
+        let mut functions = self.functions.lock().unwrap();
         let Some(crates) = crates else {
             functions.clear();
             return;
@@ -1157,8 +1378,8 @@ fn build(
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
     let contents = &content::Contents::default();
-    let root = args.checkout.clone();
-    let resolver = Resolver { db, table, root, rustc_commit: Default::default(), contents };
+    let (root, base) = (args.checkout.clone(), args.base.clone());
+    let resolver = Resolver { db, table, root, base, rustc_commit: Default::default(), contents };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
@@ -1166,7 +1387,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        for krate in crates_named(db, krate, &args.checkout)? {
+        for krate in crates_named(db, krate, args)? {
             local.push(krate);
             let listed = listed.of(db, krate);
             if at == 0 {
@@ -1440,17 +1661,17 @@ fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// The source files the daemon watches.
-struct Sources<'a> {
+struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
     /// The manifests that have changed since the daemon loaded them, as they were then.
-    manifests: &'a FxHashMap<vfs::FileId, String>,
+    manifests: FxHashMap<vfs::FileId, String>,
 }
 
 /// Why the source as it is can't be built by the daemon, when it can't.
 fn refusal(
     db: &RootDatabase,
     sources: &[vfs::FileId],
-    watched: &Sources<'_>,
+    watched: &Sources,
     out_of_date: Option<(FunctionId, String)>,
 ) -> Option<String> {
     let Sources { paths, manifests } = watched;
@@ -1609,6 +1830,11 @@ impl WatchedFile {
     /// Adds the files the last build included that are not watched yet. One is read again once
     /// its timestamp is taken, so a write between the build's read and now is not lost: the
     /// result is whether there was one.
+    fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
+        let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
+        db.included_files().iter().any(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
+    }
+
     fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
@@ -1668,6 +1894,8 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             features: args.features.clone(),
             also: Vec::new(),
             checkout: args.checkout.clone(),
+            base: args.base.clone(),
+            members: args.members.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
@@ -1740,7 +1968,7 @@ impl Target {
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
         let Target { project, krate, out, patch, link_cmd, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
-        let checkout = checkouts.root_of(&project)?;
+        let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = std::iter::once(&daemon.krate)
@@ -1751,6 +1979,8 @@ impl Target {
         Ok(Args {
             project,
             checkout,
+            base,
+            members,
             krate,
             batch,
             out,
@@ -1831,13 +2061,111 @@ impl Target {
 /// for the others: only the objects and what went into them are its own.
 struct Program {
     args: Args,
-    table: SymbolTable,
+    table: Arc<SymbolTable>,
     known: Rejections,
     unbuilt: Unbuilt,
     /// The object the last build was asked for.
     wrote: Option<PathBuf>,
     /// The object with all of the program, which a patch is the difference from.
     whole: Option<PathBuf>,
+    /// How many of its builds a change to the source has interrupted since one finished.
+    interrupted: u32,
+}
+
+/// A request, the program it is for, and who waits for the answer.
+type Asked = (Request, Option<Target>, UnixStream);
+
+/// What the daemon waits for.
+enum Event {
+    Asked(Asked),
+    /// The build of a program is over, with what to tell its clients: nothing when a change
+    /// to the source interrupted it.
+    Built(usize, Box<Program>, Option<anyhow::Result<Result<String, String>>>),
+}
+
+/// Set while the builds under way are told to stop for a change to the source.
+static INTERRUPTING: AtomicBool = AtomicBool::new(false);
+
+/// A build that is interrupted this many times is waited for the next time.
+const INTERRUPTIONS: u32 = 3;
+
+/// The clients of a program that is being built.
+struct Running {
+    clients: Vec<Asked>,
+    /// Whether a change to the source waits for the build: one that patches is short, and
+    /// has nothing to patch once it is interrupted.
+    kept: bool,
+}
+
+/// The builds under way and the requests that wait for them. A build reads the database on
+/// threads of its own, so requests for other programs are not kept waiting by it.
+struct Builds {
+    events: std::sync::mpsc::Receiver<Event>,
+    running: FxHashMap<usize, Running>,
+    /// Requests that could not be built with the ones before them.
+    waiting: std::collections::VecDeque<Asked>,
+    /// Whether the requests that wait can only be built once something else happens.
+    stuck: bool,
+}
+
+impl Builds {
+    /// Queues a request, or takes back the program of a build that is over and answers its
+    /// clients. Those of a build that was interrupted ask again, ahead of the others.
+    fn take(&mut self, event: Event, programs: &mut [Program]) -> anyhow::Result<()> {
+        self.stuck = false;
+        let (at, program, answer) = match event {
+            Event::Asked(asked) => {
+                self.waiting.push_back(asked);
+                return Ok(());
+            }
+            Event::Built(at, program, answer) => (at, program, answer),
+        };
+        let Some(Running { clients, .. }) = self.running.remove(&at) else { return Ok(()) };
+        programs[at] = *program;
+        let program = &mut programs[at];
+        let Some(answer) = answer else {
+            eprintln!("interrupted: {}", program.args.krate);
+            let patching = program.known.patching;
+            program.known = Rejections::default();
+            program.known.patching = patching;
+            program.unbuilt.stale = true;
+            (program.wrote, program.whole) = (None, None);
+            program.interrupted += 1;
+            clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
+            return Ok(());
+        };
+        program.interrupted = 0;
+        let answer = answer?;
+        for (_, _, client) in clients {
+            // A client that hangs up before the answer is not the daemon's problem.
+            let _ = match &answer {
+                Ok(built) => writeln!(&client, "ok {built}"),
+                Err(why) => writeln!(&client, "error: {}", why.replace('\n', " ")),
+            };
+        }
+        Ok(())
+    }
+
+    /// Leaves no build under way, for the database to be written to: a write stops every
+    /// thread that reads it. The builds that are kept are waited for, the others interrupted.
+    fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
+        use ide_db::base_db::salsa::Database as _;
+        while self.running.values().any(|it| it.kept) {
+            let event = self.events.recv()?;
+            self.take(event, programs)?;
+        }
+        if self.running.is_empty() {
+            return Ok(());
+        }
+        INTERRUPTING.store(true, Ordering::SeqCst);
+        db.trigger_cancellation();
+        while !self.running.is_empty() {
+            let event = self.events.recv()?;
+            self.take(event, programs)?;
+        }
+        INTERRUPTING.store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Where a build of a program goes. A checkout looked at as another has files of its own for
@@ -1895,6 +2223,12 @@ fn join(
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
     checkouts.add(&[project], db, tree.vfs())?;
+    watch_loaded(db, tree, files);
+    Ok(())
+}
+
+/// Watches the source files that were loaded since the last were.
+fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<WatchedFile>) {
     let watched: FxHashSet<vfs::FileId> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -1915,7 +2249,6 @@ fn join(
         .collect();
     tree.watch(db, &sources);
     files.extend(new);
-    Ok(())
 }
 
 /// Waits for a build request on `listener`. The result is where to send the outcome.
@@ -2005,7 +2338,8 @@ fn main() -> anyhow::Result<()> {
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
     let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config)?;
-    args.checkout = checkouts.root_of(&args.project)?;
+    let Parts { root, base, members } = checkouts.parts(&args.project)?;
+    (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());
 
     if args.out.is_dir() {
@@ -2033,8 +2367,8 @@ fn main() -> anyhow::Result<()> {
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
-        let checkout = checkouts.root_of(also)?;
-        let resolved = resolve_crates(&db, &Args { checkout, ..args.clone() })?;
+        let Parts { root: checkout, base, members } = checkouts.parts(also)?;
+        let resolved = resolve_crates(&db, &Args { checkout, base, members, ..args.clone() })?;
         eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
     }
     if !args.also.is_empty() {
@@ -2044,13 +2378,13 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
     let report_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if !PROBING.get() {
+        if !PROBING.get() && !INTERRUPTING.load(Ordering::SeqCst) {
             report_panic(info);
         }
     }));
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
-    let mut listed = Listed::default();
+    let listed = Arc::new(Listed::default());
     let mut outlines = outline::Outlines::default();
     let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
@@ -2091,54 +2425,73 @@ fn main() -> anyhow::Result<()> {
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
-    let requests = listener.map(|listener| {
-        let (sender, requests) = std::sync::mpsc::channel();
+    let (sender, events) = std::sync::mpsc::channel();
+    let serving = listener.is_some();
+    if let Some(listener) = listener {
+        let sender = sender.clone();
         std::thread::spawn(move || {
             while let Ok(request) = requested(&listener) {
-                if sender.send(request).is_err() {
+                if sender.send(Event::Asked(request)).is_err() {
                     break;
                 }
             }
         });
-        requests
-    });
+    }
     // The first is the program asked for when a request names none.
     let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
-    let mut programs =
-        vec![Program { args, table, known, unbuilt: Unbuilt::default(), wrote, whole }];
+    let mut programs = vec![Program {
+        args,
+        table: Arc::new(table),
+        known,
+        unbuilt: Unbuilt::default(),
+        wrote,
+        whole,
+        interrupted: 0,
+    }];
     let overlay = std::env::var_os("RUSTD_OVERLAY").is_some();
+    // A checkout read as another is read so by every build, so those are waited for.
+    let background = serving && !overlay;
+    let mut builds =
+        Builds { events, running: FxHashMap::default(), waiting: Default::default(), stuck: false };
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The manifests that have changed since they were loaded, as they were then.
     let mut manifests: FxHashMap<vfs::FileId, String> = FxHashMap::default();
     // The crates whose variables name another checkout than the one they were loaded in.
     let mut placed = Placed::default();
-    // Requests that could not be built with the ones before them.
-    let mut waiting = std::collections::VecDeque::new();
     loop {
+        if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
+            builds.settle(&mut db, &mut programs)?;
+        }
         if WatchedFile::watch_included(&mut files, &mut db)
             | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
         {
             programs.iter_mut().for_each(|it| it.known.touch(&db, None));
         }
         // The program each client asks for.
-        let mut clients: Vec<(usize, Request, UnixStream)> = Vec::new();
+        let mut clients: Vec<(usize, Asked)> = Vec::new();
         // Where each of those programs is to be written.
         let mut outputs: FxHashMap<usize, Outputs> = FxHashMap::default();
         // The checkout each loaded one has to be read from for them.
         let mut looked: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
-        match &requests {
-            Some(requests) => {
+        match serving {
+            true => {
                 let mut later = Vec::new();
-                let mut next = match waiting.pop_front() {
-                    Some(request) => Some(request),
-                    None => Some(requests.recv()?),
-                };
-                // Asked again after each: a checkout that joins takes long enough for the
-                // requests sent with its own to arrive.
-                while let Some((request, mut target, stream)) =
-                    next.take().or_else(|| waiting.pop_front()).or_else(|| requests.try_recv().ok())
-                {
+                if builds.stuck || builds.waiting.is_empty() {
+                    let event = builds.events.recv()?;
+                    builds.take(event, &mut programs)?;
+                }
+                loop {
+                    // Asked again after each: a checkout that joins takes long enough for the
+                    // requests sent with its own to arrive.
+                    while let Ok(event) = builds.events.try_recv() {
+                        builds.take(event, &mut programs)?;
+                    }
+                    let Some((request, target, stream)) = builds.waiting.pop_front() else {
+                        break;
+                    };
+                    let asked = target.clone();
+                    let mut target = target;
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => checkouts.view_of(project, overlay),
                         None => {
@@ -2182,21 +2535,24 @@ fn main() -> anyhow::Result<()> {
                         None => Outputs::of(&programs[0].args),
                     };
                     if let Some(at) = known {
-                        if outputs.get(&at).is_some_and(|it| *it != wanted) {
-                            later.push((request, target, stream));
+                        if builds.running.contains_key(&at)
+                            || outputs.get(&at).is_some_and(|it| *it != wanted)
+                        {
+                            later.push((request, asked, stream));
                             continue;
                         }
                         outputs.insert(at, wanted);
                         if let Some(view) = view {
                             looked.insert(view.base, view.over);
                         }
-                        clients.push((at, request, stream));
+                        clients.push((at, (request, asked, stream)));
                         continue;
                     }
                     let Some(target) = target else { continue };
                     // A checkout the daemon has not seen joins the ones it has.
                     let joined = match &target.project {
                         Some(project) if view.is_none() => {
+                            builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
                             let joined =
                                 join(project, &mut checkouts, &mut db, &mut tree, &mut files);
@@ -2213,7 +2569,19 @@ fn main() -> anyhow::Result<()> {
                     let loaded = joined
                         .and_then(|()| target.args(&programs[0].args, &checkouts))
                         .and_then(|args| {
-                            let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                            // The symbols of a checkout are those of the one it shares
+                            // packages with, which rustc built.
+                            let shared = programs.iter().find(|it| {
+                                it.args.symbol_files == args.symbol_files
+                                    && (it.args.checkout == args.checkout
+                                        || Some(&it.args.checkout) == args.base.as_ref())
+                            });
+                            let table = match shared {
+                                Some(program) => program.table.clone(),
+                                None => {
+                                    Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?)
+                                }
+                            };
                             Ok((args, table))
                         });
                     match loaded {
@@ -2222,16 +2590,25 @@ fn main() -> anyhow::Result<()> {
                             // checked when the programs before it were built.
                             let unbuilt =
                                 Unbuilt { edited: programs[0].unbuilt.edited.clone(), stale: true };
-                            clients.push((programs.len(), request, stream));
-                            outputs.insert(programs.len(), wanted);
-                            programs.push(Program {
+                            let mut program = Program {
                                 args,
                                 table,
                                 known,
                                 unbuilt,
                                 wrote: None,
                                 whole: None,
-                            });
+                                interrupted: 0,
+                            };
+                            if let Some(built) =
+                                programs.iter().find(|it| it.same_as(&db, &program))
+                            {
+                                program.known = built.known.clone();
+                                program.unbuilt.stale = false;
+                                program.whole = built.whole.clone();
+                            }
+                            clients.push((programs.len(), (request, asked, stream)));
+                            outputs.insert(programs.len(), wanted);
+                            programs.push(program);
                         }
                         // A request for what can't be built is the client's mistake.
                         Err(e) => {
@@ -2239,12 +2616,29 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                waiting.extend(later);
-                if clients.is_empty() {
+                builds.waiting.extend(later);
+                builds.stuck = clients.is_empty();
+                if builds.stuck {
                     continue;
                 }
+                // A package that was the same in two checkouts may have been edited in one.
+                let start = Instant::now();
+                let differences = checkouts.differences()?;
+                if !differences.is_empty() {
+                    builds.settle(&mut db, &mut programs)?;
+                    checkouts.share(&mut db, tree.vfs(), differences)?;
+                    watch_loaded(&mut db, &mut tree, &mut files);
+                    for program in &mut programs {
+                        let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
+                        (program.args.base, program.args.members) = (base, members);
+                        program.unbuilt.stale = true;
+                        program.known.touch(&db, None);
+                    }
+                    listed.touch(&db, None);
+                    eprintln!("split again: {:.1?}", start.elapsed());
+                }
             }
-            None => std::thread::sleep(Duration::from_millis(5)),
+            false => std::thread::sleep(Duration::from_millis(5)),
         }
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
@@ -2278,6 +2672,9 @@ fn main() -> anyhow::Result<()> {
         // Source files that are no longer there.
         let mut gone = FxHashSet::default();
         loop {
+            if tree.relisted(&db) {
+                builds.settle(&mut db, &mut programs)?;
+            }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
                 files.push(WatchedFile {
@@ -2321,21 +2718,24 @@ fn main() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
         // Without clients, the first program is built whenever a file changes.
-        let building: FxHashSet<usize> = match requests {
-            Some(_) => clients.iter().map(|it| it.0).collect(),
-            None => FxHashSet::from_iter([0]),
+        let building: FxHashSet<usize> = match serving {
+            true => clients.iter().map(|it| it.0).collect(),
+            false => FxHashSet::from_iter([0]),
         };
         let stale = building.iter().any(|&at| programs[at].unbuilt.stale) || !moved.is_empty();
         let (noticed, age) = match noticed {
             Some(noticed) => noticed,
             None if stale => (Instant::now(), Duration::ZERO),
             None => {
-                for (_, _, client) in clients {
+                for (_, (_, _, client)) in clients {
                     let _ = writeln!(&client, "ok unchanged");
                 }
                 continue;
             }
         };
+        if touched.len() + gone.len() != 0 {
+            builds.settle(&mut db, &mut programs)?;
+        }
         let settled = noticed.elapsed();
         let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
@@ -2370,7 +2770,10 @@ fn main() -> anyhow::Result<()> {
         let read = read.elapsed();
         eprintln!("change: {changed} files");
         let start = Instant::now();
-        db.apply_change(change);
+        // A write stops the builds under way, so nothing is written when nothing changed.
+        if changed != 0 || !background {
+            db.apply_change(change);
+        }
         if !removed.is_empty() {
             tree.remove(&mut db, &removed);
             let mut index = 0;
@@ -2402,7 +2805,7 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
-        let paths = Sources { paths, manifests: &manifests };
+        let paths = Arc::new(Sources { paths, manifests: manifests.clone() });
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
@@ -2425,6 +2828,53 @@ fn main() -> anyhow::Result<()> {
             listed.touch(&db, Some(&moved));
         }
         let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
+        if background {
+            let mut asked: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
+            for (at, client) in clients {
+                asked.entry(at).or_default().push(client);
+            }
+            for (at, clients) in asked {
+                let program = &mut programs[at];
+                if !program.unbuilt.stale {
+                    for (_, _, client) in clients {
+                        let _ = writeln!(&client, "ok unchanged");
+                    }
+                    continue;
+                }
+                // The program is linked unless every client of it loads the patch.
+                let link = clients.iter().any(|it| it.0 != Request::Patch);
+                let kept = program.known.patches() || program.interrupted >= INTERRUPTIONS;
+                // What stands in for the program while it is built says what program it is.
+                let away = Program {
+                    args: program.args.clone(),
+                    table: program.table.clone(),
+                    known: Rejections::default(),
+                    unbuilt: Unbuilt::default(),
+                    wrote: None,
+                    whole: None,
+                    interrupted: program.interrupted,
+                };
+                let mut program = Box::new(std::mem::replace(program, away));
+                builds.running.insert(at, Running { clients, kept });
+                let (db, listed, paths, sender) =
+                    (db.clone(), listed.clone(), paths.clone(), sender.clone());
+                let wanted = outputs.remove(&at);
+                std::thread::spawn(move || {
+                    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link)
+                    }));
+                    // The write that interrupts waits for this.
+                    drop(db);
+                    let answer = match answer {
+                        _ if INTERRUPTING.load(Ordering::SeqCst) => None,
+                        Ok(answer) => Some(answer),
+                        Err(_) => Some(Err(anyhow::anyhow!("a build panicked"))),
+                    };
+                    let _ = sender.send(Event::Built(at, program, answer));
+                });
+            }
+            continue;
+        }
         // The programs asked for are built side by side: nothing is written to the database
         // until all of them are done, so none is interrupted.
         let answers = loop {
@@ -2437,8 +2887,8 @@ fn main() -> anyhow::Result<()> {
                         .map(|(at, program)| {
                             // The program is linked unless every client of it loads the patch.
                             let link = !clients.iter().any(|it| it.0 == at)
-                                || clients.iter().any(|it| it.0 == at && it.1 != Request::Patch);
-                            let (db, listed, paths, edit) = (db.clone(), &listed, &paths, &edit);
+                                || clients.iter().any(|it| it.0 == at && it.1.0 != Request::Patch);
+                            let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
                             let wanted = outputs.get(&at);
                             let build = scope.spawn(move || {
                                 program.sync(&db, listed, paths, edit, wanted, link)
@@ -2484,7 +2934,7 @@ fn main() -> anyhow::Result<()> {
         for (at, answer) in answers {
             replies.insert(at, answer?);
         }
-        for (at, _, client) in clients {
+        for (at, (_, _, client)) in clients {
             let _ = match replies.get(&at) {
                 Some(Ok(built)) => writeln!(&client, "ok {built}"),
                 Some(Err(why)) => writeln!(&client, "error: {}", why.replace('\n', " ")),
@@ -2495,6 +2945,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// A change to the files, and how long each step up to the builds took.
+#[derive(Clone, Copy)]
 struct Edit {
     /// When the change was applied.
     start: Instant,
@@ -2507,18 +2958,36 @@ struct Edit {
 }
 
 impl Program {
+    /// Whether the last build of this program is one of `other`, which has had none: the two
+    /// are of the same crates, as checkouts that share them have it. What `other` is then
+    /// asked for is a patch of that build.
+    fn same_as(&self, db: &RootDatabase, other: &Program) -> bool {
+        let (ours, theirs) = (&self.args, &other.args);
+        let crates = |args: &Args| {
+            let names = std::iter::once(&args.krate).chain(&args.batch);
+            names.map(|it| crates_named(db, it, args).ok()).collect::<Option<Vec<_>>>()
+        };
+        !self.unbuilt.stale
+            && self.whole.is_some()
+            && self.known.patches()
+            && self.known.patching == other.known.patching
+            && Arc::ptr_eq(&self.table, &other.table)
+            && (ours.cfg_test, &ours.features) == (theirs.cfg_test, &theirs.features)
+            && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
+    }
+
     /// Brings the program up to date with the database. The result is what to tell its
     /// clients: what they have to load, or why the source can't be built.
     fn sync(
         &mut self,
         db: &RootDatabase,
         listed: &Listed,
-        paths: &Sources<'_>,
+        paths: &Sources,
         edit: &Edit,
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
-        let Program { args, table, known, unbuilt, wrote, whole } = self;
+        let Program { args, table, known, unbuilt, wrote, whole, .. } = self;
         let Outputs { out, patch, link_cmd } = wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         let args = &Args { out, patch, link_cmd, ..args.clone() };
         // A patch is for the object with all of the program, which this build may be the
@@ -2536,7 +3005,7 @@ impl Program {
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
-        edited.retain(|file| paths.paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
+        edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
             let check = {

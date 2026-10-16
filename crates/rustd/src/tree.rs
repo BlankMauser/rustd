@@ -71,6 +71,14 @@ impl Tree {
 
     /// The source files that are new since the last look. Each is in its source root once
     /// this returns, with no text in it yet.
+    /// Whether [`Tree::added`] has directories to list again.
+    pub(crate) fn relisted(&self, db: &RootDatabase) -> bool {
+        self.directories.iter().any(|(path, dir)| {
+            let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+            now.is_some() && now != dir.listed
+        })
+    }
+
     pub(crate) fn added(&mut self, db: &mut RootDatabase) -> Moved {
         let mut stale: Vec<PathBuf> = self
             .directories
@@ -143,6 +151,17 @@ impl Tree {
 
     /// Puts the files an `include!` named that were not loaded, as they are not source by
     /// their extension, in the source root of the file that includes them, with their text.
+    /// Whether [`Tree::included`] has files to add.
+    pub(crate) fn includes_more(&self, db: &RootDatabase) -> bool {
+        db.included_sources().into_iter().any(|(path, root)| {
+            let source_root = db.source_root(root).source_root(db);
+            !self
+                .vfs
+                .file_id(&VfsPath::from(path))
+                .is_some_and(|(file, _)| source_root.path_for_file(&file).is_some())
+        })
+    }
+
     pub(crate) fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
         let mut added = Vec::new();
         let mut joined: FxHashMap<SourceRootId, Vec<(FileId, VfsPath)>> = FxHashMap::default();
