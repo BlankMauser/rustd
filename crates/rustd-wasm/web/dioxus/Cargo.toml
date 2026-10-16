@@ -1,0 +1,12 @@
+# The Dioxus demo: `app` is what the page shows and rustd compiles in it; `base` is Dioxus and
+# `std` as rustc builds them, which the page loads first and the compiled `app` calls into.
+[workspace]
+members = ["app", "base"]
+resolver = "3"
+
+[workspace.dependencies]
+dioxus = { version = "=0.7.10", default-features = false, features = ["web", "macro", "html", "signals", "hooks", "launch"] }
+
+[profile.dev]
+panic = "abort"
+debug = 0
