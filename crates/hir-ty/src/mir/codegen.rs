@@ -7820,6 +7820,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, i as i32);
                 }
             }
+            ("x86.xgetbv", [register]) => {
+                let (register, _) = self.load_scalar(register)?;
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(types::I32));
+                sig.returns.push(AbiParam::new(types::I64));
+                let callee = self.cg.assembly(asm::xgetbv(), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let call = self.builder.ins().call(callee, &[register]);
+                let value = self.builder.inst_results(call)[0];
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             ("x86.pclmulqdq" | "x86.pclmulqdq.256" | "x86.pclmulqdq.512", [a, b, halves]) => {
                 let (a, ty) = self.operand(a)?;
                 let (b, _) = self.operand(b)?;

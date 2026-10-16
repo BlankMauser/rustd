@@ -23,4 +23,5 @@ cases![
     macro_item_location,
     clmul,
     cast_then_shift,
+    xgetbv,
 ];
