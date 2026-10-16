@@ -34,7 +34,7 @@ use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource, TargetDirectoryConfig,
+    RustLibSource, TargetDirectoryConfig, TargetKind,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -731,14 +731,50 @@ impl Checkouts {
                 }
                 over.pop();
             }
-            // FIXME: a manifest that differs with the lock file the same (a feature turned on,
-            // a new member) is not noticed.
-            let lock = |root: &Path| std::fs::read(root.join("Cargo.lock")).ok();
-            (lock(&over)? == lock(base)?).then(|| View {
+            self.builds_alike(base, &over).then(|| View {
                 base: base.clone(),
                 over,
                 project: loaded.clone(),
             })
+        })
+    }
+
+    /// Whether what cargo and rustc did for the checkout at `base` is what they would do for
+    /// the one at `over`: the same crates with the same features, and the same build scripts
+    /// and proc macros, which the daemon has the output of and does not run.
+    // FIXME: a build script or a proc macro that reads other files of its checkout is not
+    // noticed, and neither is a crate outside the checkout that the manifests name by path.
+    fn builds_alike(&self, base: &Path, over: &Path) -> bool {
+        let alike = |path: &Path| {
+            let Ok(inside) = path.strip_prefix(base) else { return true };
+            std::fs::read(path).ok() == std::fs::read(over.join(inside)).ok()
+        };
+        let top = ["Cargo.lock", "Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml"];
+        if !top.iter().all(|it| alike(&base.join(it))) {
+            return false;
+        }
+        let cargo = self.loaded.workspaces().iter().find_map(|it| match &it.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. }
+                if AsRef::<Path>::as_ref(cargo.workspace_root()) == base =>
+            {
+                Some(cargo)
+            }
+            _ => None,
+        });
+        let Some(cargo) = cargo else { return false };
+        cargo.packages().map(|it| &cargo[it]).filter(|it| it.is_member).all(|package| {
+            let manifest: &Path = package.manifest.as_ref();
+            alike(manifest)
+                && package.targets.iter().map(|&it| &cargo[it]).all(|target| {
+                    let root: &Path = target.root.as_ref();
+                    match target.kind {
+                        TargetKind::BuildScript => alike(root),
+                        TargetKind::Lib { is_proc_macro: true } => {
+                            root.parent().is_some_and(|it| tree_alike(it, base, over))
+                        }
+                        _ => true,
+                    }
+                })
         })
     }
 
@@ -771,6 +807,29 @@ impl Checkouts {
         self.roots.extend(roots);
         Ok(())
     }
+}
+
+/// Whether the files under `dir`, a directory of the checkout at `base`, are those of the
+/// checkout at `over`.
+fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
+    let Ok(inside) = dir.strip_prefix(base) else { return true };
+    let names = |dir: &Path| {
+        let mut names: Vec<_> =
+            std::fs::read_dir(dir).ok()?.filter_map(|it| Some(it.ok()?.file_name())).collect();
+        names.sort_unstable();
+        Some(names)
+    };
+    let theirs = over.join(inside);
+    let Some(ours) = names(dir) else { return false };
+    names(&theirs).is_some_and(|it| it == ours)
+        && ours.iter().all(|name| {
+            let path = dir.join(name);
+            if path.is_dir() {
+                tree_alike(&path, base, over)
+            } else {
+                std::fs::read(&path).ok() == std::fs::read(theirs.join(name)).ok()
+            }
+        })
 }
 
 /// A checkout as the daemon looks at it.
@@ -1154,10 +1213,10 @@ fn build(
     }
     let start = Instant::now();
     if let Some(object) = &unit.object {
-        std::fs::write(&args.out, object)?;
+        replace(&args.out, object)?;
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
-        std::fs::write(path, patch)?;
+        replace(path, patch)?;
     }
     let build = Build {
         compiled: unit.compiled.len(),
@@ -1278,23 +1337,52 @@ fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     built
 }
 
+/// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
+/// it open or under another name: the object of a program can be that of another one too.
+fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut new = path.as_os_str().to_owned();
+    new.push(format!(".{}.new", std::process::id()));
+    std::fs::write(&new, bytes)?;
+    std::fs::rename(&new, path)
+}
+
+/// The source files the daemon watches.
+struct Sources<'a> {
+    paths: FxHashMap<vfs::FileId, PathBuf>,
+    /// The manifests that have changed since the daemon loaded them, as they were then.
+    manifests: &'a FxHashMap<vfs::FileId, String>,
+}
+
 /// Why the source as it is can't be built by the daemon, when it can't.
 fn refusal(
     db: &RootDatabase,
     sources: &[vfs::FileId],
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    watched: &Sources<'_>,
     out_of_date: Option<(FunctionId, String)>,
 ) -> Option<String> {
+    let Sources { paths, manifests } = watched;
     for &file in sources {
+        let path = paths.get(&file);
+        if path.is_some_and(|it| it.file_name().is_some_and(|it| it == "Cargo.toml")) {
+            // FIXME: load the checkout again in place of turning it down.
+            if manifests.get(&file).is_some_and(|it| **it != **db.file_text(file).text(db)) {
+                let path = path.map(|it| it.display().to_string()).unwrap_or_default();
+                return Some(format!("{path} is not what the daemon loaded, start it again"));
+            }
+            continue;
+        }
         let edition = ide_db::base_db::relevant_crates(db, file)
             .first()
             .map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
         let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
         if let Some(error) = parse.errors().first() {
-            let path = paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
-            let line = db.file_text(file).text(db)[..usize::from(error.range().start())]
-                .matches('\n')
-                .count();
+            let text = db.file_text(file).text(db);
+            // A file that is included where an expression goes is not one of items.
+            if syntax::ast::Expr::parse(text, edition).errors().is_empty() {
+                continue;
+            }
+            let path = path.map(|it| it.display().to_string()).unwrap_or_default();
+            let line = text[..usize::from(error.range().start())].matches('\n').count();
             return Some(format!("{path}:{}: {error}", line + 1));
         }
     }
@@ -1911,6 +1999,8 @@ fn main() -> anyhow::Result<()> {
     let overlay = std::env::var_os("RUSTD_OVERLAY").is_some();
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
+    // The manifests that have changed since they were loaded, as they were then.
+    let mut manifests: FxHashMap<vfs::FileId, String> = FxHashMap::default();
     // Requests that could not be built with the ones before them.
     let mut waiting = std::collections::VecDeque::new();
     loop {
@@ -2151,6 +2241,11 @@ fn main() -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
+                    if path.file_name().is_some_and(|it| it == "Cargo.toml") {
+                        manifests
+                            .entry(*id)
+                            .or_insert_with(|| db.file_text(*id).text(&db).to_string());
+                    }
                     change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
                     sources.push(*id);
                 }
@@ -2192,6 +2287,7 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
+        let paths = Sources { paths, manifests: &manifests };
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
@@ -2278,7 +2374,7 @@ impl Program {
         &mut self,
         db: &RootDatabase,
         listed: &Listed,
-        paths: &FxHashMap<vfs::FileId, PathBuf>,
+        paths: &Sources<'_>,
         edit: &Edit,
         wanted: Option<&Outputs>,
         link_it: bool,
@@ -2301,7 +2397,7 @@ impl Program {
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
-        edited.retain(|file| paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
+        edited.retain(|file| paths.paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
             let check = {

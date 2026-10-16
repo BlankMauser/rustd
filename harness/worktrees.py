@@ -19,6 +19,8 @@ COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
 AREA = "sbase::square!(self.side)"
 SUM = "items.iter().sum()"
+# Not the same in any two checkouts from the start.
+NOTE = "app/src/note.txt"
 # (what the step is, [(checkout, file, old, new)], checkouts asked for in order, the ones cargo rejects)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
@@ -35,7 +37,17 @@ STEPS = [
      [(2, APP, "fn main() {", "fn extra() -> u32 {\n    41\n}\n\nfn main() {\n    println!(\"extra {}\", extra());")],
      [2, 0, 1], []),
     ("one put back as another is", [(2, MID, AREA + " + 7", AREA + " + 2")], [2, 0], []),
+    ("a file that is included edited in one", [(1, NOTE, "note of 1", "another note")], [0, 1, 2], []),
 ]
+# Cargo may build that checkout another way now, so it can't be read as the first any more. A
+# checkout that is loaded is turned down for it.
+if "--overlay" in sys.argv:
+    STEPS += [
+        ("a manifest edited in one",
+         [(2, "mid/Cargo.toml", "[dependencies]", "[features]\nmore = []\n\n[dependencies]")], [2, 0, 1], []),
+        ("that one edited", [(2, MID, AREA + " + 2", AREA + " + 9")], [0, 2, 1], []),
+        ("and another", [(0, MID, AREA + " + 2", AREA + " + 3")], [0, 2, 1], []),
+    ]
 
 
 # With `--overlay` the others are not loaded at all: each is read as the first with other files.
@@ -50,6 +62,11 @@ def main():
     for at in range(COUNT):
         ws = os.path.join(work, f"checkout{at}")
         shutil.copytree(os.path.join(HERE, "stress"), ws, ignore=shutil.ignore_patterns("target"))
+        open(os.path.join(ws, NOTE), "w").write(f"note of {at}\n")
+        main_rs = os.path.join(ws, APP)
+        text = open(main_rs).read()
+        assert "fn main() {" in text
+        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));', 1))
         # A checkout read as the first one links what rustc built of the first.
         if not (OVERLAY and checkouts):
             fx = Fixture(ws, crates, ["-p", "sapp"])
