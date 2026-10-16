@@ -77,6 +77,9 @@ def main():
             link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
             link[link.index("-fuse-ld=lld")] = "-B" + ld
         args += ["--patch", patch, "--link-cmd", shlex.join(link)]
+        # DXEDITS_SPLICE: edits are added to the linked binary where that can be done.
+        if os.environ.get("DXEDITS_SPLICE"):
+            args += ["--splice", binary]
     # DXEDITS_REQUEST: `sync` or `patch`; each build is then asked for once the file is written.
     request = os.environ.get("DXEDITS_REQUEST")
     socket = os.path.join(work, "rustd.sock")

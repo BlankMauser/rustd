@@ -53,6 +53,11 @@ STEPS = [
 ]
 
 
+def splice(program):
+    """RUSTD_SPLICE: edits are added to the linked binary where that can be done."""
+    return ["--splice", program["bin"]] if os.environ.get("RUSTD_SPLICE") else []
+
+
 def main():
     ws = tempfile.mkdtemp(prefix="rustd-programs-")
     shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
@@ -81,7 +86,7 @@ def main():
     out = open(log_path, "a")
     daemon = subprocess.Popen(
         [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"]], stderr=out, stdout=out)
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -107,7 +112,7 @@ def main():
             began = time.time()
             reply = subprocess.run(
                 [RUSTD, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
-                 "--link-cmd", program["link"], *program["symbols"]], capture_output=True, text=True, timeout=120)
+                 "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
             cargo = subprocess.run(["cargo", "build", "-q", "-p", name], cwd=ws, capture_output=True, text=True,

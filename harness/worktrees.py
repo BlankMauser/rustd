@@ -69,6 +69,11 @@ if "--overlay" in sys.argv:
 OVERLAY = "--overlay" in sys.argv
 
 
+def splice(program):
+    """RUSTD_SPLICE: edits are added to the linked binary where that can be done."""
+    return ["--splice", program["bin"]] if os.environ.get("RUSTD_SPLICE") else []
+
+
 def main():
     work = tempfile.mkdtemp(prefix="rustd-worktrees-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -99,7 +104,7 @@ def main():
     out = open(log_path, "a")
     daemon = subprocess.Popen(
         [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if "--join" not in sys.argv and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out, env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {})})
     while "watching" not in open(log_path).read():
@@ -135,7 +140,7 @@ def main():
             checkout = checkouts[at]
             return time.time(), subprocess.Popen(
                 [RUSTD, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
-                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *checkout["symbols"]],
+                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *splice(checkout), *checkout["symbols"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         # A program asked for twice in a step is asked for the second time after the others.
