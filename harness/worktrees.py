@@ -7,7 +7,7 @@ others as `--also`; each step edits files of some checkouts and asks for the pro
 `cargo build` of that checkout prints.
 
 With `--join` the daemon is started in the first copy alone, and the others join it when they
-are first asked for.
+are first asked for. With `--together` the programs of a step are asked for at once.
 """
 import os, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -84,15 +84,22 @@ def main():
             open(path, "w").write(text.replace(old, new, 1))
         time.sleep(0.02)
         print(what, flush=True)
-        for at in order:
+        together = "--together" in sys.argv
+
+        def ask(at):
             checkout = checkouts[at]
-            began = time.time()
-            reply = subprocess.run(
+            return time.time(), subprocess.Popen(
                 [RUSTD, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
                  "--patch", checkout["patch"], "--link-cmd", checkout["link"], *checkout["symbols"]],
-                capture_output=True, text=True, timeout=120)
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        # A program asked for twice in a step is asked for the second time after the others.
+        asking = {at: ask(at) for at in order} if together else {}
+        for at in order:
+            checkout = checkouts[at]
+            began, reply = asking.pop(at, None) or ask(at)
+            reply = reply.communicate(timeout=120)[0].strip()
             took = (time.time() - began) * 1000
-            reply = (reply.stdout + reply.stderr).strip()
             cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]

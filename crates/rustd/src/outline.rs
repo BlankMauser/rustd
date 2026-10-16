@@ -250,8 +250,9 @@ impl Listed {
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
+        let listed = self.functions.lock().unwrap();
         for &krate in relevant_crates(db, file).iter() {
-            match self.functions.get(&krate.into()) {
+            match listed.get(&krate.into()) {
                 Some(listed) => functions.extend(
                     listed
                         .functions
@@ -259,7 +260,7 @@ impl Listed {
                         .copied()
                         .filter(|&it| hir_ty::mir::codegen::body_file(db, it.into()) == file),
                 ),
-                None if self.functions.keys().any(|&built| {
+                None if listed.keys().any(|&built| {
                     ide_db::base_db::Crate::from(built).transitive_deps(db).contains(&krate)
                 }) =>
                 {

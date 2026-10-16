@@ -871,7 +871,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
 /// have changed the items of.
 #[derive(Default)]
 struct Listed {
-    functions: FxHashMap<Crate, ListedCrate>,
+    functions: std::sync::Mutex<FxHashMap<Crate, std::sync::Arc<ListedCrate>>>,
 }
 
 struct ListedCrate {
@@ -891,19 +891,25 @@ impl ListedCrate {
 }
 
 impl Listed {
-    fn of(&mut self, db: &RootDatabase, krate: Crate) -> &ListedCrate {
-        self.functions.entry(krate).or_insert_with(|| ListedCrate::new(db, krate))
+    /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
+    fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
+        if let Some(listed) = self.functions.lock().unwrap().get(&krate) {
+            return listed.clone();
+        }
+        let listed = std::sync::Arc::new(ListedCrate::new(db, krate));
+        self.functions.lock().unwrap().entry(krate).or_insert(listed).clone()
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     fn touch(&mut self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
+        let functions = self.functions.get_mut().unwrap();
         let Some(crates) = crates else {
-            self.functions.clear();
+            functions.clear();
             return;
         };
         for &krate in crates {
             for seeing in krate.transitive_rev_deps(db) {
-                self.functions.remove(&Crate::from(seeing));
+                functions.remove(&Crate::from(seeing));
             }
         }
     }
@@ -1019,7 +1025,7 @@ fn build(
     table: &SymbolTable,
     args: &Args,
     known: &mut Rejections,
-    listed: &mut Listed,
+    listed: &Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
     let contents = &content::Contents::default();
@@ -1478,17 +1484,6 @@ struct Target {
 }
 
 impl Target {
-    fn of(args: &Args) -> Target {
-        Target {
-            project: Some(args.project.clone()),
-            krate: args.krate.clone(),
-            out: args.out.clone(),
-            patch: args.patch.clone(),
-            link_cmd: args.link_cmd.clone(),
-            symbol_files: args.symbol_files.clone(),
-        }
-    }
-
     fn is(&self, args: &Args) -> bool {
         self.krate == args.krate && self.out == args.out
     }
@@ -1584,9 +1579,9 @@ impl Target {
     }
 }
 
-/// What the daemon keeps for a program it is not building right now. The code compiled for
-/// one program is there for the others: only the objects and what went into them are its own.
-struct Parked {
+/// What the daemon keeps for a program it builds. The code compiled for one program is there
+/// for the others: only the objects and what went into them are its own.
+struct Program {
     args: Args,
     table: SymbolTable,
     known: Rejections,
@@ -1769,13 +1764,13 @@ fn main() -> anyhow::Result<()> {
     known.patching = args.patch.is_some();
     let mut listed = Listed::default();
     let mut outlines = outline::Outlines::default();
-    let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
-    let mut cold = build(&db, &table, &args, &mut known, &mut listed)?;
+    let mut cold = build(&db, &table, &args, &mut known, &listed)?;
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
         known.touch(&db, None);
-        cold = build(&db, &table, &args, &mut known, &mut listed)?;
+        cold = build(&db, &table, &args, &mut known, &listed)?;
     }
     eprint!("cold: ");
     report(&cold);
@@ -1806,82 +1801,83 @@ fn main() -> anyhow::Result<()> {
     }
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
-    // The program asked for when a request names none.
-    let first = Target::of(&args);
-    let mut parked: Vec<Parked> = Vec::new();
-    let mut unbuilt = Unbuilt::default();
+    // Requests wait here while a build is under way, and those that have come by the time it
+    // is done are built together.
+    let requests = listener.map(|listener| {
+        let (sender, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(request) = requested(&listener) {
+                if sender.send(request).is_err() {
+                    break;
+                }
+            }
+        });
+        requests
+    });
+    // The first is the program asked for when a request names none.
+    let mut programs = vec![Program { args, table, known, unbuilt: Unbuilt::default() }];
     loop {
         if WatchedFile::watch_included(&mut files, &mut db)
             | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
         {
-            known.touch(&db, None);
-            parked.iter_mut().for_each(|it| it.known.touch(&db, None));
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
         }
-        let client = match &listener {
-            Some(listener) => {
-                let (request, target, stream) = requested(listener)?;
-                let target = target.unwrap_or_else(|| first.clone());
-                if !target.is(&args) {
-                    let next = match parked.iter().position(|it| target.is(&it.args)) {
-                        Some(at) => parked.swap_remove(at),
-                        None => {
-                            let mut known = Rejections::default();
-                            known.patching = target.patch.is_some();
+        // The program each client asks for.
+        let mut clients: Vec<(usize, Request, UnixStream)> = Vec::new();
+        match &requests {
+            Some(requests) => {
+                let mut next = Some(requests.recv()?);
+                while let Some((request, target, stream)) = next {
+                    next = requests.try_recv().ok();
+                    let known = match &target {
+                        Some(target) => programs.iter().position(|it| target.is(&it.args)),
+                        None => Some(0),
+                    };
+                    if let Some(at) = known {
+                        clients.push((at, request, stream));
+                        continue;
+                    }
+                    let Some(target) = target else { continue };
+                    // A checkout the daemon has not seen joins the ones it has.
+                    let joined = match &target.project {
+                        Some(project) if checkouts.root_of(project).is_err() => {
+                            let start = Instant::now();
+                            let joined =
+                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                            eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
+                            joined
+                        }
+                        _ => Ok(()),
+                    };
+                    let mut known = Rejections::default();
+                    known.patching = target.patch.is_some();
+                    let loaded = joined
+                        .and_then(|()| target.args(&programs[0].args, &checkouts))
+                        .and_then(|args| {
+                            let table = SymbolTable::load(&args.symbol_files, &args.root()?)?;
+                            Ok((args, table))
+                        });
+                    match loaded {
+                        Ok((args, table)) => {
                             // Never built: every file is as good as edited, but those were
                             // checked when the programs before it were built.
-                            let unbuilt = Unbuilt { edited: unbuilt.edited.clone(), stale: true };
-                            // A request for what can't be built is the client's mistake.
-                            // A checkout the daemon has not seen joins the ones it has.
-                            let joined = match &target.project {
-                                Some(project) if checkouts.root_of(project).is_err() => {
-                                    let start = Instant::now();
-                                    let joined = join(
-                                        project,
-                                        &mut checkouts,
-                                        &mut db,
-                                        &mut tree,
-                                        &mut files,
-                                    );
-                                    eprintln!(
-                                        "join {}: {:.1?}",
-                                        project.display(),
-                                        start.elapsed()
-                                    );
-                                    joined
-                                }
-                                _ => Ok(()),
-                            };
-                            let loaded = joined
-                                .and_then(|()| target.args(&args, &checkouts))
-                                .and_then(|args| {
-                                    let table =
-                                        SymbolTable::load(&args.symbol_files, &args.root()?)?;
-                                    Ok((args, table))
-                                });
-                            let (args, table) = match loaded {
-                                Ok(loaded) => loaded,
-                                Err(e) => {
-                                    let _ = writeln!(&stream, "error: {e:#}");
-                                    continue;
-                                }
-                            };
-                            Parked { args, table, known, unbuilt }
+                            let unbuilt =
+                                Unbuilt { edited: programs[0].unbuilt.edited.clone(), stale: true };
+                            clients.push((programs.len(), request, stream));
+                            programs.push(Program { args, table, known, unbuilt });
                         }
-                    };
-                    parked.push(Parked {
-                        args: std::mem::replace(&mut args, next.args),
-                        table: std::mem::replace(&mut table, next.table),
-                        known: std::mem::replace(&mut known, next.known),
-                        unbuilt: std::mem::replace(&mut unbuilt, next.unbuilt),
-                    });
+                        // A request for what can't be built is the client's mistake.
+                        Err(e) => {
+                            let _ = writeln!(&stream, "error: {e:#}");
+                        }
+                    }
                 }
-                Some((request, stream))
+                if clients.is_empty() {
+                    continue;
+                }
             }
-            None => {
-                std::thread::sleep(Duration::from_millis(5));
-                None
-            }
-        };
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
@@ -1915,17 +1911,26 @@ fn main() -> anyhow::Result<()> {
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
-            if touched.len() + gone.len() == before || client.is_some() {
+            if touched.len() + gone.len() == before || !clients.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let noticed = noticed.or_else(|| unbuilt.stale.then(|| (Instant::now(), Duration::ZERO)));
-        let Some((noticed, age)) = noticed else {
-            if let Some((_, client)) = client {
-                let _ = writeln!(&client, "ok unchanged");
+        // Without clients, the first program is built whenever a file changes.
+        let building: FxHashSet<usize> = match requests {
+            Some(_) => clients.iter().map(|it| it.0).collect(),
+            None => FxHashSet::from_iter([0]),
+        };
+        let stale = building.iter().any(|&at| programs[at].unbuilt.stale);
+        let (noticed, age) = match noticed {
+            Some(noticed) => noticed,
+            None if stale => (Instant::now(), Duration::ZERO),
+            None => {
+                for (_, _, client) in clients {
+                    let _ = writeln!(&client, "ok unchanged");
+                }
+                continue;
             }
-            continue;
         };
         let settled = noticed.elapsed();
         let read = Instant::now();
@@ -1967,17 +1972,15 @@ fn main() -> anyhow::Result<()> {
         }
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
-            known.touch(&db, None);
-            parked.iter_mut().for_each(|it| it.known.touch(&db, None));
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
             listed.touch(&db, None);
         }
         for path in included {
             db.reload_included_file(&path);
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
-        for unbuilt in
-            std::iter::once(&mut unbuilt).chain(parked.iter_mut().map(|it| &mut it.unbuilt))
-        {
+        for program in &mut programs {
+            let unbuilt = &mut program.unbuilt;
             unbuilt.stale |= changed != 0;
             unbuilt.edited.extend(&sources);
             unbuilt.edited.sort_unstable();
@@ -1990,33 +1993,107 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
-        // Another checkout's files are not this program's to be refused for.
-        let mut edited = unbuilt.edited.clone();
-        edited.retain(|file| paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
-                known.touch_bodies(&db, file);
-                parked.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
+                programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
-            known.touch(&db, crates);
-            parked.iter_mut().for_each(|it| it.known.touch(&db, crates));
+            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
             listed.touch(&db, crates);
         }
-        let apply = start.elapsed();
+        let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
+        // The programs asked for are built side by side: nothing is written to the database
+        // until all of them are done, so none is interrupted.
+        let answers: Vec<(usize, anyhow::Result<Result<String, String>>)> =
+            std::thread::scope(|scope| {
+                let builds: Vec<_> = programs
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(at, program)| building.contains(at) && program.unbuilt.stale)
+                    .map(|(at, program)| {
+                        // The program is linked unless every client of it loads the patch.
+                        let link = !clients.iter().any(|it| it.0 == at)
+                            || clients.iter().any(|it| it.0 == at && it.1 != Request::Patch);
+                        let (db, listed, paths, edit) = (db.clone(), &listed, &paths, &edit);
+                        let build =
+                            scope.spawn(move || program.sync(&db, listed, paths, edit, link));
+                        (at, build)
+                    })
+                    .collect();
+                builds
+                    .into_iter()
+                    .map(|(at, build)| {
+                        let answer = build
+                            .join()
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("a build panicked")));
+                        (at, answer)
+                    })
+                    .collect()
+            });
+        if std::env::var_os("RUSTD_TRACE").is_some() {
+            let ran: Vec<String> = ide_db::executions::take(&db)
+                .iter()
+                .take(400)
+                .map(|(query, count)| format!("{query}={count}"))
+                .collect();
+            eprintln!("ran: {}", ran.join(" "));
+            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
+        }
+        let mut replies = FxHashMap::default();
+        for (at, answer) in answers {
+            replies.insert(at, answer?);
+        }
+        for (at, _, client) in clients {
+            let _ = match replies.get(&at) {
+                Some(Ok(built)) => writeln!(&client, "ok {built}"),
+                Some(Err(why)) => writeln!(&client, "error: {}", why.replace('\n', " ")),
+                None => writeln!(&client, "ok unchanged"),
+            };
+        }
+    }
+}
+
+/// A change to the files, and how long each step up to the builds took.
+struct Edit {
+    /// When the change was applied.
+    start: Instant,
+    age: Duration,
+    settled: Duration,
+    read: Duration,
+    apply: Duration,
+    /// How many files changed.
+    changed: usize,
+}
+
+impl Program {
+    /// Brings the program up to date with the database. The result is what to tell its
+    /// clients: what they have to load, or why the source can't be built.
+    fn sync(
+        &mut self,
+        db: &RootDatabase,
+        listed: &Listed,
+        paths: &FxHashMap<vfs::FileId, PathBuf>,
+        edit: &Edit,
+        link_it: bool,
+    ) -> anyhow::Result<Result<String, String>> {
+        let Program { args, table, known, unbuilt } = self;
+        let &Edit { start, age, settled, read, apply, changed } = edit;
+        // Another checkout's files are not this program's to be refused for.
+        let mut edited = unbuilt.edited.clone();
+        edited.retain(|file| paths.get(file).is_none_or(|it| it.starts_with(&args.checkout)));
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
             let check = {
                 let (db, edited) = (db.clone(), &edited);
                 scope.spawn(move || broken_in(&db, edited))
             };
-            let warm = build(&db, &table, &args, &mut known, &mut listed);
+            let warm = build(db, table, args, known, listed);
             (warm, check.join().ok().flatten())
         });
         let warm = warm?;
@@ -2025,15 +2102,15 @@ fn main() -> anyhow::Result<()> {
         report(&warm);
         report_stats(&known.stats);
         let reported = start.elapsed();
-        let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
-        let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
-        if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
-            failed = link(&args).err().map(|it| it.to_string());
+        let out_of_date = hir::attach_db(db, || known.out_of_date(db));
+        let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        if failed.is_none() && link_it {
+            failed = link(args).err().map(|it| it.to_string());
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
         } else {
-            unbuilt = Unbuilt::default();
+            *unbuilt = Unbuilt::default();
         }
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
@@ -2066,18 +2143,6 @@ fn main() -> anyhow::Result<()> {
             let steps: Vec<String> =
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));
-        }
-        eprintln!("edit-to-binary: {total:.1?}");
-        if std::env::var_os("RUSTD_TRACE").is_some() {
-            let ran: Vec<String> = ide_db::executions::take(&db)
-                .iter()
-                .take(400)
-                .map(|(query, count)| format!("{query}={count}"))
-                .collect();
-            eprintln!("ran: {}", ran.join(" "));
-            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
-        }
-        if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!(
                 "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
                  instances {:.1?}, statics {:.1?}, left {:.1?}",
@@ -2090,25 +2155,22 @@ fn main() -> anyhow::Result<()> {
                 warm.looked.left,
             );
         }
-        if let (Some((_, client)), Some(why)) = (&client, &failed) {
-            let _ = writeln!(&mut &*client, "error: {}", why.replace('\n', " "));
-            continue;
+        eprintln!("edit-to-binary: {total:.1?}");
+        if let Some(why) = failed {
+            return Ok(Err(why));
         }
-        if let Some((_, client)) = client {
-            // What the caller has to load to be up to date: the functions that differ from the
-            // first object when the edit could be a patch, and all of them when it could not.
-            let (kind, object) = match (&args.patch, known.stats.patched) {
-                (Some(patch), Some(_)) => ("patch", patch),
-                _ => ("object", &args.out),
-            };
-            let _ = writeln!(
-                &client,
-                "ok {kind}={} functions={} files={changed} ms={}",
-                object.display(),
-                known.stats.patched.unwrap_or(known.stats.compiled),
-                total.as_millis()
-            );
-        }
+        // What the caller has to load to be up to date: the functions that differ from the
+        // first object when the edit could be a patch, and all of them when it could not.
+        let (kind, object) = match (&args.patch, known.stats.patched) {
+            (Some(patch), Some(_)) => ("patch", patch),
+            _ => ("object", &args.out),
+        };
+        Ok(Ok(format!(
+            "{kind}={} functions={} files={changed} ms={}",
+            object.display(),
+            known.stats.patched.unwrap_or(known.stats.compiled),
+            total.as_millis()
+        )))
     }
 }
 
