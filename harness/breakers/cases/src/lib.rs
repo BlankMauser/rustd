@@ -30,6 +30,7 @@ cases![
     format_blanket_new,
     f16c,
     unsized_tail_cmp,
-    safe_macro,
+    named_const_impl,
     macro_same_name_vars,
+    safe_macro,
 ];
