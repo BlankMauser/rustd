@@ -225,8 +225,8 @@ def main():
             if os.path.exists(path):
                 os.remove(path)
         seen = len(open(log_path).read())
-        # RUSTD_SPLICE: edits are added to the linked binary where that can be done.
-        splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
+        # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
+        splice = ["--binary", binary]
         daemon = subprocess.Popen(
             [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
              "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols], stderr=out, stdout=out)

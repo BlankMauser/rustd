@@ -54,8 +54,8 @@ STEPS = [
 
 
 def splice(program):
-    """RUSTD_SPLICE: edits are added to the linked binary where that can be done."""
-    return ["--splice", program["bin"]] if os.environ.get("RUSTD_SPLICE") else []
+    """Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full."""
+    return ["--binary", program["bin"]]
 
 
 def main():

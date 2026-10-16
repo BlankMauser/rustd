@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""splices.py: edits that are hard on `--splice`, a step at a time under a daemon, against cargo.
+"""splices.py: edits that are hard on the splice, a step at a time under a daemon, against cargo.
 
 The program has thread-locals, statics of every kind, vtables, tables of function pointers,
 closures, generics, recursion, panics and foreign calls, and the steps edit each. Some steps
@@ -7,7 +7,7 @@ first do something to the linked binary (strip it, touch it, run it). After ever
 binary is run as it is and with LD_BIND_NOW, read by readelf, and compared with what
 `cargo build` of the same source prints. How each step got linked is counted, not judged.
 
-RUSTD_SPLICE     pass --splice (without it this is the same test of the full link)
+RUSTD_SPLICE=0   link each edit in full (the same test of the full link)
 SPLICES_NO_PIE   link the daemon's binary with -no-pie
 SPLICES_SOAK=N   after the steps, N more edits of one constant, each checked by its output
 """
@@ -370,7 +370,7 @@ def main():
     if os.environ.get("SPLICES_NO_PIE"):
         link = [a for a in link if a != "-pie"] + ["-no-pie"]
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
+    splice = ["--binary", binary]
     ask = ["--crate", "sedge", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
     out = open(log_path, "a")
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)

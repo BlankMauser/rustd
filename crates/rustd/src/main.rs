@@ -165,7 +165,7 @@ impl Args {
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
-                "--splice" => splice = Some(PathBuf::from(value()?)),
+                "--binary" | "--splice" => splice = Some(PathBuf::from(value()?)),
                 "--report" => report = Some(PathBuf::from(value()?)),
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
@@ -1704,14 +1704,18 @@ static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executabl
     std::sync::LazyLock::new(Default::default);
 
 /// Brings an executable up to date with its objects. An edit that left the whole object alone
-/// is spliced into the executable at `splice`, when that is known from its last link; anything
-/// else, and whatever the splice declines, runs the link command, whose result is then known.
+/// is spliced into the executable at `splice`, which `--binary` names, when that is known from
+/// its last link; anything else, and whatever the splice declines, runs the link command, whose
+/// result is then known. `RUSTD_SPLICE=0` has every edit linked in full.
 fn link(
     cmd: Option<&str>,
     splice: Option<&Path>,
     patch: Option<&Path>,
     patched: bool,
 ) -> anyhow::Result<()> {
+    static SPLICING: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("RUSTD_SPLICE").is_none_or(|it| it != "0"));
+    let splice = splice.filter(|_| *SPLICING);
     // An executable linked with the object as it was is not one to add to, also when the
     // object was written for a request that does not link.
     let rewritten = match splice {
@@ -2211,7 +2215,7 @@ impl Target {
                 "--out" => out = Some(PathBuf::from(value)),
                 "--patch" => patch = Some(PathBuf::from(value)),
                 "--link-cmd" => link_cmd = Some(value),
-                "--splice" => splice = Some(PathBuf::from(value)),
+                "--binary" | "--splice" => splice = Some(PathBuf::from(value)),
                 "--symbols" => symbol_files.push(PathBuf::from(value)),
                 _ => bail!("unexpected argument {flag}"),
             }
@@ -2617,7 +2621,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
     anyhow::ensure!(
         args.splice.is_none() || (args.patch.is_some() && args.link_cmd.is_some()),
-        "--splice without --patch and --link-cmd"
+        "--binary without --patch and --link-cmd"
     );
     let report_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
