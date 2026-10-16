@@ -309,3 +309,17 @@ mod tests {
         assert_eq!(MAP.get().unwrap().len(), base_len);
     }
 }
+
+/// A symbol is saved as its text and interned again where it is loaded.
+impl serde::Serialize for Symbol {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Symbol {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Ok(Symbol::intern(&text))
+    }
+}

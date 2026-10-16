@@ -258,6 +258,9 @@ impl SourceDatabase for RootDatabase {
 
 hir::impl_hir_database!(RootDatabase);
 
+mod snapshot;
+pub use snapshot::SnapshotError;
+
 /// Counts how often each query ran, when `RUSTD_TRACE` is set.
 pub mod executions {
     use std::sync::Mutex;

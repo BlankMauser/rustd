@@ -717,10 +717,78 @@ fn load(
         cargo_config: cargo_config.clone(),
         load_config,
     };
-    let mut db = RootDatabase::new(None);
-    let mut vfs = vfs::Vfs::default();
+    // A saved database knows its files by the ids they had, so the VFS hands those out again
+    // and loading the workspace writes only the inputs that are not as they were saved.
+    let (mut db, mut vfs) = match Snapshot::from_env().and_then(|it| it.load()) {
+        Some((db, paths)) => (db, vfs::Vfs::with_paths(paths)),
+        None => (RootDatabase::new(None), vfs::Vfs::default()),
+    };
     checkouts.add(projects, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
+}
+
+/// What the database holds, by ingredient: the values a snapshot of everything would carry.
+/// The bytes are those of the values themselves, without what they point to on the heap.
+fn report_database(db: &mut RootDatabase) {
+    let db: &mut dyn ide_db::base_db::salsa::Database = db;
+    let info = db.memory_usage();
+    let mut rows: Vec<(&str, &str, usize, usize)> = info
+        .structs
+        .iter()
+        .map(|it| ("struct", it.debug_name(), it.count(), it.size_of_fields()))
+        .chain(
+            info.queries.iter().map(|(name, it)| ("query", *name, it.count(), it.size_of_fields())),
+        )
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(b.1)));
+    for (kind, name, count, bytes) in rows {
+        eprintln!("db\t{kind}\t{count}\t{bytes}\t{name}");
+    }
+}
+
+/// The file `RUSTD_SNAPSHOT` names, where the database is saved after the first build and
+/// loaded from by the next process.
+struct Snapshot {
+    path: PathBuf,
+}
+
+impl Snapshot {
+    fn from_env() -> Option<Snapshot> {
+        Some(Snapshot { path: std::env::var_os("RUSTD_SNAPSHOT")?.into() })
+    }
+
+    /// The database that was saved, if there is one this program can read.
+    fn load(&self) -> Option<(RootDatabase, Vec<VfsPath>)> {
+        let start = Instant::now();
+        let bytes = std::fs::read(&self.path).ok()?;
+        let read = start.elapsed();
+        match RootDatabase::load(&bytes) {
+            Ok(loaded) => {
+                let (len, took) = (bytes.len(), start.elapsed() - read);
+                eprintln!("snapshot: loaded {len} bytes in {took:.1?} (+{read:.1?} read)");
+                Some(loaded)
+            }
+            Err(err) => {
+                eprintln!("snapshot: not loaded, {err}");
+                None
+            }
+        }
+    }
+
+    /// Saves `db` unless a snapshot is there already.
+    fn save(&self, db: &mut RootDatabase, vfs: &Vfs) -> anyhow::Result<()> {
+        if self.path.exists() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let paths: Vec<VfsPath> = vfs.paths().cloned().collect();
+        let bytes = db.save(&paths)?;
+        let saved = start.elapsed();
+        std::fs::write(&self.path, &bytes)?;
+        let (len, wrote) = (bytes.len(), start.elapsed() - saved);
+        eprintln!("snapshot: saved {len} bytes in {saved:.1?} (+{wrote:.1?} write)");
+        Ok(())
+    }
 }
 
 /// The checkouts the daemon has loaded.
@@ -2063,7 +2131,20 @@ fn main() -> anyhow::Result<()> {
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
+    if std::env::var_os("RUSTD_TRACE").is_some() {
+        let ran: Vec<String> = ide_db::executions::take(&db)
+            .iter()
+            .map(|(query, count)| format!("{query}={count}"))
+            .collect();
+        eprintln!("cold ran: {}", ran.join(" "));
+    }
     link(&args)?;
+    if let Some(snapshot) = Snapshot::from_env() {
+        snapshot.save(&mut db, tree.vfs())?;
+    }
+    if std::env::var_os("RUSTD_DB_STATS").is_some() {
+        report_database(&mut db);
+    }
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));

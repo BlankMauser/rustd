@@ -435,3 +435,19 @@ fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
     }
     ret
 }
+
+#[cfg(feature = "serde1")]
+impl serde::Serialize for AbsPathBuf {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde1")]
+impl<'de> serde::Deserialize<'de> for AbsPathBuf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let path = Utf8PathBuf::from(String::deserialize(deserializer)?);
+        AbsPathBuf::try_from(path)
+            .map_err(|path| serde::de::Error::custom(format_args!("{path} is not absolute")))
+    }
+}

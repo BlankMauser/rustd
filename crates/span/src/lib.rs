@@ -133,7 +133,9 @@ impl fmt::Debug for SpanAnchor {
 
 /// A [`FileId`] and [`Edition`] bundled up together.
 /// The MSB is reserved for `HirFileId` encoding, more upper bits are used to then encode the edition.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct EditionedFileId(u32);
 
 impl fmt::Debug for EditionedFileId {

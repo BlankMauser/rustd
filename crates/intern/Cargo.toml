@@ -22,6 +22,7 @@ rustc-hash.workspace = true
 triomphe.workspace = true
 rayon.workspace = true
 arrayvec.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

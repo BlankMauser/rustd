@@ -62,7 +62,9 @@ use tracing::{Level, span};
 /// Handle to a file in [`Vfs`]
 ///
 /// Most functions in rust-analyzer use this when they need to refer to a file.
-#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(
+    Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct FileId(u32);
 // pub struct FileId(NonMaxU32);
 
@@ -303,6 +305,21 @@ impl Vfs {
         let len = self.data.len().max(idx + 1);
         self.data.resize(len, FileState::Deleted);
         file_id
+    }
+
+    /// Gives `paths` the ids `0..`, in order, without contents: what a database loaded from
+    /// disk knows the files as. The `Vfs` must be empty.
+    pub fn with_paths(paths: impl IntoIterator<Item = VfsPath>) -> Vfs {
+        let mut vfs = Vfs::default();
+        for path in paths {
+            vfs.alloc_file_id(path);
+        }
+        vfs
+    }
+
+    /// The path of every id handed out, in id order, whether or not the file exists.
+    pub fn paths(&self) -> impl Iterator<Item = &VfsPath> + '_ {
+        (0..self.data.len()).map(|id| self.interner.lookup(FileId(id as u32)))
     }
 
     /// Returns the status of the file associated with the given `file_id`.

@@ -260,8 +260,13 @@ impl Loaded {
             }
             db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
         }
-        LocalRoots::get(db).set_roots(db).to(local_roots);
-        LibraryRoots::get(db).set_roots(db).to(library_roots);
+        // Written only when they changed: a database loaded from disk has them already.
+        if *LocalRoots::get(db).roots(db) != local_roots {
+            LocalRoots::get(db).set_roots(db).to(local_roots);
+        }
+        if *LibraryRoots::get(db).roots(db) != library_roots {
+            LibraryRoots::get(db).set_roots(db).to(library_roots);
+        }
 
         let mut change = ChangeWithProcMacros::default();
         for (_, file) in vfs.take_changes() {

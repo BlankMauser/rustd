@@ -28,6 +28,8 @@ triomphe.workspace = true
 nohash-hasher.workspace = true
 bitflags.workspace = true
 smallvec.workspace = true
+serde = { workspace = true, features = ["derive"] }
+postcard.workspace = true
 
 # local deps
 base-db.workspace = true

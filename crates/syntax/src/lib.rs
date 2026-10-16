@@ -30,6 +30,7 @@ extern crate rustc_lexer;
 
 mod parsing;
 mod ptr;
+mod saved;
 mod syntax_error;
 mod syntax_node;
 #[cfg(test)]

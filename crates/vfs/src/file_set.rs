@@ -225,3 +225,20 @@ impl fst::Automaton for PrefixOf<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// A set is saved as its files in the order they were inserted.
+impl serde::Serialize for FileSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(&self.paths)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FileSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut set = FileSet::default();
+        for (file_id, path) in Vec::<(FileId, VfsPath)>::deserialize(deserializer)? {
+            set.insert(file_id, path);
+        }
+        Ok(set)
+    }
+}

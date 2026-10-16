@@ -9,7 +9,7 @@ use paths::{AbsPath, AbsPathBuf, RelPath};
 /// so we treat `VfsPath`s as opaque identifiers.
 ///
 /// [`Vfs`]: crate::Vfs
-#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VfsPath(VfsPathRepr);
 
 impl VfsPath {
@@ -261,7 +261,7 @@ mod windows_paths {
 }
 
 /// Internal, private representation of [`VfsPath`].
-#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 enum VfsPathRepr {
     PathBuf(AbsPathBuf),
     VirtualPath(VirtualPath),
@@ -314,7 +314,9 @@ impl PartialEq<VfsPath> for AbsPath {
 /// `/`-separated virtual path.
 ///
 /// This is used to describe files that do not reside on the file system.
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(
+    Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
 struct VirtualPath(String);
 
 impl VirtualPath {

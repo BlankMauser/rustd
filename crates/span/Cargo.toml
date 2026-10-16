@@ -16,6 +16,7 @@ salsa = { workspace = true, optional = true }
 rustc-hash.workspace = true
 hashbrown.workspace = true
 text-size.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 # local deps
 vfs.workspace = true

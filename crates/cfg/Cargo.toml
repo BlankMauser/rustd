@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 rustc-hash.workspace = true
 tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 # locals deps
 tt = { workspace = true, optional = true }

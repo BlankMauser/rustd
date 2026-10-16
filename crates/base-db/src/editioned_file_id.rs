@@ -10,7 +10,13 @@ use vfs::FileId;
 
 use crate::SourceDatabase;
 
-#[salsa::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime), revisions = usize::MAX)]
+#[salsa::interned(
+    debug,
+    constructor = from_span_file_id,
+    unsafe(no_lifetime),
+    revisions = usize::MAX,
+    persist
+)]
 #[derive(PartialOrd, Ord)]
 pub struct EditionedFileId {
     #[returns(copy)]
@@ -19,7 +25,7 @@ pub struct EditionedFileId {
 
 #[salsa::tracked]
 impl EditionedFileId {
-    #[salsa::tracked(lru = 128, returns(clone))]
+    #[salsa::tracked(lru = 128, returns(clone), persist)]
     pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
         let _p = tracing::info_span!("parse", ?self).entered();
         let (file_id, edition) = self.unpack(db);

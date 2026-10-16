@@ -2,7 +2,9 @@
 // This should live in a separate crate because we use it in both actual code and codegen.
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum Edition {
     // The syntax context stuff needs the discriminants to start from 0 and be consecutive.

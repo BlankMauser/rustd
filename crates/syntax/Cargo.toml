@@ -23,6 +23,7 @@ smol_str.workspace = true
 triomphe.workspace = true
 tracing.workspace = true
 smallvec.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 parser.workspace = true
 stdx.workspace = true

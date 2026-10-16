@@ -79,7 +79,9 @@ impl fmt::Display for ProcMacroLoadingError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct SourceRootId(pub u32);
 
 /// Files are grouped into source roots. A source root is a directory on the
@@ -89,7 +91,7 @@ pub struct SourceRootId(pub u32);
 /// source root, and the analyzer does not know the root path of the source root at
 /// all. So, a file from one source root can't refer to a file in another source
 /// root by path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceRoot {
     /// Sysroot or crates.io library.
     ///
@@ -157,7 +159,7 @@ impl fmt::Debug for CrateGraphBuilder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CrateName(Symbol);
 
 impl CrateName {
@@ -192,7 +194,7 @@ impl ops::Deref for CrateName {
 }
 
 /// Origin of the crates.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CrateOrigin {
     /// Crates that are from the rustc workspace.
     Rustc { name: Symbol },
@@ -218,7 +220,7 @@ impl CrateOrigin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LangCrateOrigin {
     Alloc,
     Core,
@@ -256,7 +258,7 @@ impl fmt::Display for LangCrateOrigin {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CrateDisplayName {
     /// The name we use to display various paths (with `_`).
     crate_name: CrateName,
@@ -349,7 +351,21 @@ pub struct UniqueCrateData {
     disambiguator: Option<Box<(BuiltCrateData, HashableCfgOptions)>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl UniqueCrateData {
+    /// What `krate` is known by, as [`CrateGraphBuilder::set_in_db`] made it.
+    pub(crate) fn of(db: &dyn salsa::Database, krate: Crate, disambiguated: bool) -> Self {
+        let data = krate.data(db);
+        let disambiguator =
+            disambiguated.then(|| Box::new((data.clone(), krate.cfg_options(db).to_hashable())));
+        UniqueCrateData { root_file_id: data.root_file_id, disambiguator }
+    }
+
+    pub(crate) fn is_disambiguated(&self) -> bool {
+        self.disambiguator.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CrateData<Id> {
     pub root_file_id: FileId,
     pub edition: Edition,
@@ -374,7 +390,7 @@ pub type CrateDataBuilder = CrateData<CrateBuilderId>;
 pub type BuiltCrateData = CrateData<Crate>;
 
 /// Crate data unrelated to analysis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtraCrateData {
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
@@ -388,7 +404,7 @@ pub struct ExtraCrateData {
     pub potential_cfg_options: Option<CfgOptions>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Env {
     entries: FxHashMap<String, String>,
 }
@@ -412,7 +428,7 @@ impl fmt::Debug for Env {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Dependency<Id> {
     pub crate_id: Id,
     pub name: CrateName,
@@ -452,7 +468,7 @@ impl BuiltDependency {
 
 pub type CratesIdMap = FxHashMap<CrateBuilderId, Crate>;
 
-#[salsa::input]
+#[salsa::input(persist)]
 #[derive(Debug, PartialOrd, Ord)]
 pub struct Crate {
     #[returns(ref)]
@@ -528,7 +544,7 @@ impl Crate {
 
 /// The mapping from [`UniqueCrateData`] to their [`Crate`] input.
 #[derive(Debug, Default)]
-pub struct CratesMap(DashMap<UniqueCrateData, Crate, BuildHasherDefault<FxHasher>>);
+pub struct CratesMap(pub(crate) DashMap<UniqueCrateData, Crate, BuildHasherDefault<FxHasher>>);
 
 impl CrateGraphBuilder {
     pub fn add_crate_root(

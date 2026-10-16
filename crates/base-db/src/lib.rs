@@ -13,6 +13,7 @@ use span::TextSize;
 mod change;
 mod editioned_file_id;
 mod input;
+pub mod snapshot;
 pub mod target;
 
 use std::{
@@ -106,7 +107,9 @@ impl Files {
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
         match self.files.entry(file_id) {
             Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_text(db).to(Arc::from(text));
+                if &**occupied.get().text(db) != text {
+                    occupied.get_mut().set_text(db).to(Arc::from(text));
+                }
             }
             Entry::Vacant(vacant) => {
                 let text = FileText::new(db, Arc::from(text), file_id);
@@ -123,8 +126,12 @@ impl Files {
         durability: Durability,
     ) {
         match self.files.entry(file_id) {
+            // A file that is read as it was is not written: what was computed from it, in
+            // this process or the one that saved the database, stays.
             Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_text(db).with_durability(durability).to(Arc::from(text));
+                if &**occupied.get().text(db) != text {
+                    occupied.get_mut().set_text(db).with_durability(durability).to(Arc::from(text));
+                }
             }
             Entry::Vacant(vacant) => {
                 let text =
@@ -241,7 +248,13 @@ impl Files {
     ) {
         match self.source_roots.entry(source_root_id) {
             Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_source_root(db).with_durability(durability).to(source_root);
+                if occupied.get().source_root(db) != source_root {
+                    occupied
+                        .get_mut()
+                        .set_source_root(db)
+                        .with_durability(durability)
+                        .to(source_root);
+                }
             }
             Entry::Vacant(vacant) => {
                 let source_root =
@@ -286,11 +299,13 @@ impl Files {
     ) {
         match self.file_source_roots.entry(id) {
             Entry::Occupied(mut occupied) => {
-                occupied
-                    .get_mut()
-                    .set_source_root_id(db)
-                    .with_durability(durability)
-                    .to(source_root_id);
+                if occupied.get().source_root_id(db) != source_root_id {
+                    occupied
+                        .get_mut()
+                        .set_source_root_id(db)
+                        .with_durability(durability)
+                        .to(source_root_id);
+                }
             }
             Entry::Vacant(vacant) => {
                 let file_source_root =
@@ -303,7 +318,7 @@ impl Files {
 
 /// The set of roots for crates.io libraries.
 /// Files in libraries are assumed to never change.
-#[salsa::input(singleton, debug)]
+#[salsa::input(singleton, debug, persist)]
 pub struct LibraryRoots {
     #[returns(ref)]
     pub roots: FxHashSet<SourceRootId>,
@@ -311,33 +326,50 @@ pub struct LibraryRoots {
 
 /// The set of "local" (that is, from the current workspace) roots.
 /// Files in local roots are assumed to change frequently.
-#[salsa::input(singleton, debug)]
+#[salsa::input(singleton, debug, persist)]
 pub struct LocalRoots {
     #[returns(ref)]
     pub roots: FxHashSet<SourceRootId>,
 }
 
-#[salsa::input(debug)]
+#[salsa::input(debug, persist(serialize = FileText::save, deserialize = FileText::load))]
 pub struct FileText {
     #[returns(ref)]
     pub text: Arc<str>,
     pub file_id: vfs::FileId,
 }
 
+impl FileText {
+    fn save<S: serde::Serializer>(
+        (text, file_id): &(Arc<str>, vfs::FileId),
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&(&**text, file_id), serializer)
+    }
+
+    fn load<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<(Arc<str>, vfs::FileId), D::Error> {
+        let (text, file_id): (std::borrow::Cow<'de, str>, _) =
+            serde::Deserialize::deserialize(deserializer)?;
+        Ok((Arc::from(&*text), file_id))
+    }
+}
+
 /// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
-#[salsa::input(debug)]
+#[salsa::input(debug, persist)]
 pub struct IncludedFile {
     #[returns(ref)]
     pub bytes: Option<std::sync::Arc<[u8]>>,
 }
 
-#[salsa::input(debug)]
+#[salsa::input(debug, persist)]
 pub struct FileSourceRootInput {
     #[returns(copy)]
     pub source_root_id: SourceRootId,
 }
 
-#[salsa::input(debug)]
+#[salsa::input(debug, persist)]
 pub struct SourceRootInput {
     #[returns(clone)]
     pub source_root: Arc<SourceRoot>,
@@ -429,7 +461,7 @@ impl Nonce {
 }
 
 /// Crate related data shared by the whole workspace.
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CrateWorkspaceData {
     pub target: Result<target::TargetData, target::TargetLoadError>,
     /// Toolchain version used to compile the crate.
@@ -453,7 +485,7 @@ pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<Relea
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-#[salsa::input(singleton, debug)]
+#[salsa::input(singleton, debug, persist)]
 struct AllCrates {
     #[returns(clone)]
     crates: std::sync::Arc<[Crate]>,
@@ -480,7 +512,7 @@ pub fn all_crates(db: &dyn salsa::Database) -> std::sync::Arc<[Crate]> {
 
 // FIXME: VFS rewrite should allow us to get rid of this wrapper
 #[doc(hidden)]
-#[salsa::interned]
+#[salsa::interned(persist)]
 pub struct InternedSourceRootId {
     #[returns(copy)]
     pub id: SourceRootId,
@@ -488,7 +520,7 @@ pub struct InternedSourceRootId {
 
 /// Crates whose root file is in `id`.
 pub fn source_root_crates(db: &dyn SourceDatabase, id: SourceRootId) -> &[Crate] {
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), persist)]
     pub fn source_root_crates<'db>(
         db: &'db dyn SourceDatabase,
         id: InternedSourceRootId<'db>,
