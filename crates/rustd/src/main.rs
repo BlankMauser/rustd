@@ -267,10 +267,14 @@ impl Resolver<'_> {
         }
     }
 
-    fn in_generic_impl(&self, func: FunctionId) -> bool {
+    /// Whether the function, or the `impl` it is in, takes types or constants.
+    fn is_generic(&self, func: FunctionId) -> bool {
+        let generic = |def: hir::GenericDef| !def.type_or_const_params(self.db).is_empty();
+        if generic(hir::Function::from(func).into()) {
+            return true;
+        }
         let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
-        let imp = hir::GenericDef::from(hir::Impl::from(imp));
-        !imp.type_or_const_params(self.db).is_empty()
+        generic(hir::Impl::from(imp).into())
     }
 
     /// rustc's `StableCrateId` of a crate it built something of.
@@ -515,9 +519,10 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
         }
-        // Not a function until the `impl<T>` it is in is given its types: there is nothing to
-        // name, the more so in a crate of such `impl`s alone, which rustc builds nothing of.
-        if self.in_generic_impl(func) {
+        // Not a function until it or the `impl<T>` it is in is given its types: there is
+        // nothing to name, the more so in a crate of such alone, which rustc builds nothing
+        // of. One of a name that another in the same function has is not to be taken for it.
+        if self.is_generic(func) {
             return None;
         }
         let path = self.path(func)?;
