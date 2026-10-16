@@ -31,6 +31,12 @@ rusty-s3 = "0.10.2"
 ureq = "3.4.2"
 tar = "0.4.44"
 zstd = "0.13.3"
+tikv-jemallocator = { version = "0.5.4", optional = true, features = ["profiling"] }
+tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
+
+[features]
+# Allocate with jemalloc, which can profile the heap: see `memory.rs`.
+heap-profile = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [lints]
 workspace = true

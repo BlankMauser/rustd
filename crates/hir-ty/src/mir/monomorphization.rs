@@ -304,6 +304,20 @@ impl<'db> Filler<'db> {
     }
 }
 
+/// `body` with `subst` in place of its generic parameters. The queries below keep the result;
+/// a caller that needs it once asks here instead.
+pub(crate) fn monomorphized<'db>(
+    db: &'db dyn HirDatabase,
+    body: &MirBody<'db>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    let mut body = body.clone();
+    filler.fill_body(&mut body)?;
+    Ok(body)
+}
+
 #[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_cycle_result)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
@@ -311,11 +325,7 @@ pub fn monomorphized_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
-    let body = db.mir_body(owner)?;
-    let mut body = (*body).clone();
-    filler.fill_body(&mut body)?;
-    Ok(body)
+    monomorphized(db, db.mir_body(owner)?, &subst, &trait_env)
 }
 
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
@@ -327,10 +337,8 @@ pub fn monomorphized_promoted_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
-    let mut body = super::promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?.clone();
-    filler.fill_body(&mut body)?;
-    Ok(body)
+    let body = super::promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?;
+    monomorphized(db, body, &subst, &trait_env)
 }
 
 fn monomorphized_mir_body_cycle_result<'db>(
@@ -350,11 +358,7 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
-    let body = db.mir_body_for_closure(closure)?;
-    let mut body = (*body).clone();
-    filler.fill_body(&mut body)?;
-    Ok(body)
+    monomorphized(db, db.mir_body_for_closure(closure)?, &subst, &trait_env)
 }
 
 fn monomorphized_mir_body_for_closure_cycle_result<'db>(
@@ -374,11 +378,7 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
-    let body = db.mir_body_for_coroutine(coroutine)?;
-    let mut body = (*body).clone();
-    filler.fill_body(&mut body)?;
-    Ok(body)
+    monomorphized(db, db.mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
 }
 
 fn monomorphized_mir_body_for_coroutine_cycle_result<'db>(
