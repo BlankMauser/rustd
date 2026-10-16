@@ -1322,7 +1322,12 @@ fn declaration_location<'db>(
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
-    let node = source.value.syntax();
+    location_of(db, source.file_id, written_range(source.value.syntax()))
+}
+
+/// The range of an item or a macro call without the attributes and comments on top of it,
+/// which rustc's span of it leaves out.
+fn written_range(node: &SyntaxNode) -> TextRange {
     let start = node
         .children_with_tokens()
         .find(|it| {
@@ -1330,7 +1335,7 @@ fn declaration_location<'db>(
                 && !it.kind().is_trivia()
         })
         .map_or(node.text_range().start(), |it| it.text_range().start());
-    location_of(db, source.file_id, TextRange::new(start, node.text_range().end()))
+    TextRange::new(start, node.text_range().end())
 }
 
 /// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
@@ -1385,7 +1390,8 @@ fn location_of(
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     let FileRange { file_id, range } = match written_call(db, file_id) {
         Some(call) if own_tokens => {
-            InFile::new(call.file_id, call.value.text_range()).original_node_file_range_rooted(db)
+            InFile::new(call.file_id, written_range(&call.value))
+                .original_node_file_range_rooted(db)
         }
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
@@ -5917,7 +5923,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(None);
         };
         let Some(site) = written_call(db, file_id) else { return Ok(None) };
-        let range = InFile::new(site.file_id, site.value.text_range());
+        let range = InFile::new(site.file_id, written_range(&site.value));
         let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
         let Some((file, line, col)) = location_of(db, file_id.into(), range) else {
             return Ok(None);

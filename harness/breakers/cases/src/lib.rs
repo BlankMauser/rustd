@@ -14,4 +14,4 @@ macro_rules! cases {
     };
 }
 
-cases![niche_eq, simd_cast];
+cases![niche_eq, simd_cast, big_frame, future_size, macro_item_location];
