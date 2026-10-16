@@ -1727,8 +1727,8 @@ fn report(build: &Build) {
     }
 }
 
-fn link(args: &Args) -> anyhow::Result<()> {
-    let Some(cmd) = &args.link_cmd else { return Ok(()) };
+fn link(cmd: Option<&str>) -> anyhow::Result<()> {
+    let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
     let status = Command::new("sh").arg("-c").arg(cmd).status()?;
     eprintln!("link: {:.1?} ({status})", start.elapsed());
@@ -2249,6 +2249,8 @@ enum Event {
     /// The build of a program is over, with what to tell its clients: nothing when a change
     /// to the source interrupted it.
     Built(usize, Box<Program>, Option<anyhow::Result<Result<String, String>>>),
+    /// The link of a program's last build failed, after the build was over.
+    Unlinked(usize),
 }
 
 /// Set while the builds under way are told to stop for a change to the source.
@@ -2287,6 +2289,11 @@ impl Builds {
                 return Ok(());
             }
             Event::Built(at, program, answer) => (at, program, answer),
+            Event::Unlinked(at) => {
+                programs[at].unbuilt.stale = true;
+                programs[at].wrote = None;
+                return Ok(());
+            }
         };
         let Some(Running { clients, .. }) = self.running.remove(&at) else { return Ok(()) };
         programs[at] = *program;
@@ -2569,7 +2576,7 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     memory::report(&mut db, "build")?;
     report_stats(&known.stats);
-    link(&args)?;
+    link(args.link_cmd.as_deref())?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
@@ -2629,6 +2636,8 @@ fn main() -> anyhow::Result<()> {
     };
     let mut builds =
         Builds { events, running: FxHashMap::default(), waiting: Default::default(), stuck: false };
+    // The links under way that no build waits for, by the object each is of.
+    let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The manifests that have changed since they were loaded, as they were then.
@@ -2909,9 +2918,15 @@ fn main() -> anyhow::Result<()> {
         }
         // A checkout read as another is read so by every build, so those are waited for.
         let background = serving && overlay != Overlay::Always && viewed.is_empty();
+        // Checkouts read as one are built in turn, so their links don't take the turn.
+        let detached = serving && !viewed.is_empty();
         for (&at, wanted) in &outputs {
             let program = &mut programs[at];
             program.unbuilt.stale |= program.wrote.as_ref() != Some(&wanted.out);
+            // The files a link reads and writes are not written again under it.
+            if let Some(link) = links.remove(&wanted.out) {
+                _ = link.join();
+            }
         }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -3140,6 +3155,7 @@ fn main() -> anyhow::Result<()> {
                             // The program is linked unless every client of it loads the patch.
                             let link = !clients.iter().any(|it| it.0 == at)
                                 || clients.iter().any(|it| it.0 == at && it.1.0 != Request::Patch);
+                            let link = link && !detached;
                             let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
                             let wanted = outputs.get(&at);
                             let build = scope.spawn(move || {
@@ -3186,12 +3202,38 @@ fn main() -> anyhow::Result<()> {
         for (at, answer) in answers {
             replies.insert(at, answer?);
         }
-        for (at, (_, _, client)) in clients {
+        let mut linking: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
+        for (at, asked) in clients {
+            let mut client = &asked.2;
             let _ = match replies.get(&at) {
-                Some(Ok(built)) => writeln!(&client, "ok {built}"),
-                Some(Err(why)) => writeln!(&client, "error: {}", why.replace('\n', " ")),
-                None => writeln!(&client, "ok unchanged"),
+                Some(Ok(_)) if detached => {
+                    linking.entry(at).or_default().push(asked);
+                    continue;
+                }
+                Some(Ok(built)) => writeln!(client, "ok {built}"),
+                Some(Err(why)) => writeln!(client, "error: {}", why.replace('\n', " ")),
+                None => writeln!(client, "ok unchanged"),
             };
+        }
+        for (at, clients) in linking {
+            let Some(Ok(built)) = replies.remove(&at) else { continue };
+            let Outputs { out, link_cmd, .. } =
+                outputs.remove(&at).unwrap_or_else(|| Outputs::of(&programs[at].args));
+            let link_cmd = link_cmd.filter(|_| clients.iter().any(|it| it.0 != Request::Patch));
+            let sender = sender.clone();
+            let linked = std::thread::spawn(move || {
+                let failed = link(link_cmd.as_deref()).err();
+                for (_, _, client) in clients {
+                    let _ = match &failed {
+                        None => writeln!(&client, "ok {built}"),
+                        Some(why) => writeln!(&client, "error: {why}"),
+                    };
+                }
+                if failed.is_some() {
+                    let _ = sender.send(Event::Unlinked(at));
+                }
+            });
+            links.insert(out, linked);
         }
     }
 }
@@ -3282,7 +3324,7 @@ impl Program {
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
         if failed.is_none() && link_it {
-            failed = link(args).err().map(|it| it.to_string());
+            failed = link(args.link_cmd.as_deref()).err().map(|it| it.to_string());
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
