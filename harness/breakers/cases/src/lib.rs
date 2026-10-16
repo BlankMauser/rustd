@@ -14,4 +14,4 @@ macro_rules! cases {
     };
 }
 
-cases![niche_eq];
+cases![niche_eq, simd_cast];

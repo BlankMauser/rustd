@@ -7533,6 +7533,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, offset);
                 }
             }
+            // `simd_cast` leaves a float out of the range of the integer undefined; saturating
+            // as `simd_as` does is one of the answers it may give.
+            ("simd_cast" | "simd_as", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (from, count) = self.simd_lanes(ty)?;
+                let (to, _) = self.simd_lanes(dst_ty)?;
+                for i in 0..count {
+                    let offset = (i * from.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(from.ty, MEM, src, offset);
+                    let value = if from.ty.is_float() || to.ty.is_float() {
+                        self.float_cast(value, from, to)?
+                    } else {
+                        self.int_cast(value, from, to)
+                    };
+                    self.builder.ins().store(MEM, value, dst, (i * to.ty.bytes() as u64) as i32);
+                }
+            }
             ("simd_bitmask", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 let (lane, count) = self.simd_lanes(ty)?;
