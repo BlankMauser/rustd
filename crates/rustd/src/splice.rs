@@ -9,15 +9,19 @@
 //! new one. Data has no entry to jump from, so a static with another value is written where
 //! the old one is, when it is no larger.
 //!
-//! What is appended, in three segments of its own:
+//! What is appended, in four segments of its own:
 //!
-//! 1. Read-only: the program headers with the new segments among them, the search table of
-//!    the unwinder with the patch's frames added, the patch's constants and unwind tables,
-//!    and the load-time relocations with the patch's added.
+//! 1. Read-only: the search table of the unwinder with the patch's frames added, the
+//!    patch's constants and unwind tables, and the load-time relocations with the patch's
+//!    added.
 //! 2. Code: the patch's functions, and a stub for each import they call directly.
 //! 3. Data: the patch's writable sections, an address slot for each symbol the code
 //!    reaches through one, and one for the loader to fix up in place of each address a
 //!    static no longer stores.
+//! 4. The program headers with the new segments among them. A kernel before Linux 5.18, and
+//!    qemu's user mode, tell the loader they are as far into memory as into the file
+//!    whatever the headers say, so they are loaded exactly there: behind everything else,
+//!    where nothing has to reach them.
 //!
 //! The patch holds everything that differs from the object the executable was linked from, so
 //! each splice starts from the executable as the linker left it: the last one is undone
@@ -115,6 +119,7 @@ impl Baseline {
         }
         file.set_len(self.image.len)?;
         file.write_all_at(&addition.appended, addition.offset)?;
+        file.write_all_at(&addition.headers, addition.headers_offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
             file.read_exact_at(&mut old, *offset)?;
@@ -139,9 +144,226 @@ impl Stamp {
     }
 }
 
+/// The architecture an executable is of: what its instructions can reach and how the
+/// relocations of its objects are numbered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Machine {
+    X86_64,
+    Aarch64,
+}
+
+/// The field a relocation fills in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// An address, in 8 bytes.
+    Address,
+    /// A distance, in 4 bytes.
+    Distance,
+    /// The distance of a `b` or `bl` in instructions, in 26 bits: 128 MB either way.
+    Branch,
+    /// The distance of an `adrp` in pages of 4 KB, in 21 bits: 4 GB either way.
+    Page,
+    /// What of an address `adrp` leaves out, in units of this many bits' worth of bytes:
+    /// 0 for an `add`, the size of what is loaded or stored for the others.
+    InPage(u8),
+}
+
+impl Machine {
+    const X16: u32 = 16;
+
+    fn of(e_machine: u16) -> Option<Machine> {
+        match e_machine {
+            elf::EM_X86_64 => Some(Machine::X86_64),
+            elf::EM_AARCH64 => Some(Machine::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// The relocation by which the loader adds where the program is to an address.
+    fn relative(self) -> u32 {
+        match self {
+            Machine::X86_64 => elf::R_X86_64_RELATIVE,
+            Machine::Aarch64 => elf::R_AARCH64_RELATIVE,
+        }
+    }
+
+    /// Whether the loader writes the address of what another library defines for it.
+    fn imports(self, r_type: u32) -> bool {
+        match self {
+            Machine::X86_64 => matches!(r_type, elf::R_X86_64_GLOB_DAT | elf::R_X86_64_JUMP_SLOT),
+            Machine::Aarch64 => {
+                matches!(r_type, elf::R_AARCH64_GLOB_DAT | elf::R_AARCH64_JUMP_SLOT)
+            }
+        }
+    }
+
+    fn fixup(self, r_type: u32) -> anyhow::Result<(Fixup, Field)> {
+        Ok(match self {
+            Machine::X86_64 => match r_type {
+                elf::R_X86_64_64 => (Fixup::Absolute, Field::Address),
+                elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => (Fixup::Relative, Field::Distance),
+                elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
+                    (Fixup::ThroughSlot, Field::Distance)
+                }
+                other => bail!("a relocation of type {other}, which only the linker handles"),
+            },
+            Machine::Aarch64 => match r_type {
+                elf::R_AARCH64_ABS64 => (Fixup::Absolute, Field::Address),
+                elf::R_AARCH64_PREL32 => (Fixup::Relative, Field::Distance),
+                elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => (Fixup::Relative, Field::Branch),
+                elf::R_AARCH64_ADR_PREL_PG_HI21 => (Fixup::Relative, Field::Page),
+                elf::R_AARCH64_ADD_ABS_LO12_NC | elf::R_AARCH64_LDST8_ABS_LO12_NC => {
+                    (Fixup::Relative, Field::InPage(0))
+                }
+                elf::R_AARCH64_LDST16_ABS_LO12_NC => (Fixup::Relative, Field::InPage(1)),
+                elf::R_AARCH64_LDST32_ABS_LO12_NC => (Fixup::Relative, Field::InPage(2)),
+                elf::R_AARCH64_LDST64_ABS_LO12_NC => (Fixup::Relative, Field::InPage(3)),
+                elf::R_AARCH64_LDST128_ABS_LO12_NC => (Fixup::Relative, Field::InPage(4)),
+                elf::R_AARCH64_ADR_GOT_PAGE => (Fixup::ThroughSlot, Field::Page),
+                elf::R_AARCH64_LD64_GOT_LO12_NC => (Fixup::ThroughSlot, Field::InPage(3)),
+                other => bail!("a relocation of type {other}, which only the linker handles"),
+            },
+        })
+    }
+
+    /// How long the shortest jump from the entry of a function to its replacement is.
+    fn jump(self) -> usize {
+        match self {
+            // `jmp new`.
+            Machine::X86_64 => 5,
+            // `b new`.
+            Machine::Aarch64 => 4,
+        }
+    }
+
+    /// The code of a stub, and what it is aligned to. An x86-64 one is `jmp *slot(%rip)`;
+    /// an AArch64 one makes an address in `x16` and branches to it.
+    fn stub(self) -> (usize, u64) {
+        match self {
+            Machine::X86_64 => (6, 1),
+            Machine::Aarch64 => (12, 4),
+        }
+    }
+
+    /// Whether a call from `place` reaches `to` without a stub in between.
+    fn reaches(self, to: u64, place: u64) -> bool {
+        match self {
+            Machine::X86_64 => true,
+            Machine::Aarch64 => Field::Branch.fill(&mut [0; 4], to, place).is_ok(),
+        }
+    }
+
+    /// A stub at `stub` that jumps to the address the slot at `slot` holds.
+    fn stub_through(self, slot: u64, stub: u64) -> anyhow::Result<Vec<u8>> {
+        Ok(match self {
+            Machine::X86_64 => {
+                let mut code = vec![0xff, 0x25];
+                code.extend_from_slice(&relative(slot, stub + 6)?.to_le_bytes());
+                code
+            }
+            // `adrp x16, slot`, `ldr x16, [x16, slot's low bits]`, `br x16`.
+            Machine::Aarch64 => {
+                let mut code = [0x9000_0000 | Self::X16, 0xf940_0210, 0xd61f_0200]
+                    .map(u32::to_le_bytes)
+                    .concat();
+                Field::Page.fill(&mut code[..4], slot, stub)?;
+                Field::InPage(3).fill(&mut code[4..8], slot, stub + 4)?;
+                code
+            }
+        })
+    }
+
+    /// Code at `from` that goes on at `to`, where a `b` does not reach: `adrp x16, to`,
+    /// `add x16, x16, to's low bits`, `br x16`. A call may change `x16` as it likes.
+    fn far_jump(self, to: u64, from: u64) -> anyhow::Result<Vec<u8>> {
+        ensure!(self == Machine::Aarch64, "the program is too large");
+        let mut code =
+            [0x9000_0000 | Self::X16, 0x9100_0210, 0xd61f_0200].map(u32::to_le_bytes).concat();
+        Field::Page.fill(&mut code[..4], to, from)?;
+        Field::InPage(0).fill(&mut code[4..8], to, from + 4)?;
+        Ok(code)
+    }
+
+    /// What is written over the entry of a function of `size` bytes at `old` to have it go
+    /// on at `new`.
+    fn redirect(self, new: u64, old: u64, size: u64) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Machine::X86_64 => {
+                let mut jump = vec![0xe9];
+                jump.extend_from_slice(&relative(new, old + 5)?.to_le_bytes());
+                Ok(jump)
+            }
+            Machine::Aarch64 => {
+                let mut jump = 0x1400_0000u32.to_le_bytes().to_vec();
+                if Field::Branch.fill(&mut jump, new, old).is_ok() {
+                    return Ok(jump);
+                }
+                let jump = self.far_jump(new, old)?;
+                ensure!(
+                    size >= jump.len() as u64,
+                    "a function of {size} bytes, too short to jump {} MB from",
+                    new.abs_diff(old) >> 20
+                );
+                Ok(jump)
+            }
+        }
+    }
+}
+
+impl Field {
+    /// Writes what the field at `place` has for `to` into its bytes.
+    fn fill(self, bytes: &mut [u8], to: u64, place: u64) -> anyhow::Result<()> {
+        let instruction = |bytes: &mut [u8], mask: u32, bits: u32| {
+            let old = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            bytes[..4].copy_from_slice(&(old & !mask | bits & mask).to_le_bytes());
+        };
+        let within = |distance: i64, bits: u32| {
+            ensure!(
+                distance >= -(1 << (bits - 1)) && distance < 1 << (bits - 1),
+                "the program is too large"
+            );
+            Ok(())
+        };
+        match self {
+            Field::Address => bytes[..8].copy_from_slice(&to.to_le_bytes()),
+            Field::Distance => bytes[..4].copy_from_slice(&relative(to, place)?.to_le_bytes()),
+            Field::Branch => {
+                let distance = to.wrapping_sub(place) as i64;
+                ensure!(distance % 4 == 0, "a branch to between two instructions");
+                within(distance >> 2, 26)?;
+                instruction(bytes, 0x03ff_ffff, (distance >> 2) as u32);
+            }
+            Field::Page => {
+                let pages = ((to >> 12) as i64).wrapping_sub((place >> 12) as i64);
+                within(pages, 21)?;
+                let pages = pages as u32;
+                instruction(bytes, 0x60ff_ffe0, (pages & 3) << 29 | (pages >> 2 & 0x7ffff) << 5);
+            }
+            Field::InPage(scale) => {
+                let low = (to & 0xfff) as u32;
+                ensure!(
+                    low.is_multiple_of(1 << scale),
+                    "a load of {} bytes from an address that is not a multiple of that",
+                    1 << scale
+                );
+                instruction(bytes, 0xfff << 10, (low >> scale) << 10);
+            }
+        }
+        Ok(())
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Field::Address => 8,
+            _ => 4,
+        }
+    }
+}
+
 /// What a splice has to know of the executable. Nothing of the file is read again.
 struct Image {
     len: u64,
+    machine: Machine,
     header: elf::FileHeader64<Endianness>,
     segments: Vec<elf::ProgramHeader64<Endianness>>,
     /// Addresses are relative to where the program is loaded, and the loader adds that to
@@ -202,10 +424,9 @@ impl Image {
         let file = ElfFile64::<Endianness>::parse(bytes)?;
         let endian = file.endian();
         let header = *file.elf_header();
-        ensure!(
-            header.e_machine(endian) == elf::EM_X86_64 && endian == Endianness::Little,
-            "not an x86-64 executable"
-        );
+        let machine =
+            Machine::of(header.e_machine(endian)).filter(|_| endian == Endianness::Little);
+        let machine = machine.context("an executable of an architecture nothing is added to")?;
         let pie = match header.e_type(endian) {
             elf::ET_DYN => true,
             elf::ET_EXEC => false,
@@ -241,7 +462,7 @@ impl Image {
             for (slot, relocation) in relocations {
                 let RelocationFlags::Elf { r_type } = relocation.flags() else { continue };
                 let RelocationTarget::Symbol(symbol) = relocation.target() else { continue };
-                if matches!(r_type, elf::R_X86_64_GLOB_DAT | elf::R_X86_64_JUMP_SLOT) {
+                if machine.imports(r_type) {
                     let name = dynamic.symbol_by_index(symbol)?.name_bytes()?;
                     imports.entry(name.into()).or_insert(slot);
                 }
@@ -250,6 +471,7 @@ impl Image {
 
         let mut image = Image {
             len: bytes.len() as u64,
+            machine,
             header,
             segments,
             pie,
@@ -260,7 +482,34 @@ impl Image {
         };
         image.unwind = UnwindTable::read(&image, bytes)?;
         image.relocations = LoadRelocations::read(&image, bytes)?;
+        ensure!(
+            !image.lands_on_pads(&file)?,
+            "an executable whose indirect branches have to land on `bti`"
+        );
         Ok(image)
+    }
+
+    /// Whether the loader is told to fault an indirect branch that lands on anything but a
+    /// `bti`: the jump written over the entry of a function is none.
+    fn lands_on_pads(&self, file: &ElfFile64<'_, Endianness>) -> anyhow::Result<bool> {
+        let e = Endianness::Little;
+        if self.machine != Machine::Aarch64 {
+            return Ok(false);
+        }
+        for segment in file.elf_program_headers() {
+            let Some(mut notes) = segment.notes(e, file.data())? else { continue };
+            while let Some(note) = notes.next()? {
+                let Some(mut properties) = note.gnu_properties(e) else { continue };
+                while let Some(property) = properties.next()? {
+                    if property.pr_type() == elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND
+                        && property.data_u32(e)? & elf::GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn segments_of(&self, kind: u32) -> impl Iterator<Item = &elf::ProgramHeader64<Endianness>> {
@@ -395,6 +644,7 @@ impl LoadRelocations {
         mut statics: Vec<Defined>,
         mut restored: FxHashMap<u64, u64>,
         spare: u64,
+        relative: u32,
     ) -> anyhow::Result<Vec<elf::Rela64<Endianness>>> {
         let e = Endianness::Little;
         if !statics.is_empty() {
@@ -409,7 +659,7 @@ impl LoadRelocations {
                     continue;
                 }
                 ensure!(
-                    entry.r_info.get(e) == u64::from(elf::R_X86_64_RELATIVE),
+                    entry.r_info.get(e) == u64::from(relative),
                     "a static that stored the address of an import"
                 );
                 match restored.remove(&at) {
@@ -425,7 +675,7 @@ impl LoadRelocations {
             .into_iter()
             .map(|(at, value)| elf::Rela64 {
                 r_offset: object::U64::new(e, at),
-                r_info: object::U64::new(e, u64::from(elf::R_X86_64_RELATIVE)),
+                r_info: object::U64::new(e, u64::from(relative)),
                 r_addend: object::I64::new(e, value as i64),
             })
             .collect())
@@ -508,7 +758,8 @@ struct Patch<'a> {
     /// The symbols the code reaches through an address slot of ours, in the order of the
     /// slots.
     slots: Vec<SymbolIndex>,
-    /// The imports the code calls directly, in the order of their stubs.
+    /// What the code calls directly and may not reach, in the order of their stubs: the
+    /// imports, and where a call reaches only so far, what the executable defines.
     stubs: Vec<SymbolIndex>,
     /// How many addresses the data stores, each of which the loader has to fix up.
     stored: usize,
@@ -576,34 +827,24 @@ impl InPlace {
 
 /// How a relocation of the patch gets its value.
 enum Fixup {
-    /// The address itself, in 8 bytes.
+    /// The address itself.
     Absolute,
-    /// The distance to it, in 4 bytes.
+    /// Where it is from the code: a distance, or the parts of one.
     Relative,
-    /// The distance to a slot that holds the address, in 4 bytes.
+    /// Where a slot that holds the address is from the code.
     ThroughSlot,
 }
 
 impl Fixup {
-    fn of(relocation: &object::Relocation) -> anyhow::Result<Fixup> {
+    fn of(relocation: &object::Relocation, machine: Machine) -> anyhow::Result<(Fixup, Field)> {
         let RelocationFlags::Elf { r_type } = relocation.flags() else {
             bail!("a relocation that is not ELF's")
         };
-        Ok(match r_type {
-            elf::R_X86_64_64 => Fixup::Absolute,
-            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => Fixup::Relative,
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
-                Fixup::ThroughSlot
-            }
-            other => bail!("a relocation of type {other}, which only the linker handles"),
-        })
+        machine.fixup(r_type)
     }
 }
 
 impl<'a> Patch<'a> {
-    const JUMP: usize = 5;
-    /// `jmp *slot(%rip)`.
-    const STUB: usize = 6;
     const SLOT: usize = 8;
 
     fn read(bytes: &'a [u8], image: &Image) -> anyhow::Result<Patch<'a>> {
@@ -653,7 +894,7 @@ impl<'a> Patch<'a> {
                     if old.kind == SymbolKind::Text && code.contains(&section) =>
                 {
                     ensure!(
-                        old.size >= Self::JUMP as u64,
+                        old.size >= image.machine.jump() as u64,
                         "{} is too short to jump from",
                         String::from_utf8_lossy(name)
                     );
@@ -696,23 +937,24 @@ impl<'a> Patch<'a> {
                         target
                     }
                 };
-                match (Fixup::of(&relocation)?, target) {
-                    (Fixup::Absolute, Target::Import(_)) => {
+                match (Fixup::of(&relocation, image.machine)?, target) {
+                    ((Fixup::Absolute, _), Target::Import(_)) => {
                         bail!("data that stores the address of an import")
                     }
-                    (Fixup::Absolute, _) => patch.stored += 1,
-                    (Fixup::Relative, Target::Import(_)) => {
+                    ((Fixup::Absolute, _), _) => patch.stored += 1,
+                    ((Fixup::Relative, _), Target::Import(_))
+                    | ((Fixup::Relative, Field::Branch), Target::Theirs(_)) => {
                         if stubs.insert(index) {
                             patch.stubs.push(index);
                         }
                     }
-                    (Fixup::ThroughSlot, Target::Import(_)) => {}
-                    (Fixup::ThroughSlot, _) => {
+                    ((Fixup::ThroughSlot, _), Target::Import(_)) => {}
+                    ((Fixup::ThroughSlot, _), _) => {
                         if slots.insert(index) {
                             patch.slots.push(index);
                         }
                     }
-                    (Fixup::Relative, _) => {}
+                    ((Fixup::Relative, _), _) => {}
                 }
             }
         }
@@ -816,6 +1058,8 @@ impl<'a> Patch<'a> {
     fn place(&self, image: &Image) -> anyhow::Result<Addition> {
         let e = Endianness::Little;
         let page = image.page();
+        let machine = image.machine;
+        let (stub_len, stub_align) = machine.stub();
         let offset = image.len.next_multiple_of(page);
         let base = image.end().next_multiple_of(page);
         let relocations = image.relocations.as_ref().filter(|_| image.pie);
@@ -831,14 +1075,13 @@ impl<'a> Patch<'a> {
         };
         let mut placed = FxHashMap::default();
         let mut extents = [(0, 0); 3];
-        let headers_len = (image.segments.len() + Segment::ALL.len())
+        let headers_len = (image.segments.len() + Segment::ALL.len() + 1)
             * size_of::<elf::ProgramHeader64<Endianness>>();
-        let (mut headers_at, mut unwind_at, mut relocations_at) = (0, 0, 0);
+        let (mut unwind_at, mut relocations_at) = (0, 0);
         let (mut stubs_at, mut slots_at, mut spare_at) = (0, 0, 0);
         for segment in Segment::ALL {
             let start = reserve(0, page);
             if let Segment::Read = segment {
-                headers_at = reserve(headers_len, 8);
                 unwind_at = reserve(image.unwind.len_with(self.frames), 4);
             }
             for &index in &self.sections[segment as usize] {
@@ -849,7 +1092,7 @@ impl<'a> Patch<'a> {
                 Segment::Read => {
                     relocations_at = reserve(relocations.map_or(0, |it| it.len_with(fixed_up)), 8);
                 }
-                Segment::Code => stubs_at = reserve(self.stubs.len() * Self::STUB, 1),
+                Segment::Code => stubs_at = reserve(self.stubs.len() * stub_len, stub_align),
                 Segment::Data => {
                     slots_at = reserve(self.slots.len() * Self::SLOT, 8);
                     spare_at = reserve(if self.in_place.is_empty() { 0 } else { Self::SLOT }, 8);
@@ -857,6 +1100,16 @@ impl<'a> Patch<'a> {
             }
             extents[segment as usize] = (start, reserve(0, 1));
         }
+        // The headers go where their place in memory is their place in the file, further
+        // by what the first segment is: past the other three in both.
+        let first = image.segments_of(elf::PT_LOAD).next().context("nothing is loaded")?;
+        let ahead = first.p_vaddr(e).checked_sub(first.p_offset(e));
+        let ahead = ahead
+            .filter(|it| it.is_multiple_of(page))
+            .context("a first segment loaded before where the file has it")?;
+        let headers_at =
+            (offset + end).max((base + end).saturating_sub(ahead)).next_multiple_of(page) - offset;
+        let headers_address = offset + headers_at + ahead;
         let mut appended = vec![0u8; end as usize];
 
         // A static written in place is where the executable has it: its section is added
@@ -898,7 +1151,7 @@ impl<'a> Patch<'a> {
             .zip((0..).map(|at| base + slots_at + at * Self::SLOT as u64))
             .collect();
         let stub_of: FxHashMap<SymbolIndex, u64> = (self.stubs.iter().copied())
-            .zip((0..).map(|at| base + stubs_at + at * Self::STUB as u64))
+            .zip((0..).map(|at| base + stubs_at + at * stub_len as u64))
             .collect();
 
         // The addresses stored in data, which the loader moves with the program.
@@ -908,7 +1161,7 @@ impl<'a> Patch<'a> {
             if image.pie {
                 fixed.push(elf::Rela64 {
                     r_offset: object::U64::new(e, at),
-                    r_info: object::U64::new(e, u64::from(elf::R_X86_64_RELATIVE)),
+                    r_info: object::U64::new(e, u64::from(machine.relative())),
                     r_addend: object::I64::new(e, value as i64),
                 });
             }
@@ -936,7 +1189,7 @@ impl<'a> Patch<'a> {
                 let target = self.targets[&index];
                 if let Some(which) = in_place.iter().position(|it| it.holds(at)) {
                     let within = (at - in_place[which].offset) as usize;
-                    let Fixup::Absolute = Fixup::of(&relocation)? else {
+                    let (Fixup::Absolute, _) = Fixup::of(&relocation, machine)? else {
                         bail!("a static that stores a distance")
                     };
                     let value = address(target, relocation.addend(), true)?;
@@ -948,7 +1201,8 @@ impl<'a> Patch<'a> {
                     continue;
                 }
                 let place = base + start + at;
-                let to = match (Fixup::of(&relocation)?, target) {
+                let (fixup, field) = Fixup::of(&relocation, machine)?;
+                let to = match (fixup, target) {
                     (Fixup::Absolute, _) => {
                         let value = address(target, relocation.addend(), true)?;
                         store(&mut appended, place, value);
@@ -958,14 +1212,23 @@ impl<'a> Patch<'a> {
                         stub_of[&index].wrapping_add_signed(relocation.addend())
                     }
                     (Fixup::Relative, _) | (Fixup::ThroughSlot, Target::Import(_)) => {
-                        address(target, relocation.addend(), !code)?
+                        let to = address(target, relocation.addend(), !code)?;
+                        match stub_of.get(&index) {
+                            Some(&stub)
+                                if field == Field::Branch && !machine.reaches(to, place) =>
+                            {
+                                ensure!(relocation.addend() == 0, "a far branch into a function");
+                                stub
+                            }
+                            _ => to,
+                        }
                     }
                     (Fixup::ThroughSlot, _) => {
                         slot_of[&index].wrapping_add_signed(relocation.addend())
                     }
                 };
-                let value = relative(to, place)?;
-                appended[(place - base) as usize..][..4].copy_from_slice(&value.to_le_bytes());
+                let bytes = appended[(place - base) as usize..].get_mut(..field.len());
+                field.fill(bytes.context("a relocation past its section")?, to, place)?;
             }
             if section.name_bytes()? == b".eh_frame" {
                 let relocated = &appended[start as usize..][..data.len()];
@@ -979,18 +1242,21 @@ impl<'a> Patch<'a> {
             store(&mut appended, slot, address(self.targets[&index], 0, true)?);
         }
         for (&index, &stub) in &stub_of {
-            let Target::Import(slot) = self.targets[&index] else { continue };
-            let code = &mut appended[(stub - base) as usize..][..Self::STUB];
-            code[..2].copy_from_slice(&[0xff, 0x25]);
-            code[2..].copy_from_slice(&relative(slot, stub + Self::STUB as u64)?.to_le_bytes());
+            let code = match self.targets[&index] {
+                Target::Import(slot) => machine.stub_through(slot, stub)?,
+                Target::Theirs(address) => machine.far_jump(address, stub)?,
+                Target::Ours(..) | Target::Section(_) => continue,
+            };
+            appended[(stub - base) as usize..][..stub_len].copy_from_slice(&code);
         }
 
         let mut redirected = 0;
         for replaced in &self.replaced {
             let Some(old) = replaced.old.filter(|it| it.kind == SymbolKind::Text) else { continue };
             let new = base + placed[&replaced.section] + replaced.offset;
-            let mut jump = vec![0xe9];
-            jump.extend_from_slice(&relative(new, old.address + Self::JUMP as u64)?.to_le_bytes());
+            let jump = machine.redirect(new, old.address, old.size).with_context(|| {
+                format!("{} cannot be jumped from", String::from_utf8_lossy(replaced.name))
+            })?;
             overwritten.push((image.offset_of(old.address)?, jump));
             // Its symbol names the new code, for whoever reads a backtrace.
             let named = [new.to_le_bytes(), replaced.size.to_le_bytes()].concat();
@@ -1011,7 +1277,14 @@ impl<'a> Patch<'a> {
             );
             let statics = self.in_place.values().flatten().map(|it| it.old).collect();
             let spare = base + spare_at;
-            fixed.extend(LoadRelocations::restore(&mut table[..old], statics, restored, spare)?);
+            let relative = image.machine.relative();
+            fixed.extend(LoadRelocations::restore(
+                &mut table[..old],
+                statics,
+                restored,
+                spare,
+                relative,
+            )?);
             let added = object::bytes_of_slice(&fixed);
             table[old..][..added.len()].copy_from_slice(added);
             let len = (old + added.len()) as u64;
@@ -1022,40 +1295,48 @@ impl<'a> Patch<'a> {
 
         // The program headers, with the ones that moved pointing here and the new segments.
         let mut segments = image.segments.clone();
+        let point_to =
+            |header: &mut elf::ProgramHeader64<Endianness>, at: u64, address: u64, len: u64| {
+                header.p_offset.set(e, offset + at);
+                header.p_vaddr.set(e, address);
+                header.p_paddr.set(e, address);
+                header.p_filesz.set(e, len);
+                header.p_memsz.set(e, len);
+            };
         let point = |header: &mut elf::ProgramHeader64<Endianness>, at: u64, len: u64| {
-            header.p_offset.set(e, offset + at);
-            header.p_vaddr.set(e, base + at);
-            header.p_paddr.set(e, base + at);
-            header.p_filesz.set(e, len);
-            header.p_memsz.set(e, len);
+            point_to(header, at, base + at, len)
         };
         point(&mut segments[image.unwind.segment], unwind_at, unwind.len() as u64);
         if let Some(header) = segments.iter_mut().find(|it| it.p_type(e) == elf::PT_PHDR) {
-            point(header, headers_at, headers_len as u64);
+            point_to(header, headers_at, headers_address, headers_len as u64);
         }
+        let loaded = |flags: u32| elf::ProgramHeader64::<Endianness> {
+            p_type: object::U32::new(e, elf::PT_LOAD),
+            p_flags: object::U32::new(e, flags),
+            p_offset: object::U64::new(e, 0),
+            p_vaddr: object::U64::new(e, 0),
+            p_paddr: object::U64::new(e, 0),
+            p_filesz: object::U64::new(e, 0),
+            p_memsz: object::U64::new(e, 0),
+            p_align: object::U64::new(e, page),
+        };
         for segment in Segment::ALL {
             let (start, end) = extents[segment as usize];
-            let mut header = elf::ProgramHeader64::<Endianness> {
-                p_type: object::U32::new(e, elf::PT_LOAD),
-                p_flags: object::U32::new(e, segment.flags()),
-                p_offset: object::U64::new(e, 0),
-                p_vaddr: object::U64::new(e, 0),
-                p_paddr: object::U64::new(e, 0),
-                p_filesz: object::U64::new(e, 0),
-                p_memsz: object::U64::new(e, 0),
-                p_align: object::U64::new(e, page),
-            };
+            let mut header = loaded(segment.flags());
             point(&mut header, start, end - start);
             segments.push(header);
         }
-        let headers = object::bytes_of_slice(&segments);
-        appended[headers_at as usize..][..headers.len()].copy_from_slice(headers);
+        let mut header = loaded(elf::PF_R);
+        point_to(&mut header, headers_at, headers_address, headers_len as u64);
+        segments.push(header);
+        let headers = object::bytes_of_slice(&segments).to_vec();
         let mut header = image.header;
         header.e_phoff.set(e, offset + headers_at);
         header.e_phnum.set(e, u16::try_from(segments.len())?);
         overwritten.push((0, object::bytes_of(&header).to_vec()));
 
-        Ok(Addition { offset, appended, overwritten, redirected })
+        let headers_offset = offset + headers_at;
+        Ok(Addition { offset, appended, headers_offset, headers, overwritten, redirected })
     }
 }
 
@@ -1064,6 +1345,9 @@ struct Addition {
     /// Where in the file `appended` goes: behind what the linker wrote.
     offset: u64,
     appended: Vec<u8>,
+    /// The program headers, which may be far behind the rest: nothing is written between.
+    headers_offset: u64,
+    headers: Vec<u8>,
     /// What changes of the file the linker wrote, by where it is.
     overwritten: Vec<(u64, Vec<u8>)>,
     redirected: usize,
@@ -1076,4 +1360,44 @@ fn read_i32(bytes: &[u8]) -> i32 {
 /// The distance from `from` to `to`, where the code has four bytes for it.
 fn relative(to: u64, from: u64) -> anyhow::Result<i32> {
     i32::try_from(to.wrapping_sub(from) as i64).context("the program is too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Field, Machine};
+
+    fn words(code: &[u8]) -> Vec<u32> {
+        code.chunks(4).map(|it| u32::from_le_bytes(it.try_into().unwrap())).collect()
+    }
+
+    /// What `as` and `ld` write for the same instructions at the same addresses.
+    #[test]
+    fn aarch64_instructions() {
+        let machine = Machine::Aarch64;
+        let far = machine.far_jump(0x1235_5678, 0x10000).unwrap();
+        assert_eq!(words(&far), [0xb009_1a30, 0x9119_e210, 0xd61f_0200]);
+        let stub = machine.stub_through(0x7ff8, 0x1000c).unwrap();
+        assert_eq!(words(&stub), [0xf0ff_ffb0, 0xf947_fe10, 0xd61f_0200]);
+        assert_eq!(words(&machine.redirect(0x7ff_ff00, 0x10018, 4).unwrap()), [0x15ff_bfba]);
+        let mut call = 0x9400_0000u32.to_le_bytes();
+        Field::Branch.fill(&mut call, 0x400, 0x1001c).unwrap();
+        assert_eq!(words(&call), [0x97ff_c0f9]);
+        let mut load = 0x7940_0001u32.to_le_bytes();
+        Field::InPage(1).fill(&mut load, 0x7ff8, 0x10024).unwrap();
+        assert_eq!(words(&load), [0x795f_f001]);
+    }
+
+    /// A `b` reaches 128 MB: past that the jump is the long one, where it fits.
+    #[test]
+    fn aarch64_reach() {
+        let machine = Machine::Aarch64;
+        let (old, last) = (0x10000u64, 0x10000 + (128 << 20) - 4);
+        assert!(machine.reaches(last, old) && !machine.reaches(last + 4, old));
+        assert!(machine.reaches(0, 128 << 20) && !machine.reaches(0, (128 << 20) + 4));
+        assert_eq!(machine.redirect(last, old, 4).unwrap().len(), 4);
+        assert_eq!(machine.redirect(last + 4, old, 12).unwrap().len(), 12);
+        assert!(machine.redirect(last + 4, old, 8).is_err());
+        assert!(machine.redirect(old + (5 << 30), old, 64).is_err());
+        assert!(Field::InPage(3).fill(&mut [0; 4], 0x7ffc, 0).is_err());
+    }
 }

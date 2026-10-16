@@ -136,7 +136,11 @@ fn main() {
     let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
     case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
 
-    if is_x86_feature_detected!("ssse3") {
+    #[cfg(target_arch = "x86_64")]
+    let shuffles = is_x86_feature_detected!("ssse3");
+    #[cfg(target_arch = "aarch64")]
+    let shuffles = std::arch::is_aarch64_feature_detected!("neon");
+    if shuffles {
         case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
     }
     case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
@@ -165,6 +169,10 @@ fn main() {
     case!(floats.a, floats.b[0], floats.b[1], nested.tag, nested.inner.0, nested.inner.1);
     let two = foreign::spill(1, 2, 3, 4, 5, foreign::Two { a: 6, b: 7 }, 8);
     case!(two.a, two.b, foreign::through_pointer(foreign::floats, foreign::make_big));
+    let quad = |x: f64| foreign::Quad { at: [x, x + 0.5, x * 2.0, x - 1.0] };
+    let five = foreign::five(foreign::Five { at: [1.0, 2.0, 3.0, 4.0, 5.0] }, 1.5);
+    case!(foreign::quads(quad(1.0), quad(2.0), quad(3.0), 0.25).at, five.at);
+    case!(foreign::wides(1, 1 << 70, 2, -5, 3, 1 << 90, 4, 1 << 100));
     let map = shapes::byte_map();
     case!(map.map[b'a' as usize], map.map[10], map.map[0]);
     let (a, b) = (shapes::state(b"abc"), shapes::state(b"abd"));
@@ -179,7 +187,6 @@ fn main() {
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
     println!("const_unsized_struct {:?}", cases::const_unsized_struct::run());
-    #[cfg(target_arch = "x86_64")]
     println!("inline_asm {:?}", cases::inline_asm::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
@@ -270,6 +277,8 @@ fn main() {
     println!("lifetime_impl_consts {}", cases::lifetime_impl_consts::run());
     #[cfg(target_arch = "x86_64")]
     println!("simd_x86 {}", cases::simd_x86::run());
+    #[cfg(target_arch = "aarch64")]
+    println!("simd_aarch64 {}", cases::simd_aarch64::run());
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
     println!("module_paths {}", cases::module_paths::run());
     println!("fn_thread_local {:?}", cases::fn_thread_local::run());

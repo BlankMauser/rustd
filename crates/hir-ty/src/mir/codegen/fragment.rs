@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, unwind::FunctionUnwind,
+    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -146,6 +147,8 @@ pub(super) struct Mark {
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
+    /// What `isa` generates code for.
+    pub(super) target: &'static Target,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -156,10 +159,15 @@ pub(super) struct Recorder<'db> {
 }
 
 impl<'db> Recorder<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, isa: &'static dyn TargetIsa) -> Self {
+    pub(super) fn new(
+        db: &'db dyn HirDatabase,
+        isa: &'static dyn TargetIsa,
+        target: &'static Target,
+    ) -> Self {
         Recorder {
             db,
             isa,
+            target,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),

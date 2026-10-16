@@ -142,6 +142,13 @@ impl Machine {
     }
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+        let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
+        if emitted.triple() != TRIPLE {
+            return Err(Unhandled::Llvm(format!(
+                "the LLVM backend emits for {TRIPLE} only, not {}",
+                emitted.triple()
+            )));
+        }
         Target::initialize_x86(&InitializationConfig::default());
         let triple = TargetTriple::create(TRIPLE);
         let target = Target::from_triple(&triple)

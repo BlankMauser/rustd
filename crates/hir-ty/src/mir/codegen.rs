@@ -13,8 +13,7 @@ use cranelift_codegen::{
         condcodes::{FloatCC, IntCC},
         types,
     },
-    isa::{self, CallConv},
-    settings::{self, Configurable},
+    isa,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{
@@ -89,6 +88,8 @@ mod llvm;
 mod patch;
 mod stable;
 mod store;
+mod target;
+pub use target::{Arch, ObjectFormat, Target, UnwindFormat};
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{pack_name, seal_left_open};
@@ -203,6 +204,15 @@ enum PassMode {
     /// Aggregate the C ABI splits over two registers, the second holding what lies eight
     /// bytes in.
     CastPair(Type, Type),
+    /// Aggregate AAPCS64 hands over in `count` registers of one type, each holding the next
+    /// `unit` bytes of it. `skipped` registers of that kind go unused first: the convention
+    /// leaves them out when the value has to start at an even register, and takes them all
+    /// out of use when the value has to go to the stack, where the units then land.
+    Uniform {
+        unit: Type,
+        count: u8,
+        skipped: u8,
+    },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -213,6 +223,24 @@ enum PassMode {
 struct FnAbi {
     ret: PassMode,
     args: Vec<PassMode>,
+}
+
+/// How AAPCS64 sorts a value, before the registers that are left decide where it goes.
+enum Aapcs64 {
+    Ignore,
+    Scalar(AbiScalar),
+    /// A homogeneous aggregate of `count` floats of the type `unit`.
+    Floats {
+        unit: Type,
+        count: u8,
+    },
+    /// Any other aggregate of at most sixteen bytes.
+    Ints {
+        size: u64,
+        align: u64,
+    },
+    /// A larger one, which the caller copies and passes the address of.
+    Memory,
 }
 
 /// What the System V x86-64 ABI calls the class of an eightbyte.
@@ -957,12 +985,12 @@ impl Resolved {
     }
 }
 
-/// The one target we compile for.
+/// The code generator of the one [`Target`] the process compiles for.
 fn target() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| target_with("backtracking"))
+        .get_or_init(|| Target::selected()?.isa("backtracking"))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -974,24 +1002,15 @@ fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| target_with("single_pass"))
+        .get_or_init(|| Target::selected()?.isa("single_pass"))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
 
 const LARGE: usize = 50_000;
 
-fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
-    let mut flags = settings::builder();
-    flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
-    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
-    flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
-    flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-    isa::lookup_by_name("x86_64-unknown-linux-gnu")
-        .map_err(|e| e.to_string())?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| e.to_string())
+fn selected_target() -> Result<&'static Target> {
+    Target::selected().map_err(CodegenError::Backend)
 }
 
 /// How many functions went through Cranelift since the process started.
@@ -1337,7 +1356,7 @@ impl TheirStatics {
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
-    let mut cg = Recorder::new(db, &**target()?);
+    let mut cg = Recorder::new(db, &**target()?, selected_target()?);
     let env =
         ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -1501,7 +1520,7 @@ fn compile<'db>(
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
-    let mut cg = Recorder::new(db, isa);
+    let mut cg = Recorder::new(db, isa, selected_target()?);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = Backend::emit(&mut cg, &mut ctx)?;
     let (requests, layouts) = cg.finish();
@@ -3505,10 +3524,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 .collect::<Result<_>>()?;
             return Ok(FnAbi { ret, args });
         }
-        if !matches!(abi, ExternAbi::C { .. } | ExternAbi::System { .. } | ExternAbi::SysV64 { .. })
-        {
-            unsupported!("calling convention {abi:?}");
+        let arch = self.cg.target.arch;
+        match (abi, arch) {
+            (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::X86_64)
+            | (ExternAbi::SysV64 { .. }, Arch::X86_64) => self.sysv_x86_64_abi(ret, args),
+            (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::Aarch64) => {
+                self.aapcs64_abi(ret, args)
+            }
+            _ => unsupported!("calling convention {abi:?}"),
         }
+    }
+
+    /// The C convention of the System V x86-64 psABI, as rustc's `callconv/x86_64.rs` has it.
+    fn sysv_x86_64_abi(
+        &self,
+        ret: Ty<'db>,
+        args: impl IntoIterator<Item = Ty<'db>>,
+    ) -> Result<FnAbi> {
         let (mut int_regs, mut sse_regs) = (6usize, 8usize);
         let ret = match self.c_pass_mode(ret)? {
             PassMode::OnStack(_) => {
@@ -3527,6 +3559,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
+                PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -3541,6 +3574,183 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             });
         }
         Ok(FnAbi { ret, args: modes })
+    }
+
+    /// The C convention of AArch64 (AAPCS64), as rustc's `callconv/aarch64.rs` has it.
+    ///
+    /// Cranelift places scalars the way the convention does, so what is decided here is
+    /// what an aggregate turns into, and which registers it leaves unused: Cranelift hands
+    /// out registers one value at a time and knows nothing of a value that takes several
+    /// or none.
+    fn aapcs64_abi(&self, ret: Ty<'db>, args: impl IntoIterator<Item = Ty<'db>>) -> Result<FnAbi> {
+        const REGS: u8 = 8;
+        let ret = match self.aapcs64_class(ret)? {
+            Aapcs64::Ignore => PassMode::Ignore,
+            Aapcs64::Scalar(scalar) => PassMode::Direct(scalar),
+            Aapcs64::Floats { unit, count } => PassMode::Uniform { unit, count, skipped: 0 },
+            Aapcs64::Ints { size, .. } => Self::aapcs64_ints(size, 0),
+            // Its address comes in a register of its own, which is not an argument's.
+            Aapcs64::Memory => PassMode::Indirect,
+        };
+        let (mut ints, mut floats) = (0u8, 0u8);
+        let mut modes = Vec::new();
+        for ty in args {
+            modes.push(match self.aapcs64_class(ty)? {
+                Aapcs64::Ignore => PassMode::Ignore,
+                Aapcs64::Scalar(scalar) => {
+                    let (used, wide) = match scalar.ty {
+                        ty if ty.is_float() => (&mut floats, false),
+                        ty => (&mut ints, ty == types::I128),
+                    };
+                    if wide {
+                        // Cranelift starts it at an even register, or puts it on the stack
+                        // whole. The registers it did not fit in stay free there, where
+                        // the convention has them out of use: turn down what would use one.
+                        *used += *used % 2;
+                        if *used + 2 > REGS && *used < REGS {
+                            unsupported!("a 128-bit argument that the registers left do not hold");
+                        }
+                        *used = (*used + 2).min(REGS);
+                    } else {
+                        *used = (*used + 1).min(REGS);
+                    }
+                    PassMode::Direct(scalar)
+                }
+                Aapcs64::Floats { unit, count } if floats + count <= REGS => {
+                    floats += count;
+                    PassMode::Uniform { unit, count, skipped: 0 }
+                }
+                Aapcs64::Floats { unit, count } => {
+                    let skipped = REGS - floats;
+                    floats = REGS;
+                    let size = u64::from(unit.bytes()) * u64::from(count);
+                    PassMode::Uniform { unit: types::F64, count: size.div_ceil(8) as u8, skipped }
+                }
+                Aapcs64::Ints { size, align } => {
+                    let count = size.div_ceil(8) as u8;
+                    let odd = if align > 8 { ints % 2 } else { 0 };
+                    if ints + odd + count <= REGS {
+                        ints += odd + count;
+                        Self::aapcs64_ints(size, odd)
+                    } else if align > 8 {
+                        // FIXME: the stack is where it goes, at an address that is a
+                        // multiple of sixteen, which the units of a `Uniform` are not at.
+                        unsupported!("an aggregate aligned to 16 bytes passed on the stack");
+                    } else {
+                        let skipped = REGS - ints;
+                        ints = REGS;
+                        PassMode::Uniform { unit: types::I64, count, skipped }
+                    }
+                }
+                Aapcs64::Memory => {
+                    ints = (ints + 1).min(REGS);
+                    PassMode::Indirect
+                }
+            });
+        }
+        Ok(FnAbi { ret, args: modes })
+    }
+
+    /// An aggregate of at most sixteen bytes in integer registers, `skipped` of them unused.
+    fn aapcs64_ints(size: u64, skipped: u8) -> PassMode {
+        match size {
+            // An integer of exactly the aggregate's size; the bits above it are undefined.
+            1 if skipped == 0 => PassMode::Cast(types::I8),
+            2 if skipped == 0 => PassMode::Cast(types::I16),
+            3 | 4 if skipped == 0 => PassMode::Cast(types::I32),
+            5..=8 if skipped == 0 => PassMode::Cast(types::I64),
+            _ => PassMode::Uniform { unit: types::I64, count: size.div_ceil(8) as u8, skipped },
+        }
+    }
+
+    /// What AAPCS64 makes of a value before it looks for registers.
+    fn aapcs64_class(&self, ty: Ty<'db>) -> Result<Aapcs64> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(Aapcs64::Ignore);
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(scalar) => return Ok(Aapcs64::Scalar(self.scalar(scalar)?)),
+            BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
+            _ => (),
+        }
+        let size = layout.size.bytes();
+        let mut leaves = Vec::new();
+        self.scalar_leaves(ty, 0, &mut leaves)?;
+        // The members of a union lie over each other.
+        leaves.sort_by_key(|&(offset, _)| offset);
+        leaves.dedup();
+        // A homogeneous floating-point aggregate: one to four floats of one type and
+        // nothing else, which go in as many vector registers.
+        if let Some(&(_, first)) = leaves.first()
+            && let Primitive::Float(_) = first.primitive()
+            && leaves.len() <= 4
+        {
+            let unit = self.scalar(first)?.ty;
+            let step = u64::from(unit.bytes());
+            let packed = leaves.iter().zip(0..).all(|(&(offset, scalar), index)| {
+                offset == index * step && scalar.primitive() == first.primitive()
+            });
+            if packed && leaves.len() as u64 * step == size {
+                return Ok(Aapcs64::Floats { unit, count: leaves.len() as u8 });
+            }
+        }
+        if size > 16 {
+            return Ok(Aapcs64::Memory);
+        }
+        Ok(Aapcs64::Ints { size, align: layout.align.abi.bytes() })
+    }
+
+    /// Every scalar a value of the C ABI is made of, with where in the value it is.
+    fn scalar_leaves(
+        &self,
+        ty: Ty<'db>,
+        offset: u64,
+        leaves: &mut Vec<(u64, Scalar)>,
+    ) -> Result<()> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(());
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(a) => leaves.push((offset, a)),
+            BackendRepr::ScalarPair(a, b) => {
+                let second = a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes();
+                leaves.extend([(offset, a), (offset + second, b)]);
+            }
+            BackendRepr::Memory { sized: true } => match ty.kind() {
+                TyKind::Tuple(tys) => {
+                    for (i, ty) in tys.iter().enumerate() {
+                        self.scalar_leaves(ty, offset + layout.fields.offset(i).bytes(), leaves)?;
+                    }
+                }
+                TyKind::Array(element, _) => {
+                    let stride = self.layout(element)?.size.bytes();
+                    for i in 0..layout.fields.count() as u64 {
+                        // More than a register class holds: nothing asks what the rest is.
+                        if leaves.len() > 16 {
+                            break;
+                        }
+                        self.scalar_leaves(element, offset + i * stride, leaves)?;
+                    }
+                }
+                TyKind::Adt(def, subst) => {
+                    let variant: VariantId = match def.def_id() {
+                        AdtId::StructId(id) => id.into(),
+                        AdtId::UnionId(id) => id.into(),
+                        AdtId::EnumId(_) => unsupported!("enum {ty:?} in the C ABI"),
+                    };
+                    for (field, ty) in self.cg.db.field_types(variant).iter() {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
+                        self.scalar_leaves(ty, offset + field.bytes(), leaves)?;
+                    }
+                }
+                _ => unsupported!("{ty:?} in the C ABI"),
+            },
+            _ => unsupported!("{ty:?} in the C ABI"),
+        }
+        Ok(())
     }
 
     fn count_regs(&self, types: &[Type]) -> (usize, usize) {
@@ -3663,6 +3873,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Pair(a, b, _) => params.extend([a.param(), b.param()]),
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
             PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
+            PassMode::Uniform { unit, count, skipped } => {
+                params.extend((0..skipped + count).map(|_| AbiParam::new(unit)))
+            }
             PassMode::Indirect => params.push(AbiParam::new(PTR)),
             PassMode::OnStack(size) => {
                 params.push(AbiParam::special(PTR, ArgumentPurpose::StructArgument(size)))
@@ -3671,7 +3884,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         match ret {
             PassMode::Indirect => {
                 sig.params.push(AbiParam::special(PTR, ArgumentPurpose::StructReturn))
@@ -3720,6 +3933,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 values.push(self.load_cast(b, rest, layout.size - Size::from_bytes(8)));
             }
+            PassMode::Uniform { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    values.push(self.zero(unit));
+                }
+                let step = u64::from(unit.bytes());
+                for index in 0..u64::from(count) {
+                    let part = self.builder.ins().iadd_imm(addr, (index * step) as i64);
+                    let left = layout.size - Size::from_bytes(index * step);
+                    values.push(self.load_cast(unit, part, left.min(Size::from_bytes(step))));
+                }
+            }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
@@ -3760,6 +3984,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 self.store_cast(b, rest, layout.size - Size::from_bytes(8));
             }
+            PassMode::Uniform { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    next();
+                }
+                let step = u64::from(unit.bytes());
+                for index in 0..u64::from(count) {
+                    let value = next();
+                    let part = self.builder.ins().iadd_imm(addr, (index * step) as i64);
+                    let left = layout.size - Size::from_bytes(index * step);
+                    self.store_cast(value, part, left.min(Size::from_bytes(step)));
+                }
+            }
+        }
+    }
+
+    /// The value of `ty` that is all zero bits.
+    fn zero(&mut self, ty: Type) -> Value {
+        match ty {
+            types::F32 => self.builder.ins().f32const(0.0),
+            types::F64 => self.builder.ins().f64const(0.0),
+            _ => self.builder.ins().iconst(ty, 0),
         }
     }
 
@@ -4687,7 +4932,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(PTR); 3]);
         let callee = self.cg.import_path("core::panicking::panic_bounds_check", &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5303,8 +5548,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             });
         }
-        let arch = self.cg.isa.triple().architecture.to_string();
-        let wrapper = asm::wrapper(&arch, &block.template, block.options, &operands)
+        let wrapper = asm::wrapper(self.cg.target.arch, &block.template, block.options, &operands)
             .map_err(CodegenError::Unsupported)?;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -5320,7 +5564,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(to, addr, size);
             }
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.assembly(wrapper.text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5930,7 +6174,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
         sig.returns.push(AbiParam::new(ty));
         let callee = self.cg.import(name, &sig)?;
@@ -5953,7 +6197,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 (_, false, types::F64, _) => "__floatuntidf",
                 _ => unsupported!("cast from {} to {}", from.ty, to.ty),
             };
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.push(AbiParam::new(from.ty));
             sig.returns.push(AbiParam::new(to.ty));
             let callee = self.cg.import(name, &sig)?;
@@ -6030,7 +6274,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.import_path(&path, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -6670,7 +6914,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         bytes[16..24].copy_from_slice(&layout.align.abi.bytes().to_le_bytes());
         let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.push(AbiParam::new(PTR));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
@@ -7996,7 +8240,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = self.cg.make_signature();
                 sig.params.push(AbiParam::new(types::I32));
                 sig.returns.push(AbiParam::new(types::I64));
                 let callee = self.cg.assembly(asm::xgetbv(), &sig);
@@ -8008,7 +8252,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = self.cg.make_signature();
                 sig.params.extend([AbiParam::new(PTR), AbiParam::new(PTR)]);
                 sig.params.push(AbiParam::new(types::I32));
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
@@ -8070,7 +8314,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// those call compiler-builtins.
     fn divide(&mut self, l: Value, r: Value, div: bool, signed: bool) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::I128 {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
             sig.returns.push(AbiParam::new(types::I128));
             let name = match (div, signed) {
@@ -8095,7 +8339,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in
     /// `compiler_builtins`.
     fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
         sig.params.push(AbiParam::new(PTR));
         sig.returns.push(AbiParam::new(types::I128));
@@ -8110,7 +8354,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(PTR); 3]);
         sig.returns.push(AbiParam::new(types::I32));
         let memcmp = self.cg.import("memcmp", &sig)?;
@@ -8459,7 +8703,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let mut values = vec![addr];
         if self.is_unsized(ty) {
@@ -8478,7 +8722,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         if self.is_unsized(ty) {
             sig.params.push(AbiParam::new(PTR));
@@ -8809,7 +9053,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let done = self.builder.create_block();
                 self.builder.ins().brif(glue, call, &[], done, &[]);
                 self.builder.switch_to_block(call);
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = self.cg.make_signature();
                 sig.params.push(AbiParam::new(PTR));
                 let sig = self.builder.import_signature(sig);
                 self.invoke_indirect(sig, glue, &[addr]);

@@ -193,6 +193,17 @@ inlined across functions. A function LLVM has no answer for is compiled by Crane
 counted with the reason on the `backend:` lines of the log. `harness/backends.py` compares
 the producers on a program.
 
+**The target.** What rustd emits for is an input of the process and not a property of the
+machine it runs on: `rustd --target <triple>`, then `CARGO_BUILD_TARGET`, then the host. It is
+named once, before anything is compiled, and one process has one target. `codegen/target.rs`
+turns the triple into a `Target` (architecture, object format, C calling convention, unwind
+format), and code that differs between platforms asks that and never `cfg!(target_arch)`.
+The triple is in the key of the code cache. `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` are accepted today; another triple is turned down by name. The
+splice does not take the target from the daemon: it reads the machine from the executable.
+The harnesses build for and run another target with `RUSTD_TARGET=<triple>` (`difftest.py`
+has the linker, the emulator and the binutils of each). `AARCH64.md` is the state of AArch64.
+
 **CAS.** Keys are (toolchain, crate source hash, flags, dependency keys) for rustc artifacts and
 (function MIR hash, instance args, toolchain) for rustd objects. Independent of the backend
 and useful on its own for clean builds.

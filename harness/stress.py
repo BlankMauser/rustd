@@ -13,7 +13,7 @@ import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -239,7 +239,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -323,7 +323,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(os.path.join(reference, "debug/sapp"))
+            ours, theirs = run(binary), run(os.path.join(profile_dir(reference), "sapp"))
             if ours == theirs:
                 verdict = "same"
             else:

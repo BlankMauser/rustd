@@ -56,7 +56,7 @@ span.workspace = true
 thin-vec = "0.2.16"
 
 # rustd spike: native codegen from MIR
-cranelift-codegen = { version = "0.136", features = ["incremental-cache"] }
+cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
 cranelift-frontend = "0.136"
 cranelift-module = { version = "0.136", features = ["enable-serde"] }
 postcard.workspace = true

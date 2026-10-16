@@ -7,7 +7,7 @@ Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects f
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
 import argparse, json, os, re, subprocess, sys
-from difftest import Fixture, compare, discard
+from difftest import Fixture, compare, discard, RUNNER
 
 
 UNIT = "(unit tests)"
@@ -59,7 +59,7 @@ class TestFixture(Fixture):
 
 def differing_tests(fx):
     """Runs every test on its own in both binaries: one that aborts hides the ones after it."""
-    listed = subprocess.run([fx.reference, "--list"], capture_output=True, text=True).stdout
+    listed = subprocess.run([*RUNNER, fx.reference, "--list"], capture_output=True, text=True).stdout
     names = [l[:-len(": test")] for l in listed.splitlines() if l.endswith(": test")]
     differing = []
     for name in names:

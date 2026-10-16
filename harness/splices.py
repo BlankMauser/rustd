@@ -15,7 +15,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir, BINUTILS
 
 TOML = """[package]
 name = "sedge"
@@ -207,7 +207,7 @@ fn main() {
 
 
 def strip(binary):
-    subprocess.run(["strip", binary], check=True)
+    subprocess.run([BINUTILS + "strip", binary], check=True)
 
 
 def touch(binary):
@@ -381,7 +381,7 @@ def main():
 
     def run(path, env=None):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -396,7 +396,7 @@ def main():
 
     def sound(path):
         """What readelf and a loader that binds everything at once have against the file."""
-        read = subprocess.run(["readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
+        read = subprocess.run([BINUTILS + "readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
         said = [l for l in read.stderr.splitlines() if l.strip()]
         if read.returncode or said:
             return f"readelf: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
@@ -412,9 +412,13 @@ def main():
     wrong, hows = 0, {}
     for what, edits, before in STEPS:
         held = None
-        if before == "hold":
+        if before == "hold" and RUNNER:
+            # The kernel refuses a write to a file it runs, which is what has this edit linked in
+            # full. An emulator only maps the file: nothing can be held against the write.
+            what += " (not run meanwhile: " + os.path.basename(RUNNER[0]) + ")"
+        elif before == "hold":
             expected = run(binary)
-            held = subprocess.Popen([binary], stdout=subprocess.PIPE, text=True, env={**os.environ, "SEDGE_HOLD": "1500"})
+            held = subprocess.Popen([*RUNNER, binary], stdout=subprocess.PIPE, text=True, env={**os.environ, "SEDGE_HOLD": "1500"})
             time.sleep(0.3)
         elif before:
             before(binary)
@@ -428,7 +432,7 @@ def main():
         assert cargo.returncode == 0, cargo.stderr[-2000:]
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon died at {what!r}: {log_path}")
-        theirs = run(os.path.join(reference, "debug", "sedge"))
+        theirs = run(os.path.join(profile_dir(reference), "sedge"))
         if not reply.startswith("ok"):
             verdict = "REFUSED: " + reply[:60]
         elif run(binary) != theirs:
@@ -462,7 +466,7 @@ def main():
                 print(f"soak {turn}: WRONG ({how}): {reply[:60]} {printed[-40:]!r}", flush=True)
         cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
-        same = run(binary) == run(os.path.join(reference, "debug", "sedge"))
+        same = run(binary) == run(os.path.join(profile_dir(reference), "sedge"))
         soak_wrong += not same
         times.sort()
         print(f"soak: {soak - soak_wrong} of {soak} right, {spliced} spliced, median {times[len(times) // 2]:.0f} ms per request, "

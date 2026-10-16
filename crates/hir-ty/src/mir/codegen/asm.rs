@@ -14,7 +14,9 @@ use object::{Object, ObjectSection, ObjectSymbol};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use super::store::Store;
+use super::{Arch, store::Store};
+
+mod aarch64;
 
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
@@ -157,19 +159,28 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
     }
 }
 
-/// The function for a block on x86-64.
+/// The function for a block, in the assembly of the architecture.
 pub(super) fn wrapper(
-    arch: &str,
+    arch: Arch,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
-    if arch != "x86_64" {
-        return Err(format!("inline assembly for {arch}"));
-    }
     if options.contains(AsmOptions::MAY_UNWIND) {
         return Err("inline assembly that unwinds".to_owned());
     }
+    match arch {
+        Arch::X86_64 => wrapper_x86_64(template, options, operands),
+        Arch::Aarch64 => aarch64::wrapper(template, options, operands),
+    }
+}
+
+/// The function for a block on x86-64.
+fn wrapper_x86_64(
+    template: &[AsmPiece],
+    options: AsmOptions,
+    operands: &[Operand<'_>],
+) -> Result<Wrapper, String> {
     // The registers the operands name come first: a class takes one of what is left.
     let mut regs = vec![None; operands.len()];
     for (index, operand) in operands.iter().enumerate() {
