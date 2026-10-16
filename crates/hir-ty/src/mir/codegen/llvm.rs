@@ -9,7 +9,7 @@
 //! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
 //! compiled by Cranelift instead.
 
-use std::{cell::RefCell, fmt};
+use std::{cell::RefCell, collections::hash_map::Entry, fmt};
 
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
@@ -103,10 +103,11 @@ impl Machine {
             static MACHINES: RefCell<FxHashMap<Optimization, TargetMachine>> = RefCell::default();
         }
         MACHINES.with_borrow_mut(|machines| {
-            if !machines.contains_key(&optimization) {
-                machines.insert(optimization, Self::create(optimization)?);
-            }
-            work(&machines[&optimization])
+            let machine = match machines.entry(optimization) {
+                Entry::Occupied(known) => known.into_mut(),
+                Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
+            };
+            work(machine)
         })
     }
 

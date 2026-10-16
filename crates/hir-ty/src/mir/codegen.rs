@@ -307,6 +307,7 @@ impl CodegenUnit {
                 Err(_) => None,
             };
             if let Some(patch) = patch {
+                backend::Tally::global().report();
                 let compiled_now = known.compiled_since_last_build();
                 known.stats = BuildStats {
                     bodies: base.bodies,

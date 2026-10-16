@@ -11,7 +11,7 @@ use cranelift_codegen::{
     ir::{LibCall, Signature},
     isa::CallConv,
 };
-use cranelift_module::{FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
+use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex,
     SectionKind, SymbolSection, elf,
@@ -20,18 +20,28 @@ use rustc_hash::FxHashMap;
 
 use super::{OWN, Symbol, Unhandled};
 use crate::mir::codegen::{
+    ConstBlob,
     fragment::{Code, Recorder},
     unwind::{FrameRows, FrameRule, FunctionUnwind},
 };
 
 pub(super) struct Emitted<'data> {
     file: object::File<'data>,
-    /// Where each section that is part of the code starts in `bytes`.
-    placed: FxHashMap<SectionIndex, u64>,
-    order: Vec<SectionIndex>,
+    /// What became of each section the code leads to.
+    placed: FxHashMap<SectionIndex, Placement>,
+    /// The sections that are part of the code, in the order they are in `bytes`.
+    inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
     align: u64,
     relocs: Vec<ModuleReloc>,
+}
+
+#[derive(Clone, Copy)]
+enum Placement {
+    /// Part of the code, this many bytes in.
+    Inline(u64),
+    /// A data object of its own: constants that hold addresses, which code cannot.
+    Blob(DataId),
 }
 
 impl<'data> Emitted<'data> {
@@ -54,12 +64,12 @@ impl<'data> Emitted<'data> {
         let mut emitted = Emitted {
             file,
             placed: FxHashMap::default(),
-            order: Vec::new(),
+            inline: Vec::new(),
             bytes: Vec::new(),
             align: 1,
             relocs: Vec::new(),
         };
-        emitted.place(text)?;
+        emitted.place(text, recorder)?;
         emitted.relocate(recorder)?;
         let unwind = emitted.unwind()?;
         let Emitted { bytes, align, relocs, .. } = emitted;
@@ -67,13 +77,24 @@ impl<'data> Emitted<'data> {
     }
 
     /// Lays out `first` and every section its relocations lead to.
-    fn place(&mut self, first: SectionIndex) -> Result<(), Unhandled> {
+    fn place(&mut self, first: SectionIndex, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
         let mut pending = vec![first];
         while let Some(index) = pending.pop() {
             if self.placed.contains_key(&index) {
                 continue;
             }
             let section = self.file.section_by_index(index)?;
+            let holds_addresses = section.relocations().any(|(_, relocation)| {
+                matches!(relocation.flags(), RelocationFlags::Elf { r_type: elf::R_X86_64_64 })
+            });
+            if holds_addresses {
+                let blob = self.blob(&section)?;
+                let id = recorder
+                    .define_const(blob)
+                    .map_err(|_| Unhandled::Shape("constants that cannot be defined"))?;
+                self.placed.insert(index, Placement::Blob(id));
+                continue;
+            }
             match section.kind() {
                 SectionKind::Text
                 | SectionKind::ReadOnlyData
@@ -86,8 +107,8 @@ impl<'data> Emitted<'data> {
             let start = (self.bytes.len() as u64).next_multiple_of(align);
             self.bytes.resize(start as usize, 0);
             self.bytes.extend_from_slice(section.data()?);
-            self.placed.insert(index, start);
-            self.order.push(index);
+            self.placed.insert(index, Placement::Inline(start));
+            self.inline.push(index);
             for (_, relocation) in section.relocations() {
                 if let SymbolSection::Section(target) = self.symbol(&relocation)?.section() {
                     pending.push(target);
@@ -95,6 +116,38 @@ impl<'data> Emitted<'data> {
             }
         }
         Ok(())
+    }
+
+    /// A section of addresses of what the function asked for, such as the table LLVM makes
+    /// of a `match` that picks one of several constants.
+    fn blob(&self, section: &object::Section<'data, '_>) -> Result<ConstBlob, Unhandled> {
+        // Written to only by the loader, which fills in the addresses.
+        if !section.name()?.starts_with(".data.rel.ro") {
+            return Err(Unhandled::Shape("code that refers to a writable section"));
+        }
+        let mut blob = ConstBlob {
+            bytes: section.data()?.to_vec(),
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align: section.align().max(1),
+        };
+        for (offset, relocation) in section.relocations() {
+            let symbol = self.symbol(&relocation)?;
+            let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
+            let target = named.and_then(Symbol::parse);
+            let absolute =
+                matches!(relocation.flags(), RelocationFlags::Elf { r_type: elf::R_X86_64_64 });
+            match (target, relocation.addend()) {
+                (Some(Symbol::Data(index)), addend) if absolute => {
+                    blob.relocs.push((offset as u32, DataId::from_u32(index), addend));
+                }
+                (Some(Symbol::Func(index)), 0) if absolute => {
+                    blob.fn_relocs.push((offset as u32, FuncId::from_u32(index)));
+                }
+                _ => return Err(Unhandled::Shape("constants that hold an address of the code")),
+            }
+        }
+        Ok(blob)
     }
 
     fn symbol(
@@ -107,24 +160,28 @@ impl<'data> Emitted<'data> {
         Ok(self.file.symbol_by_index(symbol)?)
     }
 
-    /// Fills in what points from one placed section into another, and turns the rest into
+    /// Fills in what points from one part of the code into another, and turns the rest into
     /// relocations against requests.
     fn relocate(&mut self, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
-        for &index in &self.order {
+        for &index in &self.inline {
             let section = self.file.section_by_index(index)?;
-            let base = self.placed[&index];
+            let Placement::Inline(base) = self.placed[&index] else { continue };
             for (offset, relocation) in section.relocations() {
                 let RelocationFlags::Elf { r_type } = relocation.flags() else {
                     return Err(Unhandled::Shape("an object that is not ELF"));
                 };
                 let at = base + offset;
                 let symbol = self.symbol(&relocation)?;
-                if let SymbolSection::Section(target) = symbol.section() {
+                let within = match symbol.section() {
+                    SymbolSection::Section(target) => Some(self.placed[&target]),
+                    _ => None,
+                };
+                if let Some(Placement::Inline(target)) = within {
                     // Both ends are in `bytes`, whose pieces do not move against each other.
                     let (elf::R_X86_64_PC32 | elf::R_X86_64_PLT32) = r_type else {
-                        return Err(Unhandled::Shape("constants that hold an address"));
+                        return Err(Unhandled::Shape("code that holds an address of itself"));
                     };
-                    let target = self.placed[&target] + symbol.address();
+                    let target = target + symbol.address();
                     let value = target.wrapping_add_signed(relocation.addend()).wrapping_sub(at);
                     let field = self
                         .bytes
@@ -143,13 +200,14 @@ impl<'data> Emitted<'data> {
                     elf::R_X86_64_TLSGD => Reloc::ElfX86_64TlsGd,
                     other => return Err(Unhandled::Relocation(other)),
                 };
-                let name = Self::target(symbol.name()?, recorder)?;
-                self.relocs.push(ModuleReloc {
-                    offset: at as u32,
-                    kind,
-                    name,
-                    addend: relocation.addend(),
-                });
+                let (name, addend) = match within {
+                    Some(Placement::Blob(id)) => (
+                        ModuleRelocTarget::user(1, id.as_u32()),
+                        relocation.addend() + symbol.address() as i64,
+                    ),
+                    _ => (Self::target(symbol.name()?, recorder)?, relocation.addend()),
+                };
+                self.relocs.push(ModuleReloc { offset: at as u32, kind, name, addend });
             }
         }
         Ok(())
