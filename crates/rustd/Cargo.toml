@@ -18,6 +18,7 @@ object = { version = "0.37", default-features = false, features = ["read", "std"
 rustc-demangle = "0.1.28"
 rustc-hash.workspace = true
 same-file = "1"
+dunce = "1"
 sha2 = "0.10"
 
 hir.workspace = true

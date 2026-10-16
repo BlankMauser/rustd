@@ -994,6 +994,12 @@ fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, Strin
     flags.set("opt_level", "none").map_err(|e| e.to_string())?;
     flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
     flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
+    if target.triple().operating_system == target_lexicon::OperatingSystem::Windows {
+        // Windows commits a stack one page at a time, as the guard page below the last
+        // is touched: a frame larger than a page has to touch each on its way down.
+        flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
+        flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
+    }
     if !CallConv::triple_default(target.triple()).supports_exceptions() {
         // Cranelift has landing pads for the calling conventions it can hand the exception
         // to in a register. The pads of any other take it from the frame (see

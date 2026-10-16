@@ -135,7 +135,7 @@ impl Args {
 
     /// The directory of the project, which cargo runs rustc in.
     fn root(&self) -> anyhow::Result<PathBuf> {
-        let mut root = std::fs::canonicalize(&self.project)?;
+        let mut root = dunce::canonicalize(&self.project)?;
         if root.is_file() {
             root.pop();
         }
@@ -849,7 +849,7 @@ struct Checkouts {
 
 impl Checkouts {
     fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
-        let project = std::fs::canonicalize(project)?;
+        let project = dunce::canonicalize(project)?;
         let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
     }
@@ -866,7 +866,7 @@ impl Checkouts {
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
-        let project = std::fs::canonicalize(project).ok()?;
+        let project = dunce::canonicalize(project).ok()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
             if self.splits[at].is_some() {
@@ -974,7 +974,7 @@ impl Checkouts {
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> Option<View> {
-        let project = std::fs::canonicalize(project).ok()?;
+        let project = dunce::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
             return Some(View { base: root.clone(), over: root.clone(), project });
         }
@@ -1061,7 +1061,7 @@ impl Checkouts {
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
                 splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
-                roots.push((std::fs::canonicalize(project)?, over));
+                roots.push((dunce::canonicalize(project)?, over));
                 continue;
             }
             splits.push(None);
@@ -1078,7 +1078,7 @@ impl Checkouts {
                     TargetDirectoryConfig::Directory(target.to_owned());
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            roots.push((std::fs::canonicalize(project)?, root));
+            roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
@@ -3612,7 +3612,7 @@ impl Program {
 
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
-    Ok(VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?)))
+    Ok(VfsPath::from(AbsPathBuf::assert_utf8(dunce::canonicalize(path)?)))
 }
 
 fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
