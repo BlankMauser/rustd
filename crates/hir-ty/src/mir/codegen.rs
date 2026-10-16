@@ -7814,6 +7814,43 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, i as i32);
                 }
             }
+            ("x86.pclmulqdq" | "x86.pclmulqdq.256" | "x86.pclmulqdq.512", [a, b, halves]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                let (halves, _) = self.load_scalar(halves)?;
+                // Bit 0 says which half of each 128 bits of `a` is multiplied, bit 4 of `b`.
+                let half = |fx: &mut Self, bit: i64| {
+                    let chosen = fx.builder.ins().ushr_imm(halves, bit);
+                    let chosen = fx.builder.ins().band_imm(chosen, 1);
+                    let chosen = fx.builder.ins().uextend(PTR, chosen);
+                    fx.builder.ins().ishl_imm(chosen, 3)
+                };
+                let (of_a, of_b) = (half(self, 0), half(self, 4));
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(16) {
+                    let l = self.builder.ins().iadd(a, of_a);
+                    let l = self.builder.ins().load(types::I64, MEM, l, lane);
+                    let r = self.builder.ins().iadd(b, of_b);
+                    let r = self.builder.ins().load(types::I64, MEM, r, lane);
+                    // The product without carries: `l` shifted by every bit set in `r`, xored.
+                    let mut low = self.builder.ins().iconst(types::I64, 0);
+                    let mut high = low;
+                    for bit in 0..64 {
+                        let set = self.builder.ins().ushr_imm(r, bit);
+                        let set = self.builder.ins().band_imm(set, 1);
+                        let mask = self.builder.ins().ineg(set);
+                        let part = self.builder.ins().ishl_imm(l, bit);
+                        let part = self.builder.ins().band(part, mask);
+                        low = self.builder.ins().bxor(low, part);
+                        if bit != 0 {
+                            let part = self.builder.ins().ushr_imm(l, 64 - bit);
+                            let part = self.builder.ins().band(part, mask);
+                            high = self.builder.ins().bxor(high, part);
+                        }
+                    }
+                    self.builder.ins().store(MEM, low, dst, lane);
+                    self.builder.ins().store(MEM, high, dst, lane + 8);
+                }
+            }
             _ => unsupported!("LLVM intrinsic `{name}`"),
         }
         Ok(())
