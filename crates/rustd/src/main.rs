@@ -1359,8 +1359,9 @@ fn link(args: &Args, linked: &mut Option<Executable>, patched: bool) -> anyhow::
     let start = Instant::now();
     let mut declined = String::new();
     if let (Some(binary), Some(patch)) = (&args.splice, &args.patch) {
-        let known = linked.take().filter(|_| patched).map(Executable::baseline);
+        let known = linked.take().map(Executable::baseline);
         let spliced = match known {
+            Some(_) if !patched => Err(anyhow::anyhow!("the whole object was written again")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => {
                 let spliced = std::fs::read(patch)
                     .map_err(anyhow::Error::from)

@@ -2301,8 +2301,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(data);
         }
-        if let Some(known) = self.base.and_then(|base| base.statics.get(&id)) {
-            if self.replaced.broken.contains(&patch::Node::Static(id)) {
+        let node = patch::Node::Static(id);
+        let known = self.base.and_then(|base| base.statics.get(&id));
+        // One with another value keeps its name, and what refers to it by that gets the new.
+        let again = known.filter(|_| self.replaced.changed.contains(&node));
+        if let Some(known) = known.filter(|_| again.is_none()) {
+            if self.replaced.broken.contains(&node) {
                 unsupported!("a static of the base changed");
             }
             let data =
@@ -2318,7 +2322,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
         let thread_local = is_thread_local(db, id);
-        let data = if self.patching || thread_local {
+        let data = if let Some(known) = again {
+            self.module.declare_data(&known.symbol, Linkage::Hidden, compiled.writable, false)?
+        } else if self.patching || thread_local {
             let name = format!("rustd::static::{}", self.location_counter);
             self.location_counter += 1;
             let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };

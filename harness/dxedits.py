@@ -6,7 +6,7 @@ usage: dxedits.py CHECKOUT crate[,crate...] SYMBOLS_FILE
 Starts the daemon on the crates, waits for the first build, applies each edit and reports the
 time the daemon took to rebuild and how many functions it compiled again.
 """
-import json, os, re, shlex, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
@@ -42,6 +42,7 @@ def main():
             ("new private fn", f"{cli}/build/builder.rs", lambda t: t + NEW_FN),
             ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
             ("what `dx doctor --help` prints", f"{cli}/cli/mod.rs", lambda t: t.replace("/// Diagnose installed", "/// Diagnose (edited) installed", 1)),
+            ("a static's value", f"{cli}/cli/create.rs", lambda t: t.replace('"gh:dioxuslabs/dioxus-template"', '"gh:dioxuslabs/edited-template"', 1)),
             # `main` is an `async fn`: tokio's functions are instantiated with its future.
             ("async main: a statement", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    std::hint::black_box(1u32);\n", 1)),
             ("async main: a local", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    " + BODY + "\n", 1)),
@@ -151,6 +152,12 @@ def main():
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
                     print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])
+                if "--patch" in args and "static" in name:
+                    # `dx new` logs the default template, which is the edited static, before it asks anything.
+                    with tempfile.TemporaryDirectory() as scratch:
+                        ran = subprocess.run(["timeout", "5", "script", "-qc", f"{binary} new app --yes --verbose", "/dev/null"],
+                                             capture_output=True, text=True, cwd=scratch)
+                    print("    dx new:", re.findall(r'"gh:[^"]*"', ran.stdout)[:1])
         if whole:
             whole.send_signal(2)
             whole.wait()

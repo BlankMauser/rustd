@@ -6,7 +6,8 @@
 //! resolves what it refers to against the executable's symbols, and writes a jump to the new
 //! code over the entry of each function the patch replaces. Whatever referred to the old
 //! function, a call, a vtable or a function pointer, still arrives there and goes on to the
-//! new one.
+//! new one. Data has no entry to jump from, so a static with another value is written where
+//! the old one is, when it is no larger.
 //!
 //! What is appended, in three segments of its own:
 //!
@@ -14,8 +15,9 @@
 //!    the unwinder with the patch's frames added, the patch's constants and unwind tables,
 //!    and the load-time relocations with the patch's added.
 //! 2. Code: the patch's functions, and a stub for each import they call directly.
-//! 3. Data: the patch's writable sections, and an address slot for each symbol the code
-//!    reaches through one.
+//! 3. Data: the patch's writable sections, an address slot for each symbol the code
+//!    reaches through one, and one for the loader to fix up in place of each address a
+//!    static no longer stores.
 //!
 //! The patch holds everything that differs from the object the executable was linked from, so
 //! each splice starts from the executable as the linker left it: the last one is undone
@@ -191,6 +193,8 @@ struct LoadRelocations {
     table: Vec<u8>,
     address_at: u64,
     size_at: u64,
+    /// Whether `DT_RELR` has more of them, in a form that is not added to here.
+    packed: bool,
 }
 
 impl Image {
@@ -349,6 +353,8 @@ impl UnwindTable {
 
 impl LoadRelocations {
     const ENTRY: usize = size_of::<elf::Rela64<Endianness>>();
+    /// The tag of the packed relative relocations, which `object` has no name for.
+    const DT_RELR: u32 = 36;
 
     fn read(image: &Image, bytes: &[u8]) -> anyhow::Result<Option<LoadRelocations>> {
         let e = Endianness::Little;
@@ -373,11 +379,56 @@ impl LoadRelocations {
             return Ok(None);
         };
         let table = image.bytes_at(bytes, address, size)?.to_vec();
-        Ok(Some(LoadRelocations { table, address_at, size_at }))
+        let packed = entry(Self::DT_RELR).is_some();
+        Ok(Some(LoadRelocations { table, address_at, size_at, packed }))
     }
 
     fn len_with(&self, added: usize) -> usize {
         self.table.len() + added * Self::ENTRY
+    }
+
+    /// Makes the entries of `table` for the addresses that `statics` stored those for what
+    /// they store now, which `restored` has by where. An address no longer stored has its
+    /// entry fix up `spare` instead; the entries a new one needs are handed back.
+    fn restore(
+        table: &mut [u8],
+        mut statics: Vec<Defined>,
+        mut restored: FxHashMap<u64, u64>,
+        spare: u64,
+    ) -> anyhow::Result<Vec<elf::Rela64<Endianness>>> {
+        let e = Endianness::Little;
+        if !statics.is_empty() {
+            statics.sort_unstable_by_key(|it| it.address);
+            let entries = object::slice_from_all_bytes_mut::<elf::Rela64<Endianness>>(table)
+                .map_err(|()| anyhow::anyhow!("misaligned load-time relocations"))?;
+            for entry in entries {
+                let at = entry.r_offset.get(e);
+                let before = statics.partition_point(|it| it.address <= at);
+                let Some(old) = before.checked_sub(1).map(|it| statics[it]) else { continue };
+                if at >= old.address + old.size {
+                    continue;
+                }
+                ensure!(
+                    entry.r_info.get(e) == u64::from(elf::R_X86_64_RELATIVE),
+                    "a static that stored the address of an import"
+                );
+                match restored.remove(&at) {
+                    Some(value) => entry.r_addend.set(e, value as i64),
+                    None => {
+                        entry.r_offset.set(e, spare);
+                        entry.r_addend.set(e, 0);
+                    }
+                }
+            }
+        }
+        Ok(restored
+            .into_iter()
+            .map(|(at, value)| elf::Rela64 {
+                r_offset: object::U64::new(e, at),
+                r_info: object::U64::new(e, u64::from(elf::R_X86_64_RELATIVE)),
+                r_addend: object::I64::new(e, value as i64),
+            })
+            .collect())
     }
 }
 
@@ -462,8 +513,10 @@ struct Patch<'a> {
     /// How many addresses the data stores, each of which the loader has to fix up.
     stored: usize,
     frames: usize,
-    /// The functions of the executable it has another body for.
+    /// The functions and statics it defines, with what the executable has under the name.
     replaced: Vec<Replaced<'a>>,
+    /// The statics among them that go where the executable has them, by where the patch does.
+    in_place: FxHashMap<SectionIndex, Vec<InPlace>>,
 }
 
 #[derive(Clone, Copy)]
@@ -489,6 +542,8 @@ impl Segment {
 enum Target {
     /// At an offset in a section of the patch.
     Ours(SectionIndex, u64),
+    /// A section of the patch, where what is meant is as far in as the relocation adds.
+    Section(SectionIndex),
     /// At an address of the executable.
     Theirs(u64),
     /// In another library: the loader writes its address to the slot.
@@ -500,8 +555,23 @@ struct Replaced<'a> {
     section: SectionIndex,
     offset: u64,
     size: u64,
-    /// `None` for a function the executable does not have.
+    /// `None` for what the executable does not have.
     old: Option<Defined>,
+}
+
+/// A static of the patch that is written over the executable's.
+#[derive(Clone, Copy)]
+struct InPlace {
+    /// Where its section has it.
+    offset: u64,
+    size: u64,
+    old: Defined,
+}
+
+impl InPlace {
+    fn holds(&self, offset: u64) -> bool {
+        (self.offset..self.offset + self.size).contains(&offset)
+    }
 }
 
 /// How a relocation of the patch gets its value.
@@ -547,6 +617,7 @@ impl<'a> Patch<'a> {
             stored: 0,
             frames: 0,
             replaced: Vec::new(),
+            in_place: FxHashMap::default(),
         };
         for section in patch.file.sections() {
             let object::SectionFlags::Elf { sh_flags } = section.flags() else { continue };
@@ -570,6 +641,47 @@ impl<'a> Patch<'a> {
         let code: FxHashSet<SectionIndex> =
             patch.sections[Segment::Code as usize].iter().copied().collect();
 
+        for symbol in patch.file.symbols() {
+            if !symbol.is_definition() || symbol.is_local() {
+                continue;
+            }
+            let name = symbol.name_bytes()?;
+            let section = symbol.section_index().context("a symbol in no section")?;
+            let old = match image.symbols.get(name) {
+                None => None,
+                Some(Named::One(old))
+                    if old.kind == SymbolKind::Text && code.contains(&section) =>
+                {
+                    ensure!(
+                        old.size >= Self::JUMP as u64,
+                        "{} is too short to jump from",
+                        String::from_utf8_lossy(name)
+                    );
+                    Some(*old)
+                }
+                Some(Named::One(old))
+                    if old.kind == SymbolKind::Data && !code.contains(&section) =>
+                {
+                    let new = InPlace { offset: symbol.address(), size: symbol.size(), old: *old };
+                    patch.fits(&new, section, image).with_context(|| {
+                        format!("the static {} has another value", String::from_utf8_lossy(name))
+                    })?;
+                    patch.in_place.entry(section).or_default().push(new);
+                    Some(*old)
+                }
+                Some(_) => bail!(
+                    "the patch replaces {}, which is not one function or static",
+                    String::from_utf8_lossy(name)
+                ),
+            };
+            patch.replaced.push(Replaced {
+                name,
+                section,
+                offset: symbol.address(),
+                size: symbol.size(),
+                old,
+            });
+        }
         let (mut slots, mut stubs) = (FxHashSet::default(), FxHashSet::default());
         for section in patch.file.sections().filter(|it| loaded.contains(&it.index())) {
             for (_, relocation) in section.relocations() {
@@ -594,48 +706,43 @@ impl<'a> Patch<'a> {
                             patch.stubs.push(index);
                         }
                     }
-                    (Fixup::ThroughSlot, Target::Ours(..) | Target::Theirs(_)) => {
+                    (Fixup::ThroughSlot, Target::Import(_)) => {}
+                    (Fixup::ThroughSlot, _) => {
                         if slots.insert(index) {
                             patch.slots.push(index);
                         }
                     }
-                    (Fixup::Relative, _) | (Fixup::ThroughSlot, Target::Import(_)) => {}
+                    (Fixup::Relative, _) => {}
                 }
             }
         }
 
-        for symbol in patch.file.symbols() {
-            if !symbol.is_definition() || symbol.is_local() {
-                continue;
-            }
-            let name = symbol.name_bytes()?;
-            let section = symbol.section_index().context("a symbol in no section")?;
-            let old = match image.symbols.get(name) {
-                None => None,
-                Some(Named::One(old))
-                    if old.kind == SymbolKind::Text && code.contains(&section) =>
-                {
-                    ensure!(
-                        old.size >= Self::JUMP as u64,
-                        "{} is too short to jump from",
-                        String::from_utf8_lossy(name)
-                    );
-                    Some(*old)
-                }
-                Some(_) => bail!(
-                    "the patch replaces {}, which is not one function",
-                    String::from_utf8_lossy(name)
-                ),
-            };
-            patch.replaced.push(Replaced {
-                name,
-                section,
-                offset: symbol.address(),
-                size: symbol.size(),
-                old,
-            });
-        }
         Ok(patch)
+    }
+
+    /// Whether a static can go where the executable has the one it replaces: what refers to
+    /// it there is not looked for.
+    fn fits(&self, new: &InPlace, section: SectionIndex, image: &Image) -> anyhow::Result<()> {
+        let e = Endianness::Little;
+        let old = &new.old;
+        ensure!(new.size <= old.size, "that is larger: {} bytes after {}", new.size, old.size);
+        let section = self.file.section_by_index(section)?;
+        // What a type is aligned to divides its size, and where its section has it.
+        let align = (new.offset | new.size | section.align().max(1)).isolate_lowest_one();
+        ensure!(old.address.is_multiple_of(align), "that may be aligned to {align}");
+        let segment = image
+            .segments_of(elf::PT_LOAD)
+            .find(|it| {
+                let start = it.p_vaddr(e);
+                start <= old.address && old.address + new.size <= start + it.p_filesz(e)
+            })
+            .context("that the file has no bytes for")?;
+        let object::SectionFlags::Elf { sh_flags } = section.flags() else { bail!("no flags") };
+        ensure!(
+            sh_flags & u64::from(elf::SHF_WRITE) == 0 || segment.p_flags(e) & elf::PF_W != 0,
+            "that is written to, where the old one is not"
+        );
+        Ok(())
     }
 
     fn target(
@@ -647,7 +754,10 @@ impl<'a> Patch<'a> {
         let symbol = self.file.symbol_by_index(index)?;
         if let Some(section) = symbol.section_index() {
             ensure!(loaded.contains(&section), "a reference to a section that is not loaded");
-            return Ok(Target::Ours(section, symbol.address()));
+            return Ok(match symbol.kind() {
+                SymbolKind::Section => Target::Section(section),
+                _ => Target::Ours(section, symbol.address()),
+            });
         }
         let name = symbol.name_bytes()?;
         let shown = || String::from_utf8_lossy(name);
@@ -724,7 +834,7 @@ impl<'a> Patch<'a> {
         let headers_len = (image.segments.len() + Segment::ALL.len())
             * size_of::<elf::ProgramHeader64<Endianness>>();
         let (mut headers_at, mut unwind_at, mut relocations_at) = (0, 0, 0);
-        let (mut stubs_at, mut slots_at) = (0, 0);
+        let (mut stubs_at, mut slots_at, mut spare_at) = (0, 0, 0);
         for segment in Segment::ALL {
             let start = reserve(0, page);
             if let Segment::Read = segment {
@@ -740,16 +850,49 @@ impl<'a> Patch<'a> {
                     relocations_at = reserve(relocations.map_or(0, |it| it.len_with(fixed_up)), 8);
                 }
                 Segment::Code => stubs_at = reserve(self.stubs.len() * Self::STUB, 1),
-                Segment::Data => slots_at = reserve(self.slots.len() * Self::SLOT, 8),
+                Segment::Data => {
+                    slots_at = reserve(self.slots.len() * Self::SLOT, 8);
+                    spare_at = reserve(if self.in_place.is_empty() { 0 } else { Self::SLOT }, 8);
+                }
             }
             extents[segment as usize] = (start, reserve(0, 1));
         }
         let mut appended = vec![0u8; end as usize];
 
-        let address = |target: Target| match target {
-            Target::Ours(section, at) => base + placed[&section] + at,
-            Target::Theirs(address) => address,
-            Target::Import(slot) => slot,
+        // A static written in place is where the executable has it: its section is added
+        // as a whole, with a copy of it that nothing may use. Code says how far its field is
+        // from what it means in what it adds, so a section alone does not tell which static.
+        let address = |target: Target, added: i64, exact: bool| -> anyhow::Result<u64> {
+            let (section, at) = match target {
+                Target::Ours(section, at) => (section, at),
+                Target::Section(section) => (section, 0),
+                Target::Theirs(address) => return Ok(address.wrapping_add_signed(added)),
+                Target::Import(slot) => return Ok(slot.wrapping_add_signed(added)),
+            };
+            let in_place = self.in_place.get(&section).map_or(&[][..], |it| it);
+            let found = match target {
+                Target::Section(_) if exact => {
+                    in_place.iter().find(|it| it.holds(added as u64)).map(|it| (it, added as u64))
+                }
+                Target::Section(_) => {
+                    let near = |it: &InPlace| {
+                        (it.offset as i64 - 8..(it.offset + it.size) as i64).contains(&added)
+                    };
+                    ensure!(
+                        !in_place.iter().any(near),
+                        "code that refers to a static through its section"
+                    );
+                    None
+                }
+                _ => in_place.iter().find(|it| it.holds(at)).map(|it| (it, at)),
+            };
+            Ok(match (found, target) {
+                (Some((it, at)), Target::Section(_)) => it.old.address + (at - it.offset),
+                (Some((it, at)), _) => {
+                    (it.old.address + (at - it.offset)).wrapping_add_signed(added)
+                }
+                (None, _) => (base + placed[&section] + at).wrapping_add_signed(added),
+            })
         };
         let slot_of: FxHashMap<SymbolIndex, u64> = (self.slots.iter().copied())
             .zip((0..).map(|at| base + slots_at + at * Self::SLOT as u64))
@@ -771,37 +914,69 @@ impl<'a> Patch<'a> {
             }
         };
 
+        let mut overwritten = Vec::new();
+        // The addresses the statics written in place store, by where.
+        let mut restored = FxHashMap::default();
         let mut frames = Vec::with_capacity(self.frames);
         for section in self.file.sections() {
             let Some(&start) = placed.get(&section.index()) else { continue };
             let data = section.data()?;
             appended[start as usize..][..data.len()].copy_from_slice(data);
+            let in_place = self.in_place.get(&section.index()).map_or(&[][..], |it| it);
+            let code = self.sections[Segment::Code as usize].contains(&section.index());
+            let mut values: Vec<Vec<u8>> = in_place
+                .iter()
+                .map(|it| match data.get(it.offset as usize..(it.offset + it.size) as usize) {
+                    Some(value) => value.to_vec(),
+                    None => vec![0; it.size as usize],
+                })
+                .collect();
             for (at, relocation) in section.relocations() {
                 let RelocationTarget::Symbol(index) = relocation.target() else { continue };
                 let target = self.targets[&index];
+                if let Some(which) = in_place.iter().position(|it| it.holds(at)) {
+                    let within = (at - in_place[which].offset) as usize;
+                    let Fixup::Absolute = Fixup::of(&relocation)? else {
+                        bail!("a static that stores a distance")
+                    };
+                    let value = address(target, relocation.addend(), true)?;
+                    let field = values[which].get_mut(within..within + 8);
+                    field
+                        .context("an address past its static")?
+                        .copy_from_slice(&value.to_le_bytes());
+                    restored.insert(in_place[which].old.address + within as u64, value);
+                    continue;
+                }
                 let place = base + start + at;
                 let to = match (Fixup::of(&relocation)?, target) {
                     (Fixup::Absolute, _) => {
-                        let value = address(target).wrapping_add_signed(relocation.addend());
+                        let value = address(target, relocation.addend(), true)?;
                         store(&mut appended, place, value);
                         continue;
                     }
-                    (Fixup::Relative, Target::Import(_)) => stub_of[&index],
-                    (Fixup::Relative, _) | (Fixup::ThroughSlot, Target::Import(_)) => {
-                        address(target)
+                    (Fixup::Relative, Target::Import(_)) => {
+                        stub_of[&index].wrapping_add_signed(relocation.addend())
                     }
-                    (Fixup::ThroughSlot, _) => slot_of[&index],
+                    (Fixup::Relative, _) | (Fixup::ThroughSlot, Target::Import(_)) => {
+                        address(target, relocation.addend(), !code)?
+                    }
+                    (Fixup::ThroughSlot, _) => {
+                        slot_of[&index].wrapping_add_signed(relocation.addend())
+                    }
                 };
-                let value = relative(to.wrapping_add_signed(relocation.addend()), place)?;
+                let value = relative(to, place)?;
                 appended[(place - base) as usize..][..4].copy_from_slice(&value.to_le_bytes());
             }
             if section.name_bytes()? == b".eh_frame" {
                 let relocated = &appended[start as usize..][..data.len()];
                 frames.extend(Self::frames_in(relocated, base + start)?);
             }
+            for (new, value) in in_place.iter().zip(values) {
+                overwritten.push((image.offset_of(new.old.address)?, value));
+            }
         }
         for (&index, &slot) in &slot_of {
-            store(&mut appended, slot, address(self.targets[&index]));
+            store(&mut appended, slot, address(self.targets[&index], 0, true)?);
         }
         for (&index, &stub) in &stub_of {
             let Target::Import(slot) = self.targets[&index] else { continue };
@@ -810,10 +985,9 @@ impl<'a> Patch<'a> {
             code[2..].copy_from_slice(&relative(slot, stub + Self::STUB as u64)?.to_le_bytes());
         }
 
-        let mut overwritten = Vec::new();
         let mut redirected = 0;
         for replaced in &self.replaced {
-            let Some(old) = replaced.old else { continue };
+            let Some(old) = replaced.old.filter(|it| it.kind == SymbolKind::Text) else { continue };
             let new = base + placed[&replaced.section] + replaced.offset;
             let mut jump = vec![0xe9];
             jump.extend_from_slice(&relative(new, old.address + Self::JUMP as u64)?.to_le_bytes());
@@ -831,6 +1005,13 @@ impl<'a> Patch<'a> {
             let table = &mut appended[relocations_at as usize..];
             let old = relocations.table.len();
             table[..old].copy_from_slice(&relocations.table);
+            ensure!(
+                self.in_place.is_empty() || !relocations.packed,
+                "a static with another value, where addresses are fixed up from a packed table"
+            );
+            let statics = self.in_place.values().flatten().map(|it| it.old).collect();
+            let spare = base + spare_at;
+            fixed.extend(LoadRelocations::restore(&mut table[..old], statics, restored, spare)?);
             let added = object::bytes_of_slice(&fixed);
             table[old..][..added.len()].copy_from_slice(added);
             let len = (old + added.len()) as u64;
