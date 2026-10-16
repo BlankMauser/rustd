@@ -37,6 +37,14 @@ const VALUED: &[&str] = &[
     "--remap-path-prefix",
 ];
 
+/// A `main` for cargo's link of a stand-in program to find. It is weak and of no code: the
+/// link of what runs has rustd's.
+const WEAK_MAIN: &str = r#"#[cfg(not(target_vendor = "apple"))]
+core::arch::global_asm!(".weak main", "main:");
+#[cfg(target_vendor = "apple")]
+core::arch::global_asm!(".globl _main", ".weak_definition _main", "_main:");
+"#;
+
 /// Runs rustc as cargo asked, or on what stands in for a crate of the workspace.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
@@ -91,10 +99,7 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
         }
     }
     if program {
-        // Not what runs: rustd's `main` is linked ahead of it.
-        text.push_str(
-            "#[unsafe(no_mangle)]\npub extern \"C\" fn main(_: i32, _: *const *const u8) -> i32 {\n    0\n}\n",
-        );
+        text.push_str(WEAK_MAIN);
     }
     Some((source, text))
 }

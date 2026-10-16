@@ -22,15 +22,8 @@ class Alone(Fixture):
     """A fixture whose link line is of a build that has stand-ins for the workspace crates."""
 
     def rustc_build(self):
-        plain = dict(os.environ)
-        os.environ.update(RUSTC_WORKSPACE_WRAPPER=RUSTD, RUSTD_WRAPS_RUSTC="1",
-                          CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
-        self.target_args = [*self.target_args, "--target", host()]
-        try:
-            super().rustc_build()
-        finally:
-            os.environ.clear()
-            os.environ.update(plain)
+        self.alone = True
+        super().rustc_build()
 
 
 def main():

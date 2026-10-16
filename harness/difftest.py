@@ -51,13 +51,14 @@ class Fixture:
             touch = next(t["src_path"] for p in meta["packages"] if p["name"] == target[1]
                          for t in p["targets"] if "bin" in t["kind"])
         self.touch = touch
+        # Whether rustc builds stand-ins for the workspace's crates, all of their code being rustd's.
+        self.alone = bool(os.environ.get("RUSTD_ALONE"))
 
     def rustc_build(self):
         """Builds with cargo and captures the linker line so rustd objects can be spliced in."""
         os.utime(self.touch)
         env, target = dict(os.environ), []
-        if os.environ.get("RUSTD_ALONE"):
-            # rustc builds stand-ins for the workspace's crates: all of their code is rustd's.
+        if self.alone:
             env.update(RUSTC_WORKSPACE_WRAPPER=RUSTD, RUSTD_WRAPS_RUSTC="1",
                        CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
             host = subprocess.check_output(["rustc", "-vV"], text=True, cwd=self.ws).split("host: ")[1].split()[0]
@@ -103,7 +104,11 @@ class Fixture:
     def link(self, objects):
         args = list(self.link_args)
         first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
-        args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
+        if self.alone:
+            # Nothing of the workspace is rustc's for rustd's to be defined a second time.
+            args[first:first] = objects
+        else:
+            args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
         run = subprocess.run(args, capture_output=True, text=True)
