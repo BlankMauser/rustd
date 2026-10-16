@@ -495,6 +495,12 @@ impl SymbolResolver for Resolver<'_> {
 
     fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         let places = (&*self.root, self.base.as_deref());
+        if !krate.data(self.db).origin.is_local() {
+            let root = self.crate_root(krate.into())?;
+            return Some(self.contents.library(self.db, krate, &root, &|krate| {
+                Some((self.stable_crate_id(krate), self.crate_root(krate.into())?))
+            }));
+        }
         self.contents.id(self.db, places, krate, &|krate| self.stable_crate_id(krate))
     }
 
@@ -749,6 +755,7 @@ fn load(
     load_config: LoadCargoConfig,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
+        compared: Default::default(),
         roots: Vec::new(),
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
@@ -761,8 +768,14 @@ fn load(
     Ok((db, vfs, checkouts))
 }
 
+/// A file of a checkout that was compared with the one it is in a loaded checkout: the size
+/// and the time of the last write of both, and whether the two were alike. They are not read
+/// again until one is written.
+type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, SystemTime), bool)>>;
+
 /// The checkouts the daemon has loaded.
 struct Checkouts {
+    compared: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
@@ -835,7 +848,9 @@ impl Checkouts {
         // A procedural macro is rustc's to build: one that is not the same is another build.
         packages
             .iter()
-            .filter(|(dir, proc_macro)| !proc_macro && !package_alike(dir, base, over, &nested))
+            .filter(|(dir, proc_macro)| {
+                !proc_macro && !package_alike(dir, base, over, &nested, &self.compared)
+            })
             .map(|it| &it.0)
             .filter_map(|dir| Some(dir.strip_prefix(base).ok()?.to_owned()))
             .collect()
@@ -1008,7 +1023,13 @@ struct Parts {
 /// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
 /// those of the checkout at `over`. The packages in `nested` are not part of it,
 /// and neither is what a build wrote.
-fn package_alike(dir: &Path, base: &Path, over: &Path, nested: &FxHashSet<&Path>) -> bool {
+fn package_alike(
+    dir: &Path,
+    base: &Path,
+    over: &Path,
+    nested: &FxHashSet<&Path>,
+    compared: &Compared,
+) -> bool {
     let Ok(inside) = dir.strip_prefix(base) else { return true };
     let theirs = over.join(inside);
     let skipped = |inside: &Path, name: &std::ffi::OsStr| {
@@ -1030,21 +1051,36 @@ fn package_alike(dir: &Path, base: &Path, over: &Path, nested: &FxHashSet<&Path>
         && ours.iter().all(|name| {
             let (path, their) = (dir.join(name), theirs.join(name));
             if path.is_dir() {
-                return package_alike(&path, base, over, nested);
+                return package_alike(&path, base, over, nested, compared);
             }
-            let size = |path: &Path| std::fs::metadata(path).ok().map(|it| it.len());
-            if size(&path) != size(&their) {
-                return false;
-            }
-            let (Ok(ours), Ok(theirs)) = (std::fs::read(&path), std::fs::read(&their)) else {
+            let written = |path: &Path| {
+                let file = std::fs::metadata(path).ok()?;
+                Some((file.len(), file.modified().ok()?))
+            };
+            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
                 return false;
             };
-            // Code that asks where its package is does not say the same in two checkouts.
-            let asks = path.extension().is_some_and(|it| it == "rs")
-                && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
-                    ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
-                });
-            ours == theirs && !asks
+            if ours.0 != theirs.0 {
+                return false;
+            }
+            let known = compared.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
+            if let Some((_, _, alike)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
+                return alike;
+            }
+            let alike = match (std::fs::read(&path), std::fs::read(&their)) {
+                (Ok(ours), Ok(theirs)) => {
+                    // Code that asks where its package is does not say the same in two
+                    // checkouts.
+                    let asks = path.extension().is_some_and(|it| it == "rs")
+                        && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
+                            ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
+                        });
+                    ours == theirs && !asks
+                }
+                _ => false,
+            };
+            compared.lock().unwrap_or_else(|e| e.into_inner()).insert(their, (ours, theirs, alike));
+            alike
         })
 }
 

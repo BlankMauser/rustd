@@ -28,6 +28,9 @@ use crate::{
 /// Before the content of a crate of the checkout, where a crate of rustc's alone has its id.
 const OF_CHECKOUT: char = '~';
 
+/// Before what stands for a crate from outside the checkout that rustc has no id for.
+const OF_LIBRARY: char = '^';
+
 pub(super) struct StableNames<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
@@ -36,6 +39,8 @@ pub(super) struct StableNames<'a, 'db> {
     /// Whether what is of those crates has a name, by what is written in them now.
     by_content: bool,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
+    /// How often each thing kept an instance from having a name.
+    pub(super) misses: RefCell<FxHashMap<&'static str, usize>>,
 }
 
 impl<'a, 'db> StableNames<'a, 'db> {
@@ -45,7 +50,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
         owned: FxHashSet<Crate>,
         by_content: bool,
     ) -> Self {
-        StableNames { db, symbols, owned, by_content, files: RefCell::default() }
+        StableNames {
+            db,
+            symbols,
+            owned,
+            by_content,
+            files: RefCell::default(),
+            misses: RefCell::default(),
+        }
     }
 
     /// Whether a name is of anything of a crate of the checkout, which is only what the
@@ -95,6 +107,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
+    fn miss<T>(&self, why: &'static str) -> Option<T> {
+        *self.misses.borrow_mut().entry(why).or_default() += 1;
+        None
+    }
+
     /// An item by where it is written: names do not tell two `impl`s apart.
     fn item(
         &self,
@@ -106,11 +123,20 @@ impl<'a, 'db> StableNames<'a, 'db> {
         // The source of a crate of the workspace changes too, built by the daemon or not.
         if self.owned.contains(&krate) || krate.data(self.db).origin.is_local() {
             if !self.by_content {
-                return None;
+                return self.miss("of the checkout, in a patch");
             }
-            write!(out, "{OF_CHECKOUT}{:x}:", self.symbols.content_id(krate)?).ok()?;
+            let Some(id) = self.symbols.content_id(krate) else {
+                return self.miss("no content id");
+            };
+            write!(out, "{OF_CHECKOUT}{id:x}:").ok()?;
         } else {
-            write!(out, "{:x}:", self.symbols.stable_crate_id(krate)?).ok()?;
+            match self.symbols.stable_crate_id(krate) {
+                Some(id) => write!(out, "{id:x}:").ok()?,
+                None => match self.symbols.content_id(krate) {
+                    Some(id) => write!(out, "{OF_LIBRARY}{id:x}:").ok()?,
+                    None => return self.miss("no crate id"),
+                },
+            }
         }
         self.ast(out, file, id)
     }
@@ -133,7 +159,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let db = self.db;
         match file {
             HirFileId::FileId(file) => {
-                out.push_str(&self.symbols.source_path(file.file_id(db))?);
+                let Some(path) = self.symbols.source_path(file.file_id(db)) else {
+                    return self.miss("no source path");
+                };
+                out.push_str(&path);
             }
             HirFileId::MacroFile(call) => match &call.loc(db).kind {
                 MacroCallKind::FnLike { ast_id, .. } => {
@@ -185,7 +214,9 @@ impl<'a, 'db> StableNames<'a, 'db> {
     /// A closure or an `async` block by the body it is written in and where.
     fn closure(&self, out: &mut String, closure: InternedClosure<'db>) -> Option<()> {
         let db = self.db;
-        let InferBodyId::DefWithBodyId(owner) = closure.owner else { return None };
+        let InferBodyId::DefWithBodyId(owner) = closure.owner else {
+            return self.miss("closure in an anonymous constant");
+        };
         match owner {
             DefWithBodyId::FunctionId(it) => self.function(out, it)?,
             DefWithBodyId::ConstId(it) => {
@@ -211,7 +242,16 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 GenericArgKind::Lifetime(region) => self.region(out, region)?,
                 GenericArgKind::Type(ty) => self.ty(out, ty)?,
                 GenericArgKind::Const(konst) => {
-                    write!(out, "{}", try_const_usize(self.db, konst)?).ok()?
+                    if let Some(value) = try_const_usize(self.db, konst) {
+                        write!(out, "{value}").ok()?
+                    } else if let Some(value) = konst.try_to_value()
+                        && let Some(leaf) = value.try_to_leaf()
+                    {
+                        self.ty(out, value.ty)?;
+                        write!(out, ":{leaf:?}").ok()?
+                    } else {
+                        return self.miss("constant argument");
+                    }
                 }
             }
             out.push(',');
@@ -226,7 +266,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             RegionKind::ReBound(BoundVarIndexKind::Bound(depth), bound) => {
                 write!(out, "'{}.{}", depth.as_u32(), bound.var.as_u32()).ok()
             }
-            RegionKind::ReBound(..) => None,
+            RegionKind::ReBound(..) => self.miss("bound region"),
             _ => {
                 out.push_str("'_");
                 Some(())
@@ -276,7 +316,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             TyKind::Array(element, len) => {
                 out.push('[');
                 self.ty(out, element)?;
-                write!(out, ";{}]", try_const_usize(db, len)?).ok()?;
+                let Some(len) = try_const_usize(db, len) else {
+                    return self.miss("array length");
+                };
+                write!(out, ";{len}]").ok()?;
             }
             TyKind::Tuple(tys) => {
                 out.push('(');
@@ -340,7 +383,9 @@ impl<'a, 'db> StableNames<'a, 'db> {
                             self.args(&mut out, it.args)?;
                         }
                         ExistentialPredicate::Projection(it) => {
-                            let TermId::TypeAliasId(alias) = it.def_id.0 else { return None };
+                            let TermId::TypeAliasId(alias) = it.def_id.0 else {
+                                return self.miss("projection");
+                            };
                             out.push_str("type ");
                             let id = alias.lookup(db).id;
                             self.item(&mut out, alias.krate(db), id.file_id, id.value.erase())?;
@@ -364,7 +409,13 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 self.region(out, region)?;
                 out.push(')');
             }
-            _ => return None,
+            TyKind::Alias(..) => return self.miss("alias type"),
+            TyKind::Param(..) => return self.miss("type parameter"),
+            TyKind::CoroutineClosure(..) => return self.miss("async closure"),
+            TyKind::CoroutineWitness(..) => return self.miss("coroutine witness"),
+            TyKind::Foreign(..) => return self.miss("foreign type"),
+            TyKind::Pat(..) => return self.miss("pattern type"),
+            _ => return self.miss("other type"),
         }
         Some(())
     }

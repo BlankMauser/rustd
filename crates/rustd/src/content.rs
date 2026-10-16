@@ -140,7 +140,7 @@ impl Contents {
             let on = dependency.crate_id;
             let id = match on.data(db).origin.is_local() {
                 true => self.id(db, checkouts, on, stable_crate_id)?,
-                false => stable_crate_id(on).unwrap_or_else(|| Self::library(db, on)),
+                false => stable_crate_id(on).unwrap_or_else(|| Self::version(db, on)),
             };
             field(dependency.name.as_str().as_bytes());
             field(&id.to_le_bytes());
@@ -148,9 +148,53 @@ impl Contents {
         Some(u64::from_le_bytes(hasher.finalize()[..8].try_into().ok()?))
     }
 
+    /// What stands for a crate from outside the checkout that rustc's build of the program
+    /// has no id for, one that only exports others' items or a proc macro: where its source is,
+    /// what it is configured with and what it is built on. `known` gives rustc's id of a crate,
+    /// if there is one, and where its source starts.
+    pub(crate) fn library(
+        &self,
+        db: &RootDatabase,
+        krate: Crate,
+        root: &Path,
+        known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+    ) -> u64 {
+        if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+            return id;
+        }
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(b"rustd library 1");
+        field(&Self::version(db, krate).to_le_bytes());
+        field(root.as_os_str().as_encoded_bytes());
+        let mut cfgs: Vec<String> =
+            krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
+        cfgs.sort_unstable();
+        field(cfgs.join("\n").as_bytes());
+        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
+        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        for dependency in dependencies {
+            let on = dependency.crate_id;
+            let id = match known(on) {
+                Some((Some(id), _)) => id,
+                Some((None, root)) => self.library(db, on, &root, known),
+                None => Self::version(db, on),
+            };
+            field(dependency.name.as_str().as_bytes());
+            field(&id.to_le_bytes());
+        }
+        let hash = hasher.finalize();
+        let id = u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"));
+        self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, Some(id));
+        id
+    }
+
     /// A crate rustc's build of the program has nothing of, a proc macro for one, which a
     /// version of is the same wherever it is.
-    fn library(db: &RootDatabase, krate: Crate) -> u64 {
+    fn version(db: &RootDatabase, krate: Crate) -> u64 {
         let extra = krate.extra_data(db);
         let name = extra.display_name.as_ref().map(|it| it.to_string());
         let named = format!("{name:?} {:?}", extra.version);

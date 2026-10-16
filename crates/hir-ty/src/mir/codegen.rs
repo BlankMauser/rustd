@@ -465,6 +465,11 @@ impl CodegenUnit {
                         eprintln!("store: {hits} functions found, {misses} compiled and added");
                     }
                     cg.kept.report();
+                    let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
+                    misses.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+                    if !misses.is_empty() {
+                        eprintln!("without a stable name: {misses:?}");
+                    }
                 }
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
@@ -854,16 +859,28 @@ struct Kept {
     /// Entries of the store that differ from what was compiled, with `RUSTD_CACHE_CHECK`.
     differing: usize,
     same: usize,
+    /// Why instances with a name were not added.
+    unkept: FxHashMap<&'static str, usize>,
 }
 
 impl Kept {
+    fn unkept<T>(&mut self, why: &'static str) -> Option<T> {
+        *self.unkept.entry(why).or_default() += 1;
+        None
+    }
+
     fn report(&self) {
-        let Kept { added, found, unnamed, unnamed_requests, differing, same } = self;
+        let Kept { added, found, unnamed, unnamed_requests, differing, same, unkept } = self;
         if added + found + unnamed + unnamed_requests + differing + same != 0 {
             eprintln!(
                 "entries: {found} found, {added} added, {same} as stored, {differing} not as stored, \
                  {unnamed} instances and {unnamed_requests} requests without a stable name"
             );
+        }
+        if !unkept.is_empty() {
+            let mut unkept: Vec<_> = unkept.iter().collect();
+            unkept.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+            eprintln!("not kept: {unkept:?}");
         }
     }
 }
@@ -1924,16 +1941,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         .stable_name(callee)
                         .is_none_or(|it| stable::StableNames::of_checkout(&it))
                 {
-                    return None;
+                    return self.kept.unkept("rustc's copy of a function of the checkout");
                 }
                 let checked = self.symbols.defines(&symbol);
                 CachedTarget::Import { symbol, checked }
             } else if let FuncTarget::Instance(callee, _) = &request.target {
-                CachedTarget::Named(self.stable_name(callee)?.as_ref().to_owned())
+                let Some(name) = self.stable_name(callee) else {
+                    return self.kept.unkept("unnamed callee");
+                };
+                CachedTarget::Named(name.as_ref().to_owned())
             } else if let FuncTarget::Asm(text) = &request.target {
                 CachedTarget::Asm(text.clone())
             } else {
-                return None;
+                return self.kept.unkept("call of no instance");
             };
             funcs.push(CachedFunc { target, sig: request.sig.clone() });
         }
@@ -1946,7 +1966,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 && placed
                 && self.symbols.names_place(&blob.bytes)
             {
-                return None;
+                return self.kept.unkept("data with the place of the checkout");
             }
             datas.push(match request {
                 DataRequest::Blob { blob, identity } => {
@@ -1954,7 +1974,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 DataRequest::Vtable { ty, trait_ref, blob } => {
                     let trait_ref = trait_ref.as_ref().map(|(id, args)| (*id, args.as_ref()));
-                    let key = self.names.vtable(ty.as_ref(), trait_ref)?;
+                    let Some(key) = self.names.vtable(ty.as_ref(), trait_ref) else {
+                        return self.kept.unkept("unnamed vtable");
+                    };
                     CachedData::Vtable { key, blob: blob.clone() }
                 }
                 DataRequest::Static(of) => {
@@ -1964,7 +1986,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let of_checkout = self.own_statics.crates.contains(&krate)
                         || krate.data(self.db).origin.is_local();
                     if decl.linkage != Linkage::Import || of_checkout {
-                        return None;
+                        return self.kept.unkept("static of the checkout");
                     }
                     CachedData::Static {
                         symbol: decl.linkage_name(id).into_owned(),
@@ -1973,7 +1995,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 DataRequest::Location(at) => CachedData::Location(self.location_at(*at)),
                 DataRequest::Declaration(func) => CachedData::Location(self.declaration_at(*func)),
-                DataRequest::FilePath(file) => CachedData::FilePath(self.source_path(*file)?),
+                DataRequest::FilePath(file) => {
+                    let Some(path) = self.source_path(*file) else {
+                        return self.kept.unkept("file without a path");
+                    };
+                    CachedData::FilePath(path)
+                }
             });
         }
         Some(cached::Entry {
