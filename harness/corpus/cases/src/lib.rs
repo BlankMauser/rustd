@@ -5352,3 +5352,64 @@ pub mod inline_asm {
         )
     }
 }
+
+/// Constants that hold another constant's value: what that value points to is copied, and
+/// the pointers in it have to follow, through a type that is written as an associated type
+/// and through a union.
+pub mod const_in_const {
+    pub trait Marker {
+        type Data: 'static;
+    }
+    pub struct Table {
+        names: &'static [&'static str],
+        bytes: *const [u8],
+        count: u32,
+    }
+    unsafe impl Sync for Table {}
+    pub struct Baked;
+    impl Marker for Baked {
+        type Data = Table;
+    }
+    impl Baked {
+        pub const TABLE: &'static <Baked as Marker>::Data =
+            &Table { names: &["one", "two", "three"], bytes: b"\x01\x02\x03\x04" as &[u8], count: 3 };
+    }
+    #[derive(Clone, Copy)]
+    pub union Either {
+        text: &'static str,
+        number: u128,
+    }
+    pub struct Held {
+        before: &'static [u16],
+        table: &'static Table,
+        either: Either,
+        after: &'static str,
+    }
+    const fn padding() -> &'static [u16] {
+        &[7, 8, 9, 10, 11, 12, 13]
+    }
+    const WORD: Either = Either { text: "a word behind a union" };
+    const fn held() -> Held {
+        let before = padding();
+        Held { before, table: Baked::TABLE, either: WORD, after: "after" }
+    }
+    const HELD: Held = held();
+    const AGAIN: (&[u16], Held) = (&[1, 2], held());
+
+    #[inline(never)]
+    fn read(held: &Held) -> (usize, String, Vec<u8>, u32, &'static str, &'static str) {
+        let table = std::hint::black_box(held).table;
+        (
+            held.before.len(),
+            table.names.concat(),
+            unsafe { &*table.bytes }.to_vec(),
+            table.count,
+            unsafe { held.either.text },
+            held.after,
+        )
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (read(&HELD), read(&AGAIN.1), AGAIN.0.len())
+    }
+}

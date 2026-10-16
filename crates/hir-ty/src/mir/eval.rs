@@ -2708,7 +2708,24 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         )?;
                     }
                 }
-                AdtId::UnionId(_) => (),
+                // As when the memory was kept: every word that is the address of something
+                // is taken to be a pointer.
+                AdtId::UnionId(_) => {
+                    if layout.align.abi.bytes_usize().is_multiple_of(size_of::<usize>()) {
+                        let pointer =
+                            Ty::new_imm_ptr(self.interner(), Ty::new_unit(self.interner()));
+                        for word in 0..my_size / size_of::<usize>() {
+                            self.patch_addresses(
+                                patch_map,
+                                source,
+                                ty_of_bytes,
+                                addr.offset(word * size_of::<usize>()),
+                                pointer,
+                                locals,
+                            )?;
+                        }
+                    }
+                }
                 AdtId::EnumId(e) => {
                     if let Some((ev, layout)) = detect_variant_from_bytes(
                         &layout,
@@ -2778,12 +2795,23 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             | TyKind::Error(_)
             | TyKind::Placeholder(_)
             | TyKind::Dynamic(_, _)
-            | TyKind::Alias(..)
             | TyKind::Bound(_, _)
             | TyKind::Infer(_)
             | TyKind::Param(_)
             | TyKind::UnsafeBinder(_)
             | TyKind::CoroutineClosure(_, _) => (),
+            TyKind::Alias(..) => {
+                let normalized = ObligationCtxt::new(&self.infcx)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        self.param_env.param_env,
+                        ty,
+                    )
+                    .unwrap_or(ty);
+                if !matches!(normalized.kind(), TyKind::Alias(..)) {
+                    self.patch_addresses(patch_map, source, ty_of_bytes, addr, normalized, locals)?;
+                }
+            }
         }
         Ok(())
     }

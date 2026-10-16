@@ -184,6 +184,7 @@ fn main() {
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
     println!("unsized_tail {:?}", cases::unsized_tail::run());
+    println!("const_in_const {:?}", cases::const_in_const::run());
     println!("upcast_generic {:?}", cases::upcast_generic::run());
     println!("packed_drop {:?}", cases::packed_drop::run());
     println!("array_move {:?}", cases::array_move::run());
