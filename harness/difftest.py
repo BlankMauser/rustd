@@ -224,7 +224,7 @@ def memcheck(fx):
     """Runs the rustd binary under valgrind: the first invalid access is usually the miscompile,
     where the crash or wrong output is only what it led to. Returns the error blocks."""
     import re, shutil
-    if not shutil.which("valgrind"):
+    if WASM or not shutil.which("valgrind"):
         return None
     log = os.path.join(fx.work, "valgrind.log")
     try:

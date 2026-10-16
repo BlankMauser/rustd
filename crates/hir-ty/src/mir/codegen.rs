@@ -7363,6 +7363,37 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Callee::Instance(def, generic_args) => {
                 let variadic = matches!(def, InstanceDef::Fn(func)
                     if FunctionSignature::of(self.cg.db, func).is_varargs());
+                if variadic && Target::current().is_wasm() {
+                    // The arguments after the named ones are written to memory, each at its
+                    // own alignment, and the function is given where.
+                    let InstanceDef::Fn(func) = def else { unreachable!() };
+                    let named = FunctionSignature::of(self.cg.db, func).params.len();
+                    if arg_modes.iter().any(|mode| !matches!(mode, PassMode::Direct(_))) {
+                        unsupported!("variadic call with an argument that is not one scalar");
+                    }
+                    let rest = values.split_off(named);
+                    sig.params.truncate(named);
+                    sig.params.push(AbiParam::new(ptr()));
+                    let mut offsets = Vec::with_capacity(rest.len());
+                    let mut size = 0u32;
+                    for &value in &rest {
+                        let bytes = self.builder.func.dfg.value_type(value).bytes();
+                        size = size.next_multiple_of(bytes);
+                        offsets.push(size);
+                        size += bytes;
+                    }
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        size.max(1),
+                        4,
+                    ));
+                    let buffer = self.builder.ins().stack_addr(ptr(), slot, 0);
+                    for (value, offset) in rest.into_iter().zip(offsets) {
+                        self.builder.ins().store(MEM, value, buffer, offset as i32);
+                    }
+                    values.push(buffer);
+                }
+                let variadic = variadic && !Target::current().is_wasm();
                 let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 if variadic {
