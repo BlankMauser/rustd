@@ -6518,7 +6518,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) -> Result<()> {
         let receiver_layout = self.layout(receiver_ty)?;
         if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair(..))
-            || receiver_layout.size.bytes() != 16
+            || receiver_layout.size.bytes_usize() != 2 * WORD
         {
             unsupported!("vtable call with receiver {receiver_ty:?}");
         }
@@ -6976,8 +6976,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let layout = self.layout(code_ty)?;
         let code = self.stack_slot(&layout);
         self.call_direct(start, start_args, &values, code, code_ty)?;
-        let code = self.builder.ins().load(types::I64, MEM, code, 0);
-        let code = self.builder.ins().ireduce(types::I32, code);
+        let code = self.builder.ins().load(PTR, MEM, code, 0);
+        let code =
+            if PTR == types::I32 { code } else { self.builder.ins().ireduce(types::I32, code) };
         self.builder.ins().return_(&[code]);
         Ok(())
     }

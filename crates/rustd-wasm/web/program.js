@@ -9,6 +9,13 @@ export class Program {
     this.stackPointer = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
     this.exports = {};
     // A function nobody provides fails when it is called, not when the module is linked.
+    // What a Rust program expects of its C library, where the compiler does not inline it.
+    const compare = (left, right, length) => {
+      const [a, b] = [this.bytes(left, length), this.bytes(right, length)];
+      const at = a.findIndex((byte, index) => byte !== b[index]);
+      return at < 0 ? 0 : a[at] - b[at];
+    };
+    host = { memcmp: compare, bcmp: compare, ...host };
     this.host = new Proxy(host, {
       get: (host, name) =>
         host[name] ??

@@ -8,6 +8,17 @@ const canvas = document.getElementById("canvas");
 const status = document.getElementById("status");
 const context = canvas.getContext("2d");
 
+const demos = {
+  balls: "bouncing balls",
+  life: "game of life",
+  sort: "sorting, with trait objects",
+  mandelbrot: "mandelbrot set",
+};
+const picker = document.getElementById("demo");
+for (const [name, title] of Object.entries(demos)) {
+  picker.add(new Option(title, name));
+}
+
 let program;
 const host = {
   fill: (red, green, blue) => (context.fillStyle = `rgb(${red} ${green} ${blue})`),
@@ -43,10 +54,13 @@ function build() {
   }
   building = true;
   sent = edited;
-  worker.postMessage({ id: sent, text: source.value, at: performance.now() });
+  worker.postMessage({ id: sent, text: source.value, fresh });
+  fresh = false;
   started = performance.now();
 }
 let started = 0;
+// Whether the next build is of another demo, to start over with.
+let fresh = false;
 
 worker.onmessage = ({ data }) => {
   if (data.loaded) {
@@ -54,12 +68,13 @@ worker.onmessage = ({ data }) => {
     loaded = `compiler ${(wasm_bytes / 2 ** 20).toFixed(1)} MiB, core source ${(core_bytes / 2 ** 20).toFixed(1)} MiB, fetched in ${ms(fetch_ms)}, started in ${ms(start_ms)}`;
     say(`${loaded}\nfirst build…`);
     ready = true;
-    edited = 1;
     build();
     return;
   }
   building = false;
-  if (data.error) {
+  if (data.id < shown) {
+    // A build of the demo that was on before.
+  } else if (data.error) {
     say(data.error, true);
   } else {
     const { report, module } = data;
@@ -129,5 +144,24 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
-source.value = await (await fetch("demo.rs")).text();
+// Builds from before this edit are of another demo, and not shown.
+let shown = 0;
+async function show(name) {
+  const response = await fetch(`demos/${name}.rs`);
+  source.value = response.ok ? await response.text() : `// ${name}: ${response.status}`;
+  program = new Program(host);
+  stopped = null;
+  fresh = true;
+  edited += 1;
+  shown = edited;
+  location.hash = name;
+  if (ready) {
+    say(`${loaded}\nbuilding ${demos[name]}…`);
+  }
+  build();
+}
+picker.addEventListener("change", () => show(picker.value));
+
+picker.value = location.hash.slice(1) in demos ? location.hash.slice(1) : "balls";
+await show(picker.value);
 requestAnimationFrame(frame);

@@ -13,7 +13,8 @@ const [wasm, core] = await Promise.all(
   }),
 );
 const fetched = performance.now();
-const compiler = await Compiler.load(wasm, core);
+const compiled = await WebAssembly.compile(wasm);
+let compiler = await Compiler.load(compiled, core);
 postMessage({
   loaded: {
     wasm_bytes: wasm.length,
@@ -23,9 +24,13 @@ postMessage({
   },
 });
 
-onmessage = ({ data: { id, text } }) => {
+// A `fresh` build is of another program: nothing of the one before is kept.
+onmessage = async ({ data: { id, text, fresh } }) => {
   const start = performance.now();
   try {
+    if (fresh) {
+      compiler = await Compiler.load(compiled, core);
+    }
     compiler.setFile("/app/main.rs", text);
     const { module, report } = compiler.build();
     report.build_ms = performance.now() - start;

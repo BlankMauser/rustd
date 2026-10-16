@@ -1,8 +1,11 @@
 // The compiler: `rustd_wasm.wasm` with its exports as methods.
 
 export class Compiler {
-  // `wasm` is the compiler's module as bytes, `core` the bundle of `core`'s source.
+  // `wasm` is the compiler's module, `core` the bundle of `core`'s source.
   static async load(wasm, core) {
+    if (!(wasm instanceof WebAssembly.Module)) {
+      wasm = await WebAssembly.compile(wasm);
+    }
     let memory;
     const text = (pointer, length) =>
       new TextDecoder().decode(new Uint8Array(memory.buffer, pointer >>> 0, length >>> 0).slice());
@@ -11,7 +14,7 @@ export class Compiler {
       now: () => performance.now(),
       log: (pointer, length) => console.error(text(pointer, length)),
     };
-    const { instance } = await WebAssembly.instantiate(wasm, { rustd });
+    const instance = await WebAssembly.instantiate(wasm, { rustd });
     memory = instance.exports.memory;
     const compiler = new Compiler(instance.exports);
     if (!compiler.rustd.rustd_add_bundle(...compiler.argument(core))) {

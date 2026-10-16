@@ -118,6 +118,8 @@ impl Build {
 
 impl Default for Compiler {
     fn default() -> Self {
+        // The bodies of derived methods are compiled like any other.
+        hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
         Compiler {
             db: RootDatabase::new(None),
             files: FxHashMap::default(),
