@@ -2,7 +2,8 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-#![feature(box_patterns)]
+// `box` patterns are unstable: the case is for a nightly toolchain only.
+#![cfg_attr(feature = "nightly", feature(box_patterns))]
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
@@ -2669,6 +2670,7 @@ pub mod array_map {
     }
 }
 
+#[cfg(feature = "nightly")]
 pub mod box_patterns {
     pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
     impl Drop for Noisy {

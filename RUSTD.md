@@ -164,7 +164,7 @@ deserves its own check: compare RA's computed layout for every type in a target 
 `rustc -Zprint-type-sizes` and count disagreements. Any disagreement is a silent miscompile
 waiting to happen, and today we do not measure it.
 
-The pin is `harness/toolchain`, and it has to be the rustc that rust-analyzer's `ra-ap-rustc_abi`
+The pin is `harness/toolchain`, a stable release, and it has to be the rustc that rust-analyzer's `ra-ap-rustc_abi`
 was cut from. This is not hypothetical: with stable 1.99 and `ra-ap-rustc_abi` 0.166 the two
 picked different niche values for `Result<(Comparator, ..), Error>` in semver, and every `?` on
 it took the wrong branch.
