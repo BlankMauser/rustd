@@ -163,16 +163,6 @@ fn declares_items(db: &RootDatabase, func: FunctionId) -> bool {
     })
 }
 
-/// Whether two texts of a file differ in no more than bodies that are written as ones nothing
-/// else sees into. What those bodies declare is not looked at.
-pub(crate) fn alike_outside_bodies(ours: &str, theirs: &str) -> bool {
-    let hash = |text: &str| {
-        let tree = syntax::SourceFile::parse(text, Edition::CURRENT).syntax_node();
-        hash_outside_bodies(&tree, &FxHashSet::default()).0
-    };
-    hash(ours) == hash(theirs)
-}
-
 /// The hash, and how many of the `declaring` functions were come by.
 fn hash_outside_bodies(file: &SyntaxNode, declaring: &FxHashSet<TextRange>) -> (u64, usize) {
     let mut hasher = FxHasher::default();

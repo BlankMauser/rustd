@@ -70,8 +70,12 @@ OVERLAY = "--overlay" in sys.argv
 # With `--split` the others join the first and share the packages that are the same in both.
 SPLIT = "--split" in sys.argv
 # With `--thin` the checkouts start out with the same included file, so that the others are
-# read as the first with other function bodies for as long as nothing else differs.
+# read as the first with other files from their first build on.
 THIN = "--thin" in sys.argv
+# With `--slow` every build of a checkout read as another counts as a long one, so that the
+# daemon gives up on reading them so and loads them.
+if "--slow" in sys.argv:
+    os.environ["RUSTD_SLOW_SWITCH_MS"] = "0"
 JOIN = "--join" in sys.argv or SPLIT or THIN
 
 

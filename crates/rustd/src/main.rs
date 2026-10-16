@@ -794,7 +794,6 @@ fn load(
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         compared: Default::default(),
-        light: Default::default(),
         roots: Vec::new(),
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
@@ -816,9 +815,6 @@ type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, Sy
 /// The checkouts the daemon has loaded.
 struct Checkouts {
     compared: Compared,
-    /// The files of other checkouts that differ from those of a loaded one, and whether in a
-    /// way that [`Checkouts::light`] counts.
-    light: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
@@ -955,7 +951,7 @@ impl Checkouts {
         &self,
         project: &Path,
         overlay: Overlay,
-        heavy: &dyn Fn(&Path, &Path) -> bool,
+        quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> Option<View> {
         let project = std::fs::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
@@ -975,50 +971,9 @@ impl Checkouts {
                 }
                 over.pop();
             }
-            let alike = self.builds_alike(base, &over)
-                && (overlay == Overlay::Always || self.light(base, base, &over, heavy));
+            let alike = (overlay == Overlay::Always || quick(base, &over))
+                && self.builds_alike(base, &over);
             alike.then(|| View { base: base.clone(), over, project: loaded.clone() })
-        })
-    }
-
-    /// Whether reading the checkout at `base` from `over` is an edit that is quick to take
-    /// in: none of the files under `dir` that differ is one `heavy` says takes long.
-    fn light(
-        &self,
-        dir: &Path,
-        base: &Path,
-        over: &Path,
-        heavy: &dyn Fn(&Path, &Path) -> bool,
-    ) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else { return true };
-        entries.filter_map(|it| it.ok()).all(|entry| {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else { return true };
-            if kind.is_dir() {
-                return entry.file_name() == ".git"
-                    || path.join("CACHEDIR.TAG").exists()
-                    || self.light(&path, base, over, heavy);
-            }
-            let Ok(inside) = path.strip_prefix(base) else { return true };
-            let their = over.join(inside);
-            let written = |path: &Path| {
-                let file = std::fs::metadata(path).ok()?;
-                Some((file.len(), file.modified().ok()?))
-            };
-            // A file that is gone is no longer named by one that is there, or the build fails.
-            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
-                return true;
-            };
-            let known = self.light.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
-            if let Some((_, _, light)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
-                return light;
-            }
-            let light = !heavy(&path, &their);
-            self.light
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(their, (ours, theirs, light));
-            light
         })
     }
 
@@ -1220,9 +1175,9 @@ struct Split {
 #[derive(Clone, Copy, PartialEq)]
 enum Overlay {
     Never,
-    /// When taking in what differs is quick: the checkouts read as one are built in turn, so
-    /// one that takes long is loaded with its own crates instead.
-    Light,
+    /// For as long as taking in what differs is quick: the checkouts read as one are built
+    /// in turn, so one that keeps taking long is loaded with its own crates instead.
+    Quick,
     Always,
 }
 
@@ -2256,6 +2211,13 @@ enum Event {
 /// Set while the builds under way are told to stop for a change to the source.
 static INTERRUPTING: AtomicBool = AtomicBool::new(false);
 
+/// Reading a loaded checkout from another place is long when the build takes more than this,
+/// or than `RUSTD_SLOW_SWITCH_MS`.
+const SLOW_SWITCH: Duration = Duration::from_secs(2);
+
+/// A checkout that is long to turn to or from this many times running is loaded instead.
+const SLOW_SWITCHES: u32 = 3;
+
 /// A build that is interrupted this many times is waited for the next time.
 const INTERRUPTIONS: u32 = 3;
 
@@ -2632,10 +2594,17 @@ fn main() -> anyhow::Result<()> {
     let overlay = match std::env::var("RUSTD_OVERLAY").as_deref() {
         Ok("0") => Overlay::Never,
         Ok(_) => Overlay::Always,
-        Err(_) => Overlay::Light,
+        Err(_) => Overlay::Quick,
     };
     let mut builds =
         Builds { events, running: FxHashMap::default(), waiting: Default::default(), stuck: false };
+    // How many times running each checkout that is read as a loaded one has been long to turn
+    // to or from.
+    let mut slow: FxHashMap<PathBuf, u32> = FxHashMap::default();
+    let slow_switch = std::env::var("RUSTD_SLOW_SWITCH_MS")
+        .ok()
+        .and_then(|it| it.parse().ok())
+        .map_or(SLOW_SWITCH, Duration::from_millis);
     // The links under way that no build waits for, by the object each is of.
     let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
     // The checkout each loaded one is read from, when that is not itself.
@@ -2679,12 +2648,6 @@ fn main() -> anyhow::Result<()> {
                     let mut target = target;
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
-                            let included: FxHashSet<&Path> = files
-                                .iter()
-                                .filter(|it| matches!(it.file, Watched::Included(_)))
-                                .map(|it| &*it.path)
-                                .collect();
-                            let vfs = &*tree.vfs();
                             // What a checkout reads is known once a build of it is over.
                             let pending = WatchedFile::unwatched(&files, &db);
                             let built: Vec<&Path> = programs
@@ -2695,34 +2658,12 @@ fn main() -> anyhow::Result<()> {
                                 })
                                 .map(|(_, it)| &*it.args.checkout)
                                 .collect();
-                            // Bodies that nothing else sees into are compiled again and no
-                            // more. Anything else a build reads has it look at every crate
-                            // that can see the file.
-                            let heavy = |ours: &Path, theirs: &Path| {
-                                if pending || !built.iter().any(|it| ours.starts_with(it)) {
-                                    return true;
-                                }
-                                if ours.extension().is_none_or(|it| it != "rs") {
-                                    return included.contains(ours)
-                                        && std::fs::read(ours).ok() != std::fs::read(theirs).ok();
-                                }
-                                let path = VfsPath::from(AbsPathBuf::assert_utf8(ours.to_owned()));
-                                let Some((file, _)) = vfs.file_id(&path) else { return false };
-                                if !listed.sees(&db, file) {
-                                    return false;
-                                }
-                                match (
-                                    std::fs::read_to_string(ours),
-                                    std::fs::read_to_string(theirs),
-                                ) {
-                                    (Ok(ours), Ok(theirs)) => {
-                                        ours != theirs
-                                            && !outline::alike_outside_bodies(&ours, &theirs)
-                                    }
-                                    _ => true,
-                                }
+                            let quick = |base: &Path, over: &Path| {
+                                !pending
+                                    && built.contains(&base)
+                                    && slow.get(over).is_none_or(|it| *it < SLOW_SWITCHES)
                             };
-                            checkouts.view_of(project, overlay, &heavy)
+                            checkouts.view_of(project, overlay, &quick)
                         }
                         None => {
                             let base = programs[0].args.checkout.clone();
@@ -2899,12 +2840,16 @@ fn main() -> anyhow::Result<()> {
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
         let mut switched = Vec::new();
+        // The checkouts this build stops or starts reading a loaded one from.
+        let mut turned = Vec::new();
         // The crates that are told another place than for the last build.
         let mut moved = Vec::new();
         for (base, over) in looked {
             if *viewed.get(&base).unwrap_or(&base) != over {
                 eprintln!("view: {} as {}", over.display(), base.display());
                 builds.settle(&mut db, &mut programs)?;
+                turned.extend(viewed.get(&base).cloned());
+                turned.extend((base != over).then(|| over.clone()));
                 db.set_view(&base, &over, built_in(&db, &base));
                 moved.extend(place(&mut db, &base, &over, &mut placed));
                 tree.relist(&base);
@@ -3197,6 +3142,19 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             eprintln!("ran: {}", ran.join(" "));
             eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
+        }
+        // Turning from one that is given up on is the last time it is paid for.
+        if !turned.iter().any(|it| slow.get(it).is_some_and(|it| *it >= SLOW_SWITCHES)) {
+            let long = edit.start.elapsed() > slow_switch;
+            for over in turned {
+                let times = slow.entry(over).or_default();
+                *times = if long { *times + 1 } else { 0 };
+                if *times == SLOW_SWITCHES {
+                    // The others may only have been long to turn to from this one.
+                    slow.retain(|_, it| *it >= SLOW_SWITCHES);
+                    break;
+                }
+            }
         }
         let mut replies = FxHashMap::default();
         for (at, answer) in answers {
