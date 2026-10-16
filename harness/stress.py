@@ -13,7 +13,7 @@ import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, join, RUSTD, sysroot_rlibs, with_objects, with_output
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -218,9 +218,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-        link[link.index("-o") + 1] = binary
+        link = with_output(with_objects(link, [patch, obj]), binary)
         for path in (socket, binary):
             if os.path.exists(path):
                 os.remove(path)
@@ -229,7 +227,7 @@ def main():
         splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
         daemon = subprocess.Popen(
             [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
-             "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols], stderr=out, stdout=out)
+             "--patch", patch, "--link-cmd", join(link), *splice, *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
                 print("    daemon does not start on this source", flush=True)

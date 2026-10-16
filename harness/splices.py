@@ -15,7 +15,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, join, RUSTD, sysroot_rlibs, with_objects, with_output
 
 TOML = """[package]
 name = "sedge"
@@ -364,14 +364,12 @@ def main():
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sedge.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-    link[link.index("-o") + 1] = binary
+    link = with_output(with_objects(link, [patch, obj]), binary)
     if os.environ.get("SPLICES_NO_PIE"):
         link = [a for a in link if a != "-pie"] + ["-no-pie"]
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     splice = ["--splice", binary] if os.environ.get("RUSTD_SPLICE") else []
-    ask = ["--crate", "sedge", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
+    ask = ["--crate", "sedge", "--out", obj, "--patch", patch, "--link-cmd", join(link), *splice, *symbols]
     out = open(log_path, "a")
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():

@@ -9,7 +9,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, join, RUSTD, sysroot_rlibs, with_objects, with_output
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -77,11 +77,9 @@ def main():
         fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-        link[link.index("-o") + 1] = binary
+        link = with_output(with_objects(link, [patch, obj]), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link), "symbols": symbols}
+        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": join(link), "symbols": symbols}
     first = programs["sapp"]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
