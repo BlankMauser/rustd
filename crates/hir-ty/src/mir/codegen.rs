@@ -1813,6 +1813,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             queue: Vec<(Instance, StoredParamEnvAndCrate)>,
             seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
             working: usize,
+            /// A thread was stopped in the middle of an instance, as a write to the database
+            /// does: the others are not to wait for what it would have found.
+            stopped: bool,
+        }
+        /// Tells the threads that wait when the one compiling is stopped.
+        struct Working<'a>(&'a std::sync::Mutex<Ahead>, &'a std::sync::Condvar);
+        impl Drop for Working<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
+                    self.1.notify_all();
+                }
+            }
         }
         let mut seen = std::mem::take(&mut self.ahead);
         let queue: Vec<_> = self
@@ -1821,7 +1834,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map(|(instance, env, _)| (instance.clone(), env.clone()))
             .filter(|it| seen.insert(it.clone()))
             .collect();
-        let ahead = std::sync::Mutex::new(Ahead { queue, seen, working: 0 });
+        let ahead = std::sync::Mutex::new(Ahead { queue, seen, working: 0, stopped: false });
         let idle = std::sync::Condvar::new();
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
@@ -1838,6 +1851,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut homes = home::Homes::default();
             let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                if state.stopped {
+                    return;
+                }
                 let Some((instance, env)) = state.queue.pop() else {
                     if state.working == 0 {
                         idle.notify_all();
@@ -1848,6 +1864,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 state.working += 1;
                 drop(state);
+                let working = Working(&ahead, &idle);
                 let mut found = Vec::new();
                 if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
                     for request in &compiled.requests.funcs {
@@ -1862,6 +1879,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         }
                     }
                 }
+                drop(working);
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
                 for it in found {

@@ -2116,6 +2116,8 @@ struct Program {
     whole: Option<PathBuf>,
     /// How many of its builds a change to the source has interrupted since one finished.
     interrupted: u32,
+    /// Whether its crates are others than the last build was of, which is then no patch.
+    moved: bool,
 }
 
 /// A request, the program it is for, and who waits for the answer.
@@ -2180,7 +2182,7 @@ impl Builds {
             clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
             return Ok(());
         };
-        program.interrupted = 0;
+        (program.interrupted, program.moved) = (0, false);
         let answer = answer?;
         for (_, _, client) in clients {
             // A client that hangs up before the answer is not the daemon's problem.
@@ -2497,6 +2499,7 @@ fn main() -> anyhow::Result<()> {
         wrote,
         whole,
         interrupted: 0,
+        moved: false,
     }];
     let overlay = std::env::var_os("RUSTD_OVERLAY").is_some();
     // A checkout read as another is read so by every build, so those are waited for.
@@ -2648,6 +2651,7 @@ fn main() -> anyhow::Result<()> {
                                 wrote: None,
                                 whole: None,
                                 interrupted: 0,
+                                moved: false,
                             };
                             if let Some(built) =
                                 programs.iter().find(|it| it.same_as(&db, &program))
@@ -2680,6 +2684,7 @@ fn main() -> anyhow::Result<()> {
                     watch_loaded(&mut db, &mut tree, &mut files);
                     for program in &mut programs {
                         let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
+                        program.moved |= program.args.members != members;
                         (program.args.base, program.args.members) = (base, members);
                         program.unbuilt.stale = true;
                         program.known.touch(&db, None);
@@ -2893,7 +2898,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 // The program is linked unless every client of it loads the patch.
                 let link = clients.iter().any(|it| it.0 != Request::Patch);
-                let kept = program.known.patches() || program.interrupted >= INTERRUPTIONS;
+                let patches = program.known.patches() && !program.moved;
+                let kept = patches || program.interrupted >= INTERRUPTIONS;
                 // What stands in for the program while it is built says what program it is.
                 let away = Program {
                     args: program.args.clone(),
@@ -2903,6 +2909,7 @@ fn main() -> anyhow::Result<()> {
                     wrote: None,
                     whole: None,
                     interrupted: program.interrupted,
+                    moved: program.moved,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept });
