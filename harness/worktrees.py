@@ -13,7 +13,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -79,6 +79,11 @@ if "--slow" in sys.argv:
 JOIN = "--join" in sys.argv or SPLIT or THIN
 
 
+def splice(program):
+    """Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full."""
+    return ["--binary", program["bin"]]
+
+
 def main():
     work = tempfile.mkdtemp(prefix="rustd-worktrees-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -109,7 +114,7 @@ def main():
     out = open(log_path, "a")
     daemon = subprocess.Popen(
         [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
         env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {}), "RUSTD_SPLIT": "1" if SPLIT else "0"})
@@ -120,7 +125,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -146,7 +151,7 @@ def main():
             checkout = checkouts[at]
             return time.time(), subprocess.Popen(
                 [RUSTD, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
-                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *checkout["symbols"]],
+                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *splice(checkout), *checkout["symbols"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         # A program asked for twice in a step is asked for the second time after the others.
@@ -166,7 +171,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(os.path.join(checkout["reference"], "debug", "sapp"))
+                same = run(checkout["bin"]) == run(os.path.join(profile_dir(checkout["reference"]), "sapp"))
                 verdict = "same" if same else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()

@@ -1135,11 +1135,11 @@ impl EnumVariant {
         let parent_enum = self.parent_enum(db);
         let parent_layout = parent_enum.layout(db)?;
         Ok(match &parent_layout.0.variants {
-            layout::Variants::Multiple { variants, .. } => Layout(
+            layout::Variants::Multiple { .. } => Layout(
                 {
                     let lookup = self.id.lookup(db);
                     let rustc_enum_variant_idx = RustcEnumVariantIdx(lookup.index(db));
-                    Arc::new(variants[rustc_enum_variant_idx].clone())
+                    Arc::new(TyLayout::for_variant(&parent_layout.0, rustc_enum_variant_idx))
                 },
                 db.target_data_layout(parent_enum.krate(db).into()).unwrap(),
             ),

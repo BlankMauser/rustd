@@ -13,8 +13,7 @@ use cranelift_codegen::{
         condcodes::{FloatCC, IntCC},
         types,
     },
-    isa::{self, CallConv},
-    settings::{self, Configurable},
+    isa,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{
@@ -53,7 +52,7 @@ use crate::{
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
-    layout::{CoroutineFrame, Layout, RustcEnumVariantIdx},
+    layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
@@ -80,13 +79,19 @@ use super::{
 };
 
 mod asm;
+mod backend;
+pub use backend::Backend;
 mod cached;
 mod fragment;
 mod home;
 pub use home::body_file;
+#[cfg(feature = "llvm")]
+mod llvm;
 mod patch;
 mod stable;
 mod store;
+mod target;
+pub use target::{Arch, ObjectFormat, Target, UnwindFormat};
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{pack_name, seal_left_open};
@@ -203,6 +208,15 @@ enum PassMode {
     /// Aggregate the C ABI splits over two registers, the second holding what lies eight
     /// bytes in.
     CastPair(Type, Type),
+    /// Aggregate AAPCS64 hands over in `count` registers of one type, each holding the next
+    /// `unit` bytes of it. `skipped` registers of that kind go unused first: the convention
+    /// leaves them out when the value has to start at an even register, and takes them all
+    /// out of use when the value has to go to the stack, where the units then land.
+    Uniform {
+        unit: Type,
+        count: u8,
+        skipped: u8,
+    },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -213,6 +227,24 @@ enum PassMode {
 struct FnAbi {
     ret: PassMode,
     args: Vec<PassMode>,
+}
+
+/// How AAPCS64 sorts a value, before the registers that are left decide where it goes.
+enum Aapcs64 {
+    Ignore,
+    Scalar(AbiScalar),
+    /// A homogeneous aggregate of `count` floats of the type `unit`.
+    Floats {
+        unit: Type,
+        count: u8,
+    },
+    /// Any other aggregate of at most sixteen bytes.
+    Ints {
+        size: u64,
+        align: u64,
+    },
+    /// A larger one, which the caller copies and passes the address of.
+    Memory,
 }
 
 /// What the System V x86-64 ABI calls the class of an eightbyte.
@@ -308,6 +340,7 @@ impl CodegenUnit {
                 Err(_) => None,
             };
             if let Some(patch) = patch {
+                backend::Tally::global().report();
                 let compiled_now = known.compiled_since_last_build();
                 known.stats = BuildStats {
                     bodies: base.bodies,
@@ -478,6 +511,7 @@ impl CodegenUnit {
                         eprintln!("without a stable name: {misses:?}");
                     }
                 }
+                backend::Tally::global().report();
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
@@ -643,6 +677,18 @@ impl Rejections {
     /// nothing to patch.
     pub fn patches(&self) -> bool {
         self.base.is_some()
+    }
+
+    /// Makes the next build a full one. A patch looks at everything the last build compiled,
+    /// and what an edit took away can only be looked at where a panic can be caught.
+    pub fn forget_base(&mut self) {
+        self.base = None;
+    }
+
+    /// Notes that rustc compiled `crates` from other source than they are first built from
+    /// here, so that what it compiled of them and of those that see them is not to be linked.
+    pub fn distrust(&mut self, db: &dyn HirDatabase, crates: &[Crate]) {
+        self.frozen.distrust(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
@@ -951,12 +997,12 @@ impl Resolved {
     }
 }
 
-/// The one target we compile for.
+/// The code generator of the one [`Target`] the process compiles for.
 fn target() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| target_with("backtracking"))
+        .get_or_init(|| Target::selected()?.isa("backtracking"))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -968,24 +1014,15 @@ fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| target_with("single_pass"))
+        .get_or_init(|| Target::selected()?.isa("single_pass"))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
 
 const LARGE: usize = 50_000;
 
-fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
-    let mut flags = settings::builder();
-    flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
-    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
-    flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
-    flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-    isa::lookup_by_name("x86_64-unknown-linux-gnu")
-        .map_err(|e| e.to_string())?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| e.to_string())
+fn selected_target() -> Result<&'static Target> {
+    Target::selected().map_err(CodegenError::Backend)
 }
 
 /// How many functions went through Cranelift since the process started.
@@ -1331,7 +1368,7 @@ impl TheirStatics {
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
-    let mut cg = Recorder::new(db, &**target()?);
+    let mut cg = Recorder::new(db, &**target()?, selected_target()?);
     let env =
         ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -1495,9 +1532,9 @@ fn compile<'db>(
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
-    let mut cg = Recorder::new(db, isa);
+    let mut cg = Recorder::new(db, isa, selected_target()?);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-    let code = emit(&mut ctx)?;
+    let code = Backend::emit(&mut cg, &mut ctx)?;
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(CompiledFunction { requests, code, layouts })
@@ -2459,8 +2496,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(data);
         }
-        if let Some(known) = self.base.and_then(|base| base.statics.get(&id)) {
-            if self.replaced.broken.contains(&patch::Node::Static(id)) {
+        let node = patch::Node::Static(id);
+        let known = self.base.and_then(|base| base.statics.get(&id));
+        // One with another value keeps its name, and what refers to it by that gets the new.
+        let again = known.filter(|_| self.replaced.changed.contains(&node));
+        if let Some(known) = known.filter(|_| again.is_none()) {
+            if self.replaced.broken.contains(&node) {
                 unsupported!("a static of the base changed");
             }
             let data =
@@ -2476,7 +2517,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
         let thread_local = is_thread_local(db, id);
-        let data = if self.patching || thread_local {
+        let data = if let Some(known) = again {
+            self.module.declare_data(&known.symbol, Linkage::Hidden, compiled.writable, false)?
+        } else if self.patching || thread_local {
             // Nothing else defines the statics of a program compiled to WebAssembly, and
             // under its own name a static is the same one after a build in full.
             let own = if cfg!(feature = "wasm") { self.symbols.static_(id) } else { None };
@@ -3476,8 +3519,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(match layout.backend_repr {
             BackendRepr::Scalar(_) if wide => PassMode::Indirect,
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
-            BackendRepr::ScalarPair(a, b) => {
-                let offset = a.size(&self.dl()).align_to(b.align(&self.dl()).abi);
+            BackendRepr::ScalarPair { a, b, b_offset: offset } => {
                 let (a, b) = (self.scalar(a)?, self.scalar(b)?);
                 // LLVM has a WebAssembly function return one value: of a pair it makes a
                 // pointer to where the pair goes, the first parameter.
@@ -3523,10 +3565,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 .collect::<Result<_>>()?;
             return Ok(FnAbi { ret, args });
         }
-        if !matches!(abi, ExternAbi::C { .. } | ExternAbi::System { .. } | ExternAbi::SysV64 { .. })
-        {
-            unsupported!("calling convention {abi:?}");
+        let arch = self.cg.target.arch;
+        match (abi, arch) {
+            (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::X86_64)
+            | (ExternAbi::SysV64 { .. }, Arch::X86_64) => self.sysv_x86_64_abi(ret, args),
+            (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::Aarch64) => {
+                self.aapcs64_abi(ret, args)
+            }
+            _ => unsupported!("calling convention {abi:?}"),
         }
+    }
+
+    /// The C convention of the System V x86-64 psABI, as rustc's `callconv/x86_64.rs` has it.
+    fn sysv_x86_64_abi(
+        &self,
+        ret: Ty<'db>,
+        args: impl IntoIterator<Item = Ty<'db>>,
+    ) -> Result<FnAbi> {
         let (mut int_regs, mut sse_regs) = (6usize, 8usize);
         let ret = match self.c_pass_mode(ret)? {
             PassMode::OnStack(_) => {
@@ -3545,6 +3600,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
+                PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -3559,6 +3615,182 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             });
         }
         Ok(FnAbi { ret, args: modes })
+    }
+
+    /// The C convention of AArch64 (AAPCS64), as rustc's `callconv/aarch64.rs` has it.
+    ///
+    /// Cranelift places scalars the way the convention does, so what is decided here is
+    /// what an aggregate turns into, and which registers it leaves unused: Cranelift hands
+    /// out registers one value at a time and knows nothing of a value that takes several
+    /// or none.
+    fn aapcs64_abi(&self, ret: Ty<'db>, args: impl IntoIterator<Item = Ty<'db>>) -> Result<FnAbi> {
+        const REGS: u8 = 8;
+        let ret = match self.aapcs64_class(ret)? {
+            Aapcs64::Ignore => PassMode::Ignore,
+            Aapcs64::Scalar(scalar) => PassMode::Direct(scalar),
+            Aapcs64::Floats { unit, count } => PassMode::Uniform { unit, count, skipped: 0 },
+            Aapcs64::Ints { size, .. } => Self::aapcs64_ints(size, 0),
+            // Its address comes in a register of its own, which is not an argument's.
+            Aapcs64::Memory => PassMode::Indirect,
+        };
+        let (mut ints, mut floats) = (0u8, 0u8);
+        let mut modes = Vec::new();
+        for ty in args {
+            modes.push(match self.aapcs64_class(ty)? {
+                Aapcs64::Ignore => PassMode::Ignore,
+                Aapcs64::Scalar(scalar) => {
+                    let (used, wide) = match scalar.ty {
+                        ty if ty.is_float() => (&mut floats, false),
+                        ty => (&mut ints, ty == types::I128),
+                    };
+                    if wide {
+                        // Cranelift starts it at an even register, or puts it on the stack
+                        // whole. The registers it did not fit in stay free there, where
+                        // the convention has them out of use: turn down what would use one.
+                        *used += *used % 2;
+                        if *used + 2 > REGS && *used < REGS {
+                            unsupported!("a 128-bit argument that the registers left do not hold");
+                        }
+                        *used = (*used + 2).min(REGS);
+                    } else {
+                        *used = (*used + 1).min(REGS);
+                    }
+                    PassMode::Direct(scalar)
+                }
+                Aapcs64::Floats { unit, count } if floats + count <= REGS => {
+                    floats += count;
+                    PassMode::Uniform { unit, count, skipped: 0 }
+                }
+                Aapcs64::Floats { unit, count } => {
+                    let skipped = REGS - floats;
+                    floats = REGS;
+                    let size = u64::from(unit.bytes()) * u64::from(count);
+                    PassMode::Uniform { unit: types::F64, count: size.div_ceil(8) as u8, skipped }
+                }
+                Aapcs64::Ints { size, align } => {
+                    let count = size.div_ceil(8) as u8;
+                    let odd = if align > 8 { ints % 2 } else { 0 };
+                    if ints + odd + count <= REGS {
+                        ints += odd + count;
+                        Self::aapcs64_ints(size, odd)
+                    } else if align > 8 {
+                        // FIXME: the stack is where it goes, at an address that is a
+                        // multiple of sixteen, which the units of a `Uniform` are not at.
+                        unsupported!("an aggregate aligned to 16 bytes passed on the stack");
+                    } else {
+                        let skipped = REGS - ints;
+                        ints = REGS;
+                        PassMode::Uniform { unit: types::I64, count, skipped }
+                    }
+                }
+                Aapcs64::Memory => {
+                    ints = (ints + 1).min(REGS);
+                    PassMode::Indirect
+                }
+            });
+        }
+        Ok(FnAbi { ret, args: modes })
+    }
+
+    /// An aggregate of at most sixteen bytes in integer registers, `skipped` of them unused.
+    fn aapcs64_ints(size: u64, skipped: u8) -> PassMode {
+        match size {
+            // An integer of exactly the aggregate's size; the bits above it are undefined.
+            1 if skipped == 0 => PassMode::Cast(types::I8),
+            2 if skipped == 0 => PassMode::Cast(types::I16),
+            3 | 4 if skipped == 0 => PassMode::Cast(types::I32),
+            5..=8 if skipped == 0 => PassMode::Cast(types::I64),
+            _ => PassMode::Uniform { unit: types::I64, count: size.div_ceil(8) as u8, skipped },
+        }
+    }
+
+    /// What AAPCS64 makes of a value before it looks for registers.
+    fn aapcs64_class(&self, ty: Ty<'db>) -> Result<Aapcs64> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(Aapcs64::Ignore);
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(scalar) => return Ok(Aapcs64::Scalar(self.scalar(scalar)?)),
+            BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
+            _ => (),
+        }
+        let size = layout.size.bytes();
+        let mut leaves = Vec::new();
+        self.scalar_leaves(ty, 0, &mut leaves)?;
+        // The members of a union lie over each other.
+        leaves.sort_by_key(|&(offset, _)| offset);
+        leaves.dedup();
+        // A homogeneous floating-point aggregate: one to four floats of one type and
+        // nothing else, which go in as many vector registers.
+        if let Some(&(_, first)) = leaves.first()
+            && let Primitive::Float(_) = first.primitive()
+            && leaves.len() <= 4
+        {
+            let unit = self.scalar(first)?.ty;
+            let step = u64::from(unit.bytes());
+            let packed = leaves.iter().zip(0..).all(|(&(offset, scalar), index)| {
+                offset == index * step && scalar.primitive() == first.primitive()
+            });
+            if packed && leaves.len() as u64 * step == size {
+                return Ok(Aapcs64::Floats { unit, count: leaves.len() as u8 });
+            }
+        }
+        if size > 16 {
+            return Ok(Aapcs64::Memory);
+        }
+        Ok(Aapcs64::Ints { size, align: layout.align.abi.bytes() })
+    }
+
+    /// Every scalar a value of the C ABI is made of, with where in the value it is.
+    fn scalar_leaves(
+        &self,
+        ty: Ty<'db>,
+        offset: u64,
+        leaves: &mut Vec<(u64, Scalar)>,
+    ) -> Result<()> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(());
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(a) => leaves.push((offset, a)),
+            BackendRepr::ScalarPair { a, b, b_offset } => {
+                leaves.extend([(offset, a), (offset + b_offset.bytes(), b)]);
+            }
+            BackendRepr::Memory { sized: true } => match ty.kind() {
+                TyKind::Tuple(tys) => {
+                    for (i, ty) in tys.iter().enumerate() {
+                        self.scalar_leaves(ty, offset + layout.fields.offset(i).bytes(), leaves)?;
+                    }
+                }
+                TyKind::Array(element, _) => {
+                    let stride = self.layout(element)?.size.bytes();
+                    for i in 0..layout.fields.count() as u64 {
+                        // More than a register class holds: nothing asks what the rest is.
+                        if leaves.len() > 16 {
+                            break;
+                        }
+                        self.scalar_leaves(element, offset + i * stride, leaves)?;
+                    }
+                }
+                TyKind::Adt(def, subst) => {
+                    let variant: VariantId = match def.def_id() {
+                        AdtId::StructId(id) => id.into(),
+                        AdtId::UnionId(id) => id.into(),
+                        AdtId::EnumId(_) => unsupported!("enum {ty:?} in the C ABI"),
+                    };
+                    for (field, ty) in self.cg.db.field_types(variant).iter() {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
+                        self.scalar_leaves(ty, offset + field.bytes(), leaves)?;
+                    }
+                }
+                _ => unsupported!("{ty:?} in the C ABI"),
+            },
+            _ => unsupported!("{ty:?} in the C ABI"),
+        }
+        Ok(())
     }
 
     fn count_regs(&self, types: &[Type]) -> (usize, usize) {
@@ -3629,9 +3861,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         match layout.backend_repr {
             BackendRepr::Scalar(a) => scalar(a, offset),
-            BackendRepr::ScalarPair(a, b) => {
+            BackendRepr::ScalarPair { a, b, b_offset } => {
                 scalar(a, offset);
-                scalar(b, offset + a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes());
+                scalar(b, offset + b_offset.bytes());
             }
             BackendRepr::Memory { sized: true } => match ty.kind() {
                 TyKind::Tuple(tys) => {
@@ -3681,6 +3913,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Pair(a, b, _) => params.extend([a.param(), b.param()]),
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
             PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
+            PassMode::Uniform { unit, count, skipped } => {
+                params.extend((0..skipped + count).map(|_| AbiParam::new(unit)))
+            }
             PassMode::Indirect => params.push(AbiParam::new(PTR)),
             PassMode::OnStack(size) => {
                 params.push(AbiParam::special(PTR, ArgumentPurpose::StructArgument(size)))
@@ -3689,7 +3924,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         match ret {
             PassMode::Indirect => {
                 sig.params.push(AbiParam::special(PTR, ArgumentPurpose::StructReturn))
@@ -3738,6 +3973,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 values.push(self.load_cast(b, rest, layout.size - Size::from_bytes(8)));
             }
+            PassMode::Uniform { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    values.push(self.zero(unit));
+                }
+                let step = u64::from(unit.bytes());
+                for index in 0..u64::from(count) {
+                    let part = self.builder.ins().iadd_imm(addr, (index * step) as i64);
+                    let left = layout.size - Size::from_bytes(index * step);
+                    values.push(self.load_cast(unit, part, left.min(Size::from_bytes(step))));
+                }
+            }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
@@ -3778,6 +4024,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 self.store_cast(b, rest, layout.size - Size::from_bytes(8));
             }
+            PassMode::Uniform { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    next();
+                }
+                let step = u64::from(unit.bytes());
+                for index in 0..u64::from(count) {
+                    let value = next();
+                    let part = self.builder.ins().iadd_imm(addr, (index * step) as i64);
+                    let left = layout.size - Size::from_bytes(index * step);
+                    self.store_cast(value, part, left.min(Size::from_bytes(step)));
+                }
+            }
+        }
+    }
+
+    /// The value of `ty` that is all zero bits.
+    fn zero(&mut self, ty: Type) -> Value {
+        match ty {
+            types::F32 => self.builder.ins().f32const(0.0),
+            types::F64 => self.builder.ins().f64const(0.0),
+            _ => self.builder.ins().iconst(ty, 0),
         }
     }
 
@@ -4433,8 +4700,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.builder.switch_to_block(block);
                         let index = variant.index(db);
                         let variant_layout = match &layout.variants {
-                            Variants::Multiple { variants, .. } => {
-                                variants[RustcEnumVariantIdx(index)].clone()
+                            Variants::Multiple { .. } => {
+                                Layout::for_variant(&layout, RustcEnumVariantIdx(index))
                             }
                             _ => (*layout).clone(),
                         };
@@ -4596,7 +4863,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         addr = self.builder.ins().load(PTR, MEM, addr, 0);
                         meta = None;
                     }
-                    BackendRepr::ScalarPair(..) => {
+                    BackendRepr::ScalarPair { .. } => {
                         meta = Some(self.builder.ins().load(PTR, MEM, addr, META));
                         addr = self.builder.ins().load(PTR, MEM, addr, 0);
                     }
@@ -4619,9 +4886,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             let Some(VariantId::EnumVariantId(variant)) = prev.variant_id else {
                                 unsupported!("field of enum without downcast");
                             };
-                            variants[RustcEnumVariantIdx(variant.index(self.cg.db))]
-                                .fields
-                                .offset(field.0 as usize)
+                            variants[RustcEnumVariantIdx(variant.index(self.cg.db))].field_offsets
+                                [RustcFieldIdx::new(field.0 as usize)]
                         }
                     };
                     addr = self.unsized_field_addr(addr, meta, prev.ty, offset, ty.ty)?;
@@ -4705,7 +4971,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(PTR); 3]);
         let callee = self.cg.import_path("core::panicking::panic_bounds_check", &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5338,8 +5604,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             });
         }
-        let arch = self.cg.isa.triple().architecture.to_string();
-        let wrapper = asm::wrapper(&arch, &block.template, block.options, &operands)
+        let wrapper = asm::wrapper(self.cg.target.arch, &block.template, block.options, &operands)
             .map_err(CodegenError::Unsupported)?;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -5355,7 +5620,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(to, addr, size);
             }
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.assembly(wrapper.text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5440,7 +5705,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Rvalue::Ref(_, place) => {
                 let place = self.place_ref(place)?;
                 store(self, place.addr);
-                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty.ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(dst_ty.ty)?.backend_repr {
                     let Some(meta) = place.meta else {
                         unsupported!("fat reference to a place without metadata");
                     };
@@ -5609,8 +5874,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 // Fat to fat keeps the metadata, fat to thin drops it.
                 (
-                    BackendRepr::ScalarPair(..),
-                    BackendRepr::ScalarPair(..) | BackendRepr::Scalar(_),
+                    BackendRepr::ScalarPair { .. },
+                    BackendRepr::ScalarPair { .. } | BackendRepr::Scalar(_),
                 ) => self.copy(dst, src, to.size),
                 _ => unsupported!("cast from {from_ty:?} to {to_ty:?}"),
             },
@@ -5692,8 +5957,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 unsupported!("niche enum with explicit discriminants");
                             }
                         }
-                        let first = niche_variants.start().0;
-                        let count = niche_variants.end().0 - first;
+                        let first = niche_variants.start.0;
+                        let count = niche_variants.last.0 - first;
                         let start = self.iconst(tag.ty, *niche_start);
                         let relative = self.builder.ins().isub(value, start);
                         let is_niche = self.builder.ins().icmp_imm(
@@ -5724,9 +5989,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let db = self.cg.db;
         let adt: AdtId = variant.adt_id(db);
         let layout = self.layout(Ty::new_adt(self.interner, adt, args))?;
-        let (tag, tag_encoding, tag_field, variants) = match &layout.variants {
-            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
-                (tag, tag_encoding, tag_field, variants)
+        let (tag, tag_encoding, tag_field) = match &layout.variants {
+            Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
+                (tag, tag_encoding, tag_field)
             }
             Variants::Single { index } => {
                 let inhabited = match variant {
@@ -5752,14 +6017,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             TagEncoding::Niche { untagged_variant, .. } if untagged_variant.0 == index => None,
             TagEncoding::Niche { niche_variants, niche_start, .. } => {
-                Some(((index - niche_variants.start().0) as u128).wrapping_add(*niche_start))
+                Some(((index - niche_variants.start.0) as u128).wrapping_add(*niche_start))
             }
         };
         if let Some(tag_value) = tag_value {
             let value = self.iconst(tag_ty, tag_value);
             self.builder.ins().store(MEM, value, dst, offset);
         }
-        Ok(Some(Arc::new(variants[RustcEnumVariantIdx(index)].clone())))
+        Ok(Some(Arc::new(Layout::for_variant(&layout, RustcEnumVariantIdx(index)))))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {
@@ -5822,7 +6087,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(self.builder.block_params(done)[0]);
         }
         if matches!(ty.kind(), TyKind::RawPtr(..))
-            && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair(..))
+            && matches!(self.layout(ty)?.backend_repr, BackendRepr::ScalarPair { .. })
         {
             // Wide pointers compare by address, then by metadata.
             let cc = match op {
@@ -5965,7 +6230,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
         sig.returns.push(AbiParam::new(ty));
         let callee = self.cg.import(name, &sig)?;
@@ -5988,7 +6253,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 (_, false, types::F64, _) => "__floatuntidf",
                 _ => unsupported!("cast from {} to {}", from.ty, to.ty),
             };
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.push(AbiParam::new(from.ty));
             sig.returns.push(AbiParam::new(to.ty));
             let callee = self.cg.import(name, &sig)?;
@@ -6065,7 +6330,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.import_path(&path, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -6538,7 +6803,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         let receiver_layout = self.layout(receiver_ty)?;
-        if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair(..))
+        if !matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair { .. })
             || receiver_layout.size.bytes_usize() != 2 * WORD
         {
             unsupported!("vtable call with receiver {receiver_ty:?}");
@@ -6706,7 +6971,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut blob =
             ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: WORD as u64 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.push(AbiParam::new(PTR));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
@@ -7902,14 +8167,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("discriminant_value", [arg]) => {
-                let (ptr, _) = self.load_scalar(arg)?;
+                // The reference may be a wide one, of a struct that ends in a slice.
+                let (reference, _) = self.operand(arg)?;
+                let ptr = self.builder.ins().load(PTR, MEM, reference, 0);
                 let to = self.scalar_of(dst_ty)?;
                 let value = self.discriminant(ptr, generic_args.type_at(0), to)?;
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("ptr_metadata", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
-                if let BackendRepr::ScalarPair(..) = self.layout(ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(ty)?.backend_repr {
                     let meta = self.builder.ins().load(PTR, MEM, src, META);
                     self.builder.ins().store(MEM, meta, dst, 0);
                 }
@@ -7918,7 +8185,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (data, _) = self.operand(data)?;
                 let data = self.builder.ins().load(PTR, MEM, data, 0);
                 self.builder.ins().store(MEM, data, dst, 0);
-                if let BackendRepr::ScalarPair(..) = self.layout(dst_ty)?.backend_repr {
+                if let BackendRepr::ScalarPair { .. } = self.layout(dst_ty)?.backend_repr {
                     let (meta, _) = self.load_scalar(meta)?;
                     self.builder.ins().store(MEM, meta, dst, META);
                 }
@@ -8032,7 +8299,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = self.cg.make_signature();
                 sig.params.push(AbiParam::new(types::I32));
                 sig.returns.push(AbiParam::new(types::I64));
                 let callee = self.cg.assembly(asm::xgetbv(), &sig);
@@ -8040,6 +8307,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let call = self.builder.ins().call(callee, &[register]);
                 let value = self.builder.inst_results(call)[0];
                 self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
+                let (singles, _) = self.operand(singles)?;
+                let (rounding, _) = self.load_scalar(rounding)?;
+                let mut sig = self.cg.make_signature();
+                sig.params.extend([AbiParam::new(PTR), AbiParam::new(PTR)]);
+                sig.params.push(AbiParam::new(types::I32));
+                let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
+                let callee = self.cg.assembly(asm::vcvtps2ph(register), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &[singles, dst, rounding]);
             }
             ("x86.pclmulqdq" | "x86.pclmulqdq.256" | "x86.pclmulqdq.512", [a, b, halves]) => {
                 let (a, ty) = self.operand(a)?;
@@ -8086,7 +8364,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// The lane type and lane count of a vector type. Lanes sit in memory in order.
     fn simd_lanes(&self, ty: Ty<'db>) -> Result<(AbiScalar, u64)> {
         match self.layout(ty)?.backend_repr {
-            BackendRepr::SimdVector { element, count } => Ok((self.scalar(element)?, count)),
+            BackendRepr::SimdVector { element, count } => {
+                Ok((self.scalar(element)?, count.as_u64()))
+            }
             _ => unsupported!("vector operation on {ty:?}"),
         }
     }
@@ -8095,7 +8375,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// those call compiler-builtins.
     fn divide(&mut self, l: Value, r: Value, div: bool, signed: bool) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::I128 {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = self.cg.make_signature();
             sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
             sig.returns.push(AbiParam::new(types::I128));
             let name = match (div, signed) {
@@ -8120,7 +8400,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in
     /// `compiler_builtins`.
     fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
         sig.params.push(AbiParam::new(PTR));
         sig.returns.push(AbiParam::new(types::I128));
@@ -8135,7 +8415,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(PTR); 3]);
         sig.returns.push(AbiParam::new(types::I32));
         let memcmp = self.cg.import("memcmp", &sig)?;
@@ -8484,7 +8764,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         let mut values = vec![addr];
         if self.is_unsized(ty) {
@@ -8503,7 +8783,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(PTR));
         if self.is_unsized(ty) {
             sig.params.push(AbiParam::new(PTR));
@@ -8635,7 +8915,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 );
                             }
                         };
-                        let Variants::Multiple { variants, .. } = &layout.variants else {
+                        let Variants::Multiple { .. } = &layout.variants else {
                             return Ok(());
                         };
                         let l_discr = self.discriminant(l, ty, wide.scalar())?;
@@ -8659,7 +8939,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         switch.emit(&mut self.builder, l_discr, done);
                         for (block, variant) in arms {
                             self.builder.switch_to_block(block);
-                            let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                            let index = RustcEnumVariantIdx(variant.index(db));
+                            let layout = &Layout::for_variant(&layout, index);
                             self.branch_unless_fields_equal(
                                 l,
                                 r,
@@ -8746,7 +9027,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 self.drop_fields(addr, &layout, variant.into(), subst, ty, meta)?;
                             }
                         }
-                        Variants::Multiple { variants, tag, .. } => {
+                        Variants::Multiple { tag, .. } => {
                             let wide = DiscriminantWidth::of(tag);
                             let discr = self.discriminant(addr, ty, wide.scalar())?;
                             let done = self.builder.create_block();
@@ -8763,7 +9044,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             switch.emit(&mut self.builder, discr, done);
                             for (block, variant) in arms {
                                 self.builder.switch_to_block(block);
-                                let layout = &variants[RustcEnumVariantIdx(variant.index(db))];
+                                let index = RustcEnumVariantIdx(variant.index(db));
+                                let layout = &Layout::for_variant(&layout, index);
                                 self.drop_fields(addr, layout, variant.into(), subst, ty, meta)?;
                                 self.builder.ins().jump(done, &[]);
                             }
@@ -8834,7 +9116,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let done = self.builder.create_block();
                 self.builder.ins().brif(glue, call, &[], done, &[]);
                 self.builder.switch_to_block(call);
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = self.cg.make_signature();
                 sig.params.push(AbiParam::new(PTR));
                 let sig = self.builder.import_signature(sig);
                 self.invoke_indirect(sig, glue, &[addr]);

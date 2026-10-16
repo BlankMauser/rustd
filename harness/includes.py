@@ -5,11 +5,11 @@ The file is not a `.rs` file, so nothing loads it until the macro is expanded. E
 it or the file that includes it, asks the daemon for the program and compares what it prints
 with what `cargo build` of the same source prints.
 """
-import os, shlex, subprocess, sys, tempfile, time
+import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 TOML = """[package]
 name = "sinc"
@@ -72,7 +72,9 @@ def follow(files, steps):
     link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
     link[link.index("-o") + 1] = binary
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *symbols]
+    # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
+    splice = ["--binary", binary]
+    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
     out = open(log_path, "a")
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
@@ -82,13 +84,23 @@ def follow(files, steps):
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
+    def linked(seen):
+        """How the daemon made the binary since the log was `seen` long."""
+        links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
+        if not links:
+            return "no link"
+        return "spliced" if links[-1].startswith("spliced") else \
+            "full: " + (re.search(r"not spliced: (.*)", links[-1]) or [None, "not asked to splice"])[1]
+
     wrong = 0
-    for what, edits, broken in steps:
+    # A step may say after `broken` what the way the binary was made has to contain.
+    for what, edits, broken, *how in steps:
+        seen = len(open(log_path).read())
         for path, old, new in edits:
             text = open(os.path.join(ws, path)).read()
             assert old in text, (what, old)
@@ -108,7 +120,10 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(os.path.join(reference, "debug", "sinc")) else "DIFFERENT OUTPUT"
+            verdict = "same" if run(binary) == run(os.path.join(profile_dir(reference), "sinc")) else "DIFFERENT OUTPUT"
+        made = linked(seen)
+        if how and not verdict.isupper() and how[0] not in made:
+            verdict = f"NOT {how[0]}: {made}"[:60]
         wrong += verdict.isupper()
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()

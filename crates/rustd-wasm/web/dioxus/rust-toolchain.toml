@@ -1,6 +1,7 @@
-# rustd computes `TypeId`s the way this toolchain's rustc does, and the two must agree for
-# `downcast` to work across the module rustc built and the code rustd links into it.
+# The stable rustd is pinned to (`harness/toolchain`). rustd computes layouts and `TypeId`s
+# the way this rustc does, and the two must agree for what it links into the module rustc
+# built: `downcast` across the two is one thing that depends on it.
 [toolchain]
-channel = "nightly-2026-05-10"
+channel = "1.99.0"
 components = ["rust-src"]
 targets = ["wasm32-unknown-unknown"]

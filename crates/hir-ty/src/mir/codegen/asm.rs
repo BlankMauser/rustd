@@ -14,7 +14,9 @@ use object::{Object, ObjectSection, ObjectSymbol};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use super::store::Store;
+use super::{Arch, store::Store};
+
+mod aarch64;
 
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
@@ -23,6 +25,21 @@ const SYMBOL: &str = "rustd_asm_block";
 /// control register its argument numbers.
 pub(super) fn xgetbv() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, edi\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n")
+}
+
+/// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
+/// argument and writes them to its second. The rounding is part of the instruction, so there
+/// is one for each of the eight, and the third argument says which runs.
+pub(super) fn vcvtps2ph(register: &str) -> String {
+    let mut text = format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [rdi]\nand edx, 7\nshl edx, 4\n\
+         lea rax, [rip + .Lrounding]\nadd rax, rdx\njmp rax\n.p2align 4\n.Lrounding:\n"
+    );
+    for rounding in 0..8 {
+        _ = write!(text, ".p2align 4\nvcvtps2ph xmm0, {register}, {rounding}\njmp .Lconverted\n");
+    }
+    text.push_str(".Lconverted:\nvmovdqu [rsi], xmm0\nvzeroupper\nret\n");
+    text
 }
 
 /// One operand of a block, as the function around it sees it.
@@ -142,19 +159,28 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
     }
 }
 
-/// The function for a block on x86-64.
+/// The function for a block, in the assembly of the architecture.
 pub(super) fn wrapper(
-    arch: &str,
+    arch: Arch,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
-    if arch != "x86_64" {
-        return Err(format!("inline assembly for {arch}"));
-    }
     if options.contains(AsmOptions::MAY_UNWIND) {
         return Err("inline assembly that unwinds".to_owned());
     }
+    match arch {
+        Arch::X86_64 => wrapper_x86_64(template, options, operands),
+        Arch::Aarch64 => aarch64::wrapper(template, options, operands),
+    }
+}
+
+/// The function for a block on x86-64.
+fn wrapper_x86_64(
+    template: &[AsmPiece],
+    options: AsmOptions,
+    operands: &[Operand<'_>],
+) -> Result<Wrapper, String> {
     // The registers the operands name come first: a class takes one of what is left.
     let mut regs = vec![None; operands.len()];
     for (index, operand) in operands.iter().enumerate() {
@@ -297,7 +323,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
     let code: Arc<[u8]> = match store.and_then(|it| it.get(&key)) {
         Some(code) => code.into(),
         None => {
-            let code: Arc<[u8]> = run_assembler(triple, text, &key)?.into();
+            let code: Arc<[u8]> = Assembler::selected().assemble(triple, text, &key)?.into();
             if let Some(store) = store {
                 store.insert(&key, &code);
             }
@@ -308,6 +334,34 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         assembled.insert(key, code.clone());
     }
     Ok(code)
+}
+
+/// What turns the text of a block into an object file.
+#[derive(Clone, Copy)]
+enum Assembler {
+    /// rustc, run as a process: the one assembler sure to be there.
+    Rustc,
+    /// LLVM's, in this process, when LLVM is the producer of code.
+    #[cfg(feature = "llvm")]
+    Llvm,
+}
+
+impl Assembler {
+    fn selected() -> Assembler {
+        match super::Backend::from_env() {
+            #[cfg(feature = "llvm")]
+            Ok(super::Backend::Llvm(_)) => Assembler::Llvm,
+            _ => Assembler::Rustc,
+        }
+    }
+
+    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+        match self {
+            Assembler::Rustc => run_assembler(triple, text, key),
+            #[cfg(feature = "llvm")]
+            Assembler::Llvm => code(&super::llvm::assemble(text)?),
+        }
+    }
 }
 
 /// FIXME: this runs rustc, which is the one assembler sure to be there and to read what

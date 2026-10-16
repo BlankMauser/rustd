@@ -1391,8 +1391,6 @@ dependencies = [
 [[package]]
 name = "ra-ap-rustc_abi"
 version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2cf1b1ffe31b6226c00b40cddfda65002b7729f9f4ed2d547b5856cdab0011c"
 dependencies = [
  "bitflags",
  "ra-ap-rustc_hashes",

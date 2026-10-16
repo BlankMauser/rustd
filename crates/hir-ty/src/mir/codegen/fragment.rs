@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, unwind::FunctionUnwind,
+    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -134,10 +135,20 @@ pub struct CompiledStatic {
     pub(super) writable: bool,
 }
 
+/// How many requests a [`Recorder`] had at some point, to tell the ones made since.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+pub(super) struct Mark {
+    pub(super) funcs: usize,
+    pub(super) datas: usize,
+}
+
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
+    /// What `isa` generates code for.
+    pub(super) target: &'static Target,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -148,10 +159,15 @@ pub(super) struct Recorder<'db> {
 }
 
 impl<'db> Recorder<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, isa: &'static dyn TargetIsa) -> Self {
+    pub(super) fn new(
+        db: &'db dyn HirDatabase,
+        isa: &'static dyn TargetIsa,
+        target: &'static Target,
+    ) -> Self {
         Recorder {
             db,
             isa,
+            target,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -171,6 +187,17 @@ impl<'db> Recorder<'db> {
                 .collect()
         });
         (self.requests, layouts)
+    }
+
+    #[cfg(feature = "llvm")]
+    pub(super) fn mark(&self) -> Mark {
+        Mark { funcs: self.requests.funcs.len(), datas: self.requests.datas.len() }
+    }
+
+    /// The requests made since `mark`.
+    #[cfg(feature = "llvm")]
+    pub(super) fn since(&self, mark: Mark) -> (&[FuncRequest], &[DataRequest]) {
+        (&self.requests.funcs[mark.funcs..], &self.requests.datas[mark.datas..])
     }
 
     fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {

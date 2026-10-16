@@ -17,7 +17,7 @@ harness and this report.
 | binaries, command lines the same | 25 of 29 on the 3 that ran, 4 did not run | 68 of 68 over 7 binaries | `bintest.py <name>` |
 | `harness/corpus` | 661 of 662, MATCH | 661 of 662, MATCH | `difftest.py corpus --bin runner --crate cases` |
 | `harness/stress.py` | 99 of 99 | 99 of 99, 0 restarts | `stress.py` |
-| reduced breakers | | 13 of 13 right, 3 open | `breakers.py` |
+| reduced breakers | | 15 of 15 right, 1 open | `breakers.py` |
 
 "Before" has no single number for the 93 crates: I stopped the first sweep with the
 unmodified rustd after 29 crates, to restart it with the first fixes in. In those 29, rustd
@@ -136,8 +136,8 @@ Open. 95 functions in 11 crates, and 2 crates with differing tests.
 |---|---|---|---|---|
 | rust-analyzer does not infer a type or resolve a method that rustc does (`UnresolvedMethod`, `HasErrors`, `{type error}` in a layout, `MissingFunctionDefinition`, `TypeError`, monomorphization errors) | 80 | bitvec 41, generic-array 15, itertools 9, im 6, nalgebra 3, petgraph 3, ryu 2, zerocopy 1 | no | Open-ended. Each is a separate inference bug in hir-ty, mostly around associated types of type-level numbers (typenum, bitvec's `BitStore`) and types known only from a later use. Days each, and upstream rust-analyzer work rather than codegen work. |
 | Generic function inside a `const _` block inside a function, twice in one function: compiled without its parameters, and both get one name | 9 | pin-project-lite | no, a plain copy of the pattern compiles | Small once reproduced, likely a day: the name needs the block's index, and the function is generic. |
-| `llvm.x86.vcvtps2ph` (F16C) missing | 3 | half | `f16c` | Small, half a day: the `xgetbv` way (a function of the one instruction) or the conversion in software. |
-| Comparing two references to a struct that ends in a slice reads each as one scalar | 2 | triomphe | `unsized_tail_cmp` | Small to medium, a day: the derive's comparison goes through a path in codegen that expects a thin pointer. |
+| `llvm.x86.vcvtps2ph` (F16C) missing. Fixed since: a function of the instruction, one for each rounding | 3 | half | `f16c` | Done; `half` itself not rerun. |
+| Comparing two references to a struct that ends in a slice. Fixed since: the derive's `discriminant_value` read the wide reference as one scalar | 2 | triomphe | `unsized_tail_cmp` | Done; `triomphe` itself not rerun. |
 | A call resolved to a trait method with no body (`into`) | 1 | zerocopy | no | Unknown, probably the first row again. |
 | Futures are larger than rustc's: no overlap of variables across await points | 4 tests | futures | `future_size` | Large, a week or more: coroutine layout as rustc does it, with liveness across suspension points. Changes no behaviour other than size. |
 | Frames are larger than rustc's, a deep recursion overflows the stack | 1 test | simd-json | no | Medium to large: Cranelift without optimization gives each MIR local a slot. Fix 9 removed the worst case. |

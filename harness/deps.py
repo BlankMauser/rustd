@@ -11,6 +11,8 @@ Needs the crates in cargo's local registry cache: it builds offline."""
 import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from difftest import RUNNER, TARGET, profile_dir
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "..", "target", "release", "rustd")
 LOCAL = ["app", "near"]
 
@@ -36,10 +38,23 @@ def cargo(root):
         words = line.split()
         if len(words) >= 2 and words[0] in ("Fresh", "Compiling", "Dirty"):
             said.setdefault(words[0], set()).add(words[1])
-    return said, subprocess.run([f"{root}/target/debug/app"], capture_output=True, text=True).stdout
+    return said, subprocess.run([*RUNNER, os.path.join(profile_dir(f"{root}/target"), "app")], capture_output=True, text=True).stdout
 
-def rustd(root, *args):
-    return subprocess.run([RUSTD, "deps", *args], cwd=root, capture_output=True, text=True)
+# The directories cargo builds a profile in, and the list each is sent under. A build for a
+# target that is not the host has two: build scripts and proc macros are built for the host.
+PROFILES = [("target/debug", "it")] + ([(profile_dir("target"), "it-" + TARGET)] if TARGET else [])
+
+class Said:
+    """What `rustd deps` said for each directory of the profile."""
+    def __init__(self, outs):
+        self.returncode = max(out.returncode for out in outs)
+        self.stdout, self.stderr = ("".join(getattr(out, it) for out in outs) for it in ("stdout", "stderr"))
+        self.nothing = all(out.stdout.startswith("0 units") for out in outs)
+        self.something = not any(" 0 units" in out.stdout for out in outs)
+
+def rustd(root, verb, remote):
+    return Said([subprocess.run([RUSTD, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True)
+                 for directory, name in PROFILES])
 
 right = total = 0
 def check(what, ok, detail=""):
@@ -54,25 +69,25 @@ _, printed = cargo(first)
 shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
 shutil.copytree(first, third, ignore=shutil.ignore_patterns("target"))
 
-out = rustd(first, "push", remote, "target/debug", "it")
-check("the units are pushed", out.returncode == 0 and " 0 units" not in out.stdout, out.stdout.strip() + out.stderr.strip())
-listed = open(f"{remote}/deps/it").read().split("\n")
+out = rustd(first, "push", remote)
+check("the units are pushed", out.returncode == 0 and out.something, out.stdout.strip() + out.stderr.strip())
+listed = [line for _, name in PROFILES for line in open(f"{remote}/deps/{name}").read().split("\n")]
 check("none of a crate at a path", not any(line.rsplit("-", 1)[0] in LOCAL for line in listed))
-out = rustd(first, "push", remote, "target/debug", "it")
-check("a second push sends nothing", out.stdout.startswith("0 units"), out.stdout.strip())
+out = rustd(first, "push", remote)
+check("a second push sends nothing", out.nothing, out.stdout.strip())
 
-out = rustd(second, "pull", remote, "target/debug", "it")
+out = rustd(second, "pull", remote)
 check("the units are pulled", out.returncode == 0, out.stdout.strip() + out.stderr.strip())
 said, again = cargo(second)
 check("cargo compiles the local crates only", said.get("Compiling") == set(LOCAL) and not said.get("Dirty"), str(said.get("Compiling")))
 check("and finds the others fresh", len(said.get("Fresh", ())) >= 10, str(len(said.get("Fresh", ()))))
 check("the program prints the same", again == printed and printed, repr(again))
-out = rustd(second, "pull", remote, "target/debug", "it")
-check("a second pull fetches nothing", out.stdout.startswith("0 units"), out.stdout.strip())
+out = rustd(second, "pull", remote)
+check("a second pull fetches nothing", out.nothing, out.stdout.strip())
 
 unit = sorted(os.listdir(f"{remote}/units"))[0]
 open(f"{remote}/units/{unit}", "ab").write(b"x")
-out = rustd(third, "pull", remote, "target/debug", "it")
+out = rustd(third, "pull", remote)
 check("an archive that was changed is refused", out.returncode != 0 and "not what was sent" in out.stderr, out.stderr.strip()[-80:])
 said, again = cargo(third)
 check("and cargo builds what is missing", again == printed, repr(again))

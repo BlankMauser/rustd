@@ -9,7 +9,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -53,6 +53,11 @@ STEPS = [
 ]
 
 
+def splice(program):
+    """Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full."""
+    return ["--binary", program["bin"]]
+
+
 def main():
     ws = tempfile.mkdtemp(prefix="rustd-programs-")
     shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
@@ -81,7 +86,7 @@ def main():
     out = open(log_path, "a")
     daemon = subprocess.Popen(
         [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"]], stderr=out, stdout=out)
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -89,7 +94,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -107,7 +112,7 @@ def main():
             began = time.time()
             reply = subprocess.run(
                 [RUSTD, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
-                 "--link-cmd", program["link"], *program["symbols"]], capture_output=True, text=True, timeout=120)
+                 "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
             cargo = subprocess.run(["cargo", "build", "-q", "-p", name], cwd=ws, capture_output=True, text=True,
@@ -120,7 +125,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                verdict = "same" if run(program["bin"]) == run(os.path.join(reference, "debug", name)) else "DIFFERENT OUTPUT"
+                verdict = "same" if run(program["bin"]) == run(os.path.join(profile_dir(reference), name)) else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)

@@ -37,6 +37,8 @@ inherits = "release"
 debug = 2
 
 [patch.'crates-io']
+# rustc's layout code, from the tag of the stable in `harness/toolchain`.
+ra-ap-rustc_abi = { path = "lib/rustc_abi" }
 # rowan = { path = "../rowan" }
 
 # line-index = { path = "lib/line-index" }

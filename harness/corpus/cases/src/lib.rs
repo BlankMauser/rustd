@@ -2,7 +2,8 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-#![feature(box_patterns)]
+// `box` patterns are unstable: the case is for a nightly toolchain only.
+#![cfg_attr(feature = "nightly", feature(box_patterns))]
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
@@ -820,6 +821,50 @@ pub mod simd {
             out
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    use std::arch::aarch64::*;
+
+    /// A bit per byte that is the needle, as `_mm_movemask_epi8` has them.
+    #[cfg(target_arch = "aarch64")]
+    pub fn find(hay: &[u8; 16], needle: u8) -> i32 {
+        unsafe {
+            let hay = vld1q_u8(hay.as_ptr());
+            let equal = vceqq_u8(hay, vdupq_n_u8(needle));
+            let bits = vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            let masked = vandq_u8(equal, bits);
+            let low = vaddv_u8(vget_low_u8(masked)) as i32;
+            let high = vaddv_u8(vget_high_u8(masked)) as i32;
+            low | high << 8
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn shuffle(a: &[u8; 16], b: &[u8; 16]) -> ([u8; 16], i32) {
+        unsafe {
+            let x = vld1q_u8(a.as_ptr());
+            let y = vld1q_u8(b.as_ptr());
+            let shifted = vreinterpretq_u8_u16(vshrq_n_u16::<3>(vreinterpretq_u16_u8(x)));
+            let z = vqtbl1q_u8(x, vmaxq_u8(y, shifted));
+            let doubled = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_u8(y)));
+            let least = vreinterpretq_u8_s8(vminq_s8(vreinterpretq_s8_u8(z), vreinterpretq_s8_u8(x)));
+            let z = vbicq_u8(least, doubled);
+            let mut out = [0; 16];
+            vst1q_u8(out.as_mut_ptr(), z);
+            (out, vgetq_lane_u16::<3>(vreinterpretq_u16_u8(z)) as i32)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    pub fn mix(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+        unsafe {
+            let x = vld1q_u8(a.as_ptr());
+            let y = vld1q_u8(b.as_ptr());
+            let z = veorq_u8(vandq_u8(x, y), vorrq_u8(x, vaddq_u8(x, y)));
+            let greater = vcgtq_s8(vreinterpretq_s8_u8(x), vreinterpretq_s8_u8(y));
+            let mut out = [0; 16];
+            vst1q_u8(out.as_mut_ptr(), vsubq_u8(z, greater));
+            out
+        }
+    }
 }
 
 pub mod statics {
@@ -1099,6 +1144,35 @@ pub mod foreign {
     #[allow(clippy::too_many_arguments)]
     pub extern "C" fn spill(a: u64, b: u64, c: u64, d: u64, e: u64, two: Two, last: u64) -> Two {
         Two { a: a + b + c + d + e + two.a, b: two.b * last }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Quad {
+        pub at: [f64; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Five {
+        pub at: [f32; 5],
+    }
+
+    /// Two of four floats fill the float registers a target has eight of, so the third goes
+    /// to the stack whole, and the float after it follows it there.
+    pub extern "C" fn quads(a: Quad, b: Quad, c: Quad, last: f64) -> Quad {
+        Quad { at: [a.at[0] + b.at[1], b.at[2] - c.at[3], c.at[0] * last, a.at[3] + c.at[1]] }
+    }
+
+    /// Five floats are one too many to come back in registers.
+    pub extern "C" fn five(x: Five, by: f32) -> Five {
+        Five { at: [x.at[4] * by, x.at[3], x.at[2] + by, x.at[1], x.at[0]] }
+    }
+
+    /// A 128-bit integer starts at an even register, and at an aligned slot once on the stack.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn wides(a: u64, b: u128, c: u64, d: i128, e: u64, f: u128, g: u8, h: i128) -> u128 {
+        (a as u128 + b + c as u128).wrapping_add(d as u128) + e as u128 + f + g as u128 + h as u128
     }
 
     pub fn through_pointer(f: extern "C" fn(Floats, f32) -> Floats, g: extern "C" fn(u64) -> Big) -> f32 {
@@ -2596,6 +2670,7 @@ pub mod array_map {
     }
 }
 
+#[cfg(feature = "nightly")]
 pub mod box_patterns {
     pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
     impl Drop for Noisy {
@@ -3912,6 +3987,119 @@ pub mod simd_x86 {
         if is_x86_feature_detected!("avx2") { unsafe {
             let a = _mm256_set_m128i(v, w); let b = _mm256_set_m128i(w, _mm_set1_epi8(9));
             out += &format!(" {:?}", wide(a, b)); } }
+        out
+    }
+}
+
+/// `core::arch` vector functions of AArch64: lanes, immediates that are const generics, table
+/// lookups, reductions across a vector, and the narrowing shift a byte search ends with.
+#[cfg(target_arch = "aarch64")]
+pub mod simd_aarch64 {
+    use core::arch::aarch64::*;
+
+    type Bytes = [u8; 16];
+
+    fn bytes(v: uint8x16_t) -> Bytes {
+        unsafe { core::mem::transmute(v) }
+    }
+    pub fn lanes(v: uint8x16_t) -> (u8, u16, u32, u64, i8) {
+        unsafe {
+            (
+                vgetq_lane_u8::<5>(v),
+                vgetq_lane_u16(vreinterpretq_u16_u8(v), 3),
+                vgetq_lane_u32::<2>(vreinterpretq_u32_u8(v)),
+                vgetq_lane_u64::<1>(vreinterpretq_u64_u8(v)),
+                vgetq_lane_s8::<15>(vreinterpretq_s8_u8(v)),
+            )
+        }
+    }
+    pub fn rotate(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes) {
+        unsafe { (bytes(vextq_u8::<3>(v, w)), bytes(vextq_u8(w, v, 13))) }
+    }
+    pub fn table(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes) {
+        unsafe { (bytes(vqtbl1q_u8(v, w)), bytes(vqtbx1q_u8(v, w, v))) }
+    }
+    pub fn shifts(v: uint8x16_t) -> (Bytes, Bytes, Bytes, Bytes) {
+        unsafe {
+            let wide = vreinterpretq_u16_u8(v);
+            (
+                bytes(vshrq_n_u8::<4>(v)),
+                bytes(vshlq_n_u8::<3>(v)),
+                bytes(vreinterpretq_u8_u16(vshrq_n_u16::<4>(wide))),
+                bytes(vreinterpretq_u8_s8(vshrq_n_s8::<2>(vreinterpretq_s8_u8(v)))),
+            )
+        }
+    }
+    pub fn across(v: uint8x16_t) -> (u8, u8, u8, u16, u32, u8) {
+        unsafe {
+            (
+                vmaxvq_u8(v),
+                vminvq_u8(v),
+                vaddvq_u8(v),
+                vaddvq_u16(vpaddlq_u8(v)),
+                vaddvq_u32(vpaddlq_u16(vpaddlq_u8(v))),
+                vaddvq_u8(vcntq_u8(v)),
+            )
+        }
+    }
+    /// Four bits per byte that is seven: what a search over sixteen bytes reads its match from.
+    pub fn matches(v: uint8x16_t) -> (u64, u32) {
+        unsafe {
+            let equal = vceqq_u8(v, vdupq_n_u8(7));
+            let narrowed = vshrn_n_u16::<4>(vreinterpretq_u16_u8(equal));
+            let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(narrowed));
+            (mask, mask.trailing_zeros() >> 2)
+        }
+    }
+    /// The eight-byte group of a hash table: which bytes match, and which are empty.
+    pub fn group(bytes: &[u8; 8]) -> (u64, u64) {
+        unsafe {
+            let group = vld1_u8(bytes.as_ptr());
+            let matched = vceq_u8(group, vdup_n_u8(0x41));
+            let empty = vcltz_s8(vreinterpret_s8_u8(group));
+            (
+                vget_lane_u64::<0>(vreinterpret_u64_u8(matched)) & 0x8080_8080_8080_8080,
+                vget_lane_u64(vreinterpret_u64_u8(empty), 0),
+            )
+        }
+    }
+    pub fn select(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes, Bytes, Bytes) {
+        unsafe {
+            let greater = vcgtq_u8(v, w);
+            (
+                bytes(vbslq_u8(greater, v, w)),
+                bytes(vmaxq_u8(v, w)),
+                bytes(vqaddq_u8(v, w)),
+                bytes(vqsubq_u8(v, w)),
+            )
+        }
+    }
+    pub fn wide(v: uint8x16_t, w: uint8x16_t) -> ([u16; 8], [u32; 4], [u64; 2], [f32; 4], [f64; 2]) {
+        unsafe {
+            let product = vmull_u8(vget_low_u8(v), vget_high_u8(w));
+            let words = vmulq_u32(vreinterpretq_u32_u8(v), vreinterpretq_u32_u8(w));
+            let longs = vaddq_u64(vreinterpretq_u64_u8(v), vreinterpretq_u64_u8(w));
+            let singles = vmulq_f32(vcvtq_f32_u32(vpaddlq_u16(product)), vdupq_n_f32(0.5));
+            let doubles = vsqrtq_f64(vcvtq_f64_u64(vpaddlq_u32(vpaddlq_u16(product))));
+            (
+                core::mem::transmute(product),
+                core::mem::transmute(words),
+                core::mem::transmute(longs),
+                core::mem::transmute(singles),
+                core::mem::transmute(doubles),
+            )
+        }
+    }
+    pub fn run() -> String {
+        let first: Bytes = [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        let second: Bytes = [6, 15, 4, 3, 2, 11, 1, 9, 248, 7, 6, 5, 14, 3, 0, 255];
+        let (v, w) = unsafe { (vld1q_u8(first.as_ptr()), vld1q_u8(second.as_ptr())) };
+        let mut out = format!("{:?} {:?} {:?} {:?}", lanes(v), rotate(v, w), table(v, w), shifts(w));
+        out += &format!(" {:?} {:?} {:?} {:?}", across(w), matches(v), matches(w), group(b"AbA\xffcdA\x80"));
+        out += &format!(" {:?} {:?}", select(v, w), wide(v, w));
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            out += " neon";
+        }
         out
     }
 }
@@ -5357,6 +5545,142 @@ pub mod inline_asm {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub mod inline_asm {
+    use std::arch::asm;
+
+    fn add(a: u64, b: u64) -> u64 {
+        let out: u64;
+        unsafe { asm!("add {out}, {a}, {b}", a = in(reg) a, b = in(reg) b, out = lateout(reg) out) };
+        out
+    }
+
+    fn in_place(mut x: u32) -> u32 {
+        unsafe { asm!("lsl {0:w}, {0:w}, #3", "add {0:w}, {0:w}, #{1}", inout(reg) x, const 5) };
+        x
+    }
+
+    fn divide(n: u64, d: u64) -> (u64, u64) {
+        let (quotient, remainder);
+        unsafe {
+            asm!(
+                "udiv x2, x0, {d}",
+                "msub x1, x2, {d}, x0",
+                d = in(reg) d,
+                in("x0") n,
+                out("x1") remainder,
+                out("x2") quotient,
+                options(pure, nomem, nostack),
+            )
+        };
+        (quotient, remainder)
+    }
+
+    fn halves(low: u8, high: u8) -> u16 {
+        let out: u16;
+        unsafe {
+            asm!(
+                "and {out:w}, {low:w}, #0xff",
+                "orr {out:w}, {out:w}, {high:w}, lsl #8",
+                low = in(reg) low,
+                high = in(reg) high,
+                out = out(reg) out,
+            )
+        };
+        out
+    }
+
+    fn floats(a: f64, b: f64) -> (f64, f32) {
+        let sum: f64;
+        let mut single = a as f32;
+        unsafe {
+            asm!(
+                "fadd {a:d}, {a:d}, {b:d}",
+                "fsqrt {s:s}, {s:s}",
+                a = inout(vreg) a => sum,
+                b = in(vreg) b,
+                s = inout(vreg) single,
+            )
+        };
+        (sum, single)
+    }
+
+    fn named_vector(a: f64) -> f64 {
+        let out: f64;
+        unsafe { asm!("fneg d1, d0", "fadd d1, d1, d1", in("v0") a, out("v1") out) };
+        out
+    }
+
+    /// Registers a function has to restore, and many operands at once.
+    fn kept(values: [u64; 6]) -> u64 {
+        let [a, b, c, d, e, f] = values;
+        let out: u64;
+        unsafe {
+            asm!(
+                "add {a}, {a}, {b}", "add {a}, {a}, {c}", "add {a}, {a}, {d}",
+                "add {a}, {a}, {e}", "add {a}, {a}, {f}",
+                "mov x20, {a}", "mov x21, x20", "mov x22, x21", "mov x23, x22",
+                "fmov d8, x23", "fmov x28, d8",
+                a = inout(reg) a => _, b = in(reg) b, c = in(reg) c, d = in(reg) d,
+                e = in(reg) e, f = in(reg) f,
+                out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("v8") _,
+                out("x28") out,
+            )
+        };
+        out
+    }
+
+    fn memory(values: &mut [u32; 4]) -> u32 {
+        let total: u32;
+        unsafe {
+            asm!(
+                "ldr {total:w}, [{p}]",
+                "ldr {scratch:w}, [{p}, #4]",
+                "add {total:w}, {total:w}, {scratch:w}",
+                "str {total:w}, [{p}, #8]",
+                "/* a comment */",
+                p = in(reg) values.as_mut_ptr(),
+                total = out(reg) total,
+                scratch = out(reg) _,
+            )
+        };
+        total + values[2]
+    }
+
+    /// The thread pointer, which nothing but an instruction reads.
+    fn thread_pointer() -> bool {
+        let (first, second): (u64, u64);
+        unsafe {
+            asm!("mrs {0}, tpidr_el0", out(reg) first, options(nomem, nostack, preserves_flags));
+            asm!("mrs {0}, tpidr_el0", out(reg) second);
+        }
+        first != 0 && first == second
+    }
+
+    fn stops(go: bool) -> u8 {
+        if go {
+            unsafe { asm!("brk #1", options(noreturn)) }
+        }
+        unsafe { asm!("nop") };
+        3
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            add(40, 2),
+            in_place(4),
+            divide(47, 5),
+            halves(0x34, 0x12),
+            floats(1.5, 2.25),
+            named_vector(1.25),
+            kept([1, 2, 3, 4, 5, 6]),
+            memory(&mut [10, 20, 0, 0]),
+            thread_pointer(),
+            stops(false),
+        )
+    }
+}
+
 /// Constants that hold another constant's value: what that value points to is copied, and
 /// the pointers in it have to follow, through a type that is written as an associated type
 /// and through a union.
@@ -5693,5 +6017,168 @@ pub mod track_caller_in_vtable {
         let all: [&dyn Here; 2] = [&Tracked(3), &Plain(4)];
         let through: Vec<_> = all.iter().map(|it| (it.here(5), it.provided())).collect();
         (through, Tracked(6).here(7), Tracked(1).provided())
+    }
+}
+
+/// Values whose variant is told by a niche, made on one side of the crate boundary and read
+/// on the other: the two sides must agree on which value of the niche means which variant.
+pub mod niche_values {
+    use std::ptr::NonNull;
+
+    #[derive(Copy, Clone)]
+    pub enum Position {
+        Major,
+        Minor,
+        Patch,
+        Pre,
+        Build,
+    }
+    #[derive(Copy, Clone)]
+    pub enum Op {
+        Exact,
+        Greater,
+        GreaterEq,
+        Less,
+        LessEq,
+        Tilde,
+        Caret,
+        Wildcard,
+    }
+    pub struct Prerelease {
+        pub head: NonNull<u8>,
+    }
+    pub struct Comparator {
+        pub op: Op,
+        pub major: u64,
+        pub minor: Option<u64>,
+        pub patch: Option<u64>,
+        pub pre: Prerelease,
+    }
+    pub enum ErrorKind {
+        Empty,
+        UnexpectedEnd(Position),
+        UnexpectedChar(Position, char),
+        UnexpectedCharAfter(Position, char),
+        ExpectedCommaFound(Position, char),
+        LeadingZero(Position),
+        Overflow(Position),
+        EmptySegment(Position),
+        IllegalCharacter(Position),
+        WildcardNotTheOnlyComparator(char),
+        UnexpectedAfterWildcard,
+        ExcessiveComparators,
+    }
+    pub struct Error {
+        pub kind: ErrorKind,
+    }
+    /// What semver's parser of a comparator returns.
+    pub type Parsed = Result<(Comparator, Position, &'static str), Error>;
+
+    pub enum Signed {
+        A = -3,
+        B = -1,
+        C = 2,
+    }
+    #[repr(i8)]
+    pub enum Wrap {
+        A = -128,
+        B = 127,
+        C = 5,
+    }
+    #[repr(u8)]
+    pub enum High {
+        A = 200,
+        B = 255,
+        C = 0,
+    }
+    pub enum Gap {
+        A = 0,
+        B = 1,
+        C = 250,
+        D = 255,
+    }
+    pub struct Two {
+        pub a: Option<u64>,
+        pub b: Option<u64>,
+        pub c: bool,
+        pub d: Position,
+    }
+    pub struct Ends {
+        pub a: bool,
+        pub b: u64,
+        pub c: bool,
+    }
+    pub enum Data {
+        A(u32, Position),
+        B(u8),
+        C,
+    }
+    pub enum Nested {
+        X(Data),
+        Y(Position),
+        Z,
+    }
+
+    /// For each type: a value, that value under `depth` of two `Option`s, and the depth read
+    /// back.
+    macro_rules! probes {
+        ($($value:ident $make:ident $depth:ident: $ty:ty = $it:expr;)*) => {$(
+            pub fn $value() -> $ty {
+                $it
+            }
+            pub fn $make(depth: u8) -> Option<Option<$ty>> {
+                match depth {
+                    0 => None,
+                    1 => Some(None),
+                    _ => Some(Some($value())),
+                }
+            }
+            pub fn $depth(value: &Option<Option<$ty>>) -> u8 {
+                match value {
+                    None => 0,
+                    Some(None) => 1,
+                    Some(Some(_)) => 2,
+                }
+            }
+        )*};
+    }
+
+    probes! {
+        parsed_err make_parsed_err depth_parsed_err: Parsed =
+            Err(Error { kind: ErrorKind::UnexpectedChar(Position::Pre, 'x') });
+        parsed_ok make_parsed_ok depth_parsed_ok: Parsed = Ok((
+            Comparator {
+                op: Op::Caret,
+                major: 1,
+                minor: Some(2),
+                patch: None,
+                pre: Prerelease { head: NonNull::dangling() },
+            },
+            Position::Patch,
+            "",
+        ));
+        error make_error depth_error: Error = Error { kind: ErrorKind::ExcessiveComparators };
+        kind make_kind depth_kind: ErrorKind = ErrorKind::Overflow(Position::Build);
+        signed make_signed depth_signed: Signed = Signed::B;
+        wrap make_wrap depth_wrap: Wrap = Wrap::C;
+        high make_high depth_high: High = High::B;
+        gap make_gap depth_gap: Gap = Gap::C;
+        two make_two depth_two: Two = Two { a: None, b: Some(7), c: true, d: Position::Minor };
+        ends make_ends depth_ends: Ends = Ends { a: true, b: 9, c: false };
+        data make_data depth_data: Data = Data::C;
+        nested make_nested depth_nested: Nested = Nested::Y(Position::Pre);
+        nested_data make_nested_data depth_nested_data: Nested = Nested::X(Data::B(3));
+        pair make_pair depth_pair: (bool, Op) = (true, Op::Tilde);
+        triple make_triple depth_triple: (Position, Op, char) = (Position::Pre, Op::Less, 'q');
+        letter make_letter depth_letter: char = 'z';
+        ordering make_ordering depth_ordering: std::cmp::Ordering = std::cmp::Ordering::Less;
+        nonzero make_nonzero depth_nonzero: std::num::NonZeroI8 = std::num::NonZeroI8::MIN;
+        flag make_flag depth_flag: bool = true;
+        text make_text depth_text: String = String::from("text");
+        boxed make_boxed depth_boxed: Box<u8> = Box::new(4);
+    }
+
+    pub fn is_ok(parsed: &Parsed) -> bool {
+        parsed.is_ok()
     }
 }

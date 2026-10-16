@@ -335,7 +335,11 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     return None;
                 }
                 self.function_path(func)?.hash(hasher);
-                self.args(args)?.hash(hasher);
+                // The arguments are under a binder, which binds nothing.
+                self.binder(hasher, |this, hasher| {
+                    this.args(args)?.hash(hasher);
+                    Some(())
+                })?;
             }
             TyKind::Closure(id, args) => {
                 hasher.write_isize(17);
@@ -368,6 +372,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 let safe = u8::from(header.safety().is_safe()) << 6;
                 let variadic = u8::from(header.c_variadic()) << 7;
                 hasher.write_u8(abi | safe | variadic);
+                // No argument is splatted: the syntax is unstable.
+                hasher.write_u8(u8::MAX);
             }
             TyKind::Dynamic(predicates, region) => {
                 hasher.write_isize(16);
@@ -717,6 +723,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     self.module(module)?.hash(hasher);
                 }
             }
+            // Its `mut` is not restricted: the syntax is unstable.
+            hasher.write_isize(0);
             hasher.write_isize(if field.is_unsafe { 0 } else { 1 });
             hasher.write_u8(0);
         }

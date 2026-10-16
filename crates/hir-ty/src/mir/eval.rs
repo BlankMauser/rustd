@@ -44,7 +44,7 @@ use crate::{
     consteval::{self, ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosureId},
     infer::PointerCast,
-    layout::{Layout, LayoutError, RustcEnumVariantIdx},
+    layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         AliasTy, Allocation, AllocationData, Const, ConstKind, DbInterner, ErrorGuaranteed,
@@ -212,6 +212,9 @@ pub struct Evaluator<'a, 'db> {
     cached_fn_mut_trait_func: Option<FunctionId>,
     cached_fn_once_trait_func: Option<FunctionId>,
     crate_id: Crate,
+    /// The types whose `TypeId` was asked for. An id here is the type's place in this list,
+    /// which says whether two are of one type and is not the hash compiled code has.
+    type_ids: Vec<Ty<'db>>,
     // FIXME: This is a workaround, see the comment on `interpret_mir`
     assert_placeholder_ty_is_unused: bool,
     /// A general limit on execution, to prevent non terminating programs from breaking r-a main process
@@ -518,6 +521,12 @@ impl<'db> Evaluator<'db, 'db> {
             not_supported!("targets with different pointer size from host");
         }
         let interval = self.interpret_mir(body, None.into_iter())?;
+        // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
+        // so only a constant that cannot carry one is answered: a `bool`, which is what
+        // comparing two gives, as `IS_UNIT` in core does.
+        if !self.type_ids.is_empty() && !matches!(ty.kind(), TyKind::Bool) {
+            not_supported!("a constant computed from a `TypeId`");
+        }
         let bytes = interval.get(self)?;
         let mut memory_map = self.create_memory_map(
             bytes,
@@ -580,6 +589,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             crate_id,
             stdout: vec![],
             stderr: vec![],
+            type_ids: Vec::new(),
             assert_placeholder_ty_is_unused,
             stack_depth_limit: 100,
             execution_limit: EXECUTION_LIMIT,
@@ -753,27 +763,25 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 }
                 ProjectionElem::Field(f) => {
                     let layout = self.layout(prev_ty.ty)?;
-                    let variant_layout = match &layout.variants {
+                    let offset = match &layout.variants {
                         Variants::Empty => {
                             return Err(MirEvalError::UndefinedBehavior(
                                 "field of an uninhabited type".to_owned(),
                             ));
                         }
-                        Variants::Single { .. } => &layout,
+                        Variants::Single { .. } => layout.fields.offset(f.0 as usize),
                         Variants::Multiple { variants, .. } => {
-                            &variants[match prev_ty.variant_id {
-                                Some(hir_def::VariantId::EnumVariantId(it)) => {
-                                    RustcEnumVariantIdx(it.index(self.db))
-                                }
-                                _ => {
-                                    return Err(MirEvalError::InternalError(
-                                        "mismatched layout".into(),
-                                    ));
-                                }
-                            }]
+                            let Some(hir_def::VariantId::EnumVariantId(it)) = prev_ty.variant_id
+                            else {
+                                return Err(MirEvalError::InternalError(
+                                    "mismatched layout".into(),
+                                ));
+                            };
+                            variants[RustcEnumVariantIdx(it.index(self.db))].field_offsets
+                                [RustcFieldIdx::new(f.0 as usize)]
                         }
                     };
-                    let offset = variant_layout.fields.offset(f.0 as usize).bytes_usize();
+                    let offset = offset.bytes_usize();
                     addr = addr.offset(offset);
                     // Unsized field metadata is equal to the metadata of the struct
                     if self.size_align_of(ty.ty, locals)?.is_some() {
@@ -1633,8 +1641,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             .wrapping_sub(*niche_start)
                             & (u128::MAX >> (128 - 8 * size)))
                             as usize;
-                        let first = niche_variants.start().0;
-                        let idx = if relative <= niche_variants.end().0 - first {
+                        let first = niche_variants.start.0;
+                        let idx = if relative <= niche_variants.last.0 - first {
                             first + relative
                         } else {
                             untagged_variant.0
@@ -1783,21 +1791,21 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         let layout = self.layout_adt(adt, subst)?;
         Ok(match &layout.variants {
             Variants::Single { .. } | Variants::Empty => (layout.size.bytes_usize(), layout, None),
-            Variants::Multiple { variants, tag, tag_encoding, .. } => {
+            Variants::Multiple { tag, tag_encoding, .. } => {
                 let enum_variant_id = match it {
                     VariantId::EnumVariantId(it) => it,
                     _ => not_supported!("multi variant layout for non-enums"),
                 };
                 let mut discriminant = self.const_eval_discriminant(enum_variant_id)?;
                 let rustc_enum_variant_idx = RustcEnumVariantIdx(enum_variant_id.index(self.db));
-                let variant_layout = variants[rustc_enum_variant_idx].clone();
+                let variant_layout = Layout::for_variant(&layout, rustc_enum_variant_idx);
                 let have_tag = match tag_encoding {
                     TagEncoding::Direct => true,
                     TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                         if *untagged_variant == rustc_enum_variant_idx {
                             false
                         } else {
-                            discriminant = ((rustc_enum_variant_idx.0 - niche_variants.start().0)
+                            discriminant = ((rustc_enum_variant_idx.0 - niche_variants.start.0)
                                 as i128)
                                 .wrapping_add(*niche_start as i128);
                             true

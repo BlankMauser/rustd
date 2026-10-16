@@ -95,11 +95,13 @@ pub fn layout_of_adt_query(
             &variants,
             matches!(def, AdtId::EnumId(..)),
             is_special_no_niche,
-            |min, max| repr_discr(dl, &repr, min, max).unwrap_or((Integer::I8, false)),
+            |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
             variants.iter_enumerated().filter_map(|(id, _)| {
                 let AdtId::EnumId(e) = def else { return None };
                 let d = db.const_eval_discriminant(e.enum_variants(db).variants[id.0].0).ok()?;
-                Some((id, d))
+                // As rustc has a discriminant: the bits of its type, and no more.
+                let size = Integer::from_attr(dl, repr.discr_type()).size();
+                Some((id, size.truncate(d as u128)))
             }),
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
@@ -125,14 +127,14 @@ fn repr_discr(
     dl: &TargetDataLayout,
     repr: &ReprOptions,
     min: i128,
-    max: i128,
+    max: u128,
 ) -> Result<(Integer, bool), LayoutError> {
     // Theoretically, negative values could be larger in unsigned representation
     // than the unsigned representation of the signed minimum. However, if there
     // are any negative values, the only valid unsigned representation is u128
     // which can fit all i128 values, so the result remains unaffected.
-    let unsigned_fit = Integer::fit_unsigned(cmp::max(min as u128, max as u128));
-    let signed_fit = cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+    let unsigned_fit = Integer::fit_unsigned(cmp::max(min as u128, max));
+    let signed_fit = cmp::max(Integer::fit_signed(min), Integer::fit_signed(max as i128));
 
     if let Some(ity) = repr.int {
         let discr = Integer::from_attr(dl, ity);
