@@ -303,14 +303,16 @@ Both the compiler and what it emits are wasm32 now, so memory64 is no longer nee
   borrows the settings of the x86-64 ISA, so `Target::host()` names that one when the
   `wasm` feature is on.
 
-The canvas programs are in `web/demos`: bouncing balls, the game of life (2D arrays,
+The canvas programs are in `web/demos`: bouncing balls, a fountain of drops whose
+constants are meant to be edited while it runs, the game of life (2D arrays,
 by-value array iterators), sorting (`dyn Sorter`, slices) and the Mandelbrot set (operator
 overloading, closures, `Option`). Measured in Chrome, one run each, time from picking the
 program to it running, with the compiler already loaded: balls 3.2 s (747 functions in a
 681 kB module), sort 2.4 s (397 functions), life 2.4 to 2.7 s (404), mandelbrot 2.1 to
 2.4 s (43). About 2 s of each is name resolution over `core`, which is repeated because
 picking another canvas program starts a fresh compiler. Compiler memory is 180 to 210 MiB.
-A `RADIUS` edit in balls: 71 ms, 2 functions.
+A `RADIUS` edit in balls: 71 ms, 2 functions. A `WIND` edit in the fountain: 72 ms,
+1 function.
 
 ## 6. Dioxus: linking into a module rustc built
 
@@ -375,8 +377,8 @@ bridge server, as rust-analyzer's proc-macro server is for dylibs.
 ## 7. The playground
 
 The page is one Dioxus app built by rustc and `dx` (`web/playground`, 3.3 MB of wasm): the
-picker, the editor (`dioxus-code-editor`, highlighted by `dioxus-code`), the light and
-dark themes, the output pane and the status line. It compiles nothing. It tells
+list of programs down the left, the editor (`dioxus-code-editor`, highlighted by `dioxus-code`), the light and
+dark themes, the output pane and, under both, a log with a line for each build. It compiles nothing. It tells
 `playground.js` which program to show and of every edit, and is told how each build went.
 JavaScript keeps the compiler workers, the instantiation of what they emit, the canvas
 functions and the Dioxus host module. There is one worker for the canvas programs and one

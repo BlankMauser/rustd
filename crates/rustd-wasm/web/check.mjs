@@ -54,7 +54,7 @@ assert.equal(circles(drawn).length, 1);
 for (let frame = 0; frame < 3000; frame++) program.call("frame", 400, 300, 0.016);
 
 // The other demos build whole and run, clicks and all.
-for (const name of ["life", "sort", "mandelbrot"]) {
+for (const name of ["fountain", "life", "sort", "mandelbrot"]) {
   const compiler = await Compiler.load(read("pkg/rustd_wasm.wasm"), read("pkg/core.bundle"));
   let drawn = 0;
   const draw = () => (drawn += 1);

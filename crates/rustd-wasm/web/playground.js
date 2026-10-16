@@ -1,12 +1,14 @@
 // What the playground (`playground/`, a Dioxus app) leaves to JavaScript: running the compiler
 // in `worker.js` on every edit, and the programs it builds. The app calls `window.rustd`,
-// and hears how a build went through `rustd_status`.
+// and hears how builds go through `rustd_state` and `rustd_line`.
 
-import { rustd_status } from "./assets/playground.js";
+import { rustd_line, rustd_state } from "./assets/playground.js";
 import { Program } from "./program.js";
 
 const ms = (value) => `${value.toFixed(1)} ms`;
-const mib = (bytes) => (bytes / 2 ** 20).toFixed(1);
+const mib = (bytes) => `${(bytes / 2 ** 20).toFixed(1)} MiB`;
+const kib = (bytes) => (bytes < 10240 ? `${bytes} B` : `${(bytes / 1024).toFixed(0)} KiB`);
+const count = (n, what) => `${n} ${what}${n === 1 ? "" : "s"}`;
 
 // The one shown, of the two below.
 let shown = null;
@@ -15,10 +17,10 @@ let shown = null;
 class Builds {
   constructor(worker, delay) {
     this.worker = new Worker(worker, { type: "module" });
-    this.worker.onerror = (event) => this.say(`the compiler failed to load: ${event.message}`, true);
+    this.worker.onerror = (event) => this.fail("the compiler failed to load", event.message);
     this.worker.onmessage = ({ data }) => this.message(data);
     this.delay = delay;
-    this.loaded = "";
+    this.kind = "building";
     this.text = "";
     this.sent = 0;
     this.edited = 0;
@@ -27,16 +29,26 @@ class Builds {
     this.started = 0;
   }
 
-  // Said to the app when this is the one shown, and again when it is shown again.
-  say(text, error = false) {
-    this.said = [error ? "error" : text.endsWith("…") ? "building" : "running", text];
-    this.resay();
+  // `building`, `running` or `error`: said to the app when this is the one shown, and
+  // again when it is shown again.
+  state(kind) {
+    this.kind = kind;
+    if (shown === this) {
+      rustd_state(kind);
+    }
   }
 
-  resay() {
-    if (shown === this && this.said) {
-      rustd_status(...this.said);
+  // A line of the builds the app lists: `level` is `info`, `good` or `bad`, `parts`
+  // are measurements and `notes` longer text. What a compiler not shown says is dropped.
+  line(level, head, parts = [], notes = []) {
+    if (shown === this) {
+      rustd_line(new Date().toLocaleTimeString("en-GB"), level, head, parts, notes);
     }
+  }
+
+  fail(head, error) {
+    this.line("bad", head, [], [String(error)]);
+    this.state("error");
   }
 
   edit(text) {
@@ -58,31 +70,33 @@ class Builds {
 
   message(data) {
     if (data.loaded) {
-      this.loaded = this.describe(data.loaded);
-      this.say(`${this.loaded}\nfirst build…`);
+      this.line("info", "compiler ready", this.describe(data.loaded));
       this.ready = true;
       this.build();
       return;
     }
     this.building = false;
     if (data.error) {
-      this.say(data.error, true);
+      this.fail("build failed", data.error);
     } else {
       try {
-        const notes = this.apply(data);
-        if (notes !== null) {
+        const applied = this.apply(data);
+        if (applied !== null) {
           const { report, module } = data;
-          this.say(
-            `${this.loaded}\nedit to running: ${ms(performance.now() - this.started)} — ` +
-              `${report.functions.length} functions swapped in a ${module.length} byte module ` +
-              `(${notes.shift()}codegen ${ms(report.codegen_ms)}, link ${ms(report.link_ms)}), ` +
-              `compiler memory ${mib(report.compiler_bytes)} MiB` +
-              notes.map((it) => `\n${it}`).join(""),
-            notes.length > 0,
-          );
+          const { parts, notes } = applied;
+          const failed = notes.length > 0;
+          this.line(failed ? "bad" : "good", `${failed ? "built in part" : "built"} in ${ms(performance.now() - this.started)}`, [
+            `${count(report.functions.length, "function")} swapped`,
+            `${kib(module.length)} module`,
+            ...parts,
+            `codegen ${ms(report.codegen_ms)}`,
+            `link ${ms(report.link_ms)}`,
+            `compiler memory ${mib(report.compiler_bytes)}`,
+          ], notes);
+          this.state(failed ? "error" : "running");
         }
       } catch (error) {
-        this.say(String(error.stack ?? error), true);
+        this.fail("the build did not load", error.stack ?? error);
       }
     }
     this.build();
@@ -130,9 +144,8 @@ class Canvas extends Builds {
     this.text = text;
     this.edited += 1;
     this.first = this.edited;
-    if (this.ready) {
-      this.say(`${this.loaded}\nbuilding ${name}…`);
-    }
+    this.line("info", name, [this.ready ? "building…" : "loading the compiler…"]);
+    this.state("building");
     this.build();
   }
 
@@ -143,7 +156,7 @@ class Canvas extends Builds {
   }
 
   describe({ wasm_bytes, core_bytes, fetch_ms, start_ms }) {
-    return `compiler ${mib(wasm_bytes)} MiB, core source ${mib(core_bytes)} MiB, fetched in ${ms(fetch_ms)}, started in ${ms(start_ms)}`;
+    return [`compiler ${mib(wasm_bytes)}`, `core source ${mib(core_bytes)}`, `fetched in ${ms(fetch_ms)}`, `started in ${ms(start_ms)}`];
   }
 
   apply({ id, report, module }) {
@@ -152,7 +165,10 @@ class Canvas extends Builds {
     }
     this.program.apply(module, report);
     this.stopped = null;
-    return [`of ${report.bodies} in the program, analysis ${ms(report.listing_ms)}, `, ...skipped(report)];
+    return {
+      parts: [`${report.bodies} in the program`, `analysis ${ms(report.listing_ms)}`],
+      notes: skipped(report),
+    };
   }
 
   run(name, ...args) {
@@ -162,8 +178,8 @@ class Canvas extends Builds {
     try {
       this.program.call(name, ...args);
     } catch (error) {
-      this.stopped = `\`${name}\` stopped: ${error}`;
-      this.say(this.stopped, true);
+      this.stopped = error;
+      this.fail(`\`${name}\` stopped`, error);
     }
   }
 
@@ -224,10 +240,11 @@ class Dioxus extends Builds {
 
   show(name, text) {
     if (text !== this.text) {
-      this.say(this.ready ? `${this.loaded}\nbuilding ${name}…` : "loading Dioxus and the compiler…");
+      this.line("info", name, [this.ready ? "building…" : "loading Dioxus and the compiler, which takes a while…"]);
+      this.state("building");
       this.edit(text);
     } else {
-      this.resay();
+      this.state(this.kind);
     }
   }
 
@@ -244,7 +261,7 @@ class Dioxus extends Builds {
   }
 
   describe({ wasm_bytes, core_bytes, fetch_ms, start_ms, analysis }) {
-    return `compiler ${mib(wasm_bytes)} MiB, workspace ${mib(core_bytes)} MiB, fetched in ${ms(fetch_ms)}, loaded in ${ms(start_ms)} (${analysis})`;
+    return [`compiler ${mib(wasm_bytes)}`, `workspace ${mib(core_bytes)}`, `fetched in ${ms(fetch_ms)}`, `loaded in ${ms(start_ms)}`, analysis];
   }
 
   // Not awaited: `build` was, before the build this is of.
@@ -264,11 +281,14 @@ class Dioxus extends Builds {
     } else {
       program.base.rustd_rerender();
     }
-    return [
-      `${Object.keys(report.host ?? {}).length} functions of the rustc-built module called, `,
-      ...skipped(report),
-      ...(report.mismatched ?? []).map((it) => `signature differs from rustc's: ${it}`),
-    ];
+    const host = Object.keys(report.host ?? {}).length;
+    return {
+      parts: host > 0 ? [`${count(host, "function")} of rustc's module linked`] : [],
+      notes: [
+        ...skipped(report),
+        ...(report.mismatched ?? []).map((it) => `signature differs from rustc's: ${it}`),
+      ],
+    };
   }
 }
 

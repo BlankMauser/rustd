@@ -3,7 +3,7 @@
 //!
 //! This app does not compile anything. The compiler is a worker, and `playground.js` runs it
 //! and the programs it builds: this app tells it of the program to show and of every edit,
-//! through `window.rustd`, and hears how builds went through [`rustd_status`].
+//! through `window.rustd`, and hears how builds went through [`rustd_state`] and [`rustd_line`].
 
 use std::cell::RefCell;
 
@@ -25,10 +25,8 @@ fn Playground() -> Element {
     let mut demo = use_signal(Demo::of_address);
     let mut source = use_signal(|| demo.peek().source.to_owned());
     let mut dark = use_signal(stored_dark);
-    let mut status = use_signal(|| Status {
-        kind: "building".to_owned(),
-        text: "loading the compiler…".to_owned(),
-    });
+    let mut state = use_signal(|| "building".to_owned());
+    let mut log = use_signal(Vec::<Line>::new);
 
     // The program to show, once what it is shown in is in the page.
     use_effect(move || {
@@ -37,37 +35,30 @@ fn Playground() -> Element {
         show(demo.name, demo.source);
     });
     use_future(move || async move {
-        let Some(mut receiver) = STATUSES.with_borrow_mut(|(_, receiver)| receiver.take()) else {
+        let Some(mut receiver) = SAID.with_borrow_mut(|(_, receiver)| receiver.take()) else {
             return;
         };
         while let Some(next) = receiver.next().await {
-            status.set(next);
+            match next {
+                Said::State(kind) => state.set(kind),
+                Said::Line(line) => {
+                    let mut log = log.write();
+                    let extra = (log.len() + 1).saturating_sub(LINES);
+                    log.drain(..extra);
+                    log.push(line);
+                }
+            }
         }
     });
 
     let shown = demo();
     let app = shown.output == Output::App;
     let theme = if dark() { Theme::TOKYO_NIGHT } else { Theme::GITHUB_LIGHT };
-    let Status { kind, text } = status();
     rsx! {
         div { class: "playground", "data-theme": if dark() { "dark" } else { "light" },
             header {
                 h1 { b { "rustd" } " playground" }
-                p { "{shown.about}" }
-                label {
-                    "demo "
-                    select {
-                        onchange: move |event| {
-                            if let Some(picked) = Demo::named(&event.value()) {
-                                source.set(picked.source.to_owned());
-                                demo.set(picked);
-                            }
-                        },
-                        for it in DEMOS {
-                            option { value: it.name, selected: it.name == shown.name, "{it.title}" }
-                        }
-                    }
-                }
+                p { "A Rust compiler running in this page as WebAssembly, emitting WebAssembly." }
                 button {
                     r#type: "button",
                     onclick: move |_| {
@@ -76,6 +67,30 @@ fn Playground() -> Element {
                         dark.set(now);
                     },
                     if dark() { "light mode" } else { "dark mode" }
+                }
+            }
+            nav {
+                for (kind, title) in [(Output::Canvas, "canvas, no_std"), (Output::App, "dioxus, std")] {
+                    h2 { "{title}" }
+                    for it in DEMOS.iter().copied().filter(|it| it.output == kind) {
+                        button {
+                            r#type: "button",
+                            class: if it.name == shown.name { "picked" },
+                            onclick: move |_| {
+                                if it.name != demo.peek().name {
+                                    source.set(it.source.to_owned());
+                                    demo.set(it);
+                                }
+                            },
+                            b { "{it.title}" }
+                            span { "{it.about}" }
+                            small {
+                                for tag in it.tags {
+                                    i { "{tag}" }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             section { class: "pane",
@@ -103,12 +118,35 @@ fn Playground() -> Element {
             // is shown.
             section { class: "pane",
                 h2 { if app { "app" } else { "canvas" } }
-                canvas { id: "canvas", hidden: app }
-                div { id: "main", hidden: !app }
+                // The canvas is as large as this is, whatever size it draws at.
+                div { class: "stage",
+                    canvas { id: "canvas", hidden: app }
+                    div { id: "main", hidden: !app }
+                }
             }
-            footer {
-                span { id: "state", class: "{kind}", "{kind}" }
-                div { id: "status", class: "{kind}", "{text}" }
+            section { class: "pane builds",
+                h2 {
+                    "builds"
+                    span { id: "state", class: "{state}", "{state}" }
+                    button { r#type: "button", onclick: move |_| log.write().clear(), "clear" }
+                }
+                // Newest first in the page, and shown bottom up: it stays at the newest.
+                div { id: "status",
+                    for line in log.read().iter().rev() {
+                        div { class: "line {line.level}",
+                            time { "{line.time}" }
+                            p {
+                                b { "{line.head}" }
+                                for part in line.parts.iter() {
+                                    span { "{part}" }
+                                }
+                                for note in line.notes.iter() {
+                                    pre { "{note}" }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -129,45 +167,58 @@ struct Demo {
     name: &'static str,
     title: &'static str,
     about: &'static str,
+    /// What of the language it leans on.
+    tags: &'static [&'static str],
     source: &'static str,
     output: Output,
 }
 
-const CANVAS: &str = "A Rust compiler running as WebAssembly, emitting WebAssembly: edit the code and the changed functions are swapped into the running program.";
-
 const DEMOS: &[Demo] = &[
     Demo {
         name: "balls",
-        title: "bouncing balls",
-        about: CANVAS,
+        title: "Bouncing balls",
+        about: "Click to drop a ball. Change the gravity while they fall.",
+        tags: &["structs", "traits", "statics", "f64"],
         source: include_str!("../../demos/balls.rs"),
         output: Output::Canvas,
     },
     Demo {
+        name: "fountain",
+        title: "Fountain",
+        about: "Drops under gravity. Change the speed, the wind, the color.",
+        tags: &["closures", "iterators", "consts", "f64"],
+        source: include_str!("../../demos/fountain.rs"),
+        output: Output::Canvas,
+    },
+    Demo {
         name: "life",
-        title: "game of life",
-        about: CANVAS,
+        title: "Game of life",
+        about: "Conway's cells on a grid. Click to bring one to life.",
+        tags: &["2D arrays", "iterators", "static mut"],
         source: include_str!("../../demos/life.rs"),
         output: Output::Canvas,
     },
     Demo {
         name: "sort",
-        title: "sorting, with trait objects",
-        about: CANVAS,
+        title: "Sorting",
+        about: "Three algorithms behind one trait object, a step a frame.",
+        tags: &["dyn Trait", "slices", "vtables"],
         source: include_str!("../../demos/sort.rs"),
         output: Output::Canvas,
     },
     Demo {
         name: "mandelbrot",
-        title: "mandelbrot set",
-        about: CANVAS,
+        title: "Mandelbrot set",
+        about: "Complex numbers with operators of their own. Click to zoom.",
+        tags: &["operators", "closures", "Option"],
         source: include_str!("../../demos/mandelbrot.rs"),
         output: Output::Canvas,
     },
     Demo {
         name: "dioxus",
         title: "Dioxus counter",
-        about: "A Dioxus app compiled in the page and linked into a Dioxus and std that rustc built: edit the rsx! and it re-renders with its state.",
+        about: "Linked into the Dioxus and std rustc built. Edits keep its state.",
+        tags: &["rsx!", "signals", "#[component]", "std"],
         source: include_str!("../../dioxus/app/src/main.rs"),
         output: Output::App,
     },
@@ -214,27 +265,58 @@ fn store_dark(dark: bool) {
     }
 }
 
-/// How the last build went: `kind` is `building`, `running` or `error`.
+/// How many lines of builds are kept.
+const LINES: usize = 200;
+
+/// One thing a build said. `level` is `info`, `good` or `bad`.
 #[derive(Clone, PartialEq)]
-struct Status {
-    kind: String,
-    text: String,
+struct Line {
+    time: String,
+    level: String,
+    head: String,
+    /// Measurements, shown after the head.
+    parts: Vec<String>,
+    /// Longer text, shown under it: what did not compile, and why.
+    notes: Vec<String>,
 }
 
-type Statuses = (UnboundedSender<Status>, Option<UnboundedReceiver<Status>>);
+/// What `playground.js` says.
+enum Said {
+    /// `building`, `running` or `error`.
+    State(String),
+    Line(Line),
+}
+
+type Channel = (UnboundedSender<Said>, Option<UnboundedReceiver<Said>>);
 
 thread_local! {
     /// What `playground.js` said, for the app to take.
-    static STATUSES: RefCell<Statuses> = RefCell::new({
+    static SAID: RefCell<Channel> = RefCell::new({
         let (sender, receiver) = unbounded();
         (sender, Some(receiver))
     });
 }
 
-/// Called by `playground.js` with how a build went.
+fn say(said: Said) {
+    SAID.with_borrow(|(sender, _)| _ = sender.unbounded_send(said));
+}
+
+/// Called by `playground.js` with what the program shown is doing.
 #[wasm_bindgen]
-pub fn rustd_status(kind: String, text: String) {
-    STATUSES.with_borrow(|(sender, _)| _ = sender.unbounded_send(Status { kind, text }));
+pub fn rustd_state(kind: String) {
+    say(Said::State(kind));
+}
+
+/// Called by `playground.js` with a line about a build.
+#[wasm_bindgen]
+pub fn rustd_line(
+    time: String,
+    level: String,
+    head: String,
+    parts: Vec<String>,
+    notes: Vec<String>,
+) {
+    say(Said::Line(Line { time, level, head, parts, notes }));
 }
 
 #[wasm_bindgen]
