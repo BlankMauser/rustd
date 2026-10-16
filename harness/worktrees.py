@@ -105,7 +105,7 @@ def main():
          "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
-        env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {}), **({"RUSTD_SPLIT": "1"} if SPLIT else {})})
+        env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {}), "RUSTD_SPLIT": "1" if SPLIT else "0"})
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")

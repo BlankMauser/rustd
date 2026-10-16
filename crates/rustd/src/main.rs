@@ -986,7 +986,8 @@ impl Checkouts {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let mut splits = Vec::new();
-        let share = std::env::var_os("RUSTD_SPLIT").is_some();
+        // A checkout like a loaded one shares the packages they have alike, unless told not to.
+        let share = std::env::var_os("RUSTD_SPLIT").is_none_or(|it| it != "0");
         for project in projects {
             if share && let Some((base, over)) = self.alike(project) {
                 let own = self.differing(base, &over);

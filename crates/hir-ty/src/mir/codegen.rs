@@ -1101,14 +1101,15 @@ fn compiled_instance<'db>(
 }
 
 /// The body of an instance that is not a shim, with the instance's types in place of the
-/// generic parameters. With `RUSTD_LEAN` the database does not keep it: nothing but compiling
-/// the instance reads it, and what was compiled is kept.
+/// generic parameters. The database does not keep it unless `RUSTD_LEAN=0`: nothing but
+/// compiling the instance reads it, and what was compiled is kept.
 fn instance_body<'db>(
     db: &'db dyn HirDatabase,
     instance: &Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<Cow<'db, MirBody<'db>>> {
-    static LEAN: LazyLock<bool> = LazyLock::new(|| std::env::var_os("RUSTD_LEAN").is_some());
+    static LEAN: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("RUSTD_LEAN").is_none_or(|it| it != "0"));
     let args = instance.args.clone();
     let body = match instance.def {
         InstanceDef::Fn(func) if *LEAN => db
