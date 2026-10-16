@@ -6481,8 +6481,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some((_, last)) = field_types.iter().last() else {
                     unsupported!("unsizing a struct without fields");
                 };
+                // The field may be an associated type of a parameter: an array of one, a slice
+                // of the other.
                 let from = last.ty().instantiate(self.interner, args).skip_norm_wip();
                 let to = last.ty().instantiate(self.interner, to_args).skip_norm_wip();
+                let (from, to) = (self.normalize(from), self.normalize(to));
                 self.unsize_metadata(from, to, old)
             }
             _ => unsupported!("unsizing {from:?} to {to:?}"),

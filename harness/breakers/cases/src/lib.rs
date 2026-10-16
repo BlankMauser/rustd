@@ -24,4 +24,6 @@ cases![
     clmul,
     cast_then_shift,
     xgetbv,
+    unsize_assoc_field,
+    const_bswap,
 ];
