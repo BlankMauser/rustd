@@ -292,6 +292,21 @@ class Dioxus extends Builds {
   }
 }
 
+// The list of builds stays at its newest line, unless it was scrolled away from it. The
+// app puts the list in the page once, some time after this runs.
+new MutationObserver((_, found) => {
+  const list = document.getElementById("status");
+  if (list === null) {
+    return;
+  }
+  found.disconnect();
+  let newest = true;
+  list.addEventListener("scroll", () => {
+    newest = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+  });
+  new MutationObserver(() => newest && (list.scrollTop = list.scrollHeight)).observe(list, { childList: true });
+}).observe(document.getElementById("playground"), { childList: true, subtree: true });
+
 const runners = {};
 window.rustd = {
   // Each compiler is loaded when a program of its kind is first shown, and kept.

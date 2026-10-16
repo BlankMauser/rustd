@@ -130,9 +130,8 @@ fn Playground() -> Element {
                     span { id: "state", class: "{state}", "{state}" }
                     button { r#type: "button", onclick: move |_| log.write().clear(), "clear" }
                 }
-                // Newest first in the page, and shown bottom up: it stays at the newest.
                 div { id: "status",
-                    for line in log.read().iter().rev() {
+                    for line in log.read().iter() {
                         div { class: "line {line.level}",
                             time { "{line.time}" }
                             p {

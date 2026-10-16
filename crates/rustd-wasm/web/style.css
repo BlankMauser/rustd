@@ -15,7 +15,7 @@ html, body, #playground { height: 100%; margin: 0; }
 * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 [hidden] { display: none !important; }
 .playground { height: 100%; display: grid;
-  grid-template: auto minmax(0, 1fr) clamp(190px, 32vh, 360px) / 250px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template: auto minmax(0, 1fr) clamp(130px, 21vh, 230px) / 250px minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px; padding: 12px; background: var(--bg); color: var(--text); font: 13px/1.5 var(--sans); }
 
 header { grid-column: 1 / 4; display: flex; align-items: center; gap: 14px; padding: 2px 4px; }
@@ -72,7 +72,7 @@ canvas, #main { position: absolute; inset: 0; width: 100%; height: 100%; display
   border: 1px solid var(--line); background: var(--raised); color: inherit; cursor: pointer; }
 #main button:hover { border-color: var(--accent); }
 
-/* How the builds went: the newest is last, and the one it stays at. */
+/* How the builds went: the newest is last, and `playground.js` scrolls to it. */
 .builds { grid-column: 2 / 4; }
 .builds > h2 button { background: none; color: var(--muted); font: inherit;
   border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; cursor: pointer; }
@@ -82,7 +82,7 @@ canvas, #main { position: absolute; inset: 0; width: 100%; height: 100%; display
 #state.running { background: var(--good); }
 #state.error { background: var(--bad); }
 #state.building { background: var(--accent); }
-#status { display: flex; flex-direction: column-reverse; overflow-y: auto; padding: 6px 0;
+#status { min-height: 0; overflow-y: scroll; padding: 6px 0;
   background: var(--code); font: 12.5px/1.6 var(--mono); }
 .line { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px;
   padding: 3px 14px 3px 11px; border-left: 3px solid transparent; }
