@@ -1496,8 +1496,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             &Expr::Assignment { target, value } => {
-                let Some((value, mut current)) = self.lower_expr_to_fresh_place(value, current)?
-                else {
+                // `_ = place` moves nothing out of the place, as `let _ = place` does not.
+                let lowered = if matches!(self.store[target], Pat::Wild) {
+                    self.lower_expr_as_place(current, value, true)?
+                } else {
+                    self.lower_expr_to_fresh_place(value, current)?
+                };
+                let Some((value, mut current)) = lowered else {
                     return Ok(None);
                 };
                 self.push_fake_read(current, value, expr_id.into());

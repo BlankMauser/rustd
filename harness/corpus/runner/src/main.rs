@@ -317,6 +317,7 @@ fn main() {
             run(vec![1, 2, 3, 4, 5], Separator::Comma)
         );
     }
+    println!("moved_out_field {:?}", cases::moved_out_field::run());
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 

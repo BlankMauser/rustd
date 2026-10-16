@@ -5417,3 +5417,42 @@ pub mod const_in_const {
         (read(&HELD), read(&AGAIN.1), AGAIN.0.len())
     }
 }
+
+/// A binding declared without a value takes a field out of what a match arm binds, as
+/// `syn::braced!` does: the field is dropped once, where the binding goes out of scope.
+pub mod moved_out_field {
+    use std::cell::RefCell;
+
+    struct Buffer<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+    impl Drop for Buffer<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+    struct Braces<'a> {
+        token: u32,
+        content: Buffer<'a>,
+    }
+    #[inline(never)]
+    fn braces<'a>(log: &'a RefCell<Vec<&'static str>>, fails: bool) -> Result<Braces<'a>, u8> {
+        if fails { Err(3) } else { Ok(Braces { token: 7, content: Buffer(log, "content") }) }
+    }
+    fn parse(log: &RefCell<Vec<&'static str>>, fails: bool) -> Result<u32, u8> {
+        let content: Buffer;
+        let token = match braces(log, fails) {
+            Ok(braces) => {
+                content = braces.content;
+                _ = content;
+                braces.token
+            }
+            Err(error) => return Err(error),
+        };
+        log.borrow_mut().push("parsed");
+        Ok(token + content.1.len() as u32)
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        let log = RefCell::new(Vec::new());
+        let (taken, failed) = (parse(&log, false), parse(&log, true));
+        (taken, failed, log.into_inner())
+    }
+}
