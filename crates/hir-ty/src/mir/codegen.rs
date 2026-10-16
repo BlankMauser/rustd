@@ -77,10 +77,14 @@ use super::{
 };
 
 mod asm;
+mod backend;
+pub use backend::Backend;
 mod cached;
 mod fragment;
 mod home;
 pub use home::body_file;
+#[cfg(feature = "llvm")]
+mod llvm;
 mod patch;
 mod stable;
 mod store;
@@ -466,6 +470,7 @@ impl CodegenUnit {
                     }
                     cg.kept.report();
                 }
+                backend::Tally::global().report();
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
@@ -1435,7 +1440,7 @@ fn compile<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-    let code = emit(&mut ctx)?;
+    let code = Backend::emit(&mut cg, &mut ctx)?;
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(CompiledFunction { requests, code, layouts })

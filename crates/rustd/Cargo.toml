@@ -32,5 +32,9 @@ ureq = "3.4.2"
 tar = "0.4.44"
 zstd = "0.13.3"
 
+[features]
+# Adds LLVM as a code producer, chosen with `RUSTD_BACKEND=llvm`.
+llvm = ["hir-ty/llvm"]
+
 [lints]
 workspace = true

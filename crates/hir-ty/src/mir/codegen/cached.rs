@@ -157,6 +157,8 @@ impl Entry {
         let mut hasher = Sha256::new();
         hasher.update(b"rustd entry 1");
         hasher.update((*compiler)?);
+        // Code of one producer is not what another would have given.
+        hasher.update(super::Backend::from_env().ok()?.to_string());
         hasher.update(name);
         Some(hasher.finalize().into())
     }
