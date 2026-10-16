@@ -1,14 +1,17 @@
 //! `simd_cast` had no lowering: every function that reached one was left to rustc. serde_json
 //! gets there through zmij's `_mm_mulhi_epu16`, which widens its lanes to multiply them.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// The lanes of a vector, as numbers.
+#[cfg(target_arch = "x86_64")]
 fn lanes<const N: usize, T: Copy + Into<i64>>(vector: __m128i) -> [i64; N] {
     let lanes: [T; N] = unsafe { std::mem::transmute_copy(&vector) };
     lanes.map(Into::into)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn run() -> Vec<[i64; 8]> {
     unsafe {
         let a = _mm_setr_epi16(1, -2, 300, -400, 32767, -32768, 12345, 0);
@@ -27,5 +30,29 @@ pub fn run() -> Vec<[i64; 8]> {
         // Sign and zero extension of the low lanes.
         let bytes = _mm_setr_epi8(-1, 2, -3, 4, -5, 6, -7, 8, 0, 0, 0, 0, 0, 0, 0, 0);
         vec![widened[0], widened[1], rest, lanes::<8, i16>(_mm_cvtepi8_epi16(bytes)), lanes::<8, i16>(_mm_cvtepu8_epi16(bytes))]
+    }
+}
+
+/// The same casts through NEON: lanes widened, and integers to floats and back.
+#[cfg(target_arch = "aarch64")]
+pub fn run() -> Vec<[i64; 8]> {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a: [i16; 8] = [1, -2, 300, -400, 32767, -32768, 12345, 0];
+        let low = vget_low_s16(vld1q_s16(a.as_ptr()));
+        let signed: [i32; 4] = std::mem::transmute(vmovl_s16(low));
+        let unsigned: [u32; 4] = std::mem::transmute(vmovl_u16(vreinterpret_u16_s16(low)));
+        let ints: [i32; 4] = [-7, 0, 123456789, i32::MIN];
+        let floats = vcvtq_f32_s32(vld1q_s32(ints.as_ptr()));
+        let back: [i32; 4] = std::mem::transmute(vcvtq_s32_f32(floats));
+        let narrowed: [i16; 4] = std::mem::transmute(vmovn_s32(vld1q_s32(ints.as_ptr())));
+        let mut rows = vec![[0; 8]; 2];
+        for i in 0..4 {
+            rows[0][i] = signed[i].into();
+            rows[0][i + 4] = unsigned[i].into();
+            rows[1][i] = back[i].into();
+            rows[1][i + 4] = narrowed[i].into();
+        }
+        rows
     }
 }

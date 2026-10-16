@@ -68,11 +68,12 @@ fn weaken(data: &mut [u8]) {
         Err(_) => vec![0..data.len()],
     };
     for member in members {
-        weaken_object(&mut data[member]);
+        definitions(&mut data[member]);
     }
 }
 
-fn weaken_object(data: &mut [u8]) {
+/// Makes the definitions of a Mach-O object weak; an object of another format stays as it is.
+pub(crate) fn definitions(data: &mut [u8]) {
     let Some(symbols) = symbol_table(data) else { return };
     let Some(data) = data.get_mut(symbols) else { return };
     let Ok(symbols) = pod::slice_from_all_bytes_mut::<Nlist64<LE>>(data) else { return };
