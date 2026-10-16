@@ -9,6 +9,9 @@ collected. Then the same edits are timed against cargo. Results go to bench.json
 
 RUSTD_SPLICE: edits are added to the linked binary where that can be done, and the results go
 to bench-splice.json and BENCH-splice.md instead.
+
+The `regex` bench is of bench2, which builds the regex-automata and regex-syntax that
+`vendor.sh regex-automata-<version>` and `vendor.sh regex-syntax-<version>` unpack.
 """
 import json, os, re, statistics, subprocess, sys, time
 
