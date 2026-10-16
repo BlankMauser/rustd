@@ -843,6 +843,9 @@ struct ObjectCodegen<'a, 'db> {
     found: Vec<(StableName, FuncId)>,
     found_pending: Vec<(StableName, FuncId)>,
     named_vtables: FxHashMap<String, DataId>,
+    /// The `TypeId::of` of each hash, and back.
+    type_id_shims: FxHashMap<u128, FuncId>,
+    type_ids: FxHashMap<FuncId, u128>,
     /// An entry did not fit the object, which now lacks a function it declares.
     misfit: bool,
 }
@@ -861,16 +864,24 @@ struct Kept {
     same: usize,
     /// Why instances with a name were not added.
     unkept: FxHashMap<&'static str, usize>,
+    /// Why instances with a name were compiled.
+    unfound: FxHashMap<&'static str, usize>,
 }
 
 impl Kept {
+    fn unfound<T>(&mut self, why: &'static str) -> Option<T> {
+        *self.unfound.entry(why).or_default() += 1;
+        None
+    }
+
     fn unkept<T>(&mut self, why: &'static str) -> Option<T> {
         *self.unkept.entry(why).or_default() += 1;
         None
     }
 
     fn report(&self) {
-        let Kept { added, found, unnamed, unnamed_requests, differing, same, unkept } = self;
+        let Kept { added, found, unnamed, unnamed_requests, differing, same, unkept, unfound } =
+            self;
         if added + found + unnamed + unnamed_requests + differing + same != 0 {
             eprintln!(
                 "entries: {found} found, {added} added, {same} as stored, {differing} not as stored, \
@@ -881,6 +892,11 @@ impl Kept {
             let mut unkept: Vec<_> = unkept.iter().collect();
             unkept.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
             eprintln!("not kept: {unkept:?}");
+        }
+        if !unfound.is_empty() {
+            let mut unfound: Vec<_> = unfound.iter().collect();
+            unfound.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+            eprintln!("not found: {unfound:?}");
         }
     }
 }
@@ -1651,6 +1667,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             found: Vec::new(),
             found_pending: Vec::new(),
             named_vtables: FxHashMap::default(),
+            type_id_shims: FxHashMap::default(),
+            type_ids: FxHashMap::default(),
             misfit: false,
             own_statics,
         })
@@ -1922,6 +1940,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
+    /// The function of the program that an instance without arguments is of, and its symbol.
+    fn root_named(&self, name: &str) -> Option<(FunctionId, String)> {
+        let of = self.names.functions_named(name);
+        of.into_iter().find_map(|it| Some((it, self.symbols.function(it)?)))
+    }
+
     fn entry(
         &mut self,
         instance: &Instance,
@@ -1932,7 +1956,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let mut funcs = Vec::with_capacity(ids.funcs.len());
         for (request, &id) in compiled.requests.funcs.iter().zip(&ids.funcs) {
             let decl = self.module.declarations().get_function_decl(id);
-            let target = if decl.linkage == Linkage::Import {
+            let target = if let Some(&hash) = self.type_ids.get(&id) {
+                CachedTarget::TypeId(hash)
+            } else if decl.linkage == Linkage::Import {
                 // rustc's copy of a function of the checkout is of the checkout as rustc
                 // built it, and uses rustc's copies of the statics.
                 let symbol = decl.linkage_name(id).into_owned();
@@ -1944,7 +1970,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 match callee {
                     // Ours to compile, though under a symbol: rustc built nothing of its crate.
                     Some(Some(name)) if !checked && stable::StableNames::of_checkout(&name) => {
-                        CachedTarget::Named(name.as_ref().to_owned())
+                        if self.root_named(&name).is_none() {
+                            return self.kept.unkept("unlisted function of the checkout");
+                        }
+                        CachedTarget::Root(name.as_ref().to_owned())
                     }
                     Some(name)
                         if name.as_ref().is_none_or(|it| stable::StableNames::of_checkout(it)) =>
@@ -1957,7 +1986,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let Some(name) = self.stable_name(callee) else {
                     return self.kept.unkept("unnamed callee");
                 };
-                CachedTarget::Named(name.as_ref().to_owned())
+                // A function the program is built from has no entry: it is compiled anew.
+                if stable::StableNames::of_checkout(&name) && self.root_named(&name).is_some() {
+                    CachedTarget::Root(name.as_ref().to_owned())
+                } else {
+                    CachedTarget::Named(name.as_ref().to_owned())
+                }
             } else if let FuncTarget::Asm(text) = &request.target {
                 CachedTarget::Asm(text.clone())
             } else {
@@ -1994,11 +2028,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let of_checkout = self.own_statics.crates.contains(&krate)
                         || krate.data(self.db).origin.is_local();
                     if decl.linkage != Linkage::Import || of_checkout {
-                        return self.kept.unkept("static of the checkout");
-                    }
-                    CachedData::Static {
-                        symbol: decl.linkage_name(id).into_owned(),
-                        thread_local: decl.tls,
+                        let Some(name) = self.names.static_(*of) else {
+                            return self.kept.unkept("unnamed static");
+                        };
+                        CachedData::OwnStatic(name)
+                    } else {
+                        CachedData::Static {
+                            symbol: decl.linkage_name(id).into_owned(),
+                            thread_local: decl.tls,
+                        }
                     }
                 }
                 DataRequest::Location(at) => CachedData::Location(self.location_at(*at)),
@@ -2029,11 +2067,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let Some(entries) = self.entries.clone() else { return Ok(None) };
         let symbols = self.symbols;
         if !entries.usable(name, &|symbol| symbols.defines(symbol)) {
-            return Ok(None);
+            let why = match entries.get(name) {
+                None => "no entry",
+                Some(it) if !it.links(&|symbol| symbols.defines(symbol)) => {
+                    "an entry linked against what the program lacks"
+                }
+                Some(_) => "an entry that calls what cannot be used",
+            };
+            return Ok(self.kept.unfound(why));
         }
         let Some(entry) = entries.get(name) else { return Ok(None) };
         if body.is_some_and(|it| it != entry.code.signature()) {
-            return Ok(None);
+            return Ok(self.kept.unfound("an entry of another signature"));
         }
         let symbol = format!("rustd::{}::n{}", entry.label, self.found.len());
         let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
@@ -2062,6 +2107,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             ids.funcs.push(match &func.target {
                 CachedTarget::Import { symbol, .. } => self.import(symbol, &func.sig)?,
                 CachedTarget::Asm(text) => self.assembly(text, &func.sig)?,
+                CachedTarget::TypeId(hash) => self.type_id_shim(&func.sig, *hash)?,
+                CachedTarget::Root(callee) => {
+                    let Some((of, symbol)) = self.root_named(callee) else {
+                        unsupported!("an entry calls `{callee}`, which no crate declares");
+                    };
+                    self.want(of);
+                    self.import(&symbol, &func.sig)?
+                }
                 CachedTarget::Named(callee) => {
                     let Some(id) = self.found_callee(callee, None)? else {
                         unsupported!("an entry calls `{callee}`, which the store lacks");
@@ -2085,6 +2138,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 },
                 CachedData::Static { symbol, thread_local } => {
                     self.module.declare_data(symbol, Linkage::Import, false, *thread_local)?
+                }
+                CachedData::OwnStatic(name) => {
+                    let Some(of) = self.names.static_named(name) else {
+                        unsupported!("an entry refers to `{name}`, which no crate declares");
+                    };
+                    self.static_data(of)?
                 }
                 CachedData::Location(at) => self.define_location(at.clone())?,
                 CachedData::FilePath(path) => self.define_file_path(path.clone())?,
@@ -2743,7 +2802,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&id) = self.instances.get(&instance) {
             return Ok(id);
         }
-        let name = format!("rustd::type_id::{}", self.instances.len());
+        let id = self.type_id_shim(sig, hash)?;
+        self.instances.insert(instance, id);
+        Ok(id)
+    }
+
+    /// The `TypeId::of` that returns `hash`.
+    fn type_id_shim(&mut self, sig: &Signature, hash: u128) -> Result<FuncId> {
+        if let Some(&id) = self.type_id_shims.get(&hash) {
+            return Ok(id);
+        }
+        let name = format!("rustd::type_id::h{}", self.type_id_shims.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
@@ -2781,7 +2850,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         builder.finalize(self.module.isa().frontend_config());
         self.builder_ctx = builder_ctx;
         self.define_shim(id, &mut ctx)?;
-        self.instances.insert(instance, id);
+        self.type_id_shims.insert(hash, id);
+        self.type_ids.insert(id, hash);
         Ok(id)
     }
 

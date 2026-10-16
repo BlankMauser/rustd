@@ -1157,6 +1157,27 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
+            "bswap" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError("bswap arg is not provided".into()));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                destination.write_from_bytes(self, &result)
+            }
+            "bitreverse" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "bitreverse arg is not provided".into(),
+                    ));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                for byte in &mut result {
+                    *byte = byte.reverse_bits();
+                }
+                destination.write_from_bytes(self, &result)
+            }
             "ctlz" | "ctlz_nonzero" => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctlz arg is not provided".into()));

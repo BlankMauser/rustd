@@ -51,6 +51,10 @@ pub(super) enum CachedTarget {
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
     Named(String),
+    /// A function of the checkout that is compiled whenever it is called, by its stable name.
+    Root(String),
+    /// The `TypeId::of` that returns this.
+    TypeId(u128),
     /// The function an `asm!` block is assembled as, by its assembly.
     Asm(String),
 }
@@ -70,6 +74,10 @@ pub(super) enum CachedData {
         symbol: String,
         thread_local: bool,
     },
+    /// A static by its stable name, where its symbol is not what tells whose it is: one of
+    /// the checkout is rustc's or ours as the build has it, and rustc exports no symbol for
+    /// one it kept to its crate.
+    OwnStatic(String),
     /// The file, line and column of a `core::panic::Location`.
     Location(Option<(String, u32, u32)>),
     FilePath(String),
@@ -155,7 +163,7 @@ impl Entry {
             Some(Sha256::digest(program).into())
         });
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 1");
+        hasher.update(b"rustd entry 3");
         hasher.update((*compiler)?);
         hasher.update(name);
         Some(hasher.finalize().into())
@@ -170,10 +178,13 @@ impl Entry {
     }
 
     /// Whether the program has everything of rustc's that the entry was linked against.
-    fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
+    pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
         let funcs = self.funcs.iter().all(|it| match &it.target {
             CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
-            CachedTarget::Named(_) | CachedTarget::Asm(_) => true,
+            CachedTarget::Named(_)
+            | CachedTarget::Root(_)
+            | CachedTarget::TypeId(_)
+            | CachedTarget::Asm(_) => true,
         });
         let datas = self.datas.iter().all(|it| match it {
             CachedData::Static { symbol, .. } => defines(symbol),
@@ -185,7 +196,10 @@ impl Entry {
     fn named(&self) -> impl Iterator<Item = &str> {
         self.funcs.iter().filter_map(|it| match &it.target {
             CachedTarget::Named(name) => Some(name.as_str()),
-            CachedTarget::Import { .. } | CachedTarget::Asm(_) => None,
+            CachedTarget::Import { .. }
+            | CachedTarget::Root(_)
+            | CachedTarget::TypeId(_)
+            | CachedTarget::Asm(_) => None,
         })
     }
 }

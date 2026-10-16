@@ -4,12 +4,15 @@
 
 use std::{cell::RefCell, fmt::Write};
 
-use hir_def::{AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, TraitId};
+use hir_def::{
+    AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
+    StaticId, TraitId, expr_store::Body, item_scope::ItemScope, nameres::crate_def_map,
+};
 use hir_expand::{HirFileId, MacroCallKind};
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,
+    AliasTy, AliasTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,
     inherent::{IntoKind, Safety as _, Term as _},
 };
 use salsa::plumbing::FromId;
@@ -19,7 +22,7 @@ use base_db::Crate;
 
 use super::{Instance, InstanceDef, SymbolResolver};
 use crate::{
-    InferBodyId,
+    ImplTraitId, InferBodyId,
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{GenericArgs, Region, TermId, Ty, TyKind},
@@ -31,6 +34,13 @@ const OF_CHECKOUT: char = '~';
 /// Before what stands for a crate from outside the checkout that rustc has no id for.
 const OF_LIBRARY: char = '^';
 
+/// The statics and the functions without type parameters that one build of a crate declares.
+#[derive(Default)]
+struct Listed {
+    statics: FxHashMap<String, StaticId>,
+    functions: FxHashMap<String, Vec<FunctionId>>,
+}
+
 pub(super) struct StableNames<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
@@ -39,6 +49,9 @@ pub(super) struct StableNames<'a, 'db> {
     /// Whether what is of those crates has a name, by what is written in them now.
     by_content: bool,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
+    /// The crates by what a name starts with, and what the ones asked about declare.
+    crates: RefCell<Option<FxHashMap<String, Vec<Crate>>>>,
+    listed: RefCell<FxHashMap<String, Listed>>,
     /// How often each thing kept an instance from having a name.
     pub(super) misses: RefCell<FxHashMap<&'static str, usize>>,
 }
@@ -56,6 +69,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
             owned,
             by_content,
             files: RefCell::default(),
+            crates: RefCell::default(),
+            listed: RefCell::default(),
             misses: RefCell::default(),
         }
     }
@@ -107,6 +122,118 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
+    /// A static that [`Self::static_named`] finds again.
+    pub(super) fn static_(&self, id: StaticId) -> Option<String> {
+        let name = self.static_name(id)?;
+        self.static_named(&name).is_some().then_some(name)
+    }
+
+    pub(super) fn static_named(&self, name: &str) -> Option<StaticId> {
+        self.listed(name, |it| it.statics.get(name).copied())
+    }
+
+    /// The functions an instance without arguments can be of: one for each crate that the
+    /// one build of its crate is here.
+    pub(super) fn functions_named(&self, name: &str) -> Vec<FunctionId> {
+        self.listed(name, |it| it.functions.get(name).cloned()).unwrap_or_default()
+    }
+
+    /// What the crate that `name` is of declares: a name starts with the kind of the item
+    /// and the crate it is written in.
+    fn listed<T>(&self, name: &str, of: impl FnOnce(&Listed) -> Option<T>) -> Option<T> {
+        let (_, rest) = name.split_once(' ')?;
+        let krate = &rest[..=rest.find(':')?];
+        let mut listed = self.listed.borrow_mut();
+        if !listed.contains_key(krate) {
+            // One build of a crate can be several crates here, which differ in what the
+            // daemon is told of them and not in what they declare.
+            let mut crates = self.crates.borrow_mut();
+            let crates = crates.get_or_insert_with(|| {
+                let mut crates = FxHashMap::<String, Vec<Crate>>::default();
+                for &krate in base_db::all_crates(self.db).iter() {
+                    let mut name = String::new();
+                    if self.crate_(&mut name, krate).is_some() {
+                        crates.entry(name).or_default().push(krate);
+                    }
+                }
+                crates
+            });
+            let found = self.list(crates.get(krate)?);
+            listed.insert(krate.to_owned(), found);
+        }
+        of(&listed[krate])
+    }
+
+    fn list(&self, crates: &[Crate]) -> Listed {
+        let db = self.db;
+        let mut found = Listed::default();
+        // The statics of a body's blocks too: a `static` is often written by a macro.
+        let mut bodies: Vec<DefWithBodyId> = Vec::new();
+        let function = |found: &mut Listed, id: FunctionId, bodies: &mut Vec<_>| {
+            let mut name = String::from("fn ");
+            if self.function(&mut name, id).is_some() {
+                name.push_str("<>");
+                found.functions.entry(name).or_default().push(id);
+            }
+            bodies.push(id.into());
+        };
+        let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
+            for def in scope.declarations() {
+                match def {
+                    ModuleDefId::StaticId(id) => {
+                        if let Some(name) = self.static_name(id) {
+                            found.statics.entry(name).or_insert(id);
+                        }
+                        bodies.push(id.into());
+                    }
+                    ModuleDefId::FunctionId(id) => function(&mut found, id, bodies),
+                    ModuleDefId::ConstId(id) => bodies.push(id.into()),
+                    // A method a trait provides has blocks of its own.
+                    ModuleDefId::TraitId(id) => {
+                        for &(_, item) in id.trait_items(db).items.iter() {
+                            match item {
+                                AssocItemId::FunctionId(id) => bodies.push(id.into()),
+                                AssocItemId::ConstId(id) => bodies.push(id.into()),
+                                AssocItemId::TypeAliasId(_) => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
+            for imp in scope.impls() {
+                for &(_, item) in imp.impl_items(db).items.iter() {
+                    match item {
+                        AssocItemId::FunctionId(id) => function(&mut found, id, bodies),
+                        AssocItemId::ConstId(id) => bodies.push(id.into()),
+                        AssocItemId::TypeAliasId(_) => {}
+                    }
+                }
+            }
+        };
+        for &krate in crates {
+            for (_, module) in crate_def_map(db, krate).modules(db) {
+                scope(module.scope(db), &mut bodies);
+            }
+        }
+        while let Some(body) = bodies.pop() {
+            for (_, def_map) in Body::of(db, body).blocks(db) {
+                for (_, module) in def_map.modules(db) {
+                    scope(module.scope(db), &mut bodies);
+                }
+            }
+        }
+        found
+    }
+
+    fn static_name(&self, id: StaticId) -> Option<String> {
+        let mut out = String::from("static ");
+        let at = id.lookup(self.db).id;
+        self.item(&mut out, id.krate(self.db), at.file_id, at.value.erase())?;
+        Some(out)
+    }
+
     fn miss<T>(&self, why: &'static str) -> Option<T> {
         *self.misses.borrow_mut().entry(why).or_default() += 1;
         None
@@ -120,6 +247,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
         file: HirFileId,
         id: ErasedFileAstId,
     ) -> Option<()> {
+        self.crate_(out, krate)?;
+        self.ast(out, file, id)
+    }
+
+    fn crate_(&self, out: &mut String, krate: Crate) -> Option<()> {
         // The source of a crate of the workspace changes too, built by the daemon or not.
         if self.owned.contains(&krate) || krate.data(self.db).origin.is_local() {
             if !self.by_content {
@@ -138,7 +270,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 },
             }
         }
-        self.ast(out, file, id)
+        Some(())
     }
 
     fn ast(&self, out: &mut String, file: HirFileId, id: ErasedFileAstId) -> Option<()> {
@@ -409,11 +541,42 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 self.region(out, region)?;
                 out.push(')');
             }
+            // What was left of a projection that no `impl` in reach gives a type to.
+            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. }) => {
+                let at = def_id.0.lookup(db).id;
+                out.push_str("alias ");
+                self.item(out, def_id.0.krate(db), at.file_id, at.value.erase())?;
+                self.args(out, args)?;
+            }
+            // An `impl Trait` nothing has told the type of, as in the drop glue of what holds one.
+            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => {
+                let (at, index) = match def_id.0.loc(db) {
+                    ImplTraitId::ReturnTypeImplTrait(of, index) => {
+                        out.push_str("opaque fn ");
+                        self.function(out, of)?;
+                        (None, index)
+                    }
+                    ImplTraitId::TypeAliasImplTrait(of, index) => {
+                        out.push_str("opaque alias ");
+                        (Some(of), index)
+                    }
+                };
+                if let Some(of) = at {
+                    let at = of.lookup(db).id;
+                    self.item(out, of.krate(db), at.file_id, at.value.erase())?;
+                }
+                write!(out, " {}", index.into_raw().into_u32()).ok()?;
+                self.args(out, args)?;
+            }
             TyKind::Alias(..) => return self.miss("alias type"),
             TyKind::Param(..) => return self.miss("type parameter"),
             TyKind::CoroutineClosure(..) => return self.miss("async closure"),
             TyKind::CoroutineWitness(..) => return self.miss("coroutine witness"),
-            TyKind::Foreign(..) => return self.miss("foreign type"),
+            TyKind::Foreign(def_id) => {
+                let at = def_id.0.lookup(db).id;
+                out.push_str("foreign ");
+                self.item(out, def_id.0.krate(db), at.file_id, at.value.erase())?;
+            }
             TyKind::Pat(..) => return self.miss("pattern type"),
             _ => return self.miss("other type"),
         }
