@@ -2609,6 +2609,8 @@ fn main() -> anyhow::Result<()> {
         .map_or(SLOW_SWITCH, Duration::from_millis);
     // The links under way that no build waits for, by the object each is of.
     let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
+    // What the files were like when each object was last built and linked.
+    let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The manifests that have changed since they were loaded, as they were then.
@@ -2671,6 +2673,19 @@ fn main() -> anyhow::Result<()> {
                             Some(View { over: base.clone(), base, project })
                         }
                     };
+                    // A checkout read as another that is as it was built takes no turn.
+                    if let (Some(view), Some(target)) = (&view, &target) {
+                        let unchanged = links.get(&target.out).is_none_or(|it| it.is_finished())
+                            && as_built
+                                .lock()
+                                .unwrap()
+                                .get(&target.out)
+                                .is_some_and(|it| it.still(&files, &db, view, target, request));
+                        if unchanged {
+                            let _ = writeln!(&stream, "ok unchanged");
+                            continue;
+                        }
+                    }
                     // One build reads a checkout from one place, and one that has packages of
                     // another reads that one as it is.
                     let shares = view
@@ -2872,6 +2887,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(link) = links.remove(&wanted.out) {
                 _ = link.join();
             }
+            as_built.lock().unwrap().remove(&wanted.out);
         }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -3183,12 +3199,19 @@ fn main() -> anyhow::Result<()> {
         }
         for (at, clients) in linking {
             let Some(Ok(built)) = replies.remove(&at) else { continue };
-            let Outputs { out, link_cmd, .. } =
+            let Outputs { out, link_cmd, patch } =
                 outputs.remove(&at).unwrap_or_else(|| Outputs::of(&programs[at].args));
             let link_cmd = link_cmd.filter(|_| clients.iter().any(|it| it.0 != Request::Patch));
             let sender = sender.clone();
+            let base = &programs[at].args.checkout;
+            let over = viewed.get(base).unwrap_or(base);
+            let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
+            let (as_built, object) = (as_built.clone(), out.clone());
             let linked = std::thread::spawn(move || {
                 let failed = link(link_cmd.as_deref()).err();
+                if failed.is_none() {
+                    as_built.lock().unwrap().insert(object, from);
+                }
                 for (_, _, client) in clients {
                     let _ = match &failed {
                         None => writeln!(&client, "ok {built}"),
@@ -3202,6 +3225,87 @@ fn main() -> anyhow::Result<()> {
             links.insert(out, linked);
         }
     }
+}
+
+/// What an object of a checkout read as another was built from, to tell whether it still is.
+struct Settled {
+    over: PathBuf,
+    patch: Option<PathBuf>,
+    /// `None` when it was not linked.
+    link_cmd: Option<String>,
+    /// The checkout's own files and their directories, with when each was written. Another
+    /// checkout may have other files, and a file that is new changes none of those there are.
+    own: Vec<(PathBuf, Option<SystemTime>)>,
+    /// When each file outside the checkout was written.
+    others: u64,
+}
+
+impl Settled {
+    /// To be asked once the build is over: the files are as old as they were when the build
+    /// started to read them.
+    fn of(
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        base: &Path,
+        over: &Path,
+        patch: Option<PathBuf>,
+        link_cmd: Option<String>,
+    ) -> Settled {
+        let mut own = Vec::new();
+        let mut directories = FxHashSet::default();
+        for file in files.iter().filter(|it| it.path.starts_with(base)) {
+            let path = db.on_disk(&file.path);
+            if let Some(directory) = path.parent()
+                && path.starts_with(over)
+                && directories.insert(directory.to_owned())
+            {
+                own.push((directory.to_owned(), written(directory)));
+            }
+            own.push((path, Some(file.mtime)));
+        }
+        let others = Settled::others(files, base, |file| Some(file.mtime));
+        Settled { over: over.to_owned(), patch, link_cmd, own, others }
+    }
+
+    fn others(
+        files: &[WatchedFile],
+        base: &Path,
+        written: impl Fn(&WatchedFile) -> Option<SystemTime>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        for file in files.iter().filter(|it| !it.path.starts_with(base)) {
+            (&file.path, written(file)).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Whether a build for `request` would find the files as they were and write what is
+    /// there.
+    fn still(
+        &self,
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        view: &View,
+        target: &Target,
+        request: Request,
+    ) -> bool {
+        let linked = request == Request::Patch || self.link_cmd.is_some();
+        // A file outside every checkout is read from where it is.
+        let outside = |file: &WatchedFile| written(&db.on_disk(&file.path));
+        self.over == view.over
+            && self.patch == target.patch
+            && linked
+            && (self.link_cmd.is_none() || self.link_cmd == target.link_cmd)
+            && target.out.exists()
+            && self.patch.as_ref().is_none_or(|it| it.exists())
+            && self.own.iter().all(|(path, at)| written(path) == *at)
+            && self.others == Settled::others(files, &view.base, outside)
+    }
+}
+
+fn written(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|it| it.modified()).ok()
 }
 
 /// A change to the files, and how long each step up to the builds took.
