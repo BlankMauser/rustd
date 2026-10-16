@@ -338,6 +338,7 @@ impl<'db> InferenceContext<'db> {
         if ty.is_ty_error() {
             return None;
         }
+        let ty = self.table.resolve_projections_within(ty);
 
         if let Some(result) = self.resolve_enum_variant_on_ty(ty, name, id) {
             return Some(result);
