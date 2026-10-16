@@ -9,6 +9,7 @@ import os, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs
 
 TOML = """[package]
@@ -68,8 +69,7 @@ def follow(files, steps):
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link = linkline.ahead(link, [patch, obj], RUSTD)
     link[link.index("-o") + 1] = binary
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     # RUSTD_SPLICE: edits are added to the linked binary where that can be done.

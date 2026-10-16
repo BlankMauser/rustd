@@ -17,7 +17,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{
     ObjectProduct,
     object::{
-        RelocationEncoding, RelocationFlags, RelocationKind,
+        BinaryFormat, RelocationEncoding, macho, RelocationFlags, RelocationKind,
         write::{Relocation, StandardSection},
     },
 };
@@ -224,8 +224,21 @@ impl UnwindContext {
                 },
             )
             .map_err(|e| e.to_string())?;
-        // The personality is reached through a pointer, as it can live in another DSO. It
-        // must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
+        // The personality is reached through a pointer, as it can live in another DSO. The
+        // linker of Mach-O makes that pointer, when asked for the one among its own.
+        if module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho {
+            cie.personality = Some((
+                gimli::DwEhPe(
+                    gimli::DW_EH_PE_indirect.0
+                        | gimli::DW_EH_PE_pcrel.0
+                        | gimli::DW_EH_PE_sdata4.0,
+                ),
+                address_for_func(personality),
+            ));
+            let with_landing_pads = frame_table.add_cie(cie);
+            return Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table });
+        }
+        // It must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
         let personality_ref = module
             .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
             .map_err(|e| e.to_string())?;
@@ -236,10 +249,13 @@ impl UnwindContext {
         let func_ref = module.declare_func_in_data(personality, &mut data);
         data.write_function_addr(0, func_ref);
         module.define_data(personality_ref, &data).map_err(|e| e.to_string())?;
+        // A linker of AArch64 may put more than four gigabytes between the two.
+        let distance = match module.isa().triple().architecture {
+            target_lexicon::Architecture::Aarch64(_) => gimli::DW_EH_PE_sdata8,
+            _ => gimli::DW_EH_PE_sdata4,
+        };
         cie.personality = Some((
-            gimli::DwEhPe(
-                gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
-            ),
+            gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | distance.0),
             address_for_data(personality_ref),
         ));
 
@@ -263,7 +279,11 @@ impl UnwindContext {
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
         data.define(landing_pads.clone().into_boxed_slice());
-        data.set_custom_section(".gcc_except_table");
+        // Mach-O has room for 255 sections and every custom one counts, so there the tables
+        // lie with the constants, where the unwinder finds them as well.
+        if module.isa().triple().binary_format != target_lexicon::BinaryFormat::Macho {
+            data.set_custom_section(".gcc_except_table");
+        }
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
         fde.lsda = Some(address_for_data(lsda));
 
@@ -285,9 +305,25 @@ impl UnwindContext {
             } else {
                 product.data_symbol(DataId::from_u32((reloc.symbol & !DATA_SYMBOL) as u32))
             };
-            // Local symbols are addressed through their section.
-            let (symbol, offset) =
-                product.object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0));
+            // Local symbols are addressed through their section, except in Mach-O, whose
+            // linker cuts a section into pieces at its symbols.
+            let macho = product.object.format() == BinaryFormat::MachO;
+            let (symbol, offset) = match macho {
+                true => (symbol, 0),
+                false => product.object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0)),
+            };
+            let flags = match reloc.indirect && macho {
+                true => RelocationFlags::MachO {
+                    r_type: macho::ARM64_RELOC_POINTER_TO_GOT,
+                    r_pcrel: true,
+                    r_length: 2,
+                },
+                false => RelocationFlags::Generic {
+                    kind: reloc.kind,
+                    encoding: RelocationEncoding::Generic,
+                    size: reloc.size * 8,
+                },
+            };
             product
                 .object
                 .add_relocation(
@@ -295,11 +331,7 @@ impl UnwindContext {
                     Relocation {
                         offset: u64::from(reloc.offset),
                         symbol,
-                        flags: RelocationFlags::Generic {
-                            kind: reloc.kind,
-                            encoding: RelocationEncoding::Generic,
-                            size: reloc.size * 8,
-                        },
+                        flags,
                         addend: offset as i64 + reloc.addend,
                     },
                 )
@@ -315,6 +347,8 @@ struct Reloc {
     symbol: usize,
     addend: i64,
     kind: RelocationKind,
+    /// Whether what is wanted is the address of a pointer to the symbol.
+    indirect: bool,
 }
 
 /// A [`Writer`] that collects the relocations its output needs.
@@ -358,6 +392,7 @@ impl Writer for WriterRelocate {
                     symbol,
                     addend,
                     kind: RelocationKind::Absolute,
+                    indirect: false,
                 });
                 self.write_udata(0, size)
             }
@@ -405,7 +440,14 @@ impl Writer for WriterRelocate {
                     (gimli::DW_EH_PE_absptr, _) => (RelocationKind::Absolute, size),
                     _ => return Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
                 };
-                self.relocs.push(Reloc { offset: self.len() as u32, size, symbol, addend, kind });
+                self.relocs.push(Reloc {
+                    offset: self.len() as u32,
+                    size,
+                    symbol,
+                    addend,
+                    kind,
+                    indirect: eh_pe.is_indirect(),
+                });
                 self.write_udata(0, size)
             }
         }

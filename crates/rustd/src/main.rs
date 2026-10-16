@@ -10,6 +10,7 @@ mod splice;
 mod stub;
 mod symbols;
 mod tree;
+mod weaken;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at.
@@ -2510,6 +2511,9 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("deps") {
         return deps::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("weaken") {
+        return weaken::command(std::env::args().skip(2));
     }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))

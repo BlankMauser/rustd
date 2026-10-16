@@ -203,6 +203,11 @@ enum PassMode {
     /// Aggregate the C ABI splits over two registers, the second holding what lies eight
     /// bytes in.
     CastPair(Type, Type),
+    /// Aggregate the C ABI of AArch64 hands over as so many registers of one kind, each
+    /// holding what follows the one before. Before them come `skipped` registers of that kind
+    /// that carry nothing: an aggregate goes to the stack whole once it no longer fits the
+    /// registers, and nothing after it uses the ones it left.
+    Units { unit: Type, count: u8, skipped: u8 },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -951,6 +956,18 @@ impl Resolved {
     }
 }
 
+/// The triple of the one target we compile for: the machine rustd runs on.
+const TRIPLE: target_lexicon::Triple = target_lexicon::HOST;
+
+/// The convention of every call. Rust's own is the target's C convention with rustc's choice
+/// of what goes in a register, so one serves both.
+const CALL_CONV: CallConv = match (TRIPLE.architecture, TRIPLE.vendor) {
+    (target_lexicon::Architecture::Aarch64(_), target_lexicon::Vendor::Apple) => {
+        CallConv::AppleAarch64
+    }
+    _ => CallConv::SystemV,
+};
+
 /// The one target we compile for.
 fn target() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
@@ -978,11 +995,15 @@ const LARGE: usize = 50_000;
 fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
+    let tls_model = match TRIPLE.binary_format {
+        target_lexicon::BinaryFormat::Macho => "macho",
+        _ => "elf_gd",
+    };
+    flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
     flags.set("opt_level", "none").map_err(|e| e.to_string())?;
     flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
     flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-    isa::lookup_by_name("x86_64-unknown-linux-gnu")
+    isa::lookup(TRIPLE)
         .map_err(|e| e.to_string())?
         .finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())
@@ -3484,7 +3505,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// How a call with these types passes its values. Mirrors rustc: `adjust_for_rust_abi`
-    /// for Rust's own conventions, and `callconv/x86_64.rs` for C's.
+    /// for Rust's own conventions, and `callconv/x86_64.rs` or `callconv/aarch64.rs` for C's.
     fn fn_abi(
         &self,
         abi: ExternAbi,
@@ -3502,6 +3523,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(abi, ExternAbi::C { .. } | ExternAbi::System { .. } | ExternAbi::SysV64 { .. })
         {
             unsupported!("calling convention {abi:?}");
+        }
+        if let target_lexicon::Architecture::Aarch64(_) = TRIPLE.architecture {
+            return self.aarch64_c_abi(ret, args);
         }
         let (mut int_regs, mut sse_regs) = (6usize, 8usize);
         let ret = match self.c_pass_mode(ret)? {
@@ -3521,6 +3545,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
+                PassMode::Units { .. } => unreachable!("an aggregate of the AArch64 ABI"),
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -3535,6 +3560,117 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             });
         }
         Ok(FnAbi { ret, args: modes })
+    }
+
+    /// The procedure call standard of AArch64, with what Apple changed of it. A value in memory
+    /// is a pointer to the caller's copy, and one returned in memory is written where `x8`
+    /// points, which is where Cranelift puts a struct return.
+    fn aarch64_c_abi(&self, ret: Ty<'db>, args: impl IntoIterator<Item = Ty<'db>>) -> Result<FnAbi> {
+        let ret = self.aarch64_c_pass_mode(ret)?;
+        // What is left of `x0` to `x7` and of `v0` to `v7`.
+        let (mut ints, mut floats) = (8u8, 8u8);
+        let mut modes = Vec::new();
+        for ty in args {
+            let mode = self.aarch64_c_pass_mode(ty)?;
+            modes.push(match mode {
+                PassMode::Units { unit, count, .. } => {
+                    let left = if unit.is_float() { &mut floats } else { &mut ints };
+                    let needed = count * unit.bytes().div_ceil(8) as u8;
+                    let skipped = if needed <= *left { 0 } else { *left };
+                    *left -= if skipped == 0 { needed } else { skipped };
+                    PassMode::Units { unit, count, skipped }
+                }
+                PassMode::Direct(scalar) => {
+                    let left = if scalar.ty.is_float() { &mut floats } else { &mut ints };
+                    *left = left.saturating_sub(scalar.ty.bytes().div_ceil(8) as u8);
+                    mode
+                }
+                PassMode::Indirect => {
+                    ints = ints.saturating_sub(1);
+                    mode
+                }
+                mode => mode,
+            });
+        }
+        Ok(FnAbi { ret, args: modes })
+    }
+
+    /// How the C ABI of AArch64 passes one value while registers are left for it.
+    fn aarch64_c_pass_mode(&self, ty: Ty<'db>) -> Result<PassMode> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(PassMode::Ignore);
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(scalar) => return Ok(PassMode::Direct(self.scalar(scalar)?)),
+            BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
+            _ => (),
+        }
+        let size = layout.size.bytes();
+        let mut members = Vec::new();
+        self.members(ty, 0, &mut members)?;
+        members.sort_unstable_by_key(|&(offset, _)| offset);
+        members.dedup();
+        // A homogeneous floating-point aggregate: up to four floats of one type and nothing
+        // else, each in a register of its own.
+        if let Some(&(_, first)) = members.first()
+            && first.is_float()
+            && members.len() <= 4
+            && members.iter().all(|&(_, member)| member == first)
+            && members.len() as u64 * u64::from(first.bytes()) == size
+        {
+            return Ok(PassMode::Units { unit: first, count: members.len() as u8, skipped: 0 });
+        }
+        if size > 16 {
+            return Ok(PassMode::Indirect);
+        }
+        let unit = if layout.align.abi.bytes() == 16 { types::I128 } else { types::I64 };
+        let count = size.div_ceil(u64::from(unit.bytes())) as u8;
+        Ok(PassMode::Units { unit, count, skipped: 0 })
+    }
+
+    /// The scalars `ty` is made of, each with where it lies in a value at `offset`.
+    fn members(&self, ty: Ty<'db>, offset: u64, members: &mut Vec<(u64, Type)>) -> Result<()> {
+        let layout = self.layout(ty)?;
+        if layout.is_zst() {
+            return Ok(());
+        }
+        match layout.backend_repr {
+            BackendRepr::Scalar(a) => members.push((offset, self.scalar(a)?.ty)),
+            BackendRepr::ScalarPair(a, b) => {
+                let second = a.size(self.dl()).align_to(b.align(self.dl()).abi).bytes();
+                members.push((offset, self.scalar(a)?.ty));
+                members.push((offset + second, self.scalar(b)?.ty));
+            }
+            BackendRepr::Memory { sized: true } => match ty.kind() {
+                TyKind::Tuple(tys) => {
+                    for (i, ty) in tys.iter().enumerate() {
+                        self.members(ty, offset + layout.fields.offset(i).bytes(), members)?;
+                    }
+                }
+                TyKind::Array(element, _) => {
+                    let stride = self.layout(element)?.size.bytes();
+                    for i in 0..layout.fields.count() as u64 {
+                        self.members(element, offset + i * stride, members)?;
+                    }
+                }
+                TyKind::Adt(def, subst) => {
+                    let variant: VariantId = match def.def_id() {
+                        AdtId::StructId(id) => id.into(),
+                        AdtId::UnionId(id) => id.into(),
+                        AdtId::EnumId(_) => unsupported!("enum {ty:?} in the C ABI"),
+                    };
+                    for (field, ty) in self.cg.db.field_types(variant).iter() {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
+                        self.members(ty, offset + field.bytes(), members)?;
+                    }
+                }
+                _ => unsupported!("{ty:?} in the C ABI"),
+            },
+            _ => unsupported!("{ty:?} in the C ABI"),
+        }
+        Ok(())
     }
 
     fn count_regs(&self, types: &[Type]) -> (usize, usize) {
@@ -3657,6 +3793,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Pair(a, b, _) => params.extend([a.param(), b.param()]),
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
             PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
+            PassMode::Units { unit, count, skipped } => {
+                let register = if unit.is_float() { types::F64 } else { types::I64 };
+                params.extend(std::iter::repeat_n(AbiParam::new(register), skipped.into()));
+                params.extend(std::iter::repeat_n(AbiParam::new(unit), count.into()));
+            }
             PassMode::Indirect => params.push(AbiParam::new(PTR)),
             PassMode::OnStack(size) => {
                 params.push(AbiParam::special(PTR, ArgumentPurpose::StructArgument(size)))
@@ -3665,7 +3806,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         match ret {
             PassMode::Indirect => {
                 sig.params.push(AbiParam::special(PTR, ArgumentPurpose::StructReturn))
@@ -3714,6 +3855,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 values.push(self.load_cast(b, rest, layout.size - Size::from_bytes(8)));
             }
+            PassMode::Units { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    values.push(match unit.is_float() {
+                        true => self.builder.ins().f64const(0.0),
+                        false => self.builder.ins().iconst(types::I64, 0),
+                    });
+                }
+                let whole = layout.size.bytes() / u64::from(unit.bytes());
+                for i in 0..u64::from(count) {
+                    let at = i * u64::from(unit.bytes());
+                    values.push(if i < whole {
+                        self.builder.ins().load(unit, MEM, addr, at as i32)
+                    } else {
+                        let rest = self.builder.ins().iadd_imm(addr, at as i64);
+                        self.load_cast(unit, rest, layout.size - Size::from_bytes(at))
+                    });
+                }
+            }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
@@ -3753,6 +3912,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, a, addr, 0);
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 self.store_cast(b, rest, layout.size - Size::from_bytes(8));
+            }
+            PassMode::Units { unit, count, skipped } => {
+                for _ in 0..skipped {
+                    next();
+                }
+                let whole = layout.size.bytes() / u64::from(unit.bytes());
+                for i in 0..u64::from(count) {
+                    let (value, at) = (next(), i * u64::from(unit.bytes()));
+                    if i < whole {
+                        self.builder.ins().store(MEM, value, addr, at as i32);
+                    } else {
+                        let rest = self.builder.ins().iadd_imm(addr, at as i64);
+                        self.store_cast(value, rest, layout.size - Size::from_bytes(at));
+                    }
+                }
             }
         }
     }
@@ -4681,7 +4855,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.extend([AbiParam::new(PTR); 3]);
         let callee = self.cg.import_path("core::panicking::panic_bounds_check", &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5314,7 +5488,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(to, addr, size);
             }
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.assembly(wrapper.text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -5924,7 +6098,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
         sig.returns.push(AbiParam::new(ty));
         let callee = self.cg.import(name, &sig)?;
@@ -5947,7 +6121,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 (_, false, types::F64, _) => "__floatuntidf",
                 _ => unsupported!("cast from {} to {}", from.ty, to.ty),
             };
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = Signature::new(CALL_CONV);
             sig.params.push(AbiParam::new(from.ty));
             sig.returns.push(AbiParam::new(to.ty));
             let callee = self.cg.import(name, &sig)?;
@@ -6024,7 +6198,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         self.builder.switch_to_block(panic_block);
         let location = self.caller_location()?;
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.push(AbiParam::new(PTR));
         let callee = self.cg.import_path(&path, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -6664,7 +6838,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         bytes[16..24].copy_from_slice(&layout.align.abi.bytes().to_le_bytes());
         let mut blob = ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: 8 };
         if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = Signature::new(CALL_CONV);
             sig.params.push(AbiParam::new(PTR));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
@@ -7291,9 +7465,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if variadic {
                     // Each call of a variadic function has a signature of its own, and the
                     // function is declared with only one of them.
-                    // FIXME: the callee is told how many vector registers hold arguments,
-                    // which Cranelift has no way to say.
-                    if sig.params.iter().any(|param| param.value_type.is_float()) {
+                    if let CallConv::AppleAarch64 = CALL_CONV {
+                        let InstanceDef::Fn(func) = def else { unreachable!() };
+                        let named = FunctionSignature::of(self.cg.db, func).params.len();
+                        let named = arg_modes[..named]
+                            .iter()
+                            .map(|&mode| {
+                                let mut params = Vec::new();
+                                self.push_abi_params(mode, &mut params);
+                                params.len()
+                            })
+                            .sum::<usize>()
+                            + usize::from(matches!(ret_mode, PassMode::Indirect));
+                        self.apple_variadic(&mut sig, &mut values, named);
+                    } else if sig.params.iter().any(|param| param.value_type.is_float()) {
+                        // FIXME: the callee is told how many vector registers hold arguments,
+                        // which Cranelift has no way to say.
                         unsupported!("float passed to a variadic function");
                     }
                     let sig = self.builder.import_signature(sig);
@@ -7310,6 +7497,41 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
+    }
+
+    /// Makes a call pass what follows its first `named` parameters the way Apple passes the
+    /// variable arguments of a C function on AArch64: each in eight bytes of stack, whatever
+    /// registers are free. Cranelift knows no such thing, so arguments that carry nothing
+    /// take the registers that are left.
+    fn apple_variadic(&mut self, sig: &mut Signature, values: &mut Vec<Value>, named: usize) {
+        let (mut ints, mut floats) = (8usize, 8usize);
+        for param in &sig.params[..named] {
+            match param.purpose {
+                ArgumentPurpose::StructReturn => (),
+                _ if param.value_type.is_float() => floats = floats.saturating_sub(1),
+                _ => ints = ints.saturating_sub(param.value_type.bytes().div_ceil(8) as usize),
+            }
+        }
+        for (param, value) in sig.params[named..].iter_mut().zip(&mut values[named..]) {
+            if param.value_type.is_int() && param.value_type.bits() < 64 {
+                *value = match param.extension {
+                    ir::ArgumentExtension::Sext => self.builder.ins().sextend(types::I64, *value),
+                    _ => self.builder.ins().uextend(types::I64, *value),
+                };
+                *param = AbiParam::new(types::I64);
+            }
+        }
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let zero_float = self.builder.ins().f64const(0.0);
+        sig.params.splice(
+            named..named,
+            std::iter::repeat_n(AbiParam::new(types::I64), ints)
+                .chain(std::iter::repeat_n(AbiParam::new(types::F64), floats)),
+        );
+        values.splice(
+            named..named,
+            std::iter::repeat_n(zero, ints).chain(std::iter::repeat_n(zero_float, floats)),
+        );
     }
 
     fn intrinsic(
@@ -7990,7 +8212,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(CALL_CONV);
                 sig.params.push(AbiParam::new(types::I32));
                 sig.returns.push(AbiParam::new(types::I64));
                 let callee = self.cg.assembly(asm::xgetbv(), &sig);
@@ -8002,7 +8224,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(CALL_CONV);
                 sig.params.extend([AbiParam::new(PTR), AbiParam::new(PTR)]);
                 sig.params.push(AbiParam::new(types::I32));
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
@@ -8064,7 +8286,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// those call compiler-builtins.
     fn divide(&mut self, l: Value, r: Value, div: bool, signed: bool) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::I128 {
-            let mut sig = Signature::new(CallConv::SystemV);
+            let mut sig = Signature::new(CALL_CONV);
             sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
             sig.returns.push(AbiParam::new(types::I128));
             let name = match (div, signed) {
@@ -8089,7 +8311,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Cranelift has no 128-bit multiply that reports overflow, so this calls the one in
     /// `compiler_builtins`.
     fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.extend([AbiParam::new(types::I128), AbiParam::new(types::I128)]);
         sig.params.push(AbiParam::new(PTR));
         sig.returns.push(AbiParam::new(types::I128));
@@ -8104,7 +8326,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.extend([AbiParam::new(PTR); 3]);
         sig.returns.push(AbiParam::new(types::I32));
         let memcmp = self.cg.import("memcmp", &sig)?;
@@ -8453,7 +8675,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
             return Ok(());
         }
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.push(AbiParam::new(PTR));
         let mut values = vec![addr];
         if self.is_unsized(ty) {
@@ -8472,7 +8694,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = Signature::new(CALL_CONV);
         sig.params.push(AbiParam::new(PTR));
         if self.is_unsized(ty) {
             sig.params.push(AbiParam::new(PTR));
@@ -8803,7 +9025,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let done = self.builder.create_block();
                 self.builder.ins().brif(glue, call, &[], done, &[]);
                 self.builder.switch_to_block(call);
-                let mut sig = Signature::new(CallConv::SystemV);
+                let mut sig = Signature::new(CALL_CONV);
                 sig.params.push(AbiParam::new(PTR));
                 let sig = self.builder.import_signature(sig);
                 self.invoke_indirect(sig, glue, &[addr]);

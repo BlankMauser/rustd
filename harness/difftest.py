@@ -8,6 +8,7 @@ also linked in on its own to name the ones that change behaviour.
 """
 import re
 import argparse, glob, json, os, shlex, subprocess, sys, tempfile, time
+import linkline
 
 # rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
 # has to come from the rustc that copy was taken from.
@@ -103,12 +104,12 @@ class Fixture:
 
     def link(self, objects):
         args = list(self.link_args)
-        first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
+        first = linkline.first_of_rustc(args)
         if self.alone:
             # Nothing of the workspace is rustc's for rustd's to be defined a second time.
             args[first:first] = objects
         else:
-            args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
+            args = linkline.ahead(args, objects, RUSTD)
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
         run = subprocess.run(args, capture_output=True, text=True)

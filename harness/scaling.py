@@ -16,6 +16,7 @@ import json, os, re, shlex, statistics, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["RUSTD_STATS"] = "1"
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs
 
 MARK = "rustd-scaling-edit"
@@ -55,9 +56,8 @@ def measure(name, spec, repeat):
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
     obj, patch, binary = (os.path.join(fx.work, n) for n in ("rustd.o", "rustd.patch.o", "bin-rustd"))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link = linkline.ahead(link, [patch, obj], RUSTD)
     link[link.index("-o") + 1] = binary
     if (ld := os.environ.get("SCALING_LD")) and "-fuse-ld=lld" in link:
         link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]

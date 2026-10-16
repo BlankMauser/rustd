@@ -1329,6 +1329,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "target-lexicon",
  "thin-vec",
  "tracing",
  "tracing-subscriber",
