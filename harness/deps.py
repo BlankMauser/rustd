@@ -11,6 +11,8 @@ Needs the crates in cargo's local registry cache: it builds offline."""
 import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from difftest import RUNNER, profile_dir
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "..", "target", "release", "rustd")
 LOCAL = ["app", "near"]
 
@@ -36,7 +38,7 @@ def cargo(root):
         words = line.split()
         if len(words) >= 2 and words[0] in ("Fresh", "Compiling", "Dirty"):
             said.setdefault(words[0], set()).add(words[1])
-    return said, subprocess.run([f"{root}/target/debug/app"], capture_output=True, text=True).stdout
+    return said, subprocess.run([*RUNNER, os.path.join(profile_dir(f"{root}/target"), "app")], capture_output=True, text=True).stdout
 
 def rustd(root, *args):
     return subprocess.run([RUSTD, "deps", *args], cwd=root, capture_output=True, text=True)

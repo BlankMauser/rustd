@@ -9,7 +9,7 @@ import os, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 TOML = """[package]
 name = "sinc"
@@ -84,7 +84,7 @@ def follow(files, steps):
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -110,7 +110,7 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(os.path.join(reference, "debug", "sinc")) else "DIFFERENT OUTPUT"
+            verdict = "same" if run(binary) == run(os.path.join(profile_dir(reference), "sinc")) else "DIFFERENT OUTPUT"
         wrong += verdict.isupper()
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()

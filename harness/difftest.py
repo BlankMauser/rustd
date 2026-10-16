@@ -42,10 +42,18 @@ if TARGET and TARGET != host():
     if "runner" in _cross:
         os.environ.setdefault("RUSTD_RUNNER", _cross["runner"])
         os.environ.setdefault(_env + "_RUNNER", os.environ["RUSTD_RUNNER"])
+if TARGET:
+    # Every cargo a harness runs builds for the target, and so does every rustd.
+    os.environ["CARGO_BUILD_TARGET"] = TARGET
 # What a built binary is started with.
 RUNNER = shlex.split(os.environ.get("RUSTD_RUNNER", ""))
 # What cargo and rustd take to build for the target.
 TARGET_ARGS = ["--target", TARGET] if TARGET else []
+
+
+def profile_dir(target_dir, profile="debug"):
+    """Where cargo puts what it builds under a target directory."""
+    return os.path.join(target_dir, *([TARGET] if TARGET else []), profile)
 
 
 def linker_line(output):

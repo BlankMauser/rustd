@@ -2524,6 +2524,10 @@ fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     let mut args = Args::parse()?;
+    // As cargo does: the flag, then the environment, then the host.
+    if args.target.is_none() {
+        args.target = std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+    }
     let emits = match &args.target {
         Some(triple) => hir_ty::mir::codegen::Target::select(triple),
         None => hir_ty::mir::codegen::Target::selected(),

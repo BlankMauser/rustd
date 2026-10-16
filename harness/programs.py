@@ -9,7 +9,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -94,7 +94,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -125,7 +125,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                verdict = "same" if run(program["bin"]) == run(os.path.join(reference, "debug", name)) else "DIFFERENT OUTPUT"
+                verdict = "same" if run(program["bin"]) == run(os.path.join(profile_dir(reference), name)) else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
