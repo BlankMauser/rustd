@@ -36,6 +36,8 @@ pub(super) enum FuncTarget {
     Path(String),
     /// Whatever stands for the instance in the build: rustc's copy or ours.
     Instance(Instance, StoredParamEnvAndCrate),
+    /// The function an `asm!` block is assembled as, by its assembly.
+    Asm(String),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -213,6 +215,10 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn import_path(&mut self, path: &str, sig: &Signature) -> FuncId {
         self.func(FuncTarget::Path(path.to_owned()), sig)
+    }
+
+    pub(super) fn assembly(&mut self, text: String, sig: &Signature) -> FuncId {
+        self.func(FuncTarget::Asm(text), sig)
     }
 
     pub(super) fn define_const(&mut self, blob: ConstBlob) -> Result<DataId> {

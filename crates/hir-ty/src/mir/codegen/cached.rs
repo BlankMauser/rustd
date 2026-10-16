@@ -51,6 +51,8 @@ pub(super) enum CachedTarget {
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
     Named(String),
+    /// The function an `asm!` block is assembled as, by its assembly.
+    Asm(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -171,7 +173,7 @@ impl Entry {
     fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
         let funcs = self.funcs.iter().all(|it| match &it.target {
             CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
-            CachedTarget::Named(_) => true,
+            CachedTarget::Named(_) | CachedTarget::Asm(_) => true,
         });
         let datas = self.datas.iter().all(|it| match it {
             CachedData::Static { symbol, .. } => defines(symbol),
@@ -183,7 +185,7 @@ impl Entry {
     fn named(&self) -> impl Iterator<Item = &str> {
         self.funcs.iter().filter_map(|it| match &it.target {
             CachedTarget::Named(name) => Some(name.as_str()),
-            CachedTarget::Import { .. } => None,
+            CachedTarget::Import { .. } | CachedTarget::Asm(_) => None,
         })
     }
 }

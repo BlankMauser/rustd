@@ -179,6 +179,8 @@ fn main() {
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
     println!("const_unsized_struct {:?}", cases::const_unsized_struct::run());
+    #[cfg(target_arch = "x86_64")]
+    println!("inline_asm {:?}", cases::inline_asm::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
     println!("unsized_tail {:?}", cases::unsized_tail::run());

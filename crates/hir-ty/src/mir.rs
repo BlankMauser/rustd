@@ -979,7 +979,29 @@ pub enum StatementKind {
     //Retag(RetagKind, Box<Place>),
     //AscribeUserType(Place, UserTypeProjection, Variance),
     //Intrinsic(Box<NonDivergingIntrinsic>),
+    InlineAsm(Box<InlineAsm>),
     Nop,
+}
+
+/// An `asm!` block. One that does not return is followed by `Unreachable`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct InlineAsm {
+    /// The pieces name `operands` by index.
+    pub template: Box<[hir_def::hir::AsmPiece]>,
+    pub operands: Box<[AsmOperand]>,
+    pub options: hir_def::hir::AsmOptions,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AsmOperand {
+    /// A register that holds `input` when the block starts, and whose value when the block
+    /// ends goes to `output`. With neither it is one the block overwrites.
+    Reg {
+        reg: hir_def::hir::InlineAsmRegOrRegClass,
+        input: Option<Operand>,
+        output: Option<StoredPlace>,
+    },
+    Const(Operand),
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1122,6 +1144,18 @@ impl MirBody<'_> {
                         held[index(place.local)] = true;
                     }
                     StatementKind::StorageDead(local) => held[index(*local)] = false,
+                    StatementKind::InlineAsm(asm) => {
+                        for operand in &asm.operands {
+                            let AsmOperand::Reg { input, output, .. } = operand else { continue };
+                            if let Some(input) = input {
+                                take(held, input);
+                            }
+                            if let Some(output) = output {
+                                gains(held, index(output.local));
+                                held[index(output.local)] = true;
+                            }
+                        }
+                    }
                     StatementKind::FakeRead(_)
                     | StatementKind::Deinit(_)
                     | StatementKind::StorageLive(_)
@@ -1306,6 +1340,21 @@ impl MirBody<'_> {
                         }
                     }
                     StatementKind::FakeRead(p) | StatementKind::Deinit(p) => f(p),
+                    StatementKind::InlineAsm(asm) => {
+                        for operand in &mut asm.operands {
+                            match operand {
+                                AsmOperand::Reg { input, output, .. } => {
+                                    if let Some(input) = input {
+                                        for_operand(input, &mut f);
+                                    }
+                                    if let Some(output) = output {
+                                        f(output);
+                                    }
+                                }
+                                AsmOperand::Const(value) => for_operand(value, &mut f),
+                            }
+                        }
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::Nop => (),

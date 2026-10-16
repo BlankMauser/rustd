@@ -258,6 +258,15 @@ impl<'db> Filler<'db> {
                         | Rvalue::BinaryOp(n)
                         | Rvalue::NullaryOp(n) => match *n {},
                     },
+                    StatementKind::InlineAsm(asm) => {
+                        for operand in &mut asm.operands {
+                            match operand {
+                                super::AsmOperand::Reg { input: Some(value), .. }
+                                | super::AsmOperand::Const(value) => self.fill_operand(value)?,
+                                super::AsmOperand::Reg { input: None, .. } => (),
+                            }
+                        }
+                    }
                     StatementKind::Deinit(_)
                     | StatementKind::FakeRead(_)
                     | StatementKind::StorageLive(_)

@@ -880,6 +880,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                 locals.drop_flags.add_place(l.as_ref());
                             }
                             StatementKind::Deinit(_) => not_supported!("de-init statement"),
+                            StatementKind::InlineAsm(_) => not_supported!("inline assembly"),
                             StatementKind::StorageLive(_)
                             | StatementKind::FakeRead(_)
                             | StatementKind::StorageDead(_)

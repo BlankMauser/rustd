@@ -9,8 +9,9 @@ use hir_def::{
     ItemContainerId, LocalFieldId, Lookup, TraitId,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
-        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ClosureKind, CoroutineKind, ExprId,
-        ExprOrPatId, LabelId, Literal, MatchArm, Pat, PatId, RecordLitField, RecordSpread,
+        ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
+        CoroutineKind, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat, PatId, RecordLitField,
+        RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -446,8 +447,75 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             Expr::InlineAsm(asm) if asm.comment_only => Ok(Some(current)),
-            Expr::InlineAsm(_) => {
-                not_supported!("builtin#asm")
+            Expr::InlineAsm(asm) => {
+                let Some(template) = &asm.template else {
+                    not_supported!("inline assembly whose template is not known");
+                };
+                if asm.kind != hir_def::hir::InlineAsmKind::Asm {
+                    not_supported!("a function that is assembly alone");
+                }
+                let mut operands = Vec::with_capacity(asm.operands.len());
+                for (_, operand) in &asm.operands {
+                    let (reg, input, output) = match operand {
+                        AsmOperand::In { reg, expr } => (reg, Some(*expr), None),
+                        AsmOperand::Out { reg, expr, late: _ } => (reg, None, *expr),
+                        AsmOperand::InOut { reg, expr, late: _ } => (reg, Some(*expr), Some(*expr)),
+                        AsmOperand::SplitInOut { reg, in_expr, out_expr, late: _ } => {
+                            (reg, Some(*in_expr), *out_expr)
+                        }
+                        AsmOperand::Const(value) => {
+                            let Some((value, next)) =
+                                self.lower_expr_to_some_operand(*value, current)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            operands.push(super::AsmOperand::Const(value));
+                            continue;
+                        }
+                        AsmOperand::Label(_) => not_supported!("inline assembly with a label"),
+                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                    };
+                    let input = match input {
+                        Some(input) => {
+                            let Some((input, next)) =
+                                self.lower_expr_to_some_operand(input, current)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            Some(input)
+                        }
+                        None => None,
+                    };
+                    let output = match output {
+                        Some(output) => {
+                            let Some((output, next)) =
+                                self.lower_expr_as_place(current, output, true)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            Some(output.store())
+                        }
+                        None => None,
+                    };
+                    operands.push(super::AsmOperand::Reg { reg: reg.clone(), input, output });
+                }
+                self.push_statement(
+                    current,
+                    StatementKind::InlineAsm(Box::new(super::InlineAsm {
+                        template: template.clone(),
+                        operands: operands.into(),
+                        options: asm.options,
+                    }))
+                    .with_span(expr_id.into()),
+                );
+                if asm.options.contains(hir_def::hir::AsmOptions::NORETURN) {
+                    self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
+                    return Ok(None);
+                }
+                Ok(Some(current))
             }
             Expr::Missing => {
                 if let Some(f) = self.owner.as_function() {

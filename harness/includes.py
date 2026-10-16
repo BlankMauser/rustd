@@ -55,10 +55,11 @@ STEPS = [
 ]
 
 
-def main():
+def follow(files, steps):
+    """Edits a crate called `sinc` a step at a time under a daemon, against cargo."""
     ws = tempfile.mkdtemp(prefix="rustd-includes-")
     os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", TOML), (DATA, DATA_TEXT), (MAIN, MAIN_TEXT)):
+    for path, text in (("Cargo.toml", TOML), *files):
         open(os.path.join(ws, path), "w").write(text)
     work = tempfile.mkdtemp(prefix="rustd-includes-out-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -87,7 +88,7 @@ def main():
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
     wrong = 0
-    for what, edits, broken in STEPS:
+    for what, edits, broken in steps:
         for path, old, new in edits:
             text = open(os.path.join(ws, path)).read()
             assert old in text, (what, old)
@@ -111,9 +112,9 @@ def main():
         wrong += verdict.isupper()
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()
-    print(f"{len(STEPS) - wrong} of {len(STEPS)} right; log {log_path}")
+    print(f"{len(steps) - wrong} of {len(steps)} right; log {log_path}")
     sys.exit(1 if wrong else 0)
 
 
 if __name__ == "__main__":
-    main()
+    follow([(DATA, DATA_TEXT), (MAIN, MAIN_TEXT)], STEPS)

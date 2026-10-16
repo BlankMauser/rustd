@@ -5213,3 +5213,142 @@ pub mod move_closure_fields {
         Ok(visitor.seen)
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+pub mod inline_asm {
+    use std::arch::asm;
+
+    fn add(a: u64, b: u64) -> u64 {
+        let out: u64;
+        unsafe { asm!("lea {out}, [{a} + {b}]", a = in(reg) a, b = in(reg) b, out = lateout(reg) out) };
+        out
+    }
+
+    fn in_place(mut x: u32) -> u32 {
+        unsafe { asm!("shl {0:e}, 3", "add {0:e}, {1}", inout(reg) x, const 5) };
+        x
+    }
+
+    fn divide(n: u64, d: u64) -> (u64, u64) {
+        let (quotient, remainder);
+        unsafe {
+            asm!(
+                "div {d}",
+                d = in(reg) d,
+                inout("rax") n => quotient,
+                inout("rdx") 0u64 => remainder,
+                options(pure, nomem, nostack),
+            )
+        };
+        (quotient, remainder)
+    }
+
+    fn vendor() -> [u8; 12] {
+        let (b, c, d): (u32, u32, u32);
+        unsafe {
+            asm!(
+                "mov {saved}, rbx",
+                "cpuid",
+                "xchg {saved}, rbx",
+                saved = out(reg) b,
+                inout("eax") 0 => _,
+                out("ecx") c,
+                out("edx") d,
+            )
+        };
+        let mut name = [0; 12];
+        name[..4].copy_from_slice(&b.to_le_bytes());
+        name[4..8].copy_from_slice(&d.to_le_bytes());
+        name[8..].copy_from_slice(&c.to_le_bytes());
+        name
+    }
+
+    fn bytes(low: u8, high: u8) -> u16 {
+        let out: u16;
+        unsafe {
+            asm!(
+                "mov {out:l}, {low}",
+                "mov {out:h}, {high}",
+                low = in(reg_byte) low,
+                high = in(reg_byte) high,
+                out = out(reg_abcd) out,
+            )
+        };
+        out
+    }
+
+    fn floats(a: f64, b: f64) -> (f64, f32) {
+        let sum: f64;
+        let mut single = a as f32;
+        unsafe {
+            asm!(
+                "addsd {a}, {b}",
+                "sqrtss {s}, {s}",
+                a = inout(xmm_reg) a => sum,
+                b = in(xmm_reg) b,
+                s = inout(xmm_reg) single,
+            )
+        };
+        (sum, single)
+    }
+
+    fn att(a: u64) -> u64 {
+        let out: u64;
+        unsafe { asm!("movq {0}, {1}", "addq $7, {1}", in(reg) a, out(reg) out, options(att_syntax)) };
+        out
+    }
+
+    /// Registers a function has to restore, and many operands at once.
+    fn kept(values: [u64; 6]) -> u64 {
+        let [a, b, c, d, e, f] = values;
+        let out: u64;
+        unsafe {
+            asm!(
+                "add {a}, {b}", "add {a}, {c}", "add {a}, {d}", "add {a}, {e}", "add {a}, {f}",
+                "mov r12, {a}", "mov r13, r12", "mov r14, r13", "mov r15, r14",
+                a = inout(reg) a => _, b = in(reg) b, c = in(reg) c, d = in(reg) d,
+                e = in(reg) e, f = in(reg) f,
+                out("r12") _, out("r13") _, out("r14") _, out("r15") out,
+            )
+        };
+        out
+    }
+
+    fn memory(values: &mut [u32; 4]) -> u32 {
+        let total: u32;
+        unsafe {
+            asm!(
+                "mov {total:e}, [{p}]",
+                "add {total:e}, [{p} + 4]",
+                "mov dword ptr [{p} + 8], {total:e}",
+                "/* a comment */",
+                p = in(reg) values.as_mut_ptr(),
+                total = out(reg) total,
+            )
+        };
+        total + values[2]
+    }
+
+    fn stops(go: bool) -> u8 {
+        if go {
+            unsafe { asm!("ud2", options(noreturn)) }
+        }
+        unsafe { asm!("nop") };
+        3
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            add(40, 2),
+            in_place(4),
+            divide(47, 5),
+            vendor().iter().all(u8::is_ascii_graphic),
+            bytes(0x34, 0x12),
+            floats(1.5, 2.25),
+            att(35),
+            kept([1, 2, 3, 4, 5, 6]),
+            memory(&mut [10, 20, 0, 0]),
+            stops(false),
+        )
+    }
+}

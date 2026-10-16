@@ -76,6 +76,7 @@ use super::{
     eval::interpret_mir, monomorphized_promoted_mir_body_query, return_slot,
 };
 
+mod asm;
 mod cached;
 mod fragment;
 mod home;
@@ -768,6 +769,8 @@ struct ObjectCodegen<'a, 'db> {
     module: ObjectModule,
     unwind: UnwindContext,
     imports: FxHashMap<String, FuncId>,
+    /// The functions of `asm!` blocks, by their assembly.
+    assemblies: FxHashMap<String, FuncId>,
     instances: FxHashMap<Instance, FuncId>,
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     /// Every instance that went through `pending`.
@@ -1563,6 +1566,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             module,
             unwind,
             imports: FxHashMap::default(),
+            assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
             pending: Vec::new(),
             envs: Vec::new(),
@@ -1897,6 +1901,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 CachedTarget::Import { symbol, checked }
             } else if let FuncTarget::Instance(callee, _) = &request.target {
                 CachedTarget::Named(self.stable_name(callee)?.as_ref().to_owned())
+            } else if let FuncTarget::Asm(text) = &request.target {
+                CachedTarget::Asm(text.clone())
             } else {
                 return None;
             };
@@ -1991,6 +1997,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         for func in &entry.funcs {
             ids.funcs.push(match &func.target {
                 CachedTarget::Import { symbol, .. } => self.import(symbol, &func.sig)?,
+                CachedTarget::Asm(text) => self.assembly(text, &func.sig)?,
                 CachedTarget::Named(callee) => {
                     let Some(id) = self.found_callee(callee, None)? else {
                         unsupported!("an entry calls `{callee}`, which the store lacks");
@@ -2178,7 +2185,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 self.import(&symbol, &request.sig)
             }
             FuncTarget::Instance(instance, env) => self.callee(instance, env, &request.sig),
+            FuncTarget::Asm(text) => self.assembly(text, &request.sig),
         }
+    }
+
+    /// The function of an `asm!` block, which is local to the object.
+    fn assembly(&mut self, text: &str, sig: &Signature) -> Result<FuncId> {
+        if let Some(&id) = self.assemblies.get(text) {
+            return Ok(id);
+        }
+        let triple = self.module.isa().triple().to_string();
+        let code = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
+        let name = format!("rustd::asm::{}", self.assemblies.len());
+        let id = self
+            .module
+            .declare_function(&name, Linkage::Local, sig)
+            .map_err(|e| CodegenError::Backend(e.to_string()))?;
+        self.module.define_function_bytes(id, 16, &code, &[])?;
+        self.assemblies.insert(text.to_owned(), id);
+        Ok(id)
     }
 
     fn data(&mut self, request: &DataRequest, ids: &Resolved) -> Result<DataId> {
@@ -3870,6 +3895,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.set_drop_flag(place, true);
                     }
                     StatementKind::Deinit(_) => unsupported!("deinit"),
+                    StatementKind::InlineAsm(asm) => self.inline_asm(asm)?,
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::FakeRead(_)
@@ -5033,6 +5059,93 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         } else {
             self.builder.ins().iconst(ty, bits as u64 as i64)
         }
+    }
+
+    /// Calls the function that an `asm!` block is assembled as: see [`asm`].
+    fn inline_asm(&mut self, block: &crate::mir::InlineAsm) -> Result<()> {
+        use crate::mir::AsmOperand;
+        let mut operands = Vec::with_capacity(block.operands.len());
+        for operand in &block.operands {
+            operands.push(match operand {
+                AsmOperand::Reg { reg, input, output } => {
+                    let mut size = None;
+                    let tys = [
+                        input.as_ref().map(|it| self.operand_ty(it)).transpose()?,
+                        output.as_ref().map(|it| self.place(it).map(|it| it.1.ty)).transpose()?,
+                    ];
+                    for ty in tys.into_iter().flatten() {
+                        let bytes = self.layout(ty)?.size.bytes() as u32;
+                        if size.is_some_and(|it| it != bytes) {
+                            unsupported!(
+                                "an `asm!` register that goes in and comes out in two sizes"
+                            );
+                        }
+                        size = Some(bytes);
+                    }
+                    asm::Operand::Reg {
+                        reg,
+                        size,
+                        input: input.is_some(),
+                        output: output.is_some(),
+                    }
+                }
+                AsmOperand::Const(value) => {
+                    let ty = self.operand_ty(value)?;
+                    let bits = match &value.kind {
+                        OperandKind::Allocation { allocation }
+                            if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_)) =>
+                        {
+                            let mut bytes = [0; 16];
+                            let memory = &allocation.as_ref().memory;
+                            bytes[..memory.len()].copy_from_slice(memory);
+                            Some(u128::from_le_bytes(bytes))
+                        }
+                        _ => self.const_bits(value),
+                    };
+                    let Some(bits) = bits else {
+                        unsupported!("an `asm!` constant that is not a literal");
+                    };
+                    let unused = 128 - self.layout(ty)?.size.bits() as u32;
+                    asm::Operand::Const(match ty.kind() {
+                        TyKind::Int(_) => (bits << unused) as i128 >> unused,
+                        _ => bits as i128,
+                    })
+                }
+            });
+        }
+        let arch = self.cg.isa.triple().architecture.to_string();
+        let wrapper = asm::wrapper(&arch, &block.template, block.options, &operands)
+            .map_err(CodegenError::Unsupported)?;
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            wrapper.slot_size,
+            4,
+        ));
+        let slot = self.builder.ins().stack_addr(PTR, slot, 0);
+        for (operand, offset) in block.operands.iter().zip(&wrapper.offsets) {
+            if let (AsmOperand::Reg { input: Some(input), .. }, Some(offset)) = (operand, offset) {
+                let (addr, ty) = self.operand(input)?;
+                let size = self.layout(ty)?.size;
+                let to = self.builder.ins().iadd_imm(slot, *offset as i64);
+                self.copy(to, addr, size);
+            }
+        }
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(PTR));
+        let callee = self.cg.assembly(wrapper.text, &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &[slot]);
+        for (operand, offset) in block.operands.iter().zip(&wrapper.offsets) {
+            if let (AsmOperand::Reg { output: Some(output), .. }, Some(offset)) = (operand, offset)
+            {
+                let (addr, ty) = self.place(output)?;
+                let size = self.layout(ty.ty)?.size;
+                let from = self.builder.ins().iadd_imm(slot, *offset as i64);
+                self.copy(addr, from, size);
+                self.set_drop_flag(output, true);
+            }
+        }
+        Ok(())
     }
 
     fn load_scalar(&mut self, operand: &Operand) -> Result<(Value, AbiScalar)> {

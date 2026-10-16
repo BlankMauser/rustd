@@ -64,6 +64,7 @@ sha2 = "0.10"
 crc32fast = "1"
 memmap2 = "0.9"
 cranelift-object = "0.136"
+object = { version = "0.37", default-features = false, features = ["read", "std", "elf", "macho"] }
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]
