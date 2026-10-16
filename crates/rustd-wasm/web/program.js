@@ -2,11 +2,16 @@
 // one stack pointer, and every build's module instantiated over them.
 
 export class Program {
-  // `host` has the functions the program declares in `extern` blocks.
-  constructor(host) {
-    this.memory = new WebAssembly.Memory({ initial: 32 });
-    this.table = new WebAssembly.Table({ initial: 1, element: "anyfunc" });
-    this.stackPointer = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
+  // `host` has the functions the program declares in `extern` blocks. `base` is the exports
+  // of a module the program is linked into, when there is one: the program then lives in
+  // that module's memory and table, and calls its functions by their symbols.
+  constructor(host, base = null) {
+    this.base = base;
+    this.memory = base?.memory ?? new WebAssembly.Memory({ initial: 32 });
+    this.table =
+      base?.__indirect_function_table ?? new WebAssembly.Table({ initial: 1, element: "anyfunc" });
+    this.stackPointer =
+      base?.__stack_pointer ?? new WebAssembly.Global({ value: "i32", mutable: true }, 0);
     this.exports = {};
     // A function nobody provides fails when it is called, not when the module is linked.
     // What a Rust program expects of its C library, where the compiler does not inline it.
@@ -38,6 +43,9 @@ export class Program {
     }
     if (this.stackPointer.value === 0) {
       this.stackPointer.value = report.stack_top;
+    }
+    for (const [name, slot] of Object.entries(report.host ?? {})) {
+      this.table.set(slot, this.base[name]);
     }
     const env = { memory: this.memory, table: this.table, stack_pointer: this.stackPointer };
     new WebAssembly.Instance(new WebAssembly.Module(module), { env, host: this.host });

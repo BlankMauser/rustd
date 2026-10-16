@@ -3471,12 +3471,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if layout.is_zst() {
             return Ok(PassMode::Ignore);
         }
+        // rustc returns in memory what is more than two registers hold.
+        let wide = is_ret && layout.size.bytes() > 2 * WORD as u64;
         Ok(match layout.backend_repr {
+            BackendRepr::Scalar(_) if wide => PassMode::Indirect,
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
             BackendRepr::ScalarPair(a, b) => {
                 let offset = a.size(&self.dl()).align_to(b.align(&self.dl()).abi);
                 let (a, b) = (self.scalar(a)?, self.scalar(b)?);
-                if is_ret && (a.ty == types::I128 || b.ty == types::I128) {
+                // LLVM has a WebAssembly function return one value: of a pair it makes a
+                // pointer to where the pair goes, the first parameter.
+                let one_result = cfg!(feature = "wasm");
+                if is_ret && (wide || one_result || a.ty == types::I128 || b.ty == types::I128) {
                     // More than the two return registers hold, so LLVM returns it in memory.
                     PassMode::Indirect
                 } else {
@@ -5024,7 +5030,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     TyKind::Slice(elem) => Some(elem),
                     _ => Some(pointee),
                 };
-                if memory.is_empty() {
+                let empty = match pointee.kind() {
+                    TyKind::Slice(_) => blob.usize_at(offset + WORD) == Some(0),
+                    _ => false,
+                };
+                // An empty slice can be at the address of an allocation that is not its own.
+                if memory.is_empty() || empty {
                     // Nothing is behind the pointer, and rustc makes it the alignment.
                     let align = match elem {
                         Some(elem) => self.layout(elem)?.align.abi.bytes(),
@@ -5229,17 +5240,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(());
         }
         // Const eval keeps the whole allocation a raw pointer points into.
-        // FIXME: pointers inside that allocation are not relocated.
         let Some((start, memory)) = map.map.memory_at(addr) else { return Ok(()) };
         let target = match map.defined.get(&start) {
             Some(&target) => target,
             None => {
-                let target = ConstBlob {
+                let mut target = ConstBlob {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
                     align: 16,
                 };
+                // What the allocation is of is not known here, so as in a union, every word
+                // of it that is the address of something const eval kept is taken to be one.
+                for word in 0..target.bytes.len() / WORD {
+                    let at = word * WORD;
+                    if let Some(inner) = target.usize_at(at)
+                        && inner != 0
+                        && map.map.memory_at(inner).is_some_and(|it| it.0 != start)
+                    {
+                        self.relocate_data_pointer(&mut target, at, inner, mutability, map)?;
+                    }
+                }
                 let writable = map.in_static && mutability == Mutability::Mut;
                 let target = self.cg.define_data(target, writable)?;
                 map.defined.insert(start, target);

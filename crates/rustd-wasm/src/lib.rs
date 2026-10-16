@@ -10,8 +10,15 @@
 pub mod bundle;
 #[cfg(target_family = "wasm")]
 mod exports;
+pub mod host;
 pub mod link;
+pub mod macros;
+mod names;
 pub mod pack;
+// The table `rustd` reads from the rlibs of a build, here made from the names in a module.
+#[allow(dead_code)]
+#[path = "../../rustd/src/symbols.rs"]
+mod symbols;
 
 use std::time::Duration;
 
@@ -21,7 +28,9 @@ use hir_def::{
     AssocItemId, FunctionId, HasModule as _, ItemContainerId, Lookup, ModuleDefId, StaticId,
     signatures::FunctionSignature,
 };
-use hir_ty::mir::codegen::{CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol};
+use hir_ty::mir::codegen::{
+    CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
+};
 use ide_db::{
     ChangeWithProcMacros, RootDatabase,
     base_db::{
@@ -61,6 +70,8 @@ pub struct Compiler {
     base: Vec<u8>,
     /// Proc macro calls of a pack that it had no expansion for.
     missed: std::sync::Arc<std::sync::Mutex<Vec<pack::Call>>>,
+    /// The module rustc built that the program is linked into, and the symbols it has.
+    host: Option<(host::Host, symbols::SymbolTable)>,
 }
 
 /// What one build did.
@@ -102,7 +113,8 @@ impl Build {
         format!(
             "{{\"table_len\":{},\"memory_len\":{},\"stack_top\":{},\"exports\":{{{}}},\
              \"functions\":[{}],\"data_len\":{},\"skipped\":[{}],\"bodies\":{},\
-             \"compiled\":{},\"listing_ms\":{:.3},\"codegen_ms\":{:.3},\"link_ms\":{:.3}}}",
+             \"compiled\":{},\"listing_ms\":{:.3},\"codegen_ms\":{:.3},\"link_ms\":{:.3},\
+             \"host\":{{{}}},\"mismatched\":[{}]}}",
             patch.table_len,
             patch.memory_len,
             patch.stack_top,
@@ -115,6 +127,8 @@ impl Build {
             millis(self.listing),
             millis(self.codegen),
             millis(self.link),
+            list(patch.host.iter().map(|(name, slot)| format!("{}:{slot}", quote(name))).collect()),
+            list(patch.mismatched.iter().map(|it| quote(it)).collect()),
         )
     }
 }
@@ -133,6 +147,7 @@ impl Default for Compiler {
             by_path: Vec::new(),
             base: Vec::new(),
             missed: Default::default(),
+            host: None,
         }
     }
 }
@@ -172,6 +187,13 @@ impl Compiler {
     /// Sets the workspace of a pack as what there is to compile. The file its program starts
     /// at is [`MAIN`] from then on.
     pub fn set_pack(&mut self, pack: pack::Pack, fallback: pack::Fallback) -> Result<(), String> {
+        let mut pack = pack;
+        if let Some(host) = pack.host.take() {
+            let functions = host.functions.iter().map(|it| it.0.as_str());
+            let names = functions.chain(host.data.iter().map(|it| it.0.as_str()));
+            let table = symbols::SymbolTable::of_names(names);
+            self.host = Some((host, table));
+        }
         let project = pack.project(fallback)?;
         let mut change = ChangeWithProcMacros::default();
         for (id, path, text) in project.files {
@@ -183,8 +205,17 @@ impl Compiler {
         change.set_crate_graph(project.graph);
         change.set_proc_macros(project.macros);
         self.db.apply_change(change);
+        self.db.enable_proc_attr_macros();
         self.missed = project.missed;
         Ok(())
+    }
+
+    /// Where what is linked into the pack's module goes: the first slot of its table and
+    /// the first byte of its memory that are free.
+    pub fn set_start(&mut self, table_start: u32, memory_start: u64) {
+        if let Some((host, _)) = &self.host {
+            self.linker.set_host(host, table_start, memory_start);
+        }
     }
 
     /// Resolves the names of every crate and infers the types of the program, for how long
@@ -302,8 +333,13 @@ impl Compiler {
         let start = stdx::time::Instant::now();
         let db = &self.db;
         let mut entries = Vec::new();
+        // What the module linked into has is not compiled: nothing is found by path.
+        let host = self.host.as_ref();
         let library = self.library.get_or_insert_with(|| {
             let mut library = FxHashMap::default();
+            if host.is_some() {
+                return library;
+            }
             let names = Names { db, library: &library };
             let mut named = Vec::new();
             for &krate in ide_db::base_db::all_crates(db).iter() {
@@ -326,7 +362,17 @@ impl Compiler {
         entries.extend(&self.by_path);
         let on_demand: Vec<FunctionId> = library.values().copied().collect();
         let listing = start.elapsed();
-        let resolver = Names { db, library };
+        let (paths, rustc);
+        let resolver: &dyn SymbolResolver = match host {
+            Some((_, table)) => {
+                rustc = names::Resolver { db, table };
+                &rustc
+            }
+            None => {
+                paths = Names { db, library };
+                &paths
+            }
+        };
         let known = &mut self.known;
         // What the code generator asks for by path has to be among the roots, and which paths
         // those are shows in what a build leaves undefined.
@@ -334,7 +380,7 @@ impl Compiler {
         let unit = loop {
             let roots = Roots { entries: &entries, on_demand: &on_demand, start: None };
             let unit = hir::attach_db(db, || {
-                CodegenUnit::compile(db, &resolver, roots, &Default::default(), known)
+                CodegenUnit::compile(db, resolver, roots, &Default::default(), known)
             })
             .map_err(|e| e.to_string())?;
             let before = entries.len();
@@ -365,6 +411,8 @@ impl Compiler {
         let skipped = unit
             .skipped
             .iter()
+            // A generic function has no code of its own to be missing, only that of its uses.
+            .filter(|(_, why)| !matches!(why, CodegenError::NoSymbol))
             .filter(|(func, _)| func.krate(db).data(db).origin.is_local())
             .map(|&(func, ref why)| {
                 let name = resolver

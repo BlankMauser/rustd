@@ -6,6 +6,7 @@ use std::{
 };
 
 use cfg::CfgAtom;
+use cfg::CfgDiff;
 use hir_expand::proc_macro::{
     CrateProcMacros, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacros,
@@ -14,8 +15,9 @@ use ide_db::{
     RootDatabase,
     base_db::{Crate, CrateOrigin, Env, SourceDatabase, salsa::Setter as _},
 };
+use intern::Symbol;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
-use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
+use project_model::{CargoConfig, CfgOverrides, ProjectManifest, ProjectWorkspace, RustLibSource};
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::Span;
 use vfs::AbsPathBuf;
@@ -89,11 +91,21 @@ pub fn record(
     main: &str,
     expand: impl FnOnce(&RootDatabase, &[Crate]),
 ) -> Result<Pack, Box<dyn std::error::Error>> {
+    // The program links against what cargo built, so its crates are configured as cargo's.
+    project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let cargo_config = CargoConfig {
         sysroot: Some(RustLibSource::Discover),
         target: Some(target.to_owned()),
+        // The page links against a release build.
+        cfg_overrides: CfgOverrides {
+            global: CfgDiff::new(
+                Vec::new(),
+                vec![CfgAtom::Flag(Symbol::intern("debug_assertions"))],
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let load_config = LoadCargoConfig {

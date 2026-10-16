@@ -76,7 +76,7 @@ pub unsafe extern "C" fn rustd_set_pack(ptr: *mut u8, len: usize) -> bool {
     PAGE.with_borrow_mut(|page| {
         let pack = serde_json::from_slice(&bytes).map_err(|e| e.to_string());
         drop(bytes);
-        match pack.and_then(|pack| page.compiler.set_pack(pack, |_| None)) {
+        match pack.and_then(|pack| page.compiler.set_pack(pack, crate::macros::expand)) {
             Ok(()) => true,
             Err(e) => {
                 page.report = e;
@@ -96,6 +96,12 @@ pub extern "C" fn rustd_analyze() {
             page.compiler.missed().len()
         );
     })
+}
+
+/// Says where in the module the pack is linked into the program goes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rustd_set_start(table_start: u32, memory_start: u32) {
+    PAGE.with_borrow_mut(|page| page.compiler.set_start(table_start, memory_start.into()));
 }
 
 /// Sets the text of a file.

@@ -62,11 +62,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             fs::write(out, serde_json::to_vec(&pack)?)?;
         }
+        ["host", module, pack] => {
+            let mut packed: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
+            let host = rustd_wasm::host::Host::read(&fs::read(module)?)?;
+            eprintln!("{} functions, {} data symbols", host.functions.len(), host.data.len());
+            packed.host = Some(host);
+            fs::write(pack, serde_json::to_vec(&packed)?)?;
+        }
         ["analyze", pack] => {
             let mut compiler = Compiler::default();
             let pack: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
             let start = std::time::Instant::now();
-            compiler.set_pack(pack, |_| None)?;
+            compiler.set_pack(pack, rustd_wasm::macros::expand)?;
             eprintln!("load: {:.1?}", start.elapsed());
             let (crates, resolve, infer) = compiler.analyze();
             eprintln!("{crates} crates: names {resolve:.1?}, types of the program {infer:.1?}");

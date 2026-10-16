@@ -1,23 +1,12 @@
 // The page: the source on the left, built by the compiler in `worker.js` on every edit, and
 // the program on the right, drawing to the canvas through the functions in `host`.
 
+import { demos, picker as pick, say as tell } from "./demos.js";
+import { Editor } from "./editor.js";
 import { Program } from "./program.js";
 
-const source = document.getElementById("source");
 const canvas = document.getElementById("canvas");
-const status = document.getElementById("status");
 const context = canvas.getContext("2d");
-
-const demos = {
-  balls: "bouncing balls",
-  life: "game of life",
-  sort: "sorting, with trait objects",
-  mandelbrot: "mandelbrot set",
-};
-const picker = document.getElementById("demo");
-for (const [name, title] of Object.entries(demos)) {
-  picker.add(new Option(title, name));
-}
 
 let program;
 const host = {
@@ -32,10 +21,8 @@ const host = {
 };
 program = new Program(host);
 
-const say = (text, error = false) => {
-  status.textContent = text;
-  status.classList.toggle("error", error);
-};
+const say = (text, error = false) =>
+  tell(text, error ? "error" : text.endsWith("…") ? "building" : "running");
 const ms = (value) => `${value.toFixed(1)} ms`;
 
 const worker = new Worker("worker.js", { type: "module" });
@@ -101,17 +88,10 @@ worker.onmessage = ({ data }) => {
 };
 
 let timer;
-source.addEventListener("input", () => {
+const source = await Editor.load(document.getElementById("source"), () => {
   edited += 1;
   clearTimeout(timer);
   timer = setTimeout(build, 60);
-});
-source.addEventListener("keydown", (event) => {
-  if (event.key === "Tab") {
-    event.preventDefault();
-    source.setRangeText("    ", source.selectionStart, source.selectionEnd, "end");
-    source.dispatchEvent(new Event("input"));
-  }
 });
 
 // Runs a function of the program. One that traps stops the program until the next build.
@@ -160,8 +140,7 @@ async function show(name) {
   }
   build();
 }
-picker.addEventListener("change", () => show(picker.value));
-
-picker.value = location.hash.slice(1) in demos ? location.hash.slice(1) : "balls";
+const first = location.hash.slice(1);
+const picker = pick(first in demos && first !== "dioxus" ? first : "balls", show);
 await show(picker.value);
 requestAnimationFrame(frame);

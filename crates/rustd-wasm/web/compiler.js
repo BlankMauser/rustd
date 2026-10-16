@@ -42,6 +42,11 @@ export class Compiler {
     }
   }
 
+  // Where in the module the pack is linked into the program may put its functions and data.
+  setStart(tableStart, memoryStart) {
+    this.rustd.rustd_set_start(tableStart, memoryStart);
+  }
+
   analyze() {
     this.rustd.rustd_analyze();
     return this.report();

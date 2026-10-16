@@ -12,13 +12,14 @@ use std::{
 };
 
 use hir_ty::mir::codegen::wasm::{
-    ADDRESS_LEN, STACK_POINTER, TYPE_INDEX_LEN, WasmFunction, WasmSignature,
+    ADDRESS_LEN, STACK_POINTER, TYPE_INDEX_LEN, WasmFunction, WasmSignature, WasmType,
 };
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, FunctionSection,
-    GlobalType, ImportSection, MemoryType, Module, RefType, TableType, TypeSection, ValType,
+    GlobalType, ImportSection, MemoryType, Module, NameMap, NameSection, RefType, TableType,
+    TypeSection, ValType,
 };
 
 /// The module the memory, the table and the stack pointer are imported from.
@@ -38,6 +39,12 @@ pub struct Linker {
     data: FxHashMap<Key, Placed>,
     table_len: u32,
     memory_len: u64,
+    /// The functions of the module the program is linked into, with their signatures, and
+    /// where its data is.
+    host_functions: FxHashMap<String, String>,
+    host_data: FxHashMap<String, u32>,
+    /// The data that this link gave another address than it had.
+    moved: FxHashSet<Key>,
 }
 
 /// What a function or a piece of data is from one build to the next: the one of its name,
@@ -47,6 +54,16 @@ pub struct Linker {
 enum Key {
     Named(String),
     Content(u64),
+}
+
+impl Key {
+    /// This, or what has `content` when it is a name.
+    fn numbered(self, content: u64) -> Key {
+        match self {
+            Key::Named(_) => Key::Content(content),
+            key => key,
+        }
+    }
 }
 
 struct Slot {
@@ -73,6 +90,10 @@ pub struct Patch {
     /// The symbols of the functions in the module, and the bytes of data in it.
     pub functions: Vec<String>,
     pub data_len: usize,
+    /// The slots to put functions of the module linked into in, by the name of each.
+    pub host: Vec<(String, u32)>,
+    /// The functions of that module that are called as what they are not.
+    pub mismatched: Vec<String>,
 }
 
 impl Default for Linker {
@@ -83,6 +104,9 @@ impl Default for Linker {
             // Slot 0 stays empty: a null function pointer traps.
             table_len: 1,
             memory_len: STACK_START + STACK_SIZE,
+            host_functions: FxHashMap::default(),
+            host_data: FxHashMap::default(),
+            moved: FxHashSet::default(),
         }
     }
 }
@@ -118,10 +142,15 @@ struct Symbols<'a> {
     keys: Vec<Key>,
     /// What each symbol is made of, which is its key unless it has a name.
     contents: Vec<u64>,
+    /// What the numbered symbols are made of that the objects linked after this one define.
+    numbered: &'a FxHashMap<String, u64>,
 }
 
 impl<'a> Symbols<'a> {
-    fn read(file: &object::File<'a>) -> Result<Symbols<'a>, String> {
+    fn read(
+        file: &object::File<'a>,
+        numbered: &'a FxHashMap<String, u64>,
+    ) -> Result<Symbols<'a>, String> {
         let mut defined = Vec::new();
         let mut targets = FxHashMap::default();
         for section in file.sections() {
@@ -180,11 +209,15 @@ impl<'a> Symbols<'a> {
                 targets.insert(symbol.index(), Target::Undefined(name.to_owned()));
             }
         }
-        let mut symbols = Symbols { defined, targets, keys: Vec::new(), contents: Vec::new() };
+        let mut symbols =
+            Symbols { defined, targets, keys: Vec::new(), contents: Vec::new(), numbered };
         symbols.contents = symbols.contents()?;
         symbols.keys = (symbols.defined.iter().zip(&symbols.contents))
             .map(|(it, &content)| match it.named() {
                 true => Key::Named(it.name.clone()),
+                // A patch has what changed of the object it amends under the number there,
+                // and is that one to everything that refers to it.
+                false if it.global => symbols.key(&it.name).numbered(content),
                 false => Key::Content(content),
             })
             .collect();
@@ -213,7 +246,10 @@ impl<'a> Symbols<'a> {
                 for reloc in &symbol.relocs {
                     (reloc.offset, reloc.addend).hash(&mut hasher);
                     match self.targets.get(&reloc.target) {
-                        Some(Target::Undefined(name)) => name.hash(&mut hasher),
+                        Some(Target::Undefined(name)) => match self.numbered.get(name) {
+                            Some(content) => content.hash(&mut hasher),
+                            None => name.hash(&mut hasher),
+                        },
                         Some(&Target::Defined(at)) if self.defined[at].named() => {
                             self.defined[at].name.hash(&mut hasher)
                         }
@@ -233,9 +269,23 @@ impl<'a> Symbols<'a> {
     }
 }
 
+impl Symbols<'_> {
+    /// What a name the object does not define is from one build to the next.
+    fn key(&self, name: &str) -> Key {
+        match self.numbered.get(name) {
+            Some(&content) => Key::Content(content),
+            None => Key::Named(name.to_owned()),
+        }
+    }
+}
+
 impl Defined<'_> {
+    /// Whether the name says what the symbol is. The code generator numbers the functions
+    /// and constants that have no symbol of their own, and one number is another function
+    /// in the next build. A static that is written to is the same one however it started.
     fn named(&self) -> bool {
-        self.global
+        let numbered = self.name.starts_with("rustd::") || self.name.starts_with("rustd.patch::");
+        self.global && (self.writable || !numbered)
     }
 }
 
@@ -253,23 +303,85 @@ impl Linker {
         let files = (objects.iter())
             .map(|object| object::File::parse(*object).map_err(|e| format!("object: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
-        let symbols = files.iter().map(Symbols::read).collect::<Result<Vec<_>, _>>()?;
+        // A patch refers to the numbered symbols of the object it amends, which is after it.
+        let mut numbered = vec![FxHashMap::default(); files.len() + 1];
+        for (at, file) in files.iter().enumerate().rev() {
+            let (before, after) = numbered.split_at_mut(at + 1);
+            let symbols = Symbols::read(file, &after[0])?;
+            before[at] = after[0].clone();
+            for (symbol, &content) in symbols.defined.iter().zip(&symbols.contents) {
+                if symbol.global && !symbol.named() {
+                    before[at].insert(symbol.name.clone(), content);
+                }
+            }
+        }
+        let symbols = (files.iter().zip(&numbered[1..]))
+            .map(|(file, numbered)| Symbols::read(file, numbered))
+            .collect::<Result<Vec<_>, _>>()?;
         // Everything gets its place before anything is written: code and data hold the
         // places of each other, in whichever object those are.
-        let new: Vec<_> = symbols.iter().map(|it| self.place_new(it, &mut seen)).collect();
-        for (symbols, new) in symbols.iter().zip(new) {
+        self.moved.clear();
+        let placed: Vec<_> = symbols.iter().map(|it| self.place_new(it, &mut seen)).collect();
+        for (symbols, (mut new, old)) in symbols.iter().zip(placed) {
+            // What is as it was still holds the address of data that is not: code is written
+            // again, and data has the addresses in it set, to keep the rest of what it holds.
+            let (code, data): (Vec<_>, Vec<_>) = (old.into_iter())
+                .filter(|&at| {
+                    symbols.defined[at].relocs.iter().any(|it| self.is_moved(symbols, it))
+                })
+                .partition(|&at| symbols.defined[at].is_code);
+            new.extend(code);
             self.write(symbols, new, &mut out)?;
+            for at in data {
+                let start = self.data[&symbols.keys[at]].address;
+                for reloc in &symbols.defined[at].relocs {
+                    if self.is_moved(symbols, reloc) {
+                        let value =
+                            self.place(symbols, reloc.target).wrapping_add(reloc.addend as u64);
+                        let bytes = (value as u32).to_le_bytes().to_vec();
+                        out.data.push((start + reloc.offset as u64, bytes));
+                    }
+                }
+            }
         }
         // What is left without code comes from the page.
         let mut imported: Vec<_> = std::mem::take(&mut out.called).into_iter().collect();
         imported.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut mismatched = Vec::new();
         for (name, signature) in imported {
-            let slot = self.slots.get_mut(&Key::Named(name.clone())).expect("placed by the call");
-            if slot.content.is_none() {
+            if let Some(theirs) = self.host_functions.get(&name) {
+                let bytes = |types: &[WasmType]| types.iter().map(|&it| it as u8).collect();
+                let (params, results): (Vec<u8>, Vec<u8>) =
+                    (bytes(&signature.params), bytes(&signature.results));
+                let ours = crate::host::signature(&params, &results);
+                if ours != *theirs {
+                    mismatched.push(format!("{name}: called as {ours}, is {theirs}"));
+                }
+                continue;
+            }
+            // The call gave it the slot.
+            if let Some(slot) = self.slots.get_mut(&Key::Named(name.clone()))
+                && slot.content.is_none()
+            {
                 slot.content = Some(0);
                 let ty = out.ty(&signature);
                 out.imported.push((slot.index, ty, name));
             }
+        }
+        // Called or only pointed to, a function of the module linked into is put in its
+        // slot by the page, which has the module's exports.
+        let mut host = Vec::new();
+        if !self.host_functions.is_empty() {
+            for (key, slot) in &mut self.slots {
+                if let Key::Named(name) = key
+                    && slot.content.is_none()
+                    && self.host_functions.contains_key(name)
+                {
+                    slot.content = Some(0);
+                    host.push((name.clone(), slot.index));
+                }
+            }
+            host.sort_unstable();
         }
 
         let exports = exports
@@ -285,13 +397,29 @@ impl Linker {
             memory_len: self.memory_len,
             stack_top: STACK_START + STACK_SIZE,
             exports,
+            host,
+            mismatched,
         })
     }
 
+    /// Whether what a relocation refers to is data this link moved.
+    fn is_moved(&self, symbols: &Symbols<'_>, reloc: &Reloc) -> bool {
+        match symbols.targets.get(&reloc.target) {
+            Some(Target::Undefined(name)) => self.moved.contains(&symbols.key(name)),
+            Some(&Target::Defined(at)) => self.moved.contains(&symbols.keys[at]),
+            None => false,
+        }
+    }
+
     /// Gives what is new in one object its place, and returns which of its symbols those
-    /// are. `seen` has the names that objects before this one defined.
-    fn place_new(&mut self, symbols: &Symbols<'_>, seen: &mut FxHashSet<String>) -> Vec<usize> {
-        let mut new = Vec::new();
+    /// are, and which it has that are as they were. `seen` has the names that objects before
+    /// this one defined.
+    fn place_new(
+        &mut self,
+        symbols: &Symbols<'_>,
+        seen: &mut FxHashSet<String>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let (mut new, mut old) = (Vec::new(), Vec::new());
         for (at, symbol) in symbols.defined.iter().enumerate() {
             let (key, content) = (&symbols.keys[at], symbols.contents[at]);
             if symbol.global && !seen.insert(symbol.name.clone()) {
@@ -303,6 +431,8 @@ impl Linker {
                 if slot.content != Some(content) {
                     slot.content = Some(content);
                     new.push(at);
+                } else {
+                    old.push(at);
                 }
                 continue;
             }
@@ -310,11 +440,15 @@ impl Linker {
             if self.data.get(key).is_none_or(|it| it.content != content) {
                 let address = self.memory_len.next_multiple_of(DATA_ALIGN);
                 self.memory_len = address + symbol.bytes.len() as u64;
-                self.data.insert(key.clone(), Placed { address, content });
+                if self.data.insert(key.clone(), Placed { address, content }).is_some() {
+                    self.moved.insert(key.clone());
+                }
                 new.push(at);
+            } else {
+                old.push(at);
             }
         }
-        new
+        (new, old)
     }
 
     /// Puts the symbols of an object that [`Self::place_new`] found new into the module.
@@ -348,6 +482,7 @@ impl Linker {
                 let type_at = (at + ADDRESS_LEN + 1) as u32;
                 if let Some(Target::Undefined(name)) = symbols.targets.get(&reloc.target)
                     && let Some(&(_, ty)) = function.type_fixups.iter().find(|it| it.0 == type_at)
+                    && !symbols.numbered.contains_key(name)
                     && !out.called.contains_key(name)
                 {
                     out.called.insert(name.clone(), function.types[ty as usize].clone());
@@ -368,6 +503,15 @@ impl Linker {
         Ok(())
     }
 
+    /// Links into a module that is there already, from the first slot of its table and
+    /// the first byte of its memory that are free for what is linked.
+    pub fn set_host(&mut self, host: &crate::host::Host, table_start: u32, memory_start: u64) {
+        self.host_functions = host.functions.iter().cloned().collect();
+        self.host_data = host.data.iter().cloned().collect();
+        self.table_len = table_start;
+        self.memory_len = memory_start;
+    }
+
     /// Whether a build before this one had the code of the function.
     pub fn defines(&self, symbol: &str) -> bool {
         let slot = self.slots.get(&Key::Named(symbol.to_owned()));
@@ -386,10 +530,11 @@ impl Linker {
         match symbols.targets.get(&target) {
             // Defined by an object of another build, or by the page if by nothing.
             Some(Target::Undefined(name)) => {
-                let key = Key::Named(name.clone());
-                match self.data.get(&key) {
-                    Some(data) => data.address,
-                    None => self.slot(&key) as u64,
+                let key = symbols.key(name);
+                match (self.data.get(&key), self.host_data.get(name)) {
+                    (Some(data), _) => data.address,
+                    (None, Some(&address)) => address as u64,
+                    (None, None) => self.slot(&key) as u64,
                 }
             }
             Some(&Target::Defined(at)) if symbols.defined[at].is_code => {
@@ -485,6 +630,17 @@ impl Output {
         let mut module = Module::new();
         module.section(&types).section(&imports).section(&functions).section(&elements);
         module.section(&code).section(&data);
+        // For a trap to say where it was.
+        let mut names = NameMap::new();
+        for (at, (_, _, name)) in self.imported.iter().enumerate() {
+            names.append(at as u32, name);
+        }
+        for (at, (.., name)) in self.defined.iter().enumerate() {
+            names.append((self.imported.len() + at) as u32, name);
+        }
+        let mut section = NameSection::new();
+        section.functions(&names);
+        module.section(&section);
         module.finish()
     }
 }

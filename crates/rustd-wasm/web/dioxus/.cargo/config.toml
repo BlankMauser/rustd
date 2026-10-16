@@ -1,15 +1,5 @@
 [build]
 target = "wasm32-unknown-unknown"
 
-# Every function of every crate is kept and exported, under the name rustd reads its path
-# from, for the code compiled in the page to call.
 [target.wasm32-unknown-unknown]
-rustflags = [
-    "-Csymbol-mangling-version=v0",
-    "-Clink-arg=--whole-archive",
-    "-Clink-arg=--no-gc-sections",
-    "-Clink-arg=--export-all",
-    "-Clink-arg=--export-table",
-    "-Clink-arg=--growable-table",
-    "-Clink-arg=--export=__stack_pointer",
-]
+rustflags = ["-Csymbol-mangling-version=v0"]

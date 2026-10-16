@@ -36,6 +36,9 @@ pub struct Pack {
     /// Dependencies before what depends on them.
     pub crates: Vec<Krate>,
     pub expansions: Vec<Expansion>,
+    /// The module the program is linked into, when rustc built one.
+    #[serde(default)]
+    pub host: Option<crate::host::Host>,
 }
 
 #[derive(Serialize, Deserialize)]

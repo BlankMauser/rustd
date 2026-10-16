@@ -1,0 +1,6 @@
+# rustd computes `TypeId`s the way this toolchain's rustc does, and the two must agree for
+# `downcast` to work across the module rustc built and the code rustd links into it.
+[toolchain]
+channel = "nightly-2026-05-10"
+components = ["rust-src"]
+targets = ["wasm32-unknown-unknown"]

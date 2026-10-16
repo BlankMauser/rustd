@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 dioxus.workspace = true
+wasm-bindgen.workspace = true

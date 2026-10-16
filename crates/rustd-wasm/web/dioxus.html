@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>rustd in the browser</title>
+<link rel="stylesheet" href="style.css" />
+<header>
+  <h1><b>rustd</b> in the browser</h1>
+  <p>A Dioxus app compiled in the page and linked into a Dioxus and <code>std</code> that rustc built: edit the <code>rsx!</code> and it re-renders with its state.</p>
+  <label>demo <select id="demo"></select></label>
+  <button id="theme" type="button"></button>
+</header>
+<section class="pane"><h2>src/main.rs <span>compiled in this page on every edit</span></h2><div id="source"></div></section>
+<section class="pane"><h2>app</h2><div id="main"></div></section>
+<footer><span id="state" class="building">loading</span><div id="status">loading Dioxus and the compiler…</div></footer>
+<script type="module" src="dioxus.js"></script>
