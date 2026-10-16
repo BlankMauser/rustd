@@ -641,13 +641,18 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
     place_in_definition(sema, closure, &is_closure)
 }
 
-/// The crates called `krate`: a package's library and its binary may share the name, and both
-/// are being built.
-/// The crates called `krate` that a build of the checkout at `checkout` compiles.
+/// The crates called `krate` that a build of the checkout at `checkout` compiles: a package's
+/// library and its binary may share the name, and both are being built. A `krate` that is the
+/// path of a `.rs` file is the one target with that root file, which tells a test from an
+/// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, checkout: &Path) -> anyhow::Result<Vec<Crate>> {
+    let root_file = krate.ends_with(".rs").then(|| checkout.join(krate));
     let mut found: Vec<_> = Crate::all(db)
         .into_iter()
-        .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
+        .filter(|it| match &root_file {
+            Some(root_file) => crate_root_file(db, *it).as_ref() == Some(root_file),
+            None => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        })
         .collect();
     // A dependency may be another version of the crate being built, and another checkout
     // has a crate of its name too.
@@ -1317,6 +1322,20 @@ impl WatchedFile {
             .collect()
     }
 
+    /// Puts the files an `include!` named that were not loaded in their source roots, and
+    /// watches them: whether there were any.
+    fn include_sources(
+        files: &mut Vec<WatchedFile>,
+        tree: &mut tree::Tree,
+        db: &mut RootDatabase,
+    ) -> bool {
+        let added = tree.included(db);
+        for (file, path) in &added {
+            files.extend(WatchedFile::new(Watched::Source(*file), path));
+        }
+        !added.is_empty()
+    }
+
     /// Adds the files the last build included that are not watched yet. One is read again once
     /// its timestamp is taken, so a write between the build's read and now is not lost: the
     /// result is whether there was one.
@@ -1658,8 +1677,23 @@ fn main() -> anyhow::Result<()> {
         return build_batch(&db, args);
     }
 
+    let mut files = WatchedFile::sources(&vfs);
+    let sources: Vec<_> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut tree = tree::Tree::new(&db, vfs, &sources);
+
     let start = Instant::now();
-    let resolved = resolve_crates(&db, &args)?;
+    let mut resolved = resolve_crates(&db, &args)?;
+    // Resolving the names finds the files `include!` names that were not loaded. With those
+    // in, there may be more.
+    while WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+        resolved = resolve_crates(&db, &args)?;
+    }
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
@@ -1685,7 +1719,12 @@ fn main() -> anyhow::Result<()> {
     let mut outlines = outline::Outlines::default();
     let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
-    let cold = build(&db, &table, &args, &mut known, &mut listed)?;
+    let mut cold = build(&db, &table, &args, &mut known, &mut listed)?;
+    // An `include!` in a body is first seen when the body is compiled.
+    if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+        known.touch(&db, None);
+        cold = build(&db, &table, &args, &mut known, &mut listed)?;
+    }
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
@@ -1713,23 +1752,16 @@ fn main() -> anyhow::Result<()> {
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
     }
-    let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
-    let sources: Vec<_> = files
-        .iter()
-        .filter_map(|it| match it.file {
-            Watched::Source(id) => Some((id, &*it.path)),
-            Watched::Included(_) => None,
-        })
-        .collect();
-    let mut tree = tree::Tree::new(&db, vfs, &sources);
     // The program asked for when a request names none.
     let first = Target::of(&args);
     let mut parked: Vec<Parked> = Vec::new();
     let mut unbuilt = Unbuilt::default();
     loop {
-        if WatchedFile::watch_included(&mut files, &mut db) {
+        if WatchedFile::watch_included(&mut files, &mut db)
+            | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
+        {
             known.touch(&db, None);
             parked.iter_mut().for_each(|it| it.known.touch(&db, None));
         }

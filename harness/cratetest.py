@@ -22,7 +22,8 @@ class TestFixture(Fixture):
             self.rustd_args = ["--cfg-test"]
         else:
             path = os.path.join(crate_dir, "tests", f"{test}.rs")
-            super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
+            # By its file: an example may have the name of the test.
+            super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)
         if features:
             self.target_args += ["--features", features]
             self.rustd_args += ["--features", features]

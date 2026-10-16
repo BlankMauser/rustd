@@ -76,6 +76,9 @@ pub struct Files {
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
     included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
+    /// Files an `include!` named that are not in the VFS, with the source root of the file
+    /// that includes them.
+    included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
 }
 
 impl Files {
@@ -131,6 +134,16 @@ impl Files {
         *self.included.entry(path.to_path_buf()).or_insert_with(|| {
             IncludedFile::builder(read_included(path)).durability(durability).new(db)
         })
+    }
+
+    /// Notes a file an `include!` names that the VFS has not: whoever owns the VFS puts it
+    /// in the source root, see [`Files::included_sources`].
+    pub fn include_source(&self, path: &AbsPath, root: SourceRootId) {
+        self.included_sources.entry(path.to_path_buf()).or_insert(root);
+    }
+
+    pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
+        self.included_sources.iter().map(|it| (it.key().clone(), *it.value())).collect()
     }
 
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
@@ -320,6 +333,10 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     fn included_file(&self, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
         None
     }
+
+    /// Notes that `include!` names a file `resolve_path` has nothing for: a file that is not
+    /// source by its extension, say, which the VFS does not load until it is asked to.
+    fn include_source(&self, _path: AnchoredPath<'_>) {}
 
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;

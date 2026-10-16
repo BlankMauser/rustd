@@ -121,6 +121,35 @@ impl Tree {
         moved
     }
 
+    /// Puts the files an `include!` named that were not loaded, as they are not source by
+    /// their extension, in the source root of the file that includes them, with their text.
+    pub(crate) fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
+        let mut added = Vec::new();
+        let mut joined: FxHashMap<SourceRootId, Vec<(FileId, VfsPath)>> = FxHashMap::default();
+        for (path, root) in db.included_sources() {
+            let vfs_path = VfsPath::from(path.clone());
+            let source_root = db.source_root(root).source_root(db);
+            if let Some((file, _)) = self.vfs.file_id(&vfs_path)
+                && source_root.path_for_file(&file).is_some()
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            self.vfs.set_file_contents(vfs_path.clone(), Some(text.clone().into_bytes()));
+            let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
+            let durability =
+                if source_root.is_library { Durability::HIGH } else { Durability::LOW };
+            db.set_file_text_with_durability(file, &text, durability);
+            db.set_file_source_root_with_durability(file, root, durability);
+            joined.entry(root).or_default().push((file, vfs_path));
+            added.push((file, path.into()));
+        }
+        for (root, files) in joined {
+            self.rewrite(db, root, files, &FxHashSet::default());
+        }
+        added
+    }
+
     /// Takes files that are gone out of their source roots, so that a path no longer leads
     /// to them.
     pub(crate) fn remove(&mut self, db: &mut RootDatabase, files: &[FileId]) {
@@ -151,11 +180,11 @@ impl Tree {
         for (file, path) in joined {
             files.insert(file, path);
         }
-        db.set_source_root_with_durability(
-            root,
-            Arc::new(SourceRoot::new_local(files)),
-            Durability::LOW,
-        );
+        let (source_root, durability) = match was.is_library {
+            true => (SourceRoot::new_library(files), Durability::HIGH),
+            false => (SourceRoot::new_local(files), Durability::LOW),
+        };
+        db.set_source_root_with_durability(root, Arc::new(source_root), durability);
     }
 }
 

@@ -21,7 +21,7 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
     SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance, compiled_root,
-    compiled_static,
+    compiled_static, declaration_location,
     fragment::{DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
     instance_serial, left_to_rustc, root_serial, source_location, static_serial, target,
@@ -39,8 +39,12 @@ impl Mark {
     fn new(db: &dyn HirDatabase, serial: u64, requests: &Requests) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
         for request in &requests.datas {
-            if let DataRequest::Location(Some((owner, span))) = request {
-                source_location(db, *owner, *span).hash(&mut hasher);
+            match request {
+                DataRequest::Location(Some((owner, span))) => {
+                    source_location(db, *owner, *span).hash(&mut hasher)
+                }
+                DataRequest::Declaration(func) => declaration_location(db, *func).hash(&mut hasher),
+                _ => {}
             }
         }
         Mark { serial, locations: hasher.finish() }

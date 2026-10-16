@@ -31,6 +31,11 @@ def sysroot_rlibs():
     return [p for n in ("core", "alloc", "std") for p in glob.glob(f"{lib}/lib{n}-*.rlib")]
 
 
+def label(crate):
+    """A crate may be given as its root file."""
+    return os.path.basename(crate).removesuffix(".rs")
+
+
 class Fixture:
     def __init__(self, workspace, crates, target, touch=None):
         """`target` selects what cargo links: ["-p", "app"] or ["--test", "name"]."""
@@ -69,17 +74,17 @@ class Fixture:
         symbols = [x for rlib in self.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         objects, self.reports = [], {}
         for crate in self.crates:
-            obj, report = (os.path.join(self.work, f"{crate}.{ext}") for ext in ("o", "tsv"))
+            obj, report = (os.path.join(self.work, f"{label(crate)}.{ext}") for ext in ("o", "tsv"))
             try:
                 run = subprocess.run(
                     [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj, "--report", report,
-                     "--deny", deny_file, "--isolate", os.path.join(self.work, f"{crate}.isolated"),
+                     "--deny", deny_file, "--isolate", os.path.join(self.work, f"{label(crate)}.isolated"),
                      *self.rustd_args, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,
                     env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:
                 raise SystemExit(f"rustd crashed on {crate}:\nerror: no result after {self.rustd_timeout}s")
-            open(os.path.join(self.work, f"{crate}.stderr"), "w").write(run.stderr)
+            open(os.path.join(self.work, f"{label(crate)}.stderr"), "w").write(run.stderr)
             if os.environ.get("RUSTD_STDERR"): open(os.environ["RUSTD_STDERR"], "a").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"rustd crashed on {crate}:\n{run.stderr[-2000:]}")
@@ -128,7 +133,7 @@ def isolate(fx, expected):
     """Links each rustd function into the rustc binary on its own; returns the ones that change behaviour."""
     culprits = []
     for crate in fx.crates:
-        directory = os.path.join(fx.work, f"{crate}.isolated")
+        directory = os.path.join(fx.work, f"{label(crate)}.isolated")
         for line in open(os.path.join(directory, "index.tsv")):
             index, name = line.rstrip("\n").split("\t")
             fx.link([os.path.join(directory, f"{index}.o")])
@@ -218,7 +223,7 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False, mixed=0):
         result["crates"][crate] = {
             "compiled": n, "roots": total - no_symbol, "not_roots": no_symbol,
             "instances": int(rows[0][2]), "codegen_ms": int(rows[0][4]) / 1000, "skipped": reasons}
-        print(f"{crate}: {n}/{total - no_symbol} functions from rustd")
+        print(f"{label(crate)}: {n}/{total - no_symbol} functions from rustd")
         for r in rows:
             if r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function":
                 why = r[2] if len(r[2]) < 400 else r[2][:100] + " ... " + r[2][-300:]

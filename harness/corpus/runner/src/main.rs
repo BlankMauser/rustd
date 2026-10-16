@@ -114,6 +114,7 @@ fn main() {
     case!(drops::condition_temp(&std::cell::Cell::new(0)), drops::match_temp(&std::cell::Cell::new(0)));
     case!(logged(&|l| drops::reassigned(l)), logged(&|l| drop(drops::partial_move(l))));
     case!(locations::tracked(), locations::unwraps(Some(1), Ok(2)), locations::borrows(&std::cell::RefCell::new(4)));
+    case!(locations::through_pointers(Some(7)), locations::through_pointers(None));
 
     case!(heap::boxed(1), heap::vec(5), heap::string(3), heap::consume(vec![1, 2, 3]), heap::format(4, "x"));
     case!(heap::clears(3));
@@ -177,6 +178,7 @@ fn main() {
     println!("format_temporaries {}", cases::format_temporaries(4));
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
+    println!("const_unsized_struct {:?}", cases::const_unsized_struct::run());
     println!("evaluation_order {:?}", cases::evaluation_order::run());
     println!("promoted {:?}", cases::promoted::run());
     println!("unsized_tail {:?}", cases::unsized_tail::run());

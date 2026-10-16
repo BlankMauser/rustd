@@ -126,6 +126,12 @@ impl RootDatabase {
         self.files.included_files()
     }
 
+    /// The files an `include!` named that the VFS has not, each with the source root of the
+    /// file that includes it.
+    pub fn included_sources(&self) -> Vec<(vfs::AbsPathBuf, SourceRootId)> {
+        self.files.included_sources()
+    }
+
     /// Reads such a file again, after it changed on disk.
     pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);
@@ -176,6 +182,16 @@ impl SourceDatabase for RootDatabase {
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
         let path = anchor.parent()?.absolutize(path.path);
         Some(self.files.included_file(self, &path, durability))
+    }
+
+    fn include_source(&self, path: base_db::AnchoredPath<'_>) {
+        let root_id = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root_id).source_root(self);
+        if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
+            && let Some(parent) = anchor.parent()
+        {
+            self.files.include_source(&parent.absolutize(path.path), root_id);
+        }
     }
 
     fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {

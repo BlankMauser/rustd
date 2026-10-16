@@ -30,6 +30,7 @@ use hir_def::{
     hir::ExprId,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
+    src::HasSource,
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use la_arena::ArenaMap;
@@ -1296,6 +1297,25 @@ fn source_location<'db>(
     location_of(db, source.file_id, range)
 }
 
+/// File, line and column of where a function is declared, from its visibility or `fn` on:
+/// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
+#[salsa::tracked]
+fn declaration_location<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let source = func.lookup(db).source(db);
+    let node = source.value.syntax();
+    let start = node
+        .children_with_tokens()
+        .find(|it| {
+            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+                && !it.kind().is_trivia()
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    location_of(db, source.file_id, TextRange::new(start, node.text_range().end()))
+}
+
 /// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
 /// changes with every edit above the body, and this keeps code without such literals from
 /// changing with it.
@@ -1917,6 +1937,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
                 DataRequest::Location(at) => CachedData::Location(self.location_at(*at)),
+                DataRequest::Declaration(func) => CachedData::Location(self.declaration_at(*func)),
                 DataRequest::FilePath(file) => CachedData::FilePath(self.source_path(*file)?),
             });
         }
@@ -2174,6 +2195,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             DataRequest::Static(id) => self.static_data(*id),
             DataRequest::Location(at) => self.location(*at),
+            DataRequest::Declaration(func) => {
+                let found = self.declaration_at(*func);
+                self.define_location(found)
+            }
             DataRequest::FilePath(file) => {
                 let Some(path) = self.source_path(*file) else {
                     unsupported!("`file!()` in a file without a path");
@@ -2290,6 +2315,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     fn location_at(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> Option<(String, u32, u32)> {
         at.and_then(|(owner, span)| *source_location(self.db, owner, span))
+            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
+    }
+
+    fn declaration_at(&mut self, func: FunctionId) -> Option<(String, u32, u32)> {
+        declaration_location(self.db, func)
             .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
     }
 
@@ -5279,11 +5309,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let either::Either::Left(callee) = callee else {
             unsupported!("fn pointer to a builtin derive method");
         };
+        // The function takes its caller's location as well, which the shim supplies.
+        if track_caller(db, callee) {
+            return self.reified(fn_ty, false);
+        }
         let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
         let abi = self.fn_abi(sig.abi(), sig.output(), sig.inputs().iter().copied())?;
-        if track_caller(db, callee) {
-            unsupported!("pointer to a `#[track_caller]` function");
-        }
         let sig = self.signature(&abi.args, abi.ret);
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
@@ -6506,9 +6537,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if FunctionSignature::is_intrinsic(self.cg.db, func) {
                         unsupported!("shim for an intrinsic");
                     }
-                    if track_caller(self.cg.db, func) {
-                        // FIXME: rustc's shim passes the location of the function itself.
-                        unsupported!("pointer to a `#[track_caller]` function");
+                    let db = self.cg.db;
+                    let (callee, _) = db.lookup_impl_method(self.env, func, generic_args);
+                    if let either::Either::Left(callee) = callee
+                        && track_caller(db, callee)
+                    {
+                        let location = self.cg.declaration(callee);
+                        let location = self.cg.declare_data_in_func(location, self.builder.func);
+                        self.location = Some(self.builder.ins().symbol_value(PTR, location));
                     }
                     self.call_direct(func, generic_args, &values, dst, dst_ty)?;
                 }

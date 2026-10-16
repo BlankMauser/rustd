@@ -2265,6 +2265,30 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         Ok(layout.is_sized().then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)))
     }
 
+    /// The size of a value of a struct whose last field is a `str` or a slice, or of one of
+    /// those, given the pointer metadata. `None` for a `dyn` tail.
+    fn size_of_unsized_struct(&self, ty: Ty<'db>, metadata: &[u8]) -> Result<'db, Option<usize>> {
+        let len = from_bytes!(usize, metadata);
+        Ok(match ty.kind() {
+            TyKind::Str => Some(len),
+            TyKind::Slice(inner) => Some(self.layout(inner)?.size.bytes_usize() * len),
+            TyKind::Adt(adt, subst) => {
+                let AdtId::StructId(id) = adt.def_id() else { return Ok(None) };
+                let layout = self.layout(ty)?;
+                let field_types = self.db.field_types(id.into());
+                let Some((_, last)) = field_types.iter().next_back() else { return Ok(None) };
+                let last = last.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                let Some(tail) = self.size_of_unsized_struct(last, metadata)? else {
+                    return Ok(None);
+                };
+                let start = layout.fields.offset(field_types.iter().count() - 1).bytes_usize();
+                let align = layout.align.bytes() as usize;
+                Some((start + tail).next_multiple_of(align))
+            }
+            _ => None,
+        })
+    }
+
     /// A version of `self.size_of` which returns error if the type is unsized. `what` argument should
     /// be something that complete this: `error: type {ty} was unsized. {what} should be sized`
     fn size_of_sized(
@@ -2395,6 +2419,16 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         None => {
                             let mut check_inner = None;
                             let (addr, meta) = bytes.split_at(bytes.len() / 2);
+                            if let TyKind::Adt(..) = t.kind() {
+                                // A struct with an unsized tail. FIXME: pointers in the
+                                // struct itself are not followed.
+                                if let Some(size) = this.size_of_unsized_struct(t, meta)? {
+                                    let addr = Address::from_bytes(addr)?;
+                                    let b = this.read_memory(addr, size)?;
+                                    mm.insert(addr.to_usize(), b.into());
+                                }
+                                return Ok(());
+                            }
                             let element_size = match t.kind() {
                                 TyKind::Str => 1,
                                 TyKind::Slice(t) => {

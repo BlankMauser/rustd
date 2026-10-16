@@ -11,7 +11,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, StaticId, TraitId};
+use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -62,6 +62,9 @@ pub(super) enum DataRequest {
     /// A `core::panic::Location` for a place in a body. Looked up when stitching, so that code
     /// does not change when lines above it are added.
     Location(Option<(DefWithBodyId, MirSpan)>),
+    /// A `core::panic::Location` of where a function is declared: what a pointer to a
+    /// `#[track_caller]` function passes it.
+    Declaration(FunctionId),
     /// The path of a file as rustc reports it, without a terminator.
     FilePath(FileId),
 }
@@ -262,6 +265,10 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn location(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> DataId {
         self.data(DataRequest::Location(at))
+    }
+
+    pub(super) fn declaration(&mut self, func: FunctionId) -> DataId {
+        self.data(DataRequest::Declaration(func))
     }
 
     pub(super) fn file_path(&mut self, file: FileId) -> DataId {

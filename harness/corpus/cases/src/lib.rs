@@ -927,6 +927,24 @@ pub mod locations {
         *cell.borrow_mut() += 1;
         *cell.borrow()
     }
+    pub struct Thrower;
+    impl Thrower {
+        /// doc
+        #[track_caller]
+        pub fn method<T>(_: T) -> &'static Location<'static> {
+            Location::caller()
+        }
+    }
+    /// A pointer to a tracked function reports where the function is declared, not the call.
+    pub fn through_pointers(x: Option<u8>) -> (u32, u32, u32, u32, bool) {
+        let direct: fn() -> &'static Location<'static> = here;
+        let method: fn(u8) -> &'static Location<'static> = Thrower::method::<u8>;
+        let table: [(fn(u8) -> &'static Location<'static>, u8); 2] = [(Thrower::method, 1), (Thrower::method, 2)];
+        let (a, b) = (direct(), method(3));
+        let c = table[x.unwrap_or(0) as usize & 1].0(x.unwrap_or(0));
+        let lines = (a.line(), a.column(), b.line(), b.column());
+        (lines.0, lines.1, lines.2, lines.3, c.file() == a.file() && c.line() == b.line())
+    }
 }
 
 pub mod misc {
@@ -1271,6 +1289,40 @@ pub mod const_pointers {
                 unit as *const () as usize,
             )
         }
+    }
+}
+
+pub mod const_unsized_struct {
+    #[repr(transparent)]
+    pub struct Bytes {
+        all: [u8],
+    }
+    #[repr(C)]
+    pub struct Headed {
+        head: u16,
+        rest: [u16],
+    }
+    pub enum Held<'a> {
+        Owned(Vec<u8>),
+        Borrowed(&'a Bytes),
+    }
+    const fn bytes(all: &[u8]) -> &Bytes {
+        unsafe { &*(all as *const [u8] as *const Bytes) }
+    }
+    const fn headed(all: &[u16]) -> &Headed {
+        unsafe { &*(std::ptr::slice_from_raw_parts(all.as_ptr(), all.len() - 1) as *const Headed) }
+    }
+    const HELD: Held<'static> = Held::Borrowed(bytes(b"abcd"));
+    const HEADED: &Headed = headed(&[7, 8, 9]);
+    static IN_STATIC: (u8, &Bytes) = (3, bytes(b"xyz"));
+
+    /// A constant that points to a struct whose last field is a slice.
+    pub fn run() -> (Vec<u8>, u16, Vec<u16>, u8) {
+        let held = match &HELD {
+            Held::Owned(it) => it.clone(),
+            Held::Borrowed(it) => it.all.to_vec(),
+        };
+        (held, HEADED.head, HEADED.rest.to_vec(), IN_STATIC.1.all[IN_STATIC.0 as usize - 1])
     }
 }
 
