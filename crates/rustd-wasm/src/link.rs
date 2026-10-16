@@ -157,7 +157,9 @@ impl<'a> Symbols<'a> {
                         let RelocationTarget::Symbol(target) = reloc.target() else {
                             return Err("object: relocation without a symbol".to_owned());
                         };
-                        if reloc.size() != 64 {
+                        // Data is written for a 64-bit target, which the code builder is set up as;
+                        // an address is four bytes all the same.
+                        if !matches!(reloc.size(), 32 | 64) {
                             return Err(format!("object: {}-bit relocation", reloc.size()));
                         }
                         let offset = *offset as usize - start;
@@ -328,8 +330,10 @@ impl Linker {
                 let mut bytes = symbol.bytes.to_vec();
                 for reloc in &symbol.relocs {
                     let value = self.place(symbols, reloc.target).wrapping_add(reloc.addend as u64);
-                    let place = bytes.get_mut(reloc.offset..reloc.offset + 8);
-                    place.ok_or("relocation outside")?.copy_from_slice(&value.to_le_bytes());
+                    let place = bytes.get_mut(reloc.offset..reloc.offset + 4);
+                    place
+                        .ok_or("relocation outside")?
+                        .copy_from_slice(&(value as u32).to_le_bytes());
                 }
                 if bytes.iter().any(|&it| it != 0) {
                     out.data.push((self.data[&symbols.keys[at]].address, bytes));
@@ -339,9 +343,9 @@ impl Linker {
             let (mut function, start) = WasmFunction::decode(&symbol.bytes)?;
             for reloc in &symbol.relocs {
                 let at = reloc.offset.checked_sub(start).ok_or("relocation outside")?;
-                // A call is the address, a wrap to `i32` and `call_indirect` with its type.
+                // A call is the address and `call_indirect` with its type.
                 // The signature of a function nothing defines is that of a call to it.
-                let type_at = (at + ADDRESS_LEN + 2) as u32;
+                let type_at = (at + ADDRESS_LEN + 1) as u32;
                 if let Some(Target::Undefined(name)) = symbols.targets.get(&reloc.target)
                     && let Some(&(_, ty)) = function.type_fixups.iter().find(|it| it.0 == type_at)
                     && !out.called.contains_key(name)
@@ -440,7 +444,7 @@ impl Output {
         let memory = MemoryType {
             minimum: 0,
             maximum: None,
-            memory64: true,
+            memory64: false,
             shared: false,
             page_size_log2: None,
         };
@@ -454,7 +458,7 @@ impl Output {
         };
         imports.import(ENV, "table", EntityType::Table(table));
         debug_assert_eq!(STACK_POINTER, 0);
-        let stack_pointer = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
+        let stack_pointer = GlobalType { val_type: ValType::I32, mutable: true, shared: false };
         imports.import(ENV, "stack_pointer", EntityType::Global(stack_pointer));
         for (_, ty, name) in &self.imported {
             imports.import(HOST, name, EntityType::Function(*ty));
@@ -476,7 +480,7 @@ impl Output {
         }
         let mut data = DataSection::new();
         for (address, bytes) in &self.data {
-            data.active(0, &ConstExpr::i64_const(*address as i64), bytes.iter().copied());
+            data.active(0, &ConstExpr::i32_const(*address as i32), bytes.iter().copied());
         }
         let mut module = Module::new();
         module.section(&types).section(&imports).section(&functions).section(&elements);

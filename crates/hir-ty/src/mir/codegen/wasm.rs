@@ -2,8 +2,7 @@
 //! compiler that runs where native code cannot: in a browser.
 //!
 //! Cranelift has no WebAssembly backend, so this takes the IR the rest of codegen builds and
-//! writes wasm from it directly. The target is `wasm64` (the memory64 proposal): pointers are
-//! 64 bits wide there, as everything that builds the IR assumes.
+//! writes wasm from it directly. The target is `wasm32`, so an address is an `i32`.
 //!
 //! What comes out is not a module. A [`WasmFunction`] names the functions and data it uses
 //! through relocations, like machine code does, and a linker gives them places:
@@ -33,8 +32,8 @@ use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 /// The index of the global that holds the stack pointer in every module the linker writes.
 pub const STACK_POINTER: u32 = 0;
 
-/// How many bytes a relocated `i64.const` operand takes: a LEB128 padded to full length.
-pub const ADDRESS_LEN: usize = 10;
+/// How many bytes a relocated `i32.const` operand takes: a LEB128 padded to full length.
+pub const ADDRESS_LEN: usize = 5;
 /// How many bytes a type index takes: a LEB128 padded to full length.
 pub const TYPE_INDEX_LEN: usize = 5;
 
@@ -377,7 +376,7 @@ impl<'a> Lower<'a> {
             type_fixups: Vec::new(),
         };
         if !this.slot_offsets.is_empty() {
-            let frame = this.temp(ValType::I64);
+            let frame = this.temp(ValType::I32);
             this.frame = Some((frame, size.next_multiple_of(16)));
         }
         Ok(this)
@@ -406,8 +405,8 @@ impl<'a> Lower<'a> {
         }
         if let Some((frame, size)) = self.frame {
             self.i(I::GlobalGet(STACK_POINTER));
-            self.i(I::I64Const(size as i64));
-            self.i(I::I64Sub);
+            self.i(I::I32Const(size as i32));
+            self.i(I::I32Sub);
             self.i(I::LocalTee(frame));
             self.i(I::GlobalSet(STACK_POINTER));
         }
@@ -633,11 +632,11 @@ impl<'a> Lower<'a> {
             return Err(format!("wasm: address of {name:?}"));
         };
         let name = &self.func.params.user_named_funcs()[*name];
-        // `i64.const`, then the operand.
-        self.code.push(0x42);
+        // `i32.const`, then the operand.
+        self.code.push(0x41);
         self.relocs.push(ModuleReloc {
             offset: self.code.len() as u32,
-            kind: cranelift_codegen::binemit::Reloc::Abs8,
+            kind: cranelift_codegen::binemit::Reloc::Abs4,
             name: ModuleRelocTarget::user(name.namespace, name.index),
             addend,
         });
@@ -646,7 +645,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Calls through the table the function whose slot is on the stack as an `i64`.
+    /// Calls through the table the function whose slot is on the stack.
     fn call_slot(&mut self, signature: &Signature) -> Result<(), String> {
         let signature = WasmSignature::of(signature)?;
         let index = match self.types.iter().position(|it| *it == signature) {
@@ -656,7 +655,6 @@ impl<'a> Lower<'a> {
                 self.types.len() - 1
             }
         };
-        self.i(I::I32WrapI64);
         // `call_indirect`, the type, the table.
         self.code.push(0x11);
         self.type_fixups.push((self.code.len() as u32, index as u32));
@@ -673,8 +671,8 @@ impl<'a> Lower<'a> {
         let offset = self.slot_offsets[slot.index()] as i64 + offset;
         self.i(I::LocalGet(frame));
         if offset != 0 {
-            self.i(I::I64Const(offset));
-            self.i(I::I64Add);
+            self.i(I::I32Const(offset as i32));
+            self.i(I::I32Add);
         }
         Ok(())
     }
@@ -686,8 +684,8 @@ impl<'a> Lower<'a> {
         if offset >= 0 {
             return Ok(offset as u64);
         }
-        self.i(I::I64Const(offset));
-        self.i(I::I64Add);
+        self.i(I::I32Const(offset as i32));
+        self.i(I::I32Add);
         Ok(0)
     }
 
@@ -825,8 +823,8 @@ impl<'a> Lower<'a> {
         }
         if let Some((frame, size)) = self.frame {
             self.i(I::LocalGet(frame));
-            self.i(I::I64Const(size as i64));
-            self.i(I::I64Add);
+            self.i(I::I32Const(size as i32));
+            self.i(I::I32Add);
             self.i(I::GlobalSet(STACK_POINTER));
         }
         self.i(I::Return);

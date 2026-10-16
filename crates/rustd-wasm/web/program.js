@@ -4,9 +4,9 @@
 export class Program {
   // `host` has the functions the program declares in `extern` blocks.
   constructor(host) {
-    this.memory = new WebAssembly.Memory({ initial: 32n, address: "i64" });
+    this.memory = new WebAssembly.Memory({ initial: 32 });
     this.table = new WebAssembly.Table({ initial: 1, element: "anyfunc" });
-    this.stackPointer = new WebAssembly.Global({ value: "i64", mutable: true }, 0n);
+    this.stackPointer = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
     this.exports = {};
     // A function nobody provides fails when it is called, not when the module is linked.
     this.host = new Proxy(host, {
@@ -24,13 +24,13 @@ export class Program {
     if (this.table.length < report.table_len) {
       this.table.grow(report.table_len - this.table.length);
     }
-    const pages = BigInt(Math.ceil(report.memory_len / 65536));
-    const have = BigInt(this.memory.buffer.byteLength / 65536);
+    const pages = Math.ceil(report.memory_len / 65536);
+    const have = this.memory.buffer.byteLength / 65536;
     if (have < pages) {
       this.memory.grow(pages - have);
     }
-    if (this.stackPointer.value === 0n) {
-      this.stackPointer.value = BigInt(report.stack_top);
+    if (this.stackPointer.value === 0) {
+      this.stackPointer.value = report.stack_top;
     }
     const env = { memory: this.memory, table: this.table, stack_pointer: this.stackPointer };
     new WebAssembly.Instance(new WebAssembly.Module(module), { env, host: this.host });
@@ -48,7 +48,7 @@ export class Program {
 
   // The bytes at a pointer the program handed over.
   bytes(pointer, length) {
-    return new Uint8Array(this.memory.buffer, Number(pointer), Number(length));
+    return new Uint8Array(this.memory.buffer, pointer >>> 0, length >>> 0);
   }
 
   text(pointer, length) {
