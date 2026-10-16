@@ -142,9 +142,19 @@ All 50 spliced, and the edit that prints printed. The daemon was at about 1.1 GB
 
 The splice is slower on ripgrep than on the small program and I have not profiled why. My
 guess (inferred) is the copy of the executable and writing `__LINKEDIT` again, both of which
-grow with the binary. The binary also grows with every splice: ripgrep went from 14.2 MB to
-34.0 MB over 50 splices, the small one from 3.5 MB to 5.1 MB over 100. Nothing reclaims the
-old patches short of a full link.
+grow with the binary.
+
+The binary does not grow from splice to splice. Each splice starts again from what the
+linker wrote: the copy is cut back to where `__LINKEDIT` was and the whole patch is written
+there, so the size depends on the patch and not on how many splices came before. Measured
+on ripgrep (30,628,936 bytes linked): the same line of `main` edited 20 times gave
+34,116,704 bytes after every one; adding and removing the line alternated between
+34,116,704 and 34,000,912; a line added to a different function each time, all kept, went
+from 34,017,472 to 34,133,216 over 9 edits, as the patch came to hold more functions. The
+first splice costs about 3.4 MB here whatever the edit, nearly all of it the moved
+`__eh_frame` (2,571,952 bytes) and the rebuilt `__unwind_info` (611,800). The "bytes" in
+the daemon's `spliced:` line is what it wrote, the new segments and all of `__LINKEDIT`
+(14.2 MB on ripgrep), not what the file gained.
 
 ## How the port is put together
 
@@ -211,7 +221,8 @@ It needs two more load commands than the linker leaves room for, so the link lin
 1. Run the whole list on Linux x86-64.
 2. Chained fixups in the splice, or `-no_fixup_chains` on the link line as a stopgap.
 3. Find where the 40 ms goes on ripgrep and whether an in-place write is allowed.
-4. Reclaim space in the binary, or force a full link after it has grown by some factor.
+4. See whether a splice can avoid copying all of `__eh_frame` (2.6 MB on ripgrep), for
+   instance by giving the patch's functions compact entries only. Not tried.
 5. Direct ABI tests for AArch64: variadics, HFAs, stack packing.
 6. Exact unwind rows for LLVM code on Mach-O (ask LLVM for `__eh_frame` instead of
    reading the compact entry), and the LLVM backend on Linux again.
