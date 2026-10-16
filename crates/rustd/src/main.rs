@@ -1708,13 +1708,15 @@ fn report(build: &Build) {
 static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executable>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Brings an executable up to date with its objects. An edit that left the whole object alone
-/// is spliced into the executable at `splice`, when that is known from its last link; anything
-/// else, and whatever the splice declines, runs the link command, whose result is then known.
+/// Brings an executable up to date with its objects, the whole one at `object` and the
+/// `patch`. An edit that left the whole object alone is spliced into the executable at
+/// `splice`, when that is known from its last link; anything else, and whatever the splice
+/// declines, runs the link command, whose result is then known.
 fn link(
     cmd: Option<&str>,
     splice: Option<&Path>,
     patch: Option<&Path>,
+    object: &Path,
     patched: bool,
 ) -> anyhow::Result<()> {
     // An executable linked with the object as it was is not one to add to, also when the
@@ -1726,10 +1728,12 @@ fn link(
     let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
     let mut declined = String::new();
+    let running = splice.map_or(Ok(false), set_aside)?;
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
+            _ if running => Err(anyhow::anyhow!("the executable is running")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => {
                 let spliced = std::fs::read(patch)
                     .map_err(anyhow::Error::from)
@@ -1757,10 +1761,46 @@ fn link(
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status})");
     if let (Some(binary), Some(patch)) = (splice, patch) {
-        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch));
+        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
         LINKED.lock().unwrap().insert(binary.to_owned(), linked);
     }
     Ok(())
+}
+
+/// Whether the executable at `binary` runs, in which case Windows lets nothing write it, and
+/// it is moved aside: it runs on there, and the link writes a new one. It is deleted once it
+/// has exited, by the first link to come after.
+#[cfg(windows)]
+fn set_aside(binary: &Path) -> anyhow::Result<bool> {
+    const SHARING_VIOLATION: i32 = 32;
+    let name = binary.file_name().context("an executable without a name")?.to_owned();
+    let siblings = binary.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
+    for sibling in siblings {
+        let sibling = sibling?;
+        let is_aside = sibling.path().extension() == Some("running".as_ref())
+            && sibling.file_name().as_encoded_bytes().starts_with(name.as_encoded_bytes());
+        if is_aside {
+            // The one that still runs stays.
+            let _ = std::fs::remove_file(sibling.path());
+        }
+    }
+    match std::fs::OpenOptions::new().write(true).open(binary) {
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {}
+        _ => return Ok(false),
+    }
+    static ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
+    let mut moved = binary.as_os_str().to_owned();
+    moved.push(format!(".{}-{aside}.running", std::process::id()));
+    std::fs::rename(binary, &moved).context("moving the running executable aside")?;
+    Ok(true)
+}
+
+/// Whether the executable at `binary` runs, which is nothing to a link on Unix: the linker
+/// writes a new file in its place.
+#[cfg(unix)]
+fn set_aside(_: &Path) -> anyhow::Result<bool> {
+    Ok(false)
 }
 
 /// The command that runs the line `cmd` as the platform's shell would.
@@ -2669,7 +2709,13 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     memory::report(&mut db, "build")?;
     report_stats(&known.stats);
-    link(args.link_cmd.as_deref(), args.splice.as_deref(), args.patch.as_deref(), false)?;
+    link(
+        args.link_cmd.as_deref(),
+        args.splice.as_deref(),
+        args.patch.as_deref(),
+        &args.out,
+        false,
+    )?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
@@ -3350,8 +3396,14 @@ fn main() -> anyhow::Result<()> {
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let linked = std::thread::spawn(move || {
-                let failed =
-                    link(link_cmd.as_deref(), splice.as_deref(), spliced.as_deref(), patched).err();
+                let failed = link(
+                    link_cmd.as_deref(),
+                    splice.as_deref(),
+                    spliced.as_deref(),
+                    &object,
+                    patched,
+                )
+                .err();
                 if failed.is_none() {
                     as_built.lock().unwrap().insert(object, from);
                 }
@@ -3539,8 +3591,8 @@ impl Program {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
             let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
-            let unlinked = link(cmd, splice, patch, patched).err().map(|it| it.to_string());
-            failed = failed.or(unlinked);
+            let unlinked = link(cmd, splice, patch, &args.out, patched).err();
+            failed = failed.or(unlinked.map(|it| it.to_string()));
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");

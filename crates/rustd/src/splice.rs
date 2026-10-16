@@ -39,6 +39,8 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod pe;
+
 /// The executable of the last full link, which is read on a thread of its own while the
 /// daemon waits for the next edit.
 pub(crate) struct Linked(JoinHandle<anyhow::Result<Baseline>>);
@@ -46,9 +48,9 @@ pub(crate) struct Linked(JoinHandle<anyhow::Result<Baseline>>);
 impl Linked {
     /// Starts reading the executable the linker just wrote at `binary` from `patch` and the
     /// rest of the link line. The patch is read here and now: the next edit writes another.
-    pub(crate) fn read(binary: PathBuf, patch: &Path) -> Linked {
-        let patch = std::fs::read(patch);
-        Linked(std::thread::spawn(move || Baseline::read(binary, &patch?)))
+    pub(crate) fn read(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
+        let (patch, object) = (std::fs::read(patch), object.to_owned());
+        Linked(std::thread::spawn(move || Baseline::read(binary, &patch?, &object)))
     }
 
     pub(crate) fn baseline(self) -> anyhow::Result<Baseline> {
@@ -59,7 +61,7 @@ impl Linked {
 /// An executable as the linker wrote it, and what the last splice changed of it.
 pub(crate) struct Baseline {
     path: PathBuf,
-    image: Image,
+    image: Format,
     /// The functions of the patch the executable was linked with. A patch without one of
     /// them means the function is as it first was again, which the executable no longer has.
     baked: Vec<Box<[u8]>>,
@@ -76,14 +78,21 @@ pub(crate) struct Spliced {
 }
 
 impl Baseline {
-    fn read(path: PathBuf, patch: &[u8]) -> anyhow::Result<Baseline> {
+    /// Reads the executable at `path`, which was linked with `patch` ahead of `object`.
+    fn read(path: PathBuf, patch: &[u8], object: &Path) -> anyhow::Result<Baseline> {
         let file = File::open(&path)?;
         let stamp = Stamp::of(&file)?;
         // SAFETY: the daemon is the one that has the link write the file, and it does not
         // start another while this reads.
         let bytes = unsafe { memmap2::Mmap::map(&file)? };
-        let image = Image::read(&bytes)?;
-        let patch = ElfFile64::<Endianness>::parse(patch)?;
+        let image = match object::FileKind::parse(&*bytes)? {
+            object::FileKind::Pe64 => {
+                let object = std::fs::read(object)?;
+                Format::Pe(pe::Image::read(&bytes, &path, &[patch, &object])?)
+            }
+            _ => Format::Elf(Image::read(&bytes)?),
+        };
+        let patch = object::File::parse(patch)?;
         let baked = patch
             .symbols()
             .filter(|it| it.is_definition() && !it.is_local())
@@ -99,20 +108,25 @@ impl Baseline {
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
     pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {
-        let patch = Patch::read(patch, &self.image)?;
-        let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(&**it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
-        let addition = patch.place(&self.image)?;
+        let (addition, len) = match &self.image {
+            Format::Elf(image) => {
+                let patch = Patch::read(patch, image)?;
+                self.has_baked(patch.replaced.iter().map(|it| it.name))?;
+                (patch.place(image)?, image.len)
+            }
+            Format::Pe(image) => {
+                let patch = pe::Patch::read(patch, image)?;
+                self.has_baked(patch.defined())?;
+                (patch.place(image)?, image.len)
+            }
+        };
 
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         ensure!(Stamp::of(&file)? == self.stamp, "the executable was written by someone else");
         for (offset, bytes) in self.undo.drain(..).rev() {
             write_all_at(&file, &bytes, offset)?;
         }
-        file.set_len(self.image.len)?;
+        file.set_len(len)?;
         write_all_at(&file, &addition.appended, addition.offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
@@ -123,6 +137,25 @@ impl Baseline {
         self.stamp = Stamp::of(&file)?;
         Ok(Spliced { redirected: addition.redirected, appended: addition.appended.len() })
     }
+}
+
+impl Baseline {
+    /// Whether a patch that defines `defined` has every function of the patch the
+    /// executable was linked with.
+    fn has_baked<'a>(&self, defined: impl Iterator<Item = &'a [u8]>) -> anyhow::Result<()> {
+        let defined: FxHashSet<&[u8]> = defined.collect();
+        ensure!(
+            self.baked.iter().all(|it| defined.contains(&**it)),
+            "a function the executable was linked with a patch of is as it first was"
+        );
+        Ok(())
+    }
+}
+
+/// An executable by the format it is of.
+enum Format {
+    Elf(Image),
+    Pe(pe::Image),
 }
 
 #[cfg(unix)]

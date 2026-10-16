@@ -19,6 +19,7 @@ rustc-demangle = "0.1.28"
 rustc-hash.workspace = true
 same-file = "1"
 dunce = "1"
+pdb = "0.8"
 sha2 = "0.10"
 
 hir.workspace = true

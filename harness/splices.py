@@ -15,7 +15,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, join, RUSTD, sysroot_rlibs, with_objects, with_output
+from difftest import Fixture, join, RUSTD, sysroot_rlibs, toolchain, WINDOWS, with_objects, with_output
 
 TOML = """[package]
 name = "sedge"
@@ -207,6 +207,12 @@ fn main() {
 
 
 def strip(binary):
+    if WINDOWS:
+        # The toolchain's own: a PE loses the table of symbols the linker was asked to keep.
+        sysroot, host = toolchain()
+        tool = os.path.join(sysroot, "lib", "rustlib", host, "bin", "rust-objcopy.exe")
+        subprocess.run([tool, "--strip-all", binary], check=True)
+        return
     subprocess.run(["strip", binary], check=True)
 
 
@@ -220,6 +226,62 @@ def rewrite(binary):
     os.remove(binary)
     open(binary, "wb").write(data)
     os.chmod(binary, 0o755)
+
+
+def sound_pe(path):
+    """What dumpbin has against the file, and whether the tables the loader and the unwinder
+    read are in order: sections that follow one another, functions sorted and inside the
+    image, every address to fix up inside a section."""
+    read = subprocess.run(["dumpbin", "/nologo", "/headers", "/relocations", "/unwindinfo", "/imports", path],
+                          capture_output=True, text=True)
+    said = [l for l in (read.stdout + read.stderr).splitlines() if re.search(r"(LNK|warning|error)", l)]
+    if read.returncode or said:
+        return f"dumpbin: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
+    data = open(path, "rb").read()
+    u16 = lambda at: int.from_bytes(data[at:at + 2], "little")
+    u32 = lambda at: int.from_bytes(data[at:at + 4], "little")
+    nt = u32(0x3c)
+    count, optional = u16(nt + 6), nt + 24
+    section_align, image_size = u32(optional + 32), u32(optional + 56)
+    table = optional + u16(nt + 20)
+    sections = [(u32(at + 12), u32(at + 8), u32(at + 20), u32(at + 16))
+                for at in (table + 40 * n for n in range(count))]
+    end = sections[0][0]
+    for address, size, raw, raw_size in sections:
+        if address != end:
+            return f"pe: a section at {address:#x}, the one before ends at {end:#x}"
+        if raw + raw_size > len(data):
+            return f"pe: the section at {address:#x} is past the end of the file"
+        end = (address + size + section_align - 1) // section_align * section_align
+    if end != image_size:
+        return f"pe: an image of {image_size:#x} whose sections end at {end:#x}"
+
+    def at_file(address):
+        for start, size, raw, raw_size in sections:
+            if start <= address < start + max(size, raw_size):
+                return raw + address - start
+        return None
+
+    directory = lambda n: (u32(optional + 112 + 8 * n), u32(optional + 116 + 8 * n))
+    functions, size = directory(3)
+    last = 0
+    for at in range(at_file(functions), at_file(functions) + size, 12):
+        begin, finish, unwind = u32(at), u32(at + 4), u32(at + 8)
+        if begin < last or finish <= begin or at_file(begin) is None or at_file(unwind & ~1) is None:
+            return f"pe: the function table is out of order at {begin:#x}"
+        last = begin
+    fixups, size = directory(5)
+    at, stop = at_file(fixups), at_file(fixups) + size
+    while at < stop:
+        page, block = u32(at), u32(at + 4)
+        if block < 8 or block % 4:
+            return f"pe: a block of fixups of {block} bytes"
+        for entry in range(at + 8, at + block, 2):
+            kind, offset = u16(entry) >> 12, u16(entry) & 0xfff
+            if kind not in (0, 10) or (kind and at_file(page + offset) is None):
+                return f"pe: a fixup of kind {kind} at {page + offset:#x}"
+        at += block
+    return None
 
 
 # (what the step is, [(old, new)], something done to the binary first or None)
@@ -394,6 +456,8 @@ def main():
 
     def sound(path):
         """What readelf and a loader that binds everything at once have against the file."""
+        if WINDOWS:
+            return sound_pe(path)
         read = subprocess.run(["readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
         said = [l for l in read.stderr.splitlines() if l.strip()]
         if read.returncode or said:
@@ -438,6 +502,8 @@ def main():
         else:
             verdict = sound(binary) or "same"
             verdict = verdict.upper() if verdict != "same" else verdict
+        if held:
+            held.wait(timeout=30)
         wrong += verdict != "same"
         kind = how.split(":")[0] if verdict == "same" else "wrong"
         hows[how] = hows.get(how, 0) + 1
