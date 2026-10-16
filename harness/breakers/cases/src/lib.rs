@@ -33,4 +33,6 @@ cases![
     named_const_impl,
     macro_same_name_vars,
     safe_macro,
+    path_where_clause,
+    impl_in_fn,
 ];

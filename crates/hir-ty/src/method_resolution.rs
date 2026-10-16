@@ -18,12 +18,13 @@ use tracing::{debug, instrument};
 
 use base_db::Crate;
 use hir_def::{
-    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, FunctionId, GenericParamId, HasModule,
-    ImplId, ItemContainerId, ModuleId, TraitId,
+    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
+    GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::{Body, path::GenericArgs as HirGenericArgs},
     hir::{ExprId, generics::GenericParams},
+    item_scope::ItemScope,
     lang_item::LangItems,
     nameres::{DefMap, block_def_map, crate_def_map},
     resolver::Resolver,
@@ -585,6 +586,33 @@ fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     ordered.into()
 }
 
+/// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
+/// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
+/// name, and those are looked into in every crate. A function can hold one as well, of a type
+/// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
+/// functions are looked into in the crates of the workspace alone: lowering every body of
+/// every dependency for this is too much.
+fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
+    let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
+    if !krate.data(db).origin.is_local() {
+        return holders;
+    }
+    let declared = scope.declarations().filter_map(|def| match def {
+        ModuleDefId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+        ModuleDefId::StaticId(it) => Some(DefWithBodyId::from(it)),
+        _ => None,
+    });
+    holders.extend(declared);
+    let in_impls =
+        scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(|(_, item)| match *item {
+            AssocItemId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::ConstId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::TypeAliasId(_) => None,
+        });
+    holders.extend(in_impls);
+    holders
+}
+
 #[salsa::tracked(returns(ref))]
 fn crates_containing_incoherent_inherent_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
@@ -706,11 +734,8 @@ impl<'db> InherentImpls<'db> {
                     }
                 }
 
-                // Custom derives put their impls in a const item, `const _: () = { ... };` or
-                // one with a name of their own.
-                for konst in module_data.scope(db).consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, map);
                     }
                 }
@@ -894,11 +919,8 @@ impl<'db> TraitImpls<'db> {
                     entry.1.push(impl_id);
                 }
 
-                // Custom derives put their impls in a const item, `const _: () = { ... };` or
-                // one with a name of their own.
-                for konst in module_data.scope(db).consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, lang_items, map);
                     }
                 }
