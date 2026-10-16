@@ -21,7 +21,8 @@ AREA = "sbase::square!(self.side)"
 SUM = "items.iter().sum()"
 # Not the same in any two checkouts from the start.
 NOTE = "app/src/note.txt"
-# (what the step is, [(checkout, file, old, new)], checkouts asked for in order, the ones cargo rejects)
+MORE = "app/src/more.rs"
+# (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
     ("nothing edited, all again", [], [0, 1, 2], []),
@@ -38,6 +39,15 @@ STEPS = [
      [2, 0, 1], []),
     ("one put back as another is", [(2, MID, AREA + " + 7", AREA + " + 2")], [2, 0], []),
     ("a file that is included edited in one", [(1, NOTE, "note of 1", "another note")], [0, 1, 2], []),
+    ("a module with its file added in one",
+     [(1, MORE, None, "pub fn more() -> u32 {\n    5\n}\n"),
+      (1, APP, "fn main() {", "mod more;\n\nfn main() {\n    println!(\"more {}\", more::more());")],
+     [1, 0, 2], []),
+    ("the file edited", [(1, MORE, "5", "6")], [0, 1, 2], []),
+    ("the file removed", [(1, MORE, "", None)], [1, 0, 2], [1]),
+    ("and the module with it",
+     [(1, APP, "mod more;\n\nfn main() {\n    println!(\"more {}\", more::more());", "fn main() {")],
+     [1, 0, 2], []),
 ]
 # Cargo may build that checkout another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
@@ -102,6 +112,12 @@ def main():
     for what, edits, order, broken in STEPS:
         for at, path, old, new in edits:
             path = os.path.join(checkouts[at]["ws"], path)
+            if old is None:
+                open(path, "w").write(new)
+                continue
+            if new is None:
+                os.remove(path)
+                continue
             text = open(path).read()
             assert old in text, (what, old)
             open(path, "w").write(text.replace(old, new, 1))
