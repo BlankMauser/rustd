@@ -1,0 +1,10 @@
+[package]
+name = "devdep"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+helper = { path = "helper" }
+
+[workspace]
