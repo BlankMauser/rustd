@@ -248,7 +248,13 @@ impl SymbolTable {
     pub(crate) fn get_nested(&self, named: &str, closures: &[u32], place: u64) -> Option<&str> {
         let here = |it: &&NestedSymbol| it.place.is_none_or(|known| known == place);
         let mut symbols = match &**self.nested.get(named)? {
-            [only] => return Some(only).filter(here).map(|it| &*it.name),
+            // Its closures may be numbered otherwise than here, but are as many.
+            [only] => {
+                return Some(only)
+                    .filter(here)
+                    .filter(|it| it.closures.len() == closures.len())
+                    .map(|it| &*it.name);
+            }
             symbols => symbols.iter().filter(here).filter(|it| it.closures == closures),
         };
         let symbol = symbols.next()?;

@@ -130,7 +130,11 @@ class Fixture:
             stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
             # Loggers stamp their lines with the time, on either stream.
             stamp = rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?"
-            stdout, stderr = (re.sub(stamp, b"<time>", it) for it in (run.stdout, stderr))
+            # What prints an address prints another one in every run.
+            address = rb"0x[0-9a-f]{12}\b"
+            stdout, stderr = (
+                re.sub(address, b"<address>", re.sub(stamp, b"<time>", it)) for it in (run.stdout, stderr)
+            )
             return run.returncode, self.normalize(stdout), stderr
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""

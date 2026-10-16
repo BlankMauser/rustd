@@ -322,6 +322,7 @@ fn main() {
     println!("unsized_in_struct {:?}", cases::unsized_in_struct::run());
     println!("promoted_fn_cast {:?}", cases::promoted_fn_cast::run());
     println!("same_name_callable {:?}", cases::same_name_callable::run());
+    println!("same_name_statics {:?}", cases::same_name_statics::run());
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 

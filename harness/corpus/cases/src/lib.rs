@@ -5594,3 +5594,34 @@ pub mod same_name_callable {
         (number.get(), text.get())
     }
 }
+
+/// Two statics of one name in one function, the second inside a closure, as `#[instrument]`
+/// around a `trace_span!` leaves them.
+pub mod same_name_statics {
+    struct Site {
+        name: &'static str,
+        id: &'static std::sync::atomic::AtomicUsize,
+    }
+
+    fn enter<R>(site: &'static Site, f: impl FnOnce() -> R) -> (R, &'static str, usize) {
+        let was = site.id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (f(), site.name, was)
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let outer = {
+            static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10);
+            static SITE: Site = Site { name: "outer", id: &COUNT };
+            &SITE
+        };
+        enter(outer, || {
+            let inner = {
+                static COUNT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(20);
+                static SITE: Site = Site { name: "inner", id: &COUNT };
+                &SITE
+            };
+            (enter(inner, || 1), enter(inner, || 2), enter(outer, || 3))
+        })
+    }
+}
