@@ -2601,6 +2601,8 @@ fn main() -> anyhow::Result<()> {
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.
     let mut slow: FxHashMap<PathBuf, u32> = FxHashMap::default();
+    // The ones that are loaded instead from the next time on.
+    let mut given_up: FxHashSet<PathBuf> = FxHashSet::default();
     let slow_switch = std::env::var("RUSTD_SLOW_SWITCH_MS")
         .ok()
         .and_then(|it| it.parse().ok())
@@ -2659,9 +2661,7 @@ fn main() -> anyhow::Result<()> {
                                 .map(|(_, it)| &*it.args.checkout)
                                 .collect();
                             let quick = |base: &Path, over: &Path| {
-                                !pending
-                                    && built.contains(&base)
-                                    && slow.get(over).is_none_or(|it| *it < SLOW_SWITCHES)
+                                !pending && built.contains(&base) && !given_up.contains(over)
                             };
                             checkouts.view_of(project, overlay, &quick)
                         }
@@ -2848,8 +2848,8 @@ fn main() -> anyhow::Result<()> {
             if *viewed.get(&base).unwrap_or(&base) != over {
                 eprintln!("view: {} as {}", over.display(), base.display());
                 builds.settle(&mut db, &mut programs)?;
-                turned.extend(viewed.get(&base).cloned());
-                turned.extend((base != over).then(|| over.clone()));
+                turned.extend(viewed.get(&base).map(|it| (base.clone(), it.clone())));
+                turned.extend((base != over).then(|| (base.clone(), over.clone())));
                 db.set_view(&base, &over, built_in(&db, &base));
                 moved.extend(place(&mut db, &base, &over, &mut placed));
                 tree.relist(&base);
@@ -3144,16 +3144,24 @@ fn main() -> anyhow::Result<()> {
             eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
         }
         // Turning from one that is given up on is the last time it is paid for.
-        if !turned.iter().any(|it| slow.get(it).is_some_and(|it| *it >= SLOW_SWITCHES)) {
+        if !turned.iter().any(|it| given_up.contains(&it.1)) {
             let long = edit.start.elapsed() > slow_switch;
-            for over in turned {
-                let times = slow.entry(over).or_default();
+            for (_, over) in &turned {
+                let times = slow.entry(over.clone()).or_default();
                 *times = if long { *times + 1 } else { 0 };
-                if *times == SLOW_SWITCHES {
-                    // The others may only have been long to turn to from this one.
-                    slow.retain(|_, it| *it >= SLOW_SWITCHES);
-                    break;
-                }
+            }
+            if turned.iter().any(|it| slow[&it.1] >= SLOW_SWITCHES) {
+                // Turning between two is as long for the one as for the other: the one that
+                // is further from what is loaded is what takes long.
+                let far = turned.iter().max_by_key(|(base, over)| {
+                    let differs = |file: &&WatchedFile| {
+                        let Ok(inside) = file.path.strip_prefix(base) else { return false };
+                        std::fs::read(&file.path).ok() != std::fs::read(over.join(inside)).ok()
+                    };
+                    files.iter().filter(differs).count()
+                });
+                given_up.extend(far.map(|it| it.1.clone()));
+                slow.clear();
             }
         }
         let mut replies = FxHashMap::default();
