@@ -1827,8 +1827,11 @@ fn main() -> anyhow::Result<()> {
         match &requests {
             Some(requests) => {
                 let mut next = Some(requests.recv()?);
-                while let Some((request, target, stream)) = next {
-                    next = requests.try_recv().ok();
+                // Asked again after each: a checkout that joins takes long enough for the
+                // requests sent with its own to arrive.
+                while let Some((request, target, stream)) =
+                    next.take().or_else(|| requests.try_recv().ok())
+                {
                     let known = match &target {
                         Some(target) => programs.iter().position(|it| target.is(&it.args)),
                         None => Some(0),
