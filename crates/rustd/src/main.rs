@@ -233,12 +233,16 @@ impl Resolver<'_> {
                 let mut args = Vec::new();
                 for (idx, param) in params.iter().enumerate().skip(1) {
                     let arg = trait_ref.get_type_argument(idx)?;
-                    let defaulted = param
-                        .as_type_param(self.db)
-                        .is_some_and(|it| it.default(self.db).is_some());
-                    // FIXME: the only default understood is `= Self`.
-                    let is_self = hir::attach_db(self.db, || arg == trait_ref.self_ty());
-                    if defaulted && idx + 1 == params.len() && is_self {
+                    let default = param.as_type_param(self.db).and_then(|it| it.default(self.db));
+                    // FIXME: a default that names a parameter is understood only as `= Self`.
+                    let is_default = default.as_ref().is_some_and(|default| {
+                        if default.as_type_param(self.db).is_some() {
+                            return hir::attach_db(self.db, || arg == trait_ref.self_ty());
+                        }
+                        let default = self.type_path(default);
+                        default.is_some() && default == self.type_path(&arg)
+                    });
+                    if idx + 1 == params.len() && is_default {
                         break;
                     }
                     args.push(self.type_path(&arg)?);
@@ -412,6 +416,14 @@ impl Resolver<'_> {
         }
         if let Some(builtin) = ty.as_builtin() {
             return Some(builtin.name().as_str().to_owned());
+        }
+        if ty.is_tuple() {
+            let fields: Option<Vec<_>> =
+                ty.tuple_fields(self.db).iter().map(|it| self.type_path(it)).collect();
+            return Some(match &*fields? {
+                [only] => format!("({only},)"),
+                fields => format!("({})", fields.join(", ")),
+            });
         }
         // A parameter of the `impl` an item is in, where the item is not generic itself: a
         // static, or what a closure or constant in a generic function holds.

@@ -5625,3 +5625,38 @@ pub mod same_name_statics {
         })
     }
 }
+
+/// A static in a method of a generic `impl` of a trait whose parameter is left at its default.
+pub mod static_in_defaulted_impl {
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub trait Parse<P = ()>: Sized {
+        fn parse(text: &str) -> (Option<Self>, usize);
+    }
+
+    pub struct Marker;
+
+    impl<T: FromStr> Parse for T {
+        fn parse(text: &str) -> (Option<Self>, usize) {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            (text.parse().ok(), CALLS.fetch_add(1, Ordering::Relaxed))
+        }
+    }
+
+    impl<T: FromStr> Parse<Marker> for Option<T> {
+        fn parse(text: &str) -> (Option<Self>, usize) {
+            static CALLS: AtomicUsize = AtomicUsize::new(100);
+            (Some(text.parse().ok()), CALLS.fetch_add(1, Ordering::Relaxed))
+        }
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            <u8 as Parse>::parse("7"),
+            <i16 as Parse>::parse("x"),
+            <Option<u8> as Parse<Marker>>::parse("3"),
+            <Option<bool> as Parse<Marker>>::parse("true"),
+        )
+    }
+}

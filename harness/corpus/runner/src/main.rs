@@ -323,6 +323,7 @@ fn main() {
     println!("promoted_fn_cast {:?}", cases::promoted_fn_cast::run());
     println!("same_name_callable {:?}", cases::same_name_callable::run());
     println!("same_name_statics {:?}", cases::same_name_statics::run());
+    println!("static_in_defaulted_impl {:?}", cases::static_in_defaulted_impl::run());
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 
