@@ -25,6 +25,20 @@ pub(super) fn xgetbv() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, edi\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n")
 }
 
+/// `vcvtps2ph`, which Cranelift does not have either: the floats at `rdi`, four or eight of
+/// them, to halves at `rsi`. The rounding is an immediate of the instruction and `edx` here,
+/// so there is one instruction for each rounding.
+pub(super) fn vcvtps2ph(floats: u32) -> String {
+    let source = if floats == 8 { "ymm0" } else { "xmm0" };
+    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\nvmovups {source}, [rdi]\nand edx, 7\n");
+    for rounding in 0..8 {
+        text += &format!("cmp edx, {rounding}\njne 2f\nvcvtps2ph xmm0, {source}, {rounding}\n");
+        text += "jmp 3f\n2:\n";
+    }
+    text += "3:\nvmovdqu [rsi], xmm0\nvzeroupper\nret\n";
+    text
+}
+
 /// One operand of a block, as the function around it sees it.
 pub(super) enum Operand<'a> {
     Reg {

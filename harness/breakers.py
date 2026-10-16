@@ -16,7 +16,7 @@ CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = {"future_size"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
-LEFT = {"f16c", "unsized_tail_cmp"}
+LEFT = set()
 
 
 def main():

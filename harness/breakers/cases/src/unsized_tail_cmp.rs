@@ -1,6 +1,6 @@
 //! triomphe orders `HeaderSlice<H, [T]>`, a struct that ends in a slice, by a derive. The
-//! comparison of two references to it reads each as one scalar, and they are a pointer and a
-//! length. Open: the function is left to rustc.
+//! derive asks each for its discriminant first, and the reference it passes was read as one
+//! scalar: it is a pointer and a length.
 
 #[derive(PartialEq, PartialOrd)]
 #[repr(C)]

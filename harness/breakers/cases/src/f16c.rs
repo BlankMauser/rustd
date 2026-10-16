@@ -1,5 +1,5 @@
 //! half converts `f32` to `f16` with `_mm_cvtps_ph`, which is `llvm.x86.vcvtps2ph.128`: an
-//! instruction Cranelift has no name for. Open: the function is left to rustc.
+//! instruction Cranelift has no name for. It is a function of the one instruction now.
 
 #[cfg(target_arch = "x86_64")]
 pub fn run() -> [u16; 4] {
