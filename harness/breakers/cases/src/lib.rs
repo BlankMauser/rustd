@@ -27,4 +27,6 @@ cases![
     unsize_assoc_field,
     const_bswap,
     format_blanket_new,
+    f16c,
+    unsized_tail_cmp,
 ];
