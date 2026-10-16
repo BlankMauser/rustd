@@ -30,4 +30,5 @@ cases![
     format_blanket_new,
     f16c,
     unsized_tail_cmp,
+    safe_macro,
 ];
