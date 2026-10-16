@@ -424,20 +424,36 @@ fn expand_var(
                         ])
                     );
 
-                    let wrap_in_parens = !is_negative_literal
-                        && !matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]))
-                        && sub.try_into_subtree().is_none_or(|it| {
-                            it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible
-                        });
-                    if wrap_in_parens {
-                        builder.open(tt::DelimiterKind::Parenthesis, span);
+                    // A fragment is one token tree to the macro it is passed on to, also when
+                    // it is one token: the `0` of an expression is not the `0` of a rule.
+                    let is_leaf =
+                        matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
+                    let delimiter = if is_leaf {
+                        Some(tt::DelimiterKind::Invisible)
+                    } else if is_negative_literal
+                        || sub.try_into_subtree().is_some_and(|it| {
+                            it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
+                        })
+                    {
+                        None
+                    } else {
+                        Some(tt::DelimiterKind::Parenthesis)
+                    };
+                    if let Some(delimiter) = delimiter {
+                        builder.open(delimiter, span);
                     }
                     builder.extend_with_tt_alone(sub);
-                    if wrap_in_parens {
+                    if delimiter.is_some() {
                         builder.close(span);
                     }
                 }
-                Fragment::Path(tt) => fix_up_and_push_path_tt(ctx, builder, tt),
+                Fragment::Path(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    fix_up_and_push_path_tt(ctx, builder, tt);
+                    builder.close(span);
+                }
                 Fragment::Ty(tt) if before_angle => {
                     let mut span = id;
                     marker(&mut span);
@@ -445,7 +461,13 @@ fn expand_var(
                     builder.extend_with_tt_alone(tt);
                     builder.close(span);
                 }
-                Fragment::Ty(tt) => builder.extend_with_tt_alone(tt),
+                Fragment::Ty(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
                 Fragment::Empty => (),
             };
             ExpandResult::ok(())

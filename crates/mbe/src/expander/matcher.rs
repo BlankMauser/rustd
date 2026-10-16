@@ -837,7 +837,7 @@ fn match_meta_var<'t>(
                 }),
                 MetaVarKind::Literal => {
                     eat_char(input, '-');
-                    input.expect_literal().map(drop).map_err(|()| {
+                    expect_literal(input).map_err(|()| {
                         ExpandError::binding_error(
                             span.unwrap_or(delim_span.close),
                             "expected literal",
@@ -849,10 +849,15 @@ fn match_meta_var<'t>(
             .err();
             let value = match err {
                 Some(_) => Fragment::Empty,
-                None => Fragment::Tokens {
-                    tree: input.from_savepoint(savepoint),
-                    origin: TokensOrigin::Raw,
-                },
+                None => {
+                    let tree = input.from_savepoint(savepoint);
+                    // A fragment taken as a token tree is still that fragment where it goes.
+                    let origin = match kind {
+                        MetaVarKind::Tt if is_fragment(tree) => TokensOrigin::Ast,
+                        _ => TokensOrigin::Raw,
+                    };
+                    Fragment::Tokens { tree, origin }
+                }
             };
             return ValueResult { value, err };
         }
@@ -867,6 +872,28 @@ fn match_meta_var<'t>(
     let (entry_point, origin) = fragment;
     expect_fragment(db, input, entry_point, delim_span)
         .map(|tree| Fragment::Tokens { tree, origin })
+}
+
+/// Whether `tree` is what an earlier expansion put in for one of its metavariables.
+fn is_fragment(tree: tt::TokenTreesView<'_>) -> bool {
+    tree.try_into_subtree()
+        .is_some_and(|it| it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible)
+}
+
+/// A literal, which may be one that an earlier expansion took as an expression.
+fn expect_literal(input: &mut TtIter<'_>) -> Result<(), ()> {
+    let mut fork = input.clone();
+    if let Ok((subtree, mut inner)) = fork.expect_subtree()
+        && subtree.delimiter.kind == tt::DelimiterKind::Invisible
+    {
+        inner.expect_literal()?;
+        if inner.next().is_some() {
+            return Err(());
+        }
+        *input = fork;
+        return Ok(());
+    }
+    input.expect_literal().map(drop)
 }
 
 fn collect_vars(collector_fun: &mut impl FnMut(MetaVar), pattern: &MetaTemplate) {

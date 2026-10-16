@@ -35,4 +35,5 @@ cases![
     safe_macro,
     path_where_clause,
     impl_in_fn,
+    fragment_token,
 ];
