@@ -171,7 +171,8 @@ fn expand_subtree(
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     let mut err = None;
-    'ops: for op in template.iter() {
+    let mut ops = template.iter().peekable();
+    'ops: while let Some(op) = ops.next() {
         match op {
             Op::Literal(it) => builder.push(tt::Leaf::from({
                 let mut it = it.clone();
@@ -201,8 +202,12 @@ fn expand_subtree(
                 err = err.or(e);
             }
             Op::Var { name, id, .. } => {
+                let before_angle = matches!(
+                    ops.peek(),
+                    Some(Op::Punct(puncts)) if puncts.first().is_some_and(|it| it.char == '<')
+                );
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, builder, marker);
+                    expand_var(ctx, name, *id, before_angle, builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -381,6 +386,7 @@ fn expand_var(
     ctx: &mut ExpandCtx<'_>,
     v: &Symbol,
     id: Span,
+    before_angle: bool,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
@@ -432,6 +438,14 @@ fn expand_var(
                     }
                 }
                 Fragment::Path(tt) => fix_up_and_push_path_tt(ctx, builder, tt),
+                Fragment::Ty(tt) if before_angle => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Parenthesis, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
+                Fragment::Ty(tt) => builder.extend_with_tt_alone(tt),
                 Fragment::Empty => (),
             };
             ExpandResult::ok(())
