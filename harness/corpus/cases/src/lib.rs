@@ -2071,6 +2071,10 @@ pub mod division_panics {
             panic::catch_unwind(|| black_box(i64::MIN) % black_box(-1)).is_err(),
             panic::catch_unwind(|| black_box(i128::MIN) / black_box(-1)).is_err(),
             panic::catch_unwind(|| black_box(i16::MIN) / black_box(1)).is_err(),
+            panic::catch_unwind(|| -black_box(i32::MIN)).is_err(),
+            panic::catch_unwind(|| -black_box(i128::MIN)).is_err(),
+            panic::catch_unwind(|| -black_box(-128i8 + 1)).is_err(),
+            panic::catch_unwind(|| black_box(-128i8) == i8::MIN).is_err(),
         ];
         (caught, black_box(i128::MIN + 1) / black_box(-1), black_box(7u8) % black_box(4), black_box(-7i64) / 2)
     }

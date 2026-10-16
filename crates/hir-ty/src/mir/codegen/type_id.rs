@@ -184,7 +184,10 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             ItemContainerId::ExternBlockId(_) => return None,
         };
         let name = &FunctionSignature::of(db, func).name;
-        Some(parent.child(DefPathData::ValueNs(name.as_str())))
+        // `#[test]` and `#[bench]` put a constant of the function's name ahead of it.
+        let flags = AttrFlags::query(db, func.into());
+        let earlier = u32::from(flags.intersects(AttrFlags::IS_TEST | AttrFlags::IS_BENCH));
+        Some(parent.child_at(DefPathData::ValueNs(name.as_str()), earlier))
     }
 
     fn assoc_type_path(&self, alias: TypeAliasId) -> Option<Fingerprint> {

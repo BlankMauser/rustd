@@ -5274,7 +5274,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     UnOp::Neg if self.builder.func.dfg.value_type(value).is_float() => {
                         self.builder.ins().fneg(value)
                     }
-                    UnOp::Neg => self.builder.ins().ineg(value),
+                    UnOp::Neg => {
+                        let ty = self.builder.func.dfg.value_type(value);
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let zero = match ty {
+                            types::I128 => self.builder.ins().uextend(ty, zero),
+                            types::I64 => zero,
+                            _ => self.builder.ins().ireduce(ty, zero),
+                        };
+                        let (value, overflow) = self.builder.ins().ssub_overflow(zero, value);
+                        self.panic_if(overflow, OverflowOp::Neg)?;
+                        value
+                    }
                 };
                 store(self, value);
             }

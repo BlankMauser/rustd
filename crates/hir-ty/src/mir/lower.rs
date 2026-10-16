@@ -1299,6 +1299,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         expr_id.into(),
                     );
                 }
+                // `-128i8` is that number, not the negation of one `i8` does not have.
+                if let hir_def::hir::UnaryOp::Neg = op
+                    && !self.has_adjustments(*expr)
+                    && let Expr::Literal(literal @ hir_def::hir::Literal::Int(..)) =
+                        &self.store[*expr]
+                    && let Some(negated) = literal.clone().negate()
+                {
+                    let ty = self.expr_ty_without_adjust(*expr);
+                    let mut operand = self.lower_literal_to_operand(ty, &negated)?;
+                    operand.span = Some(expr_id.into());
+                    self.push_assignment(current, place, Rvalue::Use(operand), expr_id.into());
+                    return Ok(Some(current));
+                }
                 let Some((operand, current)) = self.lower_expr_to_some_operand(*expr, current)?
                 else {
                     return Ok(None);
