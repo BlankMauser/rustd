@@ -4964,6 +4964,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // Const eval stores some scalars as 16 bytes.
             (16, size) if size < 16 => bytes.truncate(size),
             (len, 16) if len < 16 => bytes.resize(16, 0),
+            // MIR lowering gives a byte string literal a length even where its type is an array's.
+            (len, size) if len == 2 * WORD && size == WORD => bytes.truncate(size),
             _ => unsupported!("constant whose size differs from its layout"),
         }
         let mut blob = ConstBlob {

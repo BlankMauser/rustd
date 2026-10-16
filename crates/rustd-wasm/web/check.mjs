@@ -49,4 +49,7 @@ assert.deepEqual(circles(drawn).map((it) => it[3]), [30], "the ball is still the
 assert.deepEqual(report.functions, ["frame"]);
 assert.equal(drawn.at(-1)[1], "hello");
 assert.equal(circles(drawn).length, 1);
+
+// Long enough for the ball to reach the floor and a wall, which run code a first frame does not.
+for (let frame = 0; frame < 3000; frame++) program.call("frame", 400, 300, 0.016);
 console.log("ok");
