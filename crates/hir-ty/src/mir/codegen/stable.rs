@@ -1,6 +1,6 @@
 //! Names for instances that are the same in every run of the daemon on the same sources, so
-//! that code compiled by one run can be found by the next. Only for instances of crates we do
-//! not own at types we do not own: nothing an edit can change.
+//! that code compiled by one run can be found by the next. A crate of the checkout is named
+//! by what is written in it, so an edit makes other names of everything in it.
 
 use std::{cell::RefCell, fmt::Write};
 
@@ -25,11 +25,16 @@ use crate::{
     next_solver::{GenericArgs, Region, TermId, Ty, TyKind},
 };
 
+/// Before the content of a crate of the checkout, where a crate of rustc's alone has its id.
+const OF_CHECKOUT: char = '~';
+
 pub(super) struct StableNames<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     /// The crates whose code changes under the daemon.
     owned: FxHashSet<Crate>,
+    /// Whether what is of those crates has a name, by what is written in them now.
+    by_content: bool,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
 }
 
@@ -38,12 +43,18 @@ impl<'a, 'db> StableNames<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         owned: FxHashSet<Crate>,
+        by_content: bool,
     ) -> Self {
-        StableNames { db, symbols, owned, files: RefCell::default() }
+        StableNames { db, symbols, owned, by_content, files: RefCell::default() }
     }
 
-    /// `None` for an instance that names anything of a crate we own, or anything this has no
-    /// stable name for.
+    /// Whether a name is of anything of a crate of the checkout, which is only what the
+    /// name says while the checkout is as it was: rustc's build of it can be of another time.
+    pub(super) fn of_checkout(name: &str) -> bool {
+        name.contains(OF_CHECKOUT)
+    }
+
+    /// `None` for an instance that names anything this has no stable name for.
     pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
         let mut out = String::new();
         match instance.def {
@@ -94,9 +105,13 @@ impl<'a, 'db> StableNames<'a, 'db> {
     ) -> Option<()> {
         // The source of a crate of the workspace changes too, built by the daemon or not.
         if self.owned.contains(&krate) || krate.data(self.db).origin.is_local() {
-            return None;
+            if !self.by_content {
+                return None;
+            }
+            write!(out, "{OF_CHECKOUT}{:x}:", self.symbols.content_id(krate)?).ok()?;
+        } else {
+            write!(out, "{:x}:", self.symbols.stable_crate_id(krate)?).ok()?;
         }
-        write!(out, "{:x}:", self.symbols.stable_crate_id(krate)?).ok()?;
         self.ast(out, file, id)
     }
 

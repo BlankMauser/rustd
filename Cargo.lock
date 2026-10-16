@@ -2974,6 +2974,7 @@ dependencies = [
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rusty-s3",
+ "sha2 0.10.9",
  "syntax",
  "triomphe",
  "ureq",

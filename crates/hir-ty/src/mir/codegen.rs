@@ -136,6 +136,17 @@ pub trait SymbolResolver {
     }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
+    /// What stands for a crate that is not rustc's alone to build, the same wherever the
+    /// same sources are built on the same crates.
+    fn content_id(&self, krate: Crate) -> Option<u64> {
+        _ = krate;
+        None
+    }
+    /// Whether data has in it where the checkout is, which another checkout's is not.
+    fn names_place(&self, bytes: &[u8]) -> bool {
+        _ = bytes;
+        false
+    }
     /// The function a type is declared in the body of, when nothing else is around it there
     /// and no other type of the body has its name.
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
@@ -261,7 +272,10 @@ impl CodegenUnit {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
-        if let Some(base) = known.base.take() {
+        // Code of the checkout comes from the store in the first build alone: what a patch is
+        // of has to be compiled here, to tell what an edit changes.
+        let hydrate = known.base.is_none();
+        if let Some(base) = known.base.take().filter(|it| !it.outdated()) {
             let own_statics = OwnStatics::new(
                 db,
                 all().map(|root| root.krate(db)).collect(),
@@ -330,8 +344,15 @@ impl CodegenUnit {
         let mut rounds = 0;
         loop {
             rounds += 1;
-            let mut cg =
-                ObjectCodegen::new(db, symbols, rejected, own_statics.clone(), &on_demand, None)?;
+            let mut cg = ObjectCodegen::new(
+                db,
+                symbols,
+                rejected,
+                own_statics.clone(),
+                &on_demand,
+                None,
+                hydrate,
+            )?;
             cg.patching = patching;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
@@ -624,10 +645,10 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, file: base_db::FileId) {
+    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
-            base.touch_bodies(file);
+            base.touch_bodies(db, file);
         }
         self.forget();
     }
@@ -788,6 +809,8 @@ struct ObjectCodegen<'a, 'db> {
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
     names: stable::StableNames<'a, 'db>,
+    /// Whether the code of the checkout's crates can come from the store.
+    hydrate: bool,
     stable_names: FxHashMap<Instance, Option<StableName>>,
     kept: Kept,
     /// The entries of the store to build from in place of compiling, if any.
@@ -1509,6 +1532,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         own_statics: OwnStatics,
         on_demand: &'a FxHashSet<FunctionId>,
         base: Option<&'a patch::Base>,
+        hydrate: bool,
     ) -> Result<Self> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
@@ -1553,7 +1577,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             source_paths: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
-            names: stable::StableNames::new(db, symbols, own_statics.crates.clone()),
+            names: stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
+            hydrate,
             stable_names: FxHashMap::default(),
             kept: Kept::default(),
             // A patch gets these from its base, and a check compiles them to compare.
@@ -1698,11 +1723,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .collect();
         let ahead = std::sync::Mutex::new(Ahead { queue, seen, working: 0 });
         let idle = std::sync::Condvar::new();
-        let rejected = self.rejected;
+        let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         let (entries, owned) = (self.entries.as_deref(), &self.own_statics.crates);
         self.symbols.in_parallel(threads, &|db, symbols, _| {
-            let names = stable::StableNames::new(db, symbols, owned.clone());
+            let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
             // What the store has is not compiled, nor looked into for what it calls.
             let in_store = |callee: &Instance| {
                 let Some(entries) = entries else { return false };
@@ -1838,7 +1863,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         for (request, &id) in compiled.requests.funcs.iter().zip(&ids.funcs) {
             let decl = self.module.declarations().get_function_decl(id);
             let target = if decl.linkage == Linkage::Import {
+                // rustc's copy of a function of the checkout is of the checkout as rustc
+                // built it, and uses rustc's copies of the statics.
                 let symbol = decl.linkage_name(id).into_owned();
+                if let FuncTarget::Instance(callee, _) = &request.target
+                    && self
+                        .stable_name(callee)
+                        .is_none_or(|it| stable::StableNames::of_checkout(&it))
+                {
+                    return None;
+                }
                 let checked = self.symbols.defines(&symbol);
                 CachedTarget::Import { symbol, checked }
             } else if let FuncTarget::Instance(callee, _) = &request.target {
@@ -1848,8 +1882,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             };
             funcs.push(CachedFunc { target, sig: request.sig.clone() });
         }
+        // Only a crate of the checkout is compiled with where the checkout is.
+        let placed =
+            self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
         let mut datas = Vec::with_capacity(ids.datas.len());
         for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request
+                && placed
+                && self.symbols.names_place(&blob.bytes)
+            {
+                return None;
+            }
             datas.push(match request {
                 DataRequest::Blob { blob, identity } => {
                     CachedData::Blob { blob: blob.clone(), identity: *identity }
@@ -1859,9 +1902,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let key = self.names.vtable(ty.as_ref(), trait_ref)?;
                     CachedData::Vtable { key, blob: blob.clone() }
                 }
-                DataRequest::Static(_) => {
+                DataRequest::Static(of) => {
                     let decl = self.module.declarations().get_data_decl(id);
-                    if decl.linkage != Linkage::Import {
+                    // Whether a static of the checkout is rustc's or ours is up to the build.
+                    let krate = of.krate(self.db);
+                    let of_checkout = self.own_statics.crates.contains(&krate)
+                        || krate.data(self.db).origin.is_local();
+                    if decl.linkage != Linkage::Import || of_checkout {
                         return None;
                     }
                     CachedData::Static {

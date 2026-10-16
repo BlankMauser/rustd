@@ -1,6 +1,7 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod content;
 mod outline;
 mod remote;
 mod symbols;
@@ -155,6 +156,7 @@ struct Resolver<'a> {
     /// What panic locations in the workspace are relative to.
     root: PathBuf,
     rustc_commit: std::cell::OnceCell<Option<String>>,
+    contents: &'a content::Contents,
 }
 
 impl Resolver<'_> {
@@ -378,9 +380,9 @@ impl SymbolResolver for Resolver<'_> {
             for _ in 0..threads {
                 let db = self.db.clone();
                 let (next, table, root) = (&next, self.table, self.root.clone());
-                let rustc_commit = self.rustc_commit.clone();
+                let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
                 scope.spawn(move || {
-                    let resolver = Resolver { db: &db, table, root, rustc_commit };
+                    let resolver = Resolver { db: &db, table, root, rustc_commit, contents };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -423,6 +425,14 @@ impl SymbolResolver for Resolver<'_> {
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
         self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+    }
+
+    fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        self.contents.id(self.db, &self.root, krate, &|krate| self.stable_crate_id(krate))
+    }
+
+    fn names_place(&self, bytes: &[u8]) -> bool {
+        self.contents.names_place(&self.root, bytes)
     }
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
@@ -988,8 +998,9 @@ fn build(
     listed: &mut Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
-    let root = args.root()?;
-    let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
+    let contents = &content::Contents::default();
+    let root = args.checkout.clone();
+    let resolver = Resolver { db, table, root, rustc_commit: Default::default(), contents };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
@@ -1881,8 +1892,8 @@ fn main() -> anyhow::Result<()> {
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
-                known.touch_bodies(file);
-                parked.iter_mut().for_each(|it| it.known.touch_bodies(file));
+                known.touch_bodies(&db, file);
+                parked.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
