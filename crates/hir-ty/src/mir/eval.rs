@@ -1616,7 +1616,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     self.const_eval_discriminant(e.enum_variants(self.db).variants[index.0].0)?;
                 Ok(r)
             }
-            Variants::Multiple { tag, tag_encoding, variants, .. } => {
+            Variants::Multiple { tag, tag_encoding, .. } => {
                 let size = tag.size(self.target_data_layout).bytes_usize();
                 let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
                 let is_signed = tag.is_signed().into();
@@ -1625,18 +1625,20 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let tag = &bytes[offset..offset + size];
                         Ok(i128::from_le_bytes(pad16(tag, is_signed)))
                     }
-                    TagEncoding::Niche { untagged_variant, niche_start, .. } => {
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                         let tag = &bytes[offset..offset + size];
-                        let candidate_tag = i128::from_le_bytes(pad16(tag, is_signed))
-                            .wrapping_sub(*niche_start as i128)
+                        // A niche value stands for the variant that many after the first of
+                        // `niche_variants`, and the untagged one may lie among them.
+                        let relative = (u128::from_le_bytes(pad16(tag, IsSigned::No))
+                            .wrapping_sub(*niche_start)
+                            & (u128::MAX >> (128 - 8 * size)))
                             as usize;
-                        let idx = variants
-                            .iter_enumerated()
-                            .map(|(it, _)| it)
-                            .filter(|it| it != untagged_variant)
-                            .nth(candidate_tag)
-                            .unwrap_or(*untagged_variant)
-                            .0;
+                        let first = niche_variants.start().0;
+                        let idx = if relative <= niche_variants.end().0 - first {
+                            first + relative
+                        } else {
+                            untagged_variant.0
+                        };
                         let result =
                             self.const_eval_discriminant(e.enum_variants(self.db).variants[idx].0)?;
                         Ok(result)
@@ -1791,15 +1793,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let variant_layout = variants[rustc_enum_variant_idx].clone();
                 let have_tag = match tag_encoding {
                     TagEncoding::Direct => true,
-                    TagEncoding::Niche { untagged_variant, niche_variants: _, niche_start } => {
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                         if *untagged_variant == rustc_enum_variant_idx {
                             false
                         } else {
-                            discriminant = (variants
-                                .iter_enumerated()
-                                .filter(|(it, _)| it != untagged_variant)
-                                .position(|(it, _)| it == rustc_enum_variant_idx)
-                                .unwrap() as i128)
+                            discriminant = ((rustc_enum_variant_idx.0 - niche_variants.start().0)
+                                as i128)
                                 .wrapping_add(*niche_start as i128);
                             true
                         }

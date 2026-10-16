@@ -84,6 +84,9 @@ struct Args {
     isolate: Option<PathBuf>,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
+    /// Load what the tests, examples and benchmarks of the workspace depend on: a target of
+    /// those kinds is built.
+    dev_deps: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
     /// Other checkouts of projects to load into the same database, for requests that name
@@ -141,6 +144,7 @@ impl Args {
         let mut deny = None;
         let mut isolate = None;
         let mut cfg_test = false;
+        let mut dev_deps = false;
         let mut features = Vec::new();
         let mut also = Vec::new();
         while let Some(arg) = args.next() {
@@ -158,6 +162,7 @@ impl Args {
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
+                "--dev-deps" => dev_deps = true,
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
@@ -178,6 +183,7 @@ impl Args {
             deny,
             isolate,
             cfg_test,
+            dev_deps,
             features,
             also,
             checkout: PathBuf::new(),
@@ -245,6 +251,12 @@ impl Resolver<'_> {
             }
             None => Some(format!("<{self_ty}>::{}", name.as_str())),
         }
+    }
+
+    fn in_generic_impl(&self, func: FunctionId) -> bool {
+        let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
+        let imp = hir::GenericDef::from(hir::Impl::from(imp));
+        !imp.type_or_const_params(self.db).is_empty()
     }
 
     /// rustc's `StableCrateId` of a crate it built something of.
@@ -480,6 +492,11 @@ impl SymbolResolver for Resolver<'_> {
     fn function(&self, func: FunctionId) -> Option<String> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
+        }
+        // Not a function until the `impl<T>` it is in is given its types: there is nothing to
+        // name, the more so in a crate of such `impl`s alone, which rustc builds nothing of.
+        if self.in_generic_impl(func) {
+            return None;
         }
         let path = self.path(func)?;
         if let Some(symbol) = self.table.get(&path) {
@@ -729,8 +746,10 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
     let mut found: Vec<_> = Crate::all(db)
         .into_iter()
         .filter(|it| match is_file {
-            true => crate_root_file(db, *it)
-                .is_some_and(|root| args.inside(&root) == Some(Path::new(krate))),
+            // Named from the checkout, or in full.
+            true => crate_root_file(db, *it).is_some_and(|root| {
+                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+            }),
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
         .collect();
@@ -759,6 +778,7 @@ fn load(
     projects: &[&Path],
     cargo_config: &CargoConfig,
     load_config: LoadCargoConfig,
+    dev_deps: bool,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         compared: Default::default(),
@@ -767,6 +787,7 @@ fn load(
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
         load_config,
+        dev_deps,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
@@ -789,6 +810,8 @@ struct Checkouts {
     loaded: load_cargo::Loaded,
     cargo_config: CargoConfig,
     load_config: LoadCargoConfig,
+    /// Whether what only tests, examples and benchmarks depend on is loaded.
+    dev_deps: bool,
 }
 
 impl Checkouts {
@@ -998,7 +1021,8 @@ impl Checkouts {
                 continue;
             }
             splits.push(None);
-            let workspace = workspace_at(project, &self.cargo_config, &self.load_config)?;
+            let workspace =
+                workspace_at(project, &self.cargo_config, &self.load_config, self.dev_deps)?;
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
@@ -1138,15 +1162,16 @@ fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
+    dev_deps: bool,
 ) -> anyhow::Result<ProjectWorkspace> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
-        if !cargo_config.set_test {
+        if !dev_deps {
             cargo.drop_dev_dependencies();
         }
-        let built = built_features(manifest.manifest_path().as_ref(), cargo_config)?;
+        let built = built_features(manifest.manifest_path().as_ref(), cargo_config, dev_deps)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let key = (cargo[package].name.clone(), cargo[package].version.to_string());
@@ -1181,9 +1206,11 @@ fn report_sharing(db: &RootDatabase) {
 fn built_features(
     manifest: &Path,
     cargo_config: &CargoConfig,
+    dev_deps: bool,
 ) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
+    let edges = if dev_deps { "normal,dev" } else { "normal" };
     let mut command = Command::new("cargo");
-    command.args(["tree", "--edges", "normal", "--prefix", "none", "--format", "{p}|{f}"]);
+    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
     command.arg("--manifest-path").arg(manifest);
     if let CargoFeatures::Selected { features, .. } = &cargo_config.features
         && !features.is_empty()
@@ -1433,7 +1460,18 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        for krate in crates_named(db, krate, args)? {
+        let mut named = crates_named(db, krate, args)?;
+        // Of the crates of the name, the ones rustc built into this program, when it built any.
+        let linked = |krate: &Crate| {
+            let name = krate.display_name(db);
+            let root = crate_root_file(db, *krate);
+            name.zip(root)
+                .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+        };
+        if named.iter().any(linked) {
+            named.retain(linked);
+        }
+        for krate in named {
             local.push(krate);
             let listed = listed.of(db, krate);
             if at == 0 {
@@ -1937,6 +1975,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             deny: None,
             isolate: None,
             cfg_test: args.cfg_test,
+            dev_deps: args.dev_deps,
             features: args.features.clone(),
             also: Vec::new(),
             checkout: args.checkout.clone(),
@@ -2385,7 +2424,8 @@ fn main() -> anyhow::Result<()> {
     };
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
-    let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config)?;
+    let (mut db, vfs, mut checkouts) =
+        load(&projects, &cargo_config, load_config, args.cfg_test || args.dev_deps)?;
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());

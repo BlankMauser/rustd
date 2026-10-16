@@ -1374,7 +1374,12 @@ fn declaration_location<'db>(
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
-    let node = source.value.syntax();
+    location_of(db, source.file_id, written_range(source.value.syntax()))
+}
+
+/// The range of an item or a macro call without the attributes and comments on top of it,
+/// which rustc's span of it leaves out.
+fn written_range(node: &SyntaxNode) -> TextRange {
     let start = node
         .children_with_tokens()
         .find(|it| {
@@ -1382,7 +1387,7 @@ fn declaration_location<'db>(
                 && !it.kind().is_trivia()
         })
         .map_or(node.text_range().start(), |it| it.text_range().start());
-    location_of(db, source.file_id, TextRange::new(start, node.text_range().end()))
+    TextRange::new(start, node.text_range().end())
 }
 
 /// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
@@ -1436,9 +1441,8 @@ fn location_of(
     let own_tokens = file_id.macro_file().is_some()
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     let FileRange { file_id, range } = match written_call(db, file_id) {
-        Some(call) if own_tokens => {
-            InFile::new(call.file_id, call.value.text_range()).original_node_file_range_rooted(db)
-        }
+        Some(call) if own_tokens => InFile::new(call.file_id, written_range(&call.value))
+            .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
     let file_id = file_id.file_id(db);
@@ -3922,8 +3926,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (.., held) = frame.as_ref()?;
             held.locals.binary_search(&local).ok()
         };
+        let forwarded = forwarded_temps(body);
         for (local, data) in body.locals.iter() {
-            if self.locals.contains_idx(local) {
+            if self.locals.contains_idx(local) || forwarded.contains_key(&local) {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
@@ -3956,6 +3961,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
+        }
+        for (temp, to) in forwarded {
+            self.locals.insert(temp, self.locals[to]);
         }
         let mut frame_flags = Vec::new();
         for (local, data) in body.locals.iter() {
@@ -5319,6 +5327,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn copy(&mut self, dst: Value, src: Value, size: Size) {
+        // A temporary and the binding it initializes are one slot.
+        if dst == src {
+            return;
+        }
         // A load and a store per word of a future holding the whole program's state is
         // more IR than fits in memory.
         if size.bytes() > 128 {
@@ -6059,7 +6071,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(None);
         };
         let Some(site) = written_call(db, file_id) else { return Ok(None) };
-        let range = InFile::new(site.file_id, site.value.text_range());
+        let range = InFile::new(site.file_id, written_range(&site.value));
         let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
         let Some((file, line, col)) = location_of(db, file_id.into(), range) else {
             return Ok(None);
@@ -6611,8 +6623,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some((_, last)) = field_types.iter().last() else {
                     unsupported!("unsizing a struct without fields");
                 };
+                // The field may be an associated type of a parameter: an array of one, a slice
+                // of the other.
                 let from = last.ty().instantiate(self.interner, args).skip_norm_wip();
                 let to = last.ty().instantiate(self.interner, to_args).skip_norm_wip();
+                let (from, to) = (self.normalize(from), self.normalize(to));
                 self.unsize_metadata(from, to, old)
             }
             _ => unsupported!("unsizing {from:?} to {to:?}"),
@@ -7675,6 +7690,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, offset);
                 }
             }
+            // `simd_cast` leaves a float out of the range of the integer undefined; saturating
+            // as `simd_as` does is one of the answers it may give.
+            ("simd_cast" | "simd_as", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (from, count) = self.simd_lanes(ty)?;
+                let (to, _) = self.simd_lanes(dst_ty)?;
+                for i in 0..count {
+                    let offset = (i * from.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(from.ty, MEM, src, offset);
+                    let value = if from.ty.is_float() || to.ty.is_float() {
+                        self.float_cast(value, from, to)?
+                    } else {
+                        self.int_cast(value, from, to)
+                    };
+                    self.builder.ins().store(MEM, value, dst, (i * to.ty.bytes() as u64) as i32);
+                }
+            }
             ("simd_bitmask", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 let (lane, count) = self.simd_lanes(ty)?;
@@ -7931,6 +7963,54 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let cleared = self.builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
                     let value = self.builder.ins().select(cleared, zero, found);
                     self.builder.ins().store(MEM, value, dst, i as i32);
+                }
+            }
+            ("x86.xgetbv", [register]) => {
+                let (register, _) = self.load_scalar(register)?;
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(types::I32));
+                sig.returns.push(AbiParam::new(types::I64));
+                let callee = self.cg.assembly(asm::xgetbv(), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let call = self.builder.ins().call(callee, &[register]);
+                let value = self.builder.inst_results(call)[0];
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("x86.pclmulqdq" | "x86.pclmulqdq.256" | "x86.pclmulqdq.512", [a, b, halves]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                let (halves, _) = self.load_scalar(halves)?;
+                // Bit 0 says which half of each 128 bits of `a` is multiplied, bit 4 of `b`.
+                let half = |fx: &mut Self, bit: i64| {
+                    let chosen = fx.builder.ins().ushr_imm(halves, bit);
+                    let chosen = fx.builder.ins().band_imm(chosen, 1);
+                    let chosen = fx.builder.ins().uextend(PTR, chosen);
+                    fx.builder.ins().ishl_imm(chosen, 3)
+                };
+                let (of_a, of_b) = (half(self, 0), half(self, 4));
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(16) {
+                    let l = self.builder.ins().iadd(a, of_a);
+                    let l = self.builder.ins().load(types::I64, MEM, l, lane);
+                    let r = self.builder.ins().iadd(b, of_b);
+                    let r = self.builder.ins().load(types::I64, MEM, r, lane);
+                    // The product without carries: `l` shifted by every bit set in `r`, xored.
+                    let mut low = self.builder.ins().iconst(types::I64, 0);
+                    let mut high = low;
+                    for bit in 0..64 {
+                        let set = self.builder.ins().ushr_imm(r, bit);
+                        let set = self.builder.ins().band_imm(set, 1);
+                        let mask = self.builder.ins().ineg(set);
+                        let part = self.builder.ins().ishl_imm(l, bit);
+                        let part = self.builder.ins().band(part, mask);
+                        low = self.builder.ins().bxor(low, part);
+                        if bit != 0 {
+                            let part = self.builder.ins().ushr_imm(l, 64 - bit);
+                            let part = self.builder.ins().band(part, mask);
+                            high = self.builder.ins().bxor(high, part);
+                        }
+                    }
+                    self.builder.ins().store(MEM, low, dst, lane);
+                    self.builder.ins().store(MEM, high, dst, lane + 8);
                 }
             }
             _ => unsupported!("LLVM intrinsic `{name}`"),
@@ -8976,6 +9056,79 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The temporaries a `let` is initialized through, each with the binding it is copied to right
+/// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
+/// The two can be one slot, the binding holding nothing yet when the temporary is written, and
+/// a frame is not twice the size of what it declares.
+fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
+    let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
+    let mut forwarded = FxHashMap::default();
+    if body.coroutine.is_some() {
+        return forwarded;
+    }
+    for (_, block) in body.basic_blocks.iter() {
+        // The temporary written last, by a statement of this block or by the call that led
+        // here, and whether the binding's storage has started since.
+        let mut written = None;
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::StorageLive(local) => {
+                    if let Some((_, live)) = &mut written {
+                        *live = Some(*local);
+                    }
+                }
+                StatementKind::FakeRead(_) | StatementKind::Nop => (),
+                StatementKind::Assign(
+                    to,
+                    Rvalue::Use(Operand {
+                        kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                        ..
+                    }),
+                ) if let Some((temp, live)) = written
+                    && whole(from) == Some(temp)
+                    && whole(to).is_some()
+                    && whole(to) == live =>
+                {
+                    forwarded.insert(temp, to.local);
+                    written = None;
+                }
+                StatementKind::Assign(to, _) => written = whole(to).map(|it| (it, None)),
+                _ => written = None,
+            }
+        }
+        // FIXME: a temporary a call returns into is copied in the block the call leads to.
+    }
+    if forwarded.is_empty() {
+        return forwarded;
+    }
+    // Written once and read once, and by nothing else: the binding is not what it is made of.
+    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    body.clone().walk_places(|place| *mentions.entry(place.local).or_default() += 1);
+    let fake_reads = |local: LocalId| {
+        body.basic_blocks
+            .iter()
+            .flat_map(|(_, block)| &block.statements)
+            .filter(|it| matches!(&it.kind, StatementKind::FakeRead(place) if place.local == local))
+            .count()
+    };
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    forwarded.retain(|&temp, to| {
+        !bound.contains(&temp)
+            && mentions[&temp] - fake_reads(temp) == 2
+            && body.locals[temp].ty == body.locals[*to].ty
+            && !body.promoted_locals.iter().any(|it| it.0 == *to)
+            && *to != returned_local(body)
+    });
+    forwarded
 }
 
 fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {

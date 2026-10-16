@@ -19,6 +19,12 @@ use super::store::Store;
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
 
+/// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
+/// control register its argument numbers.
+pub(super) fn xgetbv() -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, edi\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n")
+}
+
 /// One operand of a block, as the function around it sees it.
 pub(super) enum Operand<'a> {
     Reg {

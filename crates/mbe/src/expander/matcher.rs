@@ -784,6 +784,10 @@ fn match_meta_var<'t>(
             return expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span)
                 .map(Fragment::Path);
         }
+        MetaVarKind::Ty => {
+            return expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span)
+                .map(Fragment::Ty);
+        }
         MetaVarKind::Expr(expr) => {
             // `expr_2021` should not match underscores, let expressions, or inline const.
             // The latter two are for [backwards compatibility][0].
@@ -852,7 +856,6 @@ fn match_meta_var<'t>(
             };
             return ValueResult { value, err };
         }
-        MetaVarKind::Ty => (parser::PrefixEntryPoint::Ty, TokensOrigin::Ast),
         MetaVarKind::Pat => (parser::PrefixEntryPoint::PatTop, TokensOrigin::Ast),
         MetaVarKind::PatParam => (parser::PrefixEntryPoint::Pat, TokensOrigin::Ast),
         MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Ast),

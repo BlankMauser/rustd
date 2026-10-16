@@ -24,11 +24,21 @@ class TestFixture(Fixture):
             path = os.path.join(crate_dir, "tests", f"{test}.rs")
             # By its file: an example may have the name of the test.
             super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)
+            self.rustd_args = ["--dev-deps"]
         if features:
             self.target_args += ["--features", features]
             self.rustd_args += ["--features", features]
         self.run_args = ["--test-threads=1"]
         self.shared = shared
+
+    def rustc_build(self):
+        super().rustc_build()
+        # A test that names nothing of the crate is linked without it: there is nothing of the
+        # crate in the binary for rustd to stand in front of.
+        linked = any(os.path.basename(r).startswith(f"lib{self.crates[0]}-") for r in self.rlibs)
+        if len(self.crates) == 2 and not linked:
+            print(f"{self.crates[0]} is not linked into this test")
+            self.crates = self.crates[1:]
 
     def rustd_build(self, deny=()):
         # The crate's objects are the same whichever test binary they are linked into.

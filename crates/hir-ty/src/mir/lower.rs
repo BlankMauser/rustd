@@ -2048,6 +2048,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
                 exprs.clone().iter().all(|&it| self.is_promotable(it))
             }
+            // The length is a constant already.
+            &Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
             Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
                 fields.clone().iter().all(|it| self.is_promotable(it.expr))
             }
