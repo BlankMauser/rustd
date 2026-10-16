@@ -33,7 +33,13 @@ mod lower;
 /// The name of the function being compiled, in the module and in the object.
 const OWN: &str = "rustd.own";
 const PERSONALITY: &str = "rust_eh_personality";
-const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+
+/// The processor code is made for: the baseline of the target, as rustc compiles for.
+pub(super) const CPU: &str = match (super::TRIPLE.architecture, super::TRIPLE.vendor) {
+    (target_lexicon::Architecture::Aarch64(_), target_lexicon::Vendor::Apple) => "apple-m1",
+    (target_lexicon::Architecture::Aarch64(_), _) => "generic",
+    _ => "x86-64",
+};
 
 pub(super) fn emit(
     recorder: &mut Recorder<'_>,
@@ -90,8 +96,14 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
     let module = context.create_module("rustd_asm");
     Machine::with(Optimization::None, |machine| {
         module.set_triple(&machine.get_triple());
-        // What rustc wraps `global_asm!` in.
-        module.set_inline_assembly(&format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"));
+        // What rustc wraps `global_asm!` in, where there are two syntaxes.
+        let text = match super::TRIPLE.architecture {
+            target_lexicon::Architecture::X86_64 => {
+                format!(".intel_syntax noprefix\n{text}\n.att_syntax\n")
+            }
+            _ => format!("{text}\n"),
+        };
+        module.set_inline_assembly(&text);
         let object = machine
             .write_to_memory_buffer(&module, FileType::Object)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
@@ -142,8 +154,12 @@ impl Machine {
     }
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+        #[cfg(target_arch = "x86_64")]
         Target::initialize_x86(&InitializationConfig::default());
-        let triple = TargetTriple::create(TRIPLE);
+        #[cfg(target_arch = "aarch64")]
+        Target::initialize_aarch64(&InitializationConfig::default());
+        let name = super::TRIPLE.to_string();
+        let triple = TargetTriple::create(&name);
         let target = Target::from_triple(&triple)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
@@ -151,13 +167,13 @@ impl Machine {
         target
             .create_target_machine(
                 &triple,
-                "x86-64",
+                CPU,
                 "",
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,
             )
-            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {TRIPLE}")))
+            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {name}")))
     }
 }
 
@@ -203,7 +219,7 @@ pub(super) enum Unhandled {
     Type(Type),
     /// IR or an object of a kind there is no answer for yet.
     Shape(&'static str),
-    /// An ELF relocation type, by its number.
+    /// A relocation type of the object format, by its number.
     Relocation(u32),
     Llvm(String),
 }

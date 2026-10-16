@@ -54,6 +54,70 @@ Notes on those numbers:
 - `deps.py` builds with `--offline`, so it needed the registry cache filled once
   (`cargo fetch` in a scratch project with the same dependencies).
 
+## The LLVM backend (measured)
+
+Everything above ran on Cranelift, the default. The LLVM backend also builds and runs here:
+`brew install llvm@20`, then
+`LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo build -p rustd --release --features llvm`
+(LLVM 20.1.8). With `RUSTD_BACKEND=llvm`, at the default `RUSTD_OPT=2`:
+
+| harness | result |
+|---|---|
+| `difftest.py corpus --bin runner --crate cases` | MATCH, 655/656 functions from rustd |
+| `programs.py` | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts |
+| `breakers.py` | 15 of 15, 1 open |
+| `unwinds.py` | 8 of 8 |
+| `RUSTD_SPLICE=1 splices.py` | 71 of 71 (57 spliced, 14 full links) |
+| `RUSTD_SPLICE=1 worktrees.py` | 52 of 52 |
+| `asmedits.py` / `deps.py` / `includes.py` | 10 of 10 / 10 of 10 / 9 of 9 |
+
+The daemon logs of programs, stress, unwinds, asmedits, includes, splices and worktrees have
+a `backend: llvm compiled` line for every build and no fallback to Cranelift, so these runs
+did go through LLVM.
+
+`backends.py` says how much LLVM compiled itself. On the corpus, of 10770 functions, 2 are
+left to Cranelift at both levels ("more than two return values"). On ripgrep 14.1.1 (the
+`rg` crate, 14352 functions) none are, and the program prints the same as cargo's with
+Cranelift, LLVM -O0 and LLVM -O2 (`rg --sort path -n -i 'splice|unwind\b' crates/rustd/src`).
+
+| ripgrep, `rg` crate | producing code, s (all threads) | code bytes | rustd wall, s |
+|---|---:|---:|---:|
+| cranelift | 2.1 | 5969204 | 2.8 |
+| llvm -O0 | 7.7 | 6535252 | 3.7 |
+| llvm -O2 | 22.4 | 1153564 | 6.5 |
+
+`backends.py corpus/kernels kernels kernels --kernels`, best of 3, ms, same checksums in
+every column:
+
+| kernel | cargo debug | cranelift | llvm -O0 | llvm -O2 | cargo release |
+|---|---:|---:|---:|---:|---:|
+| sieve | 248 | 1448 | 1865 | 294 | 24 |
+| collatz | 429 | 774 | 1004 | 274 | 93 |
+| fnv | 232 | 1368 | 1824 | 365 | 59 |
+| qsort | 755 | 1297 | 1653 | 437 | 160 |
+| matmul | 435 | 3277 | 4378 | 374 | 16 |
+| nbody | 681 | 2279 | 2842 | 409 | 19 |
+| mandelbrot | 446 | 1230 | 1269 | 175 | 166 |
+| words | 372 | 1328 | 1489 | 418 | 41 |
+
+What changed for it: the target machine, triple and CPU (`apple-m1`, rustc's baseline here)
+come from the host triple instead of being x86-64 Linux; inkwell's code generator feature is
+chosen by the host architecture in `Cargo.toml`; and `llvm/emitted.rs` reads LLVM's Mach-O
+object (underscored symbols, the arm64 page and page-offset, GOT, TLV and branch
+relocations, `__compact_unwind`). On AArch64 every constant section the code refers to
+becomes a data object of its own, because the code reaches it by page and only the linker
+knows the page. The compact unwind entry says what the frame is once set up, not where the
+prologue ends, so the rules are given from the first instruction on. That is right at
+every call, which is where a panic unwinds, and wrong inside the prologue and epilogue,
+which only matters to something that unwinds from an arbitrary instruction (a sampling
+profiler, a debugger).
+
+Not measured for LLVM: `RUSTD_OPT` other than 0 and 2 (0 only through `backends.py`), edit
+latency against Cranelift, and the x86-64 side. The x86-64 path of the feature type-checks
+(`cargo check -p hir-ty --features llvm --target x86_64-apple-darwin`) and the ELF code in
+`emitted.rs` is the old code behind a format check, but it was not run.
+
 ## Edit-to-running, full link against splice (measured)
 
 Small program: the `sedge` program of `splices.py`, 100 one-line edits in a row
@@ -124,7 +188,8 @@ It needs two more load commands than the linker leaves room for, so the link lin
    that way because `ring` needs a C cross compiler. The ELF splice path is the old code
    behind a format check, and the harness link line on Linux is the old one, but that is
    reading, not testing. Please run the list on Linux before trusting this branch there.
-3. The LLVM backend (`--features llvm`) was not built or run on macOS.
+3. The LLVM backend's unwind rules on macOS are not exact inside prologues and epilogues
+   (see the LLVM section), and it has no test of its own beyond the harnesses.
 4. The splice writes a copy and renames it because I believe the kernel caches a file's
    signature once it has run (inferred; I never tried writing in place). If that is wrong,
    in-place writes would be faster on large binaries.
@@ -148,6 +213,7 @@ It needs two more load commands than the linker leaves room for, so the link lin
 3. Find where the 40 ms goes on ripgrep and whether an in-place write is allowed.
 4. Reclaim space in the binary, or force a full link after it has grown by some factor.
 5. Direct ABI tests for AArch64: variadics, HFAs, stack packing.
-6. Build and run the LLVM backend on macOS.
+6. Exact unwind rows for LLVM code on Mach-O (ask LLVM for `__eh_frame` instead of
+   reading the compact entry), and the LLVM backend on Linux again.
 7. Port `linkbench.py` and run the remaining harnesses.
 8. Make `difftest.py corpus` work from the repo root, as the task list writes it.

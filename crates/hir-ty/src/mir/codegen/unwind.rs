@@ -86,11 +86,15 @@ pub(super) enum FrameRule {
 }
 
 impl FrameRule {
-    /// What holds where a function of the System V x86-64 ABI is entered, which the entry
-    /// every function shares says: the frame is eight bytes above the stack pointer, and
-    /// the return address is at its bottom.
+    /// What holds where a function is entered, which the entry every function shares says.
+    /// On x86-64 the frame is eight bytes above the stack pointer, and the return address
+    /// is at its bottom. On AArch64 the frame is at the stack pointer, and the return
+    /// address is in a register.
     #[cfg(feature = "llvm")]
-    pub(super) const ON_ENTRY: [FrameRule; 2] = [FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)];
+    pub(super) const ON_ENTRY: &[FrameRule] = match super::TRIPLE.architecture {
+        target_lexicon::Architecture::Aarch64(_) => &[FrameRule::Cfa(31, 0)],
+        _ => &[FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)],
+    };
 
     fn instruction(self) -> CallFrameInstruction {
         let register = gimli::Register;

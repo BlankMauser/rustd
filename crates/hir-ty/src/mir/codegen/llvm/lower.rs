@@ -102,7 +102,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         Self::mark_signature(context, &func.signature, Side::Callee, |loc, attribute| {
             function.add_attribute(loc, attribute)
         });
-        for (name, value) in [("target-cpu", "x86-64"), ("probe-stack", "inline-asm")] {
+        for (name, value) in [("target-cpu", super::CPU), ("probe-stack", "inline-asm")] {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }

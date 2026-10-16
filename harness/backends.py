@@ -33,7 +33,9 @@ class Compiled:
                                  env={**os.environ, "RUSTD_STATS": "1", **env})
         self.stderr = child.stderr.read()
         _, status, usage = os.wait4(child.pid, 0)
-        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // 1024
+        # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
+        unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
+        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // unit
         if status != 0:
             raise SystemExit(f"rustd failed with {name}:\n{self.stderr[-3000:]}")
         open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w").write(self.stderr)
