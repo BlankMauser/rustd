@@ -3,10 +3,19 @@
 This is the report for the `rustd-wasm` spike: can rustd's compiler run in a web page,
 compile Rust there, and swap edited functions into a running program?
 
-Short answer: yes, for a small `#![no_std]` program. The page in `crates/rustd-wasm/web`
-loads rustd built as WebAssembly, compiles a Rust program (and the parts of `core` it uses,
-from source) to WebAssembly, runs it against a canvas, and on each edit compiles only the
-functions that changed and swaps them in while the program keeps its memory.
+Short answer: yes. The page in `crates/rustd-wasm/web` is a playground: a Dioxus app with
+an editor on the left and a running program on the right. It loads rustd built as wasm32,
+compiles the program in the editor to wasm32, and on each edit compiles only the functions
+that changed and swaps them in while the program keeps its memory. Four of the programs are
+`#![no_std]` and draw on a canvas, with the parts of `core` they use compiled from source in
+the page. The fifth is a Dioxus counter: rustd compiles the app in the page and links it
+into a module rustc built that holds `std`, Dioxus and the wasm-bindgen glue.
+
+The work went in two passes, and the report keeps both. Sections 1 to 4 were written after
+the first pass (one canvas demo, compiler and output both wasm64) and their measurements are
+of that state. Sections 5 to 7 cover what came after: wasm32, more demos, Dioxus, proc
+macros, the playground, and stable Rust 1.99. Where the two disagree, the later sections
+are current. "What does not work" and the list of next steps at the end are current.
 
 Everything below is marked as measured, read from code, or inferred. Timings are from one
 Linux VM; where a number comes from a single run it says so.
@@ -14,27 +23,36 @@ Linux VM; where a number comes from a single run it says so.
 ## How to run it
 
     rustup component add rust-src
-    crates/rustd-wasm/web/build.sh
+    cargo install wasm-bindgen-cli --version 0.2.122
+    crates/rustd-wasm/web/build.sh              # the compiler, and the source of core
+    crates/rustd-wasm/web/build-dioxus.sh       # the Dioxus demo: rustc's module, the packed workspace
+    crates/rustd-wasm/web/build-playground.sh   # the page itself, needs `dx` and clang
     python3 -m http.server -d crates/rustd-wasm/web 8377
 
-Then open `http://localhost:8377/` in Chrome. Code is on the left, the canvas on the
-right, and the line at the bottom shows what the last build did. `node
-crates/rustd-wasm/web/check.mjs` runs the same build, edit, edit sequence without a
-browser and asserts on what the program draws.
+Then open `http://localhost:8377/` in Chrome. The line at the bottom shows what the last
+build did. `node crates/rustd-wasm/web/check.mjs` builds and edits the canvas programs
+without a browser and asserts on what they draw.
 
-The browser needs the memory64 proposal, since both the compiler and the code it emits are
-wasm64 (see "Why wasm64"). I ran it in the Chrome on this VM and in Node 24. I did not try
-Firefox or Safari.
+`wasm-bindgen` has to be the version in `web/dioxus/Cargo.lock`. A newer one refuses the
+module, and 0.2.129 also emits promise-integration code that needs `exnref`, which the
+Chrome on this VM does not have.
+
+I ran it in the Chrome on this VM and in Node 24. I did not try Firefox or Safari.
 
 ## What was built
 
 - `crates/hir-ty/src/mir/codegen/wasm.rs` (about 2,200 lines, behind the `wasm` feature of
   `hir-ty`): lowers one function of Cranelift IR to a WebAssembly function body.
 - `crates/rustd-wasm`: a `Compiler` that holds a salsa database over an in-memory file set,
-  a linker that turns the code generator's objects into a WebAssembly module, a small C ABI
-  for the page, and a CLI that does the same natively.
-- `crates/rustd-wasm/web`: the page, a worker that runs the compiler, and the runtime that
-  holds the program's memory and function table.
+  a linker that turns the code generator's objects into a WebAssembly module (`link.rs`),
+  the reading of a module rustc built and of rustc's symbol names (`host.rs`, `names.rs`),
+  the packing of a cargo workspace (`pack.rs`), the proc macros that run in the compiler
+  (`macros.rs`, `core-macro/`), a small C ABI for the page, and a CLI that does the packing
+  natively.
+- `crates/rustd-wasm/web`: the playground (`playground/`, a Dioxus app), the JavaScript it
+  leaves the compiler to (`playground.js`, `worker.js`, `compiler.js`), the runtime that
+  holds a program's memory and function table (`program.js`), the canvas programs
+  (`demos/`), and the workspace of the Dioxus demo (`dioxus/`).
 - Small portability fixes in `stdx`, `paths` and `ide-db`, listed under "Blockers".
 
 `rustd-wasm` is a workspace of its own, outside the main one. The `wasm` feature changes
@@ -43,6 +61,8 @@ native `rustd`. With the feature off, `codegen.rs` compiles as before apart from
 `std::time::Instant` becoming `stdx::time::Instant`, which is a re-export on native.
 
 ## 1. Does the front end run on wasm?
+
+(First pass. The compiler is wasm32 now, see section 5.)
 
 Yes.
 
@@ -94,6 +114,8 @@ generates code.
   dependencies, not a large workspace.
 
 ### Why wasm64
+
+(First pass. Both are wasm32 now, see section 5.)
 
 Two things in rustd assume the target's pointer is as wide as the compiler's own:
 `codegen.rs` builds IR with `I64` pointers throughout, and the MIR interpreter, which
@@ -203,7 +225,7 @@ b. MIR for that program, produced in wasm;
 c. its functions run in the page as emitted wasm;
 d. an edit recompiles only what changed and swaps it in without a reload.
 
-The demo (`crates/rustd-wasm/web/demo.rs`) is `#![no_std]`: bouncing balls drawn through
+The demo (now `crates/rustd-wasm/web/demos/balls.rs`) is `#![no_std]`: bouncing balls drawn through
 four functions the page provides (`fill`, `rect`, `circle`, `text`). It uses a trait, an
 `impl`, slices, iterators, `f64::clamp`, tuples, `match`, overflow checks and a
 `static mut`. It is not web-sys and not a UI framework; both need `alloc`, `std` and proc
@@ -263,52 +285,160 @@ rather than emitting code.
 The first build varies between runs by more than I can explain (4.5 to 7.2 s in Chrome on
 an otherwise idle machine, 11 s once while the machine was compiling). Treat it as rough.
 
+## 5. wasm32, and more programs
+
+Both the compiler and what it emits are wasm32 now, so memory64 is no longer needed.
+
+- **Emitted code.** `codegen.rs` takes its pointer type and word size from the `wasm`
+  feature (`PTR`, `WORD`). What had to change were the places that had the width written
+  in: fat pointers and vtable receivers assumed 16 bytes, `memcpy` and friends were
+  declared with 64-bit sizes, and a byte string literal, which rust-analyzer's MIR stores as
+  pointer and length even when its type is a thin `&[u8; N]`, was only recognised at 64
+  bits. The last one left `f64::clamp` and the bounds-check panics uncompiled, and the demo
+  trapped when a ball first hit a wall.
+- **The compiler.** Builds for `wasm32-unknown-unknown` on stable with no `-Zbuild-std`.
+  The MIR interpreter's refusal of a target with another pointer width does not come up,
+  because the host is now as wide as the target.
+- **Cranelift.** There is still no wasm ISA. `wasm.rs` writes wasm from the IR and only
+  borrows the settings of the x86-64 ISA, so `Target::host()` names that one when the
+  `wasm` feature is on.
+
+The canvas programs are in `web/demos`: bouncing balls, the game of life (2D arrays,
+by-value array iterators), sorting (`dyn Sorter`, slices) and the Mandelbrot set (operator
+overloading, closures, `Option`). Measured in Chrome, one run each, time from picking the
+program to it running, with the compiler already loaded: balls 3.2 s (747 functions in a
+681 kB module), sort 2.4 s (397 functions), life 2.4 to 2.7 s (404), mandelbrot 2.1 to
+2.4 s (43). About 2 s of each is name resolution over `core`, which is repeated because
+picking another canvas program starts a fresh compiler. Compiler memory is 180 to 210 MiB.
+A `RADIUS` edit in balls: 71 ms, 2 functions.
+
+## 6. Dioxus: linking into a module rustc built
+
+The Dioxus demo answers section 3 the other way round from what it recommended: `std` and
+the dependencies are not compiled in the page. They come from rustc.
+
+**The host module.** `web/dioxus` is a cargo workspace with two crates: `app`, the counter
+the editor shows, and `base`, a staticlib that depends on Dioxus and exports two functions,
+`rustd_launch(app: fn() -> Element)` and `rustd_rerender()`. `build-dioxus.sh` builds
+`base` with rustc and links it with `rust-lld` itself, with `--whole-archive --export-all
+--no-gc-sections --export-table --growable-table` and an exported `__stack_pointer`, then
+runs `wasm-bindgen --keep-lld-exports` over it. This is the same shape as the fat module
+subsecond builds for web hot-patching. Measured: 7.3 MB of wasm, 11,974 functions and
+5,422 data symbols that the program can link against by their rustc v0 symbol names.
+
+**The workspace.** rustd in the page still has to analyse everything the app's types come
+from. `rustd-wasm pack` loads the cargo workspace natively and writes one file with the
+sources of all 197 crates (3,310 files, `std` included), the crate graph, and every proc
+macro expansion rust-analyzer made while analysing the app (600 of them). Measured: 71 MB
+as JSON, not compressed. In the page, name resolution over it takes 8 to 12 s and type
+inference of the app 3 to 6 s, and the compiler's memory is about 1 GiB.
+
+**The link.** rustd compiles the functions of `app` and the generic instances they need.
+Everything else it calls resolves against the host module's exports: functions by symbol
+name with the wasm signatures compared (measured: 83 host functions called by the counter,
+no signature differing), statics through exported globals. The patch module is
+instantiated in the host's memory and table, in table slots and memory the page sets aside
+after the host's own. The host only ever reaches the program through function pointers
+(`launch(App)`, event closures), and a function pointer is a table slot, so overwriting a
+slot swaps the function. After a swap the page calls `rustd_rerender`, which marks every
+scope dirty. No jump table like `subsecond::call` was needed.
+
+Measured in Chrome, one run: first build 2.2 s (1,766 functions, 1.0 MB module); changing
+the heading text 95 ms (2 functions, 10 kB); adding a component with props 170 ms (30
+functions). The count survives every edit. An edit that does not compile leaves the old
+app running and fixing it recovers.
+
+**Matching rustc.** The program and the host must agree on layouts, symbol names, the call
+ABI, vtables and `TypeId`s. The last one bit: with the host on stable 1.99 and rustd
+reproducing the `TypeId` hashes of an older nightly, Dioxus's `downcast` of an event failed
+and a click panicked. The `rustd-spike` branch has since pinned rustd to stable 1.99.0 with
+its own copy of `rustc_abi` and fixed the hashing, this branch has that merged, and the
+host is built with 1.99.0 (`web/dioxus/rust-toolchain.toml`). Clicks work.
+
+**Bugs this found**, all fixed: an empty slice constant sharing its address with the next
+constant, which was then emitted without its pointers relocated (static text in an `if`
+rendered empty); a recompiled closure getting a fresh table slot rather than its old one,
+so unchanged code called the stale closure; and a panic in the linker after an edit that
+failed to compile.
+
+**Proc macros.** No proc-macro server runs in the page. The expansions recorded in the
+pack cover the source as it was packed. For a call the pack has no expansion of, which is
+any macro call the user edits, the compiler runs the macro itself: `rsx!` through the
+`dioxus-rsx` crate, which is an ordinary library, and `#[component]` and `#[derive(Props)]`
+through the source of `dioxus-core-macro`, which `core-macro/build.rs` copies into a
+library crate (a proc-macro crate cannot be linked) with `syn::parse` turned into
+`syn::parse2`. That is three macros, picked by name in `macros.rs`. It is not general: any
+other macro only works where its recorded expansion still applies. The general route,
+not tried, is each proc-macro crate built to its own wasm module with the compiler as the
+bridge server, as rust-analyzer's proc-macro server is for dylibs.
+
+## 7. The playground
+
+The page is one Dioxus app built by rustc and `dx` (`web/playground`, 3.3 MB of wasm): the
+picker, the editor (`dioxus-code-editor`, highlighted by `dioxus-code`), the light and
+dark themes, the output pane and the status line. It compiles nothing. It tells
+`playground.js` which program to show and of every edit, and is told how each build went.
+JavaScript keeps the compiler workers, the instantiation of what they emit, the canvas
+functions and the Dioxus host module. There is one worker for the canvas programs and one
+for the Dioxus workspace, each started when first needed and kept, so going from the
+counter to a canvas program and back keeps the counter's state.
+
+The page therefore runs two Dioxus instances when the counter is shown: the playground,
+and the host module the counter is linked into. Both find the element an event is for by a number on
+it, and a click on the counter's button reached the playground as a click on its theme
+button, so `playground.js` stops events from leaving the counter's pane. Making the
+playground itself the host was not tried. It would need the playground built the way `base` is (everything exported,
+nothing removed), and the counter would share the playground's Dioxus runtime.
+
 ## What does not work
 
-- Anything outside `core`: no `alloc`, no `std`, no dependencies, no proc macros.
-- Compile errors are not reported as diagnostics. Measured: with a type or syntax error
-  the page lists the functions that could not be built with a reason from MIR lowering or
-  codegen ("not compiled: frame: frontend: mir: HasErrors"), the old code keeps running,
-  and fixing the error recovers. Such a build is not a patch: it emitted 50 to 220
-  functions again, because a full build renumbers the generic instances.
-- The demo has no `#[panic_handler]`; `panic_impl` is an import that throws.
-- Panics abort; there is no unwinding. A trap stops the program until the next build.
+- Dependencies other than the ones in the Dioxus workspace. A project is packed natively,
+  ahead of time; nothing in the page runs cargo, a build script or a proc-macro crate.
+- Proc macros beyond `rsx!`, `#[component]` and `#[derive(Props)]`, once the call is edited.
+- Compile errors are not reported as diagnostics. The page lists the functions that could
+  not be built with a reason from MIR lowering or codegen ("not compiled: App: frontend:
+  mir: HasErrors"), the old code keeps running, and fixing the error recovers.
+- A panic in the compiler ends it. The compiler is built without unwinding, and native
+  rustd relies on catching a panic to find out that an edit took away something the last
+  build knew. Here a build that finds a function gone is a full build instead of a patch,
+  which covers deleting or renaming a function. Other ways of invalidating what the last
+  build held (I did not find one) would trap, and the page then needs a reload.
+- Panics in the program abort; there is no unwinding. A trap stops a canvas program until
+  the next build. The canvas programs have no `#[panic_handler]`.
 - Functions declared inside a function body are not listed as roots.
 - A changed `static` gets a fresh address and its initial value; the old one is leaked.
-  Table slots and data are never reclaimed.
-- Layout changes to live data are not handled. Changing the fields of `World` while balls
-  exist reinterprets old bytes.
-- wasm32 targets and browsers without memory64.
-- `rustd-wasm` has no Rust unit tests; `check.mjs` is the only test, and it needs the
-  wasm64 build. With the `wasm` feature on, `hir-ty` has dead-code warnings for the native
-  emit path.
+  Table slots and data are never reclaimed, and the Dioxus program has a fixed allowance
+  (131,072 slots, 64 MiB).
+- Layout changes to live data are not handled.
+- Hooks are not tracked. Adding or reordering hooks in a running component is whatever
+  Dioxus does with a hook list that no longer matches.
+- Tests: `rustd-wasm` has unit tests for the macros only, and `check.mjs` covers the canvas
+  programs. The linker, the Dioxus demo and the playground are only tested by hand, in
+  Chrome. With the `wasm` feature on, `hir-ty` has dead-code warnings for the native emit
+  path.
+- Startup of the Dioxus demo: 71 MB to fetch and 11 to 18 s of analysis before the first
+  build.
 
 ## From here to a real hot-reloading compiler in the browser
 
 Sizes are rough guesses at effort, not measurements.
 
-1. **`alloc` and a first slice of `std` from source** (1 to 2 weeks to learn what breaks,
-   open-ended after). Needs an allocator and a wasm `std::sys` layer or a stub of one. This
-   decides whether "compile everything from source" holds.
-2. **Diagnostics in the page** (days). rust-analyzer already computes them; they need
+1. **Startup and memory for a real workspace** (weeks). 71 MB of sources, 11 to 18 s of
+   analysis and 1 GiB for a counter. Most of the analysis is of crates that never change:
+   it needs a persisted database or a prebuilt snapshot, and a compressed pack.
+2. **Proc macros in general** (weeks). Macro crates built to wasm at pack time, and the
+   compiler as their bridge server.
+3. **Diagnostics in the page** (days). rust-analyzer already computes them; they need
    plumbing through the ABI and an editor that can show them.
-3. **Proc macros** (weeks). A wasm proc-macro ABI, a host for it in the compiler, and
-   prebuilt wasm for each macro crate. Any real UI framework needs this.
-4. **A crate graph for real projects** (1 to 2 weeks). Cargo metadata, cfgs, features and
-   build-script output computed outside the browser and shipped with the sources.
-5. **wasm32 target** (2 to 4 weeks). Pointer width as a parameter in `codegen.rs`, and the
-   interpreter running a target narrower than its host. Removes the memory64 requirement
-   and makes rustc-built objects linkable.
-6. **Linking rustc-built wasm** (2 to 4 weeks, after 5). Needed for dependencies too big to
-   compile in the page and for `wasm-bindgen`-style glue.
+4. **The playground as the host** (days to a week). One Dioxus in the page instead of two.
+5. **Unwinding in the compiler** (days). Either a build with `panic=unwind` on wasm
+   exception handling, or the patcher asking whether a thing still exists before it asks
+   about it.
+6. **A crate graph computed for any project** (1 to 2 weeks). `pack` does this natively for
+   one workspace; a service would do it for a project the user brings.
 7. **Code quality** (1 to 2 weeks for the first round). Direct calls to functions that
    have not changed, structured control flow, fewer locals.
-8. **Unwinding** (1 to 2 weeks). The wasm exception-handling proposal maps onto
-   `try_call`'s exceptional edges.
-9. **Startup** (days to weeks). 3.4 MB compressed for the compiler is fine. The 3 s of
-   analysis over `core` on every load is not; it needs a persisted database or a prebuilt
-   snapshot of `core`'s analysis.
-10. **Memory** (unknown). 250 MiB for `core` alone suggests `std` plus a framework will be
-    over a gigabyte. Needs measuring before anything else is planned around it.
-11. **Reclaiming slots and data, and state migration on layout changes** (1 to 2 weeks for
-    the first, open-ended for the second).
+8. **Unwinding in the program** (1 to 2 weeks). The wasm exception-handling proposal maps
+   onto `try_call`'s exceptional edges, and has to match what rustc's module does.
+9. **Reclaiming slots and data, and state migration on layout changes** (1 to 2 weeks for
+   the first, open-ended for the second).

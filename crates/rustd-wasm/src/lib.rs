@@ -40,7 +40,7 @@ use ide_db::{
     },
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use span::Edition;
 use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId, VfsPath, file_set::FileSet};
@@ -64,6 +64,8 @@ pub struct Compiler {
     linker: Linker,
     /// The functions of `core` by symbol, listed once: its source does not change.
     library: Option<FxHashMap<String, FunctionId>>,
+    /// The functions of the program in the last build.
+    local: FxHashSet<FunctionId>,
     /// Functions of `core` that code generation calls by path, found by building without.
     by_path: Vec<FunctionId>,
     /// The object of the last build that was not a patch.
@@ -144,6 +146,7 @@ impl Default for Compiler {
             known: Rejections::default(),
             linker: Linker::default(),
             library: None,
+            local: FxHashSet::default(),
             by_path: Vec::new(),
             base: Vec::new(),
             missed: Default::default(),
@@ -358,6 +361,12 @@ impl Compiler {
                 entries.extend(functions_of(db, krate.into()));
             }
         }
+        // This is built without unwinding, so nothing may ask about a function that is gone.
+        let local: FxHashSet<FunctionId> = entries.iter().copied().collect();
+        if !self.local.is_subset(&local) {
+            self.known.forget_base();
+        }
+        self.local = local;
         // In the order a build that found them left them in, for the next to be a patch.
         entries.extend(&self.by_path);
         let on_demand: Vec<FunctionId> = library.values().copied().collect();

@@ -1,3 +1,6 @@
+//! A Dioxus app, compiled in this page by rustd and linked into the Dioxus rustc built.
+//! Edit the `rsx!`, add a `#[component]`: it re-renders and keeps its state.
+
 use dioxus::prelude::*;
 
 fn main() {

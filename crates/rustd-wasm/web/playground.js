@@ -1,0 +1,294 @@
+// What the playground (`playground/`, a Dioxus app) leaves to JavaScript: running the compiler
+// in `worker.js` on every edit, and the programs it builds. The app calls `window.rustd`,
+// and hears how a build went through `rustd_status`.
+
+import { rustd_status } from "./assets/playground.js";
+import { Program } from "./program.js";
+
+const ms = (value) => `${value.toFixed(1)} ms`;
+const mib = (bytes) => (bytes / 2 ** 20).toFixed(1);
+
+// The one shown, of the two below.
+let shown = null;
+
+// The builds of one compiler: one at a time, an edit made during a build is built after it.
+class Builds {
+  constructor(worker, delay) {
+    this.worker = new Worker(worker, { type: "module" });
+    this.worker.onerror = (event) => this.say(`the compiler failed to load: ${event.message}`, true);
+    this.worker.onmessage = ({ data }) => this.message(data);
+    this.delay = delay;
+    this.loaded = "";
+    this.text = "";
+    this.sent = 0;
+    this.edited = 0;
+    this.building = false;
+    this.ready = false;
+    this.started = 0;
+  }
+
+  // Said to the app when this is the one shown, and again when it is shown again.
+  say(text, error = false) {
+    this.said = [error ? "error" : text.endsWith("…") ? "building" : "running", text];
+    this.resay();
+  }
+
+  resay() {
+    if (shown === this && this.said) {
+      rustd_status(...this.said);
+    }
+  }
+
+  edit(text) {
+    this.text = text;
+    this.edited += 1;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.build(), this.delay);
+  }
+
+  build() {
+    if (!this.ready || this.building || this.sent === this.edited) {
+      return;
+    }
+    this.building = true;
+    this.sent = this.edited;
+    this.worker.postMessage({ id: this.sent, text: this.text, ...this.options() });
+    this.started = performance.now();
+  }
+
+  message(data) {
+    if (data.loaded) {
+      this.loaded = this.describe(data.loaded);
+      this.say(`${this.loaded}\nfirst build…`);
+      this.ready = true;
+      this.build();
+      return;
+    }
+    this.building = false;
+    if (data.error) {
+      this.say(data.error, true);
+    } else {
+      try {
+        const notes = this.apply(data);
+        if (notes !== null) {
+          const { report, module } = data;
+          this.say(
+            `${this.loaded}\nedit to running: ${ms(performance.now() - this.started)} — ` +
+              `${report.functions.length} functions swapped in a ${module.length} byte module ` +
+              `(${notes.shift()}codegen ${ms(report.codegen_ms)}, link ${ms(report.link_ms)}), ` +
+              `compiler memory ${mib(report.compiler_bytes)} MiB` +
+              notes.map((it) => `\n${it}`).join(""),
+            notes.length > 0,
+          );
+        }
+      } catch (error) {
+        this.say(String(error.stack ?? error), true);
+      }
+    }
+    this.build();
+  }
+}
+
+const skipped = (report) => [
+  ...report.skipped.map(({ name, why }) => `not compiled: ${name}: ${why}`),
+  ...(report.errors ?? []),
+];
+
+// The programs that draw: `core` and the program are all there is, compiled from source.
+class Canvas extends Builds {
+  constructor() {
+    super("worker.js", 60);
+    this.canvas = document.getElementById("canvas");
+    this.context = this.canvas.getContext("2d");
+    const context = this.context;
+    this.host = {
+      fill: (red, green, blue) => (context.fillStyle = `rgb(${red} ${green} ${blue})`),
+      rect: (x, y, width, height) => context.fillRect(x, y, width, height),
+      circle(x, y, radius) {
+        context.beginPath();
+        context.arc(x, y, radius, 0, 2 * Math.PI);
+        context.fill();
+      },
+      text: (pointer, length, x, y) => context.fillText(this.program.text(pointer, length), x, y),
+    };
+    this.program = new Program(this.host);
+    // What a function of the program that trapped said: it stops until the next build.
+    this.stopped = null;
+    // Whether the next build is of another program, to start over with.
+    this.fresh = false;
+    // Builds from before this edit are of another program.
+    this.first = 0;
+    this.last = performance.now();
+    this.canvas.addEventListener("click", (event) => this.run("click", event.offsetX, event.offsetY));
+    requestAnimationFrame((now) => this.frame(now));
+  }
+
+  show(name, text) {
+    this.program = new Program(this.host);
+    this.stopped = null;
+    this.fresh = true;
+    this.text = text;
+    this.edited += 1;
+    this.first = this.edited;
+    if (this.ready) {
+      this.say(`${this.loaded}\nbuilding ${name}…`);
+    }
+    this.build();
+  }
+
+  options() {
+    const fresh = this.fresh;
+    this.fresh = false;
+    return { fresh };
+  }
+
+  describe({ wasm_bytes, core_bytes, fetch_ms, start_ms }) {
+    return `compiler ${mib(wasm_bytes)} MiB, core source ${mib(core_bytes)} MiB, fetched in ${ms(fetch_ms)}, started in ${ms(start_ms)}`;
+  }
+
+  apply({ id, report, module }) {
+    if (id < this.first) {
+      return null;
+    }
+    this.program.apply(module, report);
+    this.stopped = null;
+    return [`of ${report.bodies} in the program, analysis ${ms(report.listing_ms)}, `, ...skipped(report)];
+  }
+
+  run(name, ...args) {
+    if (shown !== this || this.stopped !== null || !(name in this.program.exports)) {
+      return;
+    }
+    try {
+      this.program.call(name, ...args);
+    } catch (error) {
+      this.stopped = `\`${name}\` stopped: ${error}`;
+      this.say(this.stopped, true);
+    }
+  }
+
+  frame(now) {
+    const scale = devicePixelRatio;
+    const { clientWidth: width, clientHeight: height } = this.canvas;
+    if (this.canvas.width !== width * scale || this.canvas.height !== height * scale) {
+      this.canvas.width = width * scale;
+      this.canvas.height = height * scale;
+    }
+    this.context.setTransform(scale, 0, 0, scale, 0, 0);
+    this.context.font = "14px ui-monospace, monospace";
+    this.run("frame", width, height, Math.min((now - this.last) / 1000, 0.05));
+    this.last = now;
+    requestAnimationFrame((now) => this.frame(now));
+  }
+}
+
+// What the program may fill of the module it is linked into: slots at the end of its table,
+// and memory its allocator has not been given.
+const SLOTS = 1 << 17;
+const BYTES = 64 << 20;
+
+// The Dioxus app. Dioxus and `std` are a module rustc built, `pkg/dioxus/base`, which runs
+// first. The compiler builds the app from the packed workspace, and each build is
+// instantiated in that module's memory and table.
+class Dioxus extends Builds {
+  constructor() {
+    super("worker.js?pack=pkg/dioxus.pack", 200);
+    this.launched = false;
+    this.base = this.load();
+  }
+
+  async load() {
+    // The module keeps every import wasm-bindgen can ask for, among them the promise
+    // integration some browsers lack. Nothing here calls through it, so the plain function
+    // stands in.
+    WebAssembly.Suspending ??= function (inner) {
+      return inner;
+    };
+    // The app's Dioxus is inside the playground's, and both find what an event is for by
+    // the number of its element: an event of the app is not one for the playground to see.
+    const main = document.getElementById("main");
+    for (const name in window) {
+      if (name.startsWith("on")) {
+        main.addEventListener(name.slice(2), (event) => event.stopPropagation());
+      }
+    }
+    const { default: init } = await import("./pkg/dioxus/base.js");
+    const base = await init();
+    this.program = new Program({}, base);
+    this.start = {
+      table: this.program.table.grow(SLOTS),
+      memory: this.program.memory.grow(BYTES >> 16) << 16,
+    };
+    return base;
+  }
+
+  show(name, text) {
+    if (text !== this.text) {
+      this.say(this.ready ? `${this.loaded}\nbuilding ${name}…` : "loading Dioxus and the compiler…");
+      this.edit(text);
+    } else {
+      this.resay();
+    }
+  }
+
+  async build() {
+    // The first build says where in the module the program goes.
+    await this.base;
+    super.build();
+  }
+
+  options() {
+    const start = this.placed ? undefined : this.start;
+    this.placed = true;
+    return { start };
+  }
+
+  describe({ wasm_bytes, core_bytes, fetch_ms, start_ms, analysis }) {
+    return `compiler ${mib(wasm_bytes)} MiB, workspace ${mib(core_bytes)} MiB, fetched in ${ms(fetch_ms)}, loaded in ${ms(start_ms)} (${analysis})`;
+  }
+
+  // Not awaited: `build` was, before the build this is of.
+  apply({ report, module }) {
+    const { start, program } = this;
+    if (report.table_len > start.table + SLOTS || report.memory_len > start.memory + BYTES) {
+      throw new Error("the program outgrew what the page set aside for it");
+    }
+    program.apply(module, report);
+    if (!this.launched) {
+      const app = Object.entries(report.exports).find(([name]) => name.endsWith("::App"));
+      if (!app) {
+        throw new Error("the program has no `App`");
+      }
+      program.base.rustd_launch(app[1]);
+      this.launched = true;
+    } else {
+      program.base.rustd_rerender();
+    }
+    return [
+      `${Object.keys(report.host ?? {}).length} functions of the rustc-built module called, `,
+      ...skipped(report),
+      ...(report.mismatched ?? []).map((it) => `signature differs from rustc's: ${it}`),
+    ];
+  }
+}
+
+const runners = {};
+window.rustd = {
+  // Each compiler is loaded when a program of its kind is first shown, and kept.
+  show(name, text) {
+    const kind = name === "dioxus" ? Dioxus : Canvas;
+    shown = runners[kind.name] ??= new kind();
+    shown.show(name, text);
+  },
+  edit: (text) => shown?.edit(text),
+};
+
+// Tab is four spaces in the editor.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Tab" && event.target instanceof HTMLTextAreaElement) {
+    event.preventDefault();
+    const area = event.target;
+    area.setRangeText("    ", area.selectionStart, area.selectionEnd, "end");
+    area.dispatchEvent(new InputEvent("input", { bubbles: true }));
+  }
+});

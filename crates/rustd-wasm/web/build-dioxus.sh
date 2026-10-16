@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds what the Dioxus page loads into `pkg/`, after `build.sh`: Dioxus and `std` as a module
+# Builds what the Dioxus demo loads from `pkg/`, after `build.sh`: Dioxus and `std` as a module
 # rustc builds, and the workspace of the program for rustd to compile in the page.
 # Needs the toolchain of `dioxus/rust-toolchain.toml`, and `wasm-bindgen` of the version
 # `dioxus/Cargo.lock` has (`cargo install wasm-bindgen-cli --version 0.2.122`).

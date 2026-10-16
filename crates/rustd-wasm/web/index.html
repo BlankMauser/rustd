@@ -1,15 +1,8 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>rustd in the browser</title>
+<title>rustd playground</title>
 <link rel="stylesheet" href="style.css" />
-<header>
-  <h1><b>rustd</b> in the browser</h1>
-  <p>A Rust compiler running as WebAssembly, emitting WebAssembly: edit the code and the changed functions are swapped into the running program.</p>
-  <label>demo <select id="demo"></select></label>
-  <button id="theme" type="button"></button>
-</header>
-<section class="pane"><h2>src/main.rs <span>compiled in this page on every edit</span></h2><div id="source"></div></section>
-<section class="pane"><h2>canvas</h2><canvas id="canvas"></canvas></section>
-<footer><span id="state" class="building">loading</span><div id="status">loading the compiler…</div></footer>
-<script type="module" src="page.js"></script>
+<!-- The page is a Dioxus app, `playground/`. `playground.js` starts it, and runs what it shows. -->
+<div id="playground"></div>
+<script type="module" src="playground.js"></script>

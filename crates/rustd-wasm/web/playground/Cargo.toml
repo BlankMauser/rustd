@@ -1,6 +1,6 @@
-# The source pane of the pages: `dioxus-code-editor`, which rustc builds (`build-editor.sh`).
+# The page: a Dioxus app rustc builds (`build-playground.sh`).
 [package]
-name = "editor"
+name = "playground"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -14,6 +14,7 @@ dioxus-code-editor = "0.1"
 futures-channel = "0.3"
 futures-util = "0.3"
 wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Location", "MediaQueryList", "Storage", "Window"] }
 
 [profile.release]
 opt-level = "s"

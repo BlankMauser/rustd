@@ -1,5 +1,5 @@
 # Built by `build.sh`.
 /pkg/
-# Built by `build-editor.sh`.
+# Built by `build-playground.sh`.
 /assets/
-/editor/target/
+/playground/target/
