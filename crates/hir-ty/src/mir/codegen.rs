@@ -1389,10 +1389,8 @@ fn location_of(
     let own_tokens = file_id.macro_file().is_some()
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     let FileRange { file_id, range } = match written_call(db, file_id) {
-        Some(call) if own_tokens => {
-            InFile::new(call.file_id, written_range(&call.value))
-                .original_node_file_range_rooted(db)
-        }
+        Some(call) if own_tokens => InFile::new(call.file_id, written_range(&call.value))
+            .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
     let file_id = file_id.file_id(db);
@@ -3786,8 +3784,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (.., held) = frame.as_ref()?;
             held.locals.binary_search(&local).ok()
         };
+        let forwarded = forwarded_temps(body);
         for (local, data) in body.locals.iter() {
-            if self.locals.contains_idx(local) {
+            if self.locals.contains_idx(local) || forwarded.contains_key(&local) {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
@@ -3820,6 +3819,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
+        }
+        for (temp, to) in forwarded {
+            self.locals.insert(temp, self.locals[to]);
         }
         let mut frame_flags = Vec::new();
         for (local, data) in body.locals.iter() {
@@ -5183,6 +5185,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn copy(&mut self, dst: Value, src: Value, size: Size) {
+        // A temporary and the binding it initializes are one slot.
+        if dst == src {
+            return;
+        }
         // A load and a store per word of a future holding the whole program's state is
         // more IR than fits in memory.
         if size.bytes() > 128 {
@@ -8894,6 +8900,79 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The temporaries a `let` is initialized through, each with the binding it is copied to right
+/// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
+/// The two can be one slot, the binding holding nothing yet when the temporary is written, and
+/// a frame is not twice the size of what it declares.
+fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
+    let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
+    let mut forwarded = FxHashMap::default();
+    if body.coroutine.is_some() {
+        return forwarded;
+    }
+    for (_, block) in body.basic_blocks.iter() {
+        // The temporary written last, by a statement of this block or by the call that led
+        // here, and whether the binding's storage has started since.
+        let mut written = None;
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::StorageLive(local) => {
+                    if let Some((_, live)) = &mut written {
+                        *live = Some(*local);
+                    }
+                }
+                StatementKind::FakeRead(_) | StatementKind::Nop => (),
+                StatementKind::Assign(
+                    to,
+                    Rvalue::Use(Operand {
+                        kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                        ..
+                    }),
+                ) if let Some((temp, live)) = written
+                    && whole(from) == Some(temp)
+                    && whole(to).is_some()
+                    && whole(to) == live =>
+                {
+                    forwarded.insert(temp, to.local);
+                    written = None;
+                }
+                StatementKind::Assign(to, _) => written = whole(to).map(|it| (it, None)),
+                _ => written = None,
+            }
+        }
+        // FIXME: a temporary a call returns into is copied in the block the call leads to.
+    }
+    if forwarded.is_empty() {
+        return forwarded;
+    }
+    // Written once and read once, and by nothing else: the binding is not what it is made of.
+    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    body.clone().walk_places(|place| *mentions.entry(place.local).or_default() += 1);
+    let fake_reads = |local: LocalId| {
+        body.basic_blocks
+            .iter()
+            .flat_map(|(_, block)| &block.statements)
+            .filter(|it| matches!(&it.kind, StatementKind::FakeRead(place) if place.local == local))
+            .count()
+    };
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    forwarded.retain(|&temp, to| {
+        !bound.contains(&temp)
+            && mentions[&temp] - fake_reads(temp) == 2
+            && body.locals[temp].ty == body.locals[*to].ty
+            && !body.promoted_locals.iter().any(|it| it.0 == *to)
+            && *to != returned_local(body)
+    });
+    forwarded
 }
 
 fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {

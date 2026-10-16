@@ -14,7 +14,7 @@ from difftest import Fixture
 
 CRATES = ["devdep"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = {"big_frame", "future_size"}
+OPEN = {"future_size"}
 
 
 def main():
