@@ -5,6 +5,7 @@ mod content;
 mod deps;
 mod outline;
 mod remote;
+mod stub;
 mod symbols;
 mod tree;
 
@@ -201,6 +202,27 @@ impl Resolver<'_> {
             }
             None => Some(format!("<{self_ty}>::{}", name.as_str())),
         }
+    }
+
+    /// rustc's `StableCrateId` of a crate it built something of.
+    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let krate = Crate::from(krate);
+        let name = krate.display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+    }
+
+    /// What stands for a crate of the checkout that rustc built nothing of, the same after
+    /// every edit: its name and where in the checkout its source starts.
+    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+            return None;
+        }
+        let name = Crate::from(krate).display_name(self.db)?;
+        let root = self.crate_root(krate.into())?;
+        let root = root.strip_prefix(&self.root).unwrap_or(&root);
+        let named = format!("rustd crate {} {}", name.crate_name(), root.display());
+        let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
+        Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
     }
 
     /// The file the crate's source starts at.
@@ -415,7 +437,14 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
         }
-        self.table.get(&self.path(func)?).map(str::to_owned)
+        let path = self.path(func)?;
+        if let Some(symbol) = self.table.get(&path) {
+            return Some(symbol.to_owned());
+        }
+        // rustc has built nothing of the crate: the function is ours to name.
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        let id = self.own_crate_id(krate)?;
+        Some(format!("rustd.{id:x}.{path}"))
     }
 
     fn defines(&self, symbol: &str) -> bool {
@@ -423,9 +452,7 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        let krate = Crate::from(krate);
-        let name = krate.display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+        self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
     }
 
     fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
@@ -1156,7 +1183,13 @@ fn build(
         .partition(|&(func, exported)| exported || main.is_none() || main == Some(func));
     let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
     let (entries, on_demand) = (unzip(entries), unzip(on_demand));
-    let roots = Roots { entries: &entries, on_demand: &on_demand };
+    // The program's `main` is called by one rustc wrote, when rustc built the crate.
+    let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
+    let roots = Roots {
+        entries: &entries,
+        on_demand: &on_demand,
+        start: main.filter(|it| own(it).is_some()),
+    };
     let setup = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
         eprintln!("entries: {:.1?}", setup - list);
@@ -1237,7 +1270,7 @@ fn build(
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
-                let roots = Roots { entries: &[func], on_demand: &[] };
+                let roots = Roots { entries: &[func], on_demand: &[], start: None };
                 CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
@@ -1906,6 +1939,9 @@ fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    if std::env::var_os("RUSTD_WRAPS_RUSTC").is_some() {
+        return stub::command(std::env::args_os().skip(1));
     }
     if std::env::args().nth(1).as_deref() == Some("deps") {
         return deps::command(std::env::args().skip(2));

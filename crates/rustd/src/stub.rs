@@ -1,0 +1,105 @@
+//! rustd as cargo's `RUSTC_WORKSPACE_WRAPPER`: rustc builds the crates of the registry, and of
+//! the workspace only what runs during the build. A library or program of the workspace is
+//! built from a few lines that name the crates it depends on, so that rustc links the
+//! program against them as it would have, and the code is rustd's to compile.
+//!
+//! What runs during the build is told from the rest by `--target`, which cargo passes for
+//! the program's crates alone when it is given one itself.
+
+use std::{ffi::OsString, os::unix::process::CommandExt as _, path::Path, process::Command};
+
+use anyhow::Context as _;
+
+/// The flags of rustc that cargo passes with their value as the next argument.
+const VALUED: &[&str] = &[
+    "-C",
+    "-L",
+    "-Z",
+    "-l",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+    "--cfg",
+    "--check-cfg",
+    "--extern",
+    "--out-dir",
+    "--target",
+    "--crate-name",
+    "--crate-type",
+    "--cap-lints",
+    "--emit",
+    "--edition",
+    "--error-format",
+    "--json",
+    "--color",
+    "--diagnostic-width",
+    "--remap-path-prefix",
+];
+
+/// Runs rustc as cargo asked, or on what stands in for a crate of the workspace.
+pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+    let rustc = args.next().context("cargo names rustc first")?;
+    let mut args: Vec<OsString> = args.collect();
+    if let Some((source, text)) = stand_in(&args) {
+        let out_dir = valued(&args, "--out-dir").context("cargo names where the output goes")?;
+        let name = valued(&args, "--crate-name").unwrap_or_default();
+        let extra = args
+            .iter()
+            .filter_map(|it| it.to_str()?.strip_prefix("extra-filename="))
+            .next()
+            .unwrap_or_default();
+        let path = Path::new(out_dir).join(format!("{name}{extra}.rustd.rs"));
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        args[source] = path.into();
+    }
+    Err(Command::new(rustc).args(args).exec().into())
+}
+
+fn valued<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
+    let at = args.iter().position(|it| it == flag)?;
+    args.get(at + 1)?.to_str()
+}
+
+/// Where the source of the crate is among the arguments and what to build in its place, for
+/// a library or a program of the workspace that is built for the target.
+fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
+    let args: Vec<&str> = args.iter().map(|it| it.to_str()).collect::<Option<_>>()?;
+    valued_in(&args, "--target")?;
+    let kinds: Vec<&str> =
+        args.windows(2).filter(|it| it[0] == "--crate-type").map(|it| it[1]).collect();
+    let program = match *kinds {
+        ["bin"] => true,
+        ["lib" | "rlib"] => false,
+        _ => return None,
+    };
+    if args.contains(&"--test") || valued_in(&args, "--crate-name")?.starts_with("build_script_") {
+        return None;
+    }
+    let source = (0..args.len())
+        .find(|&at| args[at].ends_with(".rs") && !(at > 0 && VALUED.contains(&args[at - 1])))?;
+    let mut text = String::from("#![allow(warnings)]\n");
+    if program {
+        text.push_str("#![no_main]\n");
+    }
+    for pair in args.windows(2).filter(|it| it[0] == "--extern") {
+        let Some((name, path)) = pair[1].split_once('=') else { continue };
+        let name = name.rsplit_once(':').map_or(name, |it| it.1);
+        // A proc macro is not linked into the program.
+        if path.ends_with(".rlib") || path.ends_with(".rmeta") {
+            text.push_str(&format!("extern crate {name};\n"));
+        }
+    }
+    if program {
+        // Not what runs: rustd's `main` is linked ahead of it.
+        text.push_str(
+            "#[unsafe(no_mangle)]\npub extern \"C\" fn main(_: i32, _: *const *const u8) -> i32 {\n    0\n}\n",
+        );
+    }
+    Some((source, text))
+}
+
+fn valued_in<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+    let at = args.iter().position(|&it| it == flag)?;
+    args.get(at + 1).copied()
+}

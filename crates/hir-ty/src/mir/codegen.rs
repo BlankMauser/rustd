@@ -257,6 +257,9 @@ pub struct Roots<'a> {
     /// Compiled once code in the object refers to them. A function not reached keeps rustc's
     /// copy, which nothing in the program calls.
     pub on_demand: &'a [FunctionId],
+    /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
+    /// then ours to write as well.
+    pub start: Option<FunctionId>,
 }
 
 impl CodegenUnit {
@@ -362,6 +365,9 @@ impl CodegenUnit {
             let mut queue = roots.entries.to_vec();
             let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
             let mut next = 0;
+            if let Some(main) = roots.start {
+                cg.define_start(main)?;
+            }
             loop {
                 // Every core compiles the roots found so far, before they are put in the
                 // object one by one.
@@ -980,6 +986,14 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
         fx.args = Some(args);
         fx.codegen()
     })
+}
+
+/// The `main` the C runtime calls, for a program whose `main` is `main`.
+#[salsa::tracked(returns(ref))]
+fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
+    let krate = main.krate(db);
+    let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
+    compile(db, env, None, false, |fx| fx.start_shim(main))
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
@@ -1685,6 +1699,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
         Ok(symbol)
+    }
+
+    /// Puts the `main` the C runtime calls in the object.
+    fn define_start(&mut self, main: FunctionId) -> Result<()> {
+        let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
+        let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
+        self.stitch(id, compiled)?;
+        Ok(())
     }
 
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
@@ -6703,6 +6725,61 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.pass(ret, dst, &dst_layout, &mut results);
         }
         self.builder.ins().return_(&results);
+        Ok(())
+    }
+
+    /// The body of the `main` the C runtime calls: `lang_start` with the program's `main`,
+    /// as rustc writes it.
+    fn start_shim(&mut self, main: FunctionId) -> Result<()> {
+        let Some(start) = self.interner.lang_items().Start else {
+            unsupported!("no `lang_start`");
+        };
+        let fn_ty = |func: FunctionId, args| {
+            Ty::new_fn_def(self.interner, CallableDefId::FunctionId(func).into(), args)
+        };
+        let sig_of = |ty: Ty<'db>| {
+            self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner))
+        };
+        let main_ty = fn_ty(main, GenericArgs::new_from_slice(&[]));
+        let returned = self.normalize(sig_of(main_ty).output());
+        let start_args = GenericArgs::new_from_slice(&[returned.into()]);
+        let start_sig = sig_of(fn_ty(start, start_args));
+        let mut sig = Signature::new(self.cg.isa.default_call_conv());
+        sig.params = vec![AbiParam::new(types::I32), AbiParam::new(PTR)];
+        sig.returns = vec![AbiParam::new(types::I32)];
+        self.builder.func.signature = sig;
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let &[argc, argv] = self.builder.block_params(entry) else {
+            unsupported!("`main` is called with a count and the arguments");
+        };
+        let argc = self.builder.ins().sextend(types::I64, argc);
+        let callee = self.fn_item(main_ty)?;
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let pointer = self.builder.ins().func_addr(PTR, callee);
+        // What `SIGPIPE` does is left as the runtime has it.
+        let sigpipe = self.builder.ins().iconst(types::I8, 0);
+        let &[main_param, argc_ty, argv_ty, sigpipe_ty] = start_sig.inputs().as_slice() else {
+            unsupported!("a `lang_start` that takes other than four arguments");
+        };
+        let mut values = Vec::new();
+        for (value, ty) in
+            [(pointer, main_param), (argc, argc_ty), (argv, argv_ty), (sigpipe, sigpipe_ty)]
+        {
+            let ty = self.normalize(ty);
+            let layout = self.layout(ty)?;
+            let slot = self.stack_slot(&layout);
+            self.builder.ins().store(MEM, value, slot, 0);
+            values.push((slot, ty));
+        }
+        let code_ty = start_sig.output();
+        let layout = self.layout(code_ty)?;
+        let code = self.stack_slot(&layout);
+        self.call_direct(start, start_args, &values, code, code_ty)?;
+        let code = self.builder.ins().load(types::I64, MEM, code, 0);
+        let code = self.builder.ins().ireduce(types::I32, code);
+        self.builder.ins().return_(&[code]);
         Ok(())
     }
 
