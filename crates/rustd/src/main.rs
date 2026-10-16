@@ -2,6 +2,7 @@
 //! functions to native code that links against rustc-built artifacts.
 
 mod content;
+mod deps;
 mod outline;
 mod remote;
 mod symbols;
@@ -1905,6 +1906,9 @@ fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("deps") {
+        return deps::command(std::env::args().skip(2));
     }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))

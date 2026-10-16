@@ -61,7 +61,7 @@ impl Remote {
     }
 
     /// The bytes under `name`, or `None` when there is nothing under it.
-    fn fetch(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    pub(crate) fn fetch(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
             Remote::Dir(dir) => match std::fs::read(dir.join(name)) {
                 Ok(bytes) => Ok(Some(bytes)),
@@ -84,7 +84,7 @@ impl Remote {
         }
     }
 
-    fn has(&self, name: &str) -> anyhow::Result<bool> {
+    pub(crate) fn has(&self, name: &str) -> anyhow::Result<bool> {
         match self {
             Remote::Dir(dir) => Ok(dir.join(name).exists()),
             Remote::S3 { bucket, credentials, prefix } => {
@@ -100,7 +100,7 @@ impl Remote {
     }
 
     /// Puts `bytes` under `name`, all of them or none.
-    fn send(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    pub(crate) fn send(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         match self {
             Remote::Dir(dir) => {
                 let to = dir.join(name);
@@ -167,7 +167,7 @@ fn local_packs(store: &Path) -> anyhow::Result<BTreeSet<String>> {
 }
 
 /// Runs `work` on each name, a few at a time, and returns how many bytes went by.
-fn transfer(
+pub(crate) fn transfer(
     names: &[&String],
     work: impl Fn(&str) -> anyhow::Result<u64> + Sync,
 ) -> anyhow::Result<u64> {

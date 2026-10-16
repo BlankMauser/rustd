@@ -29,6 +29,8 @@ paths.workspace = true
 syntax.workspace = true
 rusty-s3 = "0.10.2"
 ureq = "3.4.2"
+tar = "0.4.44"
+zstd = "0.13.3"
 
 [lints]
 workspace = true
