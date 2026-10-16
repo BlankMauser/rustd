@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
-    ModuleIdLt,
+    ModuleDefId, ModuleIdLt,
     expr_store::Body,
     hir::{Expr, ExprId},
     signatures::{
@@ -35,9 +35,25 @@ fn write_module<'db>(
     out: &mut String,
     module: ModuleIdLt<'db>,
 ) -> Option<()> {
-    // rustc names an item in a body after the function, which a block module does not say.
+    // rustc names an item in a body after the function the body is of.
     if module.is_block_module(db) {
-        return None;
+        let block = module.block(db)?;
+        let around = block.module(db);
+        let owner = around.def_map(db).module(db, around).scope(db).declarations().find_map(
+            |def| match def {
+                ModuleDefId::FunctionId(it) => {
+                    Body::of(db, it.into()).blocks(db).any(|(id, _)| id == block).then_some(it)
+                }
+                _ => None,
+            },
+        );
+        // FIXME: a method's body is named after the `impl`, which is not looked through here.
+        write_module(db, out, around)?;
+        return match owner {
+            Some(owner) => write!(out, "::{}", FunctionSignature::of(db, owner).name.as_str()).ok(),
+            // A block in a block is of the same body, and no part of the name.
+            None => around.is_block_module(db).then_some(()),
+        };
     }
     match module.containing_module(db) {
         Some(parent) => {

@@ -5456,3 +5456,22 @@ pub mod moved_out_field {
         (taken, failed, log.into_inner())
     }
 }
+
+/// `type_name` of a function written in another's body, which is how a test names a component.
+pub mod local_type_names {
+    fn name_of<T>(_: T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        fn inner() {}
+        struct Local;
+        let nested = {
+            fn deeper() -> &'static str {
+                fn deepest() {}
+                name_of(deepest)
+            }
+            (name_of(deeper), deeper())
+        };
+        (name_of(inner), std::any::type_name::<Local>(), nested, name_of(run))
+    }
+}

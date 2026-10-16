@@ -318,6 +318,7 @@ fn main() {
         );
     }
     println!("moved_out_field {:?}", cases::moved_out_field::run());
+    println!("local_type_names {:?}", cases::local_type_names::run());
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 
