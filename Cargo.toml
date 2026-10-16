@@ -1,8 +1,6 @@
 [workspace]
 members = ["xtask/", "lib/*", "lib/ungrammar/ungrammar2json", "crates/*"]
-# `rustd-wasm` turns on a feature of `hir-ty` that swaps the code generator's output, which
-# must not be unified into a build of the native crates.
-exclude = ["crates/proc-macro-srv/proc-macro-test/imp", "crates/rustd-wasm"]
+exclude = ["crates/proc-macro-srv/proc-macro-test/imp"]
 resolver = "2"
 
 [workspace.package]

@@ -24,10 +24,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
 
 
+# The triple to build for, when it is not the host's: `wasm32-wasip1` runs under wasmtime.
+TARGET = os.environ.get("RUSTD_TARGET")
+WASM = bool(TARGET) and TARGET.startswith("wasm32")
+# What runs a wasm program, which gets the program and its arguments after it.
+WASM_RUNNER = shlex.split(os.environ.get("RUSTD_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608"))
+
+
+def host():
+    return subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
+
+
 def sysroot_rlibs():
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-    host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
-    lib = f"{sysroot}/lib/rustlib/{host}/lib"
+    lib = f"{sysroot}/lib/rustlib/{TARGET or host()}/lib"
     return [p for n in ("core", "alloc", "std") for p in glob.glob(f"{lib}/lib{n}-*.rlib")]
 
 
@@ -61,16 +71,24 @@ class Fixture:
         if self.alone:
             env.update(RUSTC_WORKSPACE_WRAPPER=RUSTD, RUSTD_WRAPS_RUSTC="1",
                        CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
-            host = subprocess.check_output(["rustc", "-vV"], text=True, cwd=self.ws).split("host: ")[1].split()[0]
-            target = ["--target", host]
+            target = ["--target", host()]
+        if TARGET:
+            target = ["--target", TARGET]
         out = subprocess.run(
             ["cargo", "rustc", *self.target_args, *target, "--", "--print", "link-args", "-C", "save-temps"],
             cwd=self.ws, capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
-        line = next(l for l in (out.stdout + out.stderr).splitlines() if '"cc"' in l)
+        # The linker is `cc` for an ELF target and `rust-lld` itself for wasm, which rustc
+        # finds in the directories it puts first in `PATH`.
+        linker = "rust-lld" if WASM else "cc"
+        line = next(l for l in (out.stdout + out.stderr).splitlines() if f'"{linker}"' in l)
         args = shlex.split(line)
-        self.link_args = [a for a in args[args.index("cc"):] if not a.endswith("symbols.o")]
+        self.link_args = [a for a in args[args.index(linker):] if not a.endswith("symbols.o")]
+        if WASM:
+            path = next(a for a in args if a.startswith("PATH=")).removeprefix("PATH=")
+            self.link_args[0] = next(
+                p for d in path.split(":") if os.path.exists(p := os.path.join(d, linker)))
         self.reference = self.link_args[self.link_args.index("-o") + 1]
         # The target's own objects too: a crate rustd rebuilds may be the one being linked.
         self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
@@ -87,7 +105,7 @@ class Fixture:
                 run = subprocess.run(
                     [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj, "--report", report,
                      "--deny", deny_file, "--isolate", os.path.join(self.work, f"{label(crate)}.isolated"),
-                     *self.rustd_args, *symbols],
+                     *(["--target", TARGET] if TARGET else []), *self.rustd_args, *symbols],
                     capture_output=True, text=True, timeout=self.rustd_timeout,
                     env={**os.environ, "RUSTD_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:
@@ -108,7 +126,7 @@ class Fixture:
             # Nothing of the workspace is rustc's for rustd's to be defined a second time.
             args[first:first] = objects
         else:
-            args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
+            args[first:first] = objects + ["--allow-multiple-definition" if WASM else "-Wl,--allow-multiple-definition"]
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
         run = subprocess.run(args, capture_output=True, text=True)
@@ -123,7 +141,7 @@ class Fixture:
         allowed = 900 if binary == self.reference else max(120, 30 * getattr(self, "reference_secs", 0))
         start = time.monotonic()
         try:
-            run = subprocess.run([binary, *self.run_args], capture_output=True, timeout=allowed)
+            run = subprocess.run([*(WASM_RUNNER if WASM else []), binary, *self.run_args], capture_output=True, timeout=allowed)
             if binary == self.reference:
                 self.reference_secs = time.monotonic() - start
             # The thread id in a panic message differs from run to run.

@@ -198,6 +198,10 @@ struct Cies {
 impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
+        // Nothing unwinds on wasm: a panic aborts there.
+        if super::Target::current().is_wasm() {
+            return Ok(UnwindContext { frame_table, cies: None });
+        }
         let Some(mut cie) = module.isa().create_systemv_cie() else {
             return Ok(UnwindContext { frame_table, cies: None });
         };

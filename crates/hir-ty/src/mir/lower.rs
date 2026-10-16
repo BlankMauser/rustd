@@ -1683,7 +1683,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
         let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
         let null = Operand::from_bytes(
-            Box::new(0usize.to_le_bytes()),
+            word_bytes(0),
             self.result.locals[base].ty.as_ref(),
         );
         self.push_assignment(current, base.into(), null.into(), span);
@@ -1800,31 +1800,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 )
                 .map(|it| it.size.bytes_usize())
         };
-        const USIZE_SIZE: usize = size_of::<usize>();
+        // A reference to `len` bytes, whose address the memory map gives: two words of the
+        // target.
+        let fat = |len: usize| -> Box<[u8]> { [word_bytes(0), word_bytes(len)].concat().into() };
         let bytes: Box<[_]> = match l {
             hir_def::hir::Literal::String(b) => {
                 let b = b.as_str();
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&b.len().to_le_bytes());
+                let data = fat(b.len());
                 let mm = MemoryMap::simple(b.as_bytes().into());
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::CString(b) => {
                 let bytes = b.iter().copied().chain(iter::once(0)).collect::<Box<_>>();
 
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&bytes.len().to_le_bytes());
+                let data = fat(bytes.len());
                 let mm = MemoryMap::simple(bytes);
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::ByteString(b) => {
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&b.len().to_le_bytes());
+                // A reference to an array is the address alone.
+                let mut data = fat(b.len()).into_vec();
+                data.truncate(size()?);
+                let data = data.into_boxed_slice();
                 let mm = MemoryMap::simple(b.clone());
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::Char(c) => Box::new(u32::from(*c).to_le_bytes()),
             hir_def::hir::Literal::Bool(b) => Box::new([*b as u8]),
@@ -3384,4 +3383,10 @@ pub fn lower_to_mir_with_store<'db>(
         ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
     }
     Ok(ctx.result)
+}
+
+/// `value` as a `usize` of the target.
+fn word_bytes(value: usize) -> Box<[u8]> {
+    let word = crate::mir::codegen::Target::current().word();
+    value.to_le_bytes()[..word].into()
 }

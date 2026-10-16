@@ -134,11 +134,15 @@ fn main() {
     case!(simd::ascii_bytes(long.as_bytes()), simd::ascii_bytes(&[b'a', 200, b'c']));
     let hay = *b"hello, simd lane";
     let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
-    case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
-
-    if is_x86_feature_detected!("ssse3") {
-        case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
+    #[cfg(target_arch = "x86_64")]
+    {
+        case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
+        if is_x86_feature_detected!("ssse3") {
+            case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
+        }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (hay, other);
     case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
     case!(statics::lowest(4), statics::lowest(-9), statics::lowest(-2), statics::local(2), statics::local(77));
     case!(statics::plain(0, 5), statics::plain(2, 7), statics::plain(0, 1));

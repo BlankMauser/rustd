@@ -100,6 +100,8 @@ struct Args {
     /// Other checkouts of projects to load into the same database, for requests that name
     /// one as their `--project`. What they have in common with `project` is there once.
     also: Vec<PathBuf>,
+    /// The triple to compile for, as cargo's `--target`. The host's when there is none.
+    target: Option<String>,
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
@@ -156,6 +158,7 @@ impl Args {
         let mut dev_deps = false;
         let mut features = Vec::new();
         let mut also = Vec::new();
+        let mut target = None;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -174,6 +177,7 @@ impl Args {
                 "--cfg-test" => cfg_test = true,
                 "--dev-deps" => dev_deps = true,
                 "--also" => also.push(PathBuf::from(value()?)),
+                "--target" => target = Some(value()?),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
@@ -197,6 +201,7 @@ impl Args {
             dev_deps,
             features,
             also,
+            target,
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
@@ -2098,6 +2103,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             dev_deps: args.dev_deps,
             features: args.features.clone(),
             also: Vec::new(),
+            target: args.target.clone(),
             checkout: args.checkout.clone(),
             base: args.base.clone(),
             members: args.members.clone(),
@@ -2517,6 +2523,12 @@ fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     let mut args = Args::parse()?;
+    if let Some(triple) = &args.target {
+        let target = hir_ty::mir::codegen::Target::from_triple(triple)
+            .with_context(|| format!("no code producer for {triple}"))?;
+        hir_ty::mir::codegen::Target::select(target)
+            .map_err(|other| anyhow::anyhow!("already compiling for {other:?}"))?;
+    }
     let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
     if backend != Backend::Cranelift {
         eprintln!("backend: {backend}");
@@ -2557,6 +2569,7 @@ fn main() -> anyhow::Result<()> {
     };
     let cargo_config = CargoConfig {
         sysroot: Some(sysroot),
+        target: args.target.clone(),
         set_test: args.cfg_test,
         features: CargoFeatures::Selected {
             features: args.features.clone(),
