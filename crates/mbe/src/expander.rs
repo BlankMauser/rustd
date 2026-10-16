@@ -5,13 +5,12 @@
 mod matcher;
 mod transcriber;
 
-use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::Span;
 
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MacroCallStyle, MatchedArmIndex,
-    parser::MetaVarKind,
+    parser::{MetaVar, MetaVarKind},
 };
 
 pub(crate) fn expand_rules(
@@ -112,7 +111,7 @@ pub(crate) fn expand_rules(
 /// many is not a plain `usize`, but a `&[usize]`.
 #[derive(Debug, Default, Clone)]
 struct Bindings<'a> {
-    inner: FxHashMap<Symbol, Binding<'a>>,
+    inner: FxHashMap<MetaVar, Binding<'a>>,
 }
 
 #[derive(Debug, Clone)]

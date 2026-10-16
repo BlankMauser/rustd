@@ -31,4 +31,5 @@ cases![
     f16c,
     unsized_tail_cmp,
     safe_macro,
+    macro_same_name_vars,
 ];

@@ -10,23 +10,23 @@ use super::TokensOrigin;
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
-    parser::{ConcatMetaVarExprElem, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'t> Bindings<'t> {
-    fn get(&self, name: &Symbol, span: Span) -> Result<&Binding<'t>, ExpandError> {
+    fn get(&self, name: &MetaVar, span: Span) -> Result<&Binding<'t>, ExpandError> {
         match self.inner.get(name) {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
-                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.as_str()))),
+                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.sym().as_str()))),
             )),
         }
     }
 
     fn get_fragment(
         &self,
-        name: &Symbol,
+        name: &MetaVar,
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
@@ -306,7 +306,7 @@ fn expand_subtree(
                             // err at it.
                             // FIXME: Do what rustc does for repetitions.
                             let var_value = match ctx.bindings.get_fragment(
-                                &var.sym,
+                                &MetaVar::new(var.sym.clone(), var.span),
                                 var.span,
                                 &mut ctx.nesting,
                                 marker,
@@ -384,14 +384,14 @@ fn expand_subtree(
 
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
-    v: &Symbol,
+    v: &MetaVar,
     id: Span,
     before_angle: bool,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     // We already handle $crate case in mbe parser
-    debug_assert!(*v != sym::crate_);
+    debug_assert!(*v.sym() != sym::crate_);
 
     match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
@@ -464,9 +464,12 @@ fn expand_var(
             //     }
             // ```
             // We just treat it a normal tokens
+            let mut span = id;
+            marker(&mut span);
+            let sym = v.sym().clone();
             builder.extend([
-                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span: id }),
-                tt::Leaf::from(tt::Ident { sym: v.clone(), span: id, is_raw: tt::IdentIsRaw::No }),
+                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span }),
+                tt::Leaf::from(tt::Ident { sym, span, is_raw: tt::IdentIsRaw::No }),
             ]);
             ExpandResult::ok(())
         }

@@ -61,7 +61,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
-use intern::{Symbol, sym};
+use intern::sym;
 use smallvec::{SmallVec, smallvec};
 use tt::{
     DelimSpan,
@@ -72,15 +72,15 @@ use crate::{
     ExpandError, ExpandErrorKind, MetaTemplate, ValueResult,
     expander::{Binding, Bindings, ExpandResult, Fragment, TokensOrigin},
     expect_fragment,
-    parser::{ExprKind, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{ExprKind, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'a> Bindings<'a> {
-    fn push_optional(&mut self, name: Symbol) {
+    fn push_optional(&mut self, name: MetaVar) {
         self.inner.insert(name, Binding::Fragment(Fragment::Empty));
     }
 
-    fn push_empty(&mut self, name: Symbol) {
+    fn push_empty(&mut self, name: MetaVar) {
         self.inner.insert(name, Binding::Empty);
     }
 
@@ -133,10 +133,10 @@ pub(super) fn match_<'t>(
 
 #[derive(Debug, Clone)]
 enum BindingKind<'a> {
-    Empty(Symbol),
-    Optional(Symbol),
-    Fragment(Symbol, Fragment<'a>),
-    Missing(Symbol, MetaVarKind),
+    Empty(MetaVar),
+    Optional(MetaVar),
+    Fragment(MetaVar, Fragment<'a>),
+    Missing(MetaVar, MetaVarKind),
     Nested(usize, usize),
 }
 
@@ -184,20 +184,20 @@ impl<'a> BindingsBuilder<'a> {
         }
     }
 
-    fn push_empty(&mut self, idx: &mut BindingsIdx, var: &Symbol) {
+    fn push_empty(&mut self, idx: &mut BindingsIdx, var: &MetaVar) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Empty(var.clone()))));
     }
 
-    fn push_optional(&mut self, idx: &mut BindingsIdx, var: &Symbol) {
+    fn push_optional(&mut self, idx: &mut BindingsIdx, var: &MetaVar) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Optional(var.clone()))));
     }
 
-    fn push_fragment(&mut self, idx: &mut BindingsIdx, var: &Symbol, fragment: Fragment<'a>) {
+    fn push_fragment(&mut self, idx: &mut BindingsIdx, var: &MetaVar, fragment: Fragment<'a>) {
         self.nodes[idx.0]
             .push(LinkNode::Node(Rc::new(BindingKind::Fragment(var.clone(), fragment))));
     }
 
-    fn push_missing(&mut self, idx: &mut BindingsIdx, var: &Symbol, kind: MetaVarKind) {
+    fn push_missing(&mut self, idx: &mut BindingsIdx, var: &MetaVar, kind: MetaVarKind) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Missing(var.clone(), kind))));
     }
 
@@ -869,7 +869,7 @@ fn match_meta_var<'t>(
         .map(|tree| Fragment::Tokens { tree, origin })
 }
 
-fn collect_vars(collector_fun: &mut impl FnMut(Symbol), pattern: &MetaTemplate) {
+fn collect_vars(collector_fun: &mut impl FnMut(MetaVar), pattern: &MetaTemplate) {
     for op in pattern.iter() {
         match op {
             Op::Var { name, .. } => collector_fun(name.clone()),
