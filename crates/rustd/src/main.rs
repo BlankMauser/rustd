@@ -3,6 +3,7 @@
 
 mod content;
 mod deps;
+mod memory;
 mod outline;
 mod remote;
 mod stub;
@@ -11,8 +12,13 @@ mod tree;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at.
+#[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use ide_db::base_db::SourceDatabase as _;
 use std::{
@@ -1159,14 +1165,10 @@ fn workspace_at(
 fn report_sharing(db: &RootDatabase) {
     let crates = Crate::all(db);
     let local = crates.iter().filter(|it| it.origin(db).is_local()).count();
-    let resident = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
-        let line = status.lines().find_map(|it| it.strip_prefix("VmRSS:"))?;
-        line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()
-    });
     eprintln!(
         "sharing: {} crates, {local} of the checkouts' own, {} MB",
         crates.len(),
-        resident.map_or(0, |it| it / 1024)
+        memory::resident().unwrap_or(0)
     );
 }
 
@@ -1232,6 +1234,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
                     let start = Instant::now();
+                    let before = memory::live();
                     hir::attach_db(&db, || {
                         _ = hir::crate_def_map(&db, krate);
                         let names = start.elapsed();
@@ -1239,9 +1242,15 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                         if std::env::var_os("RUSTD_STATS").is_some() {
                             let name = krate.extra_data(&db).display_name.as_ref();
                             let name = name.map(|it| it.to_string()).unwrap_or_default();
+                            // What the heap grew by is this crate's when one thread resolves.
+                            let grew = memory::live().zip(before).map(|(now, before)| {
+                                let origin = &krate.data(&db).origin;
+                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+                            });
                             eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}",
-                                start.elapsed() - names
+                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+                                start.elapsed() - names,
+                                grew.unwrap_or_default()
                             );
                         }
                     });
@@ -2377,6 +2386,7 @@ fn main() -> anyhow::Result<()> {
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());
+    memory::checkpoint("load");
 
     if args.out.is_dir() {
         return build_batch(&db, args);
@@ -2400,6 +2410,7 @@ fn main() -> anyhow::Result<()> {
         resolved = resolve_crates(&db, &args)?;
     }
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    memory::checkpoint("resolve");
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
@@ -2432,6 +2443,7 @@ fn main() -> anyhow::Result<()> {
     }
     eprint!("cold: ");
     report(&cold);
+    memory::report(&mut db, "build")?;
     report_stats(&known.stats);
     link(&args)?;
     // What this build added goes to the other machines while the daemon waits for edits; a
@@ -2457,6 +2469,7 @@ fn main() -> anyhow::Result<()> {
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
     }
+    memory::report(&mut db, "warm-up")?;
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it

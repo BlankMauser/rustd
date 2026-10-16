@@ -3008,6 +3008,8 @@ dependencies = [
  "sha2 0.10.9",
  "syntax",
  "tar",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "triomphe",
  "ureq",
  "vfs",

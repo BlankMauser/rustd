@@ -3,7 +3,7 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-use std::fmt;
+use std::{borrow::Cow, fmt, sync::LazyLock};
 
 use base_db::Crate;
 use cranelift_codegen::{
@@ -73,7 +73,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
     PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
-    eval::interpret_mir, monomorphized_promoted_mir_body_query, return_slot,
+    eval::interpret_mir, monomorphization::monomorphized, monomorphized_promoted_mir_body_query,
+    return_slot,
 };
 
 mod asm;
@@ -1070,21 +1071,11 @@ fn compiled_instance<'db>(
         InstanceDef::ReifyShim { receiver } => {
             return compile(db, env, None, false, |fx| fx.reify_shim(ty(), receiver));
         }
-        InstanceDef::Fn(func) => {
-            db.monomorphized_mir_body(func.into(), instance.args.clone(), stored_env)
+        InstanceDef::Fn(_) | InstanceDef::Closure(_) | InstanceDef::Coroutine(_) => {
+            instance_body(db, &instance, stored_env)?
         }
-        InstanceDef::Closure(id) => db.monomorphized_mir_body_for_closure(
-            InternedClosureId::from_id(id),
-            instance.args.clone(),
-            stored_env,
-        ),
-        InstanceDef::Coroutine(id) => db.monomorphized_mir_body_for_coroutine(
-            InternedCoroutineId::from_id(id),
-            instance.args.clone(),
-            stored_env,
-        ),
     };
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = &*body;
     let dump = std::env::var("RUSTD_DUMP_MIR").ok();
     let (tracked, abi) = match instance.def {
         InstanceDef::Fn(func) => {
@@ -1109,6 +1100,43 @@ fn compiled_instance<'db>(
     })
 }
 
+/// The body of an instance that is not a shim, with the instance's types in place of the
+/// generic parameters. With `RUSTD_LEAN` the database does not keep it: nothing but compiling
+/// the instance reads it, and what was compiled is kept.
+fn instance_body<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &Instance,
+    env: StoredParamEnvAndCrate,
+) -> Result<Cow<'db, MirBody<'db>>> {
+    static LEAN: LazyLock<bool> = LazyLock::new(|| std::env::var_os("RUSTD_LEAN").is_some());
+    let args = instance.args.clone();
+    let body = match instance.def {
+        InstanceDef::Fn(func) if *LEAN => db
+            .mir_body(func.into())
+            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::Closure(id) if *LEAN => db
+            .mir_body_for_closure(InternedClosureId::from_id(id))
+            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::Coroutine(id) if *LEAN => db
+            .mir_body_for_coroutine(InternedCoroutineId::from_id(id))
+            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::Fn(func) => {
+            db.monomorphized_mir_body(func.into(), args, env).map(Cow::Borrowed)
+        }
+        InstanceDef::Closure(id) => db
+            .monomorphized_mir_body_for_closure(InternedClosureId::from_id(id), args, env)
+            .map(Cow::Borrowed),
+        InstanceDef::Coroutine(id) => db
+            .monomorphized_mir_body_for_coroutine(InternedCoroutineId::from_id(id), args, env)
+            .map(Cow::Borrowed),
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
+    };
+    body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+}
+
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
 /// for on its own so that they do not depend on the rest of the body.
 #[derive(Clone, PartialEq, Eq)]
@@ -1125,24 +1153,7 @@ fn body_types<'db>(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<BodyTypes> {
-    let body = match instance.def {
-        InstanceDef::Fn(func) => db.monomorphized_mir_body(func.into(), instance.args, env),
-        InstanceDef::Closure(id) => db.monomorphized_mir_body_for_closure(
-            InternedClosureId::from_id(id),
-            instance.args,
-            env,
-        ),
-        InstanceDef::Coroutine(id) => db.monomorphized_mir_body_for_coroutine(
-            InternedCoroutineId::from_id(id),
-            instance.args,
-            env,
-        ),
-        InstanceDef::DropGlue
-        | InstanceDef::CallOnceShim
-        | InstanceDef::FnPointerShim
-        | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
-    };
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = &*instance_body(db, &instance, env)?;
     Ok(BodyTypes {
         params: body.param_locals.iter().map(|&local| body.locals[local].ty.clone()).collect(),
         returned: body.locals[returned_local(body)].ty.clone(),
