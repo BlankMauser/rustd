@@ -239,7 +239,7 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False, mixed=0):
         print(f"{label(crate)}: {n}/{total - no_symbol} functions from rustd")
         for r in rows:
             if r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function":
-                why = r[2] if len(r[2]) < 400 else r[2][:100] + " ... " + r[2][-300:]
+                why = r[2] if len(r[2]) < (10**6 if os.environ.get("RUSTD_WHY") else 400) else r[2][:100] + " ... " + r[2][-300:]
                 print(f"  skipped {r[1]}: {why}")
     print("MATCH" if ok else "MISMATCH")
     if not ok:

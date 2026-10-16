@@ -5534,3 +5534,63 @@ pub mod promoted_fn_cast {
         (function(3), Callable::<bool>(PhantomData)(4), clobbered[3] as u8)
     }
 }
+
+/// What the `warnings` crate's attribute writes: a struct, an enum variant and a function of
+/// one name, which a path names by where it stands.
+pub mod same_name_callable {
+    pub trait Warning: 'static {
+        const ID: Id;
+    }
+    pub struct Id {
+        name: fn() -> &'static str,
+    }
+    impl Id {
+        pub const fn of<W: Warning + ?Sized>() -> Self {
+            Self { name: std::any::type_name::<W> }
+        }
+        fn if_enabled(&self, f: impl FnOnce()) {
+            if (self.name)().ends_with("hoisted") {
+                f()
+            }
+        }
+    }
+
+    #[allow(non_camel_case_types)]
+    pub struct hoisted {}
+    mod __hoisted {
+        use super::*;
+        pub(crate) enum __Callable<T: 'static> {
+            #[allow(non_camel_case_types)]
+            hoisted,
+            #[allow(dead_code)]
+            PhantomData(std::marker::PhantomData<T>),
+        }
+        impl<T: 'static> __Callable<T> {
+            fn __run_if_enabled(arg0: &std::cell::Cell<T>, arg1: T) {
+                <hoisted as Warning>::ID.if_enabled(|| {
+                    fn hoisted<T: 'static>(value: &std::cell::Cell<T>, with: T) {
+                        value.set(with);
+                    }
+                    hoisted(arg0, arg1);
+                });
+            }
+        }
+        impl<T: 'static> std::ops::Deref for __Callable<T> {
+            type Target = fn(&std::cell::Cell<T>, T);
+            fn deref(&self) -> &Self::Target {
+                &(Self::__run_if_enabled as fn(&std::cell::Cell<T>, T))
+            }
+        }
+    }
+    pub use __hoisted::__Callable::*;
+    impl Warning for hoisted {
+        const ID: Id = Id::of::<hoisted>();
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let (number, text) = (std::cell::Cell::new(1u8), std::cell::Cell::new("before"));
+        hoisted(&number, 9);
+        hoisted(&text, "after");
+        (number.get(), text.get())
+    }
+}
