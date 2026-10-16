@@ -31,7 +31,6 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
-use gimli::UnwindSection;
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags,
     RelocationTarget, SectionIndex, SymbolIndex, SymbolKind, elf,
@@ -293,12 +292,8 @@ impl Image {
 impl UnwindTable {
     /// The encodings every linker writes the table in: a 4-byte count, and pairs of 4-byte
     /// offsets from the table's start.
-    const ENCODINGS: [u8; 4] = [
-        1,
-        gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
-        gimli::DW_EH_PE_udata4.0,
-        gimli::DW_EH_PE_datarel.0 | gimli::DW_EH_PE_sdata4.0,
-    ];
+    const ENCODINGS: [u8; 4] =
+        [1, eh::RELATIVE | eh::SIGNED_4, eh::UNSIGNED_4, eh::TABLE_RELATIVE | eh::SIGNED_4];
     const HEADER: usize = 12;
     const ENTRY: usize = 8;
 
@@ -383,6 +378,72 @@ impl LoadRelocations {
 
     fn len_with(&self, added: usize) -> usize {
         self.table.len() + added * Self::ENTRY
+    }
+}
+
+/// How `.eh_frame` and `.eh_frame_hdr` say an address is written (`DW_EH_PE_*`).
+mod eh {
+    pub(super) const ABSOLUTE: u8 = 0x00;
+    pub(super) const UNSIGNED_4: u8 = 0x03;
+    pub(super) const SIGNED_4: u8 = 0x0b;
+    /// From where the address is written.
+    pub(super) const RELATIVE: u8 = 0x10;
+    /// From the start of the search table.
+    pub(super) const TABLE_RELATIVE: u8 = 0x30;
+}
+
+/// What the frames of `.eh_frame` have in common, which each refers to.
+struct CommonEntry;
+
+impl CommonEntry {
+    /// How the frames of the entry at `at` write where their code starts.
+    fn pointer_encoding(section: &[u8], at: usize) -> anyhow::Result<u8> {
+        let mut rest = section.get(at + 8..).context("a frame of no common entry")?;
+        let mut byte = || -> anyhow::Result<u8> {
+            let (&first, others) = rest.split_first().context("a common entry that ends early")?;
+            rest = others;
+            Ok(first)
+        };
+        let version = byte()?;
+        ensure!(version == 1 || version == 3, "a common entry of version {version}");
+        let mut augmentation = Vec::new();
+        loop {
+            match byte()? {
+                0 => break,
+                letter => augmentation.push(letter),
+            }
+        }
+        let mut leb = || -> anyhow::Result<()> {
+            while byte()? & 0x80 != 0 {}
+            Ok(())
+        };
+        // The alignment of code and of data, the register of the return address, and the
+        // length of what the augmentation adds.
+        for _ in 0..4 {
+            leb()?;
+        }
+        ensure!(augmentation.first() == Some(&b'z'), "a common entry without augmentation");
+        for letter in &augmentation[1..] {
+            match letter {
+                b'R' => return byte(),
+                b'L' => _ = byte()?,
+                b'S' | b'B' => {}
+                // The personality routine: an encoding and then an address written in it.
+                b'P' => {
+                    let len = match byte()? & 0x0f {
+                        0x00 | 0x04 | 0x0c => 8,
+                        0x03 | 0x0b => 4,
+                        0x02 | 0x0a => 2,
+                        other => bail!("a personality routine encoded as {other:#x}"),
+                    };
+                    for _ in 0..len {
+                        byte()?;
+                    }
+                }
+                other => bail!("a common entry augmented with {:?}", *other as char),
+            }
+        }
+        Ok(eh::ABSOLUTE)
     }
 }
 
@@ -607,15 +668,36 @@ impl<'a> Patch<'a> {
     /// The frames in an `.eh_frame` section loaded at `address`: where the code of each
     /// starts, and where the frame is.
     fn frames_in(section: &[u8], address: u64) -> anyhow::Result<Vec<(u64, u64)>> {
-        let frames = gimli::EhFrame::new(section, gimli::LittleEndian);
-        let bases = gimli::BaseAddresses::default().set_eh_frame(address);
-        let mut entries = frames.entries(&bases);
+        let early = "an unwind table that ends early";
+        let u32_at = |at: usize| -> anyhow::Result<u32> {
+            let bytes = section.get(at..at + 4).context(early)?;
+            Ok(u32::from_le_bytes(bytes.try_into()?))
+        };
         let mut found = Vec::new();
-        while let Some(entry) = entries.next()? {
-            if let gimli::CieOrFde::Fde(frame) = entry {
-                let frame = frame.parse(gimli::EhFrame::cie_from_offset)?;
-                found.push((frame.initial_address(), address + frame.offset() as u64));
+        let mut at = 0;
+        while at < section.len() {
+            let len = u32_at(at)? as usize;
+            if len == 0 {
+                break;
             }
+            ensure!(len != u32::MAX as usize, "an unwind table in the 64-bit format");
+            // A frame says how far back its common entry is; a common entry says zero.
+            let back = u32_at(at + 4)? as usize;
+            if back != 0 {
+                let common = (at + 4).checked_sub(back).context("a frame of no common entry")?;
+                let start = at + 8;
+                let begins = match CommonEntry::pointer_encoding(section, common)? {
+                    eh::ABSOLUTE => {
+                        let bytes = section.get(start..start + 8).context(early)?;
+                        u64::from_le_bytes(bytes.try_into()?)
+                    }
+                    encoding if encoding == eh::RELATIVE | eh::SIGNED_4 => (address + start as u64)
+                        .wrapping_add_signed(i64::from(u32_at(start)? as i32)),
+                    other => bail!("frames whose addresses are encoded as {other:#x}"),
+                };
+                found.push((begins, address + at as u64));
+            }
+            at += 4 + len;
         }
         Ok(found)
     }
