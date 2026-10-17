@@ -2065,9 +2065,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     kind: Adjust::Borrow(AutoBorrow::Ref(crate::infer::AutoBorrowMutability::Not)),
                     ..
                 },
-            ] => {
-                matches!(self.store[expr], Expr::Ref { .. }) && self.is_promotable_unadjusted(expr)
-            }
+            ] => self.is_promotable_unadjusted(expr),
             _ => false,
         }
     }
@@ -2117,10 +2115,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(*callee).kind() else {
                     return false;
                 };
-                let CallableDefId::FunctionId(func) = def.0 else { return false };
-                hir_def::attrs::AttrFlags::query(self.db, func.into())
-                    .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
-                    && args.clone().iter().all(|&it| self.is_promotable(it))
+                // A tuple struct or variant is made of its fields, as one with names is.
+                let made = match def.0 {
+                    CallableDefId::FunctionId(func) => {
+                        hir_def::attrs::AttrFlags::query(self.db, func.into())
+                            .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
+                    }
+                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
+                };
+                made && args.clone().iter().all(|&it| self.is_promotable(it))
             }
             &Expr::Ref { expr, mutability, .. } => {
                 mutability.is_shared() && self.is_promotable(expr)

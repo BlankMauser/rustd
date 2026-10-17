@@ -52,6 +52,7 @@ cases![
     dyn_lifetime_upcast,
     format_of_macro,
     static_fn_table,
+    static_enum_slice,
     const_none_niche,
     late_import_macro,
     line_continuation,
