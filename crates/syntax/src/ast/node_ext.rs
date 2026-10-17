@@ -1027,7 +1027,7 @@ impl RangeItem for ast::RangePat {
     fn start(&self) -> Option<ast::Pat> {
         self.syntax()
             .children_with_tokens()
-            .take_while(|it| !(it.kind() == T![..] || it.kind() == T![..=]))
+            .take_while(|it| range_pat_op(it.kind()).is_none())
             .filter_map(|it| it.into_node())
             .find_map(ast::Pat::cast)
     }
@@ -1035,33 +1035,30 @@ impl RangeItem for ast::RangePat {
     fn end(&self) -> Option<ast::Pat> {
         self.syntax()
             .children_with_tokens()
-            .skip_while(|it| !(it.kind() == T![..] || it.kind() == T![..=]))
+            .skip_while(|it| range_pat_op(it.kind()).is_none())
             .filter_map(|it| it.into_node())
             .find_map(ast::Pat::cast)
     }
 
     fn op_token(&self) -> Option<SyntaxToken> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            let token = it.into_token()?;
-
-            match token.kind() {
-                T![..] => Some(token),
-                T![..=] => Some(token),
-                _ => None,
-            }
-        })
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|token| range_pat_op(token.kind()).is_some())
     }
 
     fn op_kind(&self) -> Option<RangeOp> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            let token = it.into_token()?;
+        self.syntax().children_with_tokens().find_map(|it| range_pat_op(it.kind()))
+    }
+}
 
-            match token.kind() {
-                T![..] => Some(RangeOp::Exclusive),
-                T![..=] => Some(RangeOp::Inclusive),
-                _ => None,
-            }
-        })
+/// The range a token stands for between the bounds of a range pattern. `...` is the inclusive
+/// range of the 2015 and 2018 editions.
+fn range_pat_op(kind: SyntaxKind) -> Option<RangeOp> {
+    match kind {
+        T![..] => Some(RangeOp::Exclusive),
+        T![..=] | T![...] => Some(RangeOp::Inclusive),
+        _ => None,
     }
 }
 

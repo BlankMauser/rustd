@@ -3,3 +3,6 @@ name = "breakers"
 version = "0.0.0"
 edition = "2024"
 
+
+[dependencies]
+breakers2015 = { path = "../cases2015" }

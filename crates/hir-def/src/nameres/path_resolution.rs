@@ -634,12 +634,9 @@ impl DefMap {
         //  - current module / scope
         //  - extern prelude / macro_use prelude
         //  - std prelude
+        // A module declared in a block is in the textual scope of the macros before the block.
         let from_legacy_macro = self
-            .module(db, module)
-            .legacy_macro_in_scope(db, name)
-            // FIXME: shadowing
-            .and_then(|it| it.last())
-            .copied()
+            .legacy_macro_in_textual_scope(db, module, name)
             .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
             .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None));
         let from_scope =

@@ -42,6 +42,11 @@ class TestFixture(Fixture):
             print(f"{self.crates[0]} is not linked into this test")
             self.crates = self.crates[1:]
 
+    def binary_path(self):
+        # Beside cargo's: a test may look for the crate's other artifacts from where it runs
+        # (autocfg probes the rlibs in the directory of `current_exe`).
+        return self.reference + "-rustd"
+
     def rustd_build(self, deny=()):
         # The crate's objects are the same whichever test binary they are linked into.
         # rustd links to what the rlibs already hold, so that only goes for the same rlibs.

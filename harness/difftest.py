@@ -201,11 +201,15 @@ class Fixture:
             args[first:first] = objects
         else:
             args = linkline.ahead(args, objects, RUSTD)
-        self.binary = os.path.join(self.work, "bin-rustd")
+        self.binary = self.binary_path()
         args = linkline.with_output(args, self.binary)
         run = subprocess.run(args, capture_output=True, text=True)
         if run.returncode != 0:
             raise SystemExit(f"link failed:\n{(run.stderr + run.stdout)[-3000:]}")
+
+    def binary_path(self):
+        """Where the binary with rustd's objects is linked."""
+        return os.path.join(self.work, "bin-rustd")
 
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]

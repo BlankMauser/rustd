@@ -20,7 +20,7 @@ LEFT = set()
 
 
 def main():
-    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers"], ["-p", "breaker"])
+    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2015"], ["-p", "breaker"])
     fx.rustc_build()
     fx.rustd_build()
     skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol" not in r[2]]

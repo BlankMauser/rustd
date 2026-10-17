@@ -38,4 +38,7 @@ cases![
     fragment_token,
     blanket_in_fn,
     lifetime_only_callee,
+    dots_range_pattern,
+    wide_shift_amount,
+    macro_type_in_block_mod,
 ];

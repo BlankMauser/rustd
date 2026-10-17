@@ -6800,8 +6800,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
-                let bits = self.builder.ins().iconst(r_scalar.ty, i64::from(scalar.ty.bits()));
-                let overflow = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let (r, beyond_a_word) = self.shift_amount_word(r);
+                let bits = i64::from(scalar.ty.bits());
+                let overflow =
+                    self.builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let overflow = match beyond_a_word {
+                    Some(beyond) => self.builder.ins().bor(overflow, beyond),
+                    None => overflow,
+                };
                 let (shift_op, value) = match (op, signed) {
                     (BinOp::Shl, _) => (OverflowOp::Shl, self.builder.ins().ishl(l, r)),
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
@@ -6812,6 +6818,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             BinOp::Offset => unsupported!("pointer offset"),
         })
+    }
+
+    /// A shift amount as at most one machine word, and whether the part cut off was not zero.
+    /// A shift takes its amount modulo the width of the value, which the low word decides.
+    fn shift_amount_word(&mut self, amount: Value) -> (Value, Option<Value>) {
+        if self.builder.func.dfg.value_type(amount) != types::I128 {
+            return (amount, None);
+        }
+        let (low, high) = self.builder.ins().isplit(amount);
+        let beyond = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
+        (low, Some(beyond))
     }
 
     fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
@@ -8459,6 +8476,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (l, scalar) = self.load_scalar(lhs)?;
                 let (r, r_scalar) = self.load_scalar(rhs)?;
                 let signed = scalar.signed;
+                let r = match name {
+                    "unchecked_shl" | "unchecked_shr" => self.shift_amount_word(r).0,
+                    _ => r,
+                };
                 let value = match name {
                     "wrapping_add" | "unchecked_add" => self.builder.ins().iadd(l, r),
                     "wrapping_sub" | "unchecked_sub" => self.builder.ins().isub(l, r),
