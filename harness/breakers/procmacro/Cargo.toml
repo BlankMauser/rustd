@@ -6,5 +6,6 @@ publish = false
 
 [dependencies]
 macros = { path = "macros" }
+sized = { path = "sized" }
 
 [workspace]

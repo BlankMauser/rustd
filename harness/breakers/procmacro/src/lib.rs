@@ -14,3 +14,13 @@ pub fn name(number: i8) -> &'static str {
 pub fn numbers() -> (i8, i16, f32) {
     macros::negative_numbers!()
 }
+
+/// What the records of `sized` hold, and how large one is.
+pub fn records() -> (Vec<u32>, usize) {
+    let records = sized::records();
+    let held = records.iter().map(|record| match record {
+        sized::Record::Short(word) => *word,
+        sized::Record::Long(body) => body.words.iter().sum(),
+    });
+    (held.collect(), std::mem::size_of::<sized::Record>())
+}

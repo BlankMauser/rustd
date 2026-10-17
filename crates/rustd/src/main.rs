@@ -1427,16 +1427,17 @@ type BuiltPackage = (String, String, Option<PathBuf>);
 /// The features of each package in a build of the package of `manifest`.
 ///
 /// `cargo metadata` unifies features over every member of the workspace, and cargo doesn't
-/// when it builds one of them.
-// FIXME: a package built for the host with other features than for the target has both here.
+/// when it builds one of them. It also builds a package once for the target and once more for
+/// the procedural macros that depend on it, when the two ask for different features: the
+/// features here are the target's, and the macros' only for a package nothing else uses.
 fn built_features(
     manifest: &Path,
     cargo_config: &CargoConfig,
     dev_deps: bool,
-) -> anyhow::Result<FxHashMap<BuiltPackage, std::collections::BTreeSet<String>>> {
+) -> anyhow::Result<FxHashMap<BuiltPackage, BTreeSet<String>>> {
     let edges = if dev_deps { "normal,dev" } else { "normal" };
     let mut command = Command::new("cargo");
-    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
+    command.args(["tree", "--edges", edges, "--prefix", "depth", "--format", "{p}|{f}"]);
     command.arg("--manifest-path").arg(manifest);
     if let CargoFeatures::Selected { features, .. } = &cargo_config.features
         && !features.is_empty()
@@ -1449,22 +1450,54 @@ fn built_features(
         "`cargo tree` failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let mut built = FxHashMap::default();
+    let (mut target, mut host) = (FxHashMap::default(), FxHashMap::default());
+    // How deep the procedural macro is that the lines after it are dependencies of.
+    let mut macro_depth = None;
     for line in String::from_utf8(output.stdout)?.lines() {
-        // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
-        let Some((package, features)) = line.split_once('|') else { continue };
+        let Some(node) = TreeNode::parse(line) else { continue };
+        if macro_depth.is_some_and(|depth| node.depth <= depth) {
+            macro_depth = None;
+        }
+        if node.is_proc_macro && macro_depth.is_none() {
+            macro_depth = Some(node.depth);
+        }
+        let built = if macro_depth.is_some() { &mut host } else { &mut target };
+        built.entry(node.package).or_insert_with(BTreeSet::new).extend(node.features);
+    }
+    for (package, features) in host {
+        target.entry(package).or_insert(features);
+    }
+    Ok(target)
+}
+
+/// A line of `cargo tree --prefix depth --format {p}|{f}`:
+/// `2name v1.2.3 (proc-macro) (/path/of/a/member)|feature,feature (*)`.
+struct TreeNode {
+    depth: usize,
+    package: BuiltPackage,
+    is_proc_macro: bool,
+    features: Vec<String>,
+}
+
+impl TreeNode {
+    fn parse(line: &str) -> Option<TreeNode> {
+        let (package, features) = line.split_once('|')?;
+        let name_at = package.find(|it: char| !it.is_ascii_digit())?;
+        let depth = package[..name_at].parse().ok()?;
+        let is_proc_macro = package.contains(" (proc-macro)");
+        let package = package[name_at..].replace(" (proc-macro)", "");
         let mut package = package.splitn(3, ' ');
-        let (Some(name), Some(version)) = (package.next(), package.next()) else { continue };
-        let version = version.trim_start_matches('v');
+        let (name, version) = (package.next()?, package.next()?);
         let source = package.next().and_then(|it| it.strip_prefix('(')?.strip_suffix(')'));
         let directory = source.filter(|it| Path::new(it).is_absolute()).map(PathBuf::from);
         let features = features.trim_end_matches(" (*)").split(',').filter(|it| !it.is_empty());
-        built
-            .entry((name.to_owned(), version.to_owned(), directory))
-            .or_insert_with(std::collections::BTreeSet::new)
-            .extend(features.map(str::to_owned));
+        Some(TreeNode {
+            depth,
+            package: (name.to_owned(), version.trim_start_matches('v').to_owned(), directory),
+            is_proc_macro,
+            features: features.map(str::to_owned).collect(),
+        })
     }
-    Ok(built)
 }
 
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
