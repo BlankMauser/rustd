@@ -19,7 +19,7 @@ use hir_def::{
     signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
 };
 use hir_expand::name::Name;
-use itertools::{EitherOrBoth, Itertools};
+use itertools::{Either, EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
@@ -703,14 +703,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // What `if let` binds, and the temporaries of what it matches on, are dropped
                 // when the branch that was taken ends.
                 let bindings = self.has_let(*condition).then(|| self.push_drop_scope());
-                let (discr, current) = if plain {
-                    let Some(it) = self.lower_expr_to_some_operand(*condition, current)? else {
-                        if let Some(bindings) = bindings {
-                            bindings.pop_assume_dropped(self);
-                        }
-                        return Ok(None);
-                    };
-                    it
+                let branches = match self.store[*condition] {
+                    Expr::Let { pat, expr } => {
+                        Some(self.lower_if_let(*condition, pat, expr, current)?)
+                    }
+                    _ => None,
+                };
+                let condition_value = if let Some(branches) = branches {
+                    branches.map(Either::Right)
+                } else if plain {
+                    self.lower_expr_to_some_operand(*condition, current)?.map(Either::Left)
                 } else {
                     // The condition's temporaries are dropped before either branch runs.
                     let ty = Ty::new_bool(self.interner());
@@ -725,7 +727,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         kind: OperandKind::Copy(result.store()),
                         span: Some((*condition).into()),
                     };
-                    (discr, current)
+                    Some(Either::Left((discr, current)))
+                };
+                let Some(condition_value) = condition_value else {
+                    if let Some(bindings) = bindings {
+                        bindings.pop_assume_dropped(self);
+                    }
+                    return Ok(None);
+                };
+                let (start_of_then, start_of_else) = match condition_value {
+                    Either::Right(branches) => branches,
+                    Either::Left((discr, current)) => {
+                        let (start_of_then, start_of_else) =
+                            (self.new_basic_block(), self.new_basic_block());
+                        self.set_terminator(
+                            current,
+                            TerminatorKind::SwitchInt {
+                                discr,
+                                targets: SwitchTargets::static_if(1, start_of_then, start_of_else),
+                            },
+                            expr_id.into(),
+                        );
+                        (start_of_then, start_of_else)
+                    }
                 };
                 let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
                 let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
@@ -738,11 +762,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                     block
                 };
-                let start_of_then = self.new_basic_block();
                 let end_of_then = self
                     .lower_branch_to_place(*then_branch, place, start_of_then)?
                     .map(|block| drop_bound(self, block));
-                let start_of_else = self.new_basic_block();
                 // From the 2024 edition on, the `else` branch runs after the drops.
                 let early = self.edition().at_least_2024();
                 let else_block =
@@ -760,14 +782,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 if let Some(bindings) = bindings {
                     bindings.pop_assume_dropped(self);
                 }
-                self.set_terminator(
-                    current,
-                    TerminatorKind::SwitchInt {
-                        discr,
-                        targets: SwitchTargets::static_if(1, start_of_then, start_of_else),
-                    },
-                    expr_id.into(),
-                );
                 Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()))
             }
             Expr::Let { pat, expr } => {
@@ -1985,6 +1999,27 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
         let operand = Operand::from_bytes(Box::new(discriminant.to_le_bytes()), discr_ty);
         Ok((operand, discr_ty, current))
+    }
+
+    /// Lowers `let pat = scrutinee` where it is the whole condition of an `if`, and gives the
+    /// blocks to go on in when the pattern matches and when it does not. No block is on both
+    /// ways, so what is known of the value where the pattern did not match stays known.
+    fn lower_if_let(
+        &mut self,
+        condition: ExprId,
+        pat: PatId,
+        scrutinee: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(BasicBlockId, BasicBlockId)>> {
+        let Some((place, current)) = self.lower_expr_as_place(current, scrutinee, true)? else {
+            return Ok(None);
+        };
+        self.push_fake_read(current, place, condition.into());
+        let resolver_guard =
+            self.resolver.update_to_inner_scope(self.db, self.store_owner, condition);
+        let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
+        self.resolver.reset_to_guard(resolver_guard);
+        Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
     }
 
     /// Lowers a branch of an `if`. Its temporaries are dropped where the branch ends, also

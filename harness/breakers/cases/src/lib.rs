@@ -49,4 +49,5 @@ cases![
     uncaptured_scrutinee,
     unread_index,
     let_else_temporaries,
+    unmatched_array_drop,
 ];

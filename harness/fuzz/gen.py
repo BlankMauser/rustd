@@ -801,7 +801,15 @@ class Gen:
         name = self.fresh("x")
         unary = lambda: self.closure([(name, arg)], ty, d - 1)
         nullary = lambda: self.closure([], ty, d - 1)
-        value = lambda: self.expr(arg, d - 1)
+
+        def value():
+            # The closure is made first and borrows what is in scope: the argument changes none of it.
+            state = self.enter()
+            self.mut_floor = len(self.scope)
+            text = self.expr(arg, d - 1)
+            self.leave(state)
+            return text
+
         return self.choose([
             (2, "closure.impl_fn", lambda: f"apply({unary()}, {value()})"),
             (1, "closure.dyn_fn", lambda: f"apply_dyn(&{unary()}, {value()})"),
