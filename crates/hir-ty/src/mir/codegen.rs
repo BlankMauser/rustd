@@ -3725,6 +3725,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // Its address comes in a register of its own, which is not an argument's.
             Aapcs64::Memory => PassMode::Indirect,
         };
+        // What a value aligned to sixteen bytes starts at a multiple of, counted in
+        // registers: Apple's convention starts it at whichever register is next.
+        let even = match self.cg.target.call_conv {
+            isa::CallConv::AppleAarch64 => 1,
+            _ => 2,
+        };
         let (mut ints, mut floats) = (0u8, 0u8);
         let mut modes = Vec::new();
         for ty in args {
@@ -3739,7 +3745,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         // Cranelift starts it at an even register, or puts it on the stack
                         // whole. The registers it did not fit in stay free there, where
                         // the convention has them out of use: turn down what would use one.
-                        *used += *used % 2;
+                        *used += *used % even;
                         if *used + 2 > REGS && *used < REGS {
                             unsupported!("a 128-bit argument that the registers left do not hold");
                         }
@@ -3761,7 +3767,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 Aapcs64::Ints { size, align } => {
                     let count = size.div_ceil(8) as u8;
-                    let odd = if align > 8 { ints % 2 } else { 0 };
+                    let odd = if align > 8 { ints % even } else { 0 };
                     if ints + odd + count <= REGS {
                         ints += odd + count;
                         Self::aapcs64_ints(size, odd)

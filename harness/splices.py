@@ -489,16 +489,17 @@ def main():
         return (reply.stdout + reply.stderr).strip(), how
 
     def sound(path):
-        """What readelf and a loader that binds everything at once have against the file."""
+        """What the tools that read an executable have against the file."""
         if WINDOWS:
             return sound_pe(path)
         if WASM:
             read = subprocess.run(["wasm-tools", "validate", path], capture_output=True, text=True)
             return f"invalid: {read.stderr.strip()[:80]}" if read.returncode else None
-        read = subprocess.run(["readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
-        said = [l for l in read.stderr.splitlines() if l.strip()]
-        if read.returncode or said:
-            return f"readelf: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
+        for tool in READERS:
+            read = subprocess.run([*tool, path], capture_output=True, text=True)
+            said = [l for l in read.stderr.splitlines() if l.strip()]
+            if read.returncode or said:
+                return f"{os.path.basename(tool[0])}: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
         return None
 
     def edit(edits):
