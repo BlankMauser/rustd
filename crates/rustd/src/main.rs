@@ -46,7 +46,7 @@ use hir_def::{
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty::mir::codegen::{
-    Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
+    Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
     exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
@@ -514,14 +514,46 @@ impl Resolver<'_> {
 }
 
 /// The commit of the toolchain installed at `toolchain`, which rustc puts in the names of the
-/// standard library's files.
+/// standard library's files: as rustup's manifest has it, or else as the built library does.
 fn rustc_commit(toolchain: &str) -> Option<String> {
+    let rustlib = format!("{toolchain}lib/rustlib");
+    commit_in_manifest(&rustlib).or_else(|| commit_in_library(Path::new(&rustlib)))
+}
+
+fn commit_in_manifest(rustlib: &str) -> Option<String> {
     let manifest =
-        std::fs::read_to_string(format!("{toolchain}lib/rustlib/multirust-channel-manifest.toml"))
-            .ok()?;
+        std::fs::read_to_string(format!("{rustlib}/multirust-channel-manifest.toml")).ok()?;
     let (_, rust) = manifest.split_once("[pkg.rust]")?;
     let (_, commit) = rust.split_once("git_commit_hash = \"")?;
     Some(commit.split_once('"')?.0.to_owned())
+}
+
+/// The commit in the paths a built standard library below `rustlib` has its sources under.
+fn commit_in_library(rustlib: &Path) -> Option<String> {
+    let targets = std::fs::read_dir(rustlib).ok()?;
+    let libraries = targets.filter_map(|it| std::fs::read_dir(it.ok()?.path().join("lib")).ok());
+    let mut built: Vec<PathBuf> = libraries
+        .flatten()
+        .filter_map(|it| Some(it.ok()?.path()))
+        .filter(|it| {
+            let name = it.file_name().and_then(|it| it.to_str()).unwrap_or_default();
+            name.starts_with("libstd-") && name.ends_with(".rlib")
+        })
+        .collect();
+    built.sort_unstable();
+    built.iter().find_map(|it| commit_of_sources(&std::fs::read(it).ok()?))
+}
+
+/// The commit of the first `/rustc/<commit>/` in what rustc built.
+fn commit_of_sources(built: &[u8]) -> Option<String> {
+    const UNDER: &[u8] = b"/rustc/";
+    const LENGTH: usize = 40;
+    memchr::memmem::find_iter(built, UNDER).find_map(|at| {
+        let commit = built.get(at + UNDER.len()..at + UNDER.len() + LENGTH + 1)?;
+        let (slash, commit) = commit.split_last()?;
+        let named = *slash == b'/' && commit.iter().all(u8::is_ascii_hexdigit);
+        named.then(|| String::from_utf8_lossy(commit).into_owned())
+    })
 }
 
 /// What tells the toolchain whose library was loaded from any other: the name of the built
@@ -635,7 +667,7 @@ impl SymbolResolver for Resolver<'_> {
         self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
     }
 
-    fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<ContentId> {
         let places = (&*self.root, self.base.as_deref());
         if !krate.data(self.db).origin.is_local() {
             let root = self.crate_root(krate.into())?;
@@ -3965,4 +3997,18 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
         "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, fallback {:.1?}, object {:.1?}, {} rounds",
         phases.compile, phases.resolve, phases.define, phases.fallback, phases.object, stats.rounds
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_commit_of_a_toolchain_is_the_one_its_library_has_its_sources_under() {
+        let commit = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4";
+        let built = format!("\0/rustc/short/a.rs\0/rustc/{commit}x\0/rustc/{commit}/library/b.rs");
+        assert_eq!(commit_of_sources(built.as_bytes()).as_deref(), Some(commit));
+        assert_eq!(commit_of_sources(b"/rustc/"), None);
+        assert_eq!(commit_of_sources(format!("/rustc/{commit}").as_bytes()), None);
+    }
 }

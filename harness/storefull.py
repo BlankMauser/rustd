@@ -122,6 +122,10 @@ def kept_again(checkout, disk):
     print(f"  room made: {numbers['packs']} packs with {numbers['records']} records kept, and found by the next daemon")
 
 
+# The remote is a directory of this user's, whose lists nobody signs.
+UNSIGNED = {"RUSTD_REMOTE_UNSIGNED": "1"}
+
+
 def commands(checkout, disk, work):
     """`rustd cache` on a full disk: pull fails cleanly, gc makes room."""
     remote = os.path.join(work, "remote")
@@ -132,15 +136,18 @@ def commands(checkout, disk, work):
     status, out = cache(disk.store, "gc", "--max", "0")
     if status != 0 or files(disk.store, ".pack"):
         fail(f"gc --max 0: {out}")
+    status, out = cache(disk.store, "pull", remote, env={"RUSTD_REMOTE_UNSIGNED": ""})
+    if status == 0 or "RUSTD_REMOTE_UNSIGNED=1" not in out or files(disk.store, ".pack"):
+        fail(f"pull from lists nobody signed was not refused: {out}")
     disk.leave(64 << 10)
-    status, out = cache(disk.store, "pull", remote)
+    status, out = cache(disk.store, "pull", remote, env=UNSIGNED)
     if status == 0 or NO_ROOM not in out:
         fail(f"pull into a full store did not fail with the reason: {out}")
     whole, _, verified = verify(disk.store)
     if not whole or files(disk.store, ".tmp"):
         fail(f"pull into a full store left something behind: {os.listdir(disk.store)}\n{verified}")
     os.remove(disk.ballast)
-    status, out = cache(disk.store, "pull", remote)
+    status, out = cache(disk.store, "pull", remote, env=UNSIGNED)
     whole, numbers, verified = verify(disk.store)
     if status != 0 or not whole or numbers["packs"] != packs:
         fail(f"pull with room: {out}\n{verified}")

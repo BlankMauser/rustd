@@ -21,7 +21,7 @@ use anyhow::{Context, bail};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use crate::remote::{Remote, transfer};
+use crate::remote::{Remote, Unsigned, transfer};
 
 /// The directories of a profile that hold units, the one cargo trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
@@ -36,6 +36,12 @@ impl Listed {
 
     fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
         let bytes = remote.fetch(&Listed::at(project))?.unwrap_or_default();
+        Listed::parse(bytes)
+    }
+
+    /// The units the bytes of a list name. A line that is not a unit and the hash of its
+    /// archive is not one, and neither is ever the name of a file.
+    fn parse(bytes: Vec<u8>) -> anyhow::Result<Listed> {
         let text = String::from_utf8(bytes).context("the list of units is not text")?;
         let units = text
             .lines()
@@ -196,10 +202,14 @@ fn pull(
                 "build" | ".fingerprint" => name == unit,
                 _ => false,
             };
-            if !of_unit {
+            // Nor a link, which is to wherever it says.
+            let kind = entry.header().entry_type();
+            if !of_unit || !(kind.is_file() || kind.is_dir()) {
                 bail!("{unit} holds {}", path.display());
             }
-            entry.unpack_in(dir)?;
+            if !entry.unpack_in(dir)? {
+                bail!("{unit} holds {}, which is outside of it", path.display());
+            }
         }
         Ok(bytes.len() as u64)
     })?;
@@ -222,9 +232,101 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let start = std::time::Instant::now();
     let done = match verb.as_str() {
         "push" => push(dir, &remote, &project, &local)?,
-        "pull" => pull(dir, &remote, &project, &local)?,
+        "pull" => {
+            Unsigned::taken()?;
+            pull(dir, &remote, &project, &local)?
+        }
         _ => bail!(USAGE),
     };
     println!("{done} in {:.1?}", start.elapsed());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::tests::{changed, scratch};
+
+    const UNIT: &str = "serde-33c9cbd578789acd";
+
+    /// A remote whose list for `default` has one unit, the archive `entries` are in.
+    fn remote_with(name: &str, entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Remote {
+        let mut tar = tar::Builder::new(Vec::new());
+        entries(&mut tar);
+        let archive = zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&archive));
+        let remote = Remote::Dir(scratch(name));
+        remote.send(&format!("units/{hash}"), &archive).unwrap();
+        remote.send("deps/default", format!("{UNIT} {hash}\n").as_bytes()).unwrap();
+        remote
+    }
+
+    fn header(kind: tar::EntryType, size: u64) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header
+    }
+
+    #[test]
+    fn a_unit_is_unpacked_where_it_belongs() {
+        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
+        let remote = remote_with("unit-remote", |tar| {
+            tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
+        });
+        let dir = scratch("unit-target");
+        pull(&dir, &remote, "default", &BTreeSet::new()).unwrap();
+        assert_eq!(std::fs::read(dir.join(rlib)).unwrap(), b"rlib");
+    }
+
+    #[test]
+    fn a_unit_with_a_link_or_a_file_of_another_is_refused() {
+        let outside = scratch("link-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = |tar: &mut tar::Builder<Vec<u8>>| {
+            let mut header = header(tar::EntryType::Symlink, 0);
+            tar.append_link(&mut header, format!("build/{UNIT}"), &outside).unwrap();
+            let inside = format!("build/{UNIT}/planted");
+            tar.append_data(&mut self::header(tar::EntryType::Regular, 1), inside, &b"x"[..])
+                .unwrap();
+        };
+        let other = |tar: &mut tar::Builder<Vec<u8>>| {
+            let name = "deps/libother-0123456789abcdef.rlib";
+            tar.append_data(&mut header(tar::EntryType::Regular, 1), name, &b"x"[..]).unwrap();
+        };
+        let elsewhere = |tar: &mut tar::Builder<Vec<u8>>| {
+            let mut header = header(tar::EntryType::Regular, 1);
+            let name = format!("build/{UNIT}/../../../planted");
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            tar.append(&header, &b"x"[..]).unwrap();
+        };
+        let archives: [(&str, &dyn Fn(&mut tar::Builder<Vec<u8>>)); 3] =
+            [("link", &link), ("other", &other), ("elsewhere", &elsewhere)];
+        for (name, entries) in archives {
+            let remote = remote_with(&format!("{name}-remote"), entries);
+            let dir = scratch(&format!("{name}-target")).join("target/debug");
+            assert!(pull(&dir, &remote, "default", &BTreeSet::new()).is_err(), "{name}");
+            assert!(!outside.join("planted").exists(), "{name}");
+            let top = dir.ancestors().nth(2).unwrap();
+            assert!(!top.join("planted").exists() && !dir.join("deps").exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn no_bytes_break_the_reading_of_a_list_of_units() {
+        let archive = "ab".repeat(32);
+        let seed = format!("{UNIT} {archive}\nother-0123456789abcdef {archive}\n");
+        let mut listed = 0;
+        for bytes in changed(seed.as_bytes(), 20_000) {
+            let Ok(units) = Listed::parse(bytes) else { continue };
+            for (unit, archive) in &units.0 {
+                let plain = |it: &str| !it.contains(['/', '\\', '\0']) && !it.starts_with('.');
+                assert!(plain(unit) && plain(archive) && archive.len() == 64, "{unit} {archive}");
+                listed += 1;
+            }
+        }
+        assert!(listed > 1000);
+    }
 }

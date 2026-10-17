@@ -125,6 +125,33 @@ impl Remote {
     }
 }
 
+/// Whether this machine takes what a remote lists. Nothing on a remote says who wrote a
+/// list, and whoever writes one decides what the programs built from it run: a pack is
+/// checked against its name, which is the hash of whatever its writer put in it. So a list
+/// is taken only where `RUSTD_REMOTE_UNSIGNED=1` says that everyone who can write to the
+/// remote is trusted as the user is. Sending to a remote asks for nothing.
+pub(crate) struct Unsigned;
+
+impl Unsigned {
+    const SET: &str = "RUSTD_REMOTE_UNSIGNED";
+
+    /// An error unless the environment says lists nobody signed are taken.
+    pub(crate) fn taken() -> anyhow::Result<()> {
+        Self::taken_when(std::env::var(Self::SET).ok().as_deref())
+    }
+
+    fn taken_when(set: Option<&str>) -> anyhow::Result<()> {
+        if set == Some("1") {
+            return Ok(());
+        }
+        bail!(
+            "nothing is fetched from a remote whose lists are not signed: whoever can write \
+             to it decides what the build runs. Set {}=1 if all who can are trusted",
+            Self::SET
+        )
+    }
+}
+
 /// What a project's builds were served from: the names of packs, one a line.
 struct Manifest(BTreeSet<String>);
 
@@ -135,6 +162,12 @@ impl Manifest {
 
     fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Manifest> {
         let bytes = remote.fetch(&Manifest::at(project))?.unwrap_or_default();
+        Manifest::parse(bytes)
+    }
+
+    /// The packs the bytes of a manifest list. A line that is not the name of a pack is
+    /// not one, and is never the name of a file.
+    fn parse(bytes: Vec<u8>) -> anyhow::Result<Manifest> {
         let text = String::from_utf8(bytes).context("the manifest is not text")?;
         Ok(Manifest(
             text.lines()
@@ -209,6 +242,7 @@ pub(crate) fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resu
 /// Fetches the packs of the project's manifest that are not in the local store. A pack of
 /// another format than this build reads is left where it is.
 pub(crate) fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
+    Unsigned::taken()?;
     let dir = StoreDir::at(store);
     dir.claim()?;
     let local = local_packs(&dir)?;
@@ -394,5 +428,71 @@ impl Shared {
             Ok(done) => eprintln!("remote: {done} in {:.1?}", start.elapsed()),
             Err(e) => eprintln!("remote: {e:#}"),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustd-remote-{name}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// `seed` and `runs` changes of it, the same ones in every run: bytes cut, flipped,
+    /// put in and taken out.
+    pub(crate) fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound.max(1) as u64) as usize
+        };
+        let seed = seed.to_vec();
+        std::iter::once(seed.clone()).chain((0..runs).map(move |_| {
+            let mut bytes = seed.clone();
+            for _ in 0..=next(4) {
+                let at = next(bytes.len());
+                match next(5) {
+                    0 => bytes.truncate(at),
+                    1 if !bytes.is_empty() => bytes[at] ^= 1 << next(8),
+                    2 => bytes.insert(at, b"\n /.\\\0\xff"[next(7)]),
+                    3 if !bytes.is_empty() => _ = bytes.remove(at),
+                    _ => {
+                        let from = next(bytes.len());
+                        let again = bytes[from..].to_vec();
+                        bytes.splice(at..at, again);
+                    }
+                }
+            }
+            bytes
+        }))
+    }
+
+    #[test]
+    fn lists_nobody_signed_are_taken_only_when_asked_for() {
+        assert!(Unsigned::taken_when(Some("1")).is_ok());
+        for unset in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+            let refused = Unsigned::taken_when(unset).unwrap_err().to_string();
+            assert!(refused.contains("RUSTD_REMOTE_UNSIGNED=1"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn no_bytes_break_the_reading_of_a_manifest() {
+        let seed = format!("{0}.pack\n{1}.pack\n", "ab".repeat(32), "0f".repeat(32));
+        let mut listed = 0;
+        for bytes in changed(seed.as_bytes(), 20_000) {
+            let Ok(manifest) = Manifest::parse(bytes) else { continue };
+            for name in &manifest.0 {
+                assert!(name.len() == 69 && name.ends_with(".pack"), "{name}");
+                assert!(!name[..64].contains(['/', '\\', '\0', '.']), "{name}");
+                listed += 1;
+            }
+        }
+        assert!(listed > 1000);
     }
 }

@@ -6,6 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use hir_ty::mir::codegen::ContentId;
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -20,7 +21,7 @@ type Hash = [u8; 32];
 /// crate of the checkout that depends on it.
 #[derive(Default)]
 pub(crate) struct Contents {
-    crates: Mutex<FxHashMap<Crate, Option<u64>>>,
+    crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
 }
@@ -35,7 +36,7 @@ impl Contents {
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
-    ) -> Option<u64> {
+    ) -> Option<ContentId> {
         if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return known;
         }
@@ -67,14 +68,14 @@ impl Contents {
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
-    ) -> Option<u64> {
+    ) -> Option<ContentId> {
         let data = krate.data(db);
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd crate 2");
+        field(b"rustd crate 3");
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.is_proc_macro).as_bytes());
@@ -142,14 +143,13 @@ impl Contents {
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
             let on = dependency.crate_id;
-            let id = match on.data(db).origin.is_local() {
-                true => self.id(db, checkouts, on, stable_crate_id, process_reads)?,
-                false => stable_crate_id(on).unwrap_or_else(|| Self::version(db, on)),
-            };
             field(dependency.name.as_str().as_bytes());
-            field(&id.to_le_bytes());
+            match on.data(db).origin.is_local() {
+                true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
+                false => field(&Self::outside(db, on, stable_crate_id(on))),
+            }
         }
-        Some(u64::from_le_bytes(hasher.finalize()[..8].try_into().ok()?))
+        Some(ContentId(hasher.finalize().into()))
     }
 
     /// What stands for a crate from outside the checkout that rustc's build of the program
@@ -163,7 +163,7 @@ impl Contents {
         root: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
-    ) -> u64 {
+    ) -> ContentId {
         if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return id;
         }
@@ -172,8 +172,8 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd library 2");
-        field(&Self::version(db, krate).to_le_bytes());
+        field(b"rustd library 3");
+        field(Self::version(db, krate).as_bytes());
         field(root.as_os_str().as_encoded_bytes());
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
@@ -184,28 +184,39 @@ impl Contents {
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
             let on = dependency.crate_id;
-            let id = match known(on) {
-                Some((Some(id), _)) => id,
-                Some((None, root)) => self.library(db, on, &root, known, process_reads),
-                None => Self::version(db, on),
-            };
             field(dependency.name.as_str().as_bytes());
-            field(&id.to_le_bytes());
+            match known(on) {
+                Some((None, root)) => field(&self.library(db, on, &root, known, process_reads).0),
+                Some((id, _)) => field(&Self::outside(db, on, id)),
+                None => field(&Self::outside(db, on, None)),
+            }
         }
-        let hash = hasher.finalize();
-        let id = u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"));
+        let id = ContentId(hasher.finalize().into());
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, Some(id));
         id
     }
 
-    /// A crate rustc's build of the program has nothing of, a proc macro for one, which a
-    /// version of is the same wherever it is.
-    fn version(db: &RootDatabase, krate: Crate) -> u64 {
+    /// What stands for a crate from outside the checkout in the hash of one that is built on
+    /// it: its name and version, and rustc's id of it when rustc built something of it. The
+    /// id is 64 bits and rustc's to choose, so it is never all that tells two crates apart.
+    fn outside(db: &RootDatabase, krate: Crate, rustc_id: Option<u64>) -> Hash {
+        let mut hasher = Sha256::new();
+        let named = Self::version(db, krate);
+        hasher.update((named.len() as u64).to_le_bytes());
+        hasher.update(named.as_bytes());
+        match rustc_id {
+            Some(id) => hasher.update([&[1][..], &id.to_le_bytes()].concat()),
+            None => hasher.update([0]),
+        }
+        hasher.finalize().into()
+    }
+
+    /// The name and version of a crate, which one from a registry is the same by wherever
+    /// it is.
+    fn version(db: &RootDatabase, krate: Crate) -> String {
         let extra = krate.extra_data(db);
         let name = extra.display_name.as_ref().map(|it| it.to_string());
-        let named = format!("{name:?} {:?}", extra.version);
-        let hash = Sha256::digest(named.as_bytes());
-        u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
+        format!("{name:?} {:?}", extra.version)
     }
 }
 

@@ -86,6 +86,8 @@ mod cached;
 mod debuginfo;
 mod float_pair;
 mod fragment;
+#[cfg(test)]
+mod fuzz;
 mod home;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
@@ -138,6 +140,18 @@ macro_rules! unsupported {
     };
 }
 
+/// What a crate is by what is written in it and what it is built on: a SHA-256, all of it.
+/// The names made from it are what another machine's store is asked for code by, so it is
+/// as hard to find two crates of one id as two files of one hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentId(pub [u8; 32]);
+
+impl fmt::Display for ContentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
@@ -161,7 +175,7 @@ pub trait SymbolResolver {
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
     /// What stands for a crate that is not rustc's alone to build, the same wherever the
     /// same sources are built on the same crates.
-    fn content_id(&self, krate: Crate) -> Option<u64> {
+    fn content_id(&self, krate: Crate) -> Option<ContentId> {
         _ = krate;
         None
     }
@@ -3677,6 +3691,18 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Whether every pointer in the blob is whole inside it and to one of the first `funcs`
+    /// functions or the first `datas` data objects, which a blob read from the store is
+    /// not known to be.
+    fn sound(&self, funcs: usize, datas: usize) -> bool {
+        let inside = |offset: u32| {
+            self.bytes.len().checked_sub(word()).is_some_and(|last| offset as usize <= last)
+        };
+        (self.align == 0 || self.align.is_power_of_two())
+            && self.relocs.iter().all(|&(at, to, _)| inside(at) && (to.as_u32() as usize) < datas)
+            && self.fn_relocs.iter().all(|&(at, to)| inside(at) && (to.as_u32() as usize) < funcs)
+    }
+
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
     fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
         self.bytes[offset..offset + word()].fill(0);

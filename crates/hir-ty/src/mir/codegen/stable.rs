@@ -264,12 +264,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let Some(id) = self.symbols.content_id(krate) else {
                 return self.miss("no content id");
             };
-            write!(out, "{OF_CHECKOUT}{id:x}:").ok()?;
+            write!(out, "{OF_CHECKOUT}{id}:").ok()?;
         } else {
             match self.symbols.stable_crate_id(krate) {
                 Some(id) => write!(out, "{id:x}:").ok()?,
                 None => match self.symbols.content_id(krate) {
-                    Some(id) => write!(out, "{OF_LIBRARY}{id:x}:").ok()?,
+                    Some(id) => write!(out, "{OF_LIBRARY}{id}:").ok()?,
                     None => return self.miss("no crate id"),
                 },
             }
