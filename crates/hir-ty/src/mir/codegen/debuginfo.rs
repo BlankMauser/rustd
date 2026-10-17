@@ -221,9 +221,13 @@ impl DebugContext {
         root.set(DW_AT_comp_dir, AttributeValue::StringRef(directory));
         root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
         root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
-        // FIXME: variables are told of on x86-64 alone, by `rbp`.
-        let frame = (isa.triple().architecture == target_lexicon::Architecture::X86_64)
-            .then_some(gimli::X86_64::RBP);
+        // The register a function with locals has its frame's address in, which is what
+        // Cranelift says where they are from.
+        let frame = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_64 => Some(gimli::X86_64::RBP),
+            target_lexicon::Architecture::Aarch64(_) => Some(gimli::AArch64::X29),
+            _ => None,
+        };
         Some(DebugContext {
             dwarf,
             files: FxHashMap::default(),

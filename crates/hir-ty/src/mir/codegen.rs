@@ -44,6 +44,7 @@ use rustc_type_ir::inherent::{
 use salsa::plumbing::{AsId, FromId};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
+use unicode_width::UnicodeWidthChar;
 
 use crate::mir::is_by_move_coroutine;
 use crate::{
@@ -75,8 +76,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
     PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
-    eval::interpret_mir, monomorphization::monomorphized, monomorphized_promoted_mir_body_query,
-    return_slot,
+    eval::interpret_mir, lower::is_builtin_index, monomorphization::monomorphized,
+    monomorphized_promoted_mir_body_query, return_slot,
 };
 
 mod asm;
@@ -99,8 +100,9 @@ pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArgume
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{
-    Collected, FORMAT as STORE_FORMAT, Stats, StoreDir, Verified, compiles_against, is_pack,
-    limit_from_env, pack_name, parse_size, write_file_whole,
+    Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
+    fetch_missing_with, is_pack, limit_from_env, name_file_whole, pack_format, pack_keys,
+    pack_name, parse_size, seal_open, write_file_whole,
 };
 mod type_id;
 mod unwind;
@@ -227,16 +229,30 @@ enum PassMode {
     /// Aggregate AAPCS64 hands over in `count` registers of one type, each holding the next
     /// `unit` bytes of it. `skipped` registers of that kind go unused first: the convention
     /// leaves them out when the value has to start at an even register, and takes them all
-    /// out of use when the value has to go to the stack, where the units then land.
+    /// out of use when the value has to go to the stack, where the units then land. A unit
+    /// of 128 bits is the one that is on the stack at a multiple of sixteen bytes.
     Uniform {
         unit: Type,
         count: u8,
         skipped: u8,
     },
     Indirect,
-    /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
-    /// outgoing arguments, which Cranelift does given a pointer.
-    OnStack(u32),
+    /// The C ABI's by-value aggregate in memory: the caller copies `size` bytes into its
+    /// outgoing arguments, which Cranelift does given a pointer. Cranelift has such a copy
+    /// at the next multiple of eight bytes, so one that is aligned to sixteen has eight
+    /// bytes of nothing passed the same way ahead of it when it would not be at one:
+    /// `padded`.
+    OnStack {
+        size: u32,
+        padded: bool,
+    },
+}
+
+impl PassMode {
+    /// What fills one register of the kind the units of a `Uniform` go to.
+    fn register(unit: Type) -> Type {
+        if unit == types::I128 { types::I64 } else { unit }
+    }
 }
 
 /// How every value of a call crosses the boundary.
@@ -895,6 +911,8 @@ struct ObjectCodegen<'a, 'db> {
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     own_statics: OwnStatics,
+    /// What `finish` adds to the object of the relocations of the functions defined.
+    elf_relocs: Vec<ElfReloc>,
     statics: FxHashMap<StaticId, DataId>,
     /// Statics nothing exports and nothing can write to, which we give a copy of the value.
     frozen_statics: FxHashMap<StaticId, DataId>,
@@ -1052,6 +1070,48 @@ fn target_with_frame_pointer() -> Result<&'static isa::OwnedTargetIsa> {
 }
 
 const LARGE: usize = 50_000;
+
+/// A relocation of a function that Cranelift has no kind for, which the object is given
+/// once Cranelift has written it: see [`Code::elf_types`].
+struct ElfReloc {
+    func: FuncId,
+    reloc: ModuleReloc,
+    r_type: u32,
+}
+
+impl ElfReloc {
+    fn add(
+        &self,
+        product: &mut cranelift_object::ObjectProduct,
+    ) -> std::result::Result<(), String> {
+        use cranelift_object::object::{self, write};
+        if product.object.format() != object::BinaryFormat::Elf {
+            return Err("a relocation by its ELF type in an object that is not ELF".to_owned());
+        }
+        let symbol = match self.reloc.name {
+            ModuleRelocTarget::User { namespace: 0, index } => {
+                product.function_symbol(FuncId::from_u32(index))
+            }
+            ModuleRelocTarget::User { namespace: 1, index } => {
+                product.data_symbol(DataId::from_u32(index))
+            }
+            ref other => return Err(format!("a relocation by its ELF type against {other}")),
+        };
+        let own = product.object.symbol(product.function_symbol(self.func));
+        let write::SymbolSection::Section(section) = own.section else {
+            return Err("a function that is not in a section".to_owned());
+        };
+        let relocation = write::Relocation {
+            offset: own.value + u64::from(self.reloc.offset),
+            symbol,
+            addend: self.reloc.addend,
+            flags: object::RelocationFlags::Elf {
+                r_type: object::elf::RelocationType(self.r_type),
+            },
+        };
+        product.object.add_relocation(section, relocation).map_err(|e| e.to_string())
+    }
+}
 
 fn selected_target() -> Result<&'static Target> {
     Target::selected().map_err(CodegenError::Backend)
@@ -1222,6 +1282,9 @@ struct VariadicRegisters {
     arch: Arch,
     ints: u32,
     floats: u32,
+    /// How many bytes of the caller's stack the named parameters take, which the variable
+    /// arguments there come after.
+    stack: u32,
 }
 
 impl VariadicRegisters {
@@ -1235,7 +1298,10 @@ impl VariadicRegisters {
     }
 
     fn named(sig: &Signature, arch: Arch) -> Result<Self> {
-        let mut named = VariadicRegisters { arch, ints: 0, floats: 0 };
+        let mut named = VariadicRegisters { arch, ints: 0, floats: 0, stack: 0 };
+        if arch == Arch::Aarch64 {
+            return named.aapcs64(sig);
+        }
         for param in &sig.params {
             match param.value_type {
                 // AAPCS64 has a register of its own for where the result goes.
@@ -1256,26 +1322,40 @@ impl VariadicRegisters {
         Ok(named)
     }
 
-    /// Turns down named parameters that Apple's AArch64 convention has on the stack, where
-    /// the variable arguments then do not start.
-    fn all_in_registers(sig: &Signature) -> Result<()> {
-        const EACH: u32 = 8;
-        let (mut ints, mut floats) = (0, 0);
+    /// Where AAPCS64, as Cranelift has it, puts the named parameters: in the next register
+    /// of their kind, or on the stack when those are out, in eight bytes each and a 128-bit
+    /// integer in sixteen at a multiple of sixteen.
+    fn aapcs64(mut self, sig: &Signature) -> Result<Self> {
+        let each = Self::int_count(self.arch);
         for param in &sig.params {
-            match param.value_type {
+            let on_stack = match param.value_type {
                 // The address of what is returned has a register of its own.
-                _ if param.purpose == ArgumentPurpose::StructReturn => (),
-                ty if param.purpose == ArgumentPurpose::Normal && ty.is_int() => {
-                    ints += ty.bytes().div_ceil(8)
+                _ if param.purpose == ArgumentPurpose::StructReturn => continue,
+                _ if param.purpose != ArgumentPurpose::Normal => {
+                    unsupported!("a variadic function with a named aggregate on the stack")
                 }
-                types::F32 | types::F64 if param.purpose == ArgumentPurpose::Normal => floats += 1,
+                types::I128 => {
+                    let first = self.ints + self.ints % 2;
+                    if first + 2 <= each {
+                        self.ints = first + 2;
+                        continue;
+                    }
+                    16
+                }
+                ty if ty.is_int() && self.ints < each => {
+                    self.ints += 1;
+                    continue;
+                }
+                types::F32 | types::F64 if self.floats < Self::FLOATS => {
+                    self.floats += 1;
+                    continue;
+                }
+                ty if ty.is_int() || ty.is_float() && ty.bytes() <= 8 => 8,
                 ty => unsupported!("a variadic function with a named {ty}"),
-            }
+            };
+            self.stack = self.stack.next_multiple_of(on_stack) + on_stack;
         }
-        if ints > EACH || floats > EACH {
-            unsupported!("a variadic function with a named parameter on the stack");
-        }
-        Ok(())
+        Ok(self)
     }
 
     /// Adds the registers the named parameters left to `sig`, so that the function is given
@@ -1337,8 +1417,11 @@ impl HomedRegisters {
 enum Variadic {
     SystemV(VariadicRegisters),
     Windows(HomedRegisters),
-    /// All of them on the stack, right above the frame record.
-    Apple,
+    /// All of them on the stack, after the `named` bytes of it that the named parameters
+    /// take.
+    Apple {
+        named: u32,
+    },
 }
 
 impl Variadic {
@@ -1351,8 +1434,7 @@ impl Variadic {
             }
             Some(VariableArguments::Homed) => Some(Variadic::Windows(HomedRegisters::named(sig)?)),
             Some(VariableArguments::Stack) => {
-                VariadicRegisters::all_in_registers(sig)?;
-                Some(Variadic::Apple)
+                Some(Variadic::Apple { named: Self::apple_stack(sig)? })
             }
             None => None,
         })
@@ -1362,8 +1444,36 @@ impl Variadic {
         match self {
             Variadic::SystemV(named) => named.rest(sig),
             Variadic::Windows(named) => named.rest(sig),
-            Variadic::Apple => (),
+            Variadic::Apple { .. } => (),
         }
+    }
+
+    /// How many bytes of stack the named parameters of `sig` take under Apple's AArch64
+    /// convention: the ones the eight registers of their kind do not hold, each at a
+    /// multiple of its own size. The variable arguments start at the next multiple of eight.
+    fn apple_stack(sig: &Signature) -> Result<u32> {
+        const EACH: u32 = 8;
+        let (mut ints, mut floats, mut stack) = (0, 0, 0u32);
+        for param in &sig.params {
+            let ty = param.value_type;
+            let used = match param.purpose {
+                // The address of what is returned has a register of its own.
+                ArgumentPurpose::StructReturn => continue,
+                ArgumentPurpose::Normal if ty.is_int() => &mut ints,
+                ArgumentPurpose::Normal if ty == types::F32 || ty == types::F64 => &mut floats,
+                _ => unsupported!("a variadic function with a named {ty}"),
+            };
+            // A 128-bit integer is in two registers or in none.
+            let registers = ty.bytes().div_ceil(8);
+            if *used + registers <= EACH {
+                *used += registers;
+            } else {
+                // And nothing after it is in a register of that kind.
+                *used = EACH;
+                stack = stack.next_multiple_of(ty.bytes()) + ty.bytes();
+            }
+        }
+        Ok(stack.next_multiple_of(8))
     }
 }
 
@@ -1723,25 +1833,60 @@ fn source_location<'db>(
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
-    let mut range = source.value.syntax_node_ptr().text_range();
     if let MirSpan::ExprEnd(_) = span {
         // The brace that closes a block, which is where rustc has a scope left.
+        let range = source.value.syntax_node_ptr().text_range();
         let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
         return location_of(db, source.file_id, TextRange::new(last?, range.end()));
     }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
-        // A method call is reported from the method's name on.
-        let root = source.file_id.parse_or_expand(db);
-        let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
-    }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
-        // An index is reported from its bracket on.
-        let root = source.file_id.parse_or_expand(db);
-        let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
-    }
+    let range = match span {
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+        _ => source.value.syntax_node_ptr().text_range(),
+    };
     location_of(db, source.file_id, range)
+}
+
+/// The part of an expression that rustc's span of it covers where it panics: a method call
+/// from the method's name on, an index through `Index` from its bracket on, and any other
+/// expression together with the parentheses it is written in.
+fn reported_range(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -1828,8 +1973,23 @@ fn location_of(
     let before = text.get(..usize::from(range.start()))?;
     let line_start = before.rfind('\n').map_or(0, |it| it + 1);
     let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
-    let col = before[line_start..].chars().count() + 1;
+    let col = before[line_start..].chars().map(column_width).sum::<usize>() + 1;
     Some((file_id, line as u32, col as u32))
+}
+
+/// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
+/// its display width, four for a tab, and one for the control characters rustc prints a
+/// visible character for.
+fn column_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        '\0'..='\u{8}'
+        | '\u{b}'..='\u{1f}'
+        | '\u{7f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}' => 1,
+        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
+    }
 }
 
 fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {
@@ -1883,16 +2043,35 @@ fn compile<'db>(
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
-        Some(text) => Code {
-            signature: ctx.func.signature.clone(),
-            bytes: asm::assemble(&isa.triple().to_string(), &text)
-                .map_err(CodegenError::Unsupported)?
-                .to_vec(),
-            align: 16,
-            relocs: Vec::new(),
-            unwind: None,
-            lines: Vec::new(),
-        },
+        Some((text, syms)) => {
+            let assembled = asm::assemble(&isa.triple().to_string(), &text)
+                .map_err(CodegenError::Unsupported)?;
+            let relocs = assembled.relocs.iter().map(|named| {
+                let name = syms.get(named.operand as usize).cloned().flatten()?;
+                Some(ModuleReloc {
+                    offset: named.offset,
+                    kind: named.kind,
+                    name,
+                    addend: named.addend,
+                })
+            });
+            let Some(relocs) = relocs.collect() else {
+                unsupported!("inline assembly that names a symbol");
+            };
+            Code {
+                signature: ctx.func.signature.clone(),
+                bytes: assembled.code.clone(),
+                align: 16,
+                relocs,
+                elf_types: assembled
+                    .relocs
+                    .iter()
+                    .filter_map(|named| Some((named.offset, named.elf_type?)))
+                    .collect(),
+                unwind: None,
+                lines: Vec::new(),
+            }
+        }
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
     let source = match body.map(|body| body.owner) {
@@ -1957,6 +2136,7 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        index_spans: Default::default(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -2029,6 +2209,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .iter()
                 .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
                 .collect(),
+            elf_types: Vec::new(),
             unwind: FunctionUnwind::of(isa, ctx)?,
             lines: LineRow::of_ranges(
                 compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
@@ -2062,6 +2243,7 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
         bytes,
         align: 1,
         relocs,
+        elf_types: Vec::new(),
         unwind: None,
         lines: Vec::new(),
     })
@@ -2171,6 +2353,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             type_ids: FxHashMap::default(),
             misfit: false,
             own_statics,
+            elf_relocs: Vec::new(),
         })
     }
 
@@ -2180,6 +2363,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
+        for reloc in &self.elf_relocs {
+            reloc.add(&mut product).map_err(CodegenError::Backend)?;
+        }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         if let Some(debug) = self.debug {
             debug.emit(&mut product).map_err(CodegenError::Backend)?;
@@ -2869,7 +3055,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn define_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) -> Result<()> {
-        self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
+        if code.elf_types.is_empty() {
+            self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
+        } else {
+            // Cranelift is given the relocations it has a kind for, and `finish` adds the
+            // others to the object.
+            let elf_type = |reloc: &ModuleReloc| {
+                code.elf_types.iter().find(|(offset, _)| *offset == reloc.offset).map(|it| it.1)
+            };
+            let (by_type, plain): (Vec<_>, Vec<_>) =
+                relocs.iter().cloned().partition(|reloc| elf_type(reloc).is_some());
+            self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
+            self.elf_relocs.extend(by_type.into_iter().filter_map(|reloc| {
+                let r_type = elf_type(&reloc)?;
+                Some(ElfReloc { func: id, reloc, r_type })
+            }));
+        }
         if let Some(unwind) = &code.unwind {
             self.unwind
                 .add_function(&mut self.module, id, unwind)
@@ -2932,13 +3133,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         let triple = self.module.isa().triple().to_string();
-        let code = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
+        let assembled = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
         let name = format!("rustd::asm::{}", self.assemblies.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.module.define_function_bytes(id, 16, &code, &[])?;
+        self.module.define_function_bytes(id, 16, &assembled.code, &[])?;
         self.assemblies.insert(text.to_owned(), id);
         Ok(id)
     }
@@ -3060,13 +3261,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         } else {
             self.declare_local_data(compiled.writable)?
         };
+        // One the build after this may replace where it is has to say how large it is.
+        let named = (again.is_some() || self.patching) && !thread_local;
+        let section =
+            named.then(|| Target::current().section_of_static(compiled.writable)).flatten();
         let known = if compiled.writable { &mut self.statics } else { &mut self.frozen_statics };
         known.insert(id, data);
         let begun = self.own_static_order.len();
         self.own_static_order.push(id);
         match self.resolve(&compiled.requests) {
             Ok(ids) => {
-                self.fill_data(data, ids.blob(&compiled.blob))?;
+                self.fill_data(data, ids.blob(&compiled.blob), section)?;
                 Ok(data)
             }
             Err(e) => {
@@ -3081,7 +3286,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     fn_relocs: Vec::new(),
                     align: 1,
                 };
-                self.fill_data(data, nothing)?;
+                self.fill_data(data, nothing, section)?;
                 Err(e)
             }
         }
@@ -3654,7 +3859,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         let id = self.declare_local_data(writable)?;
-        self.fill_data(id, blob)?;
+        self.fill_data(id, blob, None)?;
         if let Some(blob) = shared {
             self.consts.insert(blob, id);
         }
@@ -3669,8 +3874,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
-    fn fill_data(&mut self, id: DataId, blob: ConstBlob) -> Result<()> {
+    /// Defines `id` as `blob`, in a section of its own named `section` when there is one.
+    fn fill_data(&mut self, id: DataId, blob: ConstBlob, section: Option<&str>) -> Result<()> {
         let mut data = DataDescription::new();
+        if let Some(section) = section {
+            data.set_custom_section(section);
+        }
         data.define(blob.bytes.into_boxed_slice());
         data.set_align(blob.align);
         for (offset, target, addend) in blob.relocs {
@@ -3875,6 +4084,8 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The index expression each local that holds an index was made for.
+    index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -4231,13 +4442,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) -> Result<FnAbi> {
         let (mut int_regs, mut sse_regs) = (6usize, 8usize);
         let ret = match self.c_pass_mode(ret)? {
-            PassMode::OnStack(_) => {
+            PassMode::OnStack { .. } => {
                 // The pointer to the return value takes the first integer register.
                 int_regs -= 1;
                 PassMode::Indirect
             }
             mode => mode,
         };
+        // How many bytes of the stack the arguments before this one take, as Cranelift
+        // places them.
+        let mut stack = 0u32;
         let mut modes = Vec::new();
         for ty in args {
             if self.decays_in_c(ty)? {
@@ -4247,7 +4461,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             let mode = self.c_pass_mode(ty)?;
             let (ints, sses) = match mode {
-                PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (0, 0),
+                PassMode::Ignore | PassMode::Indirect | PassMode::OnStack { .. } => (0, 0),
                 PassMode::Direct(s) => self.count_regs(&[s.ty]),
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
@@ -4255,15 +4469,44 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
-            modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
-                (Some(int_left), Some(sse_left)) => {
+            let in_registers = match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
+                (Some(int_left), Some(sse_left)) if !matches!(mode, PassMode::OnStack { .. }) => {
                     (int_regs, sse_regs) = (int_left, sse_left);
+                    true
+                }
+                _ => false,
+            };
+            modes.push(match mode {
+                _ if in_registers => mode,
+                // Out of registers, or too large for them: an aggregate goes to memory
+                // whole, at a multiple of its alignment.
+                _ if aggregate || matches!(mode, PassMode::OnStack { .. }) => {
+                    let layout = self.layout(ty)?;
+                    let size = layout.size.bytes().next_multiple_of(8) as u32;
+                    let padded = match layout.align.abi.bytes() {
+                        ..=8 => false,
+                        16 => stack % 16 != 0,
+                        // FIXME: the stack is at a multiple of sixteen and no more when a
+                        // function is called.
+                        _ => unsupported!("an argument in memory aligned to more than 16 bytes"),
+                    };
+                    stack += size + if padded { 8 } else { 0 };
+                    PassMode::OnStack { size, padded }
+                }
+                // Cranelift moves anything else to the stack by itself: eight bytes for
+                // each value, and a 128-bit integer whole at a multiple of sixteen.
+                PassMode::Direct(AbiScalar { ty: types::I128, .. }) => {
+                    stack = stack.next_multiple_of(16) + 16;
                     mode
                 }
-                // Out of registers: an aggregate goes to memory whole. Cranelift moves
-                // anything else to the stack by itself.
-                _ if aggregate => PassMode::OnStack(self.layout(ty)?.size.bytes() as u32),
-                _ => mode,
+                PassMode::Pair(..) => {
+                    stack += 16;
+                    mode
+                }
+                _ => {
+                    stack += 8;
+                    mode
+                }
             });
         }
         Ok(FnAbi { ret, args: modes })
@@ -4308,16 +4551,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if wide {
                         // Cranelift starts it at an even register, or puts it on the stack
                         // whole. The registers it did not fit in stay free there, where
-                        // the convention has them out of use: turn down what would use one.
-                        *used += *used % even;
-                        if *used + 2 > REGS && *used < REGS {
-                            unsupported!("a 128-bit argument that the registers left do not hold");
+                        // the convention has them out of use.
+                        let skipped = REGS - *used;
+                        if *used + *used % even + 2 <= REGS {
+                            *used += *used % even + 2;
+                            PassMode::Direct(scalar)
+                        } else {
+                            *used = REGS;
+                            PassMode::Uniform { unit: types::I128, count: 1, skipped }
                         }
-                        *used = (*used + 2).min(REGS);
                     } else {
                         *used = (*used + 1).min(REGS);
+                        PassMode::Direct(scalar)
                     }
-                    PassMode::Direct(scalar)
                 }
                 Aapcs64::Floats { unit, count } if floats + count <= REGS => {
                     floats += count;
@@ -4335,14 +4581,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if ints + odd + count <= REGS {
                         ints += odd + count;
                         Self::aapcs64_ints(size, odd)
-                    } else if align > 8 {
-                        // FIXME: the stack is where it goes, at an address that is a
-                        // multiple of sixteen, which the units of a `Uniform` are not at.
-                        unsupported!("an aggregate aligned to 16 bytes passed on the stack");
                     } else {
                         let skipped = REGS - ints;
                         ints = REGS;
-                        PassMode::Uniform { unit: types::I64, count, skipped }
+                        // On the stack, one aligned to sixteen bytes is at a multiple of
+                        // sixteen, as a 128-bit integer is.
+                        match align > 8 {
+                            true => PassMode::Uniform { unit: types::I128, count: 1, skipped },
+                            false => PassMode::Uniform { unit: types::I64, count, skipped },
+                        }
                     }
                 }
                 Aapcs64::Memory => {
@@ -4401,7 +4648,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if size > 16 {
             return Ok(Aapcs64::Memory);
         }
-        Ok(Aapcs64::Ints { size, align: layout.align.abi.bytes() })
+        // rustc has one aligned to sixteen bytes in units of 128 bits, which start at an
+        // even register and at a multiple of sixteen on the stack. AAPCS64 goes by the
+        // alignment the fields ask for, and Apple by the one `repr(align)` may have raised.
+        let align = match self.cg.target.call_conv {
+            isa::CallConv::AppleAarch64 => layout.align.abi,
+            _ => layout.unadjusted_abi_align,
+        };
+        Ok(Aapcs64::Ints { size, align: align.bytes() })
     }
 
     /// Every scalar a value of the C ABI is made of, with where in the value it is.
@@ -4540,7 +4794,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(PassMode::Ignore);
         }
         let size = layout.size.bytes();
-        let on_stack = PassMode::OnStack(size.next_multiple_of(8) as u32);
+        let on_stack = PassMode::OnStack { size: size.next_multiple_of(8) as u32, padded: false };
         match layout.backend_repr {
             BackendRepr::Scalar(scalar) => return Ok(PassMode::Direct(self.scalar(scalar)?)),
             BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
@@ -4648,11 +4902,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
             PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
             PassMode::Uniform { unit, count, skipped } => {
-                params.extend((0..skipped + count).map(|_| AbiParam::new(unit)))
+                params.extend((0..skipped).map(|_| AbiParam::new(PassMode::register(unit))));
+                params.extend((0..count).map(|_| AbiParam::new(unit)));
             }
             PassMode::Indirect => params.push(AbiParam::new(ptr())),
-            PassMode::OnStack(size) => {
-                params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size)))
+            PassMode::OnStack { size, padded } => {
+                let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
+                params.extend(padded.then(|| copied(8)));
+                params.push(copied(size));
             }
         }
     }
@@ -4709,7 +4966,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Uniform { unit, count, skipped } => {
                 for _ in 0..skipped {
-                    values.push(self.zero(unit));
+                    values.push(self.zero(PassMode::register(unit)));
                 }
                 let step = u64::from(unit.bytes());
                 for index in 0..u64::from(count) {
@@ -4724,7 +4981,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
             }
-            PassMode::OnStack(_) => values.push(addr),
+            PassMode::OnStack { padded, .. } => {
+                if padded {
+                    values.push(self.scratch());
+                }
+                values.push(addr);
+            }
         }
     }
 
@@ -4738,7 +5000,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) {
         let mut next = || values.next().expect("a value for every abi parameter");
         match mode {
-            PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (),
+            PassMode::Ignore | PassMode::Indirect | PassMode::OnStack { .. } => (),
             PassMode::Direct(_) => {
                 let value = next();
                 self.builder.ins().store(MEM, value, addr, 0);
@@ -4959,7 +5221,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             body.param_locals.iter().zip(&param_layouts).zip(param_modes)
         {
             let addr = match mode {
-                PassMode::Indirect | PassMode::OnStack(_) => {
+                PassMode::OnStack { padded: true, .. } => {
+                    incoming.nth(1).expect("a parameter in memory after its padding")
+                }
+                PassMode::Indirect | PassMode::OnStack { .. } => {
                     incoming.next().expect("indirect param")
                 }
                 _ => self.stack_slot(layout),
@@ -5019,10 +5284,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if named.arch == Arch::Aarch64 {
                 // The list has where each kind of saved register ends, and how far before
                 // that the next one is. The arguments on the stack are above the frame
-                // pointer and the return address: no named parameter is among them. Asking
-                // for the frame pointer here is what has `emit` keep one.
+                // pointer and the return address, the named ones first. Asking for the
+                // frame pointer here is what has `emit` keep one.
                 let frame = self.builder.ins().get_frame_pointer(ptr());
-                let stack = self.builder.ins().iadd_imm(frame, 16);
+                let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named.stack));
                 let ints_end = self.builder.ins().iadd_imm(saved, i64::from(int_count * 8));
                 let floats_end =
                     self.builder.ins().iadd_imm(saved, i64::from(int_count * 8 + floats_bytes));
@@ -5047,18 +5312,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
-        if let Some(Variadic::Apple) = variadic {
+        if let Some(Variadic::Apple { named }) = variadic {
             let list = *body.param_locals.last().expect("the list of a variadic function");
             let layout = self.layout(body.locals[list].ty.as_ref())?;
             if layout.size.bytes() != 8 {
                 unsupported!("a `VaList` that is not the one of this target");
             }
             let addr = self.stack_slot(&layout);
-            // The named parameters are all in registers, so the first of the variable ones
-            // is the first thing the caller left on the stack: what is right above the
-            // frame record, which is the frame pointer and the return address.
+            // What the caller left on the stack is right above the frame record, which is
+            // the frame pointer and the return address: the named parameters that are
+            // there, then the variable ones.
             let frame = self.builder.ins().get_frame_pointer(ptr());
-            let stack = self.builder.ins().iadd_imm(frame, 16);
+            let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named));
             self.builder.ins().store(MEM, stack, addr, 0);
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
@@ -5229,6 +5494,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.index_spans = index_spans(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -5247,6 +5513,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                     StatementKind::Deinit(_) => unsupported!("deinit"),
                     StatementKind::InlineAsm(asm) => self.inline_asm(asm)?,
+                    // A place that is matched on and not read is still indexed, and the
+                    // index is checked: `let _ = items[at]` panics when `at` is out of bounds.
+                    StatementKind::FakeRead(place) if is_indexed(place) => {
+                        self.place(place)?;
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::FakeRead(_)
@@ -5279,6 +5550,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
+        let mut parted: Vec<LocalId> = Vec::new();
+        for moved in &self.moved_paths {
+            if !parted.contains(&moved.local) {
+                parted.push(moved.local);
+            }
+        }
+        let parted_at_end = body.parted_at_block_ends(&parted, |place| self.moves_part(place));
         let drops = std::mem::take(&mut self.deferred_drops);
         let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
             true => FxHashMap::default(),
@@ -5287,6 +5565,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (block, place, target, span, from) in drops {
             self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
+            // A local that has not lost a part on any way here is dropped as one value.
+            let whole = parted
+                .iter()
+                .position(|&it| it == place.local)
+                .is_none_or(|at| !parted_at_end[from][at]);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
@@ -5305,7 +5588,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let dropped = self.builder.create_block();
                     self.guarded(
                         |this| {
-                            this.drop_place(&place, dropped)?;
+                            this.drop_place(&place, false, dropped)?;
                             this.builder.switch_to_block(dropped);
                             Ok(())
                         },
@@ -5317,7 +5600,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     )?;
                     self.builder.ins().jump(target, &[]);
                 }
-                _ => self.drop_place(&place, target)?,
+                _ => self.drop_place(&place, whole, target)?,
             }
         }
         self.moved_here = None;
@@ -5402,10 +5685,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some((path, ty))
     }
 
-    /// Says that the fields of `place` are all there again, after an assignment to it.
+    /// Whether using `place` as an operand moves a part out of its local, as far as is known.
+    fn moves_part(&self, place: &StoredPlace) -> bool {
+        let is_moved = |path: &Vec<u32>| {
+            self.moved_paths.iter().any(|it| it.local == place.local && it.path == *path)
+        };
+        self.moved_out_paths(place).is_none_or(|paths| paths.iter().any(is_moved))
+    }
+
+    /// Says that the fields of `place` are all there again, after an assignment to it. A
+    /// subslice of an array is its elements, as it is for a move out.
     fn clear_moved(&mut self, place: &StoredPlace) {
         if !self.drop_flags.contains_idx(place.local)
-            || self.field_path(place).is_none_or(|it| it.is_empty())
+            || self.moved_out_paths(place).is_none_or(|it| it.iter().any(Vec::is_empty))
         {
             return;
         }
@@ -5418,11 +5710,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn clear_moved_now(&mut self, place: &StoredPlace) {
-        let (Some(&flag), Some(path)) = (self.drop_flags.get(place.local), self.field_path(place))
+        let (Some(&flag), Some(paths)) =
+            (self.drop_flags.get(place.local), self.moved_out_paths(place))
         else {
             return;
         };
-        let within = |it: &&MovedPath| it.local == place.local && it.path.starts_with(&path);
+        let within = |it: &&MovedPath| {
+            it.local == place.local && paths.iter().any(|path| it.path.starts_with(path))
+        };
         let mask = self.moved_paths.iter().filter(within).fold(0u64, |mask, it| mask | 1 << it.bit);
         if mask != 0 {
             let state = flag.load(&mut self.builder);
@@ -5445,8 +5740,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(bit)
     }
 
-    /// Drops what is left of a place, which is nothing if its local holds no value.
-    fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
+    /// Drops what is left of a place, which is nothing if its local holds no value. `whole`
+    /// says that no part of the local can have been moved out.
+    fn drop_place(&mut self, place: &StoredPlace, whole: bool, target: ir::Block) -> Result<()> {
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -5464,7 +5760,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let local = place.local;
         let place = self.place_ref(place)?;
-        self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        if whole {
+            self.drop_value(place.addr, place.meta, place.ty.ty)?;
+        } else {
+            self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        }
         self.builder.ins().jump(target, &[]);
         Ok(())
     }
@@ -5861,7 +6161,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
                     let index = self.builder.ins().load(ptr(), MEM, self.locals[*local].addr, 0);
+                    // An index out of bounds is reported at the index expression, which may be
+                    // an operand of the statement that reads it.
+                    let statement = self.span;
+                    self.span = self.index_spans.get(local).copied().unwrap_or(statement);
                     addr = self.element(addr, meta, prev.ty, index)?;
+                    self.span = statement;
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -6525,8 +6830,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn inline_asm(&mut self, block: &crate::mir::InlineAsm) -> Result<()> {
         use crate::mir::AsmOperand;
         let mut operands = Vec::with_capacity(block.operands.len());
+        let mut syms = Vec::with_capacity(block.operands.len());
         for operand in &block.operands {
+            syms.push(match operand {
+                AsmOperand::Sym(_) if !block.naked => unsupported!("`asm!` with a `sym`"),
+                AsmOperand::Sym(Operand { kind: OperandKind::Static(id), .. }) => {
+                    if is_thread_local(self.cg.db, *id) {
+                        unsupported!("inline assembly with a `sym` that is thread local");
+                    }
+                    Some(ModuleRelocTarget::user(1, self.cg.static_data(*id).as_u32()))
+                }
+                AsmOperand::Sym(function) => {
+                    let ty = self.operand_ty(function)?;
+                    Some(ModuleRelocTarget::user(0, self.fn_item(ty)?.as_u32()))
+                }
+                AsmOperand::Reg { .. } | AsmOperand::Const(_) | AsmOperand::Label => None,
+            });
             operands.push(match operand {
+                AsmOperand::Sym(_) => asm::Operand::Sym,
                 AsmOperand::Reg { reg, input, output } => {
                     let mut size = None;
                     let tys = [
@@ -6588,7 +6909,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;
-            self.cg.naked = Some(text);
+            self.cg.naked = Some((text, syms));
             return Ok(());
         }
         let wrapper = asm::wrapper(&self.cg.target, &block.template, block.options, &operands)
@@ -8320,7 +8641,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (&ty, mode) in fn_sig.inputs().iter().zip(modes) {
             let layout = self.layout(ty)?;
             let addr = match mode {
-                PassMode::Indirect | PassMode::OnStack(_) => {
+                PassMode::OnStack { padded: true, .. } => {
+                    incoming.nth(1).expect("a parameter in memory after its padding")
+                }
+                PassMode::Indirect | PassMode::OnStack { .. } => {
                     incoming.next().expect("indirect param")
                 }
                 _ => self.stack_slot(&layout),
@@ -9073,17 +9397,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     Some(VariableArguments::Homed | VariableArguments::Stack)
                 ) =>
             {
-                let scalar = self.scalar_of(dst_ty)?;
-                if scalar.ty.bytes() > 8 {
-                    unsupported!("`va_arg` of {dst_ty:?}");
+                let size = self.layout(dst_ty)?.size;
+                let bytes = size.bytes() as i64;
+                let homed = self.cg.target.variable_arguments() == Some(VariableArguments::Homed);
+                // Windows has what does not fill a register exactly behind an address, which
+                // is what the caller passed: a copy of its own.
+                let by_reference = homed && !matches!(bytes, 1 | 2 | 4 | 8);
+                // Apple has a scalar wider than eight bytes at a multiple of its size.
+                let aligned = !homed && bytes > 8;
+                if aligned {
+                    self.scalar_of(dst_ty)?;
                 }
-                // The list is the address of the next argument, each of them in eight bytes.
+                // The list is the address of the next argument, each of them in eight bytes,
+                // or in as many as it is wide.
                 let (list, _) = self.load_scalar(list)?;
-                let from = self.builder.ins().load(ptr(), MEM, list, 0);
-                let next = self.builder.ins().iadd_imm(from, 8);
+                let mut slot = self.builder.ins().load(ptr(), MEM, list, 0);
+                if aligned {
+                    slot = self.builder.ins().iadd_imm(slot, bytes - 1);
+                    slot = self.builder.ins().band_imm(slot, -bytes);
+                }
+                let step = if homed { 8 } else { (bytes + 7) & !7 };
+                let next = self.builder.ins().iadd_imm(slot, step);
                 self.builder.ins().store(MEM, next, list, 0);
-                let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
-                self.builder.ins().store(MEM, value, dst, 0);
+                let from = match by_reference {
+                    true => self.builder.ins().load(ptr(), MEM, slot, 0),
+                    false => slot,
+                };
+                self.copy(dst, from, size);
             }
             ("va_arg", [list]) => {
                 if self.cg.target.variable_arguments() != Some(VariableArguments::Registers) {
@@ -9091,11 +9431,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 let arch = self.cg.target.arch;
                 let scalar = self.scalar_of(dst_ty)?;
-                if scalar.ty.bytes() > 8 {
+                // A 128-bit integer is in two registers that start at an even one, or in
+                // sixteen bytes of the stack at a multiple of sixteen.
+                let wide = scalar.ty == types::I128 && arch == Arch::Aarch64;
+                if scalar.ty.bytes() > 8 && !wide {
                     unsupported!("`va_arg` of {dst_ty:?}");
                 }
                 let float = scalar.ty.is_float();
-                let step = if float { VariadicRegisters::FLOAT_BYTES } else { 8 };
+                let step = match (float, wide) {
+                    (true, _) => VariadicRegisters::FLOAT_BYTES,
+                    (false, true) => 16,
+                    (false, false) => 8,
+                };
                 let (list, _) = self.load_scalar(list)?;
                 let [saved, stack, done] = [(); 3].map(|()| self.builder.create_block());
                 self.builder.append_block_param(done, ptr());
@@ -9105,19 +9452,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // The list counts up to zero, from the end of what was saved.
                     let (at, end) = if float { (28, 16) } else { (24, 8) };
                     let offset = self.builder.ins().load(types::I32, MEM, list, at);
-                    let fits = self.builder.ins().icmp_imm(
-                        IntCC::SignedLessThanOrEqual,
-                        offset,
-                        -i64::from(step),
-                    );
+                    let some = self.builder.create_block();
+                    let none =
+                        self.builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, offset, 0);
+                    self.builder.ins().brif(none, stack, &[], some, &[]);
+
+                    // What does not fit in the registers left takes them out of use.
+                    self.builder.switch_to_block(some);
+                    let offset = match wide {
+                        true => {
+                            let up = self.builder.ins().iadd_imm(offset, 15);
+                            self.builder.ins().band_imm(up, -16)
+                        }
+                        false => offset,
+                    };
+                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
+                    self.builder.ins().store(MEM, next, list, at);
+                    let fits = self.builder.ins().icmp_imm(IntCC::SignedLessThanOrEqual, next, 0);
                     self.builder.ins().brif(fits, saved, &[], stack, &[]);
 
                     self.builder.switch_to_block(saved);
                     let area = self.builder.ins().load(ptr(), MEM, list, end);
-                    let wide = self.builder.ins().sextend(ptr(), offset);
-                    let from = self.builder.ins().iadd(area, wide);
-                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
-                    self.builder.ins().store(MEM, next, list, at);
+                    let far = self.builder.ins().sextend(ptr(), offset);
+                    let from = self.builder.ins().iadd(area, far);
                     self.builder.ins().jump(done, &[from.into()]);
                     0
                 } else {
@@ -9148,7 +9505,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
                 self.builder.switch_to_block(stack);
                 let from = self.builder.ins().load(ptr(), MEM, list, stack_at);
-                let next = self.builder.ins().iadd_imm(from, 8);
+                let from = match wide {
+                    true => {
+                        let up = self.builder.ins().iadd_imm(from, 15);
+                        self.builder.ins().band_imm(up, -16)
+                    }
+                    false => from,
+                };
+                let next = self.builder.ins().iadd_imm(from, if wide { 16 } else { 8 });
                 self.builder.ins().store(MEM, next, list, stack_at);
                 self.builder.ins().jump(done, &[from.into()]);
 
@@ -10316,7 +10680,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
                 self.at(end);
             }
-            self.drop_place(&place, next)?;
+            self.drop_place(&place, false, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
@@ -11211,6 +11575,24 @@ fn dump_mir(body: &MirBody<'_>) {
             eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
         }
     }
+}
+
+/// Whether a place is an element of an array or slice at an index that is only known when
+/// the program runs.
+fn is_indexed(place: &StoredPlace) -> bool {
+    place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_)))
+}
+
+/// Where each local of a body starts to live. A local that holds the index of `base[index]`
+/// starts at that expression.
+fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+    statements
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => Some((local, statement.span)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The locals a body drops whole, in the order of the blocks that drop them when each block

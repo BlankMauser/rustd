@@ -43,8 +43,20 @@ vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
-rusty-s3 = "0.10.2"
-ureq = "3.4.2"
+# Without the features that bring a second HTTP and TLS stack (`rustls`), a C library built
+# with cmake (`default-https-client`, which is aws-lc) and SigV4A. The client is hyper 1 over
+# rustls with ring, which is in the tree already.
+aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1.100", default-features = false, features = ["behavior-version-latest", "rt-tokio", "http-1x"] }
+# The TLS the client above is built on, named to tell a certificate that is refused from a
+# network that is down.
+rustls = { version = "0.23", default-features = false }
+aws-smithy-http-client = { version = "1.1", features = ["rustls-ring"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ed25519-dalek = "2.2"
+getrandom = "0.3"
+url.workspace = true
 tar = "0.4.44"
 zstd = "0.13.3"
 tikv-jemallocator = { version = "0.5.4", optional = true, features = ["profiling"] }

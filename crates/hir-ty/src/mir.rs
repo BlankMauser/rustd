@@ -1011,6 +1011,8 @@ pub enum AsmOperand {
     Const(Operand),
     /// A `label` block, which the template jumps to.
     Label,
+    /// A function or a static, which the template names.
+    Sym(Operand),
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1410,6 +1412,56 @@ impl MirBody<'_> {
         HeldLocals { locals, yields, conflicts, flagged, parts }
     }
 
+    /// For the end of each block, which of `locals` may have had a part moved out since the
+    /// local last got a whole value. `moves` says whether using a place as an operand takes its
+    /// value, which the operand does not say.
+    pub fn parted_at_block_ends(
+        &self,
+        locals: &[LocalId],
+        moves: impl Fn(&StoredPlace) -> bool,
+    ) -> ArenaMap<BasicBlockId, Vec<bool>> {
+        let mut effects: ArenaMap<BasicBlockId, Vec<(usize, bool)>> = ArenaMap::new();
+        let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
+        let (mut starts, mut ends) = (ArenaMap::new(), ArenaMap::new());
+        for (id, _) in self.basic_blocks.iter() {
+            let mut in_block = Vec::new();
+            let next = self.accesses(id, &mut |local, access| {
+                let Some(at) = locals.iter().position(|&it| it == local) else { return };
+                match access {
+                    Access::Part(projection) => {
+                        if moves(&StoredPlace { local, projection }) {
+                            in_block.push((at, true));
+                        }
+                    }
+                    Access::Write => in_block.push((at, false)),
+                    Access::Read | Access::Borrow => (),
+                }
+            });
+            effects.insert(id, in_block);
+            successors.insert(id, next);
+            starts.insert(id, vec![false; locals.len()]);
+            ends.insert(id, vec![false; locals.len()]);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (id, _) in self.basic_blocks.iter() {
+                let mut parted = starts[id].clone();
+                for &(at, is_parted) in &effects[id] {
+                    parted[at] = is_parted;
+                }
+                for &successor in &successors[id] {
+                    for (known, &now) in starts[successor].iter_mut().zip(&parted) {
+                        changed |= now && !*known;
+                        *known |= now;
+                    }
+                }
+                ends.insert(id, parted);
+            }
+        }
+        ends
+    }
+
     /// The locals read after the start of each block before they are written, the ones
     /// borrowed anywhere, and the parts of each that are used as an operand.
     fn liveness(
@@ -1428,7 +1480,9 @@ impl MirBody<'_> {
                 Access::Write => writes[index(local)] = true,
                 Access::Borrow => borrowed[index(local)] = true,
                 Access::Part(part) => {
-                    parted[index(local)].insert(part);
+                    if !part.as_slice().contains(&ProjectionElem::Deref) {
+                        parted[index(local)].insert(part);
+                    }
                 }
             });
             live.insert(id, reads);
@@ -1482,7 +1536,7 @@ impl MirBody<'_> {
         fn operand(operand: &Operand, f: &mut dyn FnMut(LocalId, Access)) {
             if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
                 read(place, f);
-                if !place.projection.as_slice().is_empty() && is_within(place) {
+                if !place.projection.as_slice().is_empty() {
                     f(place.local, Access::Part(place.projection.clone()));
                 }
             }
@@ -1529,7 +1583,7 @@ impl MirBody<'_> {
                                 input.iter().for_each(|it| operand(it, f));
                                 output.iter().for_each(|it| write(it, f));
                             }
-                            AsmOperand::Const(it) => operand(it, f),
+                            AsmOperand::Const(it) | AsmOperand::Sym(it) => operand(it, f),
                             AsmOperand::Label => (),
                         }
                     }
@@ -1641,7 +1695,9 @@ impl MirBody<'_> {
                                         f(output);
                                     }
                                 }
-                                AsmOperand::Const(value) => for_operand(value, &mut f),
+                                AsmOperand::Const(value) | AsmOperand::Sym(value) => {
+                                    for_operand(value, &mut f)
+                                }
                                 AsmOperand::Label => (),
                             }
                         }

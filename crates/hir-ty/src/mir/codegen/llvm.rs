@@ -9,12 +9,13 @@
 //! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
 //! compiled by Cranelift instead.
 
-use std::{cell::RefCell, collections::hash_map::Entry, fmt};
+use std::{cell::RefCell, collections::hash_map::Entry, fmt, sync::Once};
 
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     OptimizationLevel,
     context::Context,
+    llvm_sys::support::LLVMParseCommandLineOptions,
     passes::PassBuilderOptions,
     targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
@@ -51,12 +52,11 @@ pub(super) fn emit(
     } else {
         optimization
     };
-    let context = Context::create();
-    let module = context.create_module("rustd");
-    Machine::with(optimization, |machine| {
+    Machine::with(optimization, |context, machine| {
+        let module = context.create_module("rustd");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
-        tally.time(Phase::Lower, || lower::Lowering::lower(&context, &module, func))?;
+        tally.time(Phase::Lower, || lower::Lowering::lower(context, &module, func))?;
         if std::env::var_os("RUSTD_DUMP_LLVM").is_some() {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }
@@ -86,9 +86,8 @@ pub(super) fn emit(
 /// FIXME: assembly LLVM rejects ends the process: its default diagnostic handler exits on an
 /// error, and inkwell has no way to set another.
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    let context = Context::create();
-    let module = context.create_module("rustd_asm");
-    Machine::with(Optimization::NONE, |machine| {
+    Machine::with(Optimization::NONE, |context, machine| {
+        let module = context.create_module("rustd_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
@@ -102,6 +101,20 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
         Ok(object.as_slice().to_vec())
     })
     .map_err(|e| format!("inline assembly: {e}"))
+}
+
+/// Turns LLVM's SLP vectorizer off for the process. LLVM 20.1's makes one store of several
+/// equal rows of an array of `i128` with lanes of it left as poison, so that part of the
+/// array is never written (`breakers/cases/src/repeat_rows.rs`). The `default<O2>` pipeline
+/// turns the pass on whatever its options say, which leaves the flag the pass itself reads.
+fn disable_slp_vectorizer() {
+    static DISABLED: Once = Once::new();
+    DISABLED.call_once(|| {
+        let arguments = [c"rustd".as_ptr(), c"-vectorize-slp=false".as_ptr()];
+        // SAFETY: the two arguments are C strings that outlive the call, and LLVM is given
+        // their number.
+        unsafe { LLVMParseCommandLineOptions(2, arguments.as_ptr(), std::ptr::null()) }
+    });
 }
 
 impl Optimization {
@@ -125,37 +138,48 @@ impl Optimization {
     }
 }
 
-/// The target as LLVM knows it. One per thread and level: making one costs more than a
-/// small function does.
-struct Machine;
+/// The target as LLVM knows it, one per thread and level: making one costs more than a
+/// small function does. The context the modules are made in is kept with them, as a
+/// machine holds on to things of the last context it compiled a module of: the instruction
+/// selector of AArch64 keeps the source location of the last instruction it saw, and lets
+/// go of it at the next function, by when a context of that one module would be gone.
+#[derive(Default)]
+struct Machine {
+    // Before the context, which has to outlive them.
+    machines: FxHashMap<Optimization, TargetMachine>,
+    context: Option<Context>,
+    /// How many modules were made in the context.
+    modules: usize,
+}
 
 impl Machine {
+    /// How many modules a context is kept for. The constants and source locations of all
+    /// of them stay in it.
+    const MODULES: usize = 1024;
+
     fn with<T>(
         optimization: Optimization,
-        work: impl FnOnce(&TargetMachine) -> Result<T, Unhandled>,
+        work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
-            static MACHINES: RefCell<FxHashMap<Optimization, TargetMachine>> = RefCell::default();
+            static MACHINE: RefCell<Machine> = RefCell::default();
         }
-        // At no optimization LLVM selects AArch64 code with GlobalISel, whose selector
-        // lives in the machine and keeps the debug location of the last instruction it
-        // saw. That location belongs to a context which is gone by the next function,
-        // so such a machine serves one function.
-        let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
-        if emitted.arch == Arch::Aarch64 && optimization.level() == OptimizationLevel::None {
-            return work(&Self::create(optimization)?);
-        }
-        MACHINES.with_borrow_mut(|machines| {
-            let machine = match machines.entry(optimization) {
+        MACHINE.with_borrow_mut(|this| {
+            if this.modules == Self::MODULES {
+                *this = Machine::default();
+            }
+            this.modules += 1;
+            let machine = match this.machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),
                 Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
             };
-            work(machine)
+            work(this.context.get_or_insert_with(Context::create), machine)
         })
     }
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
+        disable_slp_vectorizer();
         match emitted.arch {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
