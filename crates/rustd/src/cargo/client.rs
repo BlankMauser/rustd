@@ -81,7 +81,10 @@ fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
     let read = BufReader::new(stream).read_line(&mut line);
     if !matches!(read, Ok(1..)) {
         let log = home()?.join("daemon.log");
-        anyhow::bail!("the daemon ended before it answered (killed?), its log is {}", log.display());
+        anyhow::bail!(
+            "the daemon ended before it answered (killed?), its log is {}",
+            log.display()
+        );
     }
     serde_json::from_str(&line).context("the daemon's answer is not one of this version")
 }

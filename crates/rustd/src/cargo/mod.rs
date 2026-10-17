@@ -133,7 +133,9 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
     let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
     match reply {
         None => Err(client::why_none()),
-        Some(Reply::Synced { programs }) => Ok(programs.into_iter().map(|it| it.map(drop)).collect()),
+        Some(Reply::Synced { programs }) => {
+            Ok(programs.into_iter().map(|it| it.map(drop)).collect())
+        }
         Some(Reply::Cold { reason }) => Err(reason),
         Some(Reply::Restart { version }) => {
             Err(format!("the daemon running is another build of rustd ({version}), it is replaced"))
