@@ -48,7 +48,7 @@ does not land.
 |---|---|---|---|
 | 1 | Mismatches | Targets whose behaviour differs from rustc. Must be 0. | `harness/difftest.py` |
 | 2 | Skips | Functions rustd did not compile, per crate, by reason. Target 0. | `harness/scoreboard.py` |
-| 3 | Edit latency | Time from file save to runnable binary, split into re-analysis, codegen, link | `harness/bench.py` |
+| 3 | Edit latency | Time from file save to runnable binary, split into re-analysis, codegen, link | `harness/bench.py`, `harness/editbench.py` |
 | 4 | Footprint | Daemon RSS, cold load time | same |
 
 Coverage is counted over functions rustc emitted a symbol for (the ones rustd can replace).
@@ -78,8 +78,12 @@ less work than cargo. Get things working first, then optimise.
 - `harness/cratetest.py <crate-dir>`: the same comparison using a crate's own integration tests.
   Each test binary is relinked with rustd's objects and must report the same result per test.
   `vendor.sh` unpacks a crates.io release for it.
-- `harness/bench.py`: starts the daemon, flips a line back and forth, records the daemon's
+- `harness/editbench.py`: starts the daemon, flips a line back and forth, records the daemon's
   timings and RSS, then times cargo on the same edits. Writes `BENCH.md`.
+- `harness/bench.py`: through `cargo rustd` on pinned ripgrep, cargo and nushell, times a cold
+  build, a build with nothing changed and four kinds of edit against cargo, with the daemon's
+  peak memory and whether each edit was spliced. Writes JSON; `--compare BASELINE` fails over a
+  threshold. Results are in `PERF.md`.
 - A Cranelift panic costs one function (reported as `backend panic`), not the run.
 
 Bugs it has found so far:
