@@ -2016,9 +2016,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok((operand, discr_ty, current))
     }
 
-    /// Lowers `let pat = scrutinee` where it is the whole condition of an `if`, and gives the
-    /// blocks to go on in when the pattern matches and when it does not. No block is on both
-    /// ways, so what is known of the value where the pattern did not match stays known.
+    /// Lowers `let pat = scrutinee` where it is the whole condition of an `if`, in the scope
+    /// the `if` has made for it, and gives the blocks to go on in when the pattern matches and
+    /// when it does not. No block is on both ways, so what is known of the value where the
+    /// pattern did not match stays known.
     fn lower_if_let(
         &mut self,
         condition: ExprId,
@@ -2029,12 +2030,24 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let Some((place, current)) = self.lower_expr_as_place(current, scrutinee, true)? else {
             return Ok(None);
         };
+        if !self.edition().at_least_2024() {
+            self.outlive_innermost_scope();
+        }
         self.push_fake_read(current, place, condition.into());
         let resolver_guard =
             self.resolver.update_to_inner_scope(self.db, self.store_owner, condition);
         let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
         self.resolver.reset_to_guard(resolver_guard);
         Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
+    }
+
+    /// Hands what the innermost scope has declared to the scope around it. Before the 2024
+    /// edition the temporaries of what an `if let` matches on live as long as those of the
+    /// expression the `if` is in, and only what the pattern binds ends with the branch.
+    fn outlive_innermost_scope(&mut self) {
+        if let [.., outer, scope] = &mut self.drop_scopes[..] {
+            outer.locals.append(&mut scope.locals);
+        }
     }
 
     /// Whether these are the arms of the `match` that a `for` loop is written as.

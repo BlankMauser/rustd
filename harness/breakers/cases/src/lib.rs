@@ -51,4 +51,5 @@ cases![
     let_else_temporaries,
     unmatched_array_drop,
     for_tail_temporaries,
+    if_let_temporaries,
 ];
