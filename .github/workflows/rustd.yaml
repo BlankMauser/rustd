@@ -64,3 +64,85 @@ jobs:
           run worktrees.py
           run keys.py
           exit $failed
+
+  windows-checks:
+    name: fmt and tests (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
+
+  windows-harness:
+    name: harness (windows, ${{ matrix.backend }})
+    runs-on: windows-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+      LLVM_VERSION: 20.1.8
+      LLVM_SYS_201_PREFIX: C:\llvm20
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+      # The harnesses run the linker themselves, with the environment the compiler has.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src -c llvm-tools && rustup default 1.99.0
+      - uses: actions/cache@v4
+        id: llvm
+        with:
+          path: C:\llvm20
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+      # The release has the libraries, the headers and `llvm-config`, which is all the build
+      # reads. Its libraries want a static libxml2 that it does not have and that nothing
+      # here calls into, so an archive of nothing stands in for it.
+      - name: LLVM 20
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          name="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc"
+          curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
+          mkdir -p /c/llvm20
+          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe"
+          rm llvm.tar.xz
+          echo '#![no_std]' > nothing.rs
+          rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
+          "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-ar.exe" rc /c/llvm20/lib/libxml2s.lib nothing.o
+      - uses: Swatinem/rust-cache@v2
+      # The release is built against the static C runtime, and names libraries of the SDK
+      # that the linker is not otherwise shown.
+      - name: Build
+        run: |
+          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
+          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
+          cargo build -p rustd --release --features llvm
+      - name: Harnesses
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
+          failed=0
+          run() { echo "::group::$*"; python "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run difftest.py corpus --bin runner --crate cases --layouts
+          run programs.py
+          run stress.py
+          run breakers.py
+          run unwinds.py
+          run splices.py
+          run asmedits.py
+          run includes.py
+          run worktrees.py
+          run keys.py
+          exit $failed

@@ -12,7 +12,7 @@
 use std::{
     borrow::Cow,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock, RwLock,
@@ -113,7 +113,10 @@ pub fn seal_left_open(dir: &Path) {
         if file.try_lock().is_err() {
             continue;
         }
-        if let Ok(pack) = std::fs::read(&path) {
+        // Read through what holds it: Windows keeps everything else out of a locked file,
+        // this process too.
+        let mut pack = Vec::new();
+        if (&file).read_to_end(&mut pack).is_ok() {
             let (records, whole) = records(&pack);
             if let Some(name) = pack_name(&pack[..whole]).filter(|_| !records.is_empty()) {
                 // Readers only ever see all of a sealed pack.
