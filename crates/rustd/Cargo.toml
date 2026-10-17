@@ -23,6 +23,7 @@ same-file = "1"
 dunce = "1"
 pdb = "0.8"
 sha2 = "0.10"
+toml.workspace = true
 
 hir.workspace = true
 hir-def.workspace = true

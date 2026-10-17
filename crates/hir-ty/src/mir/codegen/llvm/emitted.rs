@@ -112,8 +112,7 @@ impl<'data> Emitted<'data> {
         };
         let malformed = |_| Unhandled::Shape("a line table that does not parse");
         let table = gimli::DebugLine::new(section.data()?, LittleEndian);
-        let program =
-            table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(malformed)?;
+        let program = table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(malformed)?;
         let (program, sequences) = program.sequences().map_err(malformed)?;
         // The function is at the start of the one section of code, which is where a
         // sequence that is yet to be relocated says it starts.

@@ -24,8 +24,8 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     debug_info::{
-        AsDIScope, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind,
-        DWARFSourceLanguage, DebugInfoBuilder, debug_metadata_version,
+        AsDIScope, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind, DWARFSourceLanguage,
+        DebugInfoBuilder, debug_metadata_version,
     },
     intrinsics::Intrinsic,
     module::{FlagBehavior, Linkage, Module},
