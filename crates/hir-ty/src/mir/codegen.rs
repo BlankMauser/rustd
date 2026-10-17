@@ -90,6 +90,7 @@ pub use home::body_file;
 mod llvm;
 mod patch;
 mod stable;
+pub use stable::block_place;
 mod store;
 mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
@@ -9267,6 +9268,44 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Intrinsic::Inline)
     }
 
+    /// The signed `wide` lanes of two vectors, each saturated to half its width, signed or
+    /// not: every 16 bytes of the result are those of `a` and then those of `b`.
+    fn pack_lanes(
+        &mut self,
+        a: &Operand,
+        b: &Operand,
+        dst: Value,
+        wide: Type,
+        signed: bool,
+    ) -> Result<()> {
+        let (a, ty) = self.operand(a)?;
+        let (b, _) = self.operand(b)?;
+        let narrow = wide.half_width().expect("a lane of 16 or 32 bits");
+        let bits = narrow.bits();
+        let (least, most) = if signed {
+            (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+        } else {
+            (0, (1i64 << bits) - 1)
+        };
+        let (wide_bytes, narrow_bytes) = (wide.bytes() as i32, narrow.bytes() as i32);
+        let per_half = 8 / wide_bytes;
+        for half in (0..self.layout(ty)?.size.bytes() as i32).step_by(16) {
+            for (from, src) in [a, b].into_iter().enumerate() {
+                for lane in 0..per_half {
+                    let value = self.builder.ins().load(wide, MEM, src, half + lane * wide_bytes);
+                    let most = self.builder.ins().iconst(wide, most);
+                    let least = self.builder.ins().iconst(wide, least);
+                    let value = self.builder.ins().smin(value, most);
+                    let value = self.builder.ins().smax(value, least);
+                    let value = self.builder.ins().ireduce(narrow, value);
+                    let at = half + (from as i32 * per_half + lane) * narrow_bytes;
+                    self.builder.ins().store(MEM, value, dst, at);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A function `core::arch` declares as `llvm.{name}`: something LLVM implements, with no
     /// body anywhere.
     fn llvm_intrinsic(
@@ -9359,6 +9398,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let sum = self.builder.ins().ireduce(types::I16, sum);
                     self.builder.ins().store(MEM, sum, dst, lane);
                 }
+            }
+            ("x86.sse2.packsswb.128" | "x86.avx2.packsswb" | "x86.avx512.packsswb.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I16, true)?
+            }
+            ("x86.sse2.packuswb.128" | "x86.avx2.packuswb" | "x86.avx512.packuswb.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I16, false)?
+            }
+            ("x86.sse2.packssdw.128" | "x86.avx2.packssdw" | "x86.avx512.packssdw.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I32, true)?
+            }
+            ("x86.sse41.packusdw" | "x86.avx2.packusdw" | "x86.avx512.packusdw.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I32, false)?
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
