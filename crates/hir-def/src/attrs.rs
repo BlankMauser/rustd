@@ -232,6 +232,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
                     "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
+                    "rustc_pass_indirectly_in_non_rustic_abis" => {
+                        attr_flags.insert(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+                    }
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
@@ -363,6 +366,7 @@ bitflags::bitflags! {
         const THREAD_LOCAL = 1 << 54;
         const RUSTC_PROMOTABLE = 1 << 55;
         const HAS_DEFINE_OPAQUE = 1 << 56;
+        const RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 57;
     }
 }
 

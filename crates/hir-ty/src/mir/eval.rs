@@ -175,15 +175,23 @@ enum MirOrDynIndex<'db> {
     Dyn(usize),
 }
 
+/// A stack or heap allocation: where it starts, its size, and what its start is a multiple of.
+#[derive(Debug, Clone, Copy)]
+struct Allocated {
+    start: usize,
+    size: usize,
+    align: usize,
+}
+
 pub struct Evaluator<'a, 'db> {
     db: &'db dyn HirDatabase,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
     heap: Vec<u8>,
-    /// Start and size of every stack and heap allocation, in address order. A raw pointer
-    /// in a constant doesn't say how much memory it can reach, its allocation does.
-    allocations: [Vec<(usize, usize)>; 2],
+    /// Every stack and heap allocation, in address order. A raw pointer in a constant
+    /// doesn't say how much memory it can reach, its allocation does.
+    allocations: [Vec<Allocated>; 2],
     code_stack: Vec<StackFrame<'a, 'db>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
@@ -360,6 +368,12 @@ impl Address {
         } else {
             Invalid(it)
         }
+    }
+
+    /// Whether this is a number made into a pointer to `size` bytes, none: no memory is
+    /// behind it, and the number is the whole of its value.
+    fn is_of_nothing(&self, size: usize) -> bool {
+        size == 0 && matches!(self, Invalid(_))
     }
 
     fn to_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
@@ -656,17 +670,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
 
     fn ptr_size(&self) -> usize {
         self.cached_ptr_size
-    }
-
-    fn caller_location_fields(&self, owner: InferBodyId<'db>, span: MirSpan) -> (String, u32, u32) {
-        let Some((file_id, text_range)) = self.resolve_mir_span(owner, span) else {
-            return (String::new(), 0, 0);
-        };
-        let source_root = self.db.file_source_root(file_id).source_root_id(self.db);
-        let source_root = self.db.source_root(source_root).source_root(self.db);
-        let path = source_root.path_for_file(&file_id).map(|path| path.to_string());
-        let (line, col) = self.db.line_column(file_id, text_range.start()).unwrap_or((0, 0));
-        (path.unwrap_or_default(), line + 1, col + 1)
     }
 
     fn resolve_mir_span(
@@ -1098,7 +1101,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 stack_ptr += size;
                 locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
                 if size != 0 {
-                    self.allocations[0].push((Stack(my_ptr).to_usize(), size));
+                    self.allocations[0].push(Allocated {
+                        start: Stack(my_ptr).to_usize(),
+                        size,
+                        align,
+                    });
                 }
             }
             stack_ptr - self.stack.len()
@@ -2346,6 +2353,26 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         }
     }
 
+    /// The allocation `addr` is in.
+    fn allocation_at(&self, addr: usize) -> Option<Allocated> {
+        self.allocations.iter().find_map(|allocations| {
+            let i = allocations.partition_point(|it| it.start <= addr);
+            let &allocation = allocations.get(i.checked_sub(1)?)?;
+            (addr - allocation.start < allocation.size).then_some(allocation)
+        })
+    }
+
+    /// Records in `map` what `addr` is known to be a multiple of: what its allocation was
+    /// aligned to, or less when it is at an offset that is a multiple of less.
+    fn note_align(&self, map: &mut ComplexMemoryMap<'db>, addr: usize) {
+        let Some(allocation) = self.allocation_at(addr) else { return };
+        let align = match addr - allocation.start {
+            0 => allocation.align,
+            offset => allocation.align.min(1 << offset.trailing_zeros()),
+        };
+        map.note_align(addr, align);
+    }
+
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
@@ -2359,7 +2386,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         let pos = self.heap.len();
         self.heap.extend(std::iter::repeat_n(0, size));
         if size != 0 {
-            self.allocations[1].push((Address::Heap(pos).to_usize(), size));
+            self.allocations[1].push(Allocated {
+                start: Address::Heap(pos).to_usize(),
+                size,
+                align,
+            });
         }
         Ok(Address::Heap(pos))
     }
@@ -2455,15 +2486,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };
                     let addr = from_bytes!(usize, addr);
-                    let allocation = this.allocations.iter().find_map(|allocations| {
-                        let i = allocations.partition_point(|&(start, _)| start <= addr);
-                        let &(start, size) = allocations.get(i.checked_sub(1)?)?;
-                        (addr - start < size).then_some((start, size))
-                    });
-                    if let Some((start, size)) = allocation
+                    if let Some(Allocated { start, size, align }) = this.allocation_at(addr)
                         && let Ok(memory) = this.read_memory(Address::from_usize(start), size)
                     {
                         mm.insert(start, memory.into());
+                        mm.note_align(start, align);
                     }
                 }
                 TyKind::Ref(_, t, _) => {
@@ -2471,9 +2498,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     match size {
                         Some((size, _)) => {
                             let addr_usize = from_bytes!(usize, bytes);
-                            let bytes =
-                                this.read_memory(Address::from_usize(addr_usize), size)?.to_vec();
+                            let addr = Address::from_usize(addr_usize);
+                            if addr.is_of_nothing(size) {
+                                return Ok(());
+                            }
+                            let bytes = this.read_memory(addr, size)?.to_vec();
                             mm.insert(addr_usize, bytes.clone().into());
+                            this.note_align(mm, addr_usize);
                             rec(this, &bytes, t, locals, mm, stack_depth_limit - 1)?;
                         }
                         None => {
@@ -2486,6 +2517,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                     let addr = Address::from_bytes(addr)?;
                                     let b = this.read_memory(addr, size)?;
                                     mm.insert(addr.to_usize(), b.into());
+                                    this.note_align(mm, addr.to_usize());
                                 }
                                 return Ok(());
                             }
@@ -2508,8 +2540,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             };
                             let size = element_size * count;
                             let addr = Address::from_bytes(addr)?;
+                            if addr.is_of_nothing(size) {
+                                return Ok(());
+                            }
                             let b = this.read_memory(addr, size)?;
                             mm.insert(addr.to_usize(), b.into());
+                            this.note_align(mm, addr.to_usize());
                             // Elements that take no room may be `usize::MAX` in number.
                             let plain = element_size == 0
                                 || check_inner.is_some_and(|ty| this.holds_no_pointer(ty));

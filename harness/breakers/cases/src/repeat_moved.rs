@@ -1,7 +1,8 @@
 //! tests/ui/drop/repeat-drop.rs: `[value; 0]` drops the value there and `[value; 1]` moves it
 //! into the array; the value was dropped a second time at the end of the scope. A constant is
 //! made once per element, so `[CONSTANT; 0]` makes and drops none. When the drop of `[value; 0]`
-//! panics, what was built before it is dropped first.
+//! panics, what was built before it is dropped first. library/coretests slice.rs: an array of
+//! `usize::MAX` elements that take no room is made at once; a write was looped over each.
 
 use std::cell::RefCell;
 
@@ -65,11 +66,19 @@ fn bursting(log: &RefCell<Vec<u8>>) {
     std::process::abort();
 }
 
+#[inline(never)]
+fn roomless(unit: ()) -> usize {
+    let units: &[()] = &[unit; usize::MAX];
+    let constant: &[()] = &[(); usize::MAX];
+    (units.len() == constant.len()) as usize + units.array_windows::<1>().count() % 7
+}
+
 pub fn run() -> Vec<u8> {
     let log = RefCell::new(Vec::new());
     none(&log);
     one(&log);
     log.borrow_mut().push(constant::<0>() as u8);
+    log.borrow_mut().push(roomless(()) as u8);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bursting(&log)));
     log.borrow_mut().push(caught.is_err() as u8);
     log.into_inner()

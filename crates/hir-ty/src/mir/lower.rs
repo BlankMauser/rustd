@@ -2128,7 +2128,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
                 self.resolver.reset_to_guard(guard);
                 match resolved {
-                    Some(ValueNs::ConstId(_) | ValueNs::EnumVariantId(_)) => true,
+                    Some(
+                        ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::GenericParam(_),
+                    ) => true,
                     Some(ValueNs::StructId(_)) => {
                         !matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..))
                     }

@@ -42,3 +42,21 @@ pub fn if_let_outlives(log: &RefCell<Vec<u8>>) {
         }
     };
 }
+
+/// Makes a macro that says whether what it is given is of the named kind of fragment.
+#[macro_export]
+macro_rules! make_matcher {
+    ($name:ident, $fragment:ident, $d:tt) => {
+        macro_rules! $name {
+            ($d _:$fragment) => {
+                true
+            };
+            (const { 0 }) => {
+                false
+            };
+            (A | B) => {
+                false
+            };
+        }
+    };
+}

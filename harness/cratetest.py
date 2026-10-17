@@ -15,14 +15,13 @@ UNIT = "(unit tests)"
 
 
 class TestFixture(Fixture):
-    def __init__(self, crate_dir, crate, test, shared, features=None, lib=None, skip=()):
+    def __init__(self, crate_dir, crate, test, path, shared, features=None, skip=()):
         if test == UNIT:
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
-                             touch=lib)
+                             touch=path)
             self.rustd_args = ["--cfg-test"]
         else:
-            path = os.path.join(crate_dir, "tests", f"{test}.rs")
             # By its file: an example may have the name of the test.
             super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)
             self.rustd_args = ["--dev-deps"]
@@ -91,20 +90,21 @@ def main():
     ap.add_argument("--json")
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
-    tests_dir = os.path.join(a.crate_dir, "tests")
-    tests = sorted(f[:-3] for f in os.listdir(tests_dir) if f.endswith(".rs")) if os.path.isdir(tests_dir) else []
     meta = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=a.crate_dir))
     package = next(p for p in meta["packages"] if p["name"].replace("-", "_") == crate
                    or any(t["name"].replace("-", "_") == crate for t in p["targets"]))
+    # The test targets as cargo sees them: one may be named otherwise than its file, or be a
+    # directory.
+    tests = sorted((t["name"], t["src_path"]) for t in package["targets"] if "test" in t["kind"])
     lib = next((t["src_path"] for t in package["targets"] if "lib" in t["kind"]), None)
     if lib:
-        tests.append(UNIT)
-    tests = [t for t in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
+        tests.append((UNIT, lib))
+    tests = [(t, path) for t, path in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
     results, shared = [], {}
-    for test in tests:
+    for test, path in tests:
         print(f"--- {test}", flush=True)
-        fx = TestFixture(a.crate_dir, crate, test, shared, a.features, lib, a.skip)
+        fx = TestFixture(a.crate_dir, crate, test, path, shared, a.features, a.skip)
         try:
             result = compare(fx, test, a.bisect)
         except SystemExit as e:

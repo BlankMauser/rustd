@@ -26,6 +26,10 @@ import linkline
 
 LINE = r"^//@ *(?:\[(?P<rev>[\w-]+)\] *)?"
 DIRECTIVE = re.compile(LINE + r"(?P<name>[\w-]+)(?: *: *| +|$)(?P<value>.*)$", re.M)
+# How many more times a program that differed once is run, to tell a race from a difference.
+RERUNS = 6
+# How long rustc's program is run over and over to see whether it too does what rustd's did.
+RACE_SECONDS = 20
 MAIN = re.compile(r"^(pub )?fn main\(\)(?P<returns> *->)?", re.M)
 FEATURE = re.compile(r"#!\[(cfg_attr\(.*, *)?feature\(")
 # What a test names beside itself, relative to its own directory.
@@ -330,6 +334,15 @@ def run_alone(ws, work, name, link, env):
     return False
 
 
+def races_to(reference, unit, got):
+    """Whether rustc's program, run again and again for RACE_SECONDS, once does what `got` is."""
+    end = time.monotonic() + RACE_SECONDS
+    while time.monotonic() < end:
+        if behaviour(reference, unit) == got:
+            return True
+    return False
+
+
 def behaviour(binary, unit):
     """What the program does: status, stdout and stderr, run in a directory of its own."""
     cwd = tempfile.mkdtemp(prefix="rustd-ui-run-")
@@ -480,8 +493,17 @@ def run_chunk(key, units, base):
             result.update(outcome="excluded", reason="differs when relinked from rustc's objects alone "
                           "(the link line the harness keeps lacks rustc's `symbols.o`)")
         else:
-            result.update(outcome="mismatch", detail=difftest.symptom(expected, got),
-                          stderr=got[2].decode(errors="replace")[-300:])
+            detail = difftest.symptom(expected, got)
+            # Said and counted on its own, never passed over: a difference that one run showed
+            # and the next runs do not is of a program that races, under rustc as well or under
+            # rustd alone.
+            again = sum(behaviour(binary, unit) == expected for _ in range(RERUNS))
+            if races_to(reference, unit, got):
+                result.update(outcome="excluded", reason="races: rustc's own program is seen to do what rustd's did")
+            elif again == RERUNS:
+                result.update(outcome="unsteady", detail=f"{detail} in one run, and in none of {RERUNS} more")
+            else:
+                result.update(outcome="mismatch", detail=detail, stderr=got[2].decode(errors="replace")[-300:])
 
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
         list(pool.map(finish, built))
@@ -529,11 +551,12 @@ def summarize(results):
     ran = [r for r in results if r["outcome"] != "excluded"]
     full = sum(r["outcome"] == "match" and not r["skipped"] for r in ran)
     print(f"{len(ran)} tests: {outcomes['match']} match ({full} with every function from rustd), "
-          f"{outcomes['mismatch']} mismatch, {outcomes['crash']} rustd crashes, {outcomes['hang']} rustd hangs, "
+          f"{outcomes['mismatch']} mismatch, {outcomes['unsteady']} differing in one run only, "
+          f"{outcomes['crash']} rustd crashes, {outcomes['hang']} rustd hangs, "
           f"{outcomes['link']} link errors; {outcomes['excluded']} left out")
     compiled, roots = sum(r["compiled"] for r in ran), sum(r["roots"] for r in ran)
     print(f"functions: {compiled} of {roots} from rustd, {roots - compiled} left to rustc")
-    for outcome in ("mismatch", "crash", "hang", "link"):
+    for outcome in ("mismatch", "unsteady", "crash", "hang", "link"):
         for r in ran:
             if r["outcome"] == outcome:
                 revision = f"#{r['revision']}" if r.get("revision") else ""
@@ -582,7 +605,7 @@ def main():
     outcomes = summarize(results)
     if a.json:
         json.dump(results, open(a.json, "w"), indent=1)
-    sys.exit(1 if outcomes["mismatch"] or outcomes["crash"] or outcomes["hang"] or outcomes["link"] else 0)
+    sys.exit(1 if outcomes["mismatch"] or outcomes["unsteady"] or outcomes["crash"] or outcomes["hang"] or outcomes["link"] else 0)
 
 
 if __name__ == "__main__":

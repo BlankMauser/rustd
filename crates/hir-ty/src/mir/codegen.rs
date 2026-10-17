@@ -33,7 +33,7 @@ use hir_def::{
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use la_arena::ArenaMap;
-use rustc_abi::{ExternAbi, Integer, Size};
+use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
@@ -3439,6 +3439,14 @@ struct Relocations<'a, 'db> {
     defined: FxHashMap<usize, DataId>,
 }
 
+impl Relocations<'_, '_> {
+    /// The alignment to give the data object made for the memory at `start`: what const eval
+    /// made it with, or where it does not say, the most a value could need.
+    fn align_of(&self, start: usize) -> u64 {
+        self.map.align_at(start).map_or(16, |align| align as u64)
+    }
+}
+
 /// Whether a data object can be the same object as another with the same content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum DataIdentity {
@@ -3957,6 +3965,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut modes = Vec::new();
         for ty in args {
+            if self.decays_in_c(ty)? {
+                int_regs = int_regs.saturating_sub(1);
+                modes.push(PassMode::Indirect);
+                continue;
+            }
             let mode = self.c_pass_mode(ty)?;
             let (ints, sses) = match mode {
                 PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (0, 0),
@@ -4006,7 +4019,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let (mut ints, mut floats) = (0u8, 0u8);
         let mut modes = Vec::new();
         for ty in args {
-            modes.push(match self.aapcs64_class(ty)? {
+            let class = match self.decays_in_c(ty)? {
+                true => Aapcs64::Memory,
+                false => self.aapcs64_class(ty)?,
+            };
+            modes.push(match class {
                 Aapcs64::Ignore => PassMode::Ignore,
                 Aapcs64::Scalar(scalar) => {
                     let (used, wide) = match scalar.ty {
@@ -4195,6 +4212,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // MSVC passes an argument of no size by reference.
             return Ok(if is_ret { PassMode::Ignore } else { PassMode::Indirect });
         }
+        if !is_ret && self.decays_in_c(ty)? {
+            return Ok(PassMode::Indirect);
+        }
         Ok(match (layout.backend_repr, layout.size.bytes()) {
             (BackendRepr::SimdVector { .. }, _) => unsupported!("vector in the C ABI"),
             (BackendRepr::Scalar(scalar), size) if size <= 8 => {
@@ -4209,6 +4229,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (_, 8) => PassMode::Cast(types::I64),
             _ => PassMode::Indirect,
         })
+    }
+
+    /// Whether a C function is handed the address of a `ty` where Rust hands over the value,
+    /// as C does with a `va_list` that is an array. Mirrors rustc's
+    /// `TyAndLayout::pass_indirectly_in_non_rustic_abis`, which looks through transparent
+    /// wrappers for a struct marked `#[rustc_pass_indirectly_in_non_rustic_abis]`.
+    fn decays_in_c(&self, ty: Ty<'db>) -> Result<bool> {
+        let TyKind::Adt(def, subst) = ty.kind() else { return Ok(false) };
+        let AdtId::StructId(id) = def.def_id() else { return Ok(false) };
+        let db = self.cg.db;
+        if AttrFlags::query(db, id.into())
+            .contains(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+        {
+            return Ok(true);
+        }
+        let transparent = AttrFlags::repr(db, id.into())
+            .is_some_and(|repr| repr.flags.contains(ReprFlags::IS_TRANSPARENT));
+        if !transparent {
+            return Ok(false);
+        }
+        for (_, field) in db.field_types(id.into()).iter() {
+            let field = field.ty().instantiate(self.interner, subst).skip_norm_wip();
+            if !self.layout(field)?.is_1zst() {
+                return self.decays_in_c(field);
+            }
+        }
+        Ok(false)
     }
 
     /// How the C ABI passes one value when registers are left for it.
@@ -5962,7 +6009,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 let at = addr - start;
                 match pointee.kind() {
@@ -6158,7 +6205,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 // What the allocation is of is not known here, so as in a union, every word
                 // of it that is the address of something const eval kept is taken to be one.
@@ -6424,6 +6471,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if matches!(operand.kind, OperandKind::Move(_)) {
                         self.drop_value(src, None, ty)?;
                     }
+                } else if size.bytes() == 0 {
+                    // Elements that take no room are not written, however many there are.
                 } else if len <= 16 {
                     for i in 0..len as u64 {
                         let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
