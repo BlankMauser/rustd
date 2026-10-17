@@ -20,7 +20,7 @@ use super::{
     daemon::{Envelope, Reply, Request, home, socket_in, version},
     wrapper,
 };
-use crate::socket::private_dir;
+use crate::socket::{connect, private_dir, private_file};
 
 /// How long a daemon that was started is waited for, and one that was told to exit.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -43,7 +43,7 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     // tells it to stop.
     let replaces = start == Start::IfMissing || matches!(request, Request::Stop);
     let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
-    let mut stream = match (UnixStream::connect(&socket), start) {
+    let mut stream = match (connect(&socket), start) {
         (Ok(stream), _) => stream,
         (Err(_), Start::Never) => return Ok(None),
         (Err(_), Start::IfMissing) => started(&home)?,
@@ -55,7 +55,7 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
         }
         // It exits once it has answered; its socket goes with it.
         let asked = Instant::now();
-        while UnixStream::connect(&socket).is_ok() && asked.elapsed() < PATIENCE {
+        while connect(&socket).is_ok() && asked.elapsed() < PATIENCE {
             std::thread::sleep(POLL);
         }
         reply = exchange(&mut started(&home)?, &envelope)?;
@@ -93,7 +93,7 @@ fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
 /// terminal's foreground does not end the daemon, and waits for it to listen.
 fn started(home: &Path) -> anyhow::Result<UnixStream> {
     private_dir(home).with_context(|| format!("the daemon's directory {}", home.display()))?;
-    let log = OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
+    let log = private_file(OpenOptions::new().create(true).append(true), &home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
     daemon.arg("daemon").env_remove(wrapper::ENABLED).env_remove("RUSTC_WORKSPACE_WRAPPER");
     daemon.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
@@ -103,7 +103,7 @@ fn started(home: &Path) -> anyhow::Result<UnixStream> {
     let socket = socket_in(home);
     let asked = Instant::now();
     loop {
-        match UnixStream::connect(&socket) {
+        match connect(&socket) {
             Ok(stream) => return Ok(stream),
             Err(error) if asked.elapsed() > PATIENCE => {
                 return Err(error).with_context(|| {

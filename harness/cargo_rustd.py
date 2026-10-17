@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """cargo_rustd.py: `cargo rustd` against plain cargo on real projects, unmodified.
 
-    cargo_rustd.py [PROJECT...] [--only-projects] [--only-checks] [--keep]
+    cargo_rustd.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--keep]
 
 Three parts, all of which have to pass.
 
-Projects. Each one below is cloned at its tag into `RUSTD_PROJECTS` (~/rustd-projects) when
+Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `RUSTD_PROJECTS` (~/rustd-projects) when
 it is not there, and copied; the clone is never written to. In the copy, with plain cargo
 building into a target directory of its own as the reference:
   cold      `cargo rustd build` from nothing, with no daemon; the program is run
@@ -25,7 +25,9 @@ Daemon. Started on demand, reused, shared by a git worktree, alive after its cli
 killed, replaced when the client is another build of rustd, gone when idle, and its workers
 gone with it.
 
-Writes CARGO-RUSTD.md and cargo_rustd.json next to this file.
+Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLVM.md and
+cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
+and keeps the others. `--small` is the three projects of the CI job.
 """
 import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
@@ -38,33 +40,33 @@ WARMUP_SECS = 1800
 
 PROJECTS = {
     "ripgrep": dict(
-        repo="BurntSushi/ripgrep", tag="15.1.0",
+        repo="BurntSushi/ripgrep", tag="15.1.0", rev="af60c2de9d85e7f3d81c78601669468cf02dabab",
         run=["-n", "--no-heading", "--sort", "path", "fn main", "crates/core/main.rs", "build.rs"],
         edits=[("crates/core/main.rs", "fn main() -> ExitCode {", 'fn main() -> ExitCode {\n    eprintln!("edited main");'),
                ("crates/printer/src/standard.rs", "pub fn new() -> StandardBuilder {", 'pub fn new() -> StandardBuilder {\n        eprintln!("edited printer");')],
     ),
     "fd": dict(
-        repo="sharkdp/fd", tag="v10.3.0",
+        repo="sharkdp/fd", tag="v10.3.0", rev="d38148f0aabdd073b4080cde770f679f3197b920",
         run=["--extension", "rs", "main", "src"],
         edits=[("src/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
     "bat": dict(
-        repo="sharkdp/bat", tag="v0.26.0",
+        repo="sharkdp/bat", tag="v0.26.0", rev="c734087e1d15fb730d7653389c841fd9e3016556",
         run=["--plain", "--color=never", "rustfmt.toml"],
         edits=[("src/bin/bat/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
     "hyperfine": dict(
-        repo="sharkdp/hyperfine", tag="v1.19.0",
+        repo="sharkdp/hyperfine", tag="v1.19.0", rev="12fec42098642a19855ead34c8cb1e0be28c8ead",
         run=["--help"],
         edits=[("src/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
     "just": dict(
-        repo="casey/just", tag="1.43.0",
+        repo="casey/just", tag="1.43.0", rev="b7e7c46495b34e9407982ffbbb25eb2808ec40b7",
         run=["--list", "--unsorted"],
         edits=[("src/main.rs", "fn main() {", 'fn main() {\n  eprintln!("edited main");')],
     ),
     "axum": dict(
-        repo="tokio-rs/axum", tag="axum-v0.8.6",
+        repo="tokio-rs/axum", tag="axum-v0.8.6", rev="c1bb9c3e90625fb8de4f9c9750f669cb4edac3df",
         build=["-p", "example-hello-world"], serves="http://127.0.0.1:3000/",
         test=["-p", "example-testing"],
         edits=[("examples/hello-world/src/main.rs", "<h1>Hello, World!</h1>", "<h1>Hello, edited world!</h1>"),
@@ -72,12 +74,63 @@ PROJECTS = {
         broken="examples/hello-world/src/main.rs",
     ),
     "nushell": dict(
-        repo="nushell/nushell", tag="0.108.0",
+        repo="nushell/nushell", tag="0.108.0", rev="da141be11b3acaa55b39321e5f9651d02aa2ed6f",
         run=["-n", "-c", "[3 1 2] | sort | str join ','"],
         test=["-p", "nu-path"],
         edits=[("src/main.rs", "fn main() -> Result<()> {", 'fn main() -> Result<()> {\n    eprintln!("edited main");')],
     ),
+    "cargo": dict(
+        repo="rust-lang/cargo", tag="0.92.0", rev="ea2d97820c16195b0ca3fadb4319fe512c199a43",
+        run=["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path", "crates/cargo-platform/Cargo.toml"],
+        test=["-p", "cargo-platform"],
+        edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
+    "rust-analyzer": dict(
+        repo="rust-lang/rust-analyzer", tag="2026-10-12", rev="2ad81e72b7e978cb800dffe1bcce5c9f98032acf",
+        build=["-p", "rust-analyzer"], run=["--version"], test=["-p", "stdx"],
+        edits=[("crates/rust-analyzer/src/bin/main.rs", "fn main() -> anyhow::Result<ExitCode> {", 'fn main() -> anyhow::Result<ExitCode> {\n    eprintln!("edited main");')],
+    ),
+    "tokei": dict(
+        repo="XAMPPRocky/tokei", tag="v15.0.0", rev="c14f744716272fadeb27a74443cdffa0af35f82f",
+        run=["src", "--sort", "code"],
+        edits=[("src/main.rs", "fn main() -> Result<(), Box<dyn Error>> {", 'fn main() -> Result<(), Box<dyn Error>> {\n    eprintln!("edited main");')],
+    ),
+    "eza": dict(
+        repo="eza-community/eza", tag="v0.23.5", rev="98442ab17c2c3738701b62a7e060b1431ae2d6ea",
+        run=["--oneline", "--color=never", "src"],
+        edits=[("src/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
+    "starship": dict(
+        repo="starship/starship", tag="v1.27.0", rev="f8e4e2155542cc84f49b342122d371f74e0ad253",
+        run=["module", "character"], test=["--lib", "modules::character"],
+        edits=[("src/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
+    "delta": dict(
+        repo="dandavison/delta", tag="0.20.1", rev="b88d2290468449d75950bfa150ea7c1291fe2977",
+        run=["--list-languages"],
+        edits=[("src/main.rs", "fn main() -> std::io::Result<()> {", 'fn main() -> std::io::Result<()> {\n    eprintln!("edited main");')],
+    ),
+    "helix": dict(
+        repo="helix-editor/helix", tag="25.07.1", rev="a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b",
+        env=dict(HELIX_DISABLE_AUTO_GRAMMAR_BUILD="1"),
+        run=["--version"], test=["-p", "helix-stdx"],
+        edits=[("helix-term/src/main.rs", "fn main() -> Result<()> {", 'fn main() -> Result<()> {\n    eprintln!("edited main");')],
+    ),
+    "tonic": dict(
+        repo="hyperium/tonic", tag="v0.14.5", rev="3f7caf3171393734ef19e12d010bd9c945c9e242",
+        build=["-p", "examples", "--bin", "helloworld-server"], client="helloworld-client",
+        test=["-p", "tonic-types"],
+        edits=[("examples/src/helloworld/server.rs", '"Hello {}!"', '"Hello edited {}!"')],
+    ),
+    "wasmtime": dict(
+        repo="bytecodealliance/wasmtime", tag="v49.0.3", rev="f96eabaa11a06086e4fb779ed1c1688481067ab9",
+        run=["wast", "tests/misc_testsuite/add.wast"], test=["-p", "wasmtime-environ"],
+        edits=[("src/bin/wasmtime.rs", "fn main() -> Result<()> {", 'fn main() -> Result<()> {\n    eprintln!("edited main");')],
+    ),
 }
+
+# The projects of the CI job: small, and a build script, a workspace and a test suite among them.
+SMALL = ["ripgrep", "fd", "hyperfine"]
 
 # What cargo and `cargo rustd` print about the build, which is not the program's output.
 STATUS = re.compile(r"^\s*((Compiling|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
@@ -161,8 +214,23 @@ def difference(ours, theirs):
     return "differ"
 
 
-def served(side, command, url):
-    """What the server `cargo run` starts on `side` answers on `url`."""
+def asked_by(client):
+    """What the server says to the client program `client`, which cargo built: the message
+    of its answer."""
+    def ask(timeout):
+        ran = subprocess.run([client], capture_output=True, text=True, timeout=timeout + 5)
+        if ran.returncode != 0:
+            raise OSError(ran.stderr[-200:])
+        return "; ".join(re.findall(r'message: "[^"]*"', ran.stdout))
+    return ask
+
+
+def fetched(url):
+    return lambda timeout: urllib.request.urlopen(url, timeout=timeout).read().decode()
+
+
+def served(side, command, ask):
+    """What the server `cargo run` starts on `side` answers when `ask` asks it."""
     argv = ["cargo", *(["rustd"] if side.rustd else []), "run", *command]
     server = subprocess.Popen(argv, cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
@@ -170,7 +238,7 @@ def served(side, command, url):
             if server.poll() is not None:
                 return f"exited {server.returncode}: {server.stderr.read()[-300:]}"
             try:
-                return urllib.request.urlopen(url, timeout=5).read().decode()
+                return ask(5)
             except OSError:
                 time.sleep(0.1)
         return "no answer"
@@ -180,7 +248,7 @@ def served(side, command, url):
         # The port is free again before the other side's server asks for it.
         for _ in range(100):
             try:
-                urllib.request.urlopen(url, timeout=1)
+                ask(1)
                 time.sleep(0.05)
             except OSError:
                 break
@@ -208,10 +276,14 @@ def rewrite(path, old, new):
 
 
 def fetch(name, spec):
+    """The checkout of the project, cloned at its tag when it is not there. The tag has to
+    be the commit the project is pinned to."""
     source = os.path.join(SOURCES, name)
     if not os.path.isdir(source):
         os.makedirs(SOURCES, exist_ok=True)
         subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", spec["tag"], f"https://github.com/{spec['repo']}", source], check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True).stdout.strip()
+    assert head == spec["rev"], f"{name} is at {head}, not at the {spec['rev']} it is pinned to"
     return source
 
 
@@ -221,7 +293,7 @@ def project(name, spec, work):
     source = fetch(name, spec)
     ws = os.path.realpath(os.path.join(work, name))
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
-    env = base_env(os.path.join(work, "home"))
+    env = dict(base_env(os.path.join(work, "home")), **spec.get("env", {}))
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
     build, run, test = spec.get("build", []), spec.get("run", []), spec.get("test", [])
     row = dict(project=name, tag=spec["tag"], wrong=[], times={}, built={})
@@ -241,8 +313,8 @@ def project(name, spec, work):
         print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
 
     def runs(label):
-        if "serves" in spec:
-            mine, other = served(ours, build, spec["serves"]), served(theirs, build, spec["serves"])
+        if ask:
+            mine, other = served(ours, build, ask), served(theirs, build, ask)
             if mine != other:
                 row["wrong"].append(f"{label}: served {mine[:80]!r} for {other[:80]!r}")
             print(f"  {label:12} served {mine[:50]!r}  {'same' if mine == other else 'WRONG'}", flush=True)
@@ -257,6 +329,10 @@ def project(name, spec, work):
 
     status = lambda ran: ran.returncode
     step("cold build", "build", build, status)
+    ask = fetched(spec["serves"]) if "serves" in spec else None
+    if "client" in spec:
+        theirs.cargo("build", "-p", build[1], "--bin", spec["client"])
+        ask = asked_by(os.path.join(ws, "target-ref/debug", spec["client"]))
     runs("cold run")
     warm("warm-up")
     step("warm build", "build", build, status)
@@ -284,14 +360,14 @@ def project(name, spec, work):
 
 
 FLAG_WORKSPACE = {
-    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n',
+    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
     "util/src/lib.rs": 'pub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
     "app/src/main.rs": 'fn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
-    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n',
+    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
 
 # Each: the subcommand, its arguments, the variables it runs with.
@@ -348,6 +424,7 @@ def flags(work):
     round_of("warm")
     rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("hello {name}")', 'format!("hello {name}!")')
     rewrite(os.path.join(ws, "app/src/main.rs"), ".len(), 7)", ".len(), 8)")
+    rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
     _, counted = ours.cargo("status")
     ours.cargo("stop")
@@ -360,6 +437,8 @@ def daemon(work):
     for file, text in FLAG_WORKSPACE.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
+    with open(os.path.join(ws, "app/src/bin/nested.rs"), "w") as nested:
+        nested.write('fn main() {\n    let cargo = std::process::Command::new("cargo").arg("build").status();\n    std::process::exit(cargo.ok().and_then(|it| it.code()).unwrap_or(1));\n}\n')
     git = lambda *args, cwd=ws: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=cwd, check=True, capture_output=True)
     open(os.path.join(ws, ".gitignore"), "w").write("target\ntarget-ref\n")
     git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
@@ -387,6 +466,15 @@ def daemon(work):
     pid, workers, _ = status()
     check("the first build starts one", first.returncode == 0 and pid is not None, f"pid {pid}")
     wait_warm(here, ws)
+    # A program that runs plain `cargo build` on its own checkout, as a test suite may, after
+    # the daemon built it: cargo's own artifacts are behind the sources, so cargo builds
+    # them again and its executable takes the place of the daemon's. Both are right.
+    edit(ws, "nested")
+    _, installed = here.cargo("build")
+    _, nested = here.cargo("run", "--bin", "nested")
+    _, after = here.cargo("run", "--bin", "app")
+    _, reference = timed(["cargo", "run", "--bin", "app"], ws, dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
+    check("a program that runs cargo on its checkout builds, and the next run is right", how_built(installed.stderr) == "daemon" and nested.returncode == 0 and after.returncode == reference.returncode and after.stdout == reference.stdout, f"{how_built(installed.stderr)}, nested {nested.returncode}, then {how_built(after.stderr)}")
     edit(ws, "one")
     _, second = here.cargo("build")
     check("a later build is the daemon's, by the same daemon", how_built(second.stderr) == "daemon" and status()[0] == pid, how_built(second.stderr))
@@ -522,6 +610,8 @@ def abuse(work, ws, tree, env, check, status, alive):
 
 CONNECT = "import socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.settimeout(5)\ntry:\n    s.connect(sys.argv[1])\nexcept OSError as e:\n    print('connect:', e.strerror)\n    sys.exit()\ns.sendall(sys.argv[2].encode() + b'\\n')\ntry:\n    print('answer:', s.recv(65536).decode())\nexcept OSError as e:\n    print('answer:', e)\n"
 
+LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"
+
 
 def stranger(home, check):
     """A second user at the daemon's socket: kept out by the directory and the socket's
@@ -560,6 +650,19 @@ def stranger(home, check):
         check("with the modes opened, the daemon turns the second user away by its uid", refused.startswith("answer:") and "Status" not in refused and "the peer is user" in log, f"{refused!r}")
         mine = knock(None)
         check("and still answers its own user", '"Status"' in mine, mine[:60])
+        # The other way round: the second user listens where a command line points the
+        # user's client, which sends its request and its variables to whoever serves it.
+        trap = os.path.join(tempfile.mkdtemp(prefix="rustd-trap-", dir="/tmp"), "sock")
+        os.chmod(os.path.dirname(trap), 0o777)
+        listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
+        try:
+            listener.stdout.readline()
+            asked = subprocess.run([RUSTD, "sync", trap], capture_output=True, text=True, timeout=60)
+            heard = listener.communicate(timeout=30)[0].strip()
+        finally:
+            listener.kill()
+            sudo("rm", "-rf", os.path.dirname(trap))
+        check("the client says nothing to a socket a second user serves", asked.returncode != 0 and "the peer is user" in asked.stderr and heard == "heard: 0", f"status {asked.returncode}, {heard}")
     finally:
         sudo("userdel", name)
 
@@ -583,7 +686,7 @@ def table(rows):
 
 def main():
     argv = sys.argv[1:]
-    names = [a for a in argv if not a.startswith("--")] or list(PROJECTS)
+    names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
     work = tempfile.mkdtemp(prefix="rustd-cargo-")
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
@@ -603,14 +706,22 @@ def main():
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
-    json.dump(result, open(os.path.join(HERE, "cargo_rustd.json"), "w"), indent=1)
-    with open(os.path.join(HERE, "CARGO-RUSTD.md"), "w") as md:
-        md.write("# cargo rustd against cargo\n\nGenerated by `harness/cargo_rustd.py`. Seconds, `cargo rustd` / plain cargo for the same step. "
+    # A run of some of it leaves the rows of the rest as the run before wrote them.
+    llvm = os.environ.get("RUSTD_BACKEND") == "llvm"
+    stored = os.path.join(HERE, "cargo_rustd_llvm.json" if llvm else "cargo_rustd.json")
+    before = json.load(open(stored)) if os.path.exists(stored) else {}
+    rows = {row["project"]: row for row in before.get("projects", []) + result["projects"]}
+    result["projects"] = [rows[name] for name in PROJECTS if name in rows]
+    if "--only-projects" in argv:
+        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon")})
+    json.dump(result, open(stored, "w"), indent=1)
+    with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
+        md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, `cargo rustd` / plain cargo for the same step. "
                  "Bold is a build the daemon did; `(c)` one cargo did in its place, with the reason below; `(f)` a warm-up that failed. "
                  "Differences counts the steps whose program output, exit status or test results were not cargo's.\n\n")
         md.write(table(result["projects"]) + "\n\n")
         for row in result["projects"]:
-            reasons = [f"{step}: {who}" for step, who in row["built"].items() if who.startswith("cargo: ") or "failed" in who]
+            reasons = [f"{step}: {who}" for step, who in row["built"].items() if who.startswith(("cargo: ", "unchanged: ")) or "failed" in who]
             if reasons or row["wrong"]:
                 md.write(f"**{row['project']}**\n\n" + "".join(f"- {r}\n" for r in reasons + row["wrong"]) + "\n")
         if result["flags"]:

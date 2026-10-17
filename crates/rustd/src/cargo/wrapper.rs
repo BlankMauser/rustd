@@ -19,6 +19,11 @@ use crate::stub::VALUED;
 /// The variable that makes `rustd` this wrapper.
 pub(crate) const ENABLED: &str = "RUSTD_CARGO_WRAPS";
 
+/// What the variables that name the programs of a build start with.
+const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
+/// The variable that names the directory cargo gives the integration tests of a build.
+const SCRATCH: &str = "CARGO_TARGET_TMPDIR";
+
 /// Runs rustc, records the unit when rustc succeeded, and ends as rustc did.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
@@ -112,6 +117,9 @@ impl Unit {
             stamp,
             copies,
             link_line,
+            env: std::env::vars()
+                .filter(|(name, _)| name.starts_with(PROGRAM_OF) || name == SCRATCH)
+                .collect(),
         }
     }
 

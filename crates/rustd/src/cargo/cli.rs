@@ -115,7 +115,7 @@ impl Subcommand {
 /// What the user asked for.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Asked {
-    Build(Invocation),
+    Build(Box<Invocation>),
     /// A subcommand that is cargo's alone, with its arguments.
     Cargo(Vec<String>),
     Status,
@@ -170,7 +170,7 @@ impl Asked {
             return Asked::Cargo(vec!["help".to_owned()]);
         };
         match (first.as_str(), Subcommand::named(first)) {
-            (_, Some(subcommand)) => Asked::Build(Invocation::parse(subcommand, rest)),
+            (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
             _ => Asked::Cargo(args),
@@ -253,7 +253,9 @@ impl Invocation {
             _ if flags.unstable => "unstable cargo flags",
             _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if set("RUSTC_WORKSPACE_WRAPPER") => "RUSTC_WORKSPACE_WRAPPER is set already",
+            _ if set("RUSTC_WORKSPACE_WRAPPER") && !set(super::wrapper::ENABLED) => {
+                "RUSTC_WORKSPACE_WRAPPER is set already"
+            }
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -337,7 +339,7 @@ mod tests {
     fn build(subcommand: &str, args: &str) -> Invocation {
         let words = std::iter::once(subcommand).chain(args.split_whitespace());
         match Asked::parse(words.map(str::to_owned).collect()) {
-            Asked::Build(invocation) => invocation,
+            Asked::Build(invocation) => *invocation,
             other => panic!("{other:?}"),
         }
     }

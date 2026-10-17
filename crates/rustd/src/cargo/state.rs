@@ -79,6 +79,11 @@ pub(crate) struct Program {
     pub(crate) package_dir: PathBuf,
     /// Where cargo has the executable.
     pub(crate) executable: PathBuf,
+    /// The other names cargo has for the executable: the file rustc wrote, when
+    /// `executable` is cargo's hard link to it. A cargo that finds the two apart links
+    /// them again, under whoever is running the program.
+    #[serde(default)]
+    names: Vec<PathBuf>,
     /// A hard link to the executable rustc linked, to give cargo back before it builds.
     cargos: PathBuf,
     /// Where it is among the programs of its checkout in `checkouts`.
@@ -207,10 +212,11 @@ fn newer_in(dir: &Path, since: u128) -> Option<PathBuf> {
         let (path, name) = (entry.path(), entry.file_name());
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() {
-            if name != "target" && name != ".git" {
-                if let Some(found) = newer_in(&path, since) {
-                    return Some(found);
-                }
+            if name != "target"
+                && name != ".git"
+                && let Some(found) = newer_in(&path, since)
+            {
+                return Some(found);
             }
         } else if entry.metadata().and_then(|it| it.modified()).is_ok_and(|it| stamp_of(it) > since)
         {
@@ -240,8 +246,7 @@ impl Built {
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
-        cargo.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?);
-        cargo.env(wrapper::ENABLED, "1");
+        as_built(&mut cargo)?;
         cargo.stdout(Stdio::piped());
         let mut cargo = cargo.spawn().context("running cargo")?;
         let said = cargo.stdout.take().context("cargo has no output")?;
@@ -286,8 +291,11 @@ impl State {
         let new = path.with_extension(format!("{}.new", std::process::id()));
         std::fs::write(&new, serde_json::to_vec(self)?)?;
         std::fs::rename(&new, &path)?;
-        let kept: Vec<(&Path, &Path)> =
-            self.programs.iter().map(|it| (&*it.executable, &*it.cargos)).collect();
+        let kept: Vec<(&Path, &Path)> = self
+            .programs
+            .iter()
+            .flat_map(|program| program.places().map(|it| (it, &*program.cargos)))
+            .collect();
         Ok(std::fs::write(State::kept_path(&self.key)?, serde_json::to_vec(&kept)?)?)
     }
 
@@ -366,9 +374,10 @@ impl State {
                 }
                 cargos.push((program, why));
             }
-            if !same_file::is_same_file(from, &program.executable).unwrap_or(false) {
-                place(from, &program.executable)
-                    .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+            for to in program.places() {
+                if !same_file::is_same_file(from, to).unwrap_or(false) {
+                    place(from, to).map_err(|it| format!("installing {}: {it}", to.display()))?;
+                }
             }
         }
         Ok(cargos)
@@ -420,6 +429,13 @@ impl State {
         if state.refusal.is_none() {
             state.refusal = other_toolchain();
         }
+        let env = match units::places_named(&used) {
+            Ok(env) => env,
+            Err(why) => {
+                state.refusal.get_or_insert(why);
+                BTreeMap::new()
+            }
+        };
         let config = |unit_test: bool| WorkerConfig {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
@@ -442,6 +458,7 @@ impl State {
             root: root.clone(),
             programs: Vec::new(),
             sources: Vec::new(),
+            env: env.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
         let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
@@ -459,6 +476,11 @@ impl State {
             std::fs::create_dir_all(&files)?;
             let cargos = files.join("cargo");
             place(executable.as_std_path(), &cargos)?;
+            let names = unit.map(|it| it.outputs()).unwrap_or_default().into_iter();
+            let names = names
+                .filter(|it| it != executable.as_std_path())
+                .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
+                .collect();
             let plan = match unit {
                 Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
                 None => Err(format!(
@@ -490,6 +512,7 @@ impl State {
                 source: artifact.target.src_path.clone().into_std_path_buf(),
                 package_dir: package_dir(package),
                 executable: executable.clone().into_std_path_buf(),
+                names,
                 cargos,
                 asked_as,
                 left_to_cargo,
@@ -533,6 +556,11 @@ impl State {
 }
 
 impl Program {
+    /// Every path cargo has the executable at.
+    fn places(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(&*self.executable).chain(self.names.iter().map(|it| &**it))
+    }
+
     /// The first of its source files that was written after cargo started.
     fn newer_input(&self, built_at: u128) -> Option<&Path> {
         let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
@@ -551,6 +579,15 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::copy(from, &new)?;
     }
     std::fs::rename(&new, to)
+}
+
+/// Gives `command` the environment cargo built in, so that a cargo it runs, or is, has the
+/// same units: cargo keys the crates of the workspace by their wrapper, and one run
+/// without it builds each program again and puts its own where this build's is, under a
+/// program that is running.
+pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
+    command.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?).env(wrapper::ENABLED, "1");
+    Ok(())
 }
 
 /// The cargo to run: the one that ran this command, or the one on the path.

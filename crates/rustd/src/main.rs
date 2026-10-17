@@ -1608,6 +1608,8 @@ struct Build {
     steps: [Duration; 3],
     /// Within the checking, the longest a thread took over each kind of cached thing.
     looked: hir_ty::mir::codegen::StaleSteps,
+    /// Why rustc does not compile what was built, when `env!` asks for a variable nobody set.
+    unset: Option<String>,
 }
 
 thread_local! {
@@ -1754,6 +1756,8 @@ fn build(
         emit: start.elapsed(),
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
+        unset: unset_in(db, &local)
+            .map(|it| format!("`env!(\"{it}\")` names a variable that is not set")),
     };
     if let Some(path) = &args.report {
         let compiled: Vec<String> = unit.compiled.iter().map(|&(func, _)| name(func)).collect();
@@ -2014,6 +2018,23 @@ fn process_reads(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<(Strin
         .collect();
     reads.sort_unstable();
     reads
+}
+
+/// A variable `env!` asks for in one of `crates` that neither cargo nor the process the build
+/// is for sets: rustc does not compile the crate.
+fn unset_in(db: &RootDatabase, crates: &[Crate]) -> Option<String> {
+    let mut unset: Vec<String> = db
+        .env_unset()
+        .into_iter()
+        .filter(|(krate, key)| {
+            crates.iter().any(|it| ide_db::base_db::Crate::from(*it) == *krate)
+                && !krate.env(db).contains_key(key)
+                && ide_db::base_db::process_env_var(db, key).is_none()
+        })
+        .map(|(_, key)| key)
+        .collect();
+    unset.sort_unstable();
+    unset.into_iter().next()
 }
 
 /// The checkout a crate was loaded in, and the one its variables name now.
@@ -2786,8 +2807,8 @@ struct Unbuilt {
 /// differ from the first build's, or `ok object=PATH ...` when the whole object was written
 /// again.
 fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("no daemon at {}", socket.display()))?;
+    let mut stream =
+        socket::connect(socket).with_context(|| format!("no daemon at {}", socket.display()))?;
     let target = target.map(|it| it.fields()).unwrap_or_default();
     let env = process::encode(&process::own());
     stream.write_all(format!("{}{target}\n{env}\n", request.name()).as_bytes())?;
@@ -3056,6 +3077,9 @@ fn main() -> anyhow::Result<()> {
         known.touch(&db, None);
         cold = build(&db, &table, &args, &mut known, &listed)?;
     }
+    if let Some(unset) = &cold.unset {
+        bail!("{unset}");
+    }
     eprint!("cold: ");
     report(&cold);
     memory::report(&mut db, "build")?;
@@ -3115,9 +3139,10 @@ fn main() -> anyhow::Result<()> {
         // Each connection is read by a thread of its own: one that sends nothing, or
         // slowly, keeps no other from being heard.
         std::thread::spawn(move || {
-            for stream in served.listener.incoming().flatten() {
+            for (stream, open) in served.incoming() {
                 let sender = sender.clone();
                 std::thread::spawn(move || {
+                    let _open = open;
                     if let Some(request) = requested(stream) {
                         // The daemon is ending when nothing takes requests any more.
                         let _ = sender.send(Event::Asked(request));
@@ -4021,7 +4046,8 @@ impl Program {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        let mut failed =
+            refusal(db, &edited, paths, out_of_date).or(broken).or_else(|| warm.unset.clone());
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         match tests {
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),

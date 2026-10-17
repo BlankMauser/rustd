@@ -38,6 +38,7 @@ cases![
     fragment_token,
     blanket_in_fn,
     lifetime_only_callee,
+    arg_frames,
     non_exhaustive_capture,
     allocator_static,
     negative_literal_token,

@@ -1915,6 +1915,8 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        argument_slots: Vec::new(),
+        free_argument_slots: Vec::new(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -3819,6 +3821,11 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The slots the arguments of the calls so far were copied to since the last were
+    /// freed, each with its size and the power of two it is aligned to.
+    argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
+    /// The ones whose call has returned.
+    free_argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -4664,7 +4671,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
-                let copy = self.stack_slot(layout);
+                let copy = self.argument_slot(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
             }
@@ -4801,6 +4808,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         }
         self.blob_addr(blob).ok()
+    }
+
+    /// Storage for the copy of an argument a callee is handed. The copy is the callee's
+    /// until it returns and nobody's after, so a later call has its own in the same place:
+    /// a function that calls a hundred others has the frame of its widest call and not
+    /// of all of them.
+    fn argument_slot(&mut self, layout: &Layout) -> Value {
+        let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
+        if align > 16 {
+            return self.stack_slot(layout);
+        }
+        let align_shift = align.trailing_zeros() as u8;
+        let free = self.free_argument_slots.iter().position(|it| it.1 == (size, align_shift));
+        let slot = match free {
+            Some(free) => self.free_argument_slots.swap_remove(free).0,
+            None => self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size,
+                align_shift,
+            )),
+        };
+        self.argument_slots.push((slot, (size, align_shift)));
+        self.builder.ins().stack_addr(ptr(), slot, 0)
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -8699,6 +8729,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let PassMode::Indirect = ret_mode {
             values.push(dst);
         }
+        // The calls before this one have returned.
+        self.free_argument_slots.append(&mut self.argument_slots);
         for (&(addr, ty), &mode) in args.iter().zip(&arg_modes) {
             let layout = self.layout(ty)?;
             self.pass(mode, addr, &layout, &mut values);

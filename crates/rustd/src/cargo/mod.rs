@@ -13,7 +13,7 @@ pub(crate) mod script;
 mod state;
 mod units;
 
-use std::{path::Path, process::Command, time::Instant};
+use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
 
 use anyhow::Context as _;
 
@@ -86,9 +86,9 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
 /// them. A program the daemon does not build stays as cargo built it while its source is
 /// what cargo compiled. `Err` is the state and why the build is cargo's.
-fn by_daemon(mut state: State) -> Result<State, (State, String)> {
+fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
     if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
-        return Err((state, reason));
+        return Err((Box::new(state), reason));
     }
     let asked: Vec<Result<Vec<Result<(), String>>, String>> =
         state.checkouts.iter().map(synced).collect();
@@ -100,7 +100,7 @@ fn by_daemon(mut state: State) -> Result<State, (State, String)> {
         .collect();
     let cargos = match state.settle(&answers) {
         Ok(cargos) => cargos,
-        Err(reason) => return Err((state, reason)),
+        Err(reason) => return Err((Box::new(state), reason)),
     };
     let unchanged = "it is as cargo built it, and its source has not changed";
     for (answer, checkout) in std::iter::zip(&asked, &state.checkouts) {
@@ -129,7 +129,7 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
         return Ok(Vec::new());
     }
     // The daemon knows the source files from when it was told to load them.
-    let asked = Checkout { sources: Vec::new(), ..checkout.clone() };
+    let asked = Checkout { sources: Vec::new(), ..asking(checkout) };
     let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
     match reply {
         None => Err(client::why_none()),
@@ -144,10 +144,20 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
     }
 }
 
+/// `checkout` as a request names it: with the variables of this process, which `env!`
+/// reads where cargo set none. The ones that make rustd the wrapper are cargo's alone.
+fn asking(checkout: &Checkout) -> Checkout {
+    let wraps = |name: &str| name == wrapper::ENABLED || name == "RUSTC_WORKSPACE_WRAPPER";
+    let mut env: BTreeMap<String, String> =
+        std::env::vars().filter(|(name, _)| !wraps(name)).collect();
+    env.extend(checkout.env.clone());
+    Checkout { env, ..checkout.clone() }
+}
+
 /// Tells the daemon to load `checkout` as cargo just built it, starting one when there is
 /// none. `Err` is why it does not.
 fn warmed(checkout: &Checkout) -> Result<(), String> {
-    match client::ask(Request::Warm(checkout.clone()), Start::IfMissing) {
+    match client::ask(Request::Warm(asking(checkout)), Start::IfMissing) {
         Ok(Some(Reply::Cold { reason })) => Err(reason),
         Ok(_) => Ok(()),
         Err(why) => Err(format!("{why:#}")),
