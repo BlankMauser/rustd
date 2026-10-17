@@ -145,6 +145,9 @@ pub struct CargoConfig {
     pub set_test: bool,
     /// Load the project without any dependencies
     pub no_deps: bool,
+    /// Run the build scripts as a build of the manifest's package has them, not as a build of
+    /// every member of its workspace does: the features of the two differ.
+    pub only_manifest_package: bool,
 }
 
 pub type Package = Idx<PackageData>;
@@ -176,6 +179,9 @@ pub struct PackageData {
     pub features: FxHashMap<String, Vec<String>>,
     /// List of features enabled on this package
     pub active_features: Vec<String>,
+    /// What the profile cargo builds the package with changes of the toolchain's cfg, when the
+    /// build is known.
+    pub profile_cfg: Option<cfg::CfgDiff>,
     /// Package id
     pub id: Arc<PackageId>,
     /// Authors as given in the `Cargo.toml`
@@ -427,6 +433,7 @@ impl CargoWorkspace {
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
+                profile_cfg: None,
                 metadata: meta.rust_analyzer.unwrap_or_default(),
                 all_member_deps: None,
             });
@@ -532,6 +539,11 @@ impl CargoWorkspace {
     /// build of the whole workspace.
     pub fn set_active_features(&mut self, package: Package, features: Vec<String>) {
         self.packages[package].active_features = features;
+    }
+
+    /// Sets what the profile the package is built with changes of the toolchain's cfg.
+    pub fn set_profile_cfg(&mut self, package: Package, cfg: cfg::CfgDiff) {
+        self.packages[package].profile_cfg = Some(cfg);
     }
 
     /// Leaves out what only tests, examples and benchmarks depend on.

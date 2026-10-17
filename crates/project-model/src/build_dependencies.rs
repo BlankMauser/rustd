@@ -451,7 +451,10 @@ impl WorkspaceBuildScripts {
                 let mut requires_unstable_options = false;
                 let mut cmd = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
 
-                cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
+                cmd.args(["check", "--quiet", "--message-format=json"]);
+                if !config.only_manifest_package {
+                    cmd.arg("--workspace");
+                }
                 cmd.args(&config.extra_args);
                 if let Some(config_path) = &config.config_path {
                     cmd.arg("--config").arg(config_path);

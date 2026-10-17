@@ -5,6 +5,7 @@ mod content;
 mod deps;
 mod memory;
 mod outline;
+mod plan;
 mod remote;
 mod splice;
 mod stub;
@@ -103,6 +104,12 @@ struct Args {
     dev_deps: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
+    /// Build without the default features of the package, as `--no-default-features` does.
+    no_default_features: bool,
+    /// Build with every feature of the package, as `--all-features` does.
+    all_features: bool,
+    /// The cargo profile the program is built with: `dev` unless told otherwise.
+    profile: String,
     /// Other checkouts of projects to load into the same database, for requests that name
     /// one as their `--project`. What they have in common with `project` is there once.
     also: Vec<PathBuf>,
@@ -164,6 +171,9 @@ impl Args {
         let mut cfg_test = false;
         let mut dev_deps = false;
         let mut features = Vec::new();
+        let mut no_default_features = false;
+        let mut all_features = false;
+        let mut profile = None;
         let mut also = Vec::new();
         let mut target = None;
         while let Some(arg) = args.next() {
@@ -186,6 +196,13 @@ impl Args {
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
+                "--no-default-features" => no_default_features = true,
+                "--all-features" => all_features = true,
+                "--release" | "--profile" if profile.is_some() => {
+                    bail!("the profile is given twice")
+                }
+                "--release" => profile = Some("release".to_owned()),
+                "--profile" => profile = Some(value()?),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
@@ -207,6 +224,9 @@ impl Args {
             cfg_test,
             dev_deps,
             features,
+            no_default_features,
+            all_features,
+            profile: profile.unwrap_or_else(|| "dev".to_owned()),
             also,
             target,
             checkout: PathBuf::new(),
@@ -818,7 +838,7 @@ fn load(
     projects: &[&Path],
     cargo_config: &CargoConfig,
     load_config: LoadCargoConfig,
-    dev_deps: bool,
+    selection: plan::Selection,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         compared: Default::default(),
@@ -827,7 +847,7 @@ fn load(
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
         load_config,
-        dev_deps,
+        selection,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
@@ -850,8 +870,8 @@ struct Checkouts {
     loaded: load_cargo::Loaded,
     cargo_config: CargoConfig,
     load_config: LoadCargoConfig,
-    /// Whether what only tests, examples and benchmarks depend on is loaded.
-    dev_deps: bool,
+    /// Which build of each project is loaded.
+    selection: plan::Selection,
 }
 
 impl Checkouts {
@@ -1073,7 +1093,7 @@ impl Checkouts {
             }
             splits.push(None);
             let workspace =
-                workspace_at(project, &self.cargo_config, &self.load_config, self.dev_deps)?;
+                workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
@@ -1223,24 +1243,23 @@ fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-    dev_deps: bool,
+    selection: &plan::Selection,
 ) -> anyhow::Result<ProjectWorkspace> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
-        if !dev_deps {
+        if !selection.dev_deps {
             cargo.drop_dev_dependencies();
         }
-        let built = built_features(manifest.manifest_path().as_ref(), cargo_config, dev_deps)?;
+        // `cargo metadata` unifies features over every member of the workspace and knows no
+        // profile. The build of this one package has both.
+        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
-            let data = &cargo[package];
-            let directory = data.is_local.then(|| PathBuf::from(data.manifest.parent()));
-            let key = (data.name.clone(), data.version.to_string(), directory);
-            if let Some(features) = built.get(&key) {
-                cargo.set_active_features(package, features.iter().cloned().collect());
-            }
+            let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
+            cargo.set_active_features(package, built.features.iter().cloned().collect());
+            cargo.set_profile_cfg(package, built.profile.cfg());
         }
     }
     if load_config.load_out_dirs_from_check {
@@ -1259,53 +1278,6 @@ fn report_sharing(db: &RootDatabase) {
         crates.len(),
         memory::resident().unwrap_or(0)
     );
-}
-
-/// A package's name, its version, and its directory when it is built from a path: a member
-/// can depend, through others, on the registry's copy of its own version.
-type BuiltPackage = (String, String, Option<PathBuf>);
-
-/// The features of each package in a build of the package of `manifest`.
-///
-/// `cargo metadata` unifies features over every member of the workspace, and cargo doesn't
-/// when it builds one of them.
-// FIXME: a package built for the host with other features than for the target has both here.
-fn built_features(
-    manifest: &Path,
-    cargo_config: &CargoConfig,
-    dev_deps: bool,
-) -> anyhow::Result<FxHashMap<BuiltPackage, std::collections::BTreeSet<String>>> {
-    let edges = if dev_deps { "normal,dev" } else { "normal" };
-    let mut command = Command::new("cargo");
-    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
-    command.arg("--manifest-path").arg(manifest);
-    if let CargoFeatures::Selected { features, .. } = &cargo_config.features
-        && !features.is_empty()
-    {
-        command.arg("--features").arg(features.join(","));
-    }
-    let output = command.output().context("running `cargo tree`")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "`cargo tree` failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let mut built = FxHashMap::default();
-    for line in String::from_utf8(output.stdout)?.lines() {
-        // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
-        let Some((package, features)) = line.split_once('|') else { continue };
-        let mut package = package.splitn(3, ' ');
-        let (Some(name), Some(version)) = (package.next(), package.next()) else { continue };
-        let version = version.trim_start_matches('v');
-        let source = package.next().and_then(|it| it.strip_prefix('(')?.strip_suffix(')'));
-        let directory = source.filter(|it| Path::new(it).is_absolute()).map(PathBuf::from);
-        let features = features.trim_end_matches(" (*)").split(',').filter(|it| !it.is_empty());
-        built
-            .entry((name.to_owned(), version.to_owned(), directory))
-            .or_insert_with(std::collections::BTreeSet::new)
-            .extend(features.map(str::to_owned));
-    }
-    Ok(built)
 }
 
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
@@ -2195,6 +2167,9 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             cfg_test: args.cfg_test,
             dev_deps: args.dev_deps,
             features: args.features.clone(),
+            no_default_features: args.no_default_features,
+            all_features: args.all_features,
+            profile: args.profile.clone(),
             also: Vec::new(),
             target: args.target.clone(),
             checkout: args.checkout.clone(),
@@ -2673,11 +2648,26 @@ fn main() -> anyhow::Result<()> {
         sysroot: Some(sysroot),
         target: args.target.clone(),
         set_test: args.cfg_test,
-        features: CargoFeatures::Selected {
-            features: args.features.clone(),
-            no_default_features: false,
+        features: match args.all_features {
+            true => CargoFeatures::All,
+            false => CargoFeatures::Selected {
+                features: args.features.clone(),
+                no_default_features: args.no_default_features,
+            },
         },
+        // The build scripts say what the build asked for says, not what `cargo check` of the
+        // workspace does.
+        extra_args: vec!["--profile".to_owned(), args.profile.clone()],
+        only_manifest_package: true,
         ..Default::default()
+    };
+    let selection = plan::Selection {
+        profile: args.profile.clone(),
+        features: args.features.clone(),
+        no_default_features: args.no_default_features,
+        all_features: args.all_features,
+        target: args.target.clone(),
+        dev_deps: args.cfg_test || args.dev_deps,
     };
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
@@ -2688,8 +2678,7 @@ fn main() -> anyhow::Result<()> {
     };
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
-    let (mut db, vfs, mut checkouts) =
-        load(&projects, &cargo_config, load_config, args.cfg_test || args.dev_deps)?;
+    let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());

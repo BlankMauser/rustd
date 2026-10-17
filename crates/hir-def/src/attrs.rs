@@ -238,6 +238,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
                     "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
+                    "rustc_inherit_overflow_checks" => {
+                        attr_flags.insert(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+                    }
                     "thread_local" => attr_flags.insert(AttrFlags::THREAD_LOCAL),
                     "pointee" => attr_flags.insert(AttrFlags::IS_POINTEE),
                     "non_exhaustive" => attr_flags.insert(AttrFlags::NON_EXHAUSTIVE),
@@ -363,6 +366,7 @@ bitflags::bitflags! {
         const THREAD_LOCAL = 1 << 54;
         const RUSTC_PROMOTABLE = 1 << 55;
         const HAS_DEFINE_OPAQUE = 1 << 56;
+        const RUSTC_INHERIT_OVERFLOW_CHECKS = 1 << 57;
     }
 }
 

@@ -1089,6 +1089,25 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     })
 }
 
+/// Whether the crate is built with `-C overflow-checks`, when cargo builds it. The standard
+/// library is built already, without.
+fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
+    if krate.data(db).origin.is_lang() {
+        return None;
+    }
+    let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
+    Some(krate.cfg_options(db).check_atom(&flag))
+}
+
+/// Whether the crates cargo builds have `-C overflow-checks`, when they all agree.
+#[salsa::tracked(returns(copy))]
+fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
+    let crates = base_db::all_crates(db);
+    let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
+    let first = settings.next()?;
+    settings.all(|it| it == first).then_some(first)
+}
+
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
 #[salsa::tracked(returns(ref))]
 fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
@@ -1994,7 +2013,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store))),
+                .map(|store| {
+                    let checked = build_checks_overflow(db);
+                    std::sync::Arc::new(cached::Entries::new(store, checked))
+                }),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2281,7 +2303,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed += 1;
             return;
         };
-        let Some(key) = cached::Entry::key(&name) else { return };
+        let checked = build_checks_overflow(self.db);
+        let Some(key) = cached::Entry::key(&name, checked) else { return };
         let stored = store.get(&key);
         let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if stored.is_some() && !check {
@@ -6374,7 +6397,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             _ => self.builder.ins().ireduce(ty, zero),
                         };
                         let (value, overflow) = self.builder.ins().ssub_overflow(zero, value);
-                        self.panic_if(overflow, OverflowOp::Neg)?;
+                        self.panic_if_overflow(overflow, OverflowOp::Neg)?;
                         value
                     }
                 };
@@ -6748,7 +6771,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && self.builder.func.dfg.value_type(l) == types::I128
         {
             let (value, overflow) = self.wide_mul_overflow(l, r, signed)?;
-            self.panic_if(overflow, OverflowOp::Mul)?;
+            self.panic_if_overflow(overflow, OverflowOp::Mul)?;
             return Ok(value);
         }
         let ins = self.builder.ins();
@@ -6773,7 +6796,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     BinOp::Sub => OverflowOp::Sub,
                     _ => OverflowOp::Mul,
                 };
-                self.panic_if(overflow, op)?;
+                self.panic_if_overflow(overflow, op)?;
                 value
             }
             BinOp::Div | BinOp::Rem => {
@@ -6807,7 +6830,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
                     (_, false) => (OverflowOp::Shr, self.builder.ins().ushr(l, r)),
                 };
-                self.panic_if(overflow, shift_op)?;
+                self.panic_if_overflow(overflow, shift_op)?;
                 value
             }
             BinOp::Offset => unsupported!("pointer offset"),
@@ -6909,6 +6932,35 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (false, false) => unreachable!("float cast between integers"),
         })
+    }
+
+    /// Whether arithmetic of the body being compiled panics when it overflows. rustc decides
+    /// it twice: the crate the body is written in leaves the check out of what it keeps of the
+    /// body unless it has `-C overflow-checks` or the function takes the setting of its
+    /// callers, and the crate that compiles the body drops the check unless it has the flag.
+    fn checks_overflow(&self) -> Result<bool> {
+        let db = self.cg.db;
+        let Some(body) = self.body else { return Ok(false) };
+        let inherits = match body.owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+            }
+            _ => false,
+        };
+        let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
+        if written_with == Some(false) || (written_with.is_none() && !inherits) {
+            return Ok(false);
+        }
+        match build_checks_overflow(db) {
+            Some(checked) => Ok(checked),
+            // The body is compiled by whichever crate uses it, and that is not known here.
+            None => unsupported!("overflow checks differ between the packages of the build"),
+        }
+    }
+
+    /// Branches to a panic when `overflow` is set, if the body is one that checks.
+    fn panic_if_overflow(&mut self, overflow: Value, op: OverflowOp) -> Result<()> {
+        if self.checks_overflow()? { self.panic_if(overflow, op) } else { Ok(()) }
     }
 
     /// Branches to a call of rustc's `panic_const_*` when `cond` is set.
@@ -8561,7 +8613,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("overflow_checks", []) => {
-                let value = self.builder.ins().iconst(types::I8, 1);
+                let Some(checked) = build_checks_overflow(self.cg.db) else {
+                    unsupported!("overflow checks differ between the packages of the build");
+                };
+                let value = self.builder.ins().iconst(types::I8, i64::from(checked));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])

@@ -1303,9 +1303,14 @@ fn cargo_to_crate_graph(
                     cfg_options.insert_atom(sym::rust_analyzer);
                 }
             }
-            // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
-            if sysroot_as_built() && !cargo.is_sysroot() {
-                cfg_options.insert_atom(sym::debug_assertions);
+            match &cargo[pkg].profile_cfg {
+                Some(profile) => cfg_options.apply_diff(profile.clone()),
+                // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
+                None if sysroot_as_built() && !cargo.is_sysroot() => {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::overflow_checks);
+                }
+                None => {}
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
