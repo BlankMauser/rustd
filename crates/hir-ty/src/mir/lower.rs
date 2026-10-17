@@ -486,7 +486,40 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands.push(super::AsmOperand::Label);
                             continue;
                         }
-                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                        AsmOperand::Sym(path) => {
+                            let guard = self.resolver.update_to_inner_scope(
+                                self.db,
+                                self.store_owner,
+                                expr_id,
+                            );
+                            let named = self.resolver.resolve_path_in_value_ns_fully(
+                                self.db,
+                                path,
+                                HygieneId::ROOT,
+                            );
+                            self.resolver.reset_to_guard(guard);
+                            let named = match named {
+                                Some(ValueNs::StaticId(id)) => {
+                                    Operand { kind: OperandKind::Static(id), span: None }
+                                }
+                                // FIXME: one with parameters, whose arguments inference
+                                // does not record for a `sym`.
+                                Some(ValueNs::FunctionId(func))
+                                    if generics(self.db, func.into()).len(true) == 0 =>
+                                {
+                                    Operand::const_zst(Ty::new_fn_def(
+                                        self.interner(),
+                                        CallableDefId::FunctionId(func).into(),
+                                        GenericArgs::empty(),
+                                    ))
+                                }
+                                _ => not_supported!(
+                                    "inline assembly with a `sym` that is not a static or a                                      function without parameters"
+                                ),
+                            };
+                            operands.push(super::AsmOperand::Sym(named));
+                            continue;
+                        }
                     };
                     let input = match input {
                         Some(input) => {

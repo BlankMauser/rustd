@@ -1762,15 +1762,29 @@ fn compile<'db>(
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
-        Some(text) => Code {
-            signature: ctx.func.signature.clone(),
-            bytes: asm::assemble(&isa.triple().to_string(), &text)
-                .map_err(CodegenError::Unsupported)?
-                .to_vec(),
-            align: 16,
-            relocs: Vec::new(),
-            unwind: None,
-        },
+        Some((text, syms)) => {
+            let assembled = asm::assemble(&isa.triple().to_string(), &text)
+                .map_err(CodegenError::Unsupported)?;
+            let relocs = assembled.relocs.iter().map(|named| {
+                let name = syms.get(named.operand as usize).cloned().flatten()?;
+                Some(ModuleReloc {
+                    offset: named.offset,
+                    kind: named.kind,
+                    name,
+                    addend: named.addend,
+                })
+            });
+            let Some(relocs) = relocs.collect() else {
+                unsupported!("inline assembly that names a symbol");
+            };
+            Code {
+                signature: ctx.func.signature.clone(),
+                bytes: assembled.code.clone(),
+                align: 16,
+                relocs,
+                unwind: None,
+            }
+        }
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
     let (requests, layouts) = cg.finish();
@@ -2696,13 +2710,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         let triple = self.module.isa().triple().to_string();
-        let code = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
+        let assembled = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
         let name = format!("rustd::asm::{}", self.assemblies.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.module.define_function_bytes(id, 16, &code, &[])?;
+        self.module.define_function_bytes(id, 16, &assembled.code, &[])?;
         self.assemblies.insert(text.to_owned(), id);
         Ok(id)
     }
@@ -6115,8 +6129,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn inline_asm(&mut self, block: &crate::mir::InlineAsm) -> Result<()> {
         use crate::mir::AsmOperand;
         let mut operands = Vec::with_capacity(block.operands.len());
+        let mut syms = Vec::with_capacity(block.operands.len());
         for operand in &block.operands {
+            syms.push(match operand {
+                AsmOperand::Sym(_) if !block.naked => unsupported!("`asm!` with a `sym`"),
+                AsmOperand::Sym(Operand { kind: OperandKind::Static(id), .. }) => {
+                    if is_thread_local(self.cg.db, *id) {
+                        unsupported!("inline assembly with a `sym` that is thread local");
+                    }
+                    Some(ModuleRelocTarget::user(1, self.cg.static_data(*id).as_u32()))
+                }
+                AsmOperand::Sym(function) => {
+                    let ty = self.operand_ty(function)?;
+                    Some(ModuleRelocTarget::user(0, self.fn_item(ty)?.as_u32()))
+                }
+                AsmOperand::Reg { .. } | AsmOperand::Const(_) | AsmOperand::Label => None,
+            });
             operands.push(match operand {
+                AsmOperand::Sym(_) => asm::Operand::Sym,
                 AsmOperand::Reg { reg, input, output } => {
                     let mut size = None;
                     let tys = [
@@ -6178,7 +6208,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;
-            self.cg.naked = Some(text);
+            self.cg.naked = Some((text, syms));
             return Ok(());
         }
         let wrapper = asm::wrapper(&self.cg.target, &block.template, block.options, &operands)
@@ -8578,17 +8608,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     Some(VariableArguments::Homed | VariableArguments::Stack)
                 ) =>
             {
-                let scalar = self.scalar_of(dst_ty)?;
-                if scalar.ty.bytes() > 8 {
-                    unsupported!("`va_arg` of {dst_ty:?}");
-                }
+                let size = self.layout(dst_ty)?.size;
+                // Windows has what does not fill a register exactly behind an address, which
+                // is what the caller passed: a copy of its own.
+                let by_reference = match self.cg.target.variable_arguments() {
+                    Some(VariableArguments::Homed) => !matches!(size.bytes(), 1 | 2 | 4 | 8),
+                    _ if size.bytes() > 8 => unsupported!("`va_arg` of {dst_ty:?}"),
+                    _ => false,
+                };
                 // The list is the address of the next argument, each of them in eight bytes.
                 let (list, _) = self.load_scalar(list)?;
-                let from = self.builder.ins().load(ptr(), MEM, list, 0);
-                let next = self.builder.ins().iadd_imm(from, 8);
+                let slot = self.builder.ins().load(ptr(), MEM, list, 0);
+                let next = self.builder.ins().iadd_imm(slot, 8);
                 self.builder.ins().store(MEM, next, list, 0);
-                let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
-                self.builder.ins().store(MEM, value, dst, 0);
+                let from = match by_reference {
+                    true => self.builder.ins().load(ptr(), MEM, slot, 0),
+                    false => slot,
+                };
+                self.copy(dst, from, size);
             }
             ("va_arg", [list]) => {
                 if self.cg.target.variable_arguments() != Some(VariableArguments::Registers) {

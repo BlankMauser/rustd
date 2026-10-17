@@ -9,8 +9,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, elf, pe};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
@@ -20,6 +21,9 @@ mod aarch64;
 
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
+
+/// What the name of an [`Operand::Sym`] starts with.
+const SYM: &str = "rustd_sym_";
 
 /// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
 /// control register its argument numbers.
@@ -90,6 +94,14 @@ pub(super) enum Operand<'a> {
     /// A `label` block. The function returns which one the block jumped to, counted from 1,
     /// or 0 when the block ran off its end.
     Label,
+    /// A function or a static: the text has a name for it that [`Assembled::relocs`] gives
+    /// back as the operand's index.
+    Sym,
+}
+
+/// The name in the text of the function or static that is operand `index`.
+fn sym(index: usize) -> String {
+    format!("{SYM}{index}")
 }
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
@@ -124,7 +136,10 @@ pub(super) fn naked(
             AsmPiece::Lit(lit) => text.push_str(lit),
             AsmPiece::Operand { index, .. } => match operands.get(*index) {
                 Some(Operand::Const(value)) => _ = write!(text, "{value}"),
-                _ => return Err("a `naked_asm!` operand that is not a constant".to_owned()),
+                Some(Operand::Sym) => text.push_str(&sym(*index)),
+                _ => {
+                    return Err("a `naked_asm!` operand that is a register or a label".to_owned());
+                }
             },
         }
     }
@@ -449,12 +464,66 @@ fn wrapper_x86_64(
     Ok(Wrapper { text, slot_size: slot_size.next_multiple_of(16).max(16), offsets })
 }
 
+/// The machine code of a function, and where in it the operands it names go.
+#[derive(Default)]
+pub(super) struct Assembled {
+    pub(super) code: Vec<u8>,
+    pub(super) relocs: Vec<Named>,
+}
+
+/// A place in the code that the address of an [`Operand::Sym`] goes.
+pub(super) struct Named {
+    pub(super) offset: u32,
+    pub(super) kind: Reloc,
+    /// The index of the operand.
+    pub(super) operand: u32,
+    pub(super) addend: i64,
+}
+
+/// The relocations a `sym` is assembled to, each with the number it is stored as.
+const RELOCS: [Reloc; 4] =
+    [Reloc::X86PCRel4, Reloc::X86CallPLTRel4, Reloc::X86GOTPCRel4, Reloc::Abs8];
+
+impl Assembled {
+    /// The bytes the store keeps.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = (self.code.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&self.code);
+        for named in &self.relocs {
+            let kind = RELOCS.iter().position(|it| *it == named.kind).unwrap_or(RELOCS.len());
+            bytes.extend_from_slice(&named.offset.to_le_bytes());
+            bytes.push(kind as u8);
+            bytes.extend_from_slice(&named.operand.to_le_bytes());
+            bytes.extend_from_slice(&named.addend.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
+        let (len, rest) = bytes.split_first_chunk()?;
+        let (code, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
+        let (records, []) = rest.as_chunks::<17>() else { return None };
+        let relocs = records.iter().map(|record| {
+            let (offset, rest) = record.split_first_chunk()?;
+            let (&kind, rest) = rest.split_first()?;
+            let (operand, rest) = rest.split_first_chunk()?;
+            Some(Named {
+                offset: u32::from_le_bytes(*offset),
+                kind: *RELOCS.get(usize::from(kind))?,
+                operand: u32::from_le_bytes(*operand),
+                addend: i64::from_le_bytes(rest.try_into().ok()?),
+            })
+        });
+        Some(Assembled { code: code.to_vec(), relocs: relocs.collect::<Option<_>>()? })
+    }
+}
+
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// store keeps the code, as it does a compiled function's.
-pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
-    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<[u8]>>>> = OnceLock::new();
+pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
+    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"rustd asm 1");
+    hasher.update(b"rustd asm 2");
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
@@ -464,16 +533,17 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         return Ok(code);
     }
     let store = Store::global();
-    let code: Arc<[u8]> = match store.and_then(|it| it.get(&key)) {
-        Some(code) => code.into(),
+    let kept = store.and_then(|it| it.get(&key)).and_then(|it| Assembled::from_bytes(&it));
+    let code = Arc::new(match kept {
+        Some(code) => code,
         None => {
-            let code: Arc<[u8]> = Assembler::selected().assemble(triple, text, &key)?.into();
+            let code = Assembler::selected().assemble(triple, text, &key)?;
             if let Some(store) = store {
-                store.insert(&key, &code);
+                store.insert(&key, &code.to_bytes());
             }
             code
         }
-    };
+    });
     if let Ok(mut assembled) = assembled.lock() {
         assembled.insert(key, code.clone());
     }
@@ -499,7 +569,7 @@ impl Assembler {
         }
     }
 
-    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
         match self {
             Assembler::Rustc => run_assembler(triple, text, key),
             #[cfg(feature = "llvm")]
@@ -510,7 +580,7 @@ impl Assembler {
 
 /// FIXME: this runs rustc, which is the one assembler sure to be there and to read what
 /// `asm!` is written in. An assembler in this process would do without the files.
-fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
     // Two threads may be assembling the same text.
     static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -553,8 +623,8 @@ fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, St
     code
 }
 
-/// The bytes of the function in an object that defines it alone.
-fn code(object: &[u8]) -> Result<Vec<u8>, String> {
+/// The function in an object that defines it alone.
+fn code(object: &[u8]) -> Result<Assembled, String> {
     let failed = |e: &dyn std::fmt::Display| format!("inline assembly: {e}");
     let file = object::File::parse(object).map_err(|e| failed(&e))?;
     let symbol = file
@@ -565,11 +635,59 @@ fn code(object: &[u8]) -> Result<Vec<u8>, String> {
         .section_index()
         .and_then(|it| file.section_by_index(it).ok())
         .ok_or_else(|| failed(&"the function is in no section"))?;
-    // FIXME: a block that names a symbol, or has data in another section.
-    if section.relocations().next().is_some() {
-        return Err("inline assembly that names a symbol".to_owned());
-    }
     let bytes = section.data().map_err(|e| failed(&e))?;
-    let start = (symbol.address() - section.address()) as usize;
-    Ok(bytes[start..].to_vec())
+    let start = symbol.address() - section.address();
+    let mut code = bytes[start as usize..].to_vec();
+    // FIXME: a block that names a symbol of its own, or has data in another section.
+    let relocs = section.relocations().map(|(offset, relocation)| {
+        let operand = match relocation.target() {
+            RelocationTarget::Symbol(index) => file.symbol_by_index(index).ok(),
+            _ => None,
+        };
+        let operand = operand
+            .and_then(|it| it.name().ok()?.strip_prefix(SYM)?.parse().ok())
+            .ok_or("inline assembly that names a symbol")?;
+        let kind = match relocation.flags() {
+            RelocationFlags::Elf { r_type: elf::R_X86_64_PC32 } => Reloc::X86PCRel4,
+            RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 } => Reloc::X86CallPLTRel4,
+            RelocationFlags::Elf {
+                r_type:
+                    elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX,
+            } => Reloc::X86GOTPCRel4,
+            RelocationFlags::Elf { r_type: elf::R_X86_64_64 }
+            | RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 } => Reloc::Abs8,
+            // The numbered forms say how many bytes of the instruction follow the field,
+            // which `object` has put in the addend.
+            RelocationFlags::Coff {
+                typ:
+                    pe::IMAGE_REL_AMD64_REL32
+                    | pe::IMAGE_REL_AMD64_REL32_1
+                    | pe::IMAGE_REL_AMD64_REL32_2
+                    | pe::IMAGE_REL_AMD64_REL32_3
+                    | pe::IMAGE_REL_AMD64_REL32_4
+                    | pe::IMAGE_REL_AMD64_REL32_5,
+            } => Reloc::X86PCRel4,
+            _ => return Err("inline assembly that names a symbol in a way that is not read"),
+        };
+        let offset = offset.checked_sub(start).ok_or("inline assembly before its function")?;
+        let mut addend = relocation.addend();
+        if relocation.has_implicit_addend() {
+            // COFF keeps what is added in the field, which whoever applies this is given apart.
+            let len = if kind == Reloc::Abs8 { 8 } else { 4 };
+            let field = code
+                .get_mut(offset as usize..)
+                .and_then(|it| it.get_mut(..len))
+                .ok_or("inline assembly with a relocation outside it")?;
+            let mut held = [0; 8];
+            held[..len].copy_from_slice(field);
+            field.fill(0);
+            addend += match len {
+                8 => i64::from_le_bytes(held),
+                _ => i64::from(i32::from_le_bytes([held[0], held[1], held[2], held[3]])),
+            };
+        }
+        Ok(Named { offset: offset as u32, kind, operand, addend })
+    });
+    let relocs = relocs.collect::<Result<_, &str>>()?;
+    Ok(Assembled { code, relocs })
 }
