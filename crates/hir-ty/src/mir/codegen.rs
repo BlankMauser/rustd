@@ -1986,10 +1986,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
-        // FIXME: a patch says nothing of its code yet.
         let debug = symbols
             .debug_directory()
-            .filter(|_| base.is_none())
             .and_then(|directory| DebugContext::new(module.isa(), &directory));
         let debugged = debug.is_some();
         Ok(ObjectCodegen {
