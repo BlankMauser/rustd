@@ -147,6 +147,10 @@ pub trait SymbolResolver {
     fn defines(&self, _symbol: &str) -> bool {
         false
     }
+    /// Whether rustc compiled the crate, so that what is skipped of it is in the program.
+    fn rustc_built(&self, _krate: Crate) -> bool {
+        true
+    }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
     /// What stands for a crate that is not rustc's alone to build, the same wherever the
@@ -456,11 +460,11 @@ impl CodegenUnit {
                 continue;
             }
             let fallback_start = stdx::time::Instant::now();
-            let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
+            let from_rustc: FxHashSet<FunctionId> = left_to_rustc(db, symbols, &skipped).collect();
             // A function left to rustc keeps using rustc's copy of a private static, so we
             // can't bring our own.
             let mut split = false;
-            let found = TheirStatics::of(db, left_to_rustc(&skipped));
+            let found = TheirStatics::of(db, from_rustc.iter().copied());
             split |= found.statics.iter().any(|it| cg.statics.contains_key(it));
             own_statics.theirs.extend(found.statics);
             let before = own_statics.unknown.len();
@@ -472,16 +476,14 @@ impl CodegenUnit {
                 rejected.extend(failed);
                 continue;
             }
-            if failed.is_empty() && from_rustc {
+            if failed.is_empty() && !from_rustc.is_empty() {
                 let mut theirs = Some(FxHashSet::default());
-                for (root, e) in &skipped {
-                    if !matches!(e, CodegenError::NoSymbol) {
-                        let blocks = async_blocks(db, *root).clone();
-                        theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
-                            all.extend(blocks);
-                            all
-                        });
-                    }
+                for root in &from_rustc {
+                    let blocks = async_blocks(db, *root).clone();
+                    theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
+                        all.extend(blocks);
+                        all
+                    });
                 }
                 let before = left.len();
                 left.extend(compiled.iter().map(|it| it.0).filter(|&root| {
@@ -1511,9 +1513,18 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
     Some(found)
 }
 
-/// The functions skipped that rustc has a copy of.
-fn left_to_rustc(skipped: &[(FunctionId, CodegenError)]) -> impl Iterator<Item = FunctionId> + '_ {
-    skipped.iter().filter(|(_, e)| !matches!(e, CodegenError::NoSymbol)).map(|it| it.0)
+/// The functions skipped that rustc has a copy of. One of a crate rustc built nothing of has
+/// none: it is missing from the program, and no code of rustc's uses a static in its place.
+fn left_to_rustc<'a>(
+    db: &'a dyn HirDatabase,
+    symbols: &'a dyn SymbolResolver,
+    skipped: &'a [(FunctionId, CodegenError)],
+) -> impl Iterator<Item = FunctionId> + 'a {
+    skipped
+        .iter()
+        .filter(|(_, e)| !matches!(e, CodegenError::NoSymbol))
+        .map(|it| it.0)
+        .filter(|&func| symbols.rustc_built(func.krate(db)))
 }
 
 /// The statics that functions left to rustc refer to, themselves or through the instances they
@@ -8797,9 +8808,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             (
-                "simd_and" | "simd_or" | "simd_xor" | "simd_add" | "simd_sub" | "simd_mul"
-                | "simd_shl" | "simd_shr" | "simd_eq" | "simd_ne" | "simd_lt" | "simd_le"
-                | "simd_gt" | "simd_ge",
+                "simd_and"
+                | "simd_or"
+                | "simd_xor"
+                | "simd_add"
+                | "simd_sub"
+                | "simd_mul"
+                | "simd_shl"
+                | "simd_shr"
+                | "simd_eq"
+                | "simd_ne"
+                | "simd_lt"
+                | "simd_le"
+                | "simd_gt"
+                | "simd_ge"
+                | "simd_div"
+                | "simd_saturating_add"
+                | "simd_saturating_sub",
                 [lhs, rhs],
             ) => {
                 let (l, ty) = self.operand(lhs)?;
@@ -8807,6 +8832,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (lane, count) = self.simd_lanes(ty)?;
                 let (out, _) = self.simd_lanes(dst_ty)?;
                 let signed = lane.signed;
+                if lane.ty.is_float() {
+                    self.simd_float_lanes(name, (l, r), dst, lane, out, count)?;
+                    return Ok(Intrinsic::Inline);
+                }
+                if name == "simd_div" {
+                    unsupported!("`simd_div` of integers");
+                }
                 for i in 0..count {
                     let offset = (i * lane.ty.bytes() as u64) as i32;
                     let a = self.builder.ins().load(lane.ty, MEM, l, offset);
@@ -8844,6 +8876,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         (None, "simd_shl") => self.builder.ins().ishl(a, b),
                         (None, "simd_shr") if signed => self.builder.ins().sshr(a, b),
                         (None, "simd_shr") => self.builder.ins().ushr(a, b),
+                        (None, "simd_saturating_add") => self.saturating(true, a, b, lane),
+                        (None, "simd_saturating_sub") => self.saturating(false, a, b, lane),
                         (None, _) => self.builder.ins().imul(a, b),
                     };
                     self.builder.ins().store(MEM, value, dst, (i * out.ty.bytes() as u64) as i32);
@@ -8972,6 +9006,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let from = AbiScalar { ty: types::I64, signed: false };
                 let value = self.int_cast(bits, from, to);
                 self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("simd_reduce_and" | "simd_reduce_or" | "simd_reduce_xor", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (lane, count) = self.simd_lanes(ty)?;
+                if lane.ty.is_float() {
+                    unsupported!("`{name}` of floats");
+                }
+                let mut acc = self.builder.ins().load(lane.ty, MEM, src, 0);
+                for i in 1..count {
+                    let offset = (i * lane.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(lane.ty, MEM, src, offset);
+                    acc = match name {
+                        "simd_reduce_and" => self.builder.ins().band(acc, value),
+                        "simd_reduce_or" => self.builder.ins().bor(acc, value),
+                        _ => self.builder.ins().bxor(acc, value),
+                    };
+                }
+                self.builder.ins().store(MEM, acc, dst, 0);
             }
             ("simd_reduce_all" | "simd_reduce_any", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
@@ -9295,6 +9347,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, high, dst, lane + 8);
                 }
             }
+            // A hint to the cache, which the program behaves the same without.
+            ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
             _ => unsupported!("LLVM intrinsic `{name}`"),
         }
         Ok(())
@@ -9385,6 +9439,48 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let memcmp = self.cg.declare_func_in_func(memcmp, self.builder.func);
         let call = self.builder.ins().call(memcmp, &[a, b, len]);
         Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// A vector operation of two operands on lanes that are floats, one lane at a time. A
+    /// comparison is all ones in the lanes where it holds, in integers as wide as the floats.
+    fn simd_float_lanes(
+        &mut self,
+        name: &str,
+        (l, r): (Value, Value),
+        dst: Value,
+        lane: AbiScalar,
+        out: AbiScalar,
+        count: u64,
+    ) -> Result<()> {
+        let cc = match name {
+            "simd_eq" => Some(FloatCC::Equal),
+            "simd_ne" => Some(FloatCC::NotEqual),
+            "simd_lt" => Some(FloatCC::LessThan),
+            "simd_le" => Some(FloatCC::LessThanOrEqual),
+            "simd_gt" => Some(FloatCC::GreaterThan),
+            "simd_ge" => Some(FloatCC::GreaterThanOrEqual),
+            _ => None,
+        };
+        for i in 0..count {
+            let offset = (i * lane.ty.bytes() as u64) as i32;
+            let a = self.builder.ins().load(lane.ty, MEM, l, offset);
+            let b = self.builder.ins().load(lane.ty, MEM, r, offset);
+            let value = match (cc, name) {
+                (Some(cc), _) => {
+                    let flag = self.builder.ins().fcmp(cc, a, b);
+                    let flag = self.builder.ins().uextend(types::I64, flag);
+                    let mask = self.builder.ins().ineg(flag);
+                    if out.ty.bits() < 64 { self.builder.ins().ireduce(out.ty, mask) } else { mask }
+                }
+                (None, "simd_add") => self.builder.ins().fadd(a, b),
+                (None, "simd_sub") => self.builder.ins().fsub(a, b),
+                (None, "simd_mul") => self.builder.ins().fmul(a, b),
+                (None, "simd_div") => self.builder.ins().fdiv(a, b),
+                (None, _) => unsupported!("`{name}` of floats"),
+            };
+            self.builder.ins().store(MEM, value, dst, (i * out.ty.bytes() as u64) as i32);
+        }
+        Ok(())
     }
 
     fn saturating(&mut self, add: bool, l: Value, r: Value, scalar: AbiScalar) -> Value {

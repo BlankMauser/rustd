@@ -290,17 +290,34 @@ impl Resolver<'_> {
         generic(hir::Impl::from(imp).into())
     }
 
-    /// rustc's `StableCrateId` of a crate it built something of.
+    /// rustc's `StableCrateId` of a crate it built something of. A crate of the checkout is
+    /// one rustc built when a file of the link is its own: the standard library has private
+    /// copies of crates (memchr, hashbrown) whose names a dependency at a path has too.
     fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let ours = !krate.data(self.db).origin.is_lang();
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+        let root = self.crate_root(krate)?;
+        if ours && !self.table.links(name.crate_name().as_str(), &root) {
+            return None;
+        }
+        self.table.stable_crate_id(name.crate_name().as_str(), &root)
     }
 
-    /// What stands for a crate of the checkout that rustc built nothing of, the same after
+    /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
+    /// of is spelled with its own id, so that no symbol of another crate of its name (the
+    /// standard library's memchr) is taken for one of its items.
+    fn crate_path(&self, krate: Crate) -> Option<String> {
+        let name = krate.display_name(self.db)?;
+        match self.own_crate_id(krate.into()) {
+            Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
+            None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
+        }
+    }
+
     /// every edit: its name and where in the checkout its source starts.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+        if krate.data(self.db).origin.is_lang() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
         let name = Crate::from(krate).display_name(self.db)?;
@@ -368,11 +385,7 @@ impl Resolver<'_> {
     /// function, closure, constant or static the block is in, which only the syntax knows.
     fn scope_path(&self, module: Module) -> Option<String> {
         if module.nearest_non_block_module(self.db) == module {
-            let krate = module.krate(self.db);
-            let krate_name = krate.display_name(self.db)?;
-            let mut path = self
-                .table
-                .crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
+            let mut path = self.crate_path(module.krate(self.db))?;
             for segment in module.path_segments(self.db) {
                 path.push_str("::");
                 path.push_str(segment.as_str());
@@ -542,7 +555,11 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = self.table.get(&path) {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name.
+        // rustc has built nothing of the crate: the function is ours to name, unless it is
+        // declared in an `extern` block, where what it links to names it.
+        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
+            return None;
+        }
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
         Some(format!("rustd.{id:x}.{path}"))
@@ -550,6 +567,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn defines(&self, symbol: &str) -> bool {
         self.table.defines(symbol)
+    }
+
+    fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
+        self.own_crate_id(krate).is_none()
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
