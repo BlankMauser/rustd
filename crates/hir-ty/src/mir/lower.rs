@@ -740,7 +740,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 };
                 let start_of_then = self.new_basic_block();
                 let end_of_then = self
-                    .lower_expr_to_place(*then_branch, place, start_of_then)?
+                    .lower_branch_to_place(*then_branch, place, start_of_then)?
                     .map(|block| drop_bound(self, block));
                 let start_of_else = self.new_basic_block();
                 // From the 2024 edition on, the `else` branch runs after the drops.
@@ -748,7 +748,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let else_block =
                     if early { drop_bound(self, start_of_else) } else { start_of_else };
                 let end_of_else = if let Some(else_branch) = else_branch {
-                    self.lower_expr_to_place(*else_branch, place, else_block)?
+                    self.lower_branch_to_place(*else_branch, place, else_block)?
                 } else {
                     Some(else_block)
                 };
@@ -1985,6 +1985,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
         let operand = Operand::from_bytes(Box::new(discriminant.to_le_bytes()), discr_ty);
         Ok((operand, discr_ty, current))
+    }
+
+    /// Lowers a branch of an `if`. Its temporaries are dropped where the branch ends, also
+    /// those of the tail of a block that would otherwise live as long as the statement the
+    /// `if` is in.
+    fn lower_branch_to_place(
+        &mut self,
+        branch: ExprId,
+        place: Place<'db>,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let temporaries = self.push_drop_scope();
+        let Some(current) = self.lower_expr_to_place(branch, place, current)? else {
+            temporaries.pop_assume_dropped(self);
+            return Ok(None);
+        };
+        Ok(Some(temporaries.pop_and_drop(self, current, branch.into())))
     }
 
     /// How many locals the innermost scope has declared: where the operands of an expression

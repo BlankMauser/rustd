@@ -45,4 +45,5 @@ cases![
     assert_message,
     stack_aggregate_odd_size,
     repeat_rows,
+    if_branch_temporaries,
 ];

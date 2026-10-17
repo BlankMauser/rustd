@@ -63,4 +63,5 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          run fuzz/fuzz.py smoke --backends "$RUSTD_BACKEND"
           exit $failed
