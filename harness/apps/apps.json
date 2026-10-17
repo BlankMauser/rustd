@@ -600,7 +600,8 @@
   "scrub": [
    "took [0-9a-z.]+",
    "\\d+(ms|s)\\b",
-   "build_time:[^\\n]*"
+   "build_time:[^\\n]*",
+   " +-  "
   ],
   "runs": [
    [
