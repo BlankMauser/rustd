@@ -859,6 +859,8 @@ struct ObjectCodegen<'a, 'db> {
     unwind: UnwindContext,
     /// What a debugger is told about the functions, when the build tells one anything.
     debug: Option<DebugContext>,
+    /// The types of the variables a debugger is told of, by the environment they are in.
+    types: FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1646,10 +1648,10 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
 /// `debug` has the places of. A name the body gives to more than one local is left out:
 /// nothing says yet from where to where each of them is the one meant. So is a variable of
 /// a type that is not told of.
-fn describe_variables(
-    db: &dyn HirDatabase,
+fn describe_variables<'db>(
+    db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
-    env: &StoredParamEnvAndCrate,
+    types: &mut debuginfo::Types<'db>,
     variables: &[Variable],
     places: &SlotPlaces,
     debug: &mut FunctionDebug,
@@ -1659,7 +1661,8 @@ fn describe_variables(
     for (_, binding) in body.bindings() {
         *uses.entry(&binding.name).or_default() += 1;
     }
-    let mut types = debuginfo::Types::new(db, env.as_ref(db));
+    // Where the type of each variable told of is among the types of the function.
+    let mut firsts = FxHashMap::default();
     for variable in variables {
         let name = &body[variable.binding].name;
         if uses.get(name) != Some(&1) {
@@ -1670,7 +1673,16 @@ fn describe_variables(
             true => place.pointee(),
             false => place.clone(),
         };
-        let Some(ty) = types.describe(variable.ty.as_ref()) else { continue };
+        let ty = variable.ty.as_ref();
+        let ty = match firsts.get(&ty) {
+            Some(&first) => first,
+            None => {
+                let Some(described) = types.describe(ty) else { continue };
+                let first = debuginfo::add_types(&mut debug.types, &described);
+                firsts.insert(ty, first);
+                first
+            }
+        };
         debug.variables.push(VariableDebug {
             name: name.as_str().to_owned(),
             param: variable.param,
@@ -1679,7 +1691,6 @@ fn describe_variables(
             scope: None,
         });
     }
-    debug.types = types.finish();
     debug.frame_base = places.frame_base.clone();
 }
 
@@ -1808,12 +1819,20 @@ fn location_of(
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
     let file_id = file_id.file_id(db);
-    let text = db.file_text(file_id).text(db);
-    let before = text.get(..usize::from(range.start()))?;
-    let line_start = before.rfind('\n').map_or(0, |it| it + 1);
-    let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
-    let col = before[line_start..].chars().count() + 1;
-    Some((file_id, line as u32, col as u32))
+    let text = db.file_text(file_id);
+    let starts = line_starts(db, text);
+    let at = u32::from(range.start());
+    let line = starts.partition_point(|&start| start <= at);
+    let line_start = *starts.get(line.checked_sub(1)?)?;
+    let written = text.text(db).get(line_start as usize..at as usize)?;
+    Some((file_id, line as u32, written.chars().count() as u32 + 1))
+}
+
+/// Where each line of a file begins, the first of them at 0.
+#[salsa::tracked(returns(ref))]
+fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> {
+    let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
+    std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
 }
 
 fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {
@@ -2082,6 +2101,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             module,
             unwind,
             debug,
+            types: FxHashMap::default(),
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -2437,7 +2457,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && let Some((env, variables)) = &compiled.variables
         {
             let places = &compiled.code.slots;
-            describe_variables(self.db, *owner, env, variables, places, &mut debug);
+            let db = self.db;
+            let types = self
+                .types
+                .entry(env.clone())
+                .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
+            describe_variables(db, *owner, types, variables, places, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);

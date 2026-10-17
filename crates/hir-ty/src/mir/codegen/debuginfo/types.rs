@@ -11,6 +11,8 @@ use hir_def::{
     AdtId, EnumId, GenericDefId, VariantId, hir::generics::GenericParamDataRef,
     item_tree::FieldsShape as Written,
 };
+use std::rc::Rc;
+
 use rustc_abi::{TagEncoding, Variants};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{UintTy, inherent::IntoKind};
@@ -43,46 +45,66 @@ mod encoding {
 /// unless it is told of anyway: a list is as long as it likes.
 const POINTERS: u32 = 2;
 
-/// The types of one function's variables, which are of its instance.
+/// The types of the variables of the functions of one environment. What a variable's type
+/// is told as depends on nothing but the type, so it is found once for every function with
+/// a variable of it: the layouts and the names are most of what telling of variables costs.
 pub(in super::super) struct Types<'db> {
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
     interner: DbInterner<'db>,
     infcx: InferCtxt<'db>,
+    /// What the type being described is made of so far, itself first.
     told: Vec<DebugType>,
     /// Where each type that is told of, or is being told of, is among `told`.
     known: FxHashMap<Ty<'db>, TypeIndex>,
+    described: FxHashMap<Ty<'db>, Option<Rc<[DebugType]>>>,
+    names: FxHashMap<Ty<'db>, Option<String>>,
+    normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
 
 impl<'db> Types<'db> {
     pub(in super::super) fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        Types { db, env, interner, infcx, told: Vec::new(), known: FxHashMap::default() }
+        Types {
+            db,
+            env,
+            interner,
+            infcx,
+            told: Vec::new(),
+            known: FxHashMap::default(),
+            described: FxHashMap::default(),
+            names: FxHashMap::default(),
+            normalized: FxHashMap::default(),
+        }
     }
 
-    /// `None` is a type that has no layout or no name rustc would spell.
-    pub(in super::super) fn describe(&mut self, ty: Ty<'db>) -> Option<TypeIndex> {
-        self.ty(ty, POINTERS)
-    }
-
-    /// Every type told of, each where its [`TypeIndex`] says.
-    pub(in super::super) fn finish(self) -> Vec<DebugType> {
-        self.told
+    /// The type and every type it is made of, with the type itself first. `None` is a type
+    /// that has no layout or no name rustc would spell.
+    pub(in super::super) fn describe(&mut self, ty: Ty<'db>) -> Option<Rc<[DebugType]>> {
+        if let Some(described) = self.described.get(&ty) {
+            return described.clone();
+        }
+        self.told.clear();
+        self.known.clear();
+        let described = self.ty(ty, POINTERS).map(|_| Rc::from(self.told.as_slice()));
+        self.described.insert(ty, described.clone());
+        described
     }
 
     fn ty(&mut self, ty: Ty<'db>, pointers: u32) -> Option<TypeIndex> {
         // A type narrowed to some of its values, as what a `NonNull` keeps is, is told as
         // the type itself.
-        let ty = match self.normalize(ty).kind() {
+        let ty = self.normalize(ty);
+        let ty = match ty.kind() {
             TyKind::Pat(of, _) => self.normalize(of),
-            _ => self.normalize(ty),
+            _ => ty,
         };
         if let Some(&index) = self.known.get(&ty) {
             return Some(index);
         }
         let layout = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
-        let name = rustc_type_name(self.db, ty)?;
+        let name = self.name(ty)?;
         // A type that is made of itself finds its place here. What stands there until the
         // type is told is what a type nothing more is known of is told as.
         let index = self.told.len() as TypeIndex;
@@ -97,6 +119,12 @@ impl<'db> Types<'db> {
             }
         }
         self.known.get(&ty).copied()
+    }
+
+    /// What rustc calls the type, which is asked of every variable the type is part of.
+    fn name(&mut self, ty: Ty<'db>) -> Option<String> {
+        let db = self.db;
+        self.names.entry(ty).or_insert_with(|| rustc_type_name(db, ty)).clone()
     }
 
     fn told_as(
@@ -304,10 +332,15 @@ impl<'db> Types<'db> {
         self.db.target_data_layout(self.env.krate).ok()
     }
 
-    fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
-        ObligationCtxt::new(&self.infcx)
+    fn normalize(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if let Some(&normalized) = self.normalized.get(&ty) {
+            return normalized;
+        }
+        let normalized = ObligationCtxt::new(&self.infcx)
             .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
-            .unwrap_or(ty)
+            .unwrap_or(ty);
+        self.normalized.insert(ty, normalized);
+        normalized
     }
 }
 

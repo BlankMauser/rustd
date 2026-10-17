@@ -355,7 +355,8 @@ def debugger(tally, what, binary, cwd, place, env=None):
     out = ran.stdout
     file, line = place.rsplit(":", 1)
     said = f"{what}: gdb at {os.path.basename(file)}:{line}"
-    stop = re.search(r"Breakpoint 1, .*? at (\S+):(\d+)", out, re.S)
+    # A breakpoint at a line with code in more than one place is numbered 1.1, 1.2 by gdb 13 on.
+    stop = re.search(r"Breakpoint 1(?:\.\d+)?, .*? at (\S+):(\d+)", out, re.S)
     if not stop or stop.group(2) != line or not file.endswith(os.path.basename(stop.group(1))):
         return tally.say(said, "NOT STOPPED", (out.strip().splitlines() or ["nothing printed"])[-1][:80])
     value = re.search(r"\$1 = (0x[0-9a-f]+)", out)

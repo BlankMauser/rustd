@@ -134,6 +134,33 @@ pub(super) enum DebugType {
     },
 }
 
+impl DebugType {
+    /// Every type this one is made of, as it names them.
+    fn parts_mut(&mut self) -> Vec<&mut TypeIndex> {
+        match self {
+            DebugType::Base { .. } | DebugType::Names { .. } => Vec::new(),
+            DebugType::Pointer { to, .. } => to.iter_mut().collect(),
+            DebugType::Array { of, .. } => vec![of],
+            DebugType::Struct(of) | DebugType::Union(of) => of.parts_mut().collect(),
+            DebugType::Enum { of, variants, .. } => {
+                let variants = variants.iter_mut().flat_map(|it| &mut it.fields);
+                of.parts_mut().chain(variants.map(|it| &mut it.ty)).collect()
+            }
+        }
+    }
+}
+
+/// Adds `types`, which name each other by their places among themselves, to the end of
+/// `all`, and returns where the first of them is then.
+pub(super) fn add_types(all: &mut Vec<DebugType>, types: &[DebugType]) -> TypeIndex {
+    let first = all.len() as TypeIndex;
+    all.extend(types.iter().cloned().map(|mut ty| {
+        ty.parts_mut().into_iter().for_each(|part| *part += first);
+        ty
+    }));
+    first
+}
+
 /// A name, a size, the fields and the types the generic parameters stand for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Aggregate {
@@ -141,6 +168,13 @@ pub(super) struct Aggregate {
     pub(super) size: u64,
     pub(super) fields: Vec<Field>,
     pub(super) parameters: Vec<(String, TypeIndex)>,
+}
+
+impl Aggregate {
+    fn parts_mut(&mut self) -> impl Iterator<Item = &mut TypeIndex> {
+        let parameters = self.parameters.iter_mut().map(|(_, ty)| ty);
+        self.fields.iter_mut().map(|it| &mut it.ty).chain(parameters)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
