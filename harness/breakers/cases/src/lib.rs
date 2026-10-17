@@ -62,4 +62,6 @@ cases![
     fragment_edition_through_macro,
     let_else_drops,
     tail_tuple_drops,
+    promoted_constructor,
+    renamed_variant_pattern,
 ];

@@ -105,6 +105,26 @@ impl Plan {
     }
 }
 
+/// Why the tests of `unit` are only right as rustc built them, if they are. rustc's
+/// harness stays in a test executable and calls the tests and their helpers, so each has
+/// to be a symbol the daemon's copy can take the place of, called the way the source says.
+fn harness_alone(unit: &Record) -> Option<String> {
+    let name = &unit.crate_name;
+    if unit.codegen("incremental").is_none() {
+        return Some(format!(
+            "the tests of `{name}` are built without incremental compilation, where rustc \
+             keeps them private to its object"
+        ));
+    }
+    let level = unit.codegen("opt-level").unwrap_or("0");
+    (level != "0").then(|| {
+        format!(
+            "the tests of `{name}` are built with opt-level {level}, where rustc inlines \
+             them into its harness and changes how it calls their helpers"
+        )
+    })
+}
+
 /// Why rustd has no part in a crate that was compiled with these flags, when it has none.
 /// What a profile sets (the level, the checks, the panic strategy) the daemon reads from
 /// cargo itself, and refuses there what it does not build.
@@ -118,6 +138,9 @@ fn unsupported(unit: &Record) -> Option<String> {
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
+    }
+    if unit.is_test() {
+        return harness_alone(unit);
     }
     None
 }
@@ -236,6 +259,32 @@ mod tests {
             link.rustc_files(),
             ["/t/deps/a.1.rcgu.o", "/t/deps/libb-2.rlib"].map(PathBuf::from)
         );
+    }
+
+    fn unit(args: &[&str]) -> Record {
+        Record {
+            id: "a-1".to_owned(),
+            crate_name: "a".to_owned(),
+            cwd: PathBuf::from("/ws"),
+            args: args.iter().map(|it| it.to_string()).collect(),
+            source: PathBuf::from("/ws/src/lib.rs"),
+            stamp: 1,
+            copies: Vec::new(),
+            link_line: None,
+            env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tests_the_harness_reaches_by_symbol_only() {
+        let incremental = "incremental=/t/debug/incremental";
+        assert_eq!(unsupported(&unit(&["--test", "-C", incremental])), None);
+        assert_eq!(unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
+        let private = unsupported(&unit(&["--test"]));
+        assert!(private.is_some_and(|why| why.contains("without incremental")));
+        let inlined = unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
+        assert!(inlined.is_some_and(|why| why.contains("opt-level 2")));
+        assert_eq!(unsupported(&unit(&["-C", "opt-level=3"])), None);
     }
 
     #[test]

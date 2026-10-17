@@ -191,7 +191,10 @@ def program_output(ran):
 
 def test_results(ran):
     """The outcome of each test and of each test executable, and the exit status."""
-    tests = collections.Counter(re.findall(r"^test (.+?) \.\.\. (ok|FAILED|ignored)", ran.stdout, re.M))
+    # A doc test in a generated file is named by its path, in a directory cargo names
+    # with a hash of how it was built.
+    names = re.sub(r"-[0-9a-f]{16}/", "-HASH/", ran.stdout.replace("target-ref", "target"))
+    tests = collections.Counter(re.findall(r"^test (.+?) \.\.\. (ok|FAILED|ignored)", names, re.M))
     totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", ran.stdout, re.M))
     return ran.returncode, tests, totals
 
@@ -362,7 +365,7 @@ def project(name, spec, work):
 FLAG_WORKSPACE = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
-    "util/src/lib.rs": 'pub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
+    "util/src/lib.rs": 'pub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
     "app/src/main.rs": 'fn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
@@ -394,6 +397,7 @@ FLAG_CASES = [
     ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
     ("test", [], {"FLAGS_FAIL": "1"}),
     ("test", ["--no-run"], {}),
+    ("test", [], {"CARGO_INCREMENTAL": "0"}),
 ]
 
 
