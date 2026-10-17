@@ -67,11 +67,8 @@ def records_of(pack):
 
 def filler(seed, size):
     """A sealed pack of `size` bytes that no build asks anything of."""
-    value = bytearray()
-    block = hashlib.sha256(seed.encode()).digest()
-    while len(value) < size - 48:
-        block = hashlib.sha256(block).digest()
-        value += block * 512
+    # Bytes that do not compress, so that what goes over the line is as large as the pack.
+    value = bytearray(hashlib.shake_256(seed.encode()).digest(size - 48))
     return pack_of([(hashlib.sha256(b"key" + seed.encode()).digest(), bytes(value[:size - 48]))])
 
 
