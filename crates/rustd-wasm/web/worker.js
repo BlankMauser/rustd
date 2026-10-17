@@ -12,7 +12,9 @@ try {
   let wasm;
   [wasm, core] = await Promise.all(
     ["pkg/rustd_wasm.wasm", pack ?? "pkg/core.bundle"].map(async (url) => {
-      const response = await fetch(url);
+      // Asked of the server each time: a compiler the browser kept from an earlier build
+      // does not have what this JavaScript calls.
+      const response = await fetch(url, { cache: "no-cache" });
       if (!response.ok) {
         throw new Error(`${url}: ${response.status}`);
       }
