@@ -265,6 +265,28 @@ impl Listed {
             })
     }
 
+    /// The crate the file is a module of, when that is one the crates being built use and
+    /// none of them: rustc compiled it, and what it compiled is all there is of it.
+    pub(crate) fn left_to_rustc(
+        &self,
+        db: &RootDatabase,
+        file: FileId,
+    ) -> Option<ide_db::base_db::Crate> {
+        let built: Vec<_> =
+            self.built.lock().unwrap().iter().map(|&it| ide_db::base_db::Crate::from(it)).collect();
+        let crates = relevant_crates(db, file);
+        if built.is_empty() || crates.iter().any(|it| built.contains(it)) {
+            return None;
+        }
+        crates.iter().copied().find(|&krate| {
+            built.iter().any(|built| built.transitive_deps(db).contains(&krate))
+                && hir_def::nameres::crate_def_map(db, krate)
+                    .modules_for_file(db, file)
+                    .next()
+                    .is_some()
+        })
+    }
+
     /// The functions written in the file, or `None` when it has some that are not listed: it
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {

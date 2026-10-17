@@ -14,14 +14,14 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, bail};
 use rustc_hash::FxHashMap;
-use sha2::{Digest, Sha256};
 
-use crate::remote::{Bounds, LIST_MAX, Remote, Unsigned, Written, transfer};
+use crate::remote::{Digest, Fetched, Remote, Room, Tally, project_name, runtime};
 
 /// The directories of a profile that hold units, the one cargo trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
@@ -46,37 +46,35 @@ fn unpacked_max() -> anyhow::Result<Option<u64>> {
 }
 
 /// The units a project's builds used and the archive of each: `unit hash` a line.
-struct Listed(BTreeMap<String, String>);
+struct Listed(BTreeMap<String, Digest>);
 
 impl Listed {
     fn at(project: &str) -> String {
         format!("deps/{project}")
     }
 
-    fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
-        let bytes = remote.fetch(&Listed::at(project), LIST_MAX)?.unwrap_or_default();
-        Listed::parse(bytes)
-    }
-
-    /// The units the bytes of a list name. A line that is not a unit and the hash of its
-    /// archive is not one, and neither is ever the name of a file.
-    fn parse(bytes: Vec<u8>) -> anyhow::Result<Listed> {
-        if bytes.len() as u64 > LIST_MAX {
-            bail!("the list of units is longer than the {LIST_MAX} bytes that are read of one");
-        }
-        let text = String::from_utf8(bytes).context("the list of units is not text")?;
-        let units = text
+    fn parse(lines: &str) -> Listed {
+        let units = lines
             .lines()
             .filter_map(|line| line.split_once(' '))
-            .filter(|(unit, archive)| hash_of(unit).is_some() && is_hex(archive, 64))
-            .map(|(unit, archive)| (unit.to_owned(), archive.to_owned()));
-        Ok(Listed(units.collect()))
+            .filter(|(unit, _)| hash_of(unit).is_some())
+            .filter_map(|(unit, archive)| Some((unit.to_owned(), Digest::parse(archive)?)));
+        Listed(units.collect())
     }
 
-    fn send(&self, remote: &Remote, project: &str) -> anyhow::Result<()> {
-        let text: String =
-            self.0.iter().map(|(unit, archive)| format!("{unit} {archive}\n")).collect();
-        remote.send(&Listed::at(project), text.as_bytes())
+    fn lines(&self) -> String {
+        self.0.iter().map(|(unit, archive)| format!("{unit} {archive}\n")).collect()
+    }
+
+    async fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
+        let lines = remote.read_list(&Listed::at(project)).await?;
+        Ok(Listed::parse(&lines.unwrap_or_default()))
+    }
+
+    /// The list as the machine that adds to it reads it.
+    async fn fetch_to_extend(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
+        let lines = remote.read_list_to_extend(&Listed::at(project)).await?;
+        Ok(Listed::parse(&lines.unwrap_or_default()))
     }
 }
 
@@ -159,36 +157,54 @@ fn archive(dir: &Path, unit: &str, outputs: &[String]) -> anyhow::Result<Vec<u8>
     Ok(tar.into_inner()?.finish()?)
 }
 
-/// Sends the units of `dir` the project's list lacks, and lists them.
-fn push(
+/// Sends the units of `dir` the project's list lacks, and lists the ones that arrived.
+async fn push(
     dir: &Path,
     remote: &Remote,
     project: &str,
     local: &BTreeSet<String>,
 ) -> anyhow::Result<String> {
-    let mut listed = Listed::fetch(remote, project)?;
-    let (units, outputs) = (units(dir, local)?, outputs(dir)?);
-    let missing: Vec<&String> = units.iter().filter(|it| !listed.0.contains_key(*it)).collect();
-    let sent = std::sync::Mutex::new(Vec::new());
-    let bytes = transfer(&missing, |unit| {
-        let none = Vec::new();
-        let outputs = hash_of(unit).and_then(|hash| outputs.get(hash)).unwrap_or(&none);
-        let bytes = archive(dir, unit, outputs)?;
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        remote.send(&format!("units/{hash}"), &bytes)?;
-        if let Ok(mut sent) = sent.lock() {
-            sent.push((unit.to_owned(), hash));
+    remote.may_write()?;
+    // A list this machine does not trust is one it does not add to: see `extend_list`.
+    let listed = Listed::fetch_to_extend(remote, project).await;
+    let listed = listed.unwrap_or_else(|_| Listed(BTreeMap::new()));
+    let (units, outputs) = (units(dir, local)?, Arc::new(outputs(dir)?));
+    let missing = units.into_iter().filter(|it| !listed.0.contains_key(it));
+    let sent = Mutex::new(BTreeMap::new());
+    let send = |unit: String| {
+        let (outputs, sent) = (outputs.clone(), &sent);
+        async move {
+            let (dir, of) = (dir.to_owned(), unit.clone());
+            let pack = move || {
+                let outputs = hash_of(&of).and_then(|hash| outputs.get(hash));
+                archive(&dir, &of, outputs.map_or(&[], |it| it))
+            };
+            let bytes = tokio::task::spawn_blocking(pack).await??;
+            let (hash, len) = (Digest::of(&bytes), bytes.len() as u64);
+            remote.send_named_by_hash(&format!("units/{hash}"), bytes).await?;
+            if let Ok(mut sent) = sent.lock() {
+                sent.insert(unit, hash);
+            }
+            Ok(Fetched::Whole(len))
         }
-        Ok(bytes.len() as u64)
-    })?;
-    listed.0.extend(sent.into_inner().unwrap_or_default());
-    listed.send(remote, project)?;
-    Ok(format!("{} units added to `{project}`, {} MB sent", missing.len(), bytes >> 20))
+    };
+    let tally = Tally::of(missing, remote.jobs(), send).await;
+    let sent = sent.into_inner().unwrap_or_default();
+    if !sent.is_empty() {
+        let extend = |lines: &str| {
+            let mut listed = Listed::parse(lines);
+            listed.0.extend(sent.iter().map(|(unit, hash)| (unit.clone(), *hash)));
+            listed.lines()
+        };
+        remote.extend_list(&Listed::at(project), extend).await?;
+    }
+    let said = format!("{} units added to `{project}`, {} bytes sent", tally.done, tally.bytes);
+    tally.settle(said, remote.traffic())
 }
 
 /// Unpacks the archive of `unit` in `dir`: only files and directories that are of the unit,
-/// and no more of them than `written` has room for.
-fn unpack(dir: &Path, unit: &str, archive: &[u8], written: &Written) -> anyhow::Result<()> {
+/// and no more of them than there is `room` for.
+fn unpack(dir: &Path, unit: &str, archive: impl std::io::Read, room: &Room) -> anyhow::Result<()> {
     let mut tar = tar::Archive::new(zstd::Decoder::new(archive)?);
     tar.set_preserve_mtime(true);
     for entry in tar.entries()? {
@@ -210,9 +226,8 @@ fn unpack(dir: &Path, unit: &str, archive: &[u8], written: &Written) -> anyhow::
             bail!("{unit} holds {}", path.display());
         }
         // An archive is small for what it unpacks to, and says itself how much that is.
-        let header = entry.header();
-        let size = header.size().unwrap_or(u64::MAX).max(entry.size());
-        written.add(size.saturating_add(HEADER))?;
+        let size = entry.header().size().unwrap_or(u64::MAX).max(entry.size());
+        room.take(size.saturating_add(HEADER))?;
         if !entry.unpack_in(dir)? {
             bail!("{unit} holds {}, which is outside of it", path.display());
         }
@@ -221,34 +236,50 @@ fn unpack(dir: &Path, unit: &str, archive: &[u8], written: &Written) -> anyhow::
 }
 
 /// Fetches the units of the project's list that `dir` has no fingerprint of.
-fn pull(
+async fn pull(
     dir: &Path,
     remote: &Remote,
     project: &str,
     local: &BTreeSet<String>,
-    bounds: Bounds,
+    unpacked_max: Option<u64>,
 ) -> anyhow::Result<String> {
-    let written = Written::none(bounds.all);
-    std::fs::create_dir_all(dir)?;
-    let listed = Listed::fetch(remote, project)?;
-    let missing: Vec<&String> = listed
-        .0
-        .keys()
-        .filter(|unit| !dir.join(".fingerprint").join(unit).exists())
-        .filter(|unit| unit.rsplit_once('-').is_some_and(|(package, _)| !local.contains(package)))
-        .collect();
-    let bytes = transfer(&missing, |unit| {
-        let hash = &listed.0[unit];
-        let Some(bytes) = remote.fetch(&format!("units/{hash}"), bounds.object)? else {
-            bail!("`{project}` lists {unit}, which is not there");
-        };
-        if format!("{:x}", Sha256::digest(&bytes)) != *hash {
-            bail!("{unit} is not what was sent under that name");
+    let room = Arc::new(Room::of(unpacked_max));
+    tokio::fs::create_dir_all(dir).await?;
+    let listed = Listed::fetch(remote, project).await?;
+    let missing =
+        listed.0.iter().filter(|(unit, _)| !dir.join(".fingerprint").join(unit).exists()).filter(
+            |(unit, _)| unit.rsplit_once('-').is_some_and(|(package, _)| !local.contains(package)),
+        );
+    let fetch = |(unit, hash): (&String, &Digest)| {
+        let (unit, hash, room) = (unit.clone(), *hash, room.clone());
+        async move {
+            let archive = dir.join(format!("{hash}.unit"));
+            let (from, most) = (format!("units/{hash}"), remote.object_max());
+            let fetched = remote.fetch_file(&from, &hash, &archive, most, |_| true).await?;
+            if let Fetched::Whole(_) = fetched {
+                let (dir, from) = (dir.to_owned(), archive.clone());
+                let unpacked = tokio::task::spawn_blocking(move || {
+                    unpack(&dir, &unit, std::fs::File::open(&from)?, &room)
+                });
+                let unpacked = unpacked.await;
+                tokio::fs::remove_file(&archive).await?;
+                unpacked??;
+            }
+            Ok(fetched)
         }
-        unpack(dir, unit, &bytes, &written)?;
-        Ok(bytes.len() as u64)
-    })?;
-    Ok(format!("{} units of `{project}` fetched, {} MB", missing.len(), bytes >> 20))
+    };
+    let tally = Tally::of(missing, remote.jobs(), fetch).await;
+    let said = format!("{} units of `{project}` fetched, {} bytes", tally.done, tally.bytes);
+    tally.settle(said, remote.traffic())
+}
+
+/// Where the turns of the lists of units are remembered: with the store, when the machine
+/// has one, and with the units themselves when it does not.
+fn turns_kept_in(dir: &Path) -> PathBuf {
+    match std::env::var_os("RUSTD_CACHE") {
+        Some(store) => PathBuf::from(store),
+        None => dir.join(".rustd"),
+    }
 }
 
 /// `rustd deps push|pull REMOTE DIR [PROJECT]`, in the directory of `Cargo.lock`.
@@ -257,22 +288,21 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let (Some(verb), Some(remote), Some(dir)) = (args.next(), args.next(), args.next()) else {
         bail!(USAGE);
     };
-    let project = args.next().unwrap_or_else(|| "default".to_owned());
-    if project.contains(['/', '\\']) || project.starts_with('.') {
-        bail!("`{project}` is not the name of a project");
-    }
+    let project = project_name(args.next())?;
     let lock = std::fs::read_to_string("Cargo.lock").context("there is no Cargo.lock here")?;
     let local = local_packages(&lock);
-    let (remote, dir) = (Remote::parse(&remote)?, Path::new(&dir));
+    let dir = Path::new(&dir);
     let start = std::time::Instant::now();
-    let done = match verb.as_str() {
-        "push" => push(dir, &remote, &project, &local)?,
-        "pull" => {
-            Unsigned::taken()?;
-            pull(dir, &remote, &project, &local, Bounds::from_env(unpacked_max()?)?)?
-        }
-        _ => bail!(USAGE),
-    };
+    let done = runtime()?.block_on(async {
+        let remote = Remote::open(&remote, &turns_kept_in(dir)).await?;
+        let done = match verb.as_str() {
+            "push" => push(dir, &remote, &project, &local).await,
+            "pull" => pull(dir, &remote, &project, &local, unpacked_max()?).await,
+            _ => bail!(USAGE),
+        };
+        eprintln!("remote: {}", remote.traffic());
+        done
+    })?;
     println!("{done} in {:.1?}", start.elapsed());
     Ok(())
 }
@@ -280,21 +310,32 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::tests::{changed, scratch};
+    use crate::remote::{
+        LIST_MAX,
+        tests::{changed, held, put, scratch, unsigned, wait},
+    };
 
     const UNIT: &str = "serde-33c9cbd578789acd";
-    const ROOMY: Bounds = Bounds { object: 1 << 20, all: Some(1 << 20) };
 
-    /// A remote whose list for `default` has one unit, the archive `entries` are in.
-    fn remote_with(name: &str, entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Remote {
+    fn packed(entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
         entries(&mut tar);
-        let archive = zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&archive));
-        let remote = Remote::Dir(scratch(name));
-        remote.send(&format!("units/{hash}"), &archive).unwrap();
-        remote.send("deps/default", format!("{UNIT} {hash}\n").as_bytes()).unwrap();
-        remote
+        zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap()
+    }
+
+    /// A remote whose list for `default` has one unit, the archive `entries` are in, and
+    /// that takes at most `object_max` bytes of an archive.
+    fn remote_with(
+        name: &str,
+        object_max: u64,
+        entries: impl FnOnce(&mut tar::Builder<Vec<u8>>),
+    ) -> (Remote, PathBuf, u64) {
+        let archive = packed(entries);
+        let hash = Digest::of(&archive);
+        let (remote, dir) = unsigned(name, object_max);
+        put(&dir, &format!("units/{hash}"), &archive);
+        put(&dir, "deps/default", format!("{UNIT} {hash}\n").as_bytes());
+        (remote, dir, archive.len() as u64)
     }
 
     fn header(kind: tar::EntryType, size: u64) -> tar::Header {
@@ -305,15 +346,26 @@ mod tests {
         header
     }
 
+    fn rlib() -> String {
+        format!("deps/libserde-{}.rlib", &UNIT[6..])
+    }
+
+    fn one_rlib(tar: &mut tar::Builder<Vec<u8>>) {
+        tar.append_data(&mut header(tar::EntryType::Regular, 4), rlib(), &b"rlib"[..]).unwrap();
+    }
+
+    fn pulled(dir: &Path, remote: &Remote, unpacked_max: Option<u64>) -> anyhow::Result<String> {
+        wait(pull(dir, remote, "default", &BTreeSet::new(), unpacked_max))
+    }
+
     #[test]
     fn a_unit_is_unpacked_where_it_belongs() {
-        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
-        let remote = remote_with("unit-remote", |tar| {
-            tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
-        });
-        let dir = scratch("unit-target");
-        pull(&dir, &remote, "default", &BTreeSet::new(), ROOMY).unwrap();
-        assert_eq!(std::fs::read(dir.join(rlib)).unwrap(), b"rlib");
+        let (remote, top, _) = remote_with("unit", 1 << 20, one_rlib);
+        let dir = top.join("target");
+        pulled(&dir, &remote, Some(1 << 20)).unwrap();
+        assert_eq!(std::fs::read(dir.join(rlib())).unwrap(), b"rlib");
+        assert_eq!(held(&dir), 4, "the archive is not left behind");
+        _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]
@@ -341,90 +393,74 @@ mod tests {
         let archives: [(&str, &dyn Fn(&mut tar::Builder<Vec<u8>>)); 3] =
             [("link", &link), ("other", &other), ("elsewhere", &elsewhere)];
         for (name, entries) in archives {
-            let remote = remote_with(&format!("{name}-remote"), entries);
-            let dir = scratch(&format!("{name}-target")).join("target/debug");
-            assert!(pull(&dir, &remote, "default", &BTreeSet::new(), ROOMY).is_err(), "{name}");
+            let (remote, top, _) = remote_with(name, 1 << 20, entries);
+            let dir = top.join("out/target/debug");
+            assert!(pulled(&dir, &remote, Some(1 << 20)).is_err(), "{name}");
             assert!(!outside.join("planted").exists(), "{name}");
-            let top = dir.ancestors().nth(2).unwrap();
-            assert!(!top.join("planted").exists() && !dir.join("deps").exists(), "{name}");
+            assert!(!top.join("out/planted").exists() && !dir.join("deps").exists(), "{name}");
+            assert_eq!(held(&dir), 0, "{name}");
+            _ = std::fs::remove_dir_all(&top);
         }
-    }
-
-    /// How many bytes the files below `dir` hold.
-    fn held(dir: &Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
-        entries
-            .flatten()
-            .map(|it| match it.metadata() {
-                Ok(meta) if meta.is_dir() => held(&it.path()),
-                Ok(meta) => meta.len(),
-                Err(_) => 0,
-            })
-            .sum()
+        _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn an_archive_or_a_list_longer_than_is_read_is_refused() {
-        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
-        let remote = remote_with("long-remote", |tar| {
-            tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
-        });
-        let Remote::Dir(at) = &remote else { unreachable!() };
-        let archive = std::fs::read_dir(at.join("units")).unwrap().next().unwrap().unwrap();
-        let long = archive.metadata().unwrap().len();
-        let dir = scratch("long-target");
-        let short = Bounds { object: long - 1, all: None };
-        let refused = pull(&dir, &remote, "default", &BTreeSet::new(), short).unwrap_err();
-        assert!(refused.to_string().contains("is longer than"), "{refused}");
-        assert_eq!(held(&dir), 0);
-        let exact = Bounds { object: long, all: None };
-        pull(&dir, &remote, "default", &BTreeSet::new(), exact).unwrap();
+    fn an_archive_longer_than_is_taken_is_refused() {
+        let (_, top, long) = remote_with("long", 0, one_rlib);
+        let trust = || crate::remote::tests::taking_unsigned();
+        let dir = top.join("target");
+        for short in [0, 1, long - 1] {
+            let remote = Remote::in_dir(&top, &top.join("kept"), trust(), short);
+            let refused = pulled(&dir, &remote, None).unwrap_err().to_string();
+            assert!(refused.contains("1 failed, 1 of them rejected"), "{short}: {refused}");
+            assert_eq!(held(&dir), 0, "{short}");
+        }
+        let remote = Remote::in_dir(&top, &top.join("kept"), trust(), long);
+        pulled(&dir, &remote, None).unwrap();
         assert_eq!(held(&dir), 4);
+        _ = std::fs::remove_dir_all(&top);
+    }
 
+    #[test]
+    fn a_list_of_units_longer_than_is_read_is_refused() {
+        let (remote, top) = unsigned("long-list", 1 << 20);
         let line = format!("{UNIT} {}\n", "ab".repeat(32));
         let mut list = line.repeat(LIST_MAX as usize / line.len());
         list.push_str(&" ".repeat(LIST_MAX as usize - list.len()));
-        remote.send("deps/default", list.as_bytes()).unwrap();
-        assert_eq!(Listed::fetch(&remote, "default").unwrap().0.len(), 1);
+        put(&top, "deps/default", list.as_bytes());
+        assert_eq!(wait(Listed::fetch(&remote, "default")).unwrap().0.len(), 1);
         list.push(' ');
-        remote.send("deps/default", list.as_bytes()).unwrap();
-        assert!(Listed::fetch(&remote, "default").is_err());
-        assert!(Listed::parse(list.into_bytes()).is_err());
+        put(&top, "deps/default", list.as_bytes());
+        assert!(wait(Listed::fetch(&remote, "default")).is_err());
+        assert!(wait(Listed::fetch_to_extend(&remote, "default")).is_err());
+        _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]
     fn an_archive_that_unpacks_to_more_than_is_taken_is_refused() {
         let file = |at: u32| format!("build/{UNIT}/out/{at}");
-        let remote = remote_with("bomb-remote", |tar| {
+        let (remote, top, long) = remote_with("bomb", 1 << 20, |tar| {
             for at in 0..64 {
                 let zeros = vec![0; 1 << 20];
-                tar.append_data(
-                    &mut header(tar::EntryType::Regular, 1 << 20),
-                    file(at),
-                    &zeros[..],
-                )
-                .unwrap();
+                let mut header = header(tar::EntryType::Regular, 1 << 20);
+                tar.append_data(&mut header, file(at), &zeros[..]).unwrap();
             }
         });
-        let Remote::Dir(at) = &remote else { unreachable!() };
-        let archive = std::fs::read_dir(at.join("units")).unwrap().next().unwrap().unwrap();
-        assert!(archive.metadata().unwrap().len() < 64 << 10, "the archive is small");
-        let dir = scratch("bomb-target");
-        let bounds = Bounds { object: 1 << 20, all: Some(4 << 20) };
-        let refused = pull(&dir, &remote, "default", &BTreeSet::new(), bounds).unwrap_err();
-        assert!(refused.to_string().contains("more than the 4194304 bytes"), "{refused}");
+        assert!(long < 64 << 10, "the archive is small");
+        let dir = top.join("target");
+        let refused = pulled(&dir, &remote, Some(4 << 20)).unwrap_err().to_string();
+        assert!(refused.contains("1 failed"), "{refused}");
         assert!(held(&dir) <= 4 << 20, "{} bytes were written", held(&dir));
-        let dir = scratch("bomb-target-roomy");
-        let bounds = Bounds { object: 1 << 20, all: Some((64 << 20) + 64 * HEADER) };
-        pull(&dir, &remote, "default", &BTreeSet::new(), bounds).unwrap();
+        let dir = top.join("roomy");
+        pulled(&dir, &remote, Some((64 << 20) + 64 * HEADER)).unwrap();
         assert_eq!(held(&dir), 64 << 20);
+        _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]
     fn no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound() {
         let mut tar = tar::Builder::new(Vec::new());
-        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
-        tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
+        one_rlib(&mut tar);
         let mut dir = header(tar::EntryType::Directory, 0);
         tar.append_data(&mut dir, format!("build/{UNIT}"), &b""[..]).unwrap();
         let out = format!("build/{UNIT}/output");
@@ -438,10 +474,9 @@ mod tests {
             _ = std::fs::remove_dir_all(&top);
             std::fs::create_dir_all(&dir).unwrap();
             let packed = zstd::encode_all(&bytes[..], 1).unwrap();
-            let written = Written::none(Some(most));
-            unpacked += unpack(&dir, UNIT, &packed, &written).is_ok() as usize;
+            unpacked += unpack(&dir, UNIT, &packed[..], &Room::of(Some(most))).is_ok() as usize;
             // The same bytes with nothing packing them are not an archive either.
-            _ = unpack(&dir, UNIT, &bytes, &Written::none(Some(most)));
+            _ = unpack(&dir, UNIT, &bytes[..], &Room::of(Some(most)));
             assert!(held(&dir) <= most, "{} bytes were written", held(&dir));
             let around: Vec<_> = std::fs::read_dir(&top).unwrap().flatten().collect();
             assert!(around.len() == 1 && held(&top) == held(&dir), "{around:?}");
@@ -456,14 +491,16 @@ mod tests {
 
     #[test]
     fn no_bytes_break_the_reading_of_a_list_of_units() {
-        let archive = "ab".repeat(32);
-        let seed = format!("{UNIT} {archive}\nother-0123456789abcdef {archive}\n");
+        let seed =
+            format!("{UNIT} {}\nlibc-0123456789abcdef {}\n", "ab".repeat(32), "0f".repeat(32));
         let mut listed = 0;
         for bytes in changed(seed.as_bytes(), 20_000) {
-            let Ok(units) = Listed::parse(bytes) else { continue };
-            for (unit, archive) in &units.0 {
-                let plain = |it: &str| !it.contains(['/', '\\', '\0']) && !it.starts_with('.');
-                assert!(plain(unit) && plain(archive) && archive.len() == 64, "{unit} {archive}");
+            let Ok(text) = String::from_utf8(bytes) else { continue };
+            for (unit, archive) in &Listed::parse(&text).0 {
+                // Both become names of files.
+                assert!(hash_of(unit).is_some(), "{unit}");
+                assert!(!unit.contains(['/', '\\', '\0']) && !unit.starts_with('.'), "{unit}");
+                assert_eq!(archive.to_string().len(), 64);
                 listed += 1;
             }
         }

@@ -97,7 +97,8 @@ check("a second pull fetches nothing", out.nothing, out.stdout.strip())
 unit = sorted(os.listdir(f"{remote}/units"))[0]
 open(f"{remote}/units/{unit}", "ab").write(b"x")
 out = rustd(third, "pull", remote)
-check("an archive that was changed is refused", out.returncode != 0 and "not what was sent" in out.stderr, out.stderr.strip()[-80:])
+check("an archive that was changed is refused", out.returncode != 0 and f"rejected units/{unit}" in out.stderr
+      and "1 of them rejected" in out.stderr, out.stderr.strip()[-80:])
 said, again = cargo(third)
 check("and cargo builds what is missing", again == printed, repr(again))
 

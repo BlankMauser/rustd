@@ -1,6 +1,7 @@
 # Security review of the store, the remote and the daemon's boundaries
 
-Branch `rustd-security`, on top of `rustd-collate` at 1547078a30. Everything below was
+Branch `rustd-security`, on top of `rustd-collate` at 526f2963ba, which has the S3 remote
+and its signed lists. Everything below was
 measured on Linux x86-64 with Rust 1.99.0 and LLVM 20. Where something is an argument and
 not a measurement it says so. The Windows code in this round was compiled for Windows and
 never run; that is said again where it matters.
@@ -33,14 +34,15 @@ directory: either cargo itself runs them, or the daemon repeats cargo's own run 
 record of it.
 
 **The signer of a remote.** A machine that pulls names the public keys it trusts
-(`RUSTD_REMOTE_TRUST`, on `rustd-s3`). A holder of one of those keys can make every
+(`RUSTD_REMOTE_TRUST`). A holder of one of those keys can make every
 machine that trusts it run any code, by signing a list that names a pack of their making.
 That is what the trust means. A signer vouches that its packs were compiled by an honest
 rustd from the sources their keys name, on a machine whose store nobody else could write
 to. rustd guarantees that nothing reaches a build from a signed remote unless a trusted
-key signed the list naming it, for the project it was signed for, and (once the rollback
-design below is applied) that a machine never goes back to an older list than one it has
-already taken.
+key signed the list naming it, for the project it was signed for, and that a machine
+never goes back to an older list than one it has already taken. A machine that has taken
+none can be given any list a trusted key ever signed; see "Rollback protection for signed
+lists".
 
 ### Who is not trusted
 
@@ -64,10 +66,10 @@ decide the bytes of every object and every list. rustd guarantees:
 - Nothing is pulled from a remote whose lists nobody trusted signed, unless the user sets
   `RUSTD_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write there
   is trusted as the signer would be.
-- With signed lists, a writer without a key can delete, withhold or (until the rollback
-  design is applied) serve an older signed list. That costs cache hits. It never gives
-  wrong code, because every pack is named by the SHA-256 of its bytes and every key
-  inside it by the full content hash of what it was compiled from.
+- With signed lists, a writer without a key can delete or withhold, which costs cache
+  hits. It cannot add or change, because every pack is named by the SHA-256 of its bytes
+  and every key inside it by the full content hash of what it was compiled from. It can
+  put back an older signed list only for a machine that has not yet taken a newer one.
 - No answer of a remote is read past a bound, and no pull writes more than a bound,
   whatever the remote sends (see "Bounds on what a remote sends").
 - No bytes from a remote make rustd panic, index out of range or write outside the place
@@ -98,16 +100,16 @@ any file rustd reads from a store or a remote, is treated as hostile input.
 
 ## This round
 
-Five things, each with its test. The findings list below has them under the numbers
-given here.
+Each with its test. The findings list below has them under the numbers given here.
 
 | | What | Where it is proved |
 |---|---|---|
+| H3 | A machine that names no keys pulls nothing unless told to, now on the S3 remote | `signed::tests::a_list_nobody_signed_is_taken_only_when_asked_for`; `remote.py`, `storeguards.py`, `deps.py`, `storefull.py` |
+| H5 | A signed list that was put back is not taken again | eight tests in `signed::tests` and `remote::tests`; `remote.py` |
 | M6 | Files cargo fetched are stored under `/cargo`, not the pusher's cargo home | `cached::tests::a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home` and two more; `storeguards.py` |
-| M7 | Every read from a remote is bounded, and so is what a pull writes | six tests in `remote::tests` and `deps::tests`; fuzz loops |
+| M7 | Every read from a remote is bounded, and so is what a pull writes | eleven tests in `remote::tests` and `deps::tests`; fuzz loops; `remote.py` |
 | M8 | rustd ran build scripts of dev-dependencies that cargo would not have | `harness/selects.py` |
 | L6 | Windows: owner and access list checked | compiled for `x86_64-pc-windows-msvc`; three tests for the Windows session |
-| | Rollback of signed lists: design | "Rollback protection for signed lists" |
 
 ## Findings, by severity
 
@@ -139,12 +141,16 @@ pack others can write to as corrupt; a daemon removes it. Tests in `store::tests
 only does anything as root; I ran it with `sudo` and it passed). End to end:
 `harness/storeguards.py`.
 
-**H3. Unsigned remotes were pulled from without asking. Fixed here for the remote that is
-on `rustd-collate`; patch for `rustd-s3` below.** `rustd cache pull` and `rustd deps pull`
-now refuse unless `RUSTD_REMOTE_UNSIGNED=1`, before anything is fetched. Only the exact
-value `1` counts. Push is unchanged. Tests: `remote::tests::lists_nobody_signed_are_taken_only_when_asked_for`,
-`harness/storeguards.py` (refused with empty, `0` and `true`; taken with `1`),
-`harness/deps.py` and `harness/storefull.py` (each first checks the refusal).
+**H3. Unsigned remotes were pulled from without asking. Fixed.** A machine that names no
+key in `RUSTD_REMOTE_TRUST` takes no list from a remote, and so fetches nothing, unless
+`RUSTD_REMOTE_UNSIGNED=1`. Only the exact value `1` counts, and it does not undo naming
+keys. The refusal is in `Trust::open` (`crates/rustd/src/remote/signed.rs`), which every
+list a pull reads goes through: `rustd cache pull`, `rustd deps pull`, the daemon's pull
+before a build and its lazy fetching. Pushing asks for nothing; it reads the list it adds
+to through `open_to_extend`, which takes nothing from it. Tests:
+`signed::tests::a_list_nobody_signed_is_taken_only_when_asked_for`, `harness/remote.py`
+(refused with empty, `0` and `true`, nothing fetched; taken with `1`; a push with nothing
+set goes through), `harness/storeguards.py`, `harness/deps.py`, `harness/storefull.py`.
 
 **H4. A dependency archive could write outside its unit. Fixed.** `rustd deps pull`
 unpacked tar archives from the remote. Entries were only checked by path prefix, so a
@@ -152,6 +158,12 @@ symlink entry followed by a file through it, or a hard link, could place files e
 and the boolean `unpack_in` returns for a skipped `..` path was ignored. Now only plain
 files and directories of the unit are accepted and a skipped entry is an error. Test:
 `deps::tests::a_unit_with_a_link_or_a_file_of_another_is_refused`.
+
+**H5. A signed list could be put back. Fixed.** A signature said who wrote a list and
+not when, so a remote, or anyone who can write to it, could serve a list the signer had
+since replaced, for ever, including one naming a pack the signer took out. Signed lists
+now carry a turn and a machine remembers the highest it took. See "Rollback protection
+for signed lists".
 
 ### Medium
 
@@ -232,9 +244,9 @@ the same for everyone using the same registry; a private registry's name is in i
 of path-dependencies outside the checkout and outside any cargo home are absolute, and
 code that names them stays local as before.
 
-**M7. A remote decided how much was read and written. Fixed.** The directory remote read
-whole files and the S3 remote whole responses into memory, and a pull wrote whatever it
-was given. See "Bounds on what a remote sends".
+**M7. A remote decided how much was read and written. Fixed.** Lists and key lists were
+read whole into memory whatever their size, and a pack or an archive was written to disk
+for as long as the remote kept sending. See "Bounds on what a remote sends".
 
 **M8. rustd ran build scripts cargo would not have. Fixed.** See "Build scripts and proc
 macros".
@@ -287,10 +299,11 @@ fix is H2: rustd refuses to be in that position.
 With write access to an unsigned remote, before this round: the same, for every machine
 that pulls. After: nothing, unless the user set `RUSTD_REMOTE_UNSIGNED=1`.
 
-With write access to a signed remote but no trusted key: they can delete, withhold or
-roll back (serve an older signed list; lists carry no counter until the design below is
-applied), which costs cache hits but never gives wrong code, since every pack is named by its hash and every key includes the
-content it was built from. They cannot add.
+With write access to a signed remote but no trusted key: they can delete or withhold,
+which costs cache hits but never gives wrong code, since every pack is named by its hash
+and every key includes the content it was built from. They cannot add. They can put an
+older signed list back, and a machine that took a newer one refuses it (H5); a machine
+that never pulled takes it.
 
 With read access to a remote: see "What one client can learn" below.
 
@@ -326,216 +339,216 @@ What fell out: M1, M2, M3 and M5 above. Accepted manifest lines are checked to b
 64 hex digits and `.pack`, with no path separator.
 
 The remote-facing parsers have the same loops, in `crates/rustd`, with the same mutator:
-the manifest (`remote::tests::no_bytes_break_the_reading_of_a_manifest`, 20,000 inputs),
-the list of dependency units (`deps::tests::no_bytes_break_the_reading_of_a_list_of_units`,
-20,000 inputs) and, new this round, the dependency archive itself
-(`deps::tests::no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound`: 3,000
-mutated tar archives by default, each tried both zstd-packed and bare, `RUSTD_FUZZ_RUNS`
-honoured). After every archive the test walks the scratch directory and fails if anything
-was written outside `deps/` and `build/` of the target directory or if more than the
-64 KiB bound is on disk. Packs pulled from a remote are read by the pack reader and
-`Entry::decode`, which are the first two rows of the table.
+
+| Target | Test | Inputs | What is asserted of every input |
+|---|---|---|---|
+| A manifest | `remote::tests::no_bytes_break_the_reading_of_a_manifest` | 20,000 | no panic; every pack and key list it names is 64 hex digits; what is found to fit under a limit sums to no more than it |
+| A list of units | `deps::tests::no_bytes_break_the_reading_of_a_list_of_units` | 20,000 | no panic; every unit is a crate name and a hash with no separator, every archive 64 hex digits |
+| A signed list | `signed::tests::no_bytes_are_taken_for_a_list_that_was_signed` | 20,000 | no panic; whatever verifies is the body that was signed, at the turn it was signed at |
+| An archive of a unit | `deps::tests::no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound` | 3,000 (`RUSTD_FUZZ_RUNS`), each zstd-packed and bare | nothing is written outside `deps/` and `build/` of the target directory, and no more than the 64 KiB bound |
+
+Packs pulled from a remote are read by the pack reader and `Entry::decode`, which are the
+first two rows of the first table.
 
 ## Bounds on what a remote sends
 
-Before this round the directory remote read whole files and the S3 remote whole response
-bodies into memory, and a pull wrote whatever arrived. Whoever writes to a remote, or
-answers for it, chose both numbers. Now every read goes through one function,
-`read_at_most`, which reads through `Read::take` and then asks for one more byte: more
-than the bound is an error and nothing past the bound plus one byte is ever read. The
-`Content-Length` header is not consulted, so a remote that lies about it gains nothing.
+Before this round a list and the keys of a pack were read whole into memory (`tokio::fs::read`
+for a directory, `body.collect()` for S3), and a pack or an archive was appended to a
+file for as long as bytes arrived. Whoever writes to a remote, or answers for it, chose
+how much. Now:
 
 | What | Bound | Set by |
 |---|---|---|
-| A manifest, or a list of dependency units | 16 MiB | fixed (`LIST_MAX`); a line is under 100 bytes |
-| One pack, or one dependency archive | 512 MiB | `RUSTD_REMOTE_MAX` |
-| All the packs one `rustd cache pull` writes | the store's limit, 8 GiB | `RUSTD_CACHE_MAX` |
+| A manifest, or a list of units | 16 MiB | fixed (`LIST_MAX`); a line is under 200 bytes |
+| A pack | the size its manifest lists it with | the manifest |
+| All the packs one pull writes | the store's limit, 8 GiB | `RUSTD_CACHE_MAX`; a pull fetches only what its listed sizes say fits |
+| The keys of one pack | the pack's listed size, and 512 MiB | `RUSTD_REMOTE_MAX` |
+| All the keys a lazy daemon holds in memory | 512 MiB | `RUSTD_REMOTE_MAX` |
+| A pack a lazy daemon fetches | its listed size, and the store's limit | `RUSTD_CACHE_MAX` |
+| The archive of one unit | 512 MiB | `RUSTD_REMOTE_MAX` |
 | All that one `rustd deps pull` unpacks | 64 GiB | `RUSTD_DEPS_MAX` (`off` for none) |
 
-The bound on what is written is counted before the write, so a pull that would pass it
-fails with what is already on disk under it. The unpack bound counts each tar entry's
-declared size plus its header before the entry is unpacked, which is what stops a small
-archive that expands: the test packs 64 files of 1 MiB of zeros into an archive under
-64 KiB and a pull held to 4 MiB writes at most 4 MiB and fails; held to exactly the
-64 MiB plus headers it succeeds. Memory during a pull is at most eight transfers of one
-object each (4 GiB at the default; lower `RUSTD_REMOTE_MAX` on a small machine).
+How each is held:
 
-Tests, each with the exact bound taken and one byte less refused:
-`remote::tests::a_file_is_read_to_the_bound_and_not_past_it` (also an endless reader),
-`a_pack_longer_than_is_read_is_not_written`, `no_more_is_written_than_the_store_may_hold`,
-`a_manifest_longer_than_is_read_is_refused`, and in `deps::tests`
-`an_archive_or_a_list_longer_than_is_read_is_refused` and
-`an_archive_that_unpacks_to_more_than_is_taken_is_refused`.
+- Small objects go through `read_at_most` (`remote.rs`), for a directory and for S3
+  alike: it takes the body a chunk at a time and stops with an error at the first chunk
+  that passes the bound. What the service says the length is, is not consulted.
+- A pack or an archive goes to a file through `fetch_file` (`remote/transfer.rs`), which
+  now takes the most the object may be and stops before appending the chunk that passes
+  it. The part file is removed, the object is counted under "objects rejected", and the
+  failure is final: it is not asked for again. A part file left by a stopped process
+  that is already longer than the bound is emptied first.
+- A pack's bound is the size in its manifest line, which with signed lists is a number
+  the signer wrote. The existing `fitting` already left out packs whose listed sizes do
+  not fit under `RUSTD_CACHE_MAX`; with each pack held to its listed size, that sum is
+  now a bound on what is written and not a hope.
+- The keys of a pack are 32 of every 40 or more bytes of it, so their list is never
+  longer than the pack.
+- Unpacking counts each tar entry's declared size plus its header before the entry is
+  unpacked, which is what stops a small archive that expands: the test packs 64 files of
+  1 MiB of zeros into an archive under 64 KiB; a pull held to 4 MiB writes at most 4 MiB
+  and fails, and held to exactly 64 MiB plus headers it succeeds.
 
-Not covered: the S3 arm is the same `read_at_most` over the response body, but no test
-here talks to an S3 server; `rustd-s3` replaces that arm with the AWS SDK and has to
-keep the bound (see below). A pack is still held whole in memory while it is checked and
-written; streaming it to a temporary file would lower the peak and was not done.
+Tests, each with the exact bound taken and less refused:
+`remote::tests::an_object_is_read_to_the_bound_and_not_past_it`,
+`an_object_without_an_end_is_given_up_on` (`/dev/zero` as the object),
+`a_pack_longer_than_its_list_says_is_not_written` (listed as 0, 8, 64 KiB and one byte
+short: rejected, the store holds nothing but its own two files; listed exactly: fetched),
+`what_a_stopped_fetch_left_does_not_count_against_the_bound_twice`,
+`a_manifest_longer_than_is_read_is_refused` (16 MiB read; one byte more refused for a
+pull and for a push, and the list not overwritten),
+`the_keys_of_a_pack_are_no_longer_than_the_pack`, and in `deps::tests`
+`an_archive_longer_than_is_taken_is_refused`,
+`a_list_of_units_longer_than_is_read_is_refused` and
+`an_archive_that_unpacks_to_more_than_is_taken_is_refused`. Against MinIO, `remote.py`
+does the pack listed as 0, 1 and one byte short and the manifest of 16 MiB and of one
+byte more through `rustd cache pull`.
 
-## The `rustd-s3` branch
+Not covered: with `RUSTD_CACHE_MAX=off` the sum of what a pull writes has no bound, which
+is what the setting says. The lazy path's two bounds have no test of their own.
 
-`origin/rustd-s3` is now at 5841b47f46, rebased onto the format-2 store, and is not in
-`rustd-collate` yet (1547078a30 does not contain it), so nothing of it is on this branch.
-When it is, three things go in on top of it: the unsigned-pull refusal below, the bounds
-above on its `read_small` and its SDK response bodies, and the rollback protection
-designed in the next section. The `Unsigned` type added to `remote.rs` and `deps.rs` here
-goes away in favour of the first. The patch below was applied to a checkout of the older
-`rustd-s3` (7b33ead6c2) last round and its tests run there (`cargo test --release -p
-rustd signed`: 4 passed, including the new one); `signed.rs` has not changed shape since.
+## What was applied on top of the S3 remote
 
-```diff
---- a/crates/rustd/src/remote/signed.rs
-+++ b/crates/rustd/src/remote/signed.rs
-@@ pub(crate) struct Trust {
-     signer: Option<SigningKey>,
-     trusted: Vec<VerifyingKey>,
-+    unsigned: bool,
- }
-@@ fn from_env
--        Ok(Trust { signer, trusted: trusted.collect::<anyhow::Result<_>>()? })
-+        let unsigned = std::env::var("RUSTD_REMOTE_UNSIGNED").is_ok_and(|it| it == "1");
-+        Ok(Trust { signer, trusted: trusted.collect::<anyhow::Result<_>>()?, unsigned })
-@@ fn open
--        if self.checks() { self.verify(name, text) } else { Ok(split(text).0) }
-+        if self.checks() {
-+            return self.verify(name, text);
-+        }
-+        if !self.unsigned {
-+            bail!(
-+                "`{name}` is not taken: RUSTD_REMOTE_TRUST names no key, and whoever can write \
-+                 to the remote decides what the build runs. Set RUSTD_REMOTE_UNSIGNED=1 if all \
-+                 who can are trusted"
-+            );
-+        }
-+        Ok(split(text).0)
-@@ fn open_to_extend
--        if self.signer.is_some() { self.verify(name, text) } else { self.open(name, text) }
-+        if self.signer.is_some() || self.checks() {
-+            self.verify(name, text)
-+        } else {
-+            Ok(split(text).0)
-+        }
-```
+`rustd-collate` at 526f2963ba has `rustd-s3`. Merging it replaced `remote.rs` and
+`deps.rs` wholesale (the remote is now asynchronous, streams packs to files and has
+`remote/s3.rs`, `remote/signed.rs`, `remote/transfer.rs`), so what this branch had done
+to the old remote was done again on the new one, not merged:
 
-`open` is the read path (`Remote::read_list`); `open_to_extend` is the push path and must
-keep working unsigned, which is why it no longer goes through `open`. In the tests, add
-`unsigned: false` to `trusting`, change the one assertion in
-`a_list_is_taken_from_a_trusted_key_only` that expects an untrusting machine to read a
-list into `is_err()`, and add:
-
-```rust
-#[test]
-fn with_no_key_to_trust_a_list_is_taken_only_when_told_to() {
-    let sealed = trusting(Some(1), &[]).seal("manifests/a", "one\n");
-    for text in [sealed.as_str(), "one\n"] {
-        let refused = trusting(None, &[]).open("manifests/a", text).unwrap_err();
-        assert!(refused.to_string().contains("RUSTD_REMOTE_UNSIGNED=1"));
-        let told = Trust { unsigned: true, ..trusting(None, &[]) };
-        assert_eq!(told.open("manifests/a", text).unwrap(), "one\n");
-        assert_eq!(trusting(None, &[]).open_to_extend("manifests/a", text).unwrap(), "one\n");
-    }
-    let told = Trust { unsigned: true, ..trusting(None, &[2]) };
-    assert!(told.open("manifests/a", &sealed).is_err());
-    assert!(told.open("manifests/a", "one\n").is_err());
-}
-```
-
-Its `harness/remote.py` builds machines without `RUSTD_REMOTE_TRUST` in several places;
-those need `RUSTD_REMOTE_UNSIGNED=1`, and the "without RUSTD_REMOTE_TRUST the forged pack
-is taken" case becomes "is refused". I did not run that harness.
-
-Three more things for that session, from reading its branch:
-
-1. `Remote::read_small` reads a list of any size into memory, for both the directory and
-   S3. Cap it (a few MB is generous for a list of hashes) before `String::from_utf8`.
-2. `deps.rs` `unpack` there still calls `entry.unpack_in(dir)?` without looking at the
-   result or the entry type. It needs the H4 fix from this branch; the two will conflict
-   in that function and this branch's version is the one to keep.
-3. Signed lists have no counter or date, so a remote can serve an old one. The next
-   section is the design for that.
+- **The unsigned-pull refusal** is in `Trust::open`, as described under H3. The
+  `Unsigned` type the old remote had here is gone.
+- **The bounds** are as in the section above.
+- **The archive checks of H4** (only files and directories, the result of `unpack_in`
+  looked at) are in the new `unpack`, which reads the archive from the file it was
+  fetched to.
+- **Rollback protection** is the next section.
+- **A fetched pack is made 0600.** The S3 remote wrote a pack it fetched with the
+  process's default mode (0644 here), into a store whose every other file is 0600.
+  `storeguards.py` found it after the merge; the part file is now opened 0600
+  (`remote::tests::a_pack_longer_than_its_list_says_is_not_written` checks the mode of
+  what arrives).
+- **A machine that signs takes only signed lists,** also when it names no keys to trust
+  and has `RUSTD_REMOTE_UNSIGNED=1`: what it pulls it later pushes under its own
+  signature, so an unsigned list would be laundered into a signed one.
+- **`Kind::of` in `store.rs`** takes `<pack>.fetch.tmp` for a temporary file of the
+  store. The stricter names of M5 did not know the name S3 gives a pack on its way, so
+  the store neither counted one nor removed it once it was old; `remote.py` found it.
+- **`harness/remote.py`** runs its machines with `RUSTD_REMOTE_UNSIGNED=1` where they
+  name no keys, and has a new section, "unsigned lists, old lists, long objects",
+  17 checks. `harness/deps.py` expects the new remote's wording for a changed archive
+  ("rejected units/...").
 
 ## Rollback protection for signed lists
 
-This is a design. It is not implemented anywhere, because the code it changes
-(`crates/rustd/src/remote/signed.rs`) is only on `rustd-s3`. It was written against that
-file as it is at 5841b47f46.
+Designed before the signed lists were on this branch, and applied when they arrived. The
+code is in `crates/rustd/src/remote/signed.rs` (`Turns`, and the turn in `seal` and
+`verify`) and in `Remote::read_list` and `Remote::extend_list` in `remote.rs`.
 
-**What it is for.** A list is signed, so a remote cannot invent one. It can serve an old
-one. Every pack an old list names was vouched for once, so this never gives code nobody
-signed. It matters when a signer has taken something back: a pack built by a rustd with a
-miscompilation, or pushed from a machine later found to be compromised, removed from the
-list by signing a new one. Without rollback protection the remote, or anyone who can
-write to it, can keep handing out the old list for ever.
+**What it is for.** A list is signed, so a remote cannot invent one. It could serve an
+old one. Every pack an old list names was vouched for once, so this never gave code
+nobody signed. It matters when a signer has taken something back: a pack built by a
+rustd with a miscompilation, or pushed from a machine later found to be compromised,
+removed from the list by signing a new one. Without this the remote, or anyone who can
+write to it, could keep handing out the old list for ever.
 
-**The signed body.** Every list gets a number, here called its turn. The last line
-becomes `signed <key> <turn> <signature>`, and the signature is over
-`rustd list 2\n<name>\n<turn>\n<body>`. The domain line changes from `rustd list 1`, so
-a signature of the old kind verifies under no key and an old list is simply unsigned.
-The turn is a decimal `u64` with no sign and no leading zero; anything else is "not
-signed". It is inside the signed bytes, so it cannot be changed without the key.
+**The signed body.** Every signed list has a number, its turn. The last line is
+`signed <key> <turn> <signature>`, and the signature is over
+`rustd list 2\n<name>\n<turn>\n<body>`. The domain line was `rustd list 1`, so a
+signature of the old kind verifies under no key, and a list signed without a turn is
+"not signed". The turn is a decimal `u64` written the one way there is to write it (no
+sign, no leading zero); anything else is "not signed". It is inside the signed bytes, so
+changing it in the line breaks the signature.
 
-**Who sets it.** A machine that pushes already reads the list it extends
-(`open_to_extend`, which verifies). It signs with
-`turn = max(turn of the list it read + 1, seconds since 1970 by its clock)`. A counter
-alone would be enough for ordering; starting it from the clock is so that a remote that
-was emptied and started again, or a list signed by a second key that never saw the first,
-still comes out above what machines remember, without anyone keeping state on the signing
-side. A signer with a clock set far ahead only makes the numbers large; the next signer
-goes one above it. The readers' clocks are never consulted, so a wrong clock on a build
-machine cannot make it refuse or accept anything.
+**Who sets it.** A machine that pushes reads the list it extends and signs with
+`turn = max(highest turn it remembers of this list + 1, seconds since 1970 by its
+clock)`. A counter alone would order the lists. Starting it from the clock is so that a
+remote that was emptied and started again, or a list signed by a second key on a machine
+that never saw the first, still comes out above what readers remember, with no state to
+keep on the signing side beyond what every machine keeps. A signer whose clock is far
+ahead only makes the numbers large; the next goes one above it. The readers' clocks are
+never consulted, so a wrong clock on a build machine cannot make it refuse or accept
+anything.
 
 I chose a counter seeded from the clock over a plain timestamp because two pushes within
 one second must still be ordered, and over a plain counter because of the reset case.
 
-**What a reader remembers.** For each list it has taken, the highest turn, in the store
-directory: `turns/<sha256 of "rustd turn 1\n<remote as given>\n<list name>">`, a file
-holding the decimal number and a newline, written like every other file of the store
-(temporary file, fsync, rename, directory fsync, 0600). It is in the store because the
-store is what the list fills, it is already private to the user and already checked for
-that, and deleting the store then forgets the turns together with the packs they
-protected. The turn belongs to the list, not to the key, so rotating keys changes
-nothing: a new trusted key that signs a lower turn is refused like any other.
+**What a machine remembers.** For each list it has taken, the highest turn, in a file
+`turns/<sha256 of the remote>/<sha256 of the list's name>` holding the decimal number
+and a newline. It is written like every file of the store (temporary file, fsync,
+rename, directory fsync), in a directory made 0700. Where:
 
-**The rule,** in `Trust::open` after the signature has verified, under the store's
-existing `lock` file so that two pulls cannot interleave a read and a write of the same
-turn:
+- For `rustd cache` and the daemon, in the store (`RUSTD_CACHE`). The store is what the
+  list fills, it is already private to the user and checked for that, and removing the
+  store forgets the turns together with the packs they protected. The store's own code
+  leaves a name it does not know alone, which `turns` is.
+- For `rustd deps`, in the store when `RUSTD_CACHE` is set, and otherwise in `.rustd/`
+  of the target directory the units are unpacked into. `cargo clean` forgets them with
+  the units.
+
+The remote is named by its directory as given, or `s3://bucket/prefix` without the
+options of the address, so the same bucket reached through another endpoint or profile
+is the same remote. The turn belongs to the list and not to a key, so rotating keys
+changes nothing: a new trusted key that signs a lower turn is refused like any other.
+
+**The rule,** applied after the signature has verified and before anything the list
+names is fetched, under a lock file in the remote's directory of turns so that two
+processes cannot interleave a read and a write:
 
 | The list's turn against the remembered one | What happens |
 |---|---|
-| Nothing remembered (first pull, or the store was removed) | Taken. The turn is remembered. |
-| Higher | Taken. The turn is remembered before any pack is fetched. |
-| Equal | Taken. Two machines that pushed at once can sign the same turn over different lines; both are signed by trusted keys, and a remote choosing between them gains nothing it could not get by withholding. |
-| Lower | Refused: "`<name>` is turn N, and this machine has taken turn M from this remote: an older list is not taken". Nothing is fetched. |
-| Signed without a turn, or with the old domain | Refused as not signed. There is no released version to stay compatible with. |
-| The remembered file cannot be read, or is not a number | Refused, naming the file. It is not treated as nothing remembered, since removing protection must not be something damage can do silently. `rustd cache forget REMOTE` (new) removes the remembered turns of a remote, and is what the message says to run. |
-| The turn cannot be written (full disk, read-only store) | The pull fails before fetching. It was about to write packs to the same place. |
+| Nothing remembered (first pull, or the store was removed) | Taken, and remembered. |
+| Higher | Taken, and remembered. |
+| Equal | Taken. Two machines that push at once can sign the same turn over different lines; both are signed by trusted keys, and a remote choosing between them gains nothing it could not by withholding. |
+| Lower | Refused: "`manifests/default` is turn N, and this machine has taken turn M of it: an older list is not taken". Nothing is fetched, and the list is counted as rejected. |
+| Signed without a turn, or under the old domain | Refused as not signed. There is no released version to stay compatible with. |
+| The remembered file cannot be read, or does not hold a turn | Refused, naming the file and `rustd cache forget REMOTE`. It is not taken for nothing remembered: what keeps an old list out must not be something damage removes quietly. The file is left as it is. |
+| The turn cannot be written (full disk, read-only store) | The pull fails before fetching. |
 
-`open_to_extend` (the push path) applies the same rule, so a signer does not extend, and
-so re-sign under a new turn, a list that was rolled back under it. A machine with
-`RUSTD_REMOTE_UNSIGNED=1` and no keys has no turns and no protection; that is the meaning
-of the setting. `rustd deps` lists go through the same `open`, so they are covered by the
-same code.
+`rustd cache forget REMOTE` (new) removes what is remembered of one remote. It is for a
+damaged memory, and for a remote that was deliberately started again by a signer whose
+clock is behind the old lists.
+
+**The pushing side.** A signer applies the same rule to the list it is about to extend,
+so it does not put its name under a list that was rolled back. Such a list gets what an
+untrusted list already got: "it is written anew", with only what this push sent, at a
+turn above everything the signer remembers. After a write goes through, the signer
+remembers its own turn. A damaged memory stops a push as it stops a pull, and the list
+on the remote is not touched. A machine with `RUSTD_REMOTE_UNSIGNED=1` and no keys has
+no turns and no protection; that is the meaning of the setting. The lists of `rustd
+deps` go through the same code.
 
 **What it does not do.** A machine that has never pulled remembers nothing, so it can be
-given any list that was ever signed; this is trust on first use. A remote can also freeze
-a machine at the newest list that machine has seen, by never showing a newer one. Both
-are the same gap, freshness, and need an expiry to close. The turn makes one possible
-without another field: a turn is never below the signing time, so a list whose turn is
-older than a chosen age was certainly signed before it. An optional
-`RUSTD_REMOTE_FRESH=<duration>`, refusing lists with `turn < now - duration`, would close
-it for machines that start from an empty store (CI), at the price of a signer having to
-re-sign at least that often and of the reader's clock mattering. I would not make it the
-default.
+given any list that was ever signed; this is trust on first use, and the harness shows
+it. A remote can also freeze a machine at the newest list that machine has seen, by
+never showing a newer one. Both are the same gap, freshness, and need an expiry to
+close. The turn makes one possible without another field: a turn is never below the
+signing time, so a list whose turn is older than a chosen age was certainly signed
+before it. An optional `RUSTD_REMOTE_FRESH=<duration>`, refusing lists with
+`turn < now - duration`, would close it for machines that start from an empty store
+(CI), at the price of a signer having to re-sign at least that often and of the reader's
+clock mattering. It is not implemented, and I would not make it the default.
 
-**Tests to add with it,** all in `signed.rs` beside the existing three, plus one harness
-case: a list is taken, a newer one is taken, the first is then refused and nothing is
-fetched; equal turns are taken; a turn edited in the signature line fails verification;
-a list sealed under `rustd list 1` is not signed; a remembered file with garbage refuses
-and `cache forget` mends it; two keys, the second signing a lower turn, refused; the
-signer's turn is above both the list it read and its clock; and the parse of the
-signature line joins the fuzz loop. In `harness/remote.py`: push, pull on a second
-machine, push again, pull, then put the first manifest back on the remote and pull:
-refused, store unchanged.
+Also not covered: a remembered turn is not itself protected against the user's own
+processes (they are trusted), and an attacker who can roll the store directory back as
+a whole (a restored backup, a snapshot) rolls the memory back with it.
+
+**Tests.** In `signed::tests`: `the_turn_is_signed_with_the_list` (a turn edited in the
+line fails; six ways to write a turn that are not the one way; `u64::MAX` is taken),
+`a_list_signed_without_a_turn_is_not_signed` (the old line, and the old signature given
+a turn), `a_turn_is_past_the_last_and_not_behind_the_clock`,
+`an_older_list_is_not_taken_again` (first, higher, equal, lower; another list and
+another remote have their own; the next process remembers),
+`a_memory_that_is_damaged_takes_no_list_until_it_is_forgotten` (six kinds of damage,
+each refused for a lower, an equal and a higher turn, the file left as it was),
+`two_that_take_at_once_remember_the_later` (eight threads, 400 turns),
+`no_bytes_are_taken_for_a_list_that_was_signed` (the fuzz loop). In `remote::tests`,
+through `Remote` on a directory with one machine that signs and one that trusts it:
+`a_list_that_was_put_back_is_not_taken`,
+`a_signer_does_not_add_to_a_list_that_was_put_back`,
+`a_memory_that_is_damaged_stops_a_push_and_a_pull`. In `harness/remote.py`, against
+MinIO, through the `rustd` binary: A signs and pushes twice, C takes both, the first
+manifest is put back in the bucket and C's pull is refused with nothing fetched; a
+machine that never pulled takes it; `cache forget` has C take it; A, pushing over it,
+writes a new list with a later turn; C takes that and then refuses the second list.
 
 ## Build scripts and proc macros
 
@@ -781,17 +794,21 @@ changed:
 
 ## What is left
 
-- **Signed lists and their rollback protection are not on this branch.** They wait for
-  `rustd-s3` to be in `rustd-collate`. Then: the unsigned-pull patch, the bounds on its
-  reads, and the rollback design, which is a design and has not been prototyped.
-- **Freshness.** Even with rollback protection a machine with an empty store can be given
-  any list ever signed. See the end of the rollback section.
+- **Freshness.** A machine with an empty store can be given any list ever signed, and a
+  remote can keep a machine at the newest list it has seen. See the end of the rollback
+  section; `RUSTD_REMOTE_FRESH` is a sketch, not code.
 - **Windows was compiled, not run.** The store check needs the commands above run on a
   Windows machine. The socket there has no peer check, and the store is not made private
-  on creation.
-- **A pack is held in memory whole** while it is pulled, up to `RUSTD_REMOTE_MAX` each
-  and eight at a time.
-- **The S3 arm of the bounds has no test** against a server.
+  on creation. The directory of turns is made 0700 on Unix and with what it inherits on
+  Windows.
+- **Real S3 was not run,** only MinIO on loopback. The bounds and the turns do not
+  depend on the service, but that is an argument.
+- **The two bounds of the lazy path** (keys held in memory, a pack over the store's
+  limit) have no test of their own.
+- **With `RUSTD_CACHE_MAX=off`** a pull writes as much as the lists name.
+- **A pushed-over list loses lines.** When a signer finds a rolled-back or untrusted
+  list it writes a new one with what it just sent, not with everything it ever sent;
+  the next pushes add the rest back. That was the behaviour for untrusted lists already.
 - **More than one cargo home in one build** (crates from two) is not remapped; such
   paths stay absolute and local.
 - **Private registry names** are in the remapped path (`/cargo/registry/src/<index>/`).
@@ -805,18 +822,26 @@ changed:
 
 ## Validation
 
-All of this is on Linux x86-64, with stable 1.99.0 and LLVM 20.1.8, on the head of this
-branch. Nothing else was run.
+All of this is on Linux x86-64, with stable 1.99.0, LLVM 20.1.8 and MinIO
+RELEASE.2026-09-22T19-25-18Z, on the head of this branch after the merge of `rustd-collate`
+at 526f2963ba. Nothing else was run.
 
 Builds and checks:
 
     cargo fmt --all -- --check                                      clean
-    cargo xtask tidy                                                exit 0
     cargo build -p rustd --release                                  builds
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 CARGO_TARGET_DIR=target-llvm \
       cargo build -p rustd --release --features llvm                builds
-    cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
-                                                                    948 passed, 0 failed, 1 ignored
+    cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd -p project-model
+                                                                    1015 passed, 0 failed, 1 ignored
+    cargo test --release -p rustd -- remote:: deps::                28 passed
+    cargo check -p hir-ty --tests --target x86_64-pc-windows-msvc   checks
+
+`cargo xtask tidy` fails, and not from this branch: it objects to two `#[should_panic]`
+tests in `crates/rustd/src/main.rs` that came with the build model merge and are on
+`rustd-collate` as it is. `cargo clippy -p rustd --all-targets` has no warning in
+`remote.rs`, `remote/` or `deps.rs` that `rustd-collate` does not have (the prints, an
+`Arc<Vec<u8>>` and two `chunks_exact`).
 
 The harnesses, from `harness/`, one backend after the other, with `RUSTD_BIN` at the
 release binary and `RUSTD_BACKEND=cranelift`, then `RUSTD_BACKEND=llvm RUSTD_OPT=2
@@ -824,49 +849,44 @@ RUSTD_EMIT=fast`:
 
 | Harness | Cranelift | LLVM |
 |---|---|---|
-| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 0 of 892 layouts differ | same |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803 of 803 functions, 0 of 893 layouts differ | same |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 25 of 25, 0 open, 0 skipped | same |
+| `breakers.py` | 43 of 43, 5 open, 0 skipped | same |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
-| `worktrees.py` | 58 of 58 | 58 of 58 |
-| `keys.py` | 36 of 36, 0 open | 36 of 36, 0 open |
+| `worktrees.py` | 62 of 62 | 62 of 62 |
+| `keys.py` | 46 of 46, 0 open | 46 of 46, 0 open |
 | `debuginfo.py` | all right | all right |
 | `deps.py` | 11 of 11 | 11 of 11 |
 | `storekills.py --kills 100` | 100 kills, all verified | same |
 | `storecorrupts.py --rounds 4` | 4 damaged stores rebuilt | same |
 | `storefull.py` | 6 full disks, all built | same |
 | `storeshared.py` | 180 builds | 180 builds |
-| `storeguards.py` (new) | all right | all right |
+| `storeguards.py` | all right | all right |
+| `selects.py` | 3 of 3 | 3 of 3 |
+| `remote.py` (MinIO; SeaweedFS is not on this machine) | 85 of 85 | 85 of 85 |
+| `buildmodel.py` (runs both backends itself) | | 194 of 194, 0 WRONG |
 
-`buildmodel.py` runs both backends itself and so needs the binary built with
-`--features llvm`: 179 of 180 as expected, 0 WRONG. The one that is not is
-`cross_aarch64` under LLVM, and it is not from this branch: rustd dies of a segmentation
-fault inside LLVM's AArch64 instruction selection (`InstructionSelect::selectMachineFunction`
-under `LLVMTargetMachineEmitToMemoryBuffer`), three runs of three, and the binary built
-from `rustd-collate` at 0151c01218 does the same on this machine, two runs of two. I did
-not look further, since it is in the code generation the ABI session owns. Two things
-about it are worth forwarding: the harness prints a daemon killed by a signal as
-`refused`, which hides a crash behind the word for a stated reason, and the matrix that
-is green elsewhere must differ from this machine in its LLVM build.
+The 5 open of `breakers.py` are the ones it lists as open on `rustd-collate`. Of the 85
+checks of `remote.py`, 17 are new here.
 
-Three things in the gate changed because of this round, and are said here so they are not
-taken for noise:
+Things in the gate that changed because of this branch, said here so they are not taken
+for noise:
 
-- `storefull.py` failed under LLVM at first: its largest disk left 1 MB of room and the
-  store of a cold build no longer filled it. The cause is the fix for standard-library
-  paths: with `/rustc/<commit>` in place of the toolchain's directory, each of the 4,330
-  paths in the LLVM store is 36 bytes shorter, and the store went from about 1.09 MB to
-  0.94 MB (measured: 937,087 bytes in 16 files). The largest room is now 768 KB. The
-  binary of `rustd-collate` passes the disk sizes with the old number, which is how I
-  know it was this.
-- `deps.py` failed at first on my own change: the check that an archive holds only
-  files and directories refused the sparse files that `tar` writes for a build script
-  with holes in it. A sparse file is now taken as a file; links are still refused.
+- `remote.py` failed one check after the merge ("the store is whole, and counts what
+  was kept aside as a temporary file"): the stricter file names of M5 met the
+  `<pack>.fetch.tmp` of the S3 remote. Fixed in `Kind::of`.
+- `storeguards.py` failed after the merge on the mode of fetched packs (0644). Fixed in
+  `transfer.rs`.
+- `deps.py` expected the old remote's words for a changed archive. It now expects
+  "rejected units/<hash>" and one object counted as rejected.
+- `storefull.py`'s largest disk is 768 KB since last round (the shorter standard-library
+  paths made the store smaller than the 1 MB it had to overflow).
 - Run at the same time in one checkout, the two backends' gates disturb each other
-  (`difftest.py` and `debuginfo.py` each failed once with "no linker line", when the
-  other had just built the same corpus). Run one after the other, both pass. The numbers
-  above are from the sequential run.
+  ("no linker line"). The numbers above are from one after the other.
+- The gate leaves about 7 GB under `/tmp` if nothing removes its scratch directories
+  between harnesses; on this machine that filled the disk once, which showed up as
+  `keys.py` failing to compile, not as a message about the disk.

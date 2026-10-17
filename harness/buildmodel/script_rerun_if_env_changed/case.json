@@ -7,14 +7,12 @@
   "steps": [
     {
       "what": "the variable is set",
-      "expect": "refused",
       "env": {
         "BM_LEVEL": "loud"
       }
     },
     {
       "what": "the variable changes",
-      "expect": "refused",
       "env": {
         "BM_LEVEL": "quiet"
       }

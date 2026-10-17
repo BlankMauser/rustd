@@ -3,6 +3,5 @@
   "package": "app",
   "crates": [
     "app"
-  ],
-  "expect": "refused"
+  ]
 }

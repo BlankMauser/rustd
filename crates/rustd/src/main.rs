@@ -9,7 +9,6 @@ mod memory;
 mod outline;
 mod plan;
 mod process;
-mod profile;
 mod remote;
 mod socket;
 mod splice;
@@ -215,6 +214,7 @@ impl Args {
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
                 }
+                "--doc" => bail!("{DOCTESTS_ARE_NOT_BUILT}"),
                 "--release" => profile = Some("release".to_owned()),
                 "--profile" => profile = Some(value()?),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
@@ -973,6 +973,7 @@ fn load(
         load_config,
         selection,
         inputs: inputs::Inputs::default(),
+        debug: Vec::new(),
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
@@ -999,6 +1000,8 @@ struct Checkouts {
     inputs: inputs::Inputs,
     /// Which build of each project is loaded.
     selection: plan::Selection,
+    /// For each of `roots`, whether its profile has the code say which lines it is of.
+    debug: Vec<bool>,
 }
 
 impl Checkouts {
@@ -1014,7 +1017,12 @@ impl Checkouts {
         let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
-        Ok(Parts { root, base, members })
+        // An override for measuring one against the other.
+        let debug = match std::env::var("RUSTD_DEBUGINFO") {
+            Ok(forced) => forced != "0",
+            Err(_) => self.debug[at],
+        };
+        Ok(Parts { root, base, members, debug })
     }
 
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
@@ -1206,7 +1214,7 @@ impl Checkouts {
     ) -> anyhow::Result<()> {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
-        let mut splits = Vec::new();
+        let (mut splits, mut debug) = (Vec::new(), Vec::new());
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
         let share = std::env::var_os("RUSTD_SPLIT").is_none_or(|it| it != "0");
         for project in projects {
@@ -1215,12 +1223,14 @@ impl Checkouts {
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
                 splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                debug.push(self.debug[base]);
                 roots.push((dunce::canonicalize(project)?, over));
                 continue;
             }
             splits.push(None);
-            let workspace =
+            let (workspace, says_lines) =
                 workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
+            debug.push(says_lines);
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
@@ -1239,7 +1249,112 @@ impl Checkouts {
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.roots.extend(roots);
         self.splits.extend(splits);
+        self.debug.extend(debug);
         Ok(())
+    }
+
+    /// The checkouts that are no longer what they were loaded from, for a build of
+    /// `project` by a process with the variables `env`. A checkout loaded in full is one
+    /// when its manifests, cargo's configuration or what its build scripts say changed, and
+    /// when the build is of it and the process has other flags for rustc. One that shares
+    /// packages with another is one when the build is of it and the two no longer build alike.
+    fn stale(&mut self, project: &Path, env: &ide_db::base_db::Env) -> anyhow::Result<Vec<usize>> {
+        let project = dunce::canonicalize(project).ok();
+        let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
+        // The checkout whose variables are those of the build: any, when it is not loaded.
+        let built = match asked {
+            Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
+            None => None,
+        };
+        let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
+        let mut stale = Vec::new();
+        for (at, (_, root)) in self.roots.iter().enumerate() {
+            let changed = match &self.splits[at] {
+                Some(split) => asked == Some(at) && !self.builds_alike(&split.base, root),
+                None => match known.get(&**root) {
+                    Some(&changed) => changed,
+                    None => {
+                        let env = (asked.is_none() || built == Some(root)).then_some(env);
+                        let changed = self.inputs.stale(root, env)?;
+                        known.insert(root, changed);
+                        changed
+                    }
+                },
+            };
+            if changed {
+                stale.push(at);
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Loads the checkouts at `stale` again, as a process with the variables `env` builds
+    /// them. Every other keeps the workspace it has, and the crates that are the same in the
+    /// workspace loaded again stay the crates they are. Nothing is changed when cargo turns
+    /// one of them down. A checkout that shares packages with one of `stale` shares what is
+    /// alike now, and is loaded in full when the two no longer build alike.
+    fn reload(
+        &mut self,
+        stale: &[usize],
+        env: &ide_db::base_db::Env,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<()> {
+        let mut loaded = Vec::new();
+        for &at in stale {
+            loaded.push(self.loaded_again(at, env)?);
+        }
+        for (&at, (workspace, debug, config)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config);
+        }
+        let mut failed = Ok(());
+        for at in 0..self.roots.len() {
+            let Some(base) = self.splits[at].as_ref().map(|it| it.base.clone()) else { continue };
+            let Some(base) = stale.iter().copied().find(|&it| self.roots[it].1 == base) else {
+                continue;
+            };
+            let over = self.roots[at].1.clone();
+            if !self.builds_alike(&self.roots[base].1, &over) {
+                match self.loaded_again(at, env) {
+                    Ok((workspace, debug, config)) => {
+                        self.place(at, workspace, debug, &config);
+                        continue;
+                    }
+                    Err(error) => failed = Err(error),
+                }
+            }
+            let own = self.differing(base, &over);
+            self.loaded.replace(at, self.split(base, &over, &own));
+            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+            self.debug[at] = self.debug[base];
+        }
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        failed
+    }
+
+    /// The workspace of the checkout at `at` as cargo has it now for a process with the
+    /// variables `env`, whether its code says which lines it is of, and how it was loaded.
+    fn loaded_again(
+        &self,
+        at: usize,
+        env: &ide_db::base_db::Env,
+    ) -> anyhow::Result<(ProjectWorkspace, bool, CargoConfig)> {
+        let (project, root) = &self.roots[at];
+        let mut config = self.cargo_config.clone();
+        config.extra_env.extend(self.inputs.variables(root, env));
+        let (workspace, debug) =
+            workspace_at(project, &config, &self.load_config, &self.selection)?;
+        Ok((workspace, debug, config))
+    }
+
+    /// Has the checkout at `at` be `workspace`, loaded in full with `config`.
+    fn place(&mut self, at: usize, workspace: ProjectWorkspace, debug: bool, config: &CargoConfig) {
+        let root = PathBuf::from(workspace.workspace_root().to_string());
+        self.inputs.watch(&root, &workspace, config);
+        self.loaded.replace(at, workspace);
+        self.roots[at].1 = root;
+        self.splits[at] = None;
+        self.debug[at] = debug;
     }
 }
 
@@ -1248,6 +1363,8 @@ struct Parts {
     root: PathBuf,
     base: Option<PathBuf>,
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    /// Whether the code is to say which lines it is of.
+    debug: bool,
 }
 
 /// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
@@ -1367,15 +1484,26 @@ struct View {
     project: PathBuf,
 }
 
+/// Why the examples in documentation are not built.
+const DOCTESTS_ARE_NOT_BUILT: &str = "doctests are not built: rustdoc takes each example out of \
+    the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc \
+    tells nobody where that crate and its link line are (`--persist-doctests` and \
+    `--test-builder` are unstable). rustd lacks the two things that would stand in for it: \
+    taking the examples out itself (hidden `#` lines, the `main` put around an example, and \
+    the `should_panic`, `no_run`, `compile_fail`, `ignore` and edition marks of a block), \
+    and linking a program of its own for each, where it only replaces functions of a \
+    program cargo linked";
+
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
-) -> anyhow::Result<ProjectWorkspace> {
+) -> anyhow::Result<(ProjectWorkspace, bool)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut debug = false;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1389,7 +1517,9 @@ fn workspace_at(
             &cargo_config.extra_env,
         )?;
         let triple = triple.first().context("no target to build for")?;
-        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, triple)?;
+        let asked = plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
+        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
+        debug = plan.debug();
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
@@ -1402,7 +1532,7 @@ fn workspace_at(
         let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
         workspace.set_build_scripts(build_scripts);
     }
-    Ok(workspace)
+    Ok((workspace, debug))
 }
 
 /// What the checkouts loaded have in common, and what holding them costs.
@@ -2132,11 +2262,59 @@ fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&new, path)
 }
 
+/// What cargo said of every crate when the checkouts were last loaded.
+struct CratesAsLoaded(FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>);
+
+type CrateAsLoaded = (
+    ide_db::base_db::BuiltCrateData,
+    ide_db::base_db::ExtraCrateData,
+    cfg::CfgOptions,
+    ide_db::base_db::Env,
+);
+
+impl CratesAsLoaded {
+    fn of(db: &RootDatabase) -> CratesAsLoaded {
+        let crates = ide_db::base_db::all_crates(db);
+        CratesAsLoaded(crates.iter().map(|&it| (it, Self::said(db, it))).collect())
+    }
+
+    fn said(db: &RootDatabase, krate: ide_db::base_db::Crate) -> CrateAsLoaded {
+        (
+            krate.data(db).clone(),
+            krate.extra_data(db).clone(),
+            krate.cfg_options(db).clone(),
+            krate.env(db).clone(),
+        )
+    }
+
+    /// The crates of `db` that cargo says something else of now, or that were not there.
+    fn changed(&self, db: &RootDatabase) -> Vec<ide_db::base_db::Crate> {
+        let crates = ide_db::base_db::all_crates(db);
+        let same = |krate| self.0.get(&krate).is_some_and(|was| *was == Self::said(db, krate));
+        crates.iter().copied().filter(|&it| !same(it)).collect()
+    }
+}
+
 /// The source files the daemon watches.
 struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
-    /// The manifests that have changed since the daemon loaded them, as they were then.
-    manifests: FxHashMap<vfs::FileId, String>,
+}
+
+/// Why an edit is to a crate the daemon does not build, when one is.
+fn left_to_rustc(
+    db: &RootDatabase,
+    listed: &Listed,
+    edited: &[vfs::FileId],
+    watched: &Sources,
+) -> Option<String> {
+    let (file, krate) = edited.iter().find_map(|&it| Some((it, listed.left_to_rustc(db, it)?)))?;
+    let path = watched.paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
+    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
+    let name = name.unwrap_or_else(|| "a crate without a name".to_owned());
+    Some(format!(
+        "{path} is of `{name}`, which the program uses and the daemon was not asked to \
+         build: rustc's copy of it is from before the edit, name the crate with `--crate`"
+    ))
 }
 
 /// Why the source as it is can't be built by the daemon, when it can't.
@@ -2146,15 +2324,11 @@ fn refusal(
     watched: &Sources,
     out_of_date: Option<(FunctionId, String)>,
 ) -> Option<String> {
-    let Sources { paths, manifests } = watched;
+    let Sources { paths } = watched;
     for &file in sources {
         let path = paths.get(&file);
+        // A manifest is cargo's to read: the checkout is loaded again when one changes.
         if path.is_some_and(|it| it.file_name().is_some_and(|it| it == "Cargo.toml")) {
-            // FIXME: load the checkout again in place of turning it down.
-            if manifests.get(&file).is_some_and(|it| **it != **db.file_text(file).text(db)) {
-                let path = path.map(|it| it.display().to_string()).unwrap_or_default();
-                return Some(format!("{path} is not what the daemon loaded, start it again"));
-            }
             continue;
         }
         let edition = ide_db::base_db::relevant_crates(db, file)
@@ -2465,7 +2639,7 @@ impl Target {
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
         let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
-        let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
+        let Parts { root: checkout, base, members, debug } = checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = batch.unwrap_or_else(|| {
@@ -2477,6 +2651,7 @@ impl Target {
             checkout,
             base,
             members,
+            debug,
             krate,
             batch,
             out,
@@ -2815,6 +2990,9 @@ struct Unbuilt {
     /// Whether the last build was for a request that does not link, which leaves the
     /// executable to the next that does.
     unlinked: bool,
+    /// Whether a client has named what rustc built of the checkout since the edits, as one
+    /// does when the checkout is loaded again: the crates left to rustc are then as edited.
+    named_anew: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
@@ -2988,6 +3166,8 @@ fn main() -> anyhow::Result<()> {
         _ => RustLibSource::Discover,
     };
     let cargo_config = CargoConfig {
+        // The variables of whoever asks for a build: those of crates are read as rustc does.
+        extra_env_for_commands_only: true,
         sysroot: Some(sysroot),
         target: args.target.clone(),
         set_test: args.cfg_test,
@@ -3032,9 +3212,8 @@ fn main() -> anyhow::Result<()> {
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
-    let Parts { root, base, members } = checkouts.parts(&args.project)?;
-    (args.checkout, args.base, args.members) = (root, base, members);
-    args.debug = profile::debug(&args.checkout, &args.profile);
+    let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+    (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
 
@@ -3064,8 +3243,9 @@ fn main() -> anyhow::Result<()> {
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
-        let Parts { root: checkout, base, members } = checkouts.parts(also)?;
-        let resolved = resolve_crates(&db, &Args { checkout, base, members, ..args.clone() })?;
+        let Parts { root: checkout, base, members, debug } = checkouts.parts(also)?;
+        let of_it = Args { checkout, base, members, debug, ..args.clone() };
+        let resolved = resolve_crates(&db, &of_it)?;
         eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
     }
     if !args.also.is_empty() {
@@ -3201,8 +3381,6 @@ fn main() -> anyhow::Result<()> {
     let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
-    // The manifests that have changed since they were loaded, as they were then.
-    let mut manifests: FxHashMap<vfs::FileId, String> = FxHashMap::default();
     // The crates whose variables name another checkout than the one they were loaded in.
     let mut placed = Placed::default();
     loop {
@@ -3236,12 +3414,61 @@ fn main() -> anyhow::Result<()> {
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
-                    if let Some(why) = checkouts.inputs.changed(&stream.env) {
-                        let _ = writeln!(&stream, "error: {why}");
-                        continue;
-                    }
                     let asked = target.clone();
                     let mut target = target;
+                    // A checkout that is not what it was loaded from is loaded again before
+                    // anything is built of it. The builds under way and the ones already
+                    // taken for this turn are of the checkout as it was.
+                    let project = target.as_ref().and_then(|it| it.project.as_ref());
+                    let project = project.unwrap_or(&programs[0].args.project);
+                    match checkouts.stale(project, &stream.env) {
+                        Ok(stale) if stale.is_empty() => {}
+                        Ok(_) if !clients.is_empty() => {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        Ok(stale) => {
+                            builds.settle(&mut db, &mut programs)?;
+                            let start = Instant::now();
+                            let before = CratesAsLoaded::of(&db);
+                            let reloaded =
+                                checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
+                            watch_loaded(&mut db, &mut tree, &mut files);
+                            let new = before.changed(&db);
+                            eprintln!(
+                                "reload: {} crates are others in {:.1?}",
+                                new.len(),
+                                start.elapsed()
+                            );
+                            let mut started = Ok(());
+                            for program in &mut programs {
+                                let parts = checkouts.parts(&program.args.project)?;
+                                let linked = target
+                                    .as_ref()
+                                    .filter(|it| it.is(&program.args))
+                                    .filter(|it| !it.symbol_files.is_empty());
+                                let same = parts.members == program.args.members
+                                    && parts.debug == program.args.debug;
+                                if same && (linked.is_none() || new.is_empty()) {
+                                    program.known.touch(&db, Some(&new));
+                                    program.unbuilt.stale |= !new.is_empty();
+                                    continue;
+                                }
+                                let again = program.start_over(&db, parts, linked, &new, &files);
+                                started = started.and(again);
+                            }
+                            listed.touch(&db, Some(&new));
+                            as_built.lock().unwrap().clear();
+                            if let Err(error) = reloaded.and(started) {
+                                let _ = writeln!(&stream, "error: {error:#}");
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = writeln!(&stream, "error: {error:#}");
+                            continue;
+                        }
+                    }
                     // One build is for one process: its variables are what `env!` reads.
                     if process::differs(&db, &stream.env) {
                         if !clients.is_empty() {
@@ -3412,6 +3639,7 @@ fn main() -> anyhow::Result<()> {
                                 edited: programs[0].unbuilt.edited.clone(),
                                 stale: true,
                                 unlinked: false,
+                                named_anew: true,
                             };
                             let mut program = Program {
                                 tests: None,
@@ -3602,11 +3830,6 @@ fn main() -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
-                    if path.file_name().is_some_and(|it| it == "Cargo.toml") {
-                        manifests
-                            .entry(*id)
-                            .or_insert_with(|| db.file_text(*id).text(&db).to_string());
-                    }
                     change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
                     sources.push(*id);
                 }
@@ -3651,7 +3874,7 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
-        let paths = Arc::new(Sources { paths, manifests: manifests.clone() });
+        let paths = Arc::new(Sources { paths });
         let sources = outlines.after_edit(&db, &listed, sources);
         for (file, bodies_only) in sources {
             if bodies_only {
@@ -3991,6 +4214,42 @@ impl Program {
         self.known.distrust(db, &other);
     }
 
+    /// Has the program be one of its checkout as it was loaded again: of the crates and the
+    /// debug information of `parts`, and never built. It is linked as `linked` says, when
+    /// that names what rustc built of the checkout since, and else with what it was linked
+    /// with, where the crates in `new` are not the ones rustc compiled.
+    fn start_over(
+        &mut self,
+        db: &RootDatabase,
+        parts: Parts,
+        linked: Option<&Target>,
+        new: &[ide_db::base_db::Crate],
+        files: &[WatchedFile],
+    ) -> anyhow::Result<()> {
+        let Parts { root, base, members, debug } = parts;
+        (self.args.checkout, self.args.base) = (root, base);
+        (self.args.members, self.args.debug) = (members, debug);
+        let patching = self.known.patching;
+        self.known = Rejections::default();
+        self.known.patching = patching;
+        (self.whole, self.moved) = (None, true);
+        self.unbuilt.stale = true;
+        match linked {
+            Some(linked) => {
+                self.args.symbol_files = linked.symbol_files.clone();
+                if linked.link_cmd.is_some() {
+                    self.args.link_cmd = linked.link_cmd.clone();
+                }
+                self.table =
+                    Arc::new(SymbolTable::load(&self.args.symbol_files, &self.args.root()?)?);
+                self.distrust_rustc(db, files, None);
+                self.unbuilt.named_anew = true;
+            }
+            None => self.known.distrust(db, new),
+        }
+        Ok(())
+    }
+
     /// Whether the last build of this program is one of `other`, which has had none: the two
     /// are of the same crates, as checkouts that share them have it. What `other` is then
     /// asked for is a patch of that build.
@@ -4036,6 +4295,7 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
+        let named_anew = std::mem::take(&mut unbuilt.named_anew);
         let mut edited = unbuilt.edited.clone();
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // Neither is what no crate that is built reads: an example, or a test.
@@ -4060,7 +4320,8 @@ impl Program {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        let stale = if named_anew { None } else { left_to_rustc(db, listed, &edited, paths) };
+        let mut failed = stale.or_else(|| refusal(db, &edited, paths, out_of_date)).or(broken);
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         match tests {
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),

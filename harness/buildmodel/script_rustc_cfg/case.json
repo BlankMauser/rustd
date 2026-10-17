@@ -7,7 +7,6 @@
   "steps": [
     {
       "what": "the file the script reads turns the cfg off",
-      "expect": "refused",
       "write": {
         "flag": "off\n"
       }

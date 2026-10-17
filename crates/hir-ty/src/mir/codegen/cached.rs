@@ -310,22 +310,20 @@ impl Entry {
     ///
     /// An entry kept with what a debugger is told is not the one kept without.
     ///
-    /// `checks_overflow` is whether the crates cargo builds have `-C overflow-checks`, when
-    /// they agree: code of the standard library that takes the setting of its callers has the
-    /// same name in a build with the checks and in one without.
-    pub(super) fn key(name: &str, debug: bool, checks_overflow: Option<bool>) -> Option<[u8; KEY]> {
+    /// Whether the code checks arithmetic for overflow is in the name.
+    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
         // Each with its length, so that no two lists of them are the same bytes.
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd entry 6");
+        field(b"rustd entry 7");
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
         // Nor is code for one target what another runs.
         field(super::Target::selected().ok()?.triple().as_bytes());
-        field(&[debug as u8, checks_overflow.map_or(2, u8::from)]);
+        field(&[debug as u8]);
         field(name.as_bytes());
         Some(hasher.finalize().into())
     }
@@ -443,8 +441,6 @@ pub(super) struct Entries {
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
-    /// Whether the build checks arithmetic for overflow: see [`Entry::key`].
-    checks_overflow: Option<bool>,
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
     known: Mutex<Known>,
@@ -471,13 +467,8 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(
-        store: &'static Store,
-        debug: bool,
-        checks_overflow: Option<bool>,
-        cargo_home: Option<String>,
-    ) -> Entries {
-        Entries { store, debug, checks_overflow, cargo_home, known: Mutex::default() }
+    pub(super) fn new(store: &'static Store, debug: bool, cargo_home: Option<String>) -> Entries {
+        Entries { store, debug, cargo_home, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -501,7 +492,7 @@ impl Entries {
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
             .then(|| {
-                let key = Entry::key(name, self.debug, self.checks_overflow)?;
+                let key = Entry::key(name, self.debug)?;
                 Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
             })
             .flatten()
@@ -760,17 +751,11 @@ mod tests {
         let (one, other) = (super::super::ContentId(one), super::super::ContentId(other));
         assert_eq!(one.to_string().len(), 64);
         assert_ne!(one.to_string(), other.to_string());
-        let key = |name: &str, debug, checked| Entry::key(name, debug, checked).unwrap();
-        let named = |id: &super::super::ContentId| key(&format!("~{id}:run"), false, None);
+        let key = |name: &str, debug| Entry::key(name, debug).unwrap();
+        let named = |id: &super::super::ContentId| key(&format!("~{id}:run"), false);
         assert_ne!(named(&one), named(&other));
         let name = format!("~{one}:run");
-        let keys = [
-            key(&name, false, None),
-            key(&name, true, None),
-            key(&name, false, Some(false)),
-            key(&name, false, Some(true)),
-            key(&format!("{name}\0"), false, None),
-        ];
+        let keys = [key(&name, false), key(&name, true), key(&format!("{name}\0"), false)];
         let distinct: std::collections::HashSet<_> = keys.iter().collect();
         assert_eq!(distinct.len(), keys.len());
     }
