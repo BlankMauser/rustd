@@ -4956,8 +4956,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             held.locals.binary_search(&local).ok()
         };
         let forwarded = forwarded_temps(body);
+        let used = used_locals(body);
         for (local, data) in body.locals.iter() {
-            if self.locals.contains_idx(local) || forwarded.contains_key(&local) {
+            if self.locals.contains_idx(local)
+                || forwarded.contains_key(&local)
+                || !used.contains(&local)
+            {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
@@ -5000,6 +5004,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (local, data) in body.locals.iter() {
             let ty = data.ty.as_ref();
             if local == returned_local(body)
+                || !self.locals.contains_idx(local)
                 || has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
             {
                 continue;
@@ -10791,6 +10796,27 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The locals a body reads, writes or returns. A closure has a local for every binding of the
+/// function it is written in, and takes no room for the ones it leaves alone.
+fn used_locals(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let mut used: rustc_hash::FxHashSet<LocalId> = body
+        .param_locals
+        .iter()
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    body.clone().walk_places(|place| {
+        used.insert(place.local);
+        for elem in place.projection.as_slice() {
+            if let ProjectionElem::Index(index) = elem {
+                used.insert(*index);
+            }
+        }
+    });
+    used
 }
 
 /// The temporaries that are written once and read once, as a whole argument of the call their

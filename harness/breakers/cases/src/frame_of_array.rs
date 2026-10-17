@@ -13,7 +13,22 @@ fn recurse(depth: usize, above: usize) -> usize {
     frame
 }
 
-/// How many arrays of 50k fit in one frame of `recurse`.
-pub fn run() -> usize {
-    recurse(1, 0) / 50000
+#[inline(never)]
+fn through_closure(depth: usize, above: usize) -> usize {
+    let array = [42u8; 50000];
+    let here = black_box(array.as_ptr() as usize);
+    let frame = if depth == 0 {
+        above - here
+    } else {
+        let next = || through_closure(depth - 1, here);
+        next()
+    };
+    drop(array);
+    frame
+}
+
+/// How many arrays of 50k fit in one frame of `recurse`, and in one of `through_closure` with
+/// the frame of its closure.
+pub fn run() -> (usize, usize) {
+    (recurse(1, 0) / 50000, through_closure(1, 0) / 50000)
 }
