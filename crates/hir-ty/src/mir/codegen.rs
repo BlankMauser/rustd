@@ -1194,6 +1194,77 @@ impl VariadicRegisters {
     }
 }
 
+/// How many of the four argument slots of Windows x64 the named parameters of a variadic
+/// function take. An argument has the slot of its position whatever its type, the caller
+/// leaves room above the return address for the four that come in registers, and the ones
+/// after them follow that room on the stack: written there, the registers and the stack are
+/// the one run of 8-byte slots a `va_list` walks.
+#[derive(Clone, Copy)]
+struct HomedRegisters {
+    named: u32,
+}
+
+impl HomedRegisters {
+    const SLOTS: u32 = 4;
+
+    fn named(sig: &Signature) -> Result<Self> {
+        for param in &sig.params {
+            let plain =
+                matches!(param.purpose, ArgumentPurpose::Normal | ArgumentPurpose::StructReturn);
+            if !plain || param.value_type.bytes() > 8 {
+                unsupported!("a variadic function with a named {}", param.value_type);
+            }
+        }
+        match sig.params.len() as u32 {
+            // The first slot is where the exception of a guarded call arrives.
+            0 => unsupported!("a variadic function without a named parameter"),
+            named => Ok(HomedRegisters { named }),
+        }
+    }
+
+    /// The registers the named parameters left.
+    fn left(self) -> u32 {
+        Self::SLOTS.saturating_sub(self.named)
+    }
+
+    /// Adds the registers the named parameters left, as the integers a caller passes a
+    /// variable argument in, and the stack past the room for the four, to `sig`.
+    fn rest(self, sig: &mut Signature) {
+        sig.params.extend((0..self.left()).map(|_| AbiParam::new(types::I64)));
+        sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+    }
+}
+
+/// How the variable arguments of a function defined here reach it.
+#[derive(Clone, Copy)]
+enum Variadic {
+    SystemV(VariadicRegisters),
+    Windows(HomedRegisters),
+}
+
+impl Variadic {
+    /// For a function whose named parameters are `sig`. `None` on a target a function that
+    /// takes `...` is not compiled for.
+    fn of(target: &Target, sig: &Signature) -> Result<Option<Self>> {
+        Ok(match (target.call_conv, target.arch) {
+            (isa::CallConv::SystemV, Arch::X86_64) => {
+                Some(Variadic::SystemV(VariadicRegisters::named(sig)?))
+            }
+            (isa::CallConv::WindowsFastcall, Arch::X86_64) => {
+                Some(Variadic::Windows(HomedRegisters::named(sig)?))
+            }
+            _ => None,
+        })
+    }
+
+    fn rest(self, sig: &mut Signature) {
+        match self {
+            Variadic::SystemV(named) => named.rest(sig),
+            Variadic::Windows(named) => named.rest(sig),
+        }
+    }
+}
+
 /// The body of an instance that is not a shim, with the instance's types in place of the
 /// generic parameters. The database does not keep it unless `RUSTD_LEAN=0`: nothing but
 /// compiling the instance reads it, and what was compiled is kept.
@@ -4456,16 +4527,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if self.tracked {
             sig.params.push(AbiParam::new(ptr()));
         }
-        let named = self.variadic.then(|| VariadicRegisters::named(&sig)).transpose()?;
-        if let Some(named) = named {
-            if (self.cg.target.call_conv, self.cg.target.arch)
-                != (isa::CallConv::SystemV, Arch::X86_64)
-                || !matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. })
-            {
-                unsupported!("a function that takes `...` for this target");
+        let variadic = match self.variadic {
+            true => {
+                let native = match self.cg.target.call_conv {
+                    isa::CallConv::WindowsFastcall => {
+                        matches!(self.abi, ExternAbi::C { .. } | ExternAbi::Win64 { .. })
+                    }
+                    _ => matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. }),
+                };
+                let Some(variadic) = Variadic::of(self.cg.target, &sig)?.filter(|_| native) else {
+                    unsupported!("a function that takes `...` for this target");
+                };
+                variadic.rest(&mut sig);
+                Some(variadic)
             }
-            named.rest(&mut sig);
-        }
+            false => None,
+        };
         self.builder.func.signature = sig;
 
         let entry = self.builder.create_block();
@@ -4492,7 +4569,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if self.tracked {
             self.location = incoming.next();
         }
-        if let Some(named) = named {
+        if let Some(Variadic::Windows(named)) = variadic {
+            let list = *body.param_locals.last().expect("the list of a variadic function");
+            let layout = self.layout(body.locals[list].ty.as_ref())?;
+            if layout.size.bytes() != 8 {
+                unsupported!("a `VaList` that is not the one of this target");
+            }
+            let addr = self.stack_slot(&layout);
+            let homed: Vec<Value> = (0..named.left())
+                .map(|_| incoming.next().expect("a register of the variable arguments"))
+                .collect();
+            let stack = incoming.next().expect("the variable arguments on the stack");
+            let first = -i64::from(named.left() * 8);
+            let first = self.builder.ins().iadd_imm(stack, first);
+            for (at, value) in homed.into_iter().enumerate() {
+                self.builder.ins().store(MEM, value, first, at as i32 * 8);
+            }
+            self.builder.ins().store(MEM, first, addr, 0);
+            self.locals.insert(list, LocalSlot { addr, borrowed: false });
+        }
+        if let Some(Variadic::SystemV(named)) = variadic {
             let list = *body.param_locals.last().expect("the list of a variadic function");
             let layout = self.layout(body.locals[list].ty.as_ref())?;
             if layout.size.bytes() != 24 {
@@ -6317,10 +6413,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let signature = FunctionSignature::of(self.cg.db, func);
         if signature.is_varargs()
             && signature.has_body()
-            && (self.cg.target.call_conv, self.cg.target.arch)
-                == (isa::CallConv::SystemV, Arch::X86_64)
+            && let Some(variadic) = Variadic::of(self.cg.target, sig)?
         {
-            VariadicRegisters::named(sig)?.rest(sig);
+            variadic.rest(sig);
         }
         Ok(())
     }
@@ -8357,6 +8452,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("overflow_checks", []) => {
                 let value = self.builder.ins().iconst(types::I8, 1);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("va_arg", [list]) if self.cg.target.call_conv == isa::CallConv::WindowsFastcall => {
+                let scalar = self.scalar_of(dst_ty)?;
+                if scalar.ty.bytes() > 8 {
+                    unsupported!("`va_arg` of {dst_ty:?}");
+                }
+                // The list is where the next argument is, and each takes eight bytes.
+                let (list, _) = self.load_scalar(list)?;
+                let from = self.builder.ins().load(ptr(), MEM, list, 0);
+                let next = self.builder.ins().iadd_imm(from, 8);
+                self.builder.ins().store(MEM, next, list, 0);
+                let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list]) => {

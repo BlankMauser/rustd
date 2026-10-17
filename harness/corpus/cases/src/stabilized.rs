@@ -351,9 +351,11 @@ pub fn never_more() -> (Vec<&'static str>, usize, String, u8, u32, bool, String)
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn variadic_floats() -> Vec<String> {
     use std::ffi::{c_char, c_int, CStr};
+    // The C runtime of MSVC has `snprintf` in a header; this library has it as a function.
+    #[cfg_attr(windows, link(name = "legacy_stdio_definitions"))]
     unsafe extern "C" { fn snprintf(buf: *mut c_char, n: usize, fmt: *const c_char, ...) -> c_int; }
     let mut out = Vec::new();
     let mut buf = [0 as c_char; 128];
@@ -402,14 +404,65 @@ pub fn c_variadic_stack() -> (f64, f64, f64) {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+// Named parameters past the registers of Windows, a result in memory, and a panic that
+// crosses the function.
+#[cfg(not(target_family = "wasm"))]
+unsafe extern "C" fn tail(a: u8, b: f32, c: i64, d: u16, e: f64, f: i32, mut args: ...) -> f64 {
+    let named = a as f64 + b as f64 + c as f64 + d as f64 + e + f as f64;
+    named * 2.0 + unsafe { args.next_arg::<f64>() + args.next_arg::<i32>() as f64 }
+}
+#[cfg(not(target_family = "wasm"))]
+unsafe extern "C" fn wide(count: u32, mut args: ...) -> [u64; 3] {
+    let mut out = [0; 3];
+    for at in 0..count as usize {
+        out[at % 3] += unsafe { args.next_arg::<u64>() };
+    }
+    out
+}
+#[cfg(all(not(target_family = "wasm"), panic = "unwind"))]
+unsafe extern "C-unwind" fn checked(limit: i32, mut args: ...) -> String {
+    let mut seen = String::new();
+    loop {
+        let next = unsafe { args.next_arg::<i32>() };
+        seen.push_str(&next.to_string());
+        if next > limit {
+            panic!("{seen} past {limit}");
+        }
+    }
+}
+#[cfg(not(target_family = "wasm"))]
+pub fn c_variadic_named() -> (f64, [u64; 3], String) {
+    #[cfg(panic = "unwind")]
+    let caught = std::panic::catch_unwind(|| unsafe { checked(3, 1i32, 2i32, 3i32, 4i32, 5i32) })
+        .unwrap_err()
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    #[cfg(not(panic = "unwind"))]
+    let caught = String::new();
+    unsafe {
+        (
+            tail(1, 2.5, -3, 4, 5.25, 6, 0.125f64, 7i32),
+            wide(7, 1u64, 2u64, 3u64, 4u64, 5u64, 6u64, 7u64),
+            caught,
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod x86 {
     use std::arch::{asm, naked_asm};
 
     // naked_functions (1.88)
+    #[cfg(unix)]
     #[unsafe(naked)]
     pub extern "C" fn naked_add(a: u64, b: u64) -> u64 {
         naked_asm!("lea rax, [rdi + rsi]", "ret")
+    }
+    #[cfg(windows)]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_add(a: u64, b: u64) -> u64 {
+        naked_asm!("lea rax, [rcx + rdx]", "ret")
     }
     pub fn naked_functions() -> u64 {
         naked_add(40, 2)
@@ -459,19 +512,32 @@ pub mod x86 {
     }
 
     // calling variadics with other ABIs (extended_varargs_abi_support 1.91)
+    #[cfg(unix)]
     unsafe extern "sysv64" {
         #[link_name = "snprintf"]
-        fn snprintf_sysv(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
+        fn snprintf_named(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
+    }
+    #[cfg(windows)]
+    #[link(name = "legacy_stdio_definitions")]
+    unsafe extern "win64" {
+        #[link_name = "snprintf"]
+        fn snprintf_named(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
     }
     pub fn varargs_abi() -> String {
         let mut buf = [0u8; 32];
-        let n = unsafe { snprintf_sysv(buf.as_mut_ptr(), 32, c"%d-%s-%.1f".as_ptr().cast(), 7i32, c"x".as_ptr(), 1.5f64) };
+        let n = unsafe { snprintf_named(buf.as_mut_ptr(), 32, c"%d-%s-%.1f".as_ptr().cast(), 7i32, c"x".as_ptr(), 1.5f64) };
         String::from_utf8_lossy(&buf[..n as usize]).into_owned()
     }
 
+    #[cfg(unix)]
     #[unsafe(naked)]
     pub extern "C" fn naked_att(a: u64) -> u64 {
         naked_asm!("leaq {k}(%rdi), %rax", "ret", k = const NAKED_K, options(att_syntax))
+    }
+    #[cfg(windows)]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_att(a: u64) -> u64 {
+        naked_asm!("leaq {k}(%rcx), %rax", "ret", k = const NAKED_K, options(att_syntax))
     }
     #[unsafe(naked)]
     pub extern "C" fn naked_float(a: f64, b: f64) -> f64 {

@@ -434,21 +434,23 @@ fn main() {
     println!("stabilized c_variadic {:?}", cases::stabilized::c_variadic());
     #[cfg(not(target_family = "wasm"))]
     println!("stabilized c_variadic_stack {:?}", cases::stabilized::c_variadic_stack());
-    #[cfg(unix)]
+    #[cfg(not(target_family = "wasm"))]
+    println!("stabilized c_variadic_named {:?}", cases::stabilized::c_variadic_named());
+    #[cfg(any(unix, windows))]
     println!("stabilized variadic_floats {:?}", cases::stabilized::variadic_floats());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized naked_functions {:?}", cases::stabilized::x86::naked_functions());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_goto {:?}", cases::stabilized::x86::asm_goto());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_cfg {:?}", cases::stabilized::x86::asm_cfg());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized target_feature_11 {:?}", cases::stabilized::x86::target_feature_11());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized varargs_abi {:?}", cases::stabilized::x86::varargs_abi());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
     #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());

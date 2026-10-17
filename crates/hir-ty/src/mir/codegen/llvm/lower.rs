@@ -13,6 +13,7 @@ use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
     types,
 };
+use cranelift_codegen::isa::CallConv;
 use std::num::NonZeroU32;
 
 use inkwell::{
@@ -175,11 +176,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             self.phis.insert(block, phis);
         }
         self.builder.position_at_end(frame);
-        self.builder.build_unconditional_branch(self.blocks[&entry])?;
         for (at, &param) in self.func.dfg.block_params(entry).iter().enumerate() {
-            let value = self.function.get_nth_param(at as u32).expect("a parameter");
-            self.values.insert(param, value.into());
+            let value = match self.func.signature.params[at].purpose {
+                ArgumentPurpose::StructArgument(_)
+                    if self.func.signature.call_conv == CallConv::WindowsFastcall =>
+                {
+                    Operand::Pointer(self.stack_argument(at)?)
+                }
+                _ => self.function.get_nth_param(at as u32).expect("a parameter").into(),
+            };
+            self.values.insert(param, value);
         }
+        self.builder.build_unconditional_branch(self.blocks[&entry])?;
 
         for block in order {
             self.builder.position_at_end(self.blocks[&block]);
@@ -710,6 +718,29 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             _ => return Err(Unhandled::Opcode(opcode)),
         }
         Ok(())
+    }
+
+    /// Where the memory of parameter `at`, which the caller wrote on the stack, is.
+    ///
+    /// By the Windows convention LLVM takes a `byval` parameter to be a pointer to a copy,
+    /// where Cranelift takes it to be the bytes themselves among the arguments on the
+    /// stack. Those start past the return address and the room for the four that come in
+    /// registers, and this looks no further than the last parameter after ones that take a
+    /// slot each.
+    fn stack_argument(&self, at: usize) -> Lowered<PointerValue<'ctx>> {
+        const REGISTERS: usize = 4;
+        let params = &self.func.signature.params;
+        let slots = params[..at].iter().all(|it| {
+            matches!(it.purpose, ArgumentPurpose::Normal | ArgumentPurpose::StructReturn)
+                && it.value_type.bytes() <= 8
+        });
+        if at < REGISTERS || at + 1 != params.len() || !slots {
+            return Err(Unhandled::Shape("memory among the arguments on the stack"));
+        }
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let returns = self.intrinsic("llvm.addressofreturnaddress", &[pointer.into()], &[])?;
+        let past = self.immediate(self.context.i64_type(), 8 * (1 + at as i64), true);
+        self.offset(returns.into_pointer_value(), past)
     }
 
     fn make_atomic(access: InstructionValue<'ctx>) -> Lowered<()> {
