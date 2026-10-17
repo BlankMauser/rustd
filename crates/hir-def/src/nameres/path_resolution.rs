@@ -445,8 +445,8 @@ impl DefMap {
         }
     }
 
-    /// The visibility an enum is declared with, which is its variants' whatever the
-    /// visibility of the name the enum was reached through.
+    /// The visibility `e` is declared with. Its variants are that visible, even when the
+    /// path reached the enum through a more private import.
     fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
         let module = e.lookup(db).container;
         let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
