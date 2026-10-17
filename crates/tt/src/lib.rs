@@ -805,6 +805,10 @@ pub fn stringify(
         operator: &str,
         source_joined: &dyn Fn(Span, &str) -> Option<bool>,
     ) -> bool {
+        // A lifetime is one token to rustc.
+        if punct(prev) == Some('\'') && matches!(next, TtElement::Leaf(Leaf::Ident(_))) {
+            return true;
+        }
         let in_source = match prev {
             TtElement::Leaf(Leaf::Punct(it)) if !it.span.ctx.is_root() => {
                 // A token of a macro's body is `Alone` to rustc.

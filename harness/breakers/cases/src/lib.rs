@@ -53,6 +53,7 @@ cases![
     format_of_macro,
     static_fn_table,
     panic_with_string,
+    stringify_lifetime,
     static_enum_slice,
     const_none_niche,
     late_import_macro,
