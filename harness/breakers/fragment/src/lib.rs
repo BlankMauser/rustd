@@ -1,4 +1,8 @@
-//! An `$e:expr` that a `macro_rules! hand_on {
+//! An `$e:expr` that a `macro_rules!` macro hands to a procedural macro is a group without
+//! delimiters to rustc, also when the expression is one token. The procedural macro sees that
+//! group (const_format's `formatcp!("{}", NAME)` relies on it).
+
+macro_rules! hand_on {
     ($e:expr) => {
         passes::fragment!($e)
     };
