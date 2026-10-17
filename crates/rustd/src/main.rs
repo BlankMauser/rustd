@@ -1388,15 +1388,18 @@ impl Listed {
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     fn touch(&self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
-        let mut functions = self.functions.lock().unwrap();
         let Some(crates) = crates else {
-            functions.clear();
+            self.functions.lock().unwrap().clear();
             return;
         };
-        for &krate in crates {
-            for seeing in krate.transitive_rev_deps(db) {
-                functions.remove(&Crate::from(seeing));
-            }
+        // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
+        let seeing: Vec<Crate> = crates
+            .iter()
+            .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
+            .collect();
+        let mut functions = self.functions.lock().unwrap();
+        for krate in seeing {
+            functions.remove(&krate);
         }
     }
 }
@@ -2076,12 +2079,15 @@ struct WatchedFile {
 
 impl WatchedFile {
     /// `path` is what the file is known as, `on_disk` where it is read from.
+    /// Whether the file is never written again: everything is watched but the sysroot, the
+    /// registry and what a build made, as path dependencies live outside the project.
+    fn immutable(path: &Path) -> bool {
+        path.components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")))
+    }
+
     fn new(file: Watched, path: &Path, on_disk: &Path) -> Option<WatchedFile> {
-        // Everything but the sysroot and the registry: path dependencies live outside the project.
-        let immutable = path
-            .components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")));
-        if immutable {
+        if WatchedFile::immutable(path) {
             return None;
         }
         let mtime = std::fs::metadata(on_disk).ok()?.modified().ok()?;
@@ -2116,7 +2122,10 @@ impl WatchedFile {
     /// result is whether there was one.
     fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
-        db.included_files().iter().any(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
+        db.included_files()
+            .iter()
+            .map(AsRef::<Path>::as_ref)
+            .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
     }
 
     fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {

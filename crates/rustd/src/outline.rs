@@ -249,7 +249,8 @@ impl Listed {
     /// Whether the file is a module of a crate that is built, or of one that such a crate uses.
     /// Any file may be one before a crate is listed.
     pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
-        let built = self.built.lock().unwrap();
+        // Copied out: a query that is cancelled unwinds, and would poison the lock.
+        let built = self.built.lock().unwrap().clone();
         // Before the first build there is no telling.
         built.is_empty()
             || relevant_crates(db, file).iter().any(|&krate| {
@@ -268,7 +269,7 @@ impl Listed {
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
-        let listed = self.functions.lock().unwrap();
+        let listed = self.functions.lock().unwrap().clone();
         for &krate in relevant_crates(db, file).iter() {
             match listed.get(&krate.into()) {
                 Some(listed) => functions.extend(
