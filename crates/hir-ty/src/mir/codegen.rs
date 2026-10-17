@@ -80,6 +80,7 @@ mod asm;
 mod backend;
 pub use backend::Backend;
 mod cached;
+mod float_pair;
 mod fragment;
 mod home;
 pub use home::body_file;

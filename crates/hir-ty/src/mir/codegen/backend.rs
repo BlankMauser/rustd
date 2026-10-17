@@ -134,9 +134,12 @@ impl Backend {
             #[cfg(not(feature = "llvm"))]
             Backend::Llvm(_) => {}
         }
-        _ = recorder;
         let start = Instant::now();
-        let code = super::emit(context)?;
+        let pairs = super::float_pair::lower(recorder, &mut context.func);
+        let mut code = super::emit(context)?;
+        if let Some(pairs) = pairs {
+            pairs.hold(context, &mut code)?;
+        }
         tally.cranelift.add(start.elapsed(), code.bytes.len());
         Ok(code)
     }
