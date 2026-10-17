@@ -446,7 +446,12 @@ was no debuginfod prompt in batch mode; the breakpoint was not pending; ptrace w
 also warns that the `gdb_load_rust_pretty_printers.py` script named by `.debug_gdb_scripts`
 is not on its path, as it does for any Rust binary run under plain `gdb`.
 
-CIRESULT
+With that change pushed (commit 22e1ec56d6, run 39044537945) both harness jobs pass on the
+runner and every gdb row is `stopped`: corpus `lib.rs:1962`, stress, rung2 `main.rs:134` and
+the binary after the last splice, with locals 9 of 9 and types 21 of 21 under Cranelift and
+6 of 9 with 3 optimized out and 20 of 21 with 1 optimized out under LLVM, the same as here.
+No row is skipped on CI. The `Coverage` workflow fails on this branch as it does on
+`rustd-collate`; I did not look into it.
 
 ## What is open
 
