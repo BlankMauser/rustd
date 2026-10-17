@@ -83,7 +83,7 @@ def build(ws, env, args):
         fx.rustd_args = list(args)
         fx.rustc_build()
         fx.rustd_build()
-        left = sum(row[0] == "skipped" and "no rustc symbol" not in row[2] for rows in fx.reports.values() for row in rows)
+        left = sum(row[0] == "skipped" and "no rustc symbol for function" not in row[2] for rows in fx.reports.values() for row in rows)
         return fx.behaviour(fx.reference), fx.behaviour(fx.binary), left
     finally:
         os.environ.clear()

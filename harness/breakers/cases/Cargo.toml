@@ -6,5 +6,6 @@ edition = "2024"
 
 [dependencies]
 foreign = { path = "../foreign" }
+breakers2015 = { path = "../edition2015" }
 breakers2021 = { path = "../edition2021" }
 literals = { path = "../literals" }

@@ -1736,7 +1736,11 @@ fn build(
     }
     let build = Build {
         compiled: unit.compiled.len(),
-        skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
+        skipped: unit
+            .skipped
+            .into_iter()
+            .map(|(func, e)| (name(func), with_failed_macro(db, func, e)))
+            .collect(),
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
@@ -1783,6 +1787,36 @@ impl Build {
         }
         Ok(std::fs::write(path, out)?)
     }
+}
+
+/// `error` with the macro of the function's crate that did not expand, when the frontend is
+/// what turned the function down: what such a macro would have written is what is then
+/// missing, and the name or method that does not resolve says nothing of it.
+fn with_failed_macro(db: &RootDatabase, func: FunctionId, error: CodegenError) -> CodegenError {
+    let frontend = match &error {
+        CodegenError::Frontend(_) => true,
+        CodegenError::Unsupported(why) => why.contains("frontend:"),
+        CodegenError::Backend(_) | CodegenError::NoSymbol => false,
+    };
+    if !frontend {
+        return error;
+    }
+    let krate = hir::Function::from(func).module(db).krate(db);
+    let Some(failed) = failed_macro(db, krate) else { return error };
+    match error {
+        CodegenError::Frontend(why) => CodegenError::Frontend(format!("{why} ({failed})")),
+        CodegenError::Unsupported(why) => CodegenError::Unsupported(format!("{why} ({failed})")),
+        error => error,
+    }
+}
+
+/// What the first macro written among the items of `krate` that did not expand said.
+fn failed_macro(db: &RootDatabase, krate: Crate) -> Option<String> {
+    let modules = hir_def::nameres::crate_def_map(db, krate.into()).modules(db);
+    let said = modules
+        .flat_map(|(_, module)| module.scope(db).all_macro_calls())
+        .find_map(|call| call.parse_macro_expansion_error(db)?.err)?;
+    Some(format!("a macro of the crate did not expand: {}", said.render_to_string(db).message))
 }
 
 fn report(build: &Build) {

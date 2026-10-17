@@ -430,16 +430,23 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         owner: self.owner.expression_store_owner(self.db),
                         path: p.clone(),
                     };
+                    // A path that starts at a type, `<T>::C`, is one only inference resolves.
+                    let associated = match self.infer.assoc_resolutions_for_pat(pattern) {
+                        Some((CandidateId::ConstId(c), subst)) => Some((c, subst)),
+                        _ => None,
+                    };
                     let hygiene = self.store.pat_path_hygiene(pattern);
-                    let pr = self
-                        .resolver
-                        .resolve_path_in_value_ns(self.db, p, hygiene)
-                        .ok_or_else(unresolved_name)?;
+                    let pr = self.resolver.resolve_path_in_value_ns(self.db, p, hygiene);
+                    let pr = match (pr, associated) {
+                        (Some(pr), _) => Some(pr),
+                        (None, Some(_)) => None,
+                        (None, None) => return Err(unresolved_name()),
+                    };
 
                     if let (
                         MatchingMode::Assign,
-                        ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding)),
-                    ) = (mode, &pr)
+                        Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding))),
+                    ) = (mode, pr.as_ref())
                     {
                         let local = self.binding_local(*binding)?;
                         let ty = self.result.locals[local].ty.as_ref();
@@ -454,18 +461,24 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         return Ok((current, current_else));
                     }
 
+                    // A unit struct, by its name or as `Self`, is all there is of its type.
+                    if let Some(ResolveValueResult::ValueNs(
+                        ValueNs::StructId(_) | ValueNs::ImplSelf(_),
+                    )) = pr
+                    {
+                        return Ok((current, current_else));
+                    }
+
                     // The path is not a variant or a local, so it is a const
                     if mode != MatchingMode::Check {
                         // A const don't bind anything. Only needs check.
                         return Ok((current, current_else));
                     }
                     let (c, subst) = 'b: {
-                        if let Some(x) = self.infer.assoc_resolutions_for_pat(pattern)
-                            && let CandidateId::ConstId(c) = x.0
-                        {
-                            break 'b (c, x.1);
+                        if let Some(found) = associated {
+                            break 'b found;
                         }
-                        if let ResolveValueResult::ValueNs(ValueNs::ConstId(c)) = pr {
+                        if let Some(ResolveValueResult::ValueNs(ValueNs::ConstId(c))) = pr {
                             break 'b (c, GenericArgs::empty());
                         }
                         not_supported!("path in pattern position that is not const or variant")

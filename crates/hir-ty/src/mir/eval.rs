@@ -849,7 +849,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     /// Whether arithmetic of the body being evaluated panics when it overflows, which is
     /// what the code compiled from the body does: a constant is what running it would give.
     fn checks_overflow(&self, locals: &Locals<'_, 'db>) -> bool {
-        crate::mir::codegen::body_checks_overflow(self.db, &locals.body).unwrap_or(true)
+        crate::mir::codegen::body_checks_overflow(self.db, locals.body).unwrap_or(true)
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'a, 'db>) -> Result<'db, Ty<'db>> {
@@ -1411,14 +1411,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         BinOp::Shl | BinOp::Shr => {
                             let r = 'b: {
                                 let bits = lc.len() as u32 * 8;
-                                let amount = match r128.as_u32() {
-                                    Some(it) => Some(it),
-                                    None if self.checks_overflow(locals) => None,
-                                    // The amount an unchecked shift takes is its low bits.
-                                    None => Some(u32::from(r128.to_bytes()[0])),
+                                let amount = if self.checks_overflow(locals) {
+                                    r128.as_u32()
+                                } else {
+                                    // An unchecked shift takes the low bits of its amount.
+                                    Some(u32::from(r128.to_bytes()[0]) % bits)
                                 };
-                                let amount = amount
-                                    .map(|it| if self.checks_overflow(locals) { it } else { it % bits });
                                 if let Some(shift_amount) = amount {
                                     let r = match op {
                                         BinOp::Shl => l128.checked_shl(shift_amount),

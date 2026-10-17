@@ -1847,6 +1847,17 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The symbol a static of an `extern` block links to.
+fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+    let signature = StaticSignature::of(db, id);
+    if !signature.flags.contains(StaticFlags::EXTERN) {
+        return None;
+    }
+    let name =
+        AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone());
+    Some(name.as_str().to_owned())
+}
+
 /// Builds the IR of one function and runs Cranelift on it.
 fn compile<'db>(
     db: &'db dyn HirDatabase,
@@ -2599,7 +2610,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let krate = of.krate(self.db);
                     let of_checkout = self.own_statics.crates.contains(&krate)
                         || krate.data(self.db).origin.is_local();
-                    if decl.linkage != Linkage::Import || of_checkout {
+                    let foreign = static_link_name(self.db, *of).is_some();
+                    if !foreign && (decl.linkage != Linkage::Import || of_checkout) {
                         let Some(name) = self.names.static_(*of) else {
                             return self.kept.unkept("unnamed static");
                         };
@@ -2974,7 +2986,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         // rustc's copy when ours has no value to give.
         let ours = self.own_statics.replaces(db, id) && compiled_static(db, id).is_ok();
-        if !ours && let Some(symbol) = self.symbols.static_(id) {
+        let theirs = || (!ours).then(|| self.symbols.static_(id)).flatten();
+        if let Some(symbol) = static_link_name(db, id).or_else(theirs) {
             let data = self.module.declare_data(
                 &symbol,
                 Linkage::Import,
@@ -7298,10 +7311,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
-    /// Whether arithmetic of the body being compiled panics when it overflows. rustc decides
-    /// it twice: the crate the body is written in leaves the check out of what it keeps of the
-    /// body unless it has `-C overflow-checks` or the function takes the setting of its
-    /// callers, and the crate that compiles the body drops the check unless it has the flag.
+    /// Whether arithmetic of the body being compiled panics when it overflows.
     fn checks_overflow(&self) -> Result<bool> {
         let Some(body) = self.body else { return Ok(false) };
         match body_checks_overflow(self.cg.db, body) {
@@ -7957,6 +7967,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             .unwrap_or(erased)
     }
 
+    /// The vtable of `trait_ref`, with each supertrait in the one form `plain_trait` gives it.
     fn vtable_layout(&self, trait_ref: TraitRef<'db>) -> VtableLayout<'db> {
         VtableLayout::of(self.interner, trait_ref, &|it| self.plain_trait(it))
     }
@@ -8101,10 +8112,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (index, slot) in slots.into_iter().enumerate() {
             let offset = ((vtable::HEADER + index) * word()) as u32;
             match slot {
-                Slot::Method(func, trait_ref) => {
+                // A slot nothing can call through is left empty, as rustc leaves it.
+                Slot::Method(func, trait_ref) if self.method_bounds_hold(func, trait_ref) => {
                     let method = self.vtable_method(func, trait_ref)?;
                     blob.fn_relocs.push((offset, method));
                 }
+                Slot::Method(..) => {}
                 Slot::Vptr(trait_ref) => {
                     let vptr = self.vtable(ty, Some(trait_ref))?;
                     blob.relocs.push((offset, vptr, 0));
@@ -8112,6 +8125,42 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         Ok(self.cg.define_vtable(key, blob))
+    }
+
+    /// What trait method `func` is called with through the vtable of `trait_ref`: only
+    /// lifetimes can be generic in a method that is in a vtable.
+    fn vtable_method_args(
+        &self,
+        func: FunctionId,
+        trait_ref: TraitRef<'db>,
+    ) -> Option<GenericArgs<'db>> {
+        let interner = self.interner;
+        let mut generic = false;
+        let args =
+            GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
+                generic |= !matches!(id, hir_def::GenericParamId::LifetimeParamId(_));
+                Region::new_erased(interner).into()
+            });
+        (!generic).then_some(args)
+    }
+
+    /// Whether the `where` clauses trait method `func` has of its own hold for `trait_ref`.
+    /// A method they do not hold for can never be called.
+    fn method_bounds_hold(&self, func: FunctionId, trait_ref: TraitRef<'db>) -> bool {
+        let Some(args) = self.vtable_method_args(func, trait_ref) else { return true };
+        let interner = self.interner;
+        let cause = crate::next_solver::infer::traits::ObligationCause::dummy();
+        let mut ocx = crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx);
+        let bounds = crate::GenericPredicates::query_own_explicit(self.cg.db, func.into());
+        for bound in bounds.iter_instantiated(interner, args.as_slice()) {
+            ocx.register_obligation(crate::next_solver::infer::traits::Obligation::new(
+                interner,
+                cause,
+                self.env.param_env,
+                bound.skip_norm_wip(),
+            ));
+        }
+        ocx.try_evaluate_obligations().is_empty()
     }
 
     /// The function a vtable slot for trait method `func` points to.
@@ -8143,16 +8192,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let sig = self.body_signature(self.body_types(def, parent_args)?)?;
             return self.cg.callee(def, parent_args, self.env, &sig);
         }
-        // Only lifetimes can be generic in a method that is in a vtable.
-        let mut generic = false;
-        let args =
-            GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
-                generic |= !matches!(id, hir_def::GenericParamId::LifetimeParamId(_));
-                Region::new_erased(interner).into()
-            });
-        if generic {
+        let Some(args) = self.vtable_method_args(func, trait_ref) else {
             unsupported!("generic method in a vtable");
-        }
+        };
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
         let either::Either::Left(callee) = callee else {
             unsupported!("builtin derive method in a vtable");

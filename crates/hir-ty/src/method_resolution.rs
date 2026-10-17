@@ -16,7 +16,7 @@ use salsa::SalsaValue;
 use span::Edition;
 use tracing::{debug, instrument};
 
-use base_db::Crate;
+use base_db::{Crate, CrateOrigin, LangCrateOrigin};
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
@@ -569,10 +569,16 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
     loaded.insert(krate);
     for dep in &krate.data(db).dependencies {
         let data = dep.crate_id.data(db);
-        let is_loaded = dep.is_sysroot()
-            || data.origin.is_lang()
-            || data.is_proc_macro
-            || named(dep.name.symbol());
+        // A proc-macro crate gives its macros and nothing else: neither its impls nor the
+        // crates it uses are loaded. `proc_macro` is a dependency of every crate, loaded for
+        // those that name it: its `impl PartialEq<Punct> for char` leaves `'a' == x` open.
+        let is_loaded = match data.origin {
+            _ if data.is_proc_macro => false,
+            CrateOrigin::Lang(LangCrateOrigin::ProcMacro) => {
+                krate.data(db).is_proc_macro || named(dep.name.symbol())
+            }
+            _ => dep.is_sysroot() || data.origin.is_lang() || named(dep.name.symbol()),
+        };
         if !is_loaded {
             continue;
         }

@@ -444,6 +444,10 @@ mod ok {
     #[test]
     fn match_arm() { run_and_expect_no_errors("test_data/parser/inline/ok/match_arm.rs"); }
     #[test]
+    fn match_arm_braced_macro_operand() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/match_arm_braced_macro_operand.rs");
+    }
+    #[test]
     fn match_arms_commas() {
         run_and_expect_no_errors("test_data/parser/inline/ok/match_arms_commas.rs");
     }
@@ -567,6 +571,10 @@ mod ok {
     }
     #[test]
     fn range_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/range_pat.rs"); }
+    #[test]
+    fn range_pat_to_global_path() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/range_pat_to_global_path.rs");
+    }
     #[test]
     fn record_field_attrs() {
         run_and_expect_no_errors("test_data/parser/inline/ok/record_field_attrs.rs");

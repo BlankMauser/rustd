@@ -477,7 +477,7 @@ fn panic_expand(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
-    let mac = if use_panic_2021(db, call_site_span) { sym::panic_2021 } else { sym::panic_2015 };
+    let mac = if use_panic_2021(db, span) { sym::panic_2021 } else { sym::panic_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -504,11 +504,7 @@ fn unreachable_expand(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
-    let mac = if use_panic_2021(db, call_site_span) {
-        sym::unreachable_2021
-    } else {
-        sym::unreachable_2015
-    };
+    let mac = if use_panic_2021(db, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
 
     // Pass the original arguments
     let mut subtree = tt.clone();
@@ -524,24 +520,21 @@ fn unreachable_expand(
     ExpandResult::ok(call)
 }
 
-#[allow(clippy::never_loop)]
+/// Whether `panic!` written at `span` is the one of edition 2021: the edition of where it is
+/// written, or of the macro that wrote it. A macro of the standard library that writes one
+/// (`assert!`, `debug_assert!`) has `#[allow_internal_unstable(edition_panic)]`, which only
+/// such a macro can have, and stands for where it is called itself.
 fn use_panic_2021(db: &dyn SourceDatabase, span: Span) -> bool {
-    // To determine the edition, we check the first span up the expansion
-    // stack that does not have #[allow_internal_unstable(edition_panic)].
-    // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
+    let mut ctx = span.ctx;
     loop {
-        let Some(expn) = span.ctx.outer_expn(db) else {
-            break false;
+        let Some(expn) = ctx.outer_expn(db) else {
+            break ctx.edition(db) >= Edition::Edition2021;
         };
         let expn = crate::MacroCallId::from(expn).loc(db);
-        // FIXME: Record allow_internal_unstable in the macro def (not been done yet because it
-        // would consume quite a bit extra memory for all call locs...)
-        // if let Some(features) = expn.def.allow_internal_unstable {
-        //     if features.iter().any(|&f| f == sym::edition_panic) {
-        //         span = expn.call_site;
-        //         continue;
-        //     }
-        // }
+        if expn.def.krate.data(db).origin.is_lang() {
+            ctx = expn.ctxt;
+            continue;
+        }
         break expn.def.edition >= Edition::Edition2021;
     }
 }

@@ -72,6 +72,10 @@ CHUNK = 150
 STALL = 20
 
 
+# What the program calls in a test whose `main` is not written where the harness can make it public.
+ENTRY = "rustd_harness_entry"
+
+
 class Unit:
     """One test in one revision, and what building and running it takes."""
 
@@ -81,6 +85,9 @@ class Unit:
         self.aux = []
         # Code generation flags, and the environment of the compiler: set, or None for unset.
         self.flags, self.rustc_env = [], {}
+        # The rustc issue the test is there to show (`known-bug`), and whether its output is
+        # also held against a file (`check-run-results`).
+        self.known_bug, self.checked_output = None, False
 
     @property
     def build(self):
@@ -171,8 +178,6 @@ def classify(test, path):
                        (r"#!\[crate_type", "`#![crate_type]`"), (r"#!\[no_core\]", "`#![no_core]`")):
         if re.search(shape, text):
             return f"{why}: not a program with a `main` of its own"
-    if not MAIN.search(text):
-        return "no `fn main()` written at the top level"
     revisions = [r for d in directives if d["name"] == "revisions" for r in d["value"].split()] or [None]
     units = []
     for revision in revisions:
@@ -190,9 +195,15 @@ def classify(test, path):
                 return f"not for stable x86_64-unknown-linux-gnu (`{re.sub(r'-(kcfi|cfi|support|address|leak|memory|thread|hwaddress|shadow-call-stack|dataflow|memtag|safestack)$', '', name)}`)"
             if name == "edition":
                 unit.edition = re.match(r"\d+", value).group(0) if re.match(r"\d+", value) else "2015"
+            elif name == "known-bug":
+                unit.known_bug = value
+            elif name == "check-run-results":
+                unit.checked_output = True
             elif name == "exec-env":
                 key, _, val = value.partition("=")
                 unit.env[key] = val
+            elif name == "unset-exec-env":
+                unit.env[value] = None
             elif name == "rustc-env":
                 key, _, val = value.partition("=")
                 unit.rustc_env[key.strip()] = val.strip()
@@ -226,12 +237,27 @@ def classify(test, path):
     return units
 
 
+def environment(changes):
+    """The environment a test's program runs in: this one with what the test sets and unsets."""
+    env = {**os.environ, **{key: value for key, value in changes.items() if value is not None}}
+    for key, value in changes.items():
+        if value is None:
+            env.pop(key, None)
+    return env
+
+
+def ignored_directories(root):
+    """The directories compiletest is told to skip: their files are parts of other tests."""
+    return [os.path.dirname(p) + "/" for p in glob.glob(f"{root}/**/compiletest-ignore-dir", recursive=True)]
+
+
 def select(checkout, needle):
     """Every run-pass test under the checkout: the units to run, and the tests left out by reason."""
     root = f"{checkout}/tests/ui"
     units, excluded = [], []
+    ignored = ignored_directories(root)
     for path in sorted(glob.glob(f"{root}/**/*.rs", recursive=True)):
-        if needle not in path or "/auxiliary/" in path:
+        if needle not in path or "/auxiliary/" in path or any(path.startswith(d) for d in ignored):
             continue
         test = os.path.relpath(path, root)
         found = classify(test, path)
@@ -302,12 +328,18 @@ def write_package(ws, name, unit):
     os.makedirs(f"{directory}/src")
     text = open(unit.path, errors="replace").read()
     main = MAIN.search(text)
-    wrapper = f"fn main() -> impl std::process::Termination {{\n    {name}::main()\n}}\n" if main["returns"] \
-        else f"fn main() {{\n    {name}::main()\n}}\n"
+    if main:
+        entry, library = "main", MAIN.sub(lambda m: "pub fn main()" + (m["returns"] or ""), text, count=1)
+    else:
+        # A `main` a macro writes, or one written in a way the pattern does not know: the
+        # library calls it, whatever it returns.
+        entry, library = ENTRY, f"{text}\npub fn {ENTRY}() -> impl std::process::Termination {{\n    main()\n}}\n"
+    wrapper = f"fn main() {{\n    {name}::{entry}()\n}}\n" if main and not main["returns"] \
+        else f"fn main() -> impl std::process::Termination {{\n    {name}::{entry}()\n}}\n"
     deps = "".join(write_aux(ws, name, aux) for aux in unit.aux)
     open(f"{directory}/Cargo.toml", "w").write(
         f'[package]\nname = "{name}"\nversion = "0.0.0"\nedition = "{unit.edition}"\n[dependencies]\n{deps}')
-    open(f"{directory}/src/lib.rs", "w").write(MAIN.sub(lambda m: "pub fn main()" + (m["returns"] or ""), text, count=1))
+    open(f"{directory}/src/lib.rs", "w").write(library)
     open(f"{directory}/src/main.rs", "w").write(wrapper)
     if copy_named(unit.path, f"{directory}/src/lib.rs", unit.path):
         return beside(unit.path, f"{directory}/src")
@@ -386,7 +418,7 @@ def behaviour(binary, unit):
     cwd = tempfile.mkdtemp(prefix="rustd-ui-run-")
     try:
         run = subprocess.run([binary, *unit.args], capture_output=True, timeout=60, cwd=cwd,
-                             env={**os.environ, **unit.env})
+                             env=environment(unit.env))
         # The thread id in a panic message differs from run to run, and the program names itself.
         clean = lambda out: re.sub(rb"' \(\d+\) panicked", b"' panicked", out).replace(
             binary.encode(), b"<program>").replace(os.path.dirname(binary).encode(), b"<directory>")
@@ -395,6 +427,26 @@ def behaviour(binary, unit):
         return "timeout", b"", b""
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
+
+
+def plain(out):
+    """Program output with what a build puts into it taken out: where a source file is, the
+    place in it, and the id of a thread."""
+    out = re.sub(r"[^\s'\"]*\.rs(:\d+:\d+|:LL:CC)", "<source>", out.replace("\r\n", "\n"))
+    return out.replace(" ($TID)", "")
+
+
+def held(unit, got):
+    """Whether what the program printed is what the files beside a `check-run-results` test
+    say, a missing file saying nothing is printed. The test's own `normalize-` rules are not
+    applied, so a test that needs them is seen to differ."""
+    stem = unit.path[:-3] + (f".{unit.revision}" if unit.revision else "")
+    for kind, text in (("stdout", got[1]), ("stderr", got[2])):
+        file = f"{stem}.run.{kind}"
+        want = open(file).read() if os.path.exists(file) else ""
+        if plain(want) != plain(text.decode(errors="replace")):
+            return False
+    return True
 
 
 def relinked(link, binary, unit):
@@ -452,6 +504,7 @@ def run_chunk(key, units, base):
     shutil.rmtree(ws, ignore_errors=True)
     names = {f"t{key}_{i}": unit for i, unit in enumerate(units)}
     results = {name: {"test": unit.test, "revision": unit.revision, "outcome": "excluded", "skipped": {},
+                      "known_bug": unit.known_bug, "checked_output": unit.checked_output,
                       "reasons": {}, "compiled": 0, "roots": 0} for name, unit in names.items()}
     for name, unit in names.items():
         why = write_package(ws, name, unit)
@@ -521,6 +574,8 @@ def run_chunk(key, units, base):
             return
         expected = behaviour(reference, unit)
         got = behaviour(binary, unit)
+        if unit.checked_output:
+            result["held"] = held(unit, got)
         # A test that fails as rustc built it does not survive being wrapped in a package, and one
         # that prints something else each time (an address, say) has no behaviour to compare.
         if expected[0] != 0:
@@ -598,13 +653,20 @@ def summarize(results):
           f"{outcomes['mismatch']} mismatch, {outcomes['unsteady']} differing in one run only, "
           f"{outcomes['crash']} rustd crashes, {outcomes['hang']} rustd hangs, "
           f"{outcomes['link']} link errors; {outcomes['excluded']} left out")
+    pinned = sum(r["outcome"] == "mismatch" and bool(r.get("known_bug")) for r in ran)
+    print(f"of the mismatches, {pinned} are of tests that are there to show a bug of rustc (`known-bug`)")
+    checked = [r for r in ran if r.get("checked_output")]
+    apart = [r["test"] for r in checked if not r.get("held")]
+    print(f"{len(checked)} of the tests run have `check-run-results`: rustd's program prints what "
+          f"the test's files say in {len(checked) - len(apart)}, not in {len(apart)} {sorted(set(apart))}")
     compiled, roots = sum(r["compiled"] for r in ran), sum(r["roots"] for r in ran)
     print(f"functions: {compiled} of {roots} from rustd, {roots - compiled} left to rustc")
     for outcome in ("mismatch", "unsteady", "crash", "hang", "link"):
         for r in ran:
             if r["outcome"] == outcome:
                 revision = f"#{r['revision']}" if r.get("revision") else ""
-                print(f"  {outcome.upper()} {r['test']}{revision}: {r.get('detail', '')}")
+                pins = f" (known-bug {r['known_bug']})" if r.get("known_bug") else ""
+                print(f"  {outcome.upper()} {r['test']}{revision}{pins}: {r.get('detail', '')}")
     left = collections.Counter(r["reason"] for r in results if r["outcome"] == "excluded")
     print("left out by reason:")
     for reason, n in left.most_common():

@@ -16,14 +16,14 @@ CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = {"raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
-LEFT = {"caller_in_constant", "empty_array_by_impl"}
+LEFT = {"caller_in_constant", "macro_reads_its_spelling", "fragment_ends_statement"}
 
 
 def main():
-    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2021"], ["-p", "breaker"])
+    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2015", "breakers2021"], ["-p", "breaker"])
     fx.rustc_build()
     fx.rustd_build()
-    skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol" not in r[2]]
+    skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol for function" not in r[2]]
     left = {name for name in LEFT if any(f"::{name}::" in row[1] for row in skipped)}
     skipped = [row for row in skipped if not any(f"::{name}::" in row[1] for name in LEFT)]
     for row in skipped:
