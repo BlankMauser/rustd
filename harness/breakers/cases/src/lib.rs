@@ -30,6 +30,7 @@ cases![
     simd_lanes,
     simd_packs,
     sha_ni,
+    const_bytes_match,
     link_name_macro,
     const_pattern,
     simd_sums,

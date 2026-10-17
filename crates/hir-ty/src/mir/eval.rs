@@ -1197,10 +1197,24 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let mut ty = self.operand_ty(lhs, locals)?;
                 while let TyKind::Ref(_, z, _) = ty.kind() {
                     ty = z;
-                    let size = if ty.is_str() {
+                    // A string or byte string pattern: the lengths, then the bytes. Elements
+                    // without padding are equal exactly when their bytes are.
+                    let element = match ty.kind() {
+                        TyKind::Str => Some(1),
+                        TyKind::Slice(element)
+                            if matches!(
+                                element.kind(),
+                                TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char
+                            ) =>
+                        {
+                            Some(self.size_of_sized(element, locals, "element of a slice")?)
+                        }
+                        _ => None,
+                    };
+                    let size = if let Some(element) = element {
                         if *op != BinOp::Eq {
                             return Err(MirEvalError::NotSupported(
-                                "Only eq is builtin for `str`".to_owned(),
+                                "Only eq is builtin for `str` and slices".to_owned(),
                             ));
                         }
                         let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
@@ -1210,8 +1224,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                         lc = &lc[..self.ptr_size()];
                         rc = &rc[..self.ptr_size()];
-                        lc = self.read_memory(Address::from_bytes(lc)?, ls)?;
-                        rc = self.read_memory(Address::from_bytes(rc)?, ls)?;
+                        lc = self.read_memory(Address::from_bytes(lc)?, ls * element)?;
+                        rc = self.read_memory(Address::from_bytes(rc)?, ls * element)?;
                         break 'binary_op Owned(vec![u8::from(lc == rc)]);
                     } else {
                         self.size_of_sized(ty, locals, "operand of binary op")?
