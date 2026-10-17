@@ -181,6 +181,13 @@ impl FunctionUnwind {
         FunctionUnwind { frame: Frame::Rows(rows), landing_pads }
     }
 
+    /// The unwind information of code of Windows that came with its own: how long the code
+    /// is and its `UNWIND_INFO`, which names no handler.
+    #[cfg(feature = "llvm")]
+    pub(super) fn from_unwind_info(len: u32, info: Vec<u8>) -> Self {
+        FunctionUnwind { frame: Frame::Windows(seh::Frame { len, info }), landing_pads: None }
+    }
+
     /// The function's `.eh_frame` entry, which a frame of Windows has none of.
     fn fde(&self, address: Address) -> Option<FrameDescriptionEntry> {
         Some(match &self.frame {

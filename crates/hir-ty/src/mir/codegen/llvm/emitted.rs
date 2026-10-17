@@ -76,6 +76,11 @@ impl<'data> Emitted<'data> {
                 emitted.relocate_macho(recorder)?;
                 emitted.unwind_macho()?
             }
+            BinaryFormat::Coff => {
+                emitted.place(text, recorder)?;
+                emitted.relocate(recorder)?;
+                emitted.unwind_coff(text)?
+            }
             _ => {
                 emitted.place(text, recorder)?;
                 emitted.relocate(recorder)?;
@@ -400,6 +405,38 @@ impl<'data> Emitted<'data> {
         }
         let Some(rows) = rows else { return Ok(None) };
         Ok(Some(FunctionUnwind::from_rows(rows, self.landing_pads()?)))
+    }
+
+    /// The function's entry of `.pdata` as the `UNWIND_INFO` of `.xdata` it names, which is
+    /// taken as it is: the offsets in it are from the start of the function.
+    fn unwind_coff(&self, text: SectionIndex) -> Result<Option<FunctionUnwind>, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("an unwind table that does not parse");
+        let Some(pdata) = self.file.section_by_name(".pdata") else { return Ok(None) };
+        let entry = pdata.data()?;
+        // Where the function starts, where it ends and where its `UNWIND_INFO` is.
+        let &[_, _, _, _, _, _, _, _, a, b, c, d] = entry else {
+            return Err(Unhandled::Shape("more than one unwind table entry"));
+        };
+        let (_, relocation) =
+            pdata.relocations().find(|(offset, _)| *offset == 8).ok_or(MALFORMED)?;
+        let symbol = self.symbol(&relocation)?;
+        let SymbolSection::Section(xdata) = symbol.section() else { return Err(MALFORMED) };
+        let xdata = self.file.section_by_index(xdata)?;
+        // The field holds what the linker adds the address of the symbol to.
+        let start =
+            symbol.address() - xdata.address() + u64::from(u32::from_le_bytes([a, b, c, d]));
+        let info = xdata.data()?.get(start as usize..).ok_or(MALFORMED)?;
+        let &[version_and_flags, _, codes, _, ..] = info else { return Err(MALFORMED) };
+        // The first version, and no flag: what follows the codes would be a handler or
+        // the entry this one goes on from.
+        if version_and_flags != 1 {
+            return Err(Unhandled::Shape("an unwind table with a handler"));
+        }
+        // The codes are two bytes each and an even number of them is there.
+        let len = 4 + usize::from(codes).next_multiple_of(2) * 2;
+        let info = info.get(..len).ok_or(MALFORMED)?;
+        let code = self.file.section_by_index(text)?.size();
+        Ok(Some(FunctionUnwind::from_unwind_info(code as u32, info.to_vec())))
     }
 
     /// The function's table of landing pads as it is: the offsets in it are from the start
