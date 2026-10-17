@@ -5,6 +5,11 @@ machine: Windows Server 2022 (10.0.20348), x86-64, 8 cores of a Xeon 8559C, 32 G
 `link.exe` 14.44, the harness toolchain `nightly-2026-05-10`, rustd built with rustc 1.99.1.
 Anything I did not run is marked "inferred" or "not run".
 
+The sections from "Harness results" down describe that first port. What changed after it
+(the LLVM backend, two-float returns, C variadic functions, naked functions) and the current
+harness results are in "Since the first port" at the end, which overrides them where they
+disagree.
+
 ## What works
 
 rustd builds with `cargo build -p rustd --release` and runs as the daemon on Windows. It emits
@@ -146,15 +151,9 @@ Without splice it ran (link 339 ms).
 
 ## What does not work, and why
 
-1. Functions that return two floats in registers (`(f64, f32)`, a struct of two `f64`)
-   are not compiled by rustd on Windows, because Cranelift's `WindowsFastcall` returns only
-   one float register. In a full build rustc's copy is used and the result is right. With
-   `--patch`, though, the daemon refuses every body edit to a file that holds such a function
-   ("`floats` is not compiled by rustd and rustc's copy is from before the edit"), because for
-   a function it cannot compile it has nothing to tell a change by. Measured: the corpus bench
-   was refused 10 of 10 times in patch mode. Code with 2D points returned by value will hit
-   this. It needs either Cranelift support for the second return register or a way to tell
-   that an uncompiled function's body is unchanged.
+1. Fixed since, see "Since the first port": functions that return two floats in registers
+   (`(f64, f32)`, a struct of two `f64`) were left to rustc, and `--patch` refused every
+   body edit to a file that held one.
 2. A static whose value grows is not spliced (2 steps of `splices.py` take the full link).
    PE has no symbol sizes, so the splice only overwrites in place and has no way to move a
    static.
@@ -174,8 +173,7 @@ full build. Both give rustc's output. I left the committed `STRESS.md` as it is.
 
 ## What is left, ranked
 
-1. Two-float returns (item 1 above). It is the only thing found that makes an ordinary edit
-   loop fall over on Windows where it works on Linux.
+1. Done: two-float returns (item 1 above).
 2. Port the remaining harnesses (`scoreboard.py`, `cratetest.py` and the others listed) and
    run the real-crate ladder on Windows. Only the corpus, the daemon fixtures and
    regex-automata have been through this backend there.
@@ -184,7 +182,7 @@ full build. Both give rustc's output. I left the committed `STRESS.md` as it is.
    scheme costs a load and a branch after every call that has a pad, and a heap allocation per
    caught panic.
 5. Updating or regenerating the PDB after a splice, or at least marking it stale.
-6. The LLVM backend on Windows.
+6. Done: the LLVM backend on Windows.
 7. Thread-local data in patches.
 
 ## Other Windows targets (inferred, nothing implemented or run)
@@ -204,3 +202,97 @@ different format, the jump written over an old function is a different instructi
 workaround would need redoing for Cranelift's AArch64 backend. The ELF splice is x86-64 only
 too, and the `asm.rs` wrappers are x86 text, so this is an architecture port first and a
 Windows port second.
+
+## Since the first port
+
+This section is newer than the rest of the file and was measured on the same machine, on
+`rustd-windows-variadic` (commit `250adbbcb2`, on `rustd-collate` `530ce12b8f`), with stable
+1.99.0 as the harness toolchain and LLVM 20.1.8.
+
+### The LLVM backend
+
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast` compiles every function Cranelift does on
+Windows; nothing is left to Cranelift in any harness. What it took:
+
+- `emitted.rs` reads COFF relocations back (REL32 and its `_1` to `_5` forms, SECREL,
+  ADDR64, with the addend in the field), and takes each function's `UNWIND_INFO` from LLVM's
+  `.pdata`/`.xdata` rather than looking for `.eh_frame`.
+- A call with a landing pad is an `invoke` under LLVM. The pad stores the exception in a
+  slot of the function's own, and the table of pads is read back from `.xdata`. The pad table
+  rustd writes is three `u32` per entry (the range of return addresses and the pad), and the
+  personality enters the pad rather than returning to the call.
+- LLVM writes no `.pdata` entry for a leaf that leaves the stack alone, and the splice tells
+  where a function ends from that entry, so such a function gets a frameless `UNWIND_INFO`.
+  Code shorter than the jump the splice writes over an old function is padded, as
+  Cranelift's is.
+- `probe-stack=inline-asm` made LLVM call a function of that name on PE; on COFF the probe is
+  `__chkstk`, through `Target::stack_probe`.
+
+Building it is not in the repository: the LLVM release for Windows is built against the
+static C runtime, so rustd needs `-C target-feature=+crt-static`, the Windows SDK library
+directory on `-L native=`, and a stub `libxml2s.lib`.
+
+### Two floats returned in registers
+
+rustc returns a pair of floats in `xmm0` and `xmm1`, and Cranelift's `windows_fastcall` has
+only `xmm0`. Before Cranelift compiles a function, a return or a call of two floats is made
+one of a single float, and two small assembled helpers carry the second through `xmm1`
+(`codegen/float_pair.rs`). The call side relies on Cranelift putting nothing between a call
+and the helper that reads `xmm1`; the emitted code is checked for that, and a function that
+fails the check is left to rustc. The return side relies on the epilogue not touching `xmm1`,
+which is not checked. LLVM returns the pair itself.
+
+With this the five corpus functions are compiled, and `--patch` no longer refuses edits to
+files that hold such a function.
+
+### C variadic functions
+
+A function that takes `...` is compiled for Windows x64 under both backends. `VaList` is one
+pointer there and every argument is an 8-byte slot. The function takes the registers its
+named parameters left as integers (the caller duplicates a float in the integer register)
+and writes them into the room the caller leaves above the return address, after which the
+registers and the stack are one run of slots; `va_arg` reads a slot and steps over it. Under
+Cranelift the address of that room is a `StructArgument` parameter. LLVM takes `byval` to be
+a pointer on Windows, so there it is `llvm.addressofreturnaddress` plus the offset.
+
+Left to rustc: a variadic function with no named parameter (the first slot is where the
+exception of a guarded call arrives), with a named parameter wider than 8 bytes, or of an ABI
+other than `C` and `win64`; and `va_arg` of a type wider than 8 bytes. None is in the corpus.
+
+### Naked functions and asm labels
+
+These needed nothing in rustd. The corpus cases were System V only because two of them name
+`rdi` and `rsi`; they have Windows variants now, and `varargs_abi` calls `snprintf` as
+`extern "win64"` there. `snprintf` is in `legacy_stdio_definitions.lib` on MSVC.
+
+### Harness results (measured)
+
+One binary built with `--features llvm`; the Cranelift column is that binary with the
+default backend. "Compiled / left" is how many functions LLVM compiled and how many it left
+to Cranelift.
+
+| Harness | LLVM | LLVM compiled / left | Cranelift |
+|---|---|---|---|
+| `difftest.py corpus --layouts` | MATCH, 806/806, 0 of 897 layouts differ | 11748 / 0 | MATCH, 806/806, 0 of 897 |
+| `scoreboard.py` | 6 targets match | 18591 / 0 | 6 targets match |
+| `programs.py` | 22 of 22 | 1289 / 0 | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts | 5425 / 0 | 99 of 99, 0 restarts |
+| `breakers.py` | 25 of 25, 0 open | 3065 / 0 | 25 of 25, 0 open |
+| `unwinds.py` | 8 of 8 | 102 / 0 | 8 of 8 |
+| `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 2337 / 0 | 71 of 71 |
+| `asmedits.py` | 10 of 10 | 20 / 0 | 10 of 10 |
+| `deps.py` | 10 of 10 | 0 / 0 | 10 of 10 |
+| `includes.py` | 9 of 9 | 76 / 0 | 9 of 9 |
+| `RUSTD_SPLICE=1 worktrees.py` | 52 of 52 | 2369 / 0 | 52 of 52 |
+| `worktrees.py --join --together` | 52 of 52 | 2385 / 0 | 52 of 52 |
+| `worktrees.py --overlay` | 61 of 61 | 1950 / 0 | 61 of 61 |
+
+The corpus has 806 functions on Windows and rustd compiles all of them. `deps.py` compiles
+no function; it pushes and pulls dependency archives.
+
+`splices.py` splices 59 to 61 of the 71 steps and the rest take the full link. Repeated runs
+gave 61, 60, 59, 60 under LLVM and 60, 60, 60 under Cranelift, all 71 of 71 right. Nine
+declines are the same every time (4 whole-object rewrites, 3 executables written by someone
+else, 1 `abs` not in the executable, 1 running executable). The rest are "the static has
+another value that is larger", and which steps get it, and the sizes it names, differ from
+run to run under both backends. I did not find out why.
