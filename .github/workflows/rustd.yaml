@@ -99,8 +99,10 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
-      # The harnesses run the linker themselves, with the environment the compiler has.
+      # The harnesses run the linker themselves, with the environment the compiler has. In
+      # this shell the `link` of coreutils comes before the linker, so it goes.
       - uses: ilammy/msvc-dev-cmd@v1
+      - run: rm -f /usr/bin/link.exe
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src -c llvm-tools && rustup default 1.99.0
       - uses: actions/cache@v4
         id: llvm
