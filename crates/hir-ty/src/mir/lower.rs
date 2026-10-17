@@ -100,6 +100,9 @@ struct MirLowerCtx<'a, 'db> {
     extended_temporaries: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
+    /// Whether what is being lowered is a statement of a block and not its tail: the operands
+    /// of a statement are in a scope of their own, inside that of its temporaries.
+    in_statement: bool,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -255,6 +258,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             super_let: None,
+            in_statement: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -1111,6 +1115,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 match variant_id {
                     VariantId::EnumVariantId(_) | VariantId::StructId(_) => {
                         let mut operands = vec![None; variant_fields.fields().len()];
+                        let declared = self.declared_locals();
                         for RecordLitField { name, expr } in fields.iter() {
                             let field_id =
                                 variant_fields.field(name).ok_or(MirLowerError::UnresolvedField)?;
@@ -1121,6 +1126,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             current = c;
                             operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                         }
+                        self.declare_operands_last(declared, operands.iter().flatten());
                         // The fields are evaluated in the order written, and the base after
                         // them.
                         let spread_place = match *spread {
@@ -1643,7 +1649,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Closure { closure_kind, .. } => not_supported!("{closure_kind:?} closure"),
             Expr::Tuple { exprs } => {
-                let Some(values) = exprs
+                let declared = self.declared_locals();
+                let Some(values): Option<Box<[Operand]>> = exprs
                     .iter()
                     .map(|it| {
                         let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)? else {
@@ -1656,6 +1663,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 else {
                     return Ok(None);
                 };
+                self.declare_operands_last(declared, values.iter());
                 let r = Rvalue::Aggregate(
                     AggregateKind::Tuple(self.expr_ty_without_adjust(expr_id).store()),
                     values,
@@ -1673,7 +1681,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             ));
                         }
                     };
-                    let Some(values) = elements
+                    let declared = self.declared_locals();
+                    let Some(values): Option<Box<[Operand]>> = elements
                         .iter()
                         .map(|it| {
                             let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)?
@@ -1687,6 +1696,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     else {
                         return Ok(None);
                     };
+                    self.declare_operands_last(declared, values.iter());
                     let r = Rvalue::Aggregate(AggregateKind::Array(elem_ty.store()), values);
                     self.push_assignment(current, place, r, expr_id.into());
                     Ok(Some(current))
@@ -1977,6 +1987,37 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok((operand, discr_ty, current))
     }
 
+    /// How many locals the innermost scope has declared: where the operands of an expression
+    /// that is about to be lowered will start.
+    fn declared_locals(&self) -> usize {
+        self.drop_scopes.last().map_or(0, |it| it.locals.len())
+    }
+
+    /// Declares the operands of one aggregate or call after everything else that was declared
+    /// since `declared`, so that they are dropped first. rustc keeps the operands in the scope
+    /// of the expression they are operands of: when a later operand panics, the earlier ones
+    /// are dropped before the temporaries that live to the end of the statement.
+    fn declare_operands_last<'o>(
+        &mut self,
+        declared: usize,
+        operands: impl Iterator<Item = &'o Operand>,
+    ) {
+        if !self.in_statement {
+            return;
+        }
+        let Some(scope) = self.drop_scopes.last_mut() else { return };
+        for operand in operands {
+            let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+                continue;
+            };
+            let found = scope.locals.iter().skip(declared).position(|&it| it == place.local);
+            if let Some(at) = found.filter(|_| place.projection.as_slice().is_empty()) {
+                let local = scope.locals.remove(declared + at);
+                scope.locals.push(local);
+            }
+        }
+    }
+
     fn lower_call_and_args(
         &mut self,
         func: Operand,
@@ -1986,6 +2027,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         is_uninhabited: bool,
         span: MirSpan,
     ) -> Result<'db, Option<BasicBlockId>> {
+        let declared = self.declared_locals();
         let Some(args) = args
             .map(|arg| {
                 if let Some((temp, c)) = self.lower_expr_to_some_operand(arg, current)? {
@@ -1999,6 +2041,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
+        self.declare_operands_last(declared, args.iter());
         self.lower_call(func, args.into(), place, current, is_uninhabited, span)
     }
 
@@ -2421,6 +2464,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
         let enclosing = self.drop_scopes.iter().rposition(|it| !it.temporaries);
         let scope = self.push_drop_scope();
+        let outer_statement = std::mem::replace(&mut self.in_statement, true);
         for statement in statements.iter() {
             match statement {
                 hir_def::hir::Statement::Let {
@@ -2502,6 +2546,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 hir_def::hir::Statement::Item(_) => (),
             }
         }
+        self.in_statement = false;
         if let Some(tail) = tail {
             let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
@@ -2526,6 +2571,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 scope.locals.rotate_right(temporaries);
             }
         }
+        self.in_statement = outer_statement;
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
     }

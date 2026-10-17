@@ -40,4 +40,7 @@ cases![
     lifetime_only_callee,
     panic_columns,
     panic_column_width,
+    panic_index_operand,
+    unwind_operand_order,
+    assert_message,
 ];
