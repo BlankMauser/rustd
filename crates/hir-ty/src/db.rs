@@ -98,6 +98,25 @@ pub trait HirDatabase: SourceDatabase + 'static {
         crate::mir::mir_body_for_coroutine_query(db, def).map_err(|err| err.clone())
     }
 
+    fn mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::mir_body_for_coroutine_by_move_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn monomorphized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_mir_body_for_coroutine_by_move_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
     fn monomorphized_mir_body_for_coroutine<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
@@ -445,7 +464,8 @@ impl<'db> InternedClosureId<'db> {
                 matches!(
                     expr,
                     hir_def::hir::Expr::Closure {
-                        closure_kind: hir_def::hir::ClosureKind::Closure,
+                        closure_kind: hir_def::hir::ClosureKind::Closure
+                            | hir_def::hir::ClosureKind::CoroutineClosure(_),
                         ..
                     }
                 ),
@@ -521,6 +541,11 @@ impl<'db> InternedCoroutineClosureId<'db> {
         }
 
         Self::new_impl(db, ClosureKey::new(db, loc))
+    }
+
+    /// The closure this is when called: its body returns the future of its `async` block.
+    pub fn as_closure(self, db: &'db dyn HirDatabase) -> InternedClosureId<'db> {
+        InternedClosureId::new(db, self.loc(db))
     }
 }
 

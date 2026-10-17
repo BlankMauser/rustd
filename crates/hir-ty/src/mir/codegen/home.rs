@@ -47,7 +47,7 @@ impl<'db> Mentions<'db> {
             InstanceDef::Closure(id) => {
                 mentions.owner(InternedClosureId::from_id(id).loc(db).owner)
             }
-            InstanceDef::Coroutine(id) => {
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
                 mentions.owner(InternedCoroutineId::from_id(id).loc(db).owner)
             }
             InstanceDef::DropGlue
@@ -122,6 +122,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                 self.crates.insert(krate);
             }
             TyKind::Closure(id, _) => self.owner(id.0.loc(self.db).owner),
+            TyKind::CoroutineClosure(id, _) => self.owner(id.0.loc(self.db).owner),
             TyKind::Coroutine(id, _) => self.owner(id.0.loc(self.db).owner),
             TyKind::Dynamic(bounds, _) => {
                 if let Some(principal) = bounds.principal() {

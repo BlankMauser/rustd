@@ -45,6 +45,7 @@ use salsa::plumbing::{AsId, FromId};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
 use triomphe::Arc;
 
+use crate::mir::is_by_move_coroutine;
 use crate::{
     CallableDefId, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::try_const_usize,
@@ -62,6 +63,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
     utils::detect_variant_from_bytes,
 };
+use hir_def::lang_item::LangItems;
 
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
@@ -804,6 +806,9 @@ enum InstanceDef {
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block. Polled with a null
     /// context, it drops whatever the block holds instead.
     Coroutine(salsa::Id),
+    /// The same of the future an `async` closure gives when it is called by value though it
+    /// could be called again: that future owns what the closure captured.
+    CoroutineByMove(salsa::Id),
     /// `drop_in_place` for the type that is the instance's only generic argument.
     DropGlue,
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
@@ -1110,9 +1115,10 @@ fn compiled_instance<'db>(
         InstanceDef::ReifyShim { receiver } => {
             return compile(db, env, None, false, |fx| fx.reify_shim(ty(), receiver));
         }
-        InstanceDef::Fn(_) | InstanceDef::Closure(_) | InstanceDef::Coroutine(_) => {
-            instance_body(db, &instance, stored_env)?
-        }
+        InstanceDef::Fn(_)
+        | InstanceDef::Closure(_)
+        | InstanceDef::Coroutine(_)
+        | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
     };
     let body = &*body;
     let dump = std::env::var("RUSTD_DUMP_MIR").ok();
@@ -1160,6 +1166,9 @@ fn instance_body<'db>(
         InstanceDef::Coroutine(id) if *LEAN => db
             .mir_body_for_coroutine(InternedCoroutineId::from_id(id))
             .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::CoroutineByMove(id) if *LEAN => db
+            .mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
         InstanceDef::Fn(func) => {
             db.monomorphized_mir_body(func.into(), args, env).map(Cow::Borrowed)
         }
@@ -1168,6 +1177,13 @@ fn instance_body<'db>(
             .map(Cow::Borrowed),
         InstanceDef::Coroutine(id) => db
             .monomorphized_mir_body_for_coroutine(InternedCoroutineId::from_id(id), args, env)
+            .map(Cow::Borrowed),
+        InstanceDef::CoroutineByMove(id) => db
+            .monomorphized_mir_body_for_coroutine_by_move(
+                InternedCoroutineId::from_id(id),
+                args,
+                env,
+            )
             .map(Cow::Borrowed),
         InstanceDef::DropGlue
         | InstanceDef::CallOnceShim
@@ -1235,6 +1251,33 @@ fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool 
     finder.coroutine
 }
 
+/// The methods of the `Fn` traits and of the `AsyncFn` traits, each from the one that borrows
+/// the callee to the one that takes it.
+fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
+    [
+        [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once],
+        [
+            lang_items.AsyncFn_async_call,
+            lang_items.AsyncFnMut_async_call_mut,
+            lang_items.AsyncFnOnce_async_call_once,
+        ],
+    ]
+}
+
+/// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
+fn coroutine_instance<'db>(
+    db: &'db dyn HirDatabase,
+    ty: Ty<'db>,
+) -> Option<(InstanceDef, GenericArgs<'db>)> {
+    let TyKind::Coroutine(id, args) = ty.kind() else { return None };
+    let args = args.as_coroutine();
+    let def = match is_by_move_coroutine(db, id.0, args) {
+        true => InstanceDef::CoroutineByMove(id.0.as_id()),
+        false => InstanceDef::Coroutine(id.0.as_id()),
+    };
+    Some((def, GenericArgs::new_from_slice(args.parent_args())))
+}
+
 /// The `async` blocks whose futures the body of `func` holds, or `None` when the body
 /// can't be read. rustc lays a future out differently, so every function that touches one
 /// has to come from the same compiler.
@@ -1245,7 +1288,9 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
         type Result = ();
 
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Coroutine(..) | TyKind::Closure(..) = ty.kind() {
+            if let TyKind::Coroutine(..) | TyKind::Closure(..) | TyKind::CoroutineClosure(..) =
+                ty.kind()
+            {
                 self.0.push(ty);
             }
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
@@ -1266,8 +1311,22 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
             let body = match ty.kind() {
                 TyKind::Coroutine(id, args) => {
                     found.insert(id.0.as_id());
-                    let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-                    db.monomorphized_mir_body_for_coroutine(id.0, parent.store(), env.store())
+                    let args = args.as_coroutine();
+                    let parent = GenericArgs::new_from_slice(args.parent_args()).store();
+                    match is_by_move_coroutine(db, id.0, args) {
+                        true => db.monomorphized_mir_body_for_coroutine_by_move(
+                            id.0,
+                            parent,
+                            env.store(),
+                        ),
+                        false => db.monomorphized_mir_body_for_coroutine(id.0, parent, env.store()),
+                    }
+                }
+                TyKind::CoroutineClosure(id, args) => {
+                    let parent =
+                        GenericArgs::new_from_slice(args.as_coroutine_closure().parent_args());
+                    let closure = id.0.as_closure(db);
+                    db.monomorphized_mir_body_for_closure(closure, parent.store(), env.store())
                 }
                 TyKind::Closure(id, args) => {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
@@ -1994,7 +2053,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let declared = &self.module.declarations().get_function_decl(id).signature;
         let has_body = matches!(
             instance.def,
-            InstanceDef::Fn(_) | InstanceDef::Closure(_) | InstanceDef::Coroutine(_)
+            InstanceDef::Fn(_)
+                | InstanceDef::Closure(_)
+                | InstanceDef::Coroutine(_)
+                | InstanceDef::CoroutineByMove(_)
         );
         if has_body && *declared != compiled.code.signature {
             unsupported!(
@@ -2320,7 +2382,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let kind = kind.split(['(', ' ']).next().unwrap_or_default().to_owned();
         let origin = match def {
             InstanceDef::Fn(func) => format!("{func:?}"),
-            InstanceDef::Closure(it) | InstanceDef::Coroutine(it) => format!("{it:?}"),
+            InstanceDef::Closure(it)
+            | InstanceDef::Coroutine(it)
+            | InstanceDef::CoroutineByMove(it) => format!("{it:?}"),
             _ => kind.clone(),
         };
         let mut hasher = rustc_hash::FxHasher::default();
@@ -2649,6 +2713,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
             InstanceDef::Closure(_)
             | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim
@@ -2790,7 +2855,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         match def {
             InstanceDef::Fn(func) => FunctionSignature::of(self.db, func).name.as_str(),
             InstanceDef::Closure(_) => "{closure}",
-            InstanceDef::Coroutine(_) => "{async}",
+            InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => "{async}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
@@ -4781,10 +4846,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         None => unsupported!("partial move out of {ty:?}"),
                     }
                 }
-                TyKind::Closure(_, args) => match args.as_closure().tupled_upvars_ty().kind() {
-                    TyKind::Tuple(tys) => tys.iter().collect(),
-                    _ => unsupported!("partial move out of a closure without tupled upvars"),
-                },
+                TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
+                    match ty.closure_upvars_ty().map(|it| it.kind()) {
+                        Some(TyKind::Tuple(tys)) => tys.iter().collect(),
+                        _ => unsupported!("partial move out of a closure without tupled upvars"),
+                    }
+                }
                 TyKind::Adt(adt_def, subst) if adt_def.is_box() => {
                     let pointee = subst.type_at(0);
                     let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
@@ -5987,14 +6054,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let layout = self.layout(ty.as_ref())?;
                     self.write_fields(dst, &layout, operands)?;
                     if let TyKind::Coroutine(..) = ty.as_ref().kind() {
-                        // The last field says where the body left off.
-                        let Some(tag) = CoroutineFrame::state_of(&layout) else {
-                            unsupported!("an async block without a state");
-                        };
-                        let tag = self.scalar(tag)?.ty;
-                        let state = layout.fields.offset(layout.fields.count() - 1).bytes();
-                        let state = self.builder.ins().iadd_imm(dst, state as i64);
-                        self.store_state(state, tag, UNRESUMED);
+                        self.start_coroutine(dst, &layout)?;
                     }
                 }
             },
@@ -6673,9 +6733,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let db = self.cg.db;
         let lang_items = self.interner.lang_items();
-        if [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once]
-            .contains(&Some(func))
-        {
+        if fn_trait_methods(lang_items).iter().any(|family| family.contains(&Some(func))) {
             self.call_fn_trait(func, generic_args, args, dst, dst_ty.ty)?;
             return self.finish_call(destination, target);
         }
@@ -6886,10 +6944,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let abi = ty.fn_sig(self.interner).abi();
                 self.emit_call(Callee::Pointer(pointer, abi), &values, dst, dst_ty)
             }
-            TyKind::Closure(id, generic_args) => {
-                let parent_args =
-                    GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-                let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
+                let (id, parent_args) = match ty.kind() {
+                    TyKind::Closure(id, generic_args) => {
+                        (id.0, generic_args.as_closure().parent_args())
+                    }
+                    TyKind::CoroutineClosure(id, generic_args) => {
+                        let closure = generic_args.as_coroutine_closure();
+                        if let TyKind::Coroutine(future, future_args) = dst_ty.kind()
+                            && is_by_move_coroutine(
+                                self.cg.db,
+                                future.0,
+                                future_args.as_coroutine(),
+                            )
+                        {
+                            let captured = closure.tupled_upvars_ty();
+                            return self.future_by_move(dst, dst_ty, &values, addr, ty, captured);
+                        }
+                        (id.0.as_closure(self.cg.db), closure.parent_args())
+                    }
+                    _ => unreachable!(),
+                };
+                let parent_args = GenericArgs::new_from_slice(parent_args);
+                let body = self.body_types(InstanceDef::Closure(id.as_id()), parent_args)?;
                 if body.params.len() != values.len() + 1 {
                     unsupported!("closure called with a tuple of arguments");
                 }
@@ -6904,7 +6981,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (addr, ty)
                 };
                 values.insert(0, self_arg);
-                let def = InstanceDef::Closure(id.0.as_id());
+                let def = InstanceDef::Closure(id.as_id());
                 let call = |this: &mut Self| {
                     this.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
                 };
@@ -6927,13 +7004,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let field = self.builder.ins().iadd_imm(tuple, offset);
                     self.copy(field, src, size);
                 }
-                let lang_items = self.interner.lang_items();
+                let [by_shared, by_mut, _] = fn_trait_methods(self.interner.lang_items())
+                    .into_iter()
+                    .find(|family| family.contains(&Some(method)))
+                    .expect("an Fn-trait method");
                 let (method, self_arg) = match by_ref {
                     None => (Some(method), (addr, ty)),
-                    Some((slot, ref_ty, Mutability::Not)) => (lang_items.Fn_call, (slot, ref_ty)),
-                    Some((slot, ref_ty, Mutability::Mut)) => {
-                        (lang_items.FnMut_call_mut, (slot, ref_ty))
-                    }
+                    Some((slot, ref_ty, Mutability::Not)) => (by_shared, (slot, ref_ty)),
+                    Some((slot, ref_ty, Mutability::Mut)) => (by_mut, (slot, ref_ty)),
                 };
                 let Some(method) = method else {
                     unsupported!("Fn-trait call on {ty:?}");
@@ -6943,6 +7021,45 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             _ => unsupported!("Fn-trait call on {ty:?}"),
         }
+    }
+
+    /// The future of an `async` closure that is called by value though it could be called
+    /// again: it takes over the arguments and what the closure at `closure` captured.
+    fn future_by_move(
+        &mut self,
+        dst: Value,
+        future_ty: Ty<'db>,
+        arguments: &[(Value, Ty<'db>)],
+        closure: Value,
+        closure_ty: Ty<'db>,
+        captured: Ty<'db>,
+    ) -> Result<()> {
+        let layout = self.layout(future_ty)?;
+        let closure_layout = self.layout(closure_ty)?;
+        let mut fields = arguments.to_vec();
+        for (i, ty) in captured.tuple_fields().iter().enumerate() {
+            let offset = closure_layout.fields.offset(i).bytes() as i64;
+            fields.push((self.builder.ins().iadd_imm(closure, offset), ty));
+        }
+        for (i, (src, ty)) in fields.into_iter().enumerate() {
+            let size = self.layout(ty)?.size;
+            let field = self.builder.ins().iadd_imm(dst, layout.fields.offset(i).bytes() as i64);
+            self.copy(field, src, size);
+        }
+        self.start_coroutine(dst, &layout)
+    }
+
+    /// Marks the future at `dst` as not polled yet.
+    fn start_coroutine(&mut self, dst: Value, layout: &Layout) -> Result<()> {
+        // The last field says where the body left off.
+        let Some(tag) = CoroutineFrame::state_of(layout) else {
+            unsupported!("an async block without a state");
+        };
+        let tag = self.scalar(tag)?.ty;
+        let state = layout.fields.offset(layout.fields.count() - 1).bytes();
+        let state = self.builder.ins().iadd_imm(dst, state as i64);
+        self.store_state(state, tag, UNRESUMED);
+        Ok(())
     }
 
     /// Whether the reference type `ty` has an `Fn` impl written for it, as opposed to the ones
@@ -7173,8 +7290,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let interner = self.interner;
         let self_ty = trait_ref.args.type_at(0);
         let lang_items = interner.lang_items();
-        let fn_methods =
-            [lang_items.Fn_call, lang_items.FnMut_call_mut, lang_items.FnOnce_call_once];
+        let [fn_methods, _] = fn_trait_methods(lang_items);
         let once = Some(func) == lang_items.FnOnce_call_once;
         let written =
             !matches!(self_ty.kind(), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..));
@@ -7192,10 +7308,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.cg.callee(InstanceDef::CallOnceShim, trait_ref.args, self.env, &sig);
         }
         if Some(func) == lang_items.FuturePoll
-            && let TyKind::Coroutine(id, args) = self_ty.kind()
+            && let Some((def, parent_args)) = coroutine_instance(db, self_ty)
         {
-            let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-            let def = InstanceDef::Coroutine(id.0.as_id());
             let sig = self.body_signature(self.body_types(def, parent_args)?)?;
             return self.cg.callee(def, parent_args, self.env, &sig);
         }
@@ -7670,10 +7784,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // A closure clones as the tuple of what it captured.
         let fields = match ty.kind() {
             TyKind::Tuple(fields) => Some(fields),
-            TyKind::Closure(_, args) => match args.as_closure().tupled_upvars_ty().kind() {
-                TyKind::Tuple(fields) => Some(fields),
-                _ => unsupported!("builtin `Clone` of a closure without tupled upvars"),
-            },
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
+                match ty.closure_upvars_ty().map(|it| it.kind()) {
+                    Some(TyKind::Tuple(fields)) => Some(fields),
+                    _ => unsupported!("builtin `Clone` of a closure without tupled upvars"),
+                }
+            }
             _ => None,
         };
         match ty.kind() {
@@ -9019,18 +9135,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
     /// it. `args` are the pinned reference and the context.
     fn coroutine_callee(&mut self, ty: Ty<'db>) -> Option<Callee<'db>> {
-        let TyKind::Coroutine(id, args) = ty.kind() else { return None };
-        let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-        Some(Callee::Instance(InstanceDef::Coroutine(id.0.as_id()), parent_args))
+        let (def, parent_args) = coroutine_instance(self.cg.db, ty)?;
+        Some(Callee::Instance(def, parent_args))
     }
 
     /// Drops the `async` block at `addr`, by polling it with no context.
     fn drop_coroutine(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
-        let TyKind::Coroutine(id, args) = ty.kind() else {
+        let Some((def, parent_args)) = coroutine_instance(self.cg.db, ty) else {
             unsupported!("drop glue for {ty:?}");
         };
-        let parent_args = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-        let body = self.body_types(InstanceDef::Coroutine(id.0.as_id()), parent_args)?;
+        let body = self.body_types(def, parent_args)?;
         let Some(poll_ty) = &body.poll else {
             unsupported!("async block whose body is not one");
         };
@@ -9044,8 +9158,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let poll_ty = poll_ty.as_ref();
         let layout = self.layout(poll_ty)?;
         let ignored = self.stack_slot(&layout);
-        let callee = Callee::Instance(InstanceDef::Coroutine(id.0.as_id()), parent_args);
-        self.emit_call(callee, &values, ignored, poll_ty)
+        self.emit_call(Callee::Instance(def, parent_args), &values, ignored, poll_ty)
     }
 
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
@@ -9453,8 +9566,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.drop_adt_fields(addr, meta, ty)?;
             }
             TyKind::Tuple(tys) => self.drop_tuple_fields(addr, ty, tys.iter().collect())?,
-            TyKind::Closure(_, args) => {
-                let TyKind::Tuple(tys) = args.as_closure().tupled_upvars_ty().kind() else {
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
+                let Some(TyKind::Tuple(tys)) = ty.closure_upvars_ty().map(|it| it.kind()) else {
                     unsupported!("drop glue for a closure without tupled upvars");
                 };
                 self.drop_tuple_fields(addr, ty, tys.iter().collect())?

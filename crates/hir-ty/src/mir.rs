@@ -42,12 +42,14 @@ pub use eval::{
     render_const_using_debug_impl,
 };
 pub use lower::{
-    MirLowerError, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,
-    mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query,
+    MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
+    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
+    mir_body_query, promoted_mir_body_query,
 };
 pub use monomorphization::{
-    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_query,
-    monomorphized_mir_body_query, monomorphized_promoted_mir_body_query,
+    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
+    monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
+    monomorphized_promoted_mir_body_query,
 };
 
 pub type BasicBlockId = Idx<BasicBlock>;
@@ -1785,7 +1787,9 @@ impl<'db> PlaceTy<'db> {
                 TyKind::Coroutine(_, args) => {
                     args.as_coroutine().tupled_upvars_ty().tuple_fields()[f.0 as usize]
                 }
-                // FIXME TyKind::CoroutineClosure...
+                TyKind::CoroutineClosure(_, args) => {
+                    args.as_coroutine_closure().tupled_upvars_ty().tuple_fields()[f.0 as usize]
+                }
                 TyKind::Tuple(tys) => tys
                     .get(f.0 as usize)
                     .cloned()

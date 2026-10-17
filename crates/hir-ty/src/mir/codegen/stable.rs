@@ -97,6 +97,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 out.push_str("coroutine ");
                 self.closure(&mut out, InternedCoroutineId::from_id(id).loc(self.db))?;
             }
+            InstanceDef::CoroutineByMove(id) => {
+                out.push_str("coroutine by move ");
+                self.closure(&mut out, InternedCoroutineId::from_id(id).loc(self.db))?;
+            }
             InstanceDef::DropGlue => out.push_str("drop"),
             InstanceDef::CallOnceShim => out.push_str("call_once"),
             InstanceDef::FnPointerShim => out.push_str("fn_pointer"),
@@ -498,6 +502,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 self.closure(out, id.0.loc(db))?;
                 self.args(out, args)?;
             }
+            TyKind::CoroutineClosure(id, args) => {
+                out.push_str("async closure ");
+                self.closure(out, id.0.loc(db))?;
+                self.args(out, args)?;
+            }
             TyKind::Coroutine(id, args) => {
                 out.push_str("coroutine ");
                 self.closure(out, id.0.loc(db))?;
@@ -570,7 +579,6 @@ impl<'a, 'db> StableNames<'a, 'db> {
             }
             TyKind::Alias(..) => return self.miss("alias type"),
             TyKind::Param(..) => return self.miss("type parameter"),
-            TyKind::CoroutineClosure(..) => return self.miss("async closure"),
             TyKind::CoroutineWitness(..) => return self.miss("coroutine witness"),
             TyKind::Foreign(def_id) => {
                 let at = def_id.0.lookup(db).id;

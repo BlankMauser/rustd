@@ -336,14 +336,14 @@ pub fn layout_of_ty_query(
             ptr.valid_range_mut().start = 1;
             Layout::scalar(dl, ptr)
         }
-        TyKind::Closure(_, args) => {
+        TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
             // Not the layout of the tuple of captures: a tuple's last field can be unsized and
             // so stays last, where a closure's fields are all free to move.
-            let fields =
-                rustc_type_ir::inherent::Ty::tuple_fields(args.as_closure().tupled_upvars_ty())
-                    .iter()
-                    .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
-                    .collect::<Result<Vec<_>, _>>()?;
+            let upvars = ty.closure_upvars_ty().expect("a closure");
+            let fields = rustc_type_ir::inherent::Ty::tuple_fields(upvars)
+                .iter()
+                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
             cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
@@ -354,9 +354,20 @@ pub fn layout_of_ty_query(
             // there, one such set over another. `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
-            let body = db
-                .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), trait_env.clone())
-                .map_err(|_| LayoutError::Unknown)?;
+            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
+                db.monomorphized_mir_body_for_coroutine_by_move(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(),
+                )
+            } else {
+                db.monomorphized_mir_body_for_coroutine(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(),
+                )
+            }
+            .map_err(|_| LayoutError::Unknown)?;
             let held = body.locals_held_across_yields(|local| {
                 crate::drop::has_drop_glue(
                     &infer_ctxt,
@@ -408,10 +419,6 @@ pub fn layout_of_ty_query(
             let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
             let state = &state;
             cx.calc.coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
-        }
-        TyKind::CoroutineClosure(_, args) => {
-            return db
-                .layout_of_ty(args.as_coroutine_closure().tupled_upvars_ty().store(), trait_env);
         }
         TyKind::CoroutineWitness(_, _) => {
             return Err(LayoutError::NotImplemented);

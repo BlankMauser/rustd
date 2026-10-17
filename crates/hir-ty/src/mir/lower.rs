@@ -10,8 +10,8 @@ use hir_def::{
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
-        CoroutineKind, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat, PatId, RecordLitField,
-        RecordSpread,
+        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat,
+        PatId, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -23,7 +23,10 @@ use itertools::{EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _};
+use rustc_type_ir::{
+    CoroutineArgs, CoroutineArgsParts,
+    inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
+};
 use salsa::SalsaValue;
 use span::Edition;
 
@@ -1514,12 +1517,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Closure {
                 closure_kind:
-                    ClosureKind::Closure | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. },
+                    ClosureKind::Closure
+                    | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                    | ClosureKind::CoroutineClosure(CoroutineKind::Async),
                 ..
             } => {
                 let ty = self.expr_ty_without_adjust(expr_id);
                 match ty.kind() {
                     TyKind::Closure(id, _) => self.result.closures.push(id.0),
+                    TyKind::CoroutineClosure(id, _) => {
+                        self.result.closures.push(id.0.as_closure(self.db))
+                    }
                     TyKind::Coroutine(..) => (),
                     _ => not_supported!("closure with non closure type"),
                 }
@@ -2954,7 +2962,7 @@ pub fn mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    lower_closure_body(db, closure.loc(db))
+    lower_closure_body(db, closure.loc(db), CoroutineCaptures::Own)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
@@ -2963,7 +2971,45 @@ pub fn mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    lower_closure_body(db, coroutine.loc(db))
+    lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::Own)
+}
+
+/// The body of the `async` block of an `async` closure that is called by value though it could
+/// be called again: the future that makes owns what the closure captured, where the block
+/// itself borrows from the closure.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+pub fn mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+) -> Result<'db, MirBody<'db>> {
+    lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
+}
+
+/// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
+/// what its `async` closure captured.
+pub fn is_by_move_coroutine<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    args: CoroutineArgs<DbInterner<'db>>,
+) -> bool {
+    let InternedClosure { owner, expr, .. } = coroutine.loc(db);
+    let store = ExpressionStore::of(db, owner.expression_store_owner(db));
+    let Expr::Closure {
+        closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
+        ..
+    } = &store[expr]
+    else {
+        return false;
+    };
+    let closure = ExpressionStore::closure_for_coroutine(expr);
+    let TyKind::CoroutineClosure(_, closure_args) =
+        InferenceResult::of(db, owner).expr_ty(closure).kind()
+    else {
+        return false;
+    };
+    let once = rustc_type_ir::ClosureKind::FnOnce;
+    args.kind_ty().to_opt_closure_kind() == Some(once)
+        && closure_args.as_coroutine_closure().kind() != once
 }
 
 fn mir_body_for_coroutine_cycle_result<'db>(
@@ -2986,9 +3032,20 @@ enum Receiver {
     Coroutine,
 }
 
+/// What the future of an `async` block holds of its surroundings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoroutineCaptures {
+    /// What the block itself captures.
+    Own,
+    /// The arguments of the `async` closure the block is the body of, then what that closure
+    /// captures.
+    OfClosure,
+}
+
 fn lower_closure_body<'db>(
     db: &'db dyn HirDatabase,
     InternedClosure { owner: body_owner, expr, .. }: InternedClosure<'db>,
+    held: CoroutineCaptures,
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
@@ -2998,7 +3055,19 @@ fn lower_closure_body<'db>(
     let Some(closure_data) = infer.closures_data.get(&expr) else {
         not_supported!("closure without capture analysis");
     };
-    let captures = closure_data.min_captures.values().flatten();
+    let captures: Vec<&CapturedPlace> = match held {
+        CoroutineCaptures::Own => closure_data.min_captures.values().flatten().collect(),
+        CoroutineCaptures::OfClosure => {
+            let closure = ExpressionStore::closure_for_coroutine(expr);
+            let (Expr::Closure { args, .. }, Some(of_closure)) =
+                (&store[closure], infer.closures_data.get(&closure))
+            else {
+                implementation_error!("async block of a closure that is not one");
+            };
+            let arguments = closure_data.min_captures.values().flatten().take(args.len());
+            arguments.chain(of_closure.min_captures.values().flatten()).collect()
+        }
+    };
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
     let interner = ctx.interner();
     let by_ref = |mutability| {
@@ -3019,9 +3088,41 @@ fn lower_closure_body<'db>(
             };
             (receiver, ty, sig.inputs())
         }
-        crate::next_solver::TyKind::Coroutine(_, substs) => {
-            ctx.result.locals.alloc(Local { ty: substs.as_coroutine().return_ty().store() });
-            (Receiver::Coroutine, by_ref(Mutability::Mut), Default::default())
+        crate::next_solver::TyKind::CoroutineClosure(_, substs) => {
+            // Returns the future of its `async` block.
+            let sig = closure_data.liberated_sig.get();
+            ctx.result.locals.alloc(Local { ty: sig.output().store() });
+            let (receiver, ty) = match substs.as_coroutine_closure().kind() {
+                rustc_type_ir::ClosureKind::FnOnce => (Receiver::Owned, infer.expr_ty(expr)),
+                rustc_type_ir::ClosureKind::FnMut => (Receiver::Borrowed, by_ref(Mutability::Mut)),
+                rustc_type_ir::ClosureKind::Fn => (Receiver::Borrowed, by_ref(Mutability::Not)),
+            };
+            (receiver, ty, sig.inputs())
+        }
+        crate::next_solver::TyKind::Coroutine(id, substs) => {
+            let own = substs.as_coroutine();
+            ctx.result.locals.alloc(Local { ty: own.return_ty().store() });
+            let future = match held {
+                CoroutineCaptures::Own => infer.expr_ty(expr),
+                CoroutineCaptures::OfClosure => {
+                    let once = rustc_type_ir::ClosureKind::FnOnce;
+                    let parts = CoroutineArgsParts {
+                        parent_args: own.parent_args(),
+                        kind_ty: Ty::from_coroutine_closure_kind(interner, once),
+                        resume_ty: own.resume_ty(),
+                        yield_ty: own.yield_ty(),
+                        return_ty: own.return_ty(),
+                        tupled_upvars_ty: Ty::new_tup_from_iter(
+                            interner,
+                            captures.iter().map(|it| it.captured_ty(db)),
+                        ),
+                    };
+                    Ty::new_coroutine(interner, id, CoroutineArgs::new(interner, parts).args)
+                }
+            };
+            let future =
+                Ty::new_ref(interner, Region::new_erased(interner), future, Mutability::Mut);
+            (Receiver::Coroutine, future, Default::default())
         }
         _ => implementation_error!("closure expression is not closure"),
     };
@@ -3064,7 +3165,7 @@ fn lower_closure_body<'db>(
     let is_by_ref_closure = receiver == Receiver::Borrowed;
     let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
         FxHashMap::default();
-    for (capture_idx, capture) in captures.enumerate() {
+    for (capture_idx, capture) in captures.into_iter().enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
         let mut projections = Vec::with_capacity(2);

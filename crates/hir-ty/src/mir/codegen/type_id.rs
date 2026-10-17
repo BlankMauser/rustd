@@ -347,9 +347,19 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                 self.args(parent)?.hash(hasher);
             }
+            TyKind::CoroutineClosure(id, args) => {
+                hasher.write_isize(18);
+                self.closure(hasher, id.0.loc(self.db))?;
+                let parent = args.as_coroutine_closure().parent_args();
+                self.args(GenericArgs::new_from_slice(parent))?.hash(hasher);
+            }
             TyKind::Coroutine(id, args) => {
                 hasher.write_isize(19);
                 self.closure(hasher, id.0.loc(self.db))?;
+                // The future of an `async` closure is another type when it owns what the
+                // closure captured.
+                let by_move = crate::mir::is_by_move_coroutine(self.db, id.0, args.as_coroutine());
+                hasher.write_u8(by_move.into());
                 let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
                 self.args(parent)?.hash(hasher);
             }

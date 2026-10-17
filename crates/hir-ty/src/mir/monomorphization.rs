@@ -381,6 +381,16 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     monomorphized(db, db.mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
 }
 
+#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
+pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    monomorphized(db, db.mir_body_for_coroutine_by_move(coroutine)?, &subst, &trait_env)
+}
+
 fn monomorphized_mir_body_for_coroutine_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
