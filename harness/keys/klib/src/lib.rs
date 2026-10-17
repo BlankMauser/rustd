@@ -55,3 +55,14 @@ pub fn shape() -> usize {
 pub fn described() -> String {
     kdep::describe::<(u8, u32)>()
 }
+
+/// Which of the sums of the dependency panic when they overflow, called from here.
+pub fn checks(x: u8) -> [bool; 4] {
+    let caught = |f: &dyn Fn() -> u8| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    [
+        caught(&|| kdep::stepped(x)),
+        caught(&|| kdep::sum(x, std::hint::black_box(1))),
+        caught(&|| kdep::widened(x)),
+        caught(&|| kdep::bumped(x)),
+    ]
+}

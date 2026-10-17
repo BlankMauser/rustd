@@ -8,7 +8,6 @@
   "steps": [
     {
       "what": "the version in the manifest changes",
-      "expect": "refused",
       "edit": [
         [
           "app/Cargo.toml",
