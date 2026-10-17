@@ -74,6 +74,12 @@ const SMALL_PACKS: usize = 16;
 /// A temporary file nobody holds is only removed when it is older than this: its writer
 /// creates it before it locks it.
 const TEMPORARY_FOR: Duration = Duration::from_secs(60);
+/// What a temporary file that holds the start of a pack being fetched ends in, before
+/// `.tmp`: one that arrives as it is, and one that arrives compressed.
+const FETCHED: [&str; 2] = [".fetch", ".zst"];
+/// The start of a fetched pack that nobody holds is kept this long for a fetch to go on
+/// from: it took a network to get.
+const FETCHED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 
 static TOOLCHAIN: OnceLock<String> = OnceLock::new();
 
@@ -143,6 +149,39 @@ pub fn limit_from_env() -> Result<Option<u64>, String> {
 /// format this build reads.
 pub fn pack_name(bytes: &[u8]) -> Option<String> {
     bytes.starts_with(MAGIC).then(|| named(&Sha256::digest(bytes)))
+}
+
+/// The keys of the records of the pack `name`, in the order they were added, if its bytes are
+/// what its name says and every record is as it was written. They are the keys as they are
+/// on disk, which only the build of rustd that wrote them can make.
+pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static str> {
+    Ok(Pack::check(name, bytes)?.into_iter().map(|it| it.key).collect())
+}
+
+/// Asked for a key, as it is on disk, that no sealed pack of the store has: brings the pack
+/// that has it into the store's directory, if it knows of one, and says whether it did.
+pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
+
+static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+
+/// Has the store of this process ask `fetch` for the keys it lacks, from now on. A process
+/// has one store, and only the first call counts.
+pub fn fetch_missing_with(fetch: FetchMissing) {
+    _ = FETCH_MISSING.set(fetch);
+}
+
+/// Seals what the store of this process has open, however little it is, so that it can be
+/// sent to other machines now. Between builds a small pack is otherwise left open.
+pub fn seal_open() {
+    if let Some(store) = Store::global() {
+        store.settle(1);
+    }
+}
+
+/// The format of the pack that starts with these bytes, if they start a pack of any.
+pub fn pack_format(start: &[u8]) -> Option<u32> {
+    let (format, name) = start.get(..MAGIC.len())?.split_last()?;
+    (name == &MAGIC[..MAGIC.len() - 1]).then_some(u32::from(*format))
 }
 
 /// Whether `name` is what a sealed pack is called, and so safe to use as a file name.
@@ -237,6 +276,25 @@ fn records(pack: &[u8]) -> (Vec<Record>, usize) {
         at = start + len;
     }
     (found, at)
+}
+
+/// The keys of the records a pack is laid out as, going by their lengths alone.
+fn headed(pack: &[u8]) -> Vec<[u8; KEY]> {
+    let mut keys = Vec::new();
+    let mut at = MAGIC.len();
+    if !pack.starts_with(MAGIC) {
+        return keys;
+    }
+    while let Some(header) = pack.get(at..at + HEADER) {
+        let (key, rest) = header.split_at(KEY);
+        let len = u32::from_le_bytes(rest[..4].try_into().expect("four bytes")) as usize;
+        at += HEADER + len;
+        if at > pack.len() {
+            break;
+        }
+        keys.push(key.try_into().expect("a key"));
+    }
+    keys
 }
 
 fn record(key: &[u8; KEY], value: &[u8], len: u32) -> Vec<u8> {
@@ -423,6 +481,25 @@ impl StoreDir {
         Ok(self.names()?.into_iter().filter(|it| is_pack(it)).collect())
     }
 
+    /// The keys, as they are on disk, that the sealed packs say they hold. A collection
+    /// makes one pack of many, so what a store holds is told by its keys and not by the
+    /// names of its packs.
+    ///
+    /// Only the headers of the records are read, not what they hold, so this is no check: a
+    /// damaged pack may be said to hold a key that a build will not get from it.
+    pub fn keys(&self) -> io::Result<FxHashSet<[u8; KEY]>> {
+        let mut keys = FxHashSet::default();
+        for name in self.packs()? {
+            // Evicted since it was listed.
+            let Ok(file) = File::open(self.dir.join(name)) else { continue };
+            // SAFETY: a sealed pack is never written again; one that is removed stays
+            // mapped.
+            let Ok(pack) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+            keys.extend(headed(&pack));
+        }
+        Ok(keys)
+    }
+
     /// Seals the open packs that daemons that are gone left behind, as far as their records
     /// are whole. Returns how many there were.
     pub fn adopt(&self) -> usize {
@@ -574,10 +651,14 @@ impl StoreDir {
         for name in self.names()?.iter().filter(|it| Kind::of(it) == Some(Kind::Temporary)) {
             let path = self.dir.join(name);
             let Ok(file) = File::open(&path) else { continue };
+            let fetched = name
+                .strip_suffix(".tmp")
+                .is_some_and(|it| FETCHED.iter().any(|end| it.ends_with(end)));
+            let kept = if fetched { FETCHED_FOR } else { TEMPORARY_FOR };
             let old = file
                 .metadata()
                 .and_then(|it| it.modified())
-                .is_ok_and(|at| at.elapsed().is_ok_and(|it| it > TEMPORARY_FOR));
+                .is_ok_and(|at| at.elapsed().is_ok_and(|it| it > kept));
             if old && file.try_lock().is_ok() && std::fs::remove_file(&path).is_ok() {
                 abandoned += 1;
             }
@@ -642,13 +723,22 @@ fn write_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
     let written = file
         .lock()
         .and_then(|()| file.write_all(bytes))
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&partial, to));
+        .and_then(|()| name_file_whole(&file, &partial, to));
     if written.is_err() {
         _ = std::fs::remove_file(&partial);
     }
-    written?;
-    sync_dir(dir)
+    written
+}
+
+/// Gives the file at `from`, which the caller wrote and holds, the name `to`: readers see
+/// all of it or none, and it is whole after a loss of power once this returns. This is how
+/// a file that arrives in pieces, as one fetched from a remote does, ends the way
+/// [`write_file_whole`] writes one. In a store `from` is `<to>.<anything>.tmp`, so that what
+/// a stopped process leaves is known for what it is.
+pub fn name_file_whole(file: &File, from: &Path, to: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    std::fs::rename(from, to)?;
+    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)
 }
 
 /// Writes a file outside a store the way [`StoreDir::write_whole`] writes one inside.
@@ -889,8 +979,13 @@ impl Store {
     /// other daemons sealed. What is not written by the time the daemon ends is compiled
     /// again by the next.
     pub(super) fn flush(&self) {
+        self.settle(self.tuning.seal_at);
+    }
+
+    /// As [`Self::flush`], sealing the open pack if it has `seal_at` bytes.
+    fn settle(&self, seal_at: u64) {
         let sealed = match self.writer.lock() {
-            Ok(mut writer) => writer.settle(&self.dir, self.tuning.seal_at),
+            Ok(mut writer) => writer.settle(&self.dir, seal_at),
             Err(_) => false,
         };
         self.mark_used();
@@ -920,16 +1015,29 @@ impl Store {
         }
     }
 
+    /// Where the value of a key as it is on disk is. A key no sealed pack has is asked of
+    /// whoever fetches packs for this process, and looked for again in what arrived.
+    fn place(&self, key: &[u8; KEY]) -> Option<Place> {
+        let known = || self.sealed.read().ok()?.index.get(key).cloned();
+        if let Some(place) = known() {
+            return Some(place);
+        }
+        if !FETCH_MISSING.get().is_some_and(|fetch| fetch(key)) {
+            return None;
+        }
+        self.refresh();
+        known()
+    }
+
     /// Whether a sealed pack has a value for the key.
     pub(super) fn has(&self, key: &[u8; KEY]) -> bool {
-        let key = self.identity.key(key);
-        self.sealed.read().is_ok_and(|it| it.index.contains_key(&key))
+        self.place(&self.identity.key(key)).is_some()
     }
 
     /// The value of a key, if a sealed pack has it as it was written.
     pub(super) fn get(&self, key: &[u8; KEY]) -> Option<Vec<u8>> {
         let key = self.identity.key(key);
-        let place = self.sealed.read().ok()?.index.get(&key)?.clone();
+        let place = self.place(&key)?;
         let mut value = vec![0; place.len as usize];
         let read = read_at(&place.pack.file, &mut value, place.at);
         if read.is_err() || checksum(&key, &value) != place.checksum {
@@ -1463,6 +1571,38 @@ mod tests {
     }
 
     #[test]
+    fn the_start_of_a_fetched_pack_is_kept_for_a_fetch_to_go_on_from() {
+        let dir = scratch("fetched");
+        sealed(&dir);
+        let kept = ["fetch", "zst"].map(|end| dir.join(format!("{}.{end}.tmp", named(&[5; KEY]))));
+        for (left, age) in kept.iter().zip([TEMPORARY_FOR * 2, FETCHED_FOR * 2]) {
+            std::fs::write(left, b"half of a pack").unwrap();
+            let old = SystemTime::now() - age;
+            File::options().write(true).open(left).unwrap().set_modified(old).unwrap();
+        }
+        assert_eq!(StoreDir::at(&dir).collect(None).unwrap().abandoned, 1);
+        assert!(kept[0].exists() && !kept[1].exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_keys_a_store_says_it_holds_are_those_of_its_records() {
+        let dir = scratch("keys");
+        sealed(&dir);
+        let store = StoreDir::at(&dir);
+        let mut held = Vec::new();
+        for name in store.packs().unwrap() {
+            let pack = std::fs::read(dir.join(&name)).unwrap();
+            held.extend(pack_keys(&name, &pack).unwrap());
+            // Cut short in a value, the record it is in is not counted.
+            assert_eq!(headed(&pack[..pack.len() - 1]).len(), headed(&pack).len() - 1);
+        }
+        assert!(!held.is_empty());
+        assert_eq!(store.keys().unwrap(), held.into_iter().collect());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn names_that_are_not_the_stores_are_not_its_files() {
         for name in ["lock", "notes.txt", "1-2.open.bak", "x.open", "-.open", "version.tmp"] {
             assert!(Kind::of(name).is_none(), "{name}");
@@ -1470,6 +1610,41 @@ mod tests {
         assert!(Kind::of("12-34.open") == Some(Kind::Open));
         assert!(Kind::of("version.12-34.tmp") == Some(Kind::Temporary));
         assert!(Kind::of(&format!("{}.7.partial", named(&[0; KEY]))) == Some(Kind::Temporary));
+    }
+
+    #[test]
+    fn a_pack_says_its_format_and_its_keys_to_those_who_send_it() {
+        let dir = scratch("sent");
+        let pack = sealed(&dir);
+        let name = pack.file_name().unwrap().to_str().unwrap();
+        let mut bytes = std::fs::read(&pack).unwrap();
+        assert_eq!(pack_format(&bytes), Some(FORMAT));
+        assert_eq!(pack_format(b"rustdpk\x01 of the first format"), Some(1));
+        assert_eq!(pack_format(b"rustdpk"), None);
+        assert_eq!(pack_format(b"something else"), None);
+        let keys = [1, 2].map(|key| identity("a toolchain").key(&[key; KEY]));
+        assert_eq!(pack_keys(name, &bytes).unwrap(), keys);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert_eq!(StoreDir::at(&dir).keys().unwrap(), keys.into_iter().collect());
+        assert!(pack_keys(name, &bytes).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_arrived_in_pieces_gets_its_name_whole() {
+        let dir = scratch("pieces");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) =
+            (dir.join(format!("{}.fetch.tmp", named(&[5; KEY]))), dir.join(named(&[5; KEY])));
+        let mut file = File::create(&from).unwrap();
+        file.write_all(b"one piece, ").unwrap();
+        assert!(Kind::of(from.file_name().unwrap().to_str().unwrap()) == Some(Kind::Temporary));
+        file.write_all(b"and another").unwrap();
+        name_file_whole(&file, &from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"one piece, and another");
+        assert!(files(&dir, Kind::Temporary).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

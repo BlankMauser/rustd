@@ -222,6 +222,8 @@ class Case:
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), "--out", obj, "--report", report,
              *self.rustd_args, *self.symbols(link, env)], capture_output=True, text=True, env=env, timeout=600)
         open(os.path.join(self.work, "rustd.stderr"), "w").write(run.stderr)
+        if run.returncode < 0:
+            raise Wrong(f"rustd died of signal {-run.returncode}: " + run.stderr[-300:])
         if run.returncode != 0:
             raise Refused(reason_of(run.stderr))
         if self.spec.get("says", "") not in run.stderr:
