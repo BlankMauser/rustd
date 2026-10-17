@@ -53,4 +53,5 @@ cases![
     for_tail_temporaries,
     if_let_temporaries,
     guard_subslice_restored,
+    unreachable_arm_move,
 ];
