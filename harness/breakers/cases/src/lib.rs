@@ -47,4 +47,6 @@ cases![
     drop_unsized_wrapper,
     assign_from_break,
     const_pattern_other_variant,
+    crlf_literal,
+    dyn_lifetime_upcast,
 ];

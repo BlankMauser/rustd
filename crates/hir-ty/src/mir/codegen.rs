@@ -7514,13 +7514,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust, None), &values, dst, dst_ty)
     }
 
-    /// The principal trait of `dyn_ty`, as implemented by `self_ty`.
+    /// The principal trait of `dyn_ty`, as implemented by `self_ty`, with its lifetimes erased.
     fn principal(&self, dyn_ty: Ty<'db>, self_ty: Ty<'db>) -> Option<TraitRef<'db>> {
         let TyKind::Dynamic(bounds, _) = dyn_ty.kind() else {
             return None;
         };
         let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
-        Some(self.interner.instantiate_bound_regions_with_erased(principal))
+        let principal = self.interner.instantiate_bound_regions_with_erased(principal);
+        // A vtable is the same whatever the lifetimes the trait is named with.
+        Some(rustc_type_ir::fold_regions(self.interner, principal, |_, _| {
+            Region::new_erased(self.interner)
+        }))
     }
 
     /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a

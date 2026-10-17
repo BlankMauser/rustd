@@ -7,3 +7,6 @@ bench_data/** binary
 *.png binary
 *.jpg binary
 *.ico binary
+
+# A breaker case about the line endings of a source file.
+harness/breakers/cases/src/crlf_literal.rs -text
