@@ -72,7 +72,8 @@ pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()
         .filter(|(name, _)| name != REAL)
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    let out_dir = env.iter().find(|(name, _)| name == "OUT_DIR").map(|(_, value)| PathBuf::from(value));
+    let out_dir =
+        env.iter().find(|(name, _)| name == "OUT_DIR").map(|(_, value)| PathBuf::from(value));
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
         let ran = Ran { real: real.clone(), cwd: std::env::current_dir()?, env };
         // Without it the script is not run again by the daemon, and cargo builds.

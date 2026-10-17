@@ -13,11 +13,7 @@ pub(crate) mod script;
 mod state;
 mod units;
 
-use std::{
-    path::Path,
-    process::Command,
-    time::Instant,
-};
+use std::{path::Path, process::Command, time::Instant};
 
 use anyhow::Context as _;
 
@@ -125,7 +121,12 @@ fn warmed(checkout: &Checkout) -> Result<(), String> {
 
 /// Builds with cargo, and has the daemon load what cargo built for the builds to come.
 /// `Err` is cargo's exit status when it failed.
-fn by_cargo(asked: &Invocation, cwd: &Path, key: &str, counts: Counts) -> anyhow::Result<Result<State, i32>> {
+fn by_cargo(
+    asked: &Invocation,
+    cwd: &Path,
+    key: &str,
+    counts: Counts,
+) -> anyhow::Result<Result<State, i32>> {
     State::give_back(key);
     let built = match Built::by_cargo(asked)? {
         Ok(built) => built,
@@ -150,7 +151,9 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
         Subcommand::Run => match run::program(asked, state, cwd)? {
             Some(code) => Ok(code),
             // Cargo says which programs there are to pick from.
-            None => plain_cargo(std::iter::once("run".to_owned()).chain(asked.typed.clone()).collect()),
+            None => {
+                plain_cargo(std::iter::once("run".to_owned()).chain(asked.typed.clone()).collect())
+            }
         },
         Subcommand::Test if asked.flags.no_run => Ok(0),
         Subcommand::Test => {
@@ -171,10 +174,16 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
 fn status() -> anyhow::Result<i32> {
     match client::ask(Request::Status, Start::Never)? {
         Some(Reply::Status(daemon)) => {
-            let idle = daemon.idle_secs.map_or("never".to_owned(), |it| format!("after {it}s idle"));
+            let idle =
+                daemon.idle_secs.map_or("never".to_owned(), |it| format!("after {it}s idle"));
             println!("daemon: pid {}, version {}, exits {idle}", daemon.pid, daemon.version);
             for worker in daemon.workers {
-                println!("  worker: pid {}, {}, log {}", worker.pid, worker.project.display(), worker.log.display());
+                println!(
+                    "  worker: pid {}, {}, log {}",
+                    worker.pid,
+                    worker.project.display(),
+                    worker.log.display()
+                );
                 for (root, warmth) in worker.checkouts {
                     println!("    {}: {warmth}", root.display());
                 }
@@ -184,7 +193,13 @@ fn status() -> anyhow::Result<i32> {
     }
     for state in State::all() {
         let to_cargo: u64 = state.counts.cargo.values().sum();
-        println!("{} ({}, {}): {} builds by the daemon, {to_cargo} by cargo", state.root.display(), state.profile, state.key, state.counts.served);
+        println!(
+            "{} ({}, {}): {} builds by the daemon, {to_cargo} by cargo",
+            state.root.display(),
+            state.profile,
+            state.key,
+            state.counts.served
+        );
         for (reason, count) in &state.counts.cargo {
             println!("  {count} x {reason}");
         }

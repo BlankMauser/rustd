@@ -36,7 +36,8 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::fs::create_dir_all(&copies)?;
         command.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
     }
-    let status = command.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
+    let status =
+        command.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
     if status.success()
         && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line))
     {
@@ -96,7 +97,8 @@ impl Unit {
         });
         unit.script = record.is_build_script() && emits_link;
         unit.linked = record.is_linked() && emits_link && !record.runs_in_build();
-        unit.id = format!("{}{}", unit.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        unit.id =
+            format!("{}{}", unit.crate_name, record.codegen("extra-filename").unwrap_or_default());
         Some(unit)
     }
 
@@ -117,7 +119,8 @@ impl Unit {
     fn record(&self, stamp: u128, to: &Path, link_line: Option<PathBuf>) -> anyhow::Result<()> {
         let record = self.as_record(stamp, Vec::new(), link_line.clone());
         // The executable is the daemon's to link; of the outputs it reads the libraries.
-        let libraries = record.outputs().into_iter().filter(|it| it.extension().is_some_and(|it| it == "rlib"));
+        let libraries =
+            record.outputs().into_iter().filter(|it| it.extension().is_some_and(|it| it == "rlib"));
         let mut originals: Vec<PathBuf> = libraries.filter(|it| it.exists()).collect();
         if let Some(line) = &link_line {
             let line = std::fs::read_to_string(line)
@@ -137,8 +140,12 @@ impl Unit {
         }
         // The daemon tells which crate a file of rustc's is by the dep-info next to it, of
         // which it reads the first source: the root of the crate.
-        let stem = format!("{}{}", self.crate_name, record.codegen("extra-filename").unwrap_or_default());
-        std::fs::write(to.join(format!("{stem}.d")), format!("{stem}: {}\n", self.source.display()))?;
+        let stem =
+            format!("{}{}", self.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        std::fs::write(
+            to.join(format!("{stem}.d")),
+            format!("{stem}: {}\n", self.source.display()),
+        )?;
         if self.script
             && let Some(linked) = record.outputs().first()
         {

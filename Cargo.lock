@@ -3067,6 +3067,7 @@ dependencies = [
  "hir-def",
  "hir-ty",
  "ide-db",
+ "libc",
  "load-cargo",
  "memchr",
  "memmap2",

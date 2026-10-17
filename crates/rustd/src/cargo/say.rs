@@ -18,7 +18,11 @@ fn painted(color: &str, word: &str) -> String {
 /// `     Running target/debug/app`, unless the build is quiet.
 pub(crate) fn status(quiet: bool, word: &str, rest: &str) {
     if !quiet {
-        eprintln!("{}{} {rest}", " ".repeat(12usize.saturating_sub(word.len())), painted(GREEN, word));
+        eprintln!(
+            "{}{} {rest}",
+            " ".repeat(12usize.saturating_sub(word.len())),
+            painted(GREEN, word)
+        );
     }
 }
 

@@ -55,8 +55,8 @@ impl Plan {
             return Ok(Err(why));
         }
         let line = unit.link_line.as_ref().context("a linked unit without a link line")?;
-        let line = std::fs::read_to_string(line)
-            .with_context(|| format!("reading {}", line.display()))?;
+        let line =
+            std::fs::read_to_string(line).with_context(|| format!("reading {}", line.display()))?;
         let Some(mut link) = LinkLine::parse(&line) else {
             return Ok(Err("the link line is not one of an ELF linker driven by `cc`".to_owned()));
         };
@@ -119,7 +119,9 @@ fn unsupported(unit: &Record) -> Option<String> {
     if unit.codegen("panic") == Some("abort") {
         return Some(format!("`{name}` is built with panic=abort"));
     }
-    for flag in ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"] {
+    for flag in
+        ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"]
+    {
         if unit.codegen(flag).is_some() {
             return Some(format!("`{name}` is built with -C {flag}"));
         }
@@ -169,7 +171,9 @@ impl LinkLine {
         for path in entries.flatten().map(|it| it.path()) {
             let name = path.file_name().and_then(|it| it.to_str()).unwrap_or_default();
             let of_library = LIBRARY.iter().any(|it| {
-                name.strip_prefix("lib").and_then(|rest| rest.strip_prefix(it)).is_some_and(|rest| rest.starts_with('-'))
+                name.strip_prefix("lib")
+                    .and_then(|rest| rest.strip_prefix(it))
+                    .is_some_and(|rest| rest.starts_with('-'))
             });
             if of_library && name.ends_with(".rlib") && !files.contains(&path) {
                 files.push(path);
@@ -181,11 +185,17 @@ impl LinkLine {
     /// The command that links the plan's executable, with its arguments in the file at
     /// `response`: a line with all of them is longer than a process may be given.
     fn command(mut self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
-        let first = self.args.iter().position(|it| is_rustc_file(it)).context("nothing of rustc's is linked")?;
+        let first = self
+            .args
+            .iter()
+            .position(|it| is_rustc_file(it))
+            .context("nothing of rustc's is linked")?;
         let ours = [&plan.patch, &plan.object].map(|it| it.display().to_string());
         self.args.splice(first..first, ours.into_iter().chain([FIRST_DEFINITION_STAYS.to_owned()]));
-        let output = self.args.iter().position(|it| it == "-o").context("the link names no output")?;
-        *self.args.get_mut(output + 1).context("the link names no output")? = plan.binary.display().to_string();
+        let output =
+            self.args.iter().position(|it| it == "-o").context("the link names no output")?;
+        *self.args.get_mut(output + 1).context("the link names no output")? =
+            plan.binary.display().to_string();
         let quoted: Vec<String> = self
             .args
             .iter()
@@ -223,10 +233,19 @@ mod tests {
     #[test]
     fn link_line_of_cc() {
         let link = LinkLine::parse(LINE).unwrap();
-        assert_eq!(link.env, [("LC_ALL".to_owned(), "C".to_owned()), ("PATH".to_owned(), "/t/bin:/usr/bin".to_owned())]);
+        assert_eq!(
+            link.env,
+            [
+                ("LC_ALL".to_owned(), "C".to_owned()),
+                ("PATH".to_owned(), "/t/bin:/usr/bin".to_owned())
+            ]
+        );
         assert_eq!(link.linker, "cc");
         assert_eq!(link.args[..2], ["-m64", "/t/deps/a.1.rcgu.o"]);
-        assert_eq!(link.rustc_files(), ["/t/deps/a.1.rcgu.o", "/t/deps/libb-2.rlib"].map(PathBuf::from));
+        assert_eq!(
+            link.rustc_files(),
+            ["/t/deps/a.1.rcgu.o", "/t/deps/libb-2.rlib"].map(PathBuf::from)
+        );
     }
 
     #[test]
@@ -258,11 +277,22 @@ mod tests {
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE).unwrap().command(&plan, &response).unwrap();
         assert_eq!(command, format!("LC_ALL=C PATH=/t/bin:/usr/bin cc @{}", response.display()));
-        let args = std::fs::read_to_string(&response).unwrap();
-        let args: Vec<&str> = args.lines().collect();
+        // As the driver reads the file: quoted where a shell would need it.
+        let args = shlex::split(&std::fs::read_to_string(&response).unwrap()).unwrap();
         assert_eq!(
             args,
-            ["-m64", "/p/patch.o", "/p/rustd.o", FIRST_DEFINITION_STAYS, "/t/deps/a.1.rcgu.o", "-Wl,-Bstatic", "/t/deps/libb-2.rlib", "-o", "/p/bin", "-pie"]
+            [
+                "-m64",
+                "/p/patch.o",
+                "/p/rustd.o",
+                FIRST_DEFINITION_STAYS,
+                "/t/deps/a.1.rcgu.o",
+                "-Wl,-Bstatic",
+                "/t/deps/libb-2.rlib",
+                "-o",
+                "/p/bin",
+                "-pie"
+            ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::Context as _;
-use cargo_metadata::{Artifact, BuildScript, Message, Metadata, MetadataCommand, Package, TargetKind};
+use cargo_metadata::{
+    Artifact, BuildScript, Message, Metadata, MetadataCommand, Package, TargetKind,
+};
 use rustc_hash::FxHashSet;
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
@@ -112,17 +114,34 @@ impl Kind {
 enum Guard {
     /// Files that are to be as they were when cargo built: there or not, and not written
     /// since.
-    Files { what: String, files: Vec<(PathBuf, bool)> },
+    Files {
+        what: String,
+        files: Vec<(PathBuf, bool)>,
+    },
     /// A directory with nothing in it written since cargo built.
-    Tree { what: String, dir: PathBuf },
-    Env { name: String, value: Option<String> },
+    Tree {
+        what: String,
+        dir: PathBuf,
+    },
+    Env {
+        name: String,
+        value: Option<String>,
+    },
     /// A file cargo writes itself while it builds, `Cargo.lock`: as cargo left it, by when
     /// it was last written, or not there.
-    AsLeft { file: PathBuf, written: Option<u128> },
+    AsLeft {
+        file: PathBuf,
+        written: Option<u128>,
+    },
     /// A build script that cargo runs again when one of `reruns_for` does not hold, and
     /// that the daemon then runs itself: the build is cargo's when the script prints or
     /// writes something else than it did.
-    Script { package: String, out_dir: PathBuf, reruns_for: Vec<Guard>, checked_at: u128 },
+    Script {
+        package: String,
+        out_dir: PathBuf,
+        reruns_for: Vec<Guard>,
+        checked_at: u128,
+    },
 }
 
 impl Guard {
@@ -154,8 +173,9 @@ impl Guard {
                 let changed = newer_in(dir, built_at)?;
                 Some(format!("{what} and {} changed", changed.display()))
             }
-            Guard::AsLeft { file, written } => (written_at(file) != *written)
-                .then(|| format!("{} changed", file.display())),
+            Guard::AsLeft { file, written } => {
+                (written_at(file) != *written).then(|| format!("{} changed", file.display()))
+            }
             Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
                 .then(|| format!("the environment variable {name} changed")),
         }
@@ -187,7 +207,8 @@ fn newer_in(dir: &Path, since: u128) -> Option<PathBuf> {
                     return Some(found);
                 }
             }
-        } else if entry.metadata().and_then(|it| it.modified()).is_ok_and(|it| stamp_of(it) > since) {
+        } else if entry.metadata().and_then(|it| it.modified()).is_ok_and(|it| stamp_of(it) > since)
+        {
             return Some(path);
         }
     }
@@ -423,7 +444,9 @@ impl State {
                 env: run_env(package, &built.scripts),
             });
         }
-        state.programs.sort_by(|a, b| (&a.package, a.kind, &a.name).cmp(&(&b.package, b.kind, &b.name)));
+        state
+            .programs
+            .sort_by(|a, b| (&a.package, a.kind, &a.name).cmp(&(&b.package, b.kind, &b.name)));
         for checkout in &mut checkouts {
             let sources = checkout.programs.iter().flat_map(|plan| {
                 let compiled = used.iter().filter(|it| plan.crates.contains(&it.source));
@@ -515,7 +538,9 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
     if let Some(named) = asked.flags.packages.first() {
         let name = named.split('@').next().unwrap_or(named);
         let package = metadata.workspace_packages().into_iter().find(|it| it.name.as_str() == name);
-        return package.map(package_dir).ok_or(format!("`-p {named}` is not a package of the workspace"));
+        return package
+            .map(package_dir)
+            .ok_or(format!("`-p {named}` is not a package of the workspace"));
     }
     if asked.flags.workspace {
         let virtual_root = metadata.root_package().is_none();
@@ -591,9 +616,18 @@ fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> 
         ("CARGO_PKG_HOMEPAGE".to_owned(), text(&package.homepage)),
         ("CARGO_PKG_REPOSITORY".to_owned(), text(&package.repository)),
         ("CARGO_PKG_LICENSE".to_owned(), text(&package.license)),
-        ("CARGO_PKG_LICENSE_FILE".to_owned(), package.license_file.as_ref().map(|it| it.to_string()).unwrap_or_default()),
-        ("CARGO_PKG_RUST_VERSION".to_owned(), package.rust_version.as_ref().map(|it| it.to_string()).unwrap_or_default()),
-        ("CARGO_PKG_README".to_owned(), package.readme.as_ref().map(|it| it.to_string()).unwrap_or_default()),
+        (
+            "CARGO_PKG_LICENSE_FILE".to_owned(),
+            package.license_file.as_ref().map(|it| it.to_string()).unwrap_or_default(),
+        ),
+        (
+            "CARGO_PKG_RUST_VERSION".to_owned(),
+            package.rust_version.as_ref().map(|it| it.to_string()).unwrap_or_default(),
+        ),
+        (
+            "CARGO_PKG_README".to_owned(),
+            package.readme.as_ref().map(|it| it.to_string()).unwrap_or_default(),
+        ),
     ];
     for script in scripts.iter().filter(|it| it.package_id == package.id) {
         env.push(("OUT_DIR".to_owned(), script.out_dir.to_string()));
@@ -611,11 +645,20 @@ fn guards(
     checkouts: &[Checkout],
 ) -> Vec<Guard> {
     let root = metadata.workspace_root.as_std_path();
-    let manifests = metadata.workspace_packages().into_iter().map(|it| it.manifest_path.clone().into_std_path_buf());
+    let manifests = metadata
+        .workspace_packages()
+        .into_iter()
+        .map(|it| it.manifest_path.clone().into_std_path_buf());
     let mut guards = vec![
         Guard::files("the manifest", manifests.chain([root.join("Cargo.toml")])),
-        Guard::AsLeft { written: written_at(&root.join("Cargo.lock")), file: root.join("Cargo.lock") },
-        Guard::files("cargo's configuration", named_above(cwd, &CONFIGS).chain(cargo_home_configs())),
+        Guard::AsLeft {
+            written: written_at(&root.join("Cargo.lock")),
+            file: root.join("Cargo.lock"),
+        },
+        Guard::files(
+            "cargo's configuration",
+            named_above(cwd, &CONFIGS).chain(cargo_home_configs()),
+        ),
         Guard::files("the toolchain file", named_above(cwd, &TOOLCHAIN_FILES)),
     ];
     let in_build = runs_in_build(used);

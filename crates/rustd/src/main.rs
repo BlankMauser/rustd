@@ -7,6 +7,7 @@ mod deps;
 mod memory;
 mod outline;
 mod remote;
+mod socket;
 mod splice;
 mod stub;
 mod symbols;
@@ -61,10 +62,10 @@ use syntax::{
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 // The same sockets, which the standard library does not have on Windows.
 #[cfg(windows)]
-use uds_windows::{UnixListener, UnixStream};
+use uds_windows::UnixStream;
 
 use crate::{
     splice::{Baseline, Linked, Spliced},
@@ -2323,7 +2324,16 @@ impl Target {
         match (krate, out) {
             (Some(krate), Some(out)) => {
                 let (krate, batch) = Target::crates(&krate);
-                Ok(Some(Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files }))
+                Ok(Some(Target {
+                    project,
+                    krate,
+                    batch,
+                    out,
+                    patch,
+                    link_cmd,
+                    splice,
+                    symbol_files,
+                }))
             }
             (None, None)
                 if patch.is_none()
@@ -2453,7 +2463,8 @@ impl Tests {
         if self == now {
             return None;
         }
-        let differs = |a: &Tests, b: &Tests| a.0.iter().find(|it| !b.0.contains(it)).map(|it| it.0.clone());
+        let differs =
+            |a: &Tests, b: &Tests| a.0.iter().find(|it| !b.0.contains(it)).map(|it| it.0.clone());
         let which = differs(now, self).or_else(|| differs(self, now)).unwrap_or_default();
         Some(format!(
             "the test `{which}` was added, removed or given other attributes, and the list of \
@@ -2660,22 +2671,26 @@ fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<Wa
     files.extend(new);
 }
 
-/// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>, UnixStream)> {
-    loop {
-        let (stream, _) = listener.accept()?;
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request)?;
-        let fields: Vec<&str> = request.trim_end_matches('\n').split('\t').collect();
-        let target = Target::parse(&fields[1..]);
-        if let Some(request) = Request::parse(fields[0])
-            && (fields.len() == 1 || target.is_some())
-        {
-            return Ok((request, target, stream));
+/// Reads the request a client sent on `stream`: the result is where to send the outcome.
+/// One that is not a request is told so and is `None`.
+fn requested(stream: UnixStream) -> Option<Asked> {
+    let request = match socket::read_request(&stream) {
+        Ok(request) => request,
+        Err(error) => {
+            // A client that hangs up before the answer is not the daemon's problem.
+            let _ = writeln!(&stream, "error: {error}");
+            return None;
         }
-        // A client that hangs up before the answer is not the daemon's problem.
-        let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
+    };
+    let fields: Vec<&str> = request.split('\t').collect();
+    let target = Target::parse(&fields[1..]);
+    if let Some(request) = Request::parse(fields[0])
+        && (fields.len() == 1 || target.is_some())
+    {
+        return Some((request, target, stream));
     }
+    let _ = writeln!(&stream, "error: unknown request {request:?}");
+    None
 }
 
 /// Ends the process when its standard input ends: the daemon that started this worker holds
@@ -2881,11 +2896,15 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let listener = match &args.socket {
-        Some(path) => {
-            // A socket file left by a daemon that is gone can't be bound again.
-            let _ = std::fs::remove_file(path);
-            Some(UnixListener::bind(path)?)
-        }
+        Some(path) => match socket::Served::bind(path) {
+            Ok(served) => Some(served),
+            Err(socket::NotServed::Taken) => {
+                bail!("another daemon serves {}", path.display())
+            }
+            Err(socket::NotServed::Failed(error)) => {
+                return Err(error).with_context(|| format!("listening on {}", path.display()));
+            }
+        },
         None if args.watch => None,
         None => return Ok(()),
     };
@@ -2903,13 +2922,19 @@ fn main() -> anyhow::Result<()> {
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
-    if let Some(listener) = listener {
+    if let Some(served) = listener {
         let sender = sender.clone();
+        // Each connection is read by a thread of its own: one that sends nothing, or
+        // slowly, keeps no other from being heard.
         std::thread::spawn(move || {
-            while let Ok(request) = requested(&listener) {
-                if sender.send(Event::Asked(request)).is_err() {
-                    break;
-                }
+            for stream in served.listener.incoming().flatten() {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    if let Some(request) = requested(stream) {
+                        // The daemon is ending when nothing takes requests any more.
+                        let _ = sender.send(Event::Asked(request));
+                    }
+                });
             }
         });
     }

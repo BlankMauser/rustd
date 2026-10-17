@@ -173,9 +173,9 @@ impl Record {
     /// The source files rustc read and the environment variables it asked for, from the
     /// dep-info cargo had it write.
     pub(crate) fn inputs(&self) -> Inputs {
-        let path = self.out_dir().map(|it| {
-            it.join(format!("{}{}.d", self.crate_name, self.extra_filename()))
-        });
+        let path = self
+            .out_dir()
+            .map(|it| it.join(format!("{}{}.d", self.crate_name, self.extra_filename())));
         let text = path.and_then(|it| std::fs::read_to_string(it).ok()).unwrap_or_default();
         Inputs::parse(&text, &self.cwd)
     }
@@ -284,7 +284,10 @@ mod tests {
     fn dep_info_that_is_empty_or_cut_short() {
         assert_eq!(Inputs::parse("", Path::new("/ws")), Inputs::default());
         assert_eq!(Inputs::parse("/t/a.d:", Path::new("/ws")), Inputs::default());
-        assert_eq!(Inputs::parse("/t/a.d: src/cut\\", Path::new("/ws")).files, Vec::<PathBuf>::new());
+        assert_eq!(
+            Inputs::parse("/t/a.d: src/cut\\", Path::new("/ws")).files,
+            Vec::<PathBuf>::new()
+        );
     }
 
     fn record(args: &[&str]) -> Record {
@@ -319,7 +322,8 @@ mod tests {
 
     #[test]
     fn outputs_by_kind() {
-        let lib = record(&["--crate-type", "lib", "--out-dir", "t/deps", "-C", "extra-filename=-1"]);
+        let lib =
+            record(&["--crate-type", "lib", "--out-dir", "t/deps", "-C", "extra-filename=-1"]);
         assert_eq!(lib.outputs(), [PathBuf::from("/ws/t/deps/liba-1.rlib")]);
         assert!(lib.is_rlib() && !lib.is_linked() && !lib.runs_in_build());
         let test = record(&["--crate-type", "lib", "--test", "--out-dir", "/t/deps"]);

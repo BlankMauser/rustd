@@ -20,6 +20,7 @@ use super::{
     daemon::{Envelope, Reply, Request, home, socket_in, version},
     wrapper,
 };
+use crate::socket::private_dir;
 
 /// How long a daemon that was started is waited for, and one that was told to exit.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -71,7 +72,7 @@ fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
 /// Starts a daemon in a process group of its own, so that what ends this command or its
 /// terminal's foreground does not end the daemon, and waits for it to listen.
 fn started(home: &Path) -> anyhow::Result<UnixStream> {
-    std::fs::create_dir_all(home)?;
+    private_dir(home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let log = OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
     daemon.arg("daemon").env_remove(wrapper::ENABLED).env_remove("RUSTC_WORKSPACE_WRAPPER");

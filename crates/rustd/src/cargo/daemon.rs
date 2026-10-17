@@ -19,11 +19,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 #[cfg(windows)]
-use uds_windows::{UnixListener, UnixStream};
+use uds_windows::UnixStream;
 
 use super::{plan::Plan, units::stamp_of};
+use crate::socket::{NotServed, Served, private_dir, read_request};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
@@ -59,12 +60,18 @@ pub(crate) enum Request {
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) enum Reply {
     /// The daemon is of another version. It exits when the client said it replaces it.
-    Restart { version: String },
+    Restart {
+        version: String,
+    },
     /// The daemon has no part in this build, and why. Cargo builds.
-    Cold { reason: String },
+    Cold {
+        reason: String,
+    },
     /// What the worker said of each program, in the order asked: its `ok` line, or why it
     /// did not build it.
-    Synced { programs: Vec<Result<String, String>> },
+    Synced {
+        programs: Vec<Result<String, String>>,
+    },
     Warming,
     Status(Status),
     Stopping,
@@ -143,9 +150,8 @@ impl Checkout {
 
     /// The line that asks a worker for `plan`.
     fn sync_line(&self, plan: &Plan) -> String {
-        let named = |path: &PathBuf| {
-            path.strip_prefix(&self.root).unwrap_or(path).display().to_string()
-        };
+        let named =
+            |path: &PathBuf| path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
@@ -205,7 +211,7 @@ impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     fn start(checkout: &Checkout, dir: PathBuf) -> anyhow::Result<Worker> {
         let first = checkout.programs.first().context("a checkout without programs")?;
-        std::fs::create_dir_all(&dir)?;
+        private_dir(&dir)?;
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let config = &checkout.config;
         let mut command = Command::new(std::env::current_exe()?);
@@ -361,7 +367,10 @@ impl Worker {
             pid: lock(&self.child).id(),
             project: self.project.clone(),
             log: self.log.clone(),
-            checkouts: checkouts.values().map(|it| (it.root.clone(), it.warmth.describe())).collect(),
+            checkouts: checkouts
+                .values()
+                .map(|it| (it.root.clone(), it.warmth.describe()))
+                .collect(),
         }
     }
 }
@@ -410,17 +419,16 @@ pub(crate) fn version() -> String {
 ///    its programs once.
 pub(crate) fn serve() -> anyhow::Result<()> {
     let home = home()?;
-    std::fs::create_dir_all(&home)?;
-    let lock_file = File::create(home.join("daemon.lock"))?;
-    if lock_file.try_lock().is_err() {
-        // Another daemon is the user's: the client that started this one finds it.
-        return Ok(());
-    }
+    private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let socket = socket_in(&home);
-    // The lock is held, so a socket that is there was left by a daemon that is gone.
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("listening on {}", socket.display()))?;
+    let served = match Served::bind(&socket) {
+        Ok(served) => served,
+        // Another daemon is the user's: the client that started this one finds it.
+        Err(NotServed::Taken) => return Ok(()),
+        Err(NotServed::Failed(error)) => {
+            return Err(error).with_context(|| format!("listening on {}", socket.display()));
+        }
+    };
     let idle = match std::env::var("RUSTD_IDLE_SECS").ok().and_then(|it| it.parse::<u64>().ok()) {
         Some(0) => None,
         Some(secs) => Some(Duration::from_secs(secs)),
@@ -433,12 +441,17 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         workers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
     });
-    eprintln!("daemon {} of pid {} listens on {}", daemon.version, std::process::id(), socket.display());
+    eprintln!(
+        "daemon {} of pid {} listens on {}",
+        daemon.version,
+        std::process::id(),
+        socket.display()
+    );
     {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
     }
-    for stream in listener.incoming() {
+    for stream in served.listener.incoming() {
         let Ok(stream) = stream else { continue };
         let daemon = daemon.clone();
         std::thread::spawn(move || {
@@ -452,8 +465,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 impl Daemon {
     /// Reads the one request of a connection and answers it.
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line)?;
+        let line = read_request(&stream)?;
         let envelope = serde_json::from_str::<Envelope>(&line);
         // A request that can't be read is one of another version too, and of a client
         // that waits for an answer it can read: it gets none, and the daemon stays.
@@ -540,7 +552,11 @@ impl Daemon {
             old.stop();
         }
         let worker = Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id))?);
-        eprintln!("worker {id} of pid {} for {}", lock(&worker.child).id(), worker.project.display());
+        eprintln!(
+            "worker {id} of pid {} for {}",
+            lock(&worker.child).id(),
+            worker.project.display()
+        );
         workers.insert(id, worker.clone());
         std::thread::spawn(move || worker.warm(&checkout, true));
         Ok(())

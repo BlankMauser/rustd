@@ -19,7 +19,11 @@ const FAILED: i32 = 101;
 
 /// Runs the program `asked` names, and ends as it ended. `None` when cargo has to say
 /// which program that is: there are several, or none.
-pub(crate) fn program(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<Option<i32>> {
+pub(crate) fn program(
+    asked: &Invocation,
+    state: &State,
+    cwd: &Path,
+) -> anyhow::Result<Option<i32>> {
     let runnable = |it: &&Program| !it.test && matches!(it.kind, Kind::Bin | Kind::Example);
     let mut programs: Vec<&Program> = state.programs.iter().filter(runnable).collect();
     if let Some(name) = asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {

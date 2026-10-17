@@ -349,7 +349,8 @@ mod tests {
 
     #[test]
     fn flags_in_both_spellings() {
-        let asked = build("build", "-p a --features=x,y -F z --target t --manifest-path m/Cargo.toml -r");
+        let asked =
+            build("build", "-p a --features=x,y -F z --target t --manifest-path m/Cargo.toml -r");
         assert_eq!(asked.flags.packages, ["a"]);
         assert_eq!(build("build", "-pa -j8").flags.packages, ["a"]);
         assert_eq!(asked.flags.features, ["x", "y", "z"]);
@@ -366,7 +367,10 @@ mod tests {
         assert_eq!(run.program_args().collect::<Vec<_>>(), ["one", "--two"]);
         let test = build("test", "--no-fail-fast -p a filter --no-run -- --nocapture");
         assert_eq!(test.build_args, ["-p", "a"]);
-        assert_eq!((&*test.positional, &*test.trailing), (&["filter".to_owned()][..], &["--nocapture".to_owned()][..]));
+        assert_eq!(
+            (&*test.positional, &*test.trailing),
+            (&["filter".to_owned()][..], &["--nocapture".to_owned()][..])
+        );
         assert!(test.flags.no_fail_fast && test.flags.no_run);
     }
 
@@ -381,7 +385,14 @@ mod tests {
     fn what_is_cargos_alone() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Cargo(vec!["help".to_owned()]));
-        for args in ["--release", "--profile bench", "--message-format json", "-p a -p b", "--all-features", "--target mips-unknown-none"] {
+        for args in [
+            "--release",
+            "--profile bench",
+            "--message-format json",
+            "-p a -p b",
+            "--all-features",
+            "--target mips-unknown-none",
+        ] {
             assert!(build("build", args).only_cargo().is_some(), "{args}");
         }
     }
