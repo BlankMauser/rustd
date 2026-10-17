@@ -1,6 +1,7 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod cargo;
 mod content;
 mod deps;
 mod inputs;
@@ -10,6 +11,7 @@ mod plan;
 mod process;
 mod profile;
 mod remote;
+mod socket;
 mod splice;
 mod stub;
 mod symbols;
@@ -26,7 +28,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use ide_db::base_db::SourceDatabase as _;
+use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _};
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
@@ -47,7 +49,7 @@ use hir_def::{
 };
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_symbol,
+    exported_symbol, link_name,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -64,10 +66,10 @@ use syntax::{
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 // The same sockets, which the standard library does not have on Windows.
 #[cfg(windows)]
-use uds_windows::{UnixListener, UnixStream};
+use uds_windows::UnixStream;
 
 use crate::{
     splice::{Baseline, Linked, Spliced},
@@ -618,12 +620,24 @@ impl SymbolResolver for Resolver<'_> {
             return None;
         }
         let path = self.path(func)?;
-        if let Some(symbol) = self.table.get(&path) {
+        // A test is the second of its name where it is written: rustc puts the constant
+        // that describes it to the harness before it, under the same name.
+        let function = hir::Function::from(func);
+        let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
+            self.table.get_at(&path, 1)
+        } else {
+            self.table.get(&path)
+        };
+        if let Some(symbol) = symbol {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name.
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            return Some(symbol);
+        }
         Some(format!("rustd.{id:x}.{path}"))
     }
 
@@ -1448,9 +1462,24 @@ impl ListedCrate {
             .copied()
             .find(|&it| hir::Function::from(it).is_main(db))
             .filter(|_| !has_no_main(db, krate));
-        let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
+        let exported = functions
+            .iter()
+            .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
+            .collect();
         ListedCrate { functions, exported, main }
     }
+}
+
+/// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
+/// through symbols rustc writes for the `#[global_allocator]`, so no call in the source names
+/// these methods, and they run all the same.
+fn serves_allocator(db: &RootDatabase, func: FunctionId) -> bool {
+    let Some(item) = hir::Function::from(func).as_assoc_item(db) else { return false };
+    let AssocItemContainer::Impl(implementation) = item.container(db) else { return false };
+    implementation.trait_(db).is_some_and(|it| {
+        let core = CrateOrigin::Lang(LangCrateOrigin::Core);
+        it.name(db).as_str() == "GlobalAlloc" && it.module(db).krate(db).origin(db) == core
+    })
 }
 
 impl Listed {
@@ -1629,7 +1658,9 @@ fn build(
         for krate in named {
             local.push(krate);
             let listed = listed.of(db, krate);
-            if at == 0 {
+            // With `cfg(test)` the program starts in the harness rustc wrote, which calls
+            // every test: the crate's own `main` is one function among the others.
+            if at == 0 && !args.cfg_test {
                 main = main.or(listed.main);
             }
             functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
@@ -2215,8 +2246,11 @@ impl WatchedFile {
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
-    fn sources(vfs: &Vfs) -> Vec<WatchedFile> {
+    /// The files of the VFS that have a text. One that is not UTF-8 has none, and is no
+    /// source of anything.
+    fn sources(vfs: &Vfs, db: &RootDatabase) -> Vec<WatchedFile> {
         vfs.iter()
+            .filter(|(id, _)| db.has_text(*id))
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 WatchedFile::new(Watched::Source(id), path, path)
@@ -2373,6 +2407,9 @@ struct Target {
     /// The checkout it is a program of. `None` is the one the daemon was started in.
     project: Option<PathBuf>,
     krate: String,
+    /// The other crates of the workspace that are in it, when the client says: the names
+    /// after the first in `--crate a,b,c`. Otherwise the ones the daemon was started with.
+    batch: Option<Vec<String>>,
     out: PathBuf,
     patch: Option<PathBuf>,
     link_cmd: Option<String>,
@@ -2390,16 +2427,15 @@ impl Target {
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, out, patch, link_cmd, splice, symbol_files } = self;
+        let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
-        let batch = std::iter::once(&daemon.krate)
-            .chain(&daemon.batch)
-            .filter(|&it| *it != krate)
-            .cloned()
-            .collect();
+        let batch = batch.unwrap_or_else(|| {
+            let started_with = std::iter::once(&daemon.krate).chain(&daemon.batch);
+            started_with.filter(|&it| *it != krate).cloned().collect()
+        });
         Ok(Args {
             project,
             checkout,
@@ -2436,7 +2472,17 @@ impl Target {
         }
         match (krate, out) {
             (Some(krate), Some(out)) => {
-                Ok(Some(Target { project, krate, out, patch, link_cmd, splice, symbol_files }))
+                let (krate, batch) = Target::crates(&krate);
+                Ok(Some(Target {
+                    project,
+                    krate,
+                    batch,
+                    out,
+                    patch,
+                    link_cmd,
+                    splice,
+                    symbol_files,
+                }))
             }
             (None, None)
                 if patch.is_none()
@@ -2457,9 +2503,11 @@ impl Target {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
+        let (krate, batch) = Target::crates(krate);
         Some(Target {
             project: given(project).map(PathBuf::from),
-            krate: krate.to_owned(),
+            krate,
+            batch,
             out: PathBuf::from(out),
             patch: given(patch).map(PathBuf::from),
             link_cmd: given(link_cmd),
@@ -2468,11 +2516,27 @@ impl Target {
         })
     }
 
+    /// The program's crate and the others in it, from `a,b,c`. A name with no comma says
+    /// nothing of the others, and `a,` says there are none.
+    fn crates(named: &str) -> (String, Option<Vec<String>>) {
+        match named.split_once(',') {
+            Some((krate, batch)) => {
+                let batch = batch.split(',').filter(|it| !it.is_empty()).map(str::to_owned);
+                (krate.to_owned(), Some(batch.collect()))
+            }
+            None => (named.to_owned(), None),
+        }
+    }
+
     fn fields(&self) -> String {
+        let crates = match &self.batch {
+            Some(batch) => format!("{},{}", self.krate, batch.join(",")),
+            None => self.krate.clone(),
+        };
         let mut fields = format!(
             "\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            self.krate,
+            crates,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.link_cmd.as_deref().unwrap_or_default(),
@@ -2501,6 +2565,61 @@ struct Program {
     interrupted: u32,
     /// Whether its crates are others than the last build was of, which is then no patch.
     moved: bool,
+    /// The tests of its crate when it was first built, which is how rustc built it.
+    tests: Option<Tests>,
+}
+
+/// The functions of a program's own crate that a test harness runs, each with its
+/// attributes. The harness of a test executable is rustc's: it lists the tests by name and
+/// by what `#[ignore]` and `#[should_panic]` say of them, so a build after the list changed
+/// would run the tests of before.
+#[derive(PartialEq)]
+struct Tests(Vec<(String, String)>);
+
+impl Tests {
+    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Tests {
+        use hir::HasSource as _;
+        use syntax::ast::HasAttrs as _;
+        let crates = crates_named(db, &args.krate, args).unwrap_or_default();
+        let mut tests = Vec::new();
+        for krate in crates {
+            for &id in &listed.of(db, krate).functions {
+                let function = hir::Function::from(id);
+                if !function.is_test(db) && !function.is_bench(db) {
+                    continue;
+                }
+                let module = function.module(db);
+                let mut path: Vec<String> = module
+                    .path_to_root(db)
+                    .into_iter()
+                    .rev()
+                    .filter_map(|it| Some(it.name(db)?.as_str().to_owned()))
+                    .collect();
+                path.push(function.name(db).as_str().to_owned());
+                let attrs = function.source(db).map(|it| {
+                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+                    attrs.collect::<Vec<_>>().join(" ")
+                });
+                tests.push((path.join("::"), attrs.unwrap_or_default()));
+            }
+        }
+        tests.sort();
+        Tests(tests)
+    }
+
+    /// Why the program can't be built by the daemon, when its tests are not these.
+    fn changed(&self, now: &Tests) -> Option<String> {
+        if self == now {
+            return None;
+        }
+        let differs =
+            |a: &Tests, b: &Tests| a.0.iter().find(|it| !b.0.contains(it)).map(|it| it.0.clone());
+        let which = differs(now, self).or_else(|| differs(self, now)).unwrap_or_default();
+        Some(format!(
+            "the test `{which}` was added, removed or given other attributes, and the list of \
+             tests is rustc's to write"
+        ))
+    }
 }
 
 /// A request, the program it is for, and who waits for the answer.
@@ -2703,7 +2822,7 @@ fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<Wa
             Watched::Included(_) => None,
         })
         .collect();
-    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs())
+    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs(), db)
         .into_iter()
         .filter(|it| !matches!(it.file, Watched::Source(id) if watched.contains(&id)))
         .collect();
@@ -2718,31 +2837,54 @@ fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<Wa
     files.extend(new);
 }
 
-/// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<Asked> {
-    loop {
-        let (stream, _) = listener.accept()?;
-        // The request, then the variables of the client: nothing else is sent.
-        let (mut request, mut env) = (String::new(), String::new());
-        let mut lines = BufReader::new(&stream);
-        lines.read_line(&mut request)?;
-        lines.read_line(&mut env)?;
-        let env = process::decode(env.trim_end_matches('\n'));
-        let fields: Vec<&str> = request.trim_end_matches('\n').split('\t').collect();
-        let target = Target::parse(&fields[1..]);
-        if let Some(request) = Request::parse(fields[0])
-            && (fields.len() == 1 || target.is_some())
-        {
-            return Ok((request, target, Client { stream, env }));
+/// Reads the request a client sent on `stream`, and the variables of its process: the
+/// result is where to send the outcome. One that is not a request is told so and is `None`.
+fn requested(stream: UnixStream) -> Option<Asked> {
+    let [request, env] = match socket::read_request_and_env(&stream) {
+        Ok(lines) => lines,
+        Err(error) => {
+            // A client that hangs up before the answer is not the daemon's problem.
+            let _ = writeln!(&stream, "error: {error}");
+            return None;
         }
-        // A client that hangs up before the answer is not the daemon's problem.
-        let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
+    };
+    let fields: Vec<&str> = request.split('\t').collect();
+    let target = Target::parse(&fields[1..]);
+    if let Some(request) = Request::parse(fields[0])
+        && (fields.len() == 1 || target.is_some())
+    {
+        return Some((request, target, Client { stream, env: process::decode(&env) }));
     }
+    let _ = writeln!(&stream, "error: unknown request {request:?}");
+    None
+}
+
+/// Ends the process when its standard input ends: the daemon that started this worker holds
+/// the other end for as long as it lives, however it dies.
+fn end_with_input() {
+    let mut held = [0u8; 64];
+    while std::io::Read::read(&mut std::io::stdin(), &mut held).is_ok_and(|read| read > 0) {}
+    std::process::exit(0);
 }
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    // A build script runs with the variables of the cargo that runs it, the wrapper's too.
+    if std::env::args().nth(1).as_deref() == Some("build-script") {
+        return cargo::script::command(std::env::args_os().skip(2));
+    }
+    if std::env::var_os(cargo::wrapper::ENABLED).is_some() {
+        return cargo::wrapper::command(std::env::args_os().skip(1));
+    }
+    match std::env::args().nth(1).as_deref() {
+        Some("cargo") => return cargo::command(std::env::args().skip(2)),
+        Some("daemon") => return cargo::daemon::serve(),
+        _ => {}
+    }
+    if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
+        std::thread::spawn(end_with_input);
     }
     if std::env::var_os("RUSTD_WRAPS_RUSTC").is_some() {
         return stub::command(std::env::args_os().skip(1));
@@ -2861,7 +3003,7 @@ fn main() -> anyhow::Result<()> {
         return build_batch(&db, args);
     }
 
-    let mut files = WatchedFile::sources(&vfs);
+    let mut files = WatchedFile::sources(&vfs, &db);
     let sources: Vec<_> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -2942,11 +3084,15 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let listener = match &args.socket {
-        Some(path) => {
-            // A socket file left by a daemon that is gone can't be bound again.
-            let _ = std::fs::remove_file(path);
-            Some(UnixListener::bind(path)?)
-        }
+        Some(path) => match socket::Served::bind(path) {
+            Ok(served) => Some(served),
+            Err(socket::NotServed::Taken) => {
+                bail!("another daemon serves {}", path.display())
+            }
+            Err(socket::NotServed::Failed(error)) => {
+                return Err(error).with_context(|| format!("listening on {}", path.display()));
+            }
+        },
         None if args.watch => None,
         None => return Ok(()),
     };
@@ -2964,19 +3110,27 @@ fn main() -> anyhow::Result<()> {
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
-    if let Some(listener) = listener {
+    if let Some(served) = listener {
         let sender = sender.clone();
+        // Each connection is read by a thread of its own: one that sends nothing, or
+        // slowly, keeps no other from being heard.
         std::thread::spawn(move || {
-            while let Ok(request) = requested(&listener) {
-                if sender.send(Event::Asked(request)).is_err() {
-                    break;
-                }
+            for stream in served.listener.incoming().flatten() {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    if let Some(request) = requested(stream) {
+                        // The daemon is ending when nothing takes requests any more.
+                        let _ = sender.send(Event::Asked(request));
+                    }
+                });
             }
         });
     }
     // The first is the program asked for when a request names none.
     let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
+    let tests = Some(hir::attach_db(&db, || Tests::of(&db, &listed, &args)));
     let mut programs = vec![Program {
+        tests,
         args,
         table: Arc::new(table),
         known,
@@ -3221,6 +3375,7 @@ fn main() -> anyhow::Result<()> {
                                 unlinked: false,
                             };
                             let mut program = Program {
+                                tests: None,
                                 args,
                                 table,
                                 known,
@@ -3507,6 +3662,7 @@ fn main() -> anyhow::Result<()> {
                     whole: None,
                     interrupted: program.interrupted,
                     moved: program.moved,
+                    tests: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept });
@@ -3825,7 +3981,7 @@ impl Program {
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
-        let Program { args, table, known, unbuilt, wrote, whole, .. } = self;
+        let Program { args, table, known, unbuilt, wrote, whole, tests, .. } = self;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
@@ -3866,6 +4022,13 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
+        match tests {
+            Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
+            // The first build of the program is of the source rustc built it from.
+            None if failed.is_none() => *tests = Some(tests_now),
+            None => {}
+        }
         if failed.is_none() || known.stats.patched.is_none() {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
