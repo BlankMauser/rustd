@@ -370,7 +370,7 @@ def transfers(top, remote):
     parts = proxy.seen("PUT", "partNumber=")
     check("a big pack goes up in parts, a few at a time",
           out.returncode == 0 and len(parts) == 3 and proxy.seen("POST", r"uploads") and proxy.seen("POST", "uploadId=")
-          and bucket.objects().get("packs/" + name) == BIG and not bucket.uploads(), f"{len(parts)} parts")
+          and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads(), f"{len(parts)} parts")
     check("rustd counts the requests the proxy saw", said_number(out.stderr, "requests") == len(proxy.requests),
           f"{said_number(out.stderr, 'requests')} and {len(proxy.requests)}")
     proxy.clear()
@@ -390,7 +390,7 @@ def transfers(top, remote):
               proxy.fault("PUT", "/manifests/", times=1, status=503)]
     out = a.rustd("cache", "push", address)
     check("5xx on a part, on completing and on the manifest: sent again",
-          out.returncode == 0 and [it.hits for it in faults] == [2, 1, 1] and digest(bucket.get("packs/" + name)) == name[:-5])
+          out.returncode == 0 and [it.hits for it in faults] == [2, 1, 1] and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5])
 
     a, b, address, bucket, name = pushed("always 503")
     proxy.fault("GET", "/packs/", times=1000, status=503)
@@ -416,7 +416,7 @@ def transfers(top, remote):
     fault = proxy.fault("PUT", "partNumber=1", times=1, cut_request=2 * MIB)
     out = a.rustd("cache", "push", address)
     check("the connection dropped in the middle of a part: sent again",
-          out.returncode == 0 and fault.hits == 1 and digest(bucket.get("packs/" + name) or b"") == name[:-5] and not bucket.uploads())
+          out.returncode == 0 and fault.hits == 1 and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads())
 
     a, b, address, bucket, name = pushed("stall")
     fault = proxy.fault("GET", "/packs/", times=1, stall=(3 * MIB, 6))
@@ -536,10 +536,10 @@ def transfers(top, remote):
     proxy.rate = None
     objects = bucket.objects()
     check("the service killed in a push: said, no pack and no manifest in the bucket",
-          out.returncode != 0 and "packs/" + name not in objects and "manifests/default" not in objects, out.stderr.strip()[-60:])
+          out.returncode != 0 and "packs/" + name + ".zst" not in objects and "manifests/default" not in objects, out.stderr.strip()[-60:])
     out = a.rustd("cache", "push", address)
     check("back: the push goes through and no upload is left unfinished",
-          out.returncode == 0 and digest(bucket.get("packs/" + name) or b"") == name[:-5] and not bucket.uploads(),
+          out.returncode == 0 and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads(),
           out.stdout.strip())
 
 
@@ -666,7 +666,7 @@ def over_tls(top, remote):
         out = b.rustd("cache", "pull", address, env=trusting)
         check("a big pack sent and fetched over TLS, the certificate trusted through SSL_CERT_FILE",
               sent.returncode == 0 and out.returncode == 0 and b.packs() == {name: True}
-              and digest(bucket.get("packs/" + name) or b"") == name[:-5], out.stdout.strip())
+              and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5], out.stdout.strip())
         b.empty()
         out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_TIMEOUT": "2"})
         check("a certificate nobody vouches for: refused, said, nothing fetched",
@@ -689,20 +689,35 @@ def spoiled(top, remote):
         other = big_store(a, f"{remote.name} {what} whole") if what == "one byte changed" else None
         if a.rustd("cache", "push", address).returncode != 0:
             raise SystemExit("the push failed")
-        bucket.put("packs/" + name, spoil(data))
+        sent = bucket.get("packs/" + name + ".zst")
+        bucket.put("packs/" + name + ".zst", spoil(sent))
         out = b.rustd("cache", "pull", address)
         check(f"a pack with {what}: rejected, said, counted, not in the store",
-              out.returncode != 0 and name not in b.packs() and not b.partials() and "rejected packs/" + name in out.stderr
+              out.returncode != 0 and name not in b.packs() and not b.partials() and "rejected packs/" + name + ".zst" in out.stderr
               and said_number(out.stderr, "objects rejected") == 1 and (other is None or b.packs() == {other: True}),
               out.stderr.strip().split("\n")[-1][-60:])
-        bucket.put("packs/" + name, data)
+        bucket.put("packs/" + name + ".zst", sent)
         out = b.rustd("cache", "pull", address)
         check("put back: fetched", out.returncode == 0 and b.packs().get(name) is True)
+    # An object that is what the manifest says and unpacks to something else than the pack.
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"s-{remote.name}-inside-{it}", remote) for it in "ab")
+    name = a.add_pack(filler(f"{remote.name} inside", MIB))
+    a.rustd("cache", "push", address)
+    line = bucket.get("manifests/default").decode().split()
+    for what, inside in (("another pack inside", packed(filler(f"{remote.name} other", MIB))), ("not compressed inside", b"x" * 4096)):
+        bucket.put("packs/" + name + ".zst", inside)
+        bucket.put("manifests/default", (" ".join(line[:4] + [digest(inside), str(len(inside))]) + "\n").encode())
+        out = b.rustd("cache", "pull", address)
+        check(f"a compressed object with {what}: rejected after unpacking, nothing left",
+              out.returncode != 0 and not b.packs() and not b.partials() and "rejected packs/" + name + ".zst" in out.stderr
+              and said_number(out.stderr, "objects rejected") == 1 and b.cache("verify")[0],
+              out.stderr.strip().split("\n")[-1][-60:])
     address, bucket = remote.fresh()
     a, b = (Machine(top, f"s-{remote.name}-gone-{it}", remote) for it in "ab")
     name = big_store(a, f"{remote.name} gone")
     a.rustd("cache", "push", address)
-    bucket.delete("packs/" + name)
+    bucket.delete("packs/" + name + ".zst")
     out = b.rustd("cache", "pull", address)
     check("a pack the manifest lists that is not there: said", out.returncode != 0 and "is listed and is not there" in out.stderr
           and not b.packs() and not b.partials())
@@ -722,11 +737,11 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
         return m
 
     # 1. The pack A sent, changed in place: its name no longer fits.
-    pack = "packs/" + listed[0][0] + ".pack"
+    pack = "packs/" + listed[0][0] + ".pack.zst"
     data = bucket.get(pack)
-    records = records_of(data)
+    records = records_of(unpacked(data))
     changed = pack_of([(key, value[:-1] + bytes([value[-1] ^ 0x55]) if value else value) for key, value in records])
-    bucket.put(pack, changed)
+    bucket.put(pack, packed(changed))
     b = machine("changed")
     log, _ = b.build(crates, env={"RUSTD_REMOTE": address})
     check("code changed under A's name: rejected, B compiles its own and prints the same",
