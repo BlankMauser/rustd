@@ -1175,7 +1175,9 @@ fn compiled_instance<'db>(
             return compile(db, env, None, false, instance.checked, |fx| fx.fn_pointer_shim(ty()));
         }
         InstanceDef::ReifyShim { receiver } => {
-            return compile(db, env, None, false, instance.checked, |fx| fx.reify_shim(ty(), receiver));
+            return compile(db, env, None, false, instance.checked, |fx| {
+                fx.reify_shim(ty(), receiver)
+            });
         }
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)

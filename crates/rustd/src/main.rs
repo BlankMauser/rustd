@@ -2233,6 +2233,23 @@ struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
 }
 
+/// Why an edit is to a crate the daemon does not build, when one is.
+fn left_to_rustc(
+    db: &RootDatabase,
+    listed: &Listed,
+    edited: &[vfs::FileId],
+    watched: &Sources,
+) -> Option<String> {
+    let (file, krate) = edited.iter().find_map(|&it| Some((it, listed.left_to_rustc(db, it)?)))?;
+    let path = watched.paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
+    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
+    let name = name.unwrap_or_else(|| "a crate without a name".to_owned());
+    Some(format!(
+        "{path} is of `{name}`, which the program uses and the daemon was not asked to \
+         build: rustc's copy of it is from before the edit, name the crate with `--crate`"
+    ))
+}
+
 /// Why the source as it is can't be built by the daemon, when it can't.
 fn refusal(
     db: &RootDatabase,
@@ -4102,7 +4119,9 @@ impl Program {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        let mut failed = left_to_rustc(db, listed, &edited, paths)
+            .or_else(|| refusal(db, &edited, paths, out_of_date))
+            .or(broken);
         if failed.is_none() || known.stats.patched.is_none() {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
