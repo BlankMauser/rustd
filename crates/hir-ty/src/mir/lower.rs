@@ -2058,6 +2058,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
+            // rustc's `promote_consts::Validator::validate_rvalue`.
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(mutability)), .. },
+            ] => {
+                let shared = matches!(Mutability::from(*mutability), Mutability::Not);
+                let reference = self.expr_ty_without_adjust(expr).as_reference().is_some();
+                shared && reference && self.is_promotable_unadjusted(expr)
+            }
             _ => false,
         }
     }
