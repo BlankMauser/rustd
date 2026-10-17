@@ -33,6 +33,8 @@ cases![
     const_bytes_match,
     link_name_macro,
     const_pattern,
+    cfg_variant_match,
+    powi,
     simd_sums,
     variant_alias,
     two_bitflags,

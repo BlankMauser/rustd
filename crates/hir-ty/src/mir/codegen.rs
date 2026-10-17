@@ -9136,6 +9136,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            ("powif32" | "powif64", [base, power]) => {
+                let (base, float) = self.load_scalar(base)?;
+                let (power, _) = self.load_scalar(power)?;
+                // compiler-builtins multiplies as LLVM's `llvm.powi` is lowered to do.
+                let name = if float.ty == types::F32 { "__powisf2" } else { "__powidf2" };
+                let value =
+                    self.builtin(name, &[float.ty, types::I32], float.ty, &[base, power])?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             ("fmaf32" | "fmaf64" | "fmuladdf32" | "fmuladdf64", [a, b, c]) => {
                 let (a, scalar) = self.load_scalar(a)?;
                 let (b, _) = self.load_scalar(b)?;
