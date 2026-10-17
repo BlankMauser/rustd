@@ -101,8 +101,7 @@ includes, and also deps and keys) passed on the first run; nothing needed fixing
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
 -p syntax -p rustd` passes. `cargo clippy -p rustd -p hir-ty --all-targets` has no errors.
 
-GitHub Actions, on 8354d5f92f (the commit before this report was filled in; the report is
-the only difference):
+GitHub Actions, on 8354d5f92f (the commits after it change this report only):
 
 | job | result |
 |---|---|
@@ -111,7 +110,7 @@ the only difference):
 | harness (cranelift), Linux x86-64 | green |
 | harness (llvm), Linux x86-64 | green |
 | fmt and tests, Linux | green |
-| coverage (another workflow) | red, as on 6d12f21c86: the same 18 `hir-ty` tests fail on both |
+| coverage (another workflow) | red, as on 6d12f21c86: `1033 passed; 18 failed` in one test binary on both (I compared the counts, not the names) |
 
 So Linux x86-64 was run on this branch, by CI, not by me locally.
 
