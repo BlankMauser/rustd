@@ -6,7 +6,8 @@ closures, generics, recursion, panics and foreign calls, and the steps edit each
 first do something to the linked binary (strip it, touch it, run it). After every step the
 binary is run as it is and with everything bound at once (LD_BIND_NOW, or DYLD_BIND_AT_LAUNCH
 on macOS), read by readelf (there: its signature verified and its fixups read by dyld_info), and compared with what
-`cargo build` of the same source prints. How each step got linked is counted, not judged.
+`cargo build` of the same source prints. How each step got linked is counted, and where SPLICED
+has the target, the number of steps that were spliced has to be the one it says.
 
 RUSTD_SPLICE=0   link each edit in full (the same test of the full link)
 SPLICES_NO_PIE   link the daemon's binary with -no-pie
@@ -17,7 +18,11 @@ import os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET_ARGS, built, WASM
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET, TARGET_ARGS, built, WASM, host
+
+# How many of the steps are spliced, by target: the rest link in full for the reasons printed,
+# and one more of them is a splice that got worse. A target that is not here is held to none.
+SPLICED = {"x86_64-pc-windows-msvc": 61}
 
 TOML = """[package]
 name = "sedge"
@@ -578,6 +583,10 @@ def main():
     for how, count in sorted(hows.items(), key=lambda it: -it[1]):
         print(f"  {count:3} {how}")
     print(f"{len(STEPS) - wrong} of {len(STEPS)} right; log {log_path}; source {ws}")
+    spliced, expected = hows.get("spliced", 0), SPLICED.get(TARGET or host())
+    if expected not in (None, spliced):
+        print(f"{spliced} steps spliced, where {expected} do")
+        wrong += 1
     sys.exit(1 if wrong or soak_wrong else 0)
 
 
