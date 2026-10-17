@@ -106,6 +106,9 @@ struct Args {
     /// Load what the tests, examples and benchmarks of the workspace depend on: a target of
     /// those kinds is built.
     dev_deps: bool,
+    /// Run build scripts and build proc macros in a directory of rustd's own under the
+    /// target directory, so that nothing here waits for a cargo that is building there.
+    own_target: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
     /// Build without the default features of the package, as `--no-default-features` does.
@@ -180,6 +183,7 @@ impl Args {
         let mut isolate = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
+        let mut own_target = false;
         let mut features = Vec::new();
         let mut no_default_features = false;
         let (mut packages, mut workspace) = (Vec::new(), false);
@@ -204,6 +208,7 @@ impl Args {
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
                 "--dev-deps" => dev_deps = true,
+                "--own-target" => own_target = true,
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
@@ -237,6 +242,7 @@ impl Args {
             isolate,
             cfg_test,
             dev_deps,
+            own_target,
             features,
             no_default_features,
             packages,
@@ -1199,11 +1205,13 @@ impl Checkouts {
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-                && self.cargo_config.target_dir_config == TargetDirectoryConfig::None
+                && !matches!(self.cargo_config.target_dir_config, TargetDirectoryConfig::Directory(_))
             {
                 let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-                self.cargo_config.target_dir_config =
-                    TargetDirectoryConfig::Directory(target.to_owned());
+                let scripts = self.cargo_config.target_dir_config.target_dir(Some(target));
+                self.cargo_config.target_dir_config = TargetDirectoryConfig::Directory(
+                    scripts.map_or_else(|| target.to_owned(), |it| it.into_owned()),
+                );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
             self.inputs.watch(&root, &workspace, &self.cargo_config);
@@ -2536,6 +2544,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             isolate: None,
             cfg_test: args.cfg_test,
             dev_deps: args.dev_deps,
+            own_target: args.own_target,
             features: args.features.clone(),
             no_default_features: args.no_default_features,
             packages: args.packages.clone(),
@@ -3168,6 +3177,10 @@ fn main() -> anyhow::Result<()> {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
+        target_dir_config: match args.own_target {
+            true => TargetDirectoryConfig::UseSubdirectory,
+            false => TargetDirectoryConfig::None,
+        },
         ..Default::default()
     };
     let selection = plan::Selection {

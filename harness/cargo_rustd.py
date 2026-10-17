@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """cargo_rustd.py: `cargo rustd` against plain cargo on real projects, unmodified.
 
-    cargo_rustd.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--keep]
+    cargo_rustd.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--rustd] [--plain] [--keep]
 
-Three parts, all of which have to pass.
+Four parts, all of which have to pass.
 
 Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `RUSTD_PROJECTS` (~/rustd-projects) when
 it is not there, and copied; the clone is never written to. In the copy, with plain cargo
@@ -18,12 +18,22 @@ After every step the program's output and exit status and the result of every te
 what plain cargo gives for the same source. A build cargo did in place of the daemon passes
 (that is the contract) and is in the table with the reason.
 
+Every project is run twice, in a fresh copy each time: with `cargo rustd`, and with plain
+cargo in a cargo home in which `rustd enable` was run. `--rustd` or `--plain` runs the one.
+Then a second checkout of the repository is built, edited and built again, and the
+functions the daemon compiled itself are counted.
+
 Flags. A small workspace made here is built and run with each flag `cargo rustd` passes
 through, cold and after an edit, and compared with cargo the same way.
 
 Daemon. Started on demand, reused, shared by a git worktree, alive after its client is
 killed, replaced when the client is another build of rustd, gone when idle, and its workers
 gone with it.
+
+Plain cargo. `rustd enable` and `rustd disable` over a cargo configuration that is there,
+that is not, and that is edited in between; a wrapper the user had; what a project's own
+configuration and the environment do; and plain `cargo build`, `run`, `test`, `check`,
+`install` and doc tests with the daemon there, killed, and of another version.
 
 Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLVM.md and
 cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
@@ -134,6 +144,8 @@ PROJECTS = {
 
 # The projects of the CI job: small, and a build script, a workspace and a test suite among them.
 SMALL = ["ripgrep", "fd", "hyperfine"]
+# How a project is built: the name of the mode, and how the report names it.
+MODES = {"rustd": "`cargo rustd`", "plain": "plain cargo after `rustd enable`"}
 
 # What cargo and `cargo rustd` print about the build, which is not the program's output.
 STATUS = re.compile(r"^\s*((Compiling|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
@@ -153,16 +165,72 @@ def timed(argv, cwd, env, timeout=7200):
     return time.time() - began, ran
 
 
+def enabled_home(work, env):
+    """A cargo home in which `rustd enable` was run, with what the user's has downloaded.
+    The result is the environment that has cargo use it."""
+    home = os.path.join(work, "cargo-home")
+    env = dict(env, CARGO_HOME=home)
+    if not os.path.isdir(home):
+        os.makedirs(home)
+        downloads(home)
+        subprocess.run([RUSTD, "enable"], env=env, check=True, capture_output=True)
+    return env
+
+
+def downloads(home):
+    """Has the cargo home `home` use what the user's has downloaded."""
+    users = os.environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo")
+    for kept in ("registry", "git"):
+        if os.path.isdir(os.path.join(users, kept)):
+            os.symlink(os.path.join(users, kept), os.path.join(home, kept))
+
+
 class Side:
-    """One of the two builds of a checkout: `cargo rustd`, or cargo into `target-ref`."""
+    """One of the builds of a checkout: `cargo rustd` (`True`), plain cargo once `rustd
+    enable` was run (`"plain"`), or cargo alone into `target-ref` (`False`)."""
 
     def __init__(self, ws, env, rustd):
-        self.ws, self.rustd = ws, rustd
+        self.ws, self.rustd, self.plain = ws, bool(rustd), rustd == "plain"
         self.env = env if rustd else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
+        self.tally = os.path.join(env["RUSTD_HOME"], "plain-cargo.log")
+        self.read = 0
+
+    def argv(self, command, *args):
+        if self.plain:
+            return [RUSTD, command] if command in ("status", "stop") else ["cargo", command, *args]
+        return ["cargo", *(["rustd"] if self.rustd else []), command, *args]
 
     def cargo(self, command, *args, env=None, timeout=7200):
-        argv = ["cargo", *(["rustd"] if self.rustd else []), command, *args]
-        return timed(argv, self.ws, dict(self.env, **(env or {})), timeout)
+        return timed(self.argv(command, *args), self.ws, dict(self.env, **(env or {})), timeout)
+
+    def how_built(self, stderr):
+        """Whether the daemon built what the last command asked for, or why cargo did."""
+        if not self.plain:
+            return how_built(stderr)
+        lines = open(self.tally).read().splitlines() if os.path.exists(self.tally) else []
+        new, self.read = lines[self.read:], len(lines)
+        reasons = [l.split("\t", 1)[1] for l in new if l.startswith("rustc\t")]
+        if reasons:
+            return "cargo: " + reasons[0]
+        if not new:
+            return "cargo" if re.search(r"^\s*Compiling ", stderr, re.M) else "nothing to build"
+        return "daemon"
+
+    def settled(self):
+        """Waits until no build of plain cargo is still being handed to the daemon."""
+        settling = os.path.join(self.env["RUSTD_HOME"], "settling")
+        began = time.time()
+        while self.plain and os.path.isdir(settling) and os.listdir(settling) and time.time() - began < WARMUP_SECS:
+            time.sleep(0.05)
+
+    def share(self):
+        """The functions of the largest load the daemon compiled itself, of all it has."""
+        loads = []
+        workers = os.path.join(self.env["RUSTD_HOME"], "workers")
+        for worker in os.listdir(workers) if os.path.isdir(workers) else []:
+            log = open(os.path.join(workers, worker, "log"), errors="replace").read()
+            loads += [(int(of), int(done)) for done, of in re.findall(r"^cold: compiled (\d+) of (\d+) fns", log, re.M)]
+        return max(loads, default=(0, 0))[::-1]
 
 
 def how_built(stderr):
@@ -237,8 +305,7 @@ def fetched(url):
 
 def served(side, command, ask):
     """What the server `cargo run` starts on `side` answers when `ask` asks it."""
-    argv = ["cargo", *(["rustd"] if side.rustd else []), "run", *command]
-    server = subprocess.Popen(argv, cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    server = subprocess.Popen(side.argv("run", *command), cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         for _ in range(3000):
             if server.poll() is not None:
@@ -264,6 +331,7 @@ def wait_warm(side, root):
     """Waits until the daemon has every build of `root` loaded or has given up on one. The
     result is the seconds it took and how each ended."""
     began = time.time()
+    side.settled()
     while time.time() - began < WARMUP_SECS:
         _, status = side.cargo("status")
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
@@ -293,16 +361,18 @@ def fetch(name, spec):
     return source
 
 
-def project(name, spec, work):
-    """Runs the steps of one project. The result is the row of the table: times, who built
+def project(name, spec, work, mode):
+    """Runs the steps of one project with `cargo rustd` (`mode` "rustd") or with plain cargo
+    after `rustd enable` ("plain"). The result is the row of the table: times, who built
     each step, and every difference from cargo."""
     source = fetch(name, spec)
     ws = os.path.realpath(os.path.join(work, name))
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
-    env = dict(base_env(os.path.join(work, "home")), **spec.get("env", {}))
-    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    env = dict(base_env(os.path.join(work, "home-" + mode)), **spec.get("env", {}))
+    plain = mode == "plain"
+    ours, theirs = Side(ws, enabled_home(work, env) if plain else env, "plain" if plain else True), Side(ws, env, False)
     build, run, test = spec.get("build", []), spec.get("run", []), spec.get("test", [])
-    row = dict(project=name, tag=spec["tag"], wrong=[], times={}, built={})
+    row = dict(project=name, mode=mode, tag=spec["tag"], wrong=[], times={}, built={})
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
     ours.cargo("stop")
 
@@ -310,7 +380,7 @@ def project(name, spec, work):
         """Runs `command` on both sides and compares what `compare` reads from each."""
         (took, mine), (reference, other) = ours.cargo(command, *args), theirs.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(reference, 2))
-        row["built"][label] = how_built(mine.stderr)
+        row["built"][label] = ours.how_built(mine.stderr)
         wrong = difference(compare(mine), compare(other))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
@@ -359,6 +429,9 @@ def project(name, spec, work):
     open(path, "w").write(edited)
     step("mended", "build", build, status)
     runs("mended run")
+    worktree(ours, row, build, [*build, "--", *run] if not ask else None, spec["edits"], work)
+    row["share"] = ours.share()
+    print(f"  functions    {row['share'][0]} of {row['share'][1]} compiled by rustd", flush=True)
     _, counted = ours.cargo("status")
     row["status"] = counted.stdout
     ours.cargo("stop")
@@ -674,10 +747,286 @@ def stranger(home, check):
         sudo("userdel", name)
 
 
+WRAPPER = '#!/bin/sh\necho "$1" >> "{log}"\nexec "$@"\n'
+DOCTEST = '/// ```\n/// assert_eq!(util::doubled(2), 4);\n/// ```\npub fn doubled(n: u32) -> u32 {\n    n * 2\n}\n'
+
+
+def switches(work, env, check):
+    """`rustd enable` and `rustd disable` over the cargo configurations a user may have."""
+    rustd = lambda home, *args, cwd=None, **more: subprocess.run([RUSTD, *args], env=dict(env, CARGO_HOME=home, **more), cwd=cwd or work, capture_output=True, text=True)
+    cases = [
+        ("no configuration", "config.toml", None),
+        ("a configuration with other settings", "config.toml", '# mine\n[net]\noffline = false\n\n[build]\njobs = 4 # all of them\n'),
+        ("a configuration in the old file name", "config", '[term]\ncolor = "never"\n'),
+        ("a dotted `build.rustc-wrapper`", "config.toml", 'build.rustc-wrapper = "/usr/bin/env"\n'),
+        ("a workspace wrapper of the user's", "config.toml", '[build]\nrustc-workspace-wrapper = "/usr/bin/env"\n'),
+    ]
+    for n, (name, file, text) in enumerate(cases):
+        home = os.path.join(work, f"switch-{n}")
+        os.makedirs(home)
+        config = os.path.join(home, file)
+        if text is not None:
+            open(config, "w").write(text)
+        on = rustd(home, "enable")
+        named = os.path.exists(config) and "rustd-rustc" in open(config).read()
+        again = rustd(home, "enable")
+        seen = rustd(home, "status").stdout.splitlines()[0]
+        off = rustd(home, "disable")
+        same = (open(config).read() if os.path.exists(config) else None) == text
+        left = sorted(os.listdir(home)) == ([file] if text is not None else [])
+        check(f"enable and disable over {name} leave it as it was", on.returncode == 0 and named and again.returncode == 0 and "through rustd" in seen and off.returncode == 0 and same and left, f"{seen[:70]}; {'same bytes' if same else 'DIFFERENT'}")
+
+    home = os.path.join(work, "switch-edited")
+    os.makedirs(home)
+    config = os.path.join(home, "config.toml")
+    open(config, "w").write('[build]\njobs = 2\n')
+    rustd(home, "enable")
+    open(config, "a").write('\n[net]\noffline = false\n')
+    off = rustd(home, "disable")
+    text = open(config).read()
+    check("disable after the user edited the file takes rustd's line out and keeps the edit", off.returncode == 0 and "rustd" not in text and "offline = false" in text and "jobs = 2" in text, repr(text))
+
+    rustd(home, "enable")
+    project = os.path.join(work, "switch-project")
+    os.makedirs(os.path.join(project, ".cargo"))
+    open(os.path.join(project, ".cargo/config.toml"), "w").write('[build]\nrustc-workspace-wrapper = "/usr/bin/env"\n')
+    below = rustd(home, "status", cwd=project).stdout
+    check("status says a project's own configuration has cargo not run rustd there", "not below " + project in below, below.splitlines()[1] if below.count("\n") > 1 else below)
+    shell = rustd(home, "status", RUSTC_WORKSPACE_WRAPPER="/usr/bin/env").stdout
+    check("status says a RUSTC_WORKSPACE_WRAPPER of the shell has cargo not run rustd", "not in this shell" in shell)
+    rustd(home, "disable")
+
+
+def plain(work):
+    """Plain cargo once `rustd enable` was run. The result is each check with whether it held."""
+    checks = []
+
+    def check(name, held, detail=""):
+        checks.append((name, bool(held), detail))
+        print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+
+    env = base_env(os.path.join(work, "home-plain-checks"))
+    switches(work, env, check)
+
+    ws = os.path.realpath(os.path.join(work, "plain"))
+    for file, text in FLAG_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    open(os.path.join(ws, "util/src/lib.rs"), "a").write(DOCTEST)
+    open(os.path.join(ws, "util/build.rs"), "w").write('fn main() {\n    println!("cargo:rustc-cfg=built");\n}\n')
+    open(os.path.join(ws, ".gitignore"), "w").write("target\ntarget-ref\n")
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ws, check=True, capture_output=True)
+    git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
+
+    # A wrapper of the user's around rustc, as sccache is, and one around the workspace's crates.
+    home = os.path.join(work, "plain-cargo-home")
+    os.makedirs(home)
+    logs = {}
+    for name in ("outer", "inner"):
+        logs[name] = os.path.join(work, f"plain-{name}.log")
+        script = os.path.join(work, f"plain-{name}.sh")
+        open(script, "w").write(WRAPPER.format(log=logs[name]))
+        os.chmod(script, 0o755)
+    before = f'[build]\nrustc-wrapper = "{work}/plain-outer.sh"\nrustc-workspace-wrapper = "{work}/plain-inner.sh"\n'
+    open(os.path.join(home, "config.toml"), "w").write(before)
+    downloads(home)
+    env = dict(env, CARGO_HOME=home)
+    on = subprocess.run([RUSTD, "enable"], env=env, capture_output=True, text=True)
+    here, alone = Side(ws, env, "plain"), Side(ws, base_env(env["RUSTD_HOME"]), False)
+    calls = lambda name: open(logs[name]).read().splitlines() if os.path.exists(logs[name]) else []
+    edit = lambda text, root=ws: rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("', f'format!("{text} ')
+    touch = lambda text, root=ws: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
+
+    alive = lambda pid: os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
+
+    def status(rustd=RUSTD):
+        text = subprocess.run([rustd, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
+        pid = re.search(r"^daemon: pid (\d+)", text, re.M)
+        return (int(pid[1]) if pid else None), [int(p) for p in re.findall(r"worker: pid (\d+)", text)], text
+
+    def same(command, *args, more=None):
+        """One command by plain cargo with rustd enabled and by cargo alone: what differs."""
+        _, mine = here.cargo(command, *args, env=more)
+        _, other = alone.cargo(command, *args, env=more)
+        compare = test_results if command == "test" else program_output
+        return mine, here.how_built(mine.stderr), difference(compare(mine), compare(other))
+
+    first, how, wrong = same("run")
+    outer, inner = calls("outer"), calls("inner")
+    check("the first plain `cargo run` is rustc's and is right", first.returncode == 0 and not wrong and how.startswith("cargo"), f"{how}; {wrong or 'same as cargo'}")
+    check("the user's `rustc-wrapper` still runs, around rustd's wrapper", "chained" not in on.stdout and any("rustd-rustc" in c for c in outer), f"{len(outer)} calls")
+    check("the user's workspace wrapper still runs, under rustd's", "plain-inner.sh" in on.stdout and len(inner) > 0 and not any("rustd-rustc" in c for c in inner), f"{len(inner)} calls")
+    took, states = wait_warm(here, ws)
+    pid, workers, _ = status()
+    check("the daemon was started by that build and has loaded it", pid is not None and "ready" in " ".join(states), f"pid {pid}, {'; '.join(states)}, {took:.1f}s")
+
+    touch("one")
+    mine, how, wrong = same("run", "one")
+    check("an edit of the program is linked by the daemon", mine.returncode == 0 and not wrong and how == "daemon", f"{how}; {wrong or 'same as cargo'}")
+    edit("lib")
+    mine, how, wrong = same("run", "lib")
+    check("an edit of a library of the workspace is built by the daemon into the program", mine.returncode == 0 and not wrong and how == "daemon" and mine.stdout == "lib hello lib\n", f"{how}; {wrong or 'same as cargo'}")
+    took, noop = here.cargo("run")
+    check("a build with nothing changed runs nothing", noop.returncode == 0 and "Compiling" not in noop.stderr, f"{took:.2f}s")
+
+    cases = [
+        ("test", [], None), ("test", ["--doc"], None), ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
+        ("run", ["--example", "demo"], None), ("run", ["--release"], None),
+        ("run", ["--target", "x86_64-unknown-linux-gnu"], None), ("run", ["--bin", "other"], None),
+        ("run", ["--features", "loud", "-p", "app"], None), ("run", ["--", "fail"], None),
+        ("check", [], None), ("check", ["--all-targets"], None), ("build", ["--workspace", "--all-targets"], None),
+    ]
+    for round in ("first", "edited"):
+        for command, args, more in cases:
+            mine, how, wrong = same(command, *args, more=more)
+            name = " ".join(["cargo", command, *args, *(f"{k}={v}" for k, v in (more or {}).items())])
+            check(f"`{name}`, {round}", not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
+        wait_warm(here, ws)
+        touch(round)
+        edit(round)
+
+    broken = os.path.join(ws, "app/src/main.rs")
+    kept = open(broken).read()
+    open(broken, "a").write("\nfn broken() -> u32 { \"text\" }\n")
+    mine, how, wrong = same("build")
+    check("a build that does not compile fails as cargo's does, with rustc's error", mine.returncode == 101 and "error[E0308]" in mine.stderr and not wrong, how[:90])
+    open(broken, "w").write(kept)
+    mine, how, wrong = same("run", "mended")
+    check("and the build after it is mended is right", mine.returncode == 0 and not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
+
+    root = os.path.join(work, "plain-installed")
+    _, installed = here.cargo("install", "--path", "app", "--root", root, "--bin", "app")
+    ran = subprocess.run([os.path.join(root, "bin/app"), "installed"], capture_output=True, text=True)
+    check("`cargo install` installs a program that runs", installed.returncode == 0 and ran.returncode == 0 and ran.stdout.endswith("hello installed\n"), ran.stdout.strip() or installed.stderr[-200:])
+
+    # What rust-analyzer does while the user builds: `cargo check` with JSON messages.
+    wait_warm(here, ws)
+    touch("checked")
+    checker = subprocess.Popen(["cargo", "check", "--workspace", "--all-targets", "--message-format=json"], cwd=ws, env=here.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    mine, how, wrong = same("run", "checked")
+    out, _ = checker.communicate(timeout=600)
+    whole = all(line.startswith("{") for line in out.splitlines())
+    check("a `cargo check` with JSON messages at the same time as a build: both are right", checker.returncode == 0 and whole and mine.returncode == 0 and not wrong, f"{how[:60]}; {len(out.splitlines())} messages; {wrong or 'same as cargo'}")
+
+    trees = [ws]
+    for n in (1, 2, 3):
+        trees.append(os.path.realpath(os.path.join(work, f"plain-worktree{n}")))
+        git("worktree", "add", "-q", "--detach", trees[-1])
+    sides = [Side(root, env, "plain") for root in trees]
+    for side in sides[1:]:
+        side.cargo("build")
+    for side in sides:
+        wait_warm(side, side.ws)
+    pid, workers, text = status()
+    check("the worktrees are loaded by the one daemon", pid is not None and all(f"    {root}: ready" in text for root in trees), f"{len(workers)} workers")
+    for n, root in enumerate(trees[1:], 1):
+        rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("hello {name}")', f'format!("tree{n} {{name}}")')
+    here.how_built("")
+    spawn = lambda root, *args: subprocess.Popen(["cargo", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    clients = [(n, i, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees) if n]
+    ended = [(n, i, client.communicate(timeout=600), client.returncode) for n, i, client in clients]
+    right = [code == 0 and out[0] == f"tree{n} c{i}\n" for n, i, out, code in ended]
+    check("12 plain cargo builds at once on 3 worktrees each run their own tree's program", all(right) and status()[0] == pid, f"{sum(right)} of 12 right; {here.how_built('')[:80]}")
+
+    for side in sides:
+        wait_warm(side, side.ws)
+    pid, workers, _ = status()
+    touch("killed")
+    signalled = lambda sent: [os.kill(p, sent) for p in workers if alive(p)]
+    signalled(signal.SIGSTOP)
+    client = spawn(ws, "run", "killed")
+    time.sleep(1.5)
+    waits = client.poll() is None
+    os.kill(pid, signal.SIGKILL)
+    signalled(signal.SIGCONT)
+    out, err = client.communicate(timeout=600)
+    said = here.how_built(err)
+    check("the build whose daemon is killed is rustc's, succeeds, and says so", waits and client.returncode == 0 and out.endswith("killed\n") and "the daemon ended" in said and "rustd: " in err, said[:120])
+    wait_warm(here, ws)
+    touch("after")
+    mine, how, wrong = same("run", "after")
+    check("the build after that is a new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status()[0] not in (None, pid), how[:90])
+
+    # Another build of rustd: the same files in another place have another version.
+    other = os.path.join(work, "plain-other-build")
+    os.makedirs(other)
+    for name in ("rustd", "cargo-rustd", "rustd-rustc"):
+        shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
+    pid = status()[0]
+    subprocess.run([RUSTD, "disable"], env=env, capture_output=True)
+    subprocess.run([os.path.join(other, "rustd"), "enable"], env=env, capture_output=True)
+    touch("skew")
+    mine, how, wrong = same("run", "skew")
+    theirs = os.path.join(other, "rustd")
+    began = time.time()
+    while "    " + ws + ": ready" not in status(theirs)[2] and time.time() - began < 120:
+        time.sleep(0.25)
+    newer = status(theirs)[0]
+    check("plain cargo by another build of rustd is rustc's and replaces the daemon", mine.returncode == 0 and not wrong and how.startswith("cargo") and newer not in (None, pid) and not alive(pid), f"{how[:120]}; daemon {pid} then {newer}")
+    touch("skewed")
+    mine, how, wrong = same("run", "skewed")
+    check("and the build after that is the new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status(theirs)[0] == newer, how[:90])
+    subprocess.run([os.path.join(other, "rustd"), "disable"], env=env, capture_output=True)
+
+    seen = subprocess.run([RUSTD, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
+    counted = re.search(r"(\d+) programs? linked by the daemon, (\d+) by rustc", seen)
+    check("status counts what the daemon linked and why rustc linked the rest", counted and int(counted[1]) > 0 and "the daemon ended" in seen, counted[0] if counted else seen[:200])
+    back = open(os.path.join(home, "config.toml")).read()
+    check("after `rustd disable` the configuration is the user's again, byte for byte", back == before)
+    touch("off")
+    n = len(calls("outer"))
+    mine, how, wrong = same("run", "off")
+    check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and "rustd" not in mine.stderr and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n)
+    subprocess.run([RUSTD, "stop"], env=env, capture_output=True)
+    subprocess.run([os.path.join(other, "rustd"), "stop"], env=env, capture_output=True)
+    return checks
+
+
+def worktree(ours, row, build, run, edits, work):
+    """A second checkout of the project's repository, at the commit the first started from:
+    built from nothing, which is cargo's, then edited as the first was and built again. What
+    its program says after the edit has to be what the first one's says."""
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ours.ws, capture_output=True, text=True)
+    tree = os.path.realpath(os.path.join(work, row["project"] + "-worktree"))
+    added = git("worktree", "add", "-q", "--detach", tree)
+    if added.returncode != 0:
+        row["wrong"].append(f"worktree: {added.stderr[-200:]}")
+        return
+    there = Side(tree, ours.env, "plain" if ours.plain else True)
+    ours.how_built("")
+    there.read = ours.read
+
+    def step(label, command, args):
+        took, ran = there.cargo(command, *args)
+        row["times"][label] = (round(took, 2), None)
+        row["built"][label] = there.how_built(ran.stderr)
+        print(f"  {label:12} rustd {took:7.2f}s  {row['built'][label]:8.80}  exit {ran.returncode}", flush=True)
+        return ran
+
+    if step("tree build", "build", build).returncode != 0:
+        row["wrong"].append("tree build: failed")
+    took, states = wait_warm(there, tree)
+    row["times"]["tree warm-up"], row["built"]["tree warm-up"] = (round(took, 2), None), "; ".join(states)
+    print(f"  tree warm-up {took:7.2f}s  {'; '.join(states)[:150]}", flush=True)
+    for file, old, new in edits:
+        rewrite(os.path.join(tree, file), old, new)
+    if step("tree edit", "build", build).returncode != 0:
+        row["wrong"].append("tree edit: failed")
+    if run:
+        _, first = ours.cargo("run", *run)
+        ours.how_built(first.stderr)
+        second = step("tree run", "run", run)
+        wrong = difference(program_output(second), program_output(first))
+        if wrong:
+            row["wrong"].append(f"tree run: {wrong}")
+    git("worktree", "remove", "--force", tree)
+    shutil.rmtree(tree, ignore_errors=True)
+
+
 def table(rows):
     """The table of the report: for every step the seconds of `cargo rustd` and of cargo."""
-    steps = ["cold build", "warm-up", "warm build", "cold test", "test warm-up", "warm test", "edit build", "edit test", "broken", "mended"]
-    out = ["| Project | " + " | ".join(steps) + " | Differences |", "|---|" + "---:|" * len(steps) + "---|"]
+    steps = ["cold build", "warm-up", "warm build", "cold test", "test warm-up", "warm test", "edit build", "edit test", "broken", "mended", "tree build", "tree warm-up", "tree edit"]
+    out = ["| Project | " + " | ".join(steps) + " | Functions by rustd | Differences |", "|---|" + "---:|" * (len(steps) + 1) + "---|"]
     for row in rows:
         cells = []
         for step in steps:
@@ -687,24 +1036,28 @@ def table(rows):
             if "warm-up" in step:
                 mark = "" if who and all(s == "ready" for s in who.split("; ")) else " (f)"
             cells.append("-" if ours is None else f"{ours:.2f}{mark}" if theirs is None else f"{'**' if who == 'daemon' else ''}{ours:.2f}{'**' if who == 'daemon' else ''}{mark} / {theirs:.2f}")
-        out.append(f"| {row['project']} {row['tag']} | " + " | ".join(cells) + f" | {len(row['wrong'])} |")
+        done, of = row.get("share", (0, 0))
+        share = f"{done} of {of} ({100 * done // of}%)" if of else "-"
+        out.append(f"| {row['project']} {row['tag']} | " + " | ".join(cells) + f" | {share} | {len(row['wrong'])} |")
     return "\n".join(out)
 
 
 def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
+    modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
     work = tempfile.mkdtemp(prefix="rustd-cargo-")
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:
         for name in names:
-            print(f"{name}:", flush=True)
-            row = project(name, PROJECTS[name], work)
-            result["projects"].append(row)
-            result["wrong"] += [f"{name}: {w}" for w in row["wrong"]]
-            if "--keep" not in argv:
-                shutil.rmtree(os.path.join(work, name), ignore_errors=True)
+            for mode in modes:
+                print(f"{name}, {MODES[mode]}:", flush=True)
+                row = project(name, PROJECTS[name], work, mode)
+                result["projects"].append(row)
+                result["wrong"] += [f"{name}, {mode}: {w}" for w in row["wrong"]]
+                if "--keep" not in argv:
+                    shutil.rmtree(os.path.join(work, name), ignore_errors=True)
     if "--only-projects" not in argv:
         print("flags:", flush=True)
         rows, wrong, counted = flags(work)
@@ -713,29 +1066,35 @@ def main():
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
+        print("plain cargo:", flush=True)
+        result["plain"] = plain(work)
+        result["wrong"] += [f"plain cargo: {name} {detail}" for name, held, detail in result["plain"] if not held]
     # A run of some of it leaves the rows of the rest as the run before wrote them.
     llvm = os.environ.get("RUSTD_BACKEND") == "llvm"
     stored = os.path.join(HERE, "cargo_rustd_llvm.json" if llvm else "cargo_rustd.json")
     before = json.load(open(stored)) if os.path.exists(stored) else {}
-    rows = {row["project"]: row for row in before.get("projects", []) + result["projects"]}
-    result["projects"] = [rows[name] for name in PROJECTS if name in rows]
+    rows = {(row["project"], row.get("mode", "rustd")): row for row in before.get("projects", []) + result["projects"]}
+    result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
     if "--only-projects" in argv:
-        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon")})
+        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon", "plain")})
     json.dump(result, open(stored, "w"), indent=1)
     with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
-        md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, `cargo rustd` / plain cargo for the same step. "
+        md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, rustd / cargo alone for the same step; the steps in the second checkout (`tree`) are rustd's only. "
                  "Bold is a build the daemon did; `(c)` one cargo did in its place, with the reason below; `(f)` a warm-up that failed. "
                  "Differences counts the steps whose program output, exit status or test results were not cargo's.\n\n")
-        md.write(table(result["projects"]) + "\n\n")
+        for mode, title in MODES.items():
+            md.write(f"## {title}\n\n" + table([r for r in result["projects"] if r.get("mode", "rustd") == mode]) + "\n\n")
         for row in result["projects"]:
             reasons = [f"{step}: {who}" for step, who in row["built"].items() if who.startswith(("cargo: ", "unchanged: ")) or "failed" in who]
             if reasons or row["wrong"]:
-                md.write(f"**{row['project']}**\n\n" + "".join(f"- {r}\n" for r in reasons + row["wrong"]) + "\n")
+                md.write(f"**{row['project']}, {MODES[row.get('mode', 'rustd')]}**\n\n" + "".join(f"- {r}\n" for r in reasons + row["wrong"]) + "\n")
         if result["flags"]:
             md.write("## Flags\n\n| Round | Command | Built by | Exit | Against cargo |\n|---|---|---|---:|---|\n")
             md.writelines(f"| {label} | `{shown}` | {who} | {code} | {same} |\n" for label, shown, who, code, same in result["flags"])
         if result["daemon"]:
             md.write("\n## Daemon\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["daemon"]))
+        if result.get("plain"):
+            md.write("\n## Plain cargo after `rustd enable`\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["plain"]))
     if "--keep" not in argv:
         shutil.rmtree(work, ignore_errors=True)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))

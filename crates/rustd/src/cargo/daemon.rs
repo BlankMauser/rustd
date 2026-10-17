@@ -229,7 +229,7 @@ impl Worker {
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let config = &checkout.config;
         let mut command = Command::new(std::env::current_exe()?);
-        command.arg(checkout.project());
+        command.arg(checkout.project()).arg("--own-target");
         if let Some(target) = &config.target {
             command.args(["--target", target]);
         }
