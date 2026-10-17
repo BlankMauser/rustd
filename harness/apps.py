@@ -110,9 +110,12 @@ class App(Fixture):
         symbols = [x for rlib in self.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         argv = [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj,
                 "--report", report, *self.rustd_args, *symbols]
+        with open(os.path.join(self.work, "all.argv"), "w") as out:
+            out.write(shlex.join(argv))
         began = time.monotonic()
         with open(log, "w") as err:
-            child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err)
+            child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err,
+                                     env={**os.environ, "RUST_BACKTRACE": "1"})
             _, status, usage = os.wait4(child.pid, 0)
         self.rustd_secs, self.rustd_kb = time.monotonic() - began, usage.ru_maxrss
         if status != 0:

@@ -33,6 +33,8 @@ cases![
     variant_alias,
     two_bitflags,
     extern_static,
+    raw_through_deref,
+    dyn_lifetime,
     unsize_assoc_field,
     const_bswap,
     format_blanket_new,

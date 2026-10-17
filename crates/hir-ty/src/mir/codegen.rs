@@ -7532,7 +7532,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         };
         let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
-        Some(self.interner.instantiate_bound_regions_with_erased(principal))
+        let principal = self.interner.instantiate_bound_regions_with_erased(principal);
+        // No lifetime tells one vtable from another.
+        Some(rustc_type_ir::fold_regions(self.interner, principal, |_, _| {
+            Region::new_erased(self.interner)
+        }))
     }
 
     /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a

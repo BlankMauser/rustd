@@ -484,7 +484,7 @@
  "starship": {
   "repo": "https://github.com/starship/starship",
   "rev": "2d8741e4830273ff2bec1fe45e1e7fe6aa979cf4",
-  "package": "starship",
+  "package": "starship", "cargo_args": ["--bin", "starship"],
   "env": {
    "STARSHIP_CONFIG": "/dev/null",
    "STARSHIP_CACHE": "/tmp/starship-apps-cache",

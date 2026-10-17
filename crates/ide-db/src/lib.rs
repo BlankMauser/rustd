@@ -153,6 +153,11 @@ impl RootDatabase {
         krate.set_env(self).to(env);
     }
 
+    /// See [`base_db::Files::has_file_text`].
+    pub fn has_file_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.has_file_text(file_id)
+    }
+
     /// See [`base_db::Files::on_disk`].
     pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
         self.files.on_disk(path)
