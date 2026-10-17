@@ -134,7 +134,9 @@ class App(Fixture):
                                  stdin=stdin, timeout=600, cwd=self.ws, env=self.run_env)
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""
-        return run.returncode, self.scrub(run.stdout), self.scrub(run.stderr)
+        # A program that prints where it is prints a different place for each build.
+        where = os.fsencode(binary)
+        return run.returncode, *(self.scrub(out.replace(where, b"<program>")) for out in (run.stdout, run.stderr))
 
     def scrub(self, output):
         """What a program measures (elapsed times) differs from run to run."""
