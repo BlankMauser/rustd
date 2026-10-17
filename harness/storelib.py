@@ -1,7 +1,8 @@
 """storelib.py: a checkout of the stress workspace under a daemon that keeps a store.
 
-What storekills.py, storecorrupts.py, storefull.py and storeshared.py have in common: the checkout, cargo's
-build of it to compare with, the daemon and its store, and `rustd cache` on that store.
+What storekills.py, storecorrupts.py, storefull.py and storeshared.py have in common: the
+checkout, cargo's build of it to compare with, the daemon and its store, and `rustd cache`
+on that store.
 """
 import os, shutil, subprocess, sys, tempfile, time
 

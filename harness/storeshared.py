@@ -8,8 +8,9 @@ seal packs side by side and read each other's.
 
 First with room for everything: afterwards a daemon that has compiled nothing has to find
 nearly all of its code in what the others sealed. Then with a store that is far too small,
-while `rustd cache gc` evicts and merges in a loop and `rustd cache verify` reads the store in a loop: every program has to print
-what cargo's does, and verify must never find a pack that is not what was written.
+while `rustd cache gc` evicts and merges in a loop and `rustd cache verify` reads the store
+in a loop: every program has to print what cargo's does, and verify must never find a pack
+that is not what was written.
 
     python3 storeshared.py [--daemons N] [--rounds N] [--seed N]
 """
