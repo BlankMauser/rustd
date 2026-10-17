@@ -382,7 +382,7 @@ after arms for every variant are all unreachable for any value and all still hav
 so the array is dropped from the back; an arm covered through an or-pattern, through a
 nested pattern or through an integer literal has none.
 
-So the fix follows rustc's construction. `mir/lower/match_tree.rs` (about 450 lines) turns
+So the fix follows rustc's construction. `mir/lower/match_tree.rs` (about 490 lines) turns
 each arm into what rustc calls a candidate, the list of places its pattern tests, and sorts
 the candidates the way `rustc_mir_build`'s match builder does: take the first test of the
 first candidate, sort the candidates the outcome says something about into its branches,
