@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -27,6 +27,72 @@ use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 /// How long a signed request is good for: one pack on a slow line.
 const SIGNED_FOR: Duration = Duration::from_secs(60 * 60);
 const TRANSFERS: usize = 8;
+
+/// The most bytes that are read of a list: a manifest, or the list of the units of a
+/// project. A line of either is under a hundred bytes, so this is a hundred thousand of them.
+pub(crate) const LIST_MAX: u64 = 16 << 20;
+
+/// The most bytes that are read of one pack or one archive, unless `RUSTD_REMOTE_MAX` says.
+const OBJECT_MAX: u64 = 512 << 20;
+
+/// What the remote's files are held to. Whoever writes to a remote decides how long its
+/// files are, and each is read into memory whole, so none is read past what is taken of it.
+#[derive(Clone, Copy)]
+pub(crate) struct Bounds {
+    /// The most bytes of one pack or one archive.
+    pub(crate) object: u64,
+    /// The most bytes all that one command fetches may come to on the disk.
+    pub(crate) all: Option<u64>,
+}
+
+impl Bounds {
+    const SET: &str = "RUSTD_REMOTE_MAX";
+
+    /// The bound on one file from `RUSTD_REMOTE_MAX`, and `all` on what is written.
+    pub(crate) fn from_env(all: Option<u64>) -> anyhow::Result<Bounds> {
+        let object = match std::env::var(Self::SET) {
+            Err(_) => OBJECT_MAX,
+            Ok(text) => parse_size(&text)
+                .with_context(|| format!("{}=`{text}` is not a size", Self::SET))?,
+        };
+        Ok(Bounds { object, all })
+    }
+}
+
+/// How much one command has written of what it fetched, against the most it may.
+pub(crate) struct Written {
+    bytes: AtomicU64,
+    most: Option<u64>,
+}
+
+impl Written {
+    pub(crate) fn none(most: Option<u64>) -> Written {
+        Written { bytes: AtomicU64::new(0), most }
+    }
+
+    /// Counts `bytes` that are about to be written: an error when they are more than is
+    /// left, before any of them is.
+    pub(crate) fn add(&self, bytes: u64) -> anyhow::Result<()> {
+        let now = self.bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+        match self.most {
+            Some(most) if now > most => {
+                bail!("the remote holds more than the {most} bytes that are taken from it")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// All `from` has when that is at most `most` bytes: an error, with at most one byte more
+/// than that read, when it has more.
+fn read_at_most(mut from: impl Read, most: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    from.by_ref().take(most).read_to_end(&mut bytes)?;
+    if from.read(&mut [0])? != 0 {
+        bail!("{name} is longer than the {most} bytes that are read of it");
+    }
+    Ok(bytes)
+}
 
 pub(crate) enum Remote {
     /// A directory, such as a mount shared by the machines.
@@ -66,11 +132,12 @@ impl Remote {
         Ok(Remote::S3 { bucket, credentials, prefix })
     }
 
-    /// The bytes under `name`, or `None` when there is nothing under it.
-    pub(crate) fn fetch(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// The bytes under `name`, or `None` when there is nothing under it. An error when
+    /// there are more than `most`, which are then not read.
+    pub(crate) fn fetch(&self, name: &str, most: u64) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
-            Remote::Dir(dir) => match std::fs::read(dir.join(name)) {
-                Ok(bytes) => Ok(Some(bytes)),
+            Remote::Dir(dir) => match std::fs::File::open(dir.join(name)) {
+                Ok(file) => Ok(Some(read_at_most(file, most, name)?)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e.into()),
             },
@@ -79,9 +146,8 @@ impl Remote {
                 let url = bucket.get_object(Some(credentials), &key).sign(SIGNED_FOR);
                 match ureq::get(url.as_str()).call() {
                     Ok(response) => {
-                        let mut bytes = Vec::new();
-                        response.into_body().into_reader().read_to_end(&mut bytes)?;
-                        Ok(Some(bytes))
+                        let body = response.into_body().into_reader();
+                        Ok(Some(read_at_most(body, most, name)?))
                     }
                     Err(ureq::Error::StatusCode(404)) => Ok(None),
                     Err(e) => Err(e).with_context(|| format!("fetching {name}")),
@@ -161,13 +227,16 @@ impl Manifest {
     }
 
     fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Manifest> {
-        let bytes = remote.fetch(&Manifest::at(project))?.unwrap_or_default();
+        let bytes = remote.fetch(&Manifest::at(project), LIST_MAX)?.unwrap_or_default();
         Manifest::parse(bytes)
     }
 
     /// The packs the bytes of a manifest list. A line that is not the name of a pack is
     /// not one, and is never the name of a file.
     fn parse(bytes: Vec<u8>) -> anyhow::Result<Manifest> {
+        if bytes.len() as u64 > LIST_MAX {
+            bail!("the manifest is longer than the {LIST_MAX} bytes that are read of one");
+        }
         let text = String::from_utf8(bytes).context("the manifest is not text")?;
         Ok(Manifest(
             text.lines()
@@ -243,6 +312,19 @@ pub(crate) fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resu
 /// another format than this build reads is left where it is.
 pub(crate) fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     Unsigned::taken()?;
+    let bounds = Bounds::from_env(limit_from_env().map_err(anyhow::Error::msg)?)?;
+    pull_within(store, remote, project, bounds)
+}
+
+/// [`pull`], with no pack longer than `bounds.object` read and no more than `bounds.all`
+/// written: a store is not sent more than it is let to hold.
+fn pull_within(
+    store: &Path,
+    remote: &Remote,
+    project: &str,
+    bounds: Bounds,
+) -> anyhow::Result<String> {
+    let written = Written::none(bounds.all);
     let dir = StoreDir::at(store);
     dir.claim()?;
     let local = local_packs(&dir)?;
@@ -250,7 +332,7 @@ pub(crate) fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Resu
     let missing: Vec<&String> = manifest.0.difference(&local).collect();
     let other_format = AtomicUsize::new(0);
     let fetched = transfer(&missing, |name| {
-        let Some(bytes) = remote.fetch(&format!("packs/{name}"))? else {
+        let Some(bytes) = remote.fetch(&format!("packs/{name}"), bounds.object)? else {
             bail!("`{project}` lists {name}, which is not there");
         };
         match pack_name(&bytes) {
@@ -261,6 +343,7 @@ pub(crate) fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Resu
                 return Ok(0);
             }
         }
+        written.add(bytes.len() as u64)?;
         dir.write_whole(name, &bytes)?;
         Ok(bytes.len() as u64)
     })?;
@@ -479,6 +562,88 @@ pub(crate) mod tests {
             let refused = Unsigned::taken_when(unset).unwrap_err().to_string();
             assert!(refused.contains("RUSTD_REMOTE_UNSIGNED=1"), "{refused}");
         }
+    }
+
+    #[test]
+    fn a_file_is_read_to_the_bound_and_not_past_it() {
+        let remote = Remote::Dir(scratch("bounded"));
+        remote.send("packs/long", &[7; 100]).unwrap();
+        assert_eq!(remote.fetch("packs/long", 100).unwrap().unwrap().len(), 100);
+        assert_eq!(remote.fetch("packs/long", 1 << 40).unwrap().unwrap().len(), 100);
+        for most in [0, 1, 99] {
+            let refused = remote.fetch("packs/long", most).unwrap_err().to_string();
+            assert!(refused.contains("is longer than"), "{refused}");
+        }
+        assert!(remote.fetch("packs/none", 0).unwrap().is_none());
+        // What never ends is not read past the bound either.
+        assert!(read_at_most(std::io::repeat(0), 1 << 10, "endless").is_err());
+        assert_eq!(read_at_most(std::io::empty(), 0, "empty").unwrap(), b"");
+    }
+
+    /// A remote with `packs` sealed packs of about `each` bytes listed for `default`.
+    fn remote_with_packs(name: &str, packs: usize, each: usize) -> (Remote, PathBuf) {
+        let mut listed = Manifest(BTreeSet::new());
+        let remote = Remote::Dir(scratch(&format!("{name}-remote")));
+        for at in 0..packs {
+            // Only the start of a pack says it is one: what is in it is read by a build.
+            let mut pack = [&b"rustdpk"[..], &[STORE_FORMAT as u8]].concat();
+            pack.extend(std::iter::repeat_n(at as u8, each));
+            let named = pack_name(&pack).unwrap();
+            remote.send(&format!("packs/{named}"), &pack).unwrap();
+            listed.0.insert(named);
+        }
+        listed.send(&remote, "default").unwrap();
+        (remote, scratch(&format!("{name}-to")))
+    }
+
+    fn packs_in(store: &Path) -> (usize, u64) {
+        let packs = StoreDir::at(store).packs().unwrap();
+        let bytes = packs.iter().map(|it| std::fs::metadata(store.join(it)).unwrap().len());
+        (packs.len(), bytes.sum())
+    }
+
+    #[test]
+    fn a_pack_longer_than_is_read_is_not_written() {
+        let (remote, to) = remote_with_packs("long-pack", 1, 4096);
+        let Remote::Dir(at) = &remote else { unreachable!() };
+        let pack = std::fs::read_dir(at.join("packs")).unwrap().next().unwrap().unwrap();
+        let long = pack.metadata().unwrap().len();
+        let short = Bounds { object: long - 1, all: None };
+        let refused = pull_within(&to, &remote, "default", short).unwrap_err().to_string();
+        assert!(refused.contains("is longer than"), "{refused}");
+        assert_eq!(packs_in(&to), (0, 0));
+        pull_within(&to, &remote, "default", Bounds { object: long, all: None }).unwrap();
+        assert_eq!(packs_in(&to), (1, long));
+    }
+
+    #[test]
+    fn no_more_is_written_than_the_store_may_hold() {
+        let (remote, to) = remote_with_packs("many-packs", 12, 4096);
+        let Remote::Dir(at) = &remote else { unreachable!() };
+        let pack = std::fs::read_dir(at.join("packs")).unwrap().next().unwrap().unwrap();
+        let long = pack.metadata().unwrap().len();
+        let bounds = Bounds { object: long, all: Some(3 * long) };
+        let refused = pull_within(&to, &remote, "default", bounds).unwrap_err().to_string();
+        assert!(refused.contains("more than the"), "{refused}");
+        let (packs, bytes) = packs_in(&to);
+        assert!(packs <= 3 && bytes <= 3 * long, "{packs} packs of {bytes} bytes");
+        let bounds = Bounds { object: long, all: Some(12 * long) };
+        pull_within(&to, &remote, "default", bounds).unwrap();
+        assert_eq!(packs_in(&to), (12, 12 * long));
+    }
+
+    #[test]
+    fn a_manifest_longer_than_is_read_is_refused() {
+        let remote = Remote::Dir(scratch("long-manifest"));
+        let line = format!("{}.pack\n", "ab".repeat(32));
+        let mut list = line.repeat(LIST_MAX as usize / line.len());
+        list.push_str(&"\n".repeat(LIST_MAX as usize - list.len()));
+        remote.send("manifests/default", list.as_bytes()).unwrap();
+        assert_eq!(Manifest::fetch(&remote, "default").unwrap().0.len(), 1);
+        list.push('\n');
+        remote.send("manifests/default", list.as_bytes()).unwrap();
+        assert!(Manifest::fetch(&remote, "default").is_err());
+        assert!(Manifest::parse(list.into_bytes()).is_err());
     }
 
     #[test]

@@ -1,39 +1,113 @@
 # Security review of the store, the remote and the daemon's boundaries
 
-Branch `rustd-security`, on top of `rustd-collate` at 0151c01218. Everything below was
+Branch `rustd-security`, on top of `rustd-collate` at 1547078a30. Everything below was
 measured on Linux x86-64 with Rust 1.99.0 and LLVM 20. Where something is an argument and
-not a measurement it says so.
+not a measurement it says so. The Windows code in this round was compiled for Windows and
+never run; that is said again where it matters.
 
-## Trust model
+## Threat model
 
-**The local store is the user's own.** Whatever is in the store directory is machine code
-that the next build links and runs, found by a key anyone can compute. So whoever can
-write to the directory can make the user's builds run anything. The per-pack SHA-256 and
-the per-record CRC catch damage, not malice: an attacker writes a well-formed pack. The
-only defence is that nobody else can write there, and rustd now enforces that instead of
-assuming it. The store directory is created 0700 and its files 0600. A directory that
-belongs to another user, or that group or others can write to, is refused with the reason
-and the build goes on without a store. A file inside it with the same problem is not read.
-Another process running as the same user is inside the boundary; rustd does not defend
-against it and cannot.
+rustd compiles a user's code and keeps the result, on that user's disk and optionally on
+a remote that other machines read. What it keeps is machine code that later builds link
+and run. So the question for every party is the same: can they decide what ends up in a
+program the user builds, and can they read what the user built?
 
-**A remote is trusted through signed lists.** Packs and dependency archives on a remote are
-named by the SHA-256 of their bytes, so the only thing a writer to the remote can change
-without being caught is the list (manifest) that says which hashes belong to a project.
-The `rustd-s3` branch signs those lists with Ed25519. A machine that pulls takes a list
-only if a key it trusts signed it. Pulling from a remote with no trusted key is refused
-unless `RUSTD_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write to
-the remote is trusted as much as the local user. Pushing unsigned is allowed and asks for
-nothing.
+### Who is trusted
 
-**The daemon socket is the user's own.** The socket lives in a 0700 directory, is 0600,
-and the daemon checks that the peer is the same user. There is no boundary between two
-clients of the same user. That code is on `rustd-cargo` and is reviewed, not changed, here.
+**The user.** rustd runs as the user and can do nothing the user cannot. Every process
+running as the same user is inside the boundary: it can write the store, the `target`
+directory and the sources, and talk to the daemon. rustd does not defend against it and
+does not claim to. In particular there is no isolation between two checkouts of the same
+user: one can find what the other stored, by design.
 
-**What a signer vouches for.** A trusted signer vouches that the code in its packs was
-compiled by an honest rustd from the sources the keys name. A compromised signer, or a
-signer that builds untrusted code in the same store it pushes from, is outside what
-signing can fix.
+**The user's checkouts, with their build scripts and proc macros.** A build script and a
+proc macro are programs that the checkout, or a crate it depends on, has cargo compile and
+run during a build. They run with the user's full rights under cargo, and they run with
+exactly the same rights under rustd. rustd adds no sandbox and removes none. Building a
+checkout with rustd is as much an act of trust in it as building it with cargo, and no
+more. What rustd guarantees is narrower and is checked (see "Build scripts and proc
+macros" below): it does not run a build script or a proc macro that cargo, given the same
+selection of packages, features, profile and target, would not have run. It also does
+not run them with different arguments, a different environment or a different working
+directory: either cargo itself runs them, or the daemon repeats cargo's own run from a
+record of it.
+
+**The signer of a remote.** A machine that pulls names the public keys it trusts
+(`RUSTD_REMOTE_TRUST`, on `rustd-s3`). A holder of one of those keys can make every
+machine that trusts it run any code, by signing a list that names a pack of their making.
+That is what the trust means. A signer vouches that its packs were compiled by an honest
+rustd from the sources their keys name, on a machine whose store nobody else could write
+to. rustd guarantees that nothing reaches a build from a signed remote unless a trusted
+key signed the list naming it, for the project it was signed for, and (once the rollback
+design below is applied) that a machine never goes back to an older list than one it has
+already taken.
+
+### Who is not trusted
+
+**Other users of the machine.** They must not be able to change what the user's builds
+run, nor read what the user built. rustd guarantees: the store directory is created for
+the user alone (0700, files 0600; on Windows it has the access list of the directory it
+is made in), and a
+store or a file in it that belongs to someone else, or that someone else could write to,
+is refused with the reason and the build goes on without it. On Unix this is the owner and
+the mode, read from the open handle. On Windows it is the owner and every entry of the
+access control list, written this round and not yet run. The daemon's socket is in a 0700
+directory, is 0600, and the daemon checks that the peer is the same user (that code is
+`crates/rustd/src/socket.rs`, reviewed and not changed here). What rustd does not
+guarantee: that timing tells another user nothing (they cannot reach the daemon or the
+store, so they would have to infer it from machine load), and anything at all against
+root or, on Windows, the system and the administrators.
+
+**An unsigned remote, and anyone who can write to a remote without a trusted key.** They
+decide the bytes of every object and every list. rustd guarantees:
+
+- Nothing is pulled from a remote whose lists nobody trusted signed, unless the user sets
+  `RUSTD_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write there
+  is trusted as the signer would be.
+- With signed lists, a writer without a key can delete, withhold or (until the rollback
+  design is applied) serve an older signed list. That costs cache hits. It never gives
+  wrong code, because every pack is named by the SHA-256 of its bytes and every key
+  inside it by the full content hash of what it was compiled from.
+- No answer of a remote is read past a bound, and no pull writes more than a bound,
+  whatever the remote sends (see "Bounds on what a remote sends").
+- No bytes from a remote make rustd panic, index out of range or write outside the place
+  they belong: the parsers are fuzzed and dependency archives are unpacked only as plain
+  files and directories of their own unit.
+
+**Readers of a remote.** Whoever can read a remote learns what was pushed: machine code,
+names of functions and crates, source lines in debug info. rustd guarantees that the
+paths of the pusher's machine are not among it: files of the checkout are named relative
+to it, the standard library's as `/rustc/<commit>/...`, and, from this round, files cargo
+fetched as `/cargo/registry/...` and `/cargo/git/...`. `storeguards.py` looks through
+every byte of a store and of the remote it was pushed to for the checkout, the home
+directory and the cargo home.
+
+**A damaged disk.** Bytes that are not what was written: a torn write, a truncated file,
+flipped bits, a file from another version. rustd guarantees that damaged bytes are
+detected (SHA-256 per pack on first read, CRC per record on every read, a format version
+in the store and in each pack), discarded and recompiled, never linked. Stored entries
+that pass the checksum are still validated structurally before use. A disk that is
+damaged by someone who also recomputes the checksums is not damage, it is a writer, and
+is covered by the paragraphs above.
+
+### What follows from it
+
+The local store is as sensitive as `target/`: whoever writes it owns the user's builds.
+The remote is as sensitive as its signing keys. Everything else, including the content of
+any file rustd reads from a store or a remote, is treated as hostile input.
+
+## This round
+
+Five things, each with its test. The findings list below has them under the numbers
+given here.
+
+| | What | Where it is proved |
+|---|---|---|
+| M6 | Files cargo fetched are stored under `/cargo`, not the pusher's cargo home | `cached::tests::a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home` and two more; `storeguards.py` |
+| M7 | Every read from a remote is bounded, and so is what a pull writes | six tests in `remote::tests` and `deps::tests`; fuzz loops |
+| M8 | rustd ran build scripts of dev-dependencies that cargo would not have | `harness/selects.py` |
+| L6 | Windows: owner and access list checked | compiled for `x86_64-pc-windows-msvc`; three tests for the Windows session |
+| | Rollback of signed lists: design | "Rollback protection for signed lists" |
 
 ## Findings, by severity
 
@@ -114,6 +188,57 @@ a name like `<hash>.pack.4242\0-17.tmp` was taken for one of the store's tempora
 (and so could be removed by collection). The writer suffix must now be digits and hyphens.
 Test: `store::tests::no_name_breaks_the_telling_of_what_a_file_is`.
 
+**M6. Registry and git paths carried the pusher's cargo home. Fixed.** A crate cargo
+fetched has its sources under `$CARGO_HOME/registry/src/<index>/<name>-<version>/` or
+`$CARGO_HOME/git/checkouts/...`, and that absolute path was in the stable names of its
+generic instantiations, in panic locations, in `file!()` and in debug info. So packs held
+the pusher's home directory, and two users with different cargo homes shared none of
+that code. The cargo home is now found from the crates themselves (the outermost
+`registry/src` or `git/checkouts` above a crate root outside the checkout; nothing is
+read from the environment, so it is what cargo actually used), and:
+
+- stable names, and so store keys, are made from the path with `/cargo` in place of the
+  home (`StableNames::stored`);
+- the content id of an outside crate hashes its root the same way (`rustd library 4`);
+- an entry on its way to the store has every path it carries rewritten (`Entry::leave`):
+  panic locations, `file!()` strings and the file table of its debug info;
+- an entry on its way out of the store has them rewritten to the cargo home of the
+  machine that reads it (`Entry::arrived`), so a panic message and a debugger show a file
+  that exists there, as they do under cargo.
+
+Three cases are refused rather than guessed. A constant whose bytes contain the cargo
+home (a string built from `file!()` at compile time, say) is not stored. A path that
+already starts with `/cargo/` when the cargo home is somewhere else is not stored, since
+it would be read back as a fetched file. An entry with fetched files is a miss on a
+machine where no cargo home can be told. If crates come from more than one cargo home
+nothing is renamed and those paths stay as they are, which the path checks then keep
+local as before.
+
+The code compiled into a function does not contain the path: locations and `file!()`
+strings are data the entry refers to, which is why rewriting them is enough. That is
+measured, not assumed: `storeguards.py` builds a program on a registry crate that uses
+`file!()`, a panic with a location and a generic function, under one cargo home, then
+again under another with the same store. The second build finds every entry the first
+kept (302 of 302, both backends) and adds none, the program prints the path under its own
+cargo home exactly as cargo's build does, and neither home is anywhere in the store or in
+the remote the store is pushed to, while `/cargo/registry/src/` is. Unit tests:
+`cached::tests::a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home`,
+`a_fetched_file_is_not_taken_where_cargo_has_no_directory`,
+`a_directory_named_as_cargos_stands_in_is_not_mistaken_for_it`,
+`content::tests::the_cargo_home_is_told_from_a_file_cargo_fetched`.
+
+What is not remapped: the index directory name (`index.crates.io-<hash>`) stays, and is
+the same for everyone using the same registry; a private registry's name is in it. Paths
+of path-dependencies outside the checkout and outside any cargo home are absolute, and
+code that names them stays local as before.
+
+**M7. A remote decided how much was read and written. Fixed.** The directory remote read
+whole files and the S3 remote whole responses into memory, and a pull wrote whatever it
+was given. See "Bounds on what a remote sends".
+
+**M8. rustd ran build scripts cargo would not have. Fixed.** See "Build scripts and proc
+macros".
+
 ### Low, not changed
 
 **L1. rustc's `StableCrateId` is 64 bits and names crates from outside the checkout.**
@@ -150,8 +275,7 @@ that key changes.
 target is checked with `fstat` like any file, so it has to be the user's and not writable
 by others.
 
-**L6. Windows has no owner or mode check.** The helper returns "fine" off Unix and relies
-on the profile directory's ACL. Not tested.
+**L6. Windows had no owner or access check. Written, not run.** See "Windows".
 
 ## What an attacker can make a build run
 
@@ -164,8 +288,8 @@ With write access to an unsigned remote, before this round: the same, for every 
 that pulls. After: nothing, unless the user set `RUSTD_REMOTE_UNSIGNED=1`.
 
 With write access to a signed remote but no trusted key: they can delete, withhold or
-roll back (serve an older signed list; lists carry no counter), which costs cache hits but
-never gives wrong code, since every pack is named by its hash and every key includes the
+roll back (serve an older signed list; lists carry no counter until the design below is
+applied), which costs cache hits but never gives wrong code, since every pack is named by its hash and every key includes the
 content it was built from. They cannot add.
 
 With read access to a remote: see "What one client can learn" below.
@@ -201,19 +325,63 @@ in it is out of range.
 What fell out: M1, M2, M3 and M5 above. Accepted manifest lines are checked to be exactly
 64 hex digits and `.pack`, with no path separator.
 
-Not covered: the manifest and key-list loops do not honour `RUSTD_FUZZ_RUNS` and do not
-measure allocation (they parse lines of a buffer that is already in memory). The S3 fetch
-on `rustd-collate` reads a response of any size into memory; `rustd-s3` replaces that code
-and its `read_small` has the same property for lists (see below).
+The remote-facing parsers have the same loops, in `crates/rustd`, with the same mutator:
+the manifest (`remote::tests::no_bytes_break_the_reading_of_a_manifest`, 20,000 inputs),
+the list of dependency units (`deps::tests::no_bytes_break_the_reading_of_a_list_of_units`,
+20,000 inputs) and, new this round, the dependency archive itself
+(`deps::tests::no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound`: 3,000
+mutated tar archives by default, each tried both zstd-packed and bare, `RUSTD_FUZZ_RUNS`
+honoured). After every archive the test walks the scratch directory and fails if anything
+was written outside `deps/` and `build/` of the target directory or if more than the
+64 KiB bound is on disk. Packs pulled from a remote are read by the pack reader and
+`Entry::decode`, which are the first two rows of the table.
+
+## Bounds on what a remote sends
+
+Before this round the directory remote read whole files and the S3 remote whole response
+bodies into memory, and a pull wrote whatever arrived. Whoever writes to a remote, or
+answers for it, chose both numbers. Now every read goes through one function,
+`read_at_most`, which reads through `Read::take` and then asks for one more byte: more
+than the bound is an error and nothing past the bound plus one byte is ever read. The
+`Content-Length` header is not consulted, so a remote that lies about it gains nothing.
+
+| What | Bound | Set by |
+|---|---|---|
+| A manifest, or a list of dependency units | 16 MiB | fixed (`LIST_MAX`); a line is under 100 bytes |
+| One pack, or one dependency archive | 512 MiB | `RUSTD_REMOTE_MAX` |
+| All the packs one `rustd cache pull` writes | the store's limit, 8 GiB | `RUSTD_CACHE_MAX` |
+| All that one `rustd deps pull` unpacks | 64 GiB | `RUSTD_DEPS_MAX` (`off` for none) |
+
+The bound on what is written is counted before the write, so a pull that would pass it
+fails with what is already on disk under it. The unpack bound counts each tar entry's
+declared size plus its header before the entry is unpacked, which is what stops a small
+archive that expands: the test packs 64 files of 1 MiB of zeros into an archive under
+64 KiB and a pull held to 4 MiB writes at most 4 MiB and fails; held to exactly the
+64 MiB plus headers it succeeds. Memory during a pull is at most eight transfers of one
+object each (4 GiB at the default; lower `RUSTD_REMOTE_MAX` on a small machine).
+
+Tests, each with the exact bound taken and one byte less refused:
+`remote::tests::a_file_is_read_to_the_bound_and_not_past_it` (also an endless reader),
+`a_pack_longer_than_is_read_is_not_written`, `no_more_is_written_than_the_store_may_hold`,
+`a_manifest_longer_than_is_read_is_refused`, and in `deps::tests`
+`an_archive_or_a_list_longer_than_is_read_is_refused` and
+`an_archive_that_unpacks_to_more_than_is_taken_is_refused`.
+
+Not covered: the S3 arm is the same `read_at_most` over the response body, but no test
+here talks to an S3 server; `rustd-s3` replaces that arm with the AWS SDK and has to
+keep the bound (see below). A pack is still held whole in memory while it is checked and
+written; streaming it to a temporary file would lower the peak and was not done.
 
 ## The `rustd-s3` branch
 
-`origin/rustd-s3` (7b33ead6c2) has pushed its work and report, but it is still based on
-27315323cb, before the format-2 store. Merging it here conflicts across `store.rs`,
-`remote.rs` and `deps.rs` and would mean doing its port for it, so I did not. I applied
-the following to a checkout of that branch and ran its tests (`cargo test --release -p
-rustd signed`: 4 passed, including the new one). It should go in when that branch lands,
-and the `Unsigned` type added to `remote.rs` and `deps.rs` here goes away in favour of it.
+`origin/rustd-s3` is now at 5841b47f46, rebased onto the format-2 store, and is not in
+`rustd-collate` yet (1547078a30 does not contain it), so nothing of it is on this branch.
+When it is, three things go in on top of it: the unsigned-pull refusal below, the bounds
+above on its `read_small` and its SDK response bodies, and the rollback protection
+designed in the next section. The `Unsigned` type added to `remote.rs` and `deps.rs` here
+goes away in favour of the first. The patch below was applied to a checkout of the older
+`rustd-s3` (7b33ead6c2) last round and its tests run there (`cargo test --release -p
+rustd signed`: 4 passed, including the new one); `signed.rs` has not changed shape since.
 
 ```diff
 --- a/crates/rustd/src/remote/signed.rs
@@ -283,9 +451,231 @@ Three more things for that session, from reading its branch:
 2. `deps.rs` `unpack` there still calls `entry.unpack_in(dir)?` without looking at the
    result or the entry type. It needs the H4 fix from this branch; the two will conflict
    in that function and this branch's version is the one to keep.
-3. Signed lists have no counter or date, so a remote can serve an old one. That costs
-   hits, not correctness, but it also means a pack a signer has since stopped vouching for
-   can be served forever. Worth a line in `REMOTE.md` at least.
+3. Signed lists have no counter or date, so a remote can serve an old one. The next
+   section is the design for that.
+
+## Rollback protection for signed lists
+
+This is a design. It is not implemented anywhere, because the code it changes
+(`crates/rustd/src/remote/signed.rs`) is only on `rustd-s3`. It was written against that
+file as it is at 5841b47f46.
+
+**What it is for.** A list is signed, so a remote cannot invent one. It can serve an old
+one. Every pack an old list names was vouched for once, so this never gives code nobody
+signed. It matters when a signer has taken something back: a pack built by a rustd with a
+miscompilation, or pushed from a machine later found to be compromised, removed from the
+list by signing a new one. Without rollback protection the remote, or anyone who can
+write to it, can keep handing out the old list for ever.
+
+**The signed body.** Every list gets a number, here called its turn. The last line
+becomes `signed <key> <turn> <signature>`, and the signature is over
+`rustd list 2\n<name>\n<turn>\n<body>`. The domain line changes from `rustd list 1`, so
+a signature of the old kind verifies under no key and an old list is simply unsigned.
+The turn is a decimal `u64` with no sign and no leading zero; anything else is "not
+signed". It is inside the signed bytes, so it cannot be changed without the key.
+
+**Who sets it.** A machine that pushes already reads the list it extends
+(`open_to_extend`, which verifies). It signs with
+`turn = max(turn of the list it read + 1, seconds since 1970 by its clock)`. A counter
+alone would be enough for ordering; starting it from the clock is so that a remote that
+was emptied and started again, or a list signed by a second key that never saw the first,
+still comes out above what machines remember, without anyone keeping state on the signing
+side. A signer with a clock set far ahead only makes the numbers large; the next signer
+goes one above it. The readers' clocks are never consulted, so a wrong clock on a build
+machine cannot make it refuse or accept anything.
+
+I chose a counter seeded from the clock over a plain timestamp because two pushes within
+one second must still be ordered, and over a plain counter because of the reset case.
+
+**What a reader remembers.** For each list it has taken, the highest turn, in the store
+directory: `turns/<sha256 of "rustd turn 1\n<remote as given>\n<list name>">`, a file
+holding the decimal number and a newline, written like every other file of the store
+(temporary file, fsync, rename, directory fsync, 0600). It is in the store because the
+store is what the list fills, it is already private to the user and already checked for
+that, and deleting the store then forgets the turns together with the packs they
+protected. The turn belongs to the list, not to the key, so rotating keys changes
+nothing: a new trusted key that signs a lower turn is refused like any other.
+
+**The rule,** in `Trust::open` after the signature has verified, under the store's
+existing `lock` file so that two pulls cannot interleave a read and a write of the same
+turn:
+
+| The list's turn against the remembered one | What happens |
+|---|---|
+| Nothing remembered (first pull, or the store was removed) | Taken. The turn is remembered. |
+| Higher | Taken. The turn is remembered before any pack is fetched. |
+| Equal | Taken. Two machines that pushed at once can sign the same turn over different lines; both are signed by trusted keys, and a remote choosing between them gains nothing it could not get by withholding. |
+| Lower | Refused: "`<name>` is turn N, and this machine has taken turn M from this remote: an older list is not taken". Nothing is fetched. |
+| Signed without a turn, or with the old domain | Refused as not signed. There is no released version to stay compatible with. |
+| The remembered file cannot be read, or is not a number | Refused, naming the file. It is not treated as nothing remembered, since removing protection must not be something damage can do silently. `rustd cache forget REMOTE` (new) removes the remembered turns of a remote, and is what the message says to run. |
+| The turn cannot be written (full disk, read-only store) | The pull fails before fetching. It was about to write packs to the same place. |
+
+`open_to_extend` (the push path) applies the same rule, so a signer does not extend, and
+so re-sign under a new turn, a list that was rolled back under it. A machine with
+`RUSTD_REMOTE_UNSIGNED=1` and no keys has no turns and no protection; that is the meaning
+of the setting. `rustd deps` lists go through the same `open`, so they are covered by the
+same code.
+
+**What it does not do.** A machine that has never pulled remembers nothing, so it can be
+given any list that was ever signed; this is trust on first use. A remote can also freeze
+a machine at the newest list that machine has seen, by never showing a newer one. Both
+are the same gap, freshness, and need an expiry to close. The turn makes one possible
+without another field: a turn is never below the signing time, so a list whose turn is
+older than a chosen age was certainly signed before it. An optional
+`RUSTD_REMOTE_FRESH=<duration>`, refusing lists with `turn < now - duration`, would close
+it for machines that start from an empty store (CI), at the price of a signer having to
+re-sign at least that often and of the reader's clock mattering. I would not make it the
+default.
+
+**Tests to add with it,** all in `signed.rs` beside the existing three, plus one harness
+case: a list is taken, a newer one is taken, the first is then refused and nothing is
+fetched; equal turns are taken; a turn edited in the signature line fails verification;
+a list sealed under `rustd list 1` is not signed; a remembered file with garbage refuses
+and `cache forget` mends it; two keys, the second signing a lower turn, refused; the
+signer's turn is above both the list it read and its clock; and the parse of the
+signature line joins the fuzz loop. In `harness/remote.py`: push, pull on a second
+machine, push again, pull, then put the first manifest back on the remote and pull:
+refused, store unchanged.
+
+## Build scripts and proc macros
+
+They are the checkout's programs and run as the user, under rustd exactly as under cargo;
+rustd neither confines them nor gives them anything cargo would not. The thing to check
+was that rustd never runs one cargo would not have. I read every place rustd starts a
+process (`grep -n "Command::new" crates/rustd/src`) and every place a build script or a
+proc macro can come to run. There are three.
+
+1. **`rustd DIR ...` loading a workspace** (`main.rs`, through `project-model`). rustd
+   does not run build scripts or compile proc macros itself here. It has cargo do it:
+   `cargo check --compile-time-deps` with the profile, packages, features and target the
+   build was asked for. Proc macros are then expanded by the toolchain's own proc-macro
+   server, loading the libraries that cargo run built, and only for macro calls in crates
+   being compiled.
+
+   **This is where M8 was.** The command also passed `--all-targets` without being asked,
+   which is right for an editor and wrong for a build: all targets include tests and
+   examples, those bring in dev-dependencies, and cargo then runs the build scripts of
+   dev-dependencies and builds their proc macros. Measured on a workspace where every
+   script and macro writes a line when it runs: `cargo build -p app` ran one build script
+   (of `dep`); the command rustd gave cargo for the same selection ran two (of `dep` and
+   of the dev-dependency `devdep`). A crate that is only a dev-dependency is exactly what
+   someone building a release binary does not expect to execute. Fixed in
+   `project-model`: `--all-targets` is passed with `--compile-time-deps` only when the
+   configuration asks for all targets, and rustd asks only when the build has tests in it
+   (`--cfg-test` or `--dev-deps`).
+
+2. **`cargo rustd ...`** (`crates/rustd/src/cargo`). Cargo is run as itself with rustd as
+   `RUSTC_WORKSPACE_WRAPPER` (`cargo/state.rs`), so cargo decides what is compiled and
+   run. The wrapper renames a linked build script to `<script>.real` and leaves a
+   two-line shell script in its place that runs `rustd build-script`, which writes down
+   the environment and directory cargo gave it and then `exec`s the real script with the
+   same arguments. Nothing runs that cargo did not start.
+
+3. **The daemon running a build script again** (`cargo/script.rs`, `rerun_is_same`, called
+   from `Guard::broken` in `state.rs`). This is the one place rustd starts a build script
+   itself. It does so only for a script cargo has already run in this target directory,
+   only when one of the files the script named with `rerun-if-changed` has changed (or
+   any file of the package, if it named none), which is when cargo would run it again,
+   and with the recorded environment (`env_clear` then exactly what cargo set), directory
+   and executable. If its output differs the build is handed back to cargo. A change to
+   a `rerun-if-env-changed` variable is never handled this way; that is cargo's.
+
+   The record (`rustd-ran.json`) is in the target directory and names the executable to
+   run. Whoever can write there can already replace the script itself, or any rlib, so it
+   is no new way in; the target directory is as trusted as the checkout.
+
+The other processes rustd starts are cargo, rustc (as the wrapper, with cargo's
+arguments), the linker line cargo's rustc printed, the built program for `cargo rustd
+run` and `test`, and itself as daemon or worker.
+
+**The test** is `harness/selects.py`, new and in the workflow. A workspace has an `app`
+with a dependency, a dev-dependency and a dev-only proc macro, and another member nothing
+depends on; each build script and the macro append a line to a file when they run. For
+three selections the same thing is asked of cargo and of rustd, each on a fresh copy, and
+every line rustd's build wrote has to be one cargo's wrote:
+
+| Selection | cargo ran | rustd ran |
+|---|---|---|
+| `build -p app` / `--package app` | script of `dep` | the same 1 |
+| `test --no-run -p app` / `--package app --cfg-test` | scripts of `dep`, `devdep`; macro `devmacro` | the same 3 |
+| `build --workspace` / `--workspace` | scripts of `dep`, `devdep`, `other` | the same 3 |
+
+Before the fix the first row fails, by the measurement above. Not covered by the harness:
+the `cargo rustd` path, where the argument is that cargo is the one running; and a
+`rustd DIR` with no package selected at the root of a workspace, which builds every
+member as `cargo build` there does.
+
+## Windows
+
+**Why modes are not enough.** Windows has no owner/group/other bits. Rust's
+`Permissions` there is the read-only attribute, which says nothing of who. Who may write
+a file is its discretionary access control list, mostly inherited from the directory it
+was made in. A store under `%LOCALAPPDATA%` inherits a list that lets in the user, SYSTEM
+and Administrators. A store at `C:\cache`, or on a second drive, inherits one where
+`Authenticated Users` may create and modify files, which is the group/world-writable
+store of H2. So the check has to read the owner and walk the list.
+
+**What the code does** (`crates/hir-ty/src/mir/codegen/store/acl.rs`, behind
+`cfg(windows)`, called from the same two places as the Unix check: the store directory
+when it is opened, each file through the handle it is then read from):
+
+- The owner (`GetSecurityInfo` on the open handle, so there is no window between check
+  and use) has to be the user of the process (`OpenProcessToken`, `TokenUser`), SYSTEM or
+  the Administrators group. The last two are accepted because they can take any file
+  whatever its list says, and because a file made by an elevated process is owned by
+  Administrators, not by the user who ran it.
+- No list at all means everyone may do everything: refused.
+- Every entry of the list is read. Deny entries and inherit-only entries (which apply to
+  children, not to the object) are skipped. An allow entry counts if its mask has any
+  right that changes the file or directory or who controls it: write or append data
+  (add file, add subdirectory), delete, delete child, write DAC, write owner, generic
+  write, generic all. Such an entry is fine for the user, SYSTEM, Administrators and
+  `OWNER RIGHTS`; for any other identity the store is refused as "can be written to by
+  other users", with the `icacls` command that mends it.
+- An entry of a kind that is not a plain allow or deny (object, callback or conditional
+  entries) with a write right is refused as unreadable rather than interpreted.
+- If the token, the owner or the list cannot be read, that is a refusal too.
+
+Reading by others is not refused, on Windows or on Unix; on Unix a readable store
+directory is closed to others when it is claimed, and on Windows nothing is tightened:
+the store is created with whatever it inherits, and a place that inherits write access
+for others is refused with the reason instead of being silently re-permissioned. Setting
+an explicit list at creation would be the equivalent of 0700 and is not done.
+
+**Status.** `cargo check -p hir-ty --tests --target x86_64-pc-windows-msvc` passes on
+Linux, so it type-checks against `windows-sys` 0.61 (a new dependency of `hir-ty` on
+Windows only, already in the lock file through other crates). It has never been run. In
+particular the layout of an access entry is declared by hand (`Entry`), and the set of
+rights in `WRITES` is from the documentation.
+
+**What the Windows session must run,** from the repository root in a normal (not
+elevated) shell, then the first line again in an elevated one:
+
+    cargo test --release -p hir-ty --lib -- store::tests
+    cargo build -p rustd --release
+    mkdir C:\rustd-store-check
+    set RUSTD_CACHE=C:\rustd-store-check
+    target\release\rustd.exe cache stats
+    icacls C:\rustd-store-check /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
+    target\release\rustd.exe cache stats
+    mkdir %LOCALAPPDATA%\rustd-store-check
+    set RUSTD_CACHE=%LOCALAPPDATA%\rustd-store-check
+    target\release\rustd.exe cache stats
+
+Expected: the tests pass, among them the three written for Windows
+(`a_store_under_the_users_profile_is_taken`,
+`a_store_whose_list_lets_others_write_is_refused`, which grants Everyone each write right
+in turn with `icacls` and expects a refusal for each, and
+`a_pack_whose_list_lets_others_write_is_not_read`). The first `cache stats` is refused
+with "can be written to by other users" and the `icacls` line, since a directory at the
+top of `C:` inherits write access for `Authenticated Users`. The second, after the
+`icacls`, prints the statistics. The third, on a store under the profile, prints
+them too. In the elevated shell the tests must still pass: there the files are owned by
+Administrators. If the first `cache stats` is not refused, or the store under the profile is,
+the check is wrong and I need the output of `icacls <the directory>`.
+
+Not done on Windows: the socket (`socket.rs` is not mine to edit; finding 7 below stands),
+and making the store private on creation.
 
 ## The daemon socket: findings to forward
 
@@ -297,6 +687,14 @@ the peer's uid is checked (`SO_PEERCRED` on Linux, `getpeereid` elsewhere) befor
 is read; the lock is taken before a stale socket is removed, so two daemons starting
 together cannot unlink each other's socket; requests are capped at 16 MiB and 10 seconds;
 each connection has its own thread so a slow one blocks nobody.
+
+Read again this round at `rustd-collate` 1547078a30, where the file is now
+`crates/rustd/src/socket.rs`; still not edited. The list below was forwarded last round.
+Of it, finding 1 still stands as written (`main.rs` calls `Served::bind(path)` on a
+`--socket` path with no `private_dir`; the daemon's home and the worker directories do
+call it, in `cargo/daemon.rs` and `cargo/client.rs`), and so do 2, 3 (no
+`set_write_timeout` anywhere), 5 (`File::create(lock_of(socket))`) and 7 (the three
+Windows functions are still `create_dir_all`, nothing and nothing).
 
 Findings:
 
@@ -360,14 +758,14 @@ Across machines, through a remote, for anyone who can read it:
 
 - Packs hold stable names: for checkout crates the content hash, file paths relative to
   the checkout (`app/src/main.rs`), item positions and the generic arguments of every
-  instantiation; for registry crates the absolute path of the pusher's cargo registry,
-  which has their home directory in it. Machine code is of course there too.
+  instantiation; for crates cargo fetched, the path under `/cargo` (M6), which has the
+  registry's index name and the crate's name and version in it and nothing of the
+  pusher's machine. Machine code is of course there too.
 - The checkout's own path is not there. Code whose data names the checkout (through
   `env!("CARGO_MANIFEST_DIR")` and the like) is kept out of shared entries by an existing
   check, and `storeguards.py` now measures that: 0 occurrences of the checkout path or the
-  home directory in the store and in the pushed remote for the stress workspace. That
-  workspace has no registry dependencies, so the registry-path statement above is from
-  reading the code, not from the harness.
+  home directory in the store and in the pushed remote for the stress workspace, and 0 of
+  either of two cargo homes for a workspace built on a registry crate.
 - Whether a key is present tells a reader that someone built exactly that source. They
   have to have the source already to compute the key.
 
@@ -383,25 +781,27 @@ changed:
 
 ## What is left
 
-- **Registry paths in names.** The pusher's cargo home appears in packs for registry
-  crates, and two users with different homes do not share those instantiations. This is
-  not a naming detail that can be changed alone: compiled code has the same absolute path
-  in its panic locations, so sharing it under a path-free name would hand one user's paths
-  to another inside the code. The real fix is to remap registry paths in both, as
-  `--remap-path-prefix` does, and that has to agree with what rustc put in the rlibs the
-  program links. Not done.
-- **Signed lists are not on this branch.** They are on `rustd-s3`. Until it lands, the
-  only choices here are refuse (the default) or `RUSTD_REMOTE_UNSIGNED=1`. The patch above
-  is what makes the default right once it does.
-- **Rollback of signed lists** (above).
-- **Unbounded list and S3 response sizes** in the remote code, here and on `rustd-s3`.
-- **Windows**: no owner or mode checks in the store, no peer check on the socket.
+- **Signed lists and their rollback protection are not on this branch.** They wait for
+  `rustd-s3` to be in `rustd-collate`. Then: the unsigned-pull patch, the bounds on its
+  reads, and the rollback design, which is a design and has not been prototyped.
+- **Freshness.** Even with rollback protection a machine with an empty store can be given
+  any list ever signed. See the end of the rollback section.
+- **Windows was compiled, not run.** The store check needs the commands above run on a
+  Windows machine. The socket there has no peer check, and the store is not made private
+  on creation.
+- **A pack is held in memory whole** while it is pulled, up to `RUSTD_REMOTE_MAX` each
+  and eight at a time.
+- **The S3 arm of the bounds has no test** against a server.
+- **More than one cargo home in one build** (crates from two) is not remapped; such
+  paths stay absolute and local.
+- **Private registry names** are in the remapped path (`/cargo/registry/src/<index>/`).
 - **`a_store_of_another_user_is_refused` needs root** to do anything, so CI as a normal
   user does not exercise it.
 - **L1 and L4** are arguments. If rustd ever names an outside crate without its path, L1
   stops holding.
 - **Same-user isolation** (one checkout's daemon against another's) is not a goal and
   nothing here provides it.
+- **The socket findings** that still stand are for the session that owns `socket.rs`.
 
 ## Validation
 

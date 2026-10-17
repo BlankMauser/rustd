@@ -70,4 +70,5 @@ jobs:
           run storefull.py
           run storeshared.py
           run storeguards.py
+          run selects.py
           exit $failed

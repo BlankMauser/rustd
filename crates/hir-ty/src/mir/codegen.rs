@@ -152,6 +152,16 @@ impl fmt::Display for ContentId {
     }
 }
 
+/// Where cargo keeps the sources it fetched of registries and of git, as what is stored names
+/// it: the same on every machine, whoever's home the directory is in.
+pub const CARGO_HOME: &str = "/cargo";
+
+/// `path` with the directory `to` in place of the directory `from` it is under.
+pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
+    let rest = path.strip_prefix(from)?;
+    rest.starts_with(['/', '\\']).then(|| format!("{to}{rest}"))
+}
+
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
@@ -177,6 +187,11 @@ pub trait SymbolResolver {
     /// same sources are built on the same crates.
     fn content_id(&self, krate: Crate) -> Option<ContentId> {
         _ = krate;
+        None
+    }
+    /// Where cargo keeps the sources it fetched on this machine, when the crates of the
+    /// program tell: [`CARGO_HOME`] stands for it in what is stored.
+    fn cargo_home(&self) -> Option<String> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -2136,7 +2151,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
                 .map(|store| {
                     let checked = build_checks_overflow(db);
-                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked))
+                    let home = symbols.cargo_home();
+                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked, home))
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
@@ -2483,10 +2499,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return;
         }
         let stored = store.get(&key).filter(|_| check);
-        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
+        let Some(mut entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
+        if !entry.leave(self.symbols.cargo_home().as_deref()) {
+            let _: Option<()> = self.kept.unkept("a file under what stands for cargo's directory");
+            return;
+        }
         let Some(bytes) = entry.encode() else { return };
         match stored {
             None => {
@@ -2569,13 +2589,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Only a crate of the checkout is compiled with where the checkout is.
         let placed =
             self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
+        let home = self.symbols.cargo_home();
         let mut datas = Vec::with_capacity(ids.datas.len());
         for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
-            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request
-                && placed
-                && self.symbols.names_place(&blob.bytes)
-            {
-                return self.kept.unkept("data with the place of the checkout");
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
+                if placed && self.symbols.names_place(&blob.bytes) {
+                    return self.kept.unkept("data with the place of the checkout");
+                }
+                if home.as_deref().is_some_and(|home| cached::holds(&blob.bytes, home)) {
+                    return self.kept.unkept("data with the place of cargo's directory");
+                }
             }
             datas.push(match request {
                 DataRequest::Blob { blob, identity } => {

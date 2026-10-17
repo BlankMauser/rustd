@@ -707,6 +707,10 @@ impl SymbolResolver for Resolver<'_> {
         )
     }
 
+    fn cargo_home(&self) -> Option<String> {
+        self.contents.cargo_home(self.db)
+    }
+
     fn names_place(&self, bytes: &[u8]) -> bool {
         self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
@@ -2987,6 +2991,9 @@ fn main() -> anyhow::Result<()> {
         sysroot: Some(sysroot),
         target: args.target.clone(),
         set_test: args.cfg_test,
+        // Tests, benches and examples are what dev-dependencies are for: cargo runs the
+        // build scripts and the proc macros of those only for a build that has them.
+        all_targets: args.cfg_test || args.dev_deps,
         features: match args.all_features {
             true => CargoFeatures::All,
             false => CargoFeatures::Selected {

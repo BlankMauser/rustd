@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use hir_ty::mir::codegen::ContentId;
+use hir_ty::mir::codegen::{CARGO_HOME, ContentId, moved};
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -24,6 +24,8 @@ pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
+    /// Where cargo keeps the sources it fetched, once the crates were asked.
+    cargo_home: std::sync::OnceLock<Option<String>>,
 }
 
 impl Contents {
@@ -43,6 +45,22 @@ impl Contents {
         let id = self.hash(db, checkouts, krate, stable_crate_id, process_reads);
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
         id
+    }
+
+    /// Where cargo keeps the sources it fetched, when the crates that are not of the
+    /// checkout are under one such directory: what is stored names it the same on every
+    /// machine. With none, or with more than one, nothing is renamed.
+    pub(crate) fn cargo_home(&self, db: &RootDatabase) -> Option<String> {
+        let found = || {
+            let crates = ide_db::base_db::all_crates(db);
+            let outside = crates.iter().filter(|it| !it.data(db).origin.is_local());
+            let roots = outside.filter_map(|&it| crate::crate_root_file(db, it.into()));
+            let homes: FxHashSet<String> =
+                roots.filter_map(|it| Some(cargo_home_of(&it)?.to_str()?.to_owned())).collect();
+            let mut homes = homes.into_iter();
+            homes.next().filter(|_| homes.next().is_none())
+        };
+        self.cargo_home.get_or_init(found).clone()
     }
 
     /// Whether data of a crate hashed here has in it where the checkout or the output of a
@@ -172,9 +190,13 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd library 3");
+        field(b"rustd library 4");
         field(Self::version(db, krate).as_bytes());
-        field(root.as_os_str().as_encoded_bytes());
+        // Where cargo fetched it to is under another directory on another machine.
+        let root = root.to_string_lossy();
+        let home = self.cargo_home(db);
+        let there = home.and_then(|home| moved(&root, &home, CARGO_HOME));
+        field(there.as_deref().unwrap_or(&root).as_bytes());
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
         cfgs.sort_unstable();
@@ -220,6 +242,13 @@ impl Contents {
     }
 }
 
+/// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry
+/// are in its `registry/src`, those of git in its `git/checkouts`.
+fn cargo_home_of(path: &Path) -> Option<&Path> {
+    let fetched = |dir: &&Path| dir.ends_with("registry/src") || dir.ends_with("git/checkouts");
+    path.ancestors().filter(fetched).last()?.parent()?.parent()
+}
+
 /// Where a file of a crate is, by what its path is hashed from.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Written {
@@ -248,5 +277,24 @@ impl FileHashes {
         let hash: Hash = Sha256::digest(text.as_bytes()).into();
         hashes.files.insert(file, (text.clone(), hash));
         hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cargo_home_is_told_from_a_file_cargo_fetched() {
+        fn home(path: &str) -> Option<&str> {
+            cargo_home_of(Path::new(path))?.to_str()
+        }
+        let registry = "/home/one/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
+        assert_eq!(home(&format!("{registry}/dep-0.1.0/src/lib.rs")), Some("/home/one/.cargo"));
+        assert_eq!(home("/srv/c/git/checkouts/dep-1a2b/3c4d/src/lib.rs"), Some("/srv/c"));
+        // A crate that vendors another has the outermost such directory as cargo's.
+        let nested = format!("{registry}/dep-0.1.0/registry/src/inner/lib.rs");
+        assert_eq!(home(&nested), Some("/home/one/.cargo"));
+        assert_eq!(home("/home/one/checkout/src/lib.rs"), None);
     }
 }

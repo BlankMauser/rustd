@@ -21,10 +21,29 @@ use anyhow::{Context, bail};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use crate::remote::{Remote, Unsigned, transfer};
+use crate::remote::{Bounds, LIST_MAX, Remote, Unsigned, Written, transfer};
 
 /// The directories of a profile that hold units, the one cargo trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
+
+/// What an entry of an archive takes of it besides what the file holds.
+const HEADER: u64 = 512;
+
+/// The most the units one `rustd deps pull` fetches unpack to, unless `RUSTD_DEPS_MAX`
+/// says: `off` for no limit.
+const UNPACKED_MAX: u64 = 64 << 30;
+
+/// The bound on what a pull unpacks, from `RUSTD_DEPS_MAX`.
+fn unpacked_max() -> anyhow::Result<Option<u64>> {
+    match std::env::var("RUSTD_DEPS_MAX") {
+        Err(_) => Ok(Some(UNPACKED_MAX)),
+        Ok(text) if text == "off" => Ok(None),
+        Ok(text) => Ok(Some(
+            hir_ty::mir::codegen::parse_size(&text)
+                .with_context(|| format!("RUSTD_DEPS_MAX=`{text}` is neither a size nor `off`"))?,
+        )),
+    }
+}
 
 /// The units a project's builds used and the archive of each: `unit hash` a line.
 struct Listed(BTreeMap<String, String>);
@@ -35,13 +54,16 @@ impl Listed {
     }
 
     fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
-        let bytes = remote.fetch(&Listed::at(project))?.unwrap_or_default();
+        let bytes = remote.fetch(&Listed::at(project), LIST_MAX)?.unwrap_or_default();
         Listed::parse(bytes)
     }
 
     /// The units the bytes of a list name. A line that is not a unit and the hash of its
     /// archive is not one, and neither is ever the name of a file.
     fn parse(bytes: Vec<u8>) -> anyhow::Result<Listed> {
+        if bytes.len() as u64 > LIST_MAX {
+            bail!("the list of units is longer than the {LIST_MAX} bytes that are read of one");
+        }
         let text = String::from_utf8(bytes).context("the list of units is not text")?;
         let units = text
             .lines()
@@ -164,13 +186,49 @@ fn push(
     Ok(format!("{} units added to `{project}`, {} MB sent", missing.len(), bytes >> 20))
 }
 
+/// Unpacks the archive of `unit` in `dir`: only files and directories that are of the unit,
+/// and no more of them than `written` has room for.
+fn unpack(dir: &Path, unit: &str, archive: &[u8], written: &Written) -> anyhow::Result<()> {
+    let mut tar = tar::Archive::new(zstd::Decoder::new(archive)?);
+    tar.set_preserve_mtime(true);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        // Only what is of this unit: an archive is not trusted to say where it goes.
+        let path = entry.path()?.into_owned();
+        let mut parts = path.components().map(|it| it.as_os_str().to_str());
+        let (Some(Some(place)), Some(Some(name))) = (parts.next(), parts.next()) else {
+            bail!("{unit} holds {}", path.display());
+        };
+        let of_unit = match place {
+            "deps" => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
+            "build" | ".fingerprint" => name == unit,
+            _ => false,
+        };
+        // Nor a link, which is to wherever it says. A file with holes is a file.
+        let kind = entry.header().entry_type();
+        if !of_unit || !(kind.is_file() || kind.is_dir() || kind.is_gnu_sparse()) {
+            bail!("{unit} holds {}", path.display());
+        }
+        // An archive is small for what it unpacks to, and says itself how much that is.
+        let header = entry.header();
+        let size = header.size().unwrap_or(u64::MAX).max(entry.size());
+        written.add(size.saturating_add(HEADER))?;
+        if !entry.unpack_in(dir)? {
+            bail!("{unit} holds {}, which is outside of it", path.display());
+        }
+    }
+    Ok(())
+}
+
 /// Fetches the units of the project's list that `dir` has no fingerprint of.
 fn pull(
     dir: &Path,
     remote: &Remote,
     project: &str,
     local: &BTreeSet<String>,
+    bounds: Bounds,
 ) -> anyhow::Result<String> {
+    let written = Written::none(bounds.all);
     std::fs::create_dir_all(dir)?;
     let listed = Listed::fetch(remote, project)?;
     let missing: Vec<&String> = listed
@@ -181,36 +239,13 @@ fn pull(
         .collect();
     let bytes = transfer(&missing, |unit| {
         let hash = &listed.0[unit];
-        let Some(bytes) = remote.fetch(&format!("units/{hash}"))? else {
+        let Some(bytes) = remote.fetch(&format!("units/{hash}"), bounds.object)? else {
             bail!("`{project}` lists {unit}, which is not there");
         };
         if format!("{:x}", Sha256::digest(&bytes)) != *hash {
             bail!("{unit} is not what was sent under that name");
         }
-        let mut tar = tar::Archive::new(zstd::Decoder::new(&bytes[..])?);
-        tar.set_preserve_mtime(true);
-        for entry in tar.entries()? {
-            let mut entry = entry?;
-            // Only what is of this unit: an archive is not trusted to say where it goes.
-            let path = entry.path()?.into_owned();
-            let mut parts = path.components().map(|it| it.as_os_str().to_str());
-            let (Some(Some(place)), Some(Some(name))) = (parts.next(), parts.next()) else {
-                bail!("{unit} holds {}", path.display());
-            };
-            let of_unit = match place {
-                "deps" => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
-                "build" | ".fingerprint" => name == unit,
-                _ => false,
-            };
-            // Nor a link, which is to wherever it says. A file with holes is a file.
-            let kind = entry.header().entry_type();
-            if !of_unit || !(kind.is_file() || kind.is_dir() || kind.is_gnu_sparse()) {
-                bail!("{unit} holds {}", path.display());
-            }
-            if !entry.unpack_in(dir)? {
-                bail!("{unit} holds {}, which is outside of it", path.display());
-            }
-        }
+        unpack(dir, unit, &bytes, &written)?;
         Ok(bytes.len() as u64)
     })?;
     Ok(format!("{} units of `{project}` fetched, {} MB", missing.len(), bytes >> 20))
@@ -234,7 +269,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         "push" => push(dir, &remote, &project, &local)?,
         "pull" => {
             Unsigned::taken()?;
-            pull(dir, &remote, &project, &local)?
+            pull(dir, &remote, &project, &local, Bounds::from_env(unpacked_max()?)?)?
         }
         _ => bail!(USAGE),
     };
@@ -248,6 +283,7 @@ mod tests {
     use crate::remote::tests::{changed, scratch};
 
     const UNIT: &str = "serde-33c9cbd578789acd";
+    const ROOMY: Bounds = Bounds { object: 1 << 20, all: Some(1 << 20) };
 
     /// A remote whose list for `default` has one unit, the archive `entries` are in.
     fn remote_with(name: &str, entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Remote {
@@ -276,7 +312,7 @@ mod tests {
             tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
         });
         let dir = scratch("unit-target");
-        pull(&dir, &remote, "default", &BTreeSet::new()).unwrap();
+        pull(&dir, &remote, "default", &BTreeSet::new(), ROOMY).unwrap();
         assert_eq!(std::fs::read(dir.join(rlib)).unwrap(), b"rlib");
     }
 
@@ -307,11 +343,115 @@ mod tests {
         for (name, entries) in archives {
             let remote = remote_with(&format!("{name}-remote"), entries);
             let dir = scratch(&format!("{name}-target")).join("target/debug");
-            assert!(pull(&dir, &remote, "default", &BTreeSet::new()).is_err(), "{name}");
+            assert!(pull(&dir, &remote, "default", &BTreeSet::new(), ROOMY).is_err(), "{name}");
             assert!(!outside.join("planted").exists(), "{name}");
             let top = dir.ancestors().nth(2).unwrap();
             assert!(!top.join("planted").exists() && !dir.join("deps").exists(), "{name}");
         }
+    }
+
+    /// How many bytes the files below `dir` hold.
+    fn held(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|it| match it.metadata() {
+                Ok(meta) if meta.is_dir() => held(&it.path()),
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn an_archive_or_a_list_longer_than_is_read_is_refused() {
+        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
+        let remote = remote_with("long-remote", |tar| {
+            tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
+        });
+        let Remote::Dir(at) = &remote else { unreachable!() };
+        let archive = std::fs::read_dir(at.join("units")).unwrap().next().unwrap().unwrap();
+        let long = archive.metadata().unwrap().len();
+        let dir = scratch("long-target");
+        let short = Bounds { object: long - 1, all: None };
+        let refused = pull(&dir, &remote, "default", &BTreeSet::new(), short).unwrap_err();
+        assert!(refused.to_string().contains("is longer than"), "{refused}");
+        assert_eq!(held(&dir), 0);
+        let exact = Bounds { object: long, all: None };
+        pull(&dir, &remote, "default", &BTreeSet::new(), exact).unwrap();
+        assert_eq!(held(&dir), 4);
+
+        let line = format!("{UNIT} {}\n", "ab".repeat(32));
+        let mut list = line.repeat(LIST_MAX as usize / line.len());
+        list.push_str(&" ".repeat(LIST_MAX as usize - list.len()));
+        remote.send("deps/default", list.as_bytes()).unwrap();
+        assert_eq!(Listed::fetch(&remote, "default").unwrap().0.len(), 1);
+        list.push(' ');
+        remote.send("deps/default", list.as_bytes()).unwrap();
+        assert!(Listed::fetch(&remote, "default").is_err());
+        assert!(Listed::parse(list.into_bytes()).is_err());
+    }
+
+    #[test]
+    fn an_archive_that_unpacks_to_more_than_is_taken_is_refused() {
+        let file = |at: u32| format!("build/{UNIT}/out/{at}");
+        let remote = remote_with("bomb-remote", |tar| {
+            for at in 0..64 {
+                let zeros = vec![0; 1 << 20];
+                tar.append_data(
+                    &mut header(tar::EntryType::Regular, 1 << 20),
+                    file(at),
+                    &zeros[..],
+                )
+                .unwrap();
+            }
+        });
+        let Remote::Dir(at) = &remote else { unreachable!() };
+        let archive = std::fs::read_dir(at.join("units")).unwrap().next().unwrap().unwrap();
+        assert!(archive.metadata().unwrap().len() < 64 << 10, "the archive is small");
+        let dir = scratch("bomb-target");
+        let bounds = Bounds { object: 1 << 20, all: Some(4 << 20) };
+        let refused = pull(&dir, &remote, "default", &BTreeSet::new(), bounds).unwrap_err();
+        assert!(refused.to_string().contains("more than the 4194304 bytes"), "{refused}");
+        assert!(held(&dir) <= 4 << 20, "{} bytes were written", held(&dir));
+        let dir = scratch("bomb-target-roomy");
+        let bounds = Bounds { object: 1 << 20, all: Some((64 << 20) + 64 * HEADER) };
+        pull(&dir, &remote, "default", &BTreeSet::new(), bounds).unwrap();
+        assert_eq!(held(&dir), 64 << 20);
+    }
+
+    #[test]
+    fn no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let rlib = format!("deps/libserde-{}.rlib", &UNIT[6..]);
+        tar.append_data(&mut header(tar::EntryType::Regular, 4), &rlib, &b"rlib"[..]).unwrap();
+        let mut dir = header(tar::EntryType::Directory, 0);
+        tar.append_data(&mut dir, format!("build/{UNIT}"), &b""[..]).unwrap();
+        let out = format!("build/{UNIT}/output");
+        tar.append_data(&mut header(tar::EntryType::Regular, 9), out, &b"cargo:x=1"[..]).unwrap();
+        let seed = tar.into_inner().unwrap();
+        let top = scratch("changed-archives");
+        let dir = top.join("target/debug");
+        let runs: usize = std::env::var("RUSTD_FUZZ_RUNS").map_or(3_000, |it| it.parse().unwrap());
+        let (mut unpacked, most) = (0, 1 << 16);
+        for bytes in changed(&seed, runs) {
+            _ = std::fs::remove_dir_all(&top);
+            std::fs::create_dir_all(&dir).unwrap();
+            let packed = zstd::encode_all(&bytes[..], 1).unwrap();
+            let written = Written::none(Some(most));
+            unpacked += unpack(&dir, UNIT, &packed, &written).is_ok() as usize;
+            // The same bytes with nothing packing them are not an archive either.
+            _ = unpack(&dir, UNIT, &bytes, &Written::none(Some(most)));
+            assert!(held(&dir) <= most, "{} bytes were written", held(&dir));
+            let around: Vec<_> = std::fs::read_dir(&top).unwrap().flatten().collect();
+            assert!(around.len() == 1 && held(&top) == held(&dir), "{around:?}");
+            for place in std::fs::read_dir(&dir).unwrap().flatten() {
+                let place = place.file_name().into_string().unwrap();
+                assert!(matches!(&*place, "deps" | "build"), "{place}");
+            }
+        }
+        assert!(unpacked > runs / 100, "{unpacked} of {runs} unpacked");
+        _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]

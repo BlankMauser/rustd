@@ -380,12 +380,12 @@ impl StoreDir {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, said))
         };
         // A link to a directory is taken for the directory, which is what is checked.
-        let meta = std::fs::metadata(&self.dir)?;
-        if !meta.is_dir() {
+        let dir = private::open_dir(&self.dir)?;
+        if !dir.metadata()?.is_dir() {
             return refused("is not a directory");
         }
-        match private::others_write(&meta) {
-            Some(why) => refused(&format!("{why} (`chmod 700` it if it is yours)")),
+        match private::others_write(&dir) {
+            Some(why) => refused(&format!("{why} ({} if it is yours)", private::MENDED_BY)),
             None => Ok(()),
         }
     }
@@ -394,7 +394,7 @@ impl StoreDir {
     /// another user's or that others can write to is not the store's.
     fn open(&self, name: &str, write: bool) -> io::Result<File> {
         let file = OpenOptions::new().read(true).write(write).open(self.dir.join(name))?;
-        match private::others_write(&file.metadata()?) {
+        match private::others_write(&file) {
             Some(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, why)),
             None => Ok(file),
         }
@@ -1156,14 +1156,36 @@ impl New {
     }
 }
 
-/// Keeping the store to the user it is of. On Windows a directory of the user's profile is
-/// the user's by the access control list it inherits, and nothing is checked here.
+#[cfg(windows)]
+mod acl;
+
+/// Keeping the store to the user it is of. On Unix that is the owner and the mode of the
+/// directory and of each file. On Windows it is the owner and the access control list,
+/// see [`acl`]: a directory is made with the list it inherits, which under the user's
+/// profile lets in the user alone, and one that lets in others is refused, not mended.
 mod private {
     use std::{
-        fs::{Metadata, OpenOptions},
+        fs::{File, OpenOptions},
         io,
         path::Path,
     };
+
+    /// What makes a directory that was refused one that is taken.
+    #[cfg(not(windows))]
+    pub(super) const MENDED_BY: &str = "`chmod 700` it";
+    #[cfg(windows)]
+    pub(super) const MENDED_BY: &str =
+        "`icacls DIR /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"` it";
+
+    /// Opens a directory for what is asked of it by its handle.
+    pub(super) fn open_dir(dir: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // Windows opens a directory only when told that it may be one.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0200_0000);
+        options.open(dir)
+    }
 
     /// Makes the directory and the ones above it that are missing, for the user alone.
     pub(super) fn create_dir(dir: &Path) -> io::Result<()> {
@@ -1197,11 +1219,14 @@ mod private {
         options
     }
 
-    /// Why what `meta` is of could have been written by someone other than the user this
+    /// Why what `file` is could have been written by someone other than the user this
     /// process runs as, if it could.
     #[cfg(unix)]
-    pub(super) fn others_write(meta: &Metadata) -> Option<&'static str> {
+    pub(super) fn others_write(file: &File) -> Option<&'static str> {
         use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = file.metadata() else {
+            return Some("has an owner that could not be read");
+        };
         // SAFETY: `geteuid` takes nothing and cannot fail.
         let user = unsafe { libc::geteuid() };
         if meta.uid() != user {
@@ -1210,8 +1235,11 @@ mod private {
         (meta.mode() & 0o022 != 0).then_some("can be written to by other users")
     }
 
-    #[cfg(not(unix))]
-    pub(super) fn others_write(_: &Metadata) -> Option<&'static str> {
+    #[cfg(windows)]
+    pub(super) use super::acl::others_write;
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn others_write(_: &File) -> Option<&'static str> {
         None
     }
 }
@@ -1708,6 +1736,61 @@ mod tests {
         std::fs::write(&dir, b"").unwrap();
         assert!(Store::open(&dir, identity("a toolchain"), EAGER).is_err());
         std::fs::remove_file(&dir).unwrap();
+    }
+
+    /// Lets every user of the machine do `rights` to `path`, as `icacls` writes them.
+    #[cfg(windows)]
+    fn let_everyone(path: &Path, rights: &str) {
+        let grant = format!("*S-1-1-0:{rights}");
+        let done = std::process::Command::new("icacls").arg(path).args(["/grant", &grant]).output();
+        assert!(done.unwrap().status.success(), "icacls {} /grant {grant}", path.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_under_the_users_profile_is_taken() {
+        let dir = scratch("acl-inherited");
+        let pack = sealed(&dir);
+        assert_eq!(StoreDir::at(&dir).verify().unwrap().corrupt, []);
+        assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        // Reading is not writing: a store others can only read is still the user's.
+        let_everyone(&dir, "(OI)(CI)RX");
+        let_everyone(&pack, "R");
+        assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_whose_list_lets_others_write_is_refused() {
+        for rights in ["(OI)(CI)M", "(OI)(CI)F", "(AD)", "(WD)", "(DC)", "(WDAC)", "(WO)"] {
+            let dir = scratch("acl-writable");
+            sealed(&dir);
+            let_everyone(&dir, rights);
+            let refused = Store::open(&dir, identity("a toolchain"), EAGER).err().unwrap();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{rights}");
+            assert!(refused.to_string().contains("written to by other users"), "{refused}");
+            assert!(refused.to_string().contains("icacls"), "{refused}");
+            assert!(StoreDir::at(&dir).verify().is_err(), "{rights}");
+            assert!(StoreDir::at(&dir).stats().is_err(), "{rights}");
+            assert!(StoreDir::at(&dir).collect(None).is_err(), "{rights}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pack_whose_list_lets_others_write_is_not_read() {
+        let dir = scratch("acl-writable-pack");
+        let pack = sealed(&dir);
+        let_everyone(&pack, "M");
+        let found = StoreDir::at(&dir).verify().unwrap();
+        assert_eq!(found.corrupt.len(), 1);
+        assert!(found.corrupt[0].1.contains("written to by other users"));
+        let store = open(&dir, EAGER);
+        assert_eq!(store.get(&[1; KEY]), None);
+        assert_eq!(store.corrupt.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Another user's store is refused: run as root, where a directory can be given away.

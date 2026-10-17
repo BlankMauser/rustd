@@ -383,6 +383,61 @@ impl Entry {
     }
 }
 
+/// Whether `bytes` have the name of the directory `place` in them.
+pub(super) fn holds(bytes: &[u8], place: &str) -> bool {
+    !place.is_empty() && bytes.windows(place.len()).any(|it| it == place.as_bytes())
+}
+
+impl Entry {
+    /// The names of the files the entry tells of: in its panic locations, in what `file!()`
+    /// is, and in what a debugger is told.
+    fn files(&mut self) -> impl Iterator<Item = &mut String> {
+        let named = self.datas.iter_mut().filter_map(|it| match it {
+            CachedData::Location(Some((file, ..))) | CachedData::FilePath(file) => Some(file),
+            _ => None,
+        });
+        named.chain(self.debug.iter_mut().flat_map(|it| &mut it.files))
+    }
+
+    fn of_cargo(&mut self) -> bool {
+        self.files().any(|it| super::moved(it, super::CARGO_HOME, "").is_some())
+    }
+
+    /// Names the files under `cargo_home` as every machine does, on the way to the store.
+    /// Not to be kept when a file is already named as one of those and is not: it would be
+    /// read back as one.
+    pub(super) fn leave(&mut self, cargo_home: Option<&str>) -> bool {
+        if cargo_home == Some(super::CARGO_HOME) {
+            return true;
+        }
+        if self.of_cargo() {
+            return false;
+        }
+        let Some(home) = cargo_home else { return true };
+        for file in self.files() {
+            if let Some(there) = super::moved(file, home, super::CARGO_HOME) {
+                *file = there;
+            }
+        }
+        true
+    }
+
+    /// Names the files of cargo's directory as this machine does, on the way from the store.
+    /// `None` when the entry has such files and this machine has no such directory.
+    pub(super) fn arrived(mut self, cargo_home: Option<&str>) -> Option<Entry> {
+        if cargo_home == Some(super::CARGO_HOME) || !self.of_cargo() {
+            return Some(self);
+        }
+        let home = cargo_home?;
+        for file in self.files() {
+            if let Some(here) = super::moved(file, super::CARGO_HOME, home) {
+                *file = here;
+            }
+        }
+        Some(self)
+    }
+}
+
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
     store: &'static Store,
@@ -390,6 +445,8 @@ pub(super) struct Entries {
     debug: bool,
     /// Whether the build checks arithmetic for overflow: see [`Entry::key`].
     checks_overflow: Option<bool>,
+    /// Where cargo keeps the sources it fetched on this machine.
+    cargo_home: Option<String>,
     known: Mutex<Known>,
 }
 
@@ -418,8 +475,9 @@ impl Entries {
         store: &'static Store,
         debug: bool,
         checks_overflow: Option<bool>,
+        cargo_home: Option<String>,
     ) -> Entries {
-        Entries { store, debug, checks_overflow, known: Mutex::default() }
+        Entries { store, debug, checks_overflow, cargo_home, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -444,7 +502,7 @@ impl Entries {
         let entry = (!banned)
             .then(|| {
                 let key = Entry::key(name, self.debug, self.checks_overflow)?;
-                Entry::decode(&self.store.get(&key)?)
+                Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
             })
             .flatten()
             .map(Arc::new);
@@ -625,6 +683,58 @@ mod tests {
             code: code(vec![reloc(4, 0, 4), reloc(12, 1, 5)]),
             debug: Some(debug(nested(6))),
         }
+    }
+
+    /// An entry of a crate cargo fetched to `home`, with each kind of file name it can have.
+    fn fetched_to(home: &str) -> Entry {
+        let file =
+            format!("{home}/registry/src/index.crates.io-1949cf8c6b5b557f/dep-0.1.0/src/lib.rs");
+        let mut entry = entry();
+        entry.datas.push(CachedData::Location(Some((file.clone(), 3, 9))));
+        entry.datas.push(CachedData::FilePath(file.clone()));
+        entry.debug.as_mut().unwrap().files.push(file);
+        entry
+    }
+
+    #[test]
+    fn a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home() {
+        let (one, other) = ("/home/one/.cargo", "/srv/another user/cargo");
+        let mut stored = fetched_to(one);
+        assert!(stored.leave(Some(one)));
+        let mut theirs = fetched_to(other);
+        assert!(theirs.leave(Some(other)));
+        let bytes = stored.encode().unwrap();
+        assert_eq!(bytes, theirs.encode().unwrap());
+        assert!(!holds(&bytes, one) && !holds(&bytes, other));
+        assert!(holds(&bytes, "/cargo/registry/src/"));
+        // The files of the checkout are named as they were.
+        assert!(stored.files().any(|it| it == "src/lib.rs"));
+        let here = Entry::decode(&bytes).unwrap().arrived(Some(other)).unwrap();
+        assert_eq!(here.encode().unwrap(), fetched_to(other).encode().unwrap());
+    }
+
+    #[test]
+    fn a_fetched_file_is_not_taken_where_cargo_has_no_directory() {
+        let mut stored = fetched_to("/home/one/.cargo");
+        assert!(stored.leave(Some("/home/one/.cargo")));
+        assert!(Entry::decode(&stored.encode().unwrap()).unwrap().arrived(None).is_none());
+        // An entry without one is taken anywhere.
+        assert!(entry().arrived(None).is_some());
+    }
+
+    #[test]
+    fn a_directory_named_as_cargos_stands_in_is_not_mistaken_for_it() {
+        // A checkout that really is under `/cargo` is not stored as if cargo fetched it.
+        assert!(!fetched_to("/cargo").leave(Some("/home/one/.cargo")));
+        assert!(!fetched_to("/cargo").leave(None));
+        // A cargo home that is `/cargo` already names its files as every machine does.
+        let mut same = fetched_to("/cargo");
+        assert!(same.leave(Some("/cargo")));
+        assert_eq!(same.encode().unwrap(), fetched_to("/cargo").encode().unwrap());
+        // Only whole components are the home.
+        let mut beside = fetched_to("/home/one/.cargo-old");
+        assert!(beside.leave(Some("/home/one/.cargo")));
+        assert!(beside.files().any(|it| it.starts_with("/home/one/.cargo-old/")));
     }
 
     /// Does with an entry what stitching it does with the places it names.

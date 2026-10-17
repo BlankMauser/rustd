@@ -15,13 +15,19 @@ A daemon fills a store and ends. Then:
   - `rustd cache pull` from a remote whose lists nobody signed has to be refused, with
     nothing fetched, unless RUSTD_REMOTE_UNSIGNED=1; `rustd cache push` asks for nothing.
 
+  - a crate cargo fetched from a registry is kept under `/cargo`, not under the cargo home
+    of whoever built it: a second user with another cargo home has to find what the first
+    kept, the program has to print what that user's cargo's prints (the place of the file
+    under their own cargo home), and neither home may be in the store.
+
     python3 storeguards.py
 """
-import os, shutil, stat, sys
+import os, re, shutil, stat, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import Checkout, Daemon, cache, files, scratch, verify
+from storelib import Checkout, Daemon, cache, files, run, scratch, verify
+from difftest import Fixture
 
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
 OTHERS_WRITE = "written to by other users"
@@ -121,6 +127,94 @@ def unsigned(store, work):
           f"then {len(files(second, '.pack'))} packs fetched")
 
 
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write(text)
+
+
+def fetched_workspace(top):
+    """A workspace whose program is built on a crate of a registry of this machine's own."""
+    registry, ws = os.path.join(top, "registry"), os.path.join(top, "ws")
+    write(f"{top}/stage/dep-0.1.0/Cargo.toml", '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
+    write(f"{top}/stage/dep-0.1.0/src/lib.rs",
+          'pub fn place() -> &\'static str {\n    file!()\n}\n\n'
+          'pub fn third(of: &[u32]) -> u32 {\n    of[2]\n}\n\n'
+          'pub fn first<T: Copy>(of: &[T]) -> T {\n    of[0]\n}\n')
+    os.makedirs(f"{registry}/crates")
+    crate = f"{registry}/crates/dep-0.1.0.crate"
+    subprocess.run(["tar", "-czf", crate, "-C", f"{top}/stage", "dep-0.1.0"], check=True)
+    import hashlib
+    cksum = hashlib.sha256(open(crate, "rb").read()).hexdigest()
+    write(f"{registry}/index/3/d/dep",
+          '{"name":"dep","vers":"0.1.0","deps":[],"cksum":"%s","features":{},"yanked":false}\n' % cksum)
+    write(f"{registry}/index/config.json", '{"dl": "file://%s/crates/{crate}-{version}.crate"}\n' % registry)
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", f"{registry}/index"]
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "index"]):
+        subprocess.run([*git, *args], check=True)
+    write(f"{ws}/.cargo/config.toml", f'[registries.local]\nindex = "file://{registry}/index"\n')
+    write(f"{ws}/Cargo.toml", '[workspace]\nmembers = ["app"]\nresolver = "2"\n')
+    write(f"{ws}/app/Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
+          '[dependencies]\ndep = { version = "0.1", registry = "local" }\n')
+    write(f"{ws}/app/src/main.rs",
+          'fn main() {\n    println!("{} {}", dep::place(), dep::first(&[4u8]));\n'
+          '    let short = std::env::args().map(|it| it.len() as u32).collect::<Vec<_>>();\n'
+          '    let caught = std::panic::catch_unwind(|| dep::third(&short)).unwrap_err();\n'
+          '    println!("{}", caught.downcast_ref::<String>().map_or("?", |it| it));\n}\n')
+    return ws
+
+
+def built_with_home(ws, home, store):
+    """Builds the program with `home` as cargo's; returns what rustd said of the store."""
+    were = {name: os.environ.get(name) for name in ("CARGO_HOME", "RUSTD_CACHE", "PATH")}
+    cargo_bin = os.path.dirname(shutil.which("cargo"))
+    os.environ.update(CARGO_HOME=home, RUSTD_CACHE=store, PATH=cargo_bin + os.pathsep + os.environ["PATH"],
+                      **SEALS)
+    try:
+        fx = Fixture(ws, ["dep", "app"], ["-p", "app"])
+        fx.rustc_build()
+        fx.rustd_build()
+    finally:
+        for name, value in were.items():
+            os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
+    want, got = run(fx.reference), run(fx.binary)
+    if home not in want or got != want:
+        fail(f"with {home} as cargo's home the program prints\n{got}\nand cargo's\n{want}")
+    said = open(os.path.join(fx.work, "app.stderr")).read()
+    counted = re.search(r"entries: (\d+) found, (\d+) added", said)
+    if not counted:
+        fail(f"rustd said nothing of the entries of the crate of the registry:\n{said[-2000:]}")
+    return int(counted[1]), int(counted[2])
+
+
+def another_cargo_home(work):
+    top = os.path.join(work, "fetched")
+    ws, store = fetched_workspace(top), os.path.join(top, "store")
+    homes = [os.path.join(top, name, "cargo") for name in ("one", "another-user")]
+    found, added = built_with_home(ws, homes[0], store)
+    if found or not added:
+        fail(f"the first build found {found} entries and added {added}")
+    found_again, added_again = built_with_home(ws, homes[1], store)
+    if found_again != added or added_again:
+        fail(f"under another cargo home {found_again} of {added} entries were found and {added_again} added")
+    remote = os.path.join(top, "remote")
+    status, out = cache(store, "push", remote)
+    if status != 0:
+        fail(f"push: {out}")
+    stored = b""
+    for what, directory in (("the store", store), ("the remote", remote)):
+        held = b"".join(open(os.path.join(at, name), "rb").read()
+                        for at, _, names in os.walk(directory) for name in sorted(names))
+        for home in homes:
+            if home.encode() in held:
+                fail(f"{what} has the cargo home {home} in it")
+        if b"/cargo/registry/src/" not in held:
+            fail(f"{what} has no file of the registry in it by the name every machine has for it")
+        stored = stored or held
+    print(f"  cargo home: {added} entries, some of a crate of a registry, kept under one cargo home, all found "
+          f"under another; neither home in the {len(stored)} bytes of the store or in the remote it was pushed to; the program prints "
+          f"the place under the home it was built with")
+
+
 if os.name != "posix":
     raise SystemExit("storeguards.py: the modes of files are checked on Unix only")
 WORK = scratch("rustd-storeguards-")
@@ -132,6 +226,7 @@ filled(CHECKOUT, STORE, "fill")
 the_users_alone(STORE)
 names_no_checkout(CHECKOUT, STORE, "the store")
 unsigned(STORE, WORK)
+another_cargo_home(WORK)
 writable_pack(CHECKOUT, STORE)
 writable_store(CHECKOUT, STORE)
 shutil.rmtree(WORK, ignore_errors=True)
