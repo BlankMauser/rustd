@@ -192,6 +192,10 @@ def wait_warm(side, root):
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
         if states and not any(s.startswith("loading") for s in states):
             return time.time() - began, states
+        # A project whose every build is cargo's has no daemon to wait for.
+        refused = re.findall(r"^  (every build is cargo's: .*)$", status.stdout, re.M)
+        if refused and not states:
+            return time.time() - began, refused
         time.sleep(0.25)
     return time.time() - began, ["not loaded in time"]
 
@@ -461,7 +465,8 @@ def table(rows):
 def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or list(PROJECTS)
-    work = tempfile.mkdtemp(prefix="rustd-cargo-")
+    # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
+    work = tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else None)
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:

@@ -5,12 +5,17 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use hir_ty::mir::codegen::ObjectFormat;
 use serde::{Deserialize, Serialize};
 
 use super::units::Record;
+use crate::weaken;
 
-/// What the linker is told so that the first definition of a name is the one that stays.
+/// What an ELF linker is told so that the first definition of a name is the one that stays.
 const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
+
+/// What Apple's linker is told so that a splice has room in the header for its two segments.
+const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
 
 /// The crates of the standard library whose symbols the daemon reads.
 const LIBRARY: [&str; 3] = ["core", "alloc", "std"];
@@ -58,7 +63,9 @@ impl Plan {
         let line =
             std::fs::read_to_string(line).with_context(|| format!("reading {}", line.display()))?;
         let Some(mut link) = LinkLine::parse(&line) else {
-            return Ok(Err("the link line is not one of an ELF linker driven by `cc`".to_owned()));
+            return Ok(Err(
+                "the link line is not one of an ELF or Mach-O linker driven by `cc`".to_owned()
+            ));
         };
         let mut plan = Plan {
             crates: vec![unit.source.clone()],
@@ -134,15 +141,24 @@ fn unsupported(unit: &Record) -> Option<String> {
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
 struct LinkLine {
+    /// What the line starts with to run the driver without some variables: `env -u NAME`.
+    without: Vec<String>,
     env: Vec<(String, String)>,
     linker: String,
     args: Vec<String>,
+    /// What the linker links: Apple's is told its architecture.
+    format: ObjectFormat,
 }
 
 impl LinkLine {
-    /// `None` for a line that is not `cc`'s for an ELF linker.
+    /// `None` for a line that is not `cc`'s for an ELF or a Mach-O linker.
     fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
+        let unsets = match words.first().map(String::as_str) {
+            Some("env") => words[1..].chunks(2).take_while(|it| it[0] == "-u").count(),
+            _ => 0,
+        };
+        let (without, words) = words.split_at(if unsets == 0 { 0 } else { 1 + 2 * unsets });
         let first = words.iter().position(|it| !is_assignment(it))?;
         let env = words[..first]
             .iter()
@@ -155,9 +171,14 @@ impl LinkLine {
             .filter(|it| !it.ends_with("symbols.o"))
             .cloned()
             .collect();
-        let elf = args.iter().any(|it| it == "-o")
-            && !args.iter().any(|it| it == "/NOLOGO" || it == "-flavor" || it == "-arch");
-        elf.then(|| LinkLine { env, linker: words[first].clone(), args })
+        let of_cc = args.iter().any(|it| it == "-o")
+            && !args.iter().any(|it| it == "/NOLOGO" || it == "-flavor");
+        let format = match args.iter().any(|it| it == "-arch") {
+            true => ObjectFormat::MachO,
+            false => ObjectFormat::Elf,
+        };
+        let (without, linker) = (without.to_vec(), words[first].clone());
+        of_cc.then(|| LinkLine { without, env, linker, args, format })
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
@@ -191,7 +212,20 @@ impl LinkLine {
             .position(|it| is_rustc_file(it))
             .context("nothing of rustc's is linked")?;
         let ours = [&plan.patch, &plan.object].map(|it| it.display().to_string());
-        self.args.splice(first..first, ours.into_iter().chain([FIRST_DEFINITION_STAYS.to_owned()]));
+        let flag = match self.format {
+            ObjectFormat::MachO => {
+                // Apple's linker has no flag for the first definition staying: what rustc
+                // built of the workspace gives way to the daemon's by being weak.
+                for arg in &mut self.args {
+                    if plan.copies.iter().any(|it| it == Path::new(arg)) {
+                        *arg = weaken::copy_of(Path::new(arg))?.display().to_string();
+                    }
+                }
+                ROOM_FOR_SEGMENTS
+            }
+            _ => FIRST_DEFINITION_STAYS,
+        };
+        self.args.splice(first..first, ours.into_iter().chain([flag.to_owned()]));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
@@ -203,7 +237,7 @@ impl LinkLine {
             .collect::<Result<_, _>>()
             .context("an argument of the link can't be quoted")?;
         std::fs::write(response, quoted.join("\n"))?;
-        let mut command = Vec::new();
+        let mut command = self.without;
         for (name, value) in &self.env {
             command.push(format!("{name}={}", shlex::try_quote(value)?));
         }
@@ -254,8 +288,21 @@ mod tests {
         assert!(LinkLine::parse("no quotes here").is_none());
         assert!(LinkLine::parse(r#""link.exe" "/NOLOGO" "/OUT:a.exe" "-o""#).is_none());
         assert!(LinkLine::parse(r#""rust-lld" "-flavor" "wasm" "-o" "a.wasm""#).is_none());
-        assert!(LinkLine::parse(r#""cc" "-arch" "arm64" "-o" "a""#).is_none());
         assert!(LinkLine::parse(r#"A="1" "cc" "unterminated"#).is_none());
+    }
+
+    #[test]
+    fn link_line_of_cc_for_mach_o() {
+        let line = r#"env -u IPHONEOS_DEPLOYMENT_TARGET -u TVOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "/t/deps/a.1.rcgu.o" "-arch" "arm64" "-o" "/t/deps/a-1""#;
+        let link = LinkLine::parse(line).unwrap();
+        assert_eq!(
+            link.without,
+            ["env", "-u", "IPHONEOS_DEPLOYMENT_TARGET", "-u", "TVOS_DEPLOYMENT_TARGET"]
+        );
+        assert_eq!(link.env, [("LC_ALL".to_owned(), "C".to_owned())]);
+        assert_eq!(link.linker, "cc");
+        assert_eq!(link.format, ObjectFormat::MachO);
+        assert_eq!(LinkLine::parse(LINE).unwrap().format, ObjectFormat::Elf);
     }
 
     #[test]

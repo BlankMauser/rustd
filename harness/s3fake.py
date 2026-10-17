@@ -11,13 +11,19 @@ import xml.etree.ElementTree as ET
 ACCESS, SECRET = "rustdharness", "rustdharness-not-a-secret"
 
 
+GIVEN = set()
+
+
 def free_port(below=65536):
-    """A port nothing listens on. SeaweedFS takes the port 10000 above each of its own too."""
+    """A port nothing listens on and no earlier call was given: macOS hands the same ones out
+    again, in order, before anything listens on them. SeaweedFS takes the port 10000 above
+    each of its own too."""
     while True:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        if port < below:
+        if port < below and port not in GIVEN:
+            GIVEN.add(port)
             return port
 
 

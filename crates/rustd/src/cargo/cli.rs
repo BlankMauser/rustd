@@ -312,7 +312,9 @@ impl Flags {
 fn unsupported_target(triple: &str) -> Option<String> {
     use hir_ty::mir::codegen::{ObjectFormat, Target};
     match Target::select(triple) {
-        Ok(target) if target.object_format == ObjectFormat::Elf => None,
+        Ok(target) if matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO) => {
+            None
+        }
         Ok(_) => Some(format!("programs for {triple} are not linked through `cargo rustd` yet")),
         Err(why) => Some(why),
     }

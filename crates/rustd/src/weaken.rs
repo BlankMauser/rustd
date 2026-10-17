@@ -9,7 +9,10 @@
 //! the libraries it loads. Nothing else of a file changes, and a file that is no Mach-O
 //! object is copied as it is.
 
-use std::{ops::Range, path::Path};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use object::{
@@ -28,22 +31,27 @@ const DIR: &str = "rustd-weak";
 /// Writes the copy of each file and prints where it is, in the order given.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     for file in args {
-        let file = Path::new(&file);
-        let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
-            anyhow::bail!("{} names no file", file.display());
-        };
-        let dir = dir.join(DIR);
-        std::fs::create_dir_all(&dir)?;
-        let copy = dir.join(name);
-        if !up_to_date(&copy, file) {
-            let mut data =
-                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-            weaken(&mut data);
-            crate::replace(&copy, &data)?;
-        }
-        println!("{}", copy.display());
+        println!("{}", copy_of(Path::new(&file))?.display());
     }
     Ok(())
+}
+
+/// Writes the copy of `file`, unless the one there is of the file as it is, and says where
+/// it is.
+pub(crate) fn copy_of(file: &Path) -> anyhow::Result<PathBuf> {
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+        anyhow::bail!("{} names no file", file.display());
+    };
+    let dir = dir.join(DIR);
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join(name);
+    if !up_to_date(&copy, file) {
+        let mut data =
+            std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+        weaken(&mut data);
+        crate::replace(&copy, &data)?;
+    }
+    Ok(copy)
 }
 
 /// Whether the copy was written after the file it is of.

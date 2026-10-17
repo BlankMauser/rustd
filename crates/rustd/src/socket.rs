@@ -179,15 +179,24 @@ fn read_lines_within<const LINES: usize>(
     timeout: Duration,
 ) -> io::Result<[String; LINES]> {
     check_peer(stream)?;
-    stream.set_read_timeout(Some(timeout))?;
+    wait_at_most(stream, Some(timeout))?;
     let mut lines = BufReader::new(stream.take(longest));
     let mut read = [const { String::new() }; LINES];
     for line in &mut read {
         *line = read_line(&mut lines)?;
     }
     // What a build takes is not the client's to be timed for.
-    stream.set_read_timeout(None)?;
+    wait_at_most(stream, None)?;
     Ok(read)
+}
+
+/// Has a read of `stream` wait no longer than `timeout`. macOS refuses that for a socket
+/// whose peer has hung up, which a read does not wait on anyway.
+fn wait_at_most(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
+    match stream.set_read_timeout(timeout) {
+        Err(refused) if refused.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        set => set,
+    }
 }
 
 /// The next line of `lines` without its end, when it has one before `lines` is at its limit.
