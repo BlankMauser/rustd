@@ -16,7 +16,7 @@ proxy or needs to kill the service.
     python3 remote.py --measure WORKSPACE -p PACKAGE --bin NAME --crate A,B,C [--run ARG]
                                                    a fresh machine with and without the remote
 """
-import argparse, hashlib, os, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, zlib
+import argparse, hashlib, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -104,16 +104,6 @@ class Remote:
             self.endpoint = os.environ.get("AWS_ENDPOINT_URL") or f"https://s3.{self.region}.amazonaws.com"
             self.env = {}
             self.secrets = [os.environ[it] for it in ("AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN") if it in os.environ]
-
-    def start(self):
-        if self.server:
-            self.server.start()
-            self.direct().create()
-            self.direct().put(PROBE, PROBE.encode())
-
-    def direct(self, prefix=""):
-        """The bucket as the service has it, past the proxy."""
-        return Bucket(f"http://127.0.0.1:{self.server.port}", self.bucket_name, prefix)
 
     def start(self):
         if self.server:
@@ -621,6 +611,118 @@ def stored(top, remote):
               (out.stdout + out.stderr).strip()[-70:])
 
 
+def collected(top, remote):
+    """`rustd cache gc --remote`: what no list names goes when it is old, and nothing else does."""
+    print(f"{remote.name}: the remote collected", flush=True)
+    DAYS = 24 * 3600
+
+    def gc(machine, address, *args, env=None):
+        out = machine.rustd("cache", "gc", "--remote", address, *args, env=env)
+        numbers = {}
+        for line in out.stdout.splitlines():
+            name, _, value = line.partition(":")
+            numbers[name.strip()] = [int(it) for it in re.findall(r"\d+", value)]
+        return out, numbers
+
+    def aged(seconds, one=True):
+        remote.proxy.clear()
+        remote.proxy.age, remote.proxy.age_one = seconds, one
+
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"g-{remote.name}-{it}", remote) for it in "ab")
+    sent = [a.add_pack(filler(f"{remote.name} collected {at}", 256 << 10)) for at in range(3)]
+    if a.rustd("cache", "push", address).returncode != 0:
+        raise SystemExit("the push failed")
+    stray = filler(f"{remote.name} listed nowhere", 256 << 10)
+    strays = {f"packs/{digest(stray)}.pack.zst": packed(stray), f"keys/{digest(b'k' * 32)}": b"k" * 32,
+              f"units/{digest(b'a unit')}": b"a unit"}
+    for name, data in strays.items():
+        bucket.put(name, data)
+    before = bucket.objects()
+
+    out, said = gc(a, address)
+    check("what was just written stays, listed or not", out.returncode == 0 and said.get("objects removed") == [0]
+          and said.get("lines taken out") == [0, 0] and bucket.objects() == before, out.stdout.splitlines()[0] if out.stdout else out.stderr[-80:])
+    out, _ = gc(a, address, "--unlisted-after", "1h")
+    check("an unlisted object cannot be given less than a push takes it as sent for",
+          out.returncode != 0 and "at least 7200 seconds" in out.stderr and bucket.objects() == before)
+    out, _ = gc(a, address, env={"RUSTD_REMOTE_READONLY": "1"})
+    check("a machine that only reads collects nothing", out.returncode != 0 and "RUSTD_REMOTE_READONLY" in out.stderr)
+    if not remote.proxy:
+        print("given: the checks that need old objects are left out: they need the proxy to say they are old")
+        return
+
+    aged(3 * DAYS)
+    out, said = gc(a, address, "--dry-run")
+    check("--dry-run says what would go and removes nothing", out.returncode == 0
+          and said.get("objects that would be removed") == [3] and bucket.objects() == before
+          and not remote.proxy.seen("DELETE"), out.stdout.replace("\n", "; ")[:110])
+    aged(3 * DAYS, one=False)
+    out, said = gc(a, address)
+    check("an object written again since it was listed stays", out.returncode == 0 and said.get("objects removed") == [0]
+          and bucket.objects() == before)
+    aged(3 * DAYS)
+    out, said = gc(a, address)
+    left = bucket.objects()
+    check("old objects that no list names are removed, and only those", out.returncode == 0
+          and said.get("objects removed") == [3] and said.get("bytes") == [sum(len(it) for it in strays.values())]
+          and set(before) - set(left) == set(strays), out.stdout.replace("\n", "; ")[:110])
+    aged(0)
+    out = b.rustd("cache", "pull", address)
+    whole, verified, _ = b.cache("verify")
+    check("what the lists name is all still there to pull", out.returncode == 0 and whole and sorted(b.packs()) == sorted(sent))
+
+    # A list this machine does not trust keeps what it names and all its lines.
+    key_file = os.path.join(remote.keys, "collector")
+    public = a.rustd("cache", "keygen", key_file).stdout.strip()
+    aged(3 * DAYS)
+    out, said = gc(a, address, "--older-than", "1d", env={"RUSTD_REMOTE_SIGN": key_file, "RUSTD_REMOTE_TRUST": public})
+    check("a list of another signer is left with its lines and what they name",
+          out.returncode == 0 and said.get("manifests left that this machine does not trust") == [1]
+          and said.get("objects removed") == [0] and bucket.objects() == left, out.stdout.replace("\n", "; ")[:110])
+
+    # A pack that was there before and is listed nowhere is sent again once it is old, and its age starts anew.
+    bucket.put(f"packs/{digest(stray)}.pack.zst", packed(stray))
+    c = Machine(top, f"g-{remote.name}-c", remote)
+    c.add_pack(stray)
+    aged(3 * DAYS)
+    out = c.rustd("cache", "push", address, "another")
+    check("a push sends again what has been there unlisted for long", out.returncode == 0
+          and len(remote.proxy.seen("PUT", "/packs/")) == 1, out.stdout.strip()[:80])
+
+    out, said = gc(a, address, "--older-than", "1d")
+    aged(0)
+    check("--older-than takes old packs off the lists and out of the remote", out.returncode == 0
+          and said.get("lines taken out") == [4, 0] and said.get("manifests written") == [2]
+          and not [it for it in bucket.objects() if it.startswith(("packs/", "keys/"))], out.stdout.replace("\n", "; ")[:110])
+    out = a.rustd("cache", "push", address)
+    d = Machine(top, f"g-{remote.name}-d", remote)
+    pulled = d.rustd("cache", "pull", address)
+    check("what was taken out is pushed again by a machine that has it", out.returncode == 0 and out.stdout.startswith("3 packs")
+          and pulled.returncode == 0 and sorted(d.packs()) == sorted(sent), out.stdout.strip()[:80])
+
+    # A store that made one pack of its small ones pushes that one too: the remote has them twice.
+    address, bucket = remote.fresh()
+    e, f = (Machine(top, f"g-{remote.name}-{it}", remote) for it in "ef")
+    for at in range(24):
+        e.add_pack(filler(f"{remote.name} small collected {at}", 64 << 10))
+    e.rustd("cache", "push", address)
+    ok, merged, _ = e.cache("gc")
+    out = e.rustd("cache", "push", address)
+    twice = len([it for it in bucket.objects() if it.startswith("packs/")])
+    aged(3 * DAYS)
+    collect, said = gc(e, address)
+    aged(0)
+    once = [it for it in bucket.objects() if it.startswith("packs/")]
+    pulled = f.rustd("cache", "pull", address)
+    whole, verified, _ = f.cache("verify")
+    check("packs whose keys are all in a merged pack are taken out, and the merged one stays",
+          ok and out.returncode == 0 and twice > len(once) and collect.returncode == 0
+          and said.get("lines taken out") == [0, twice - len(once)] and said.get("objects removed") == [2 * (twice - len(once))]
+          and pulled.returncode == 0 and whole and verified.get("records") == 24 and sorted(f.packs()) == sorted(e.packs()),
+          f"{twice} packs, then {len(once)}; " + collect.stdout.splitlines()[0][:70] if collect.stdout else collect.stderr[-80:])
+
+
 def packs_fetched(remote):
     """How many fetches of packs the proxy saw since it was last asked, or `None` without a proxy."""
     if not remote.proxy:
@@ -848,6 +950,7 @@ def checks():
             if remote.server:
                 over_tls(top, remote)
             stored(top, remote)
+            collected(top, remote)
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)

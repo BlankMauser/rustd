@@ -7,7 +7,7 @@ use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, bail};
@@ -461,6 +461,14 @@ impl super::Remote {
 /// An object that a list names and the remote does not have.
 #[derive(Debug)]
 pub(crate) struct Missing(pub(super) String);
+
+/// An object of a remote, as a listing has it.
+pub(crate) struct Object {
+    pub(super) name: String,
+    pub(super) len: u64,
+    /// When it was last written, by the clock of whatever holds it.
+    pub(super) written: SystemTime,
+}
 
 impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

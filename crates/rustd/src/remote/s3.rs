@@ -9,7 +9,7 @@
 use std::{
     path::Path,
     sync::{Arc, atomic::Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, bail};
@@ -28,7 +28,7 @@ use aws_smithy_http_client::{Builder as HttpClients, tls};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use url::Url;
 
-use super::transfer::{Refused, Traffic, Version};
+use super::transfer::{Object, Refused, Traffic, Version};
 
 /// A file of at least this many bytes is sent in parts.
 const MULTIPART_AT: u64 = 16 << 20;
@@ -153,14 +153,48 @@ impl S3 {
         Ok(Some((bytes.to_vec(), version)))
     }
 
-    /// How many bytes the object under `name` has, if there is one.
-    pub(crate) async fn size(&self, name: &str) -> anyhow::Result<Option<u64>> {
+    /// The object under `name` as a listing would have it, if there is one.
+    pub(crate) async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         match self.client.head_object().bucket(&self.bucket).key(self.key(name)).send().await {
-            Ok(found) => Ok(found.content_length.and_then(|it| u64::try_from(it).ok())),
+            Ok(found) => Ok(Some(Object {
+                name: name.to_owned(),
+                len: found.content_length.and_then(|it| u64::try_from(it).ok()).unwrap_or(0),
+                written: written_at(found.last_modified),
+            })),
             Err(e) if e.as_service_error().is_some_and(|it| it.is_not_found()) => Ok(None),
             Err(e) => Err(failed(e)).with_context(|| format!("looking for {name}")),
         }
+    }
+
+    /// The objects whose names start with `prefix`.
+    pub(crate) async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+        let (mut objects, mut next) = (Vec::new(), None);
+        loop {
+            self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+            let listing = self.client.list_objects_v2().bucket(&self.bucket);
+            let page = listing.prefix(self.key(prefix)).set_continuation_token(next).send().await;
+            let page = page.map_err(failed).with_context(|| format!("listing {prefix}"))?;
+            objects.extend(page.contents().iter().filter_map(|it| {
+                Some(Object {
+                    name: it.key()?.strip_prefix(&self.prefix)?.to_owned(),
+                    len: it.size().and_then(|it| u64::try_from(it).ok()).unwrap_or(0),
+                    written: written_at(it.last_modified),
+                })
+            }));
+            next = page.next_continuation_token().map(str::to_owned);
+            if next.is_none() {
+                return Ok(objects);
+            }
+        }
+    }
+
+    /// Removes the object under `name`. One that is not there is removed.
+    pub(crate) async fn delete(&self, name: &str) -> anyhow::Result<()> {
+        self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+        let sent =
+            self.client.delete_object().bucket(&self.bucket).key(self.key(name)).send().await;
+        sent.map(drop).map_err(failed).with_context(|| format!("removing {name}"))
     }
 
     /// Writes a small object if the one there is still the version that was read: `None`
@@ -323,6 +357,12 @@ impl Intercept for CountAttempts {
         self.0.requests.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// When the service says an object was written. One it gives no time for is taken to have
+/// been written now, which is the reading that removes nothing.
+fn written_at(at: Option<aws_sdk_s3::primitives::DateTime>) -> SystemTime {
+    at.and_then(|it| SystemTime::try_from(it).ok()).unwrap_or_else(SystemTime::now)
 }
 
 fn status<E, R>(error: &SdkError<E, R>) -> Option<u16>

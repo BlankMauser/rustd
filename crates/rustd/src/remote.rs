@@ -17,6 +17,7 @@
 //! remote can withhold code and cannot change it. What it could change is the list, which
 //! is what `signed.rs` is for. `RUSTD_REMOTE_READONLY` keeps a machine from writing at all.
 
+mod collect;
 mod s3;
 mod signed;
 mod transfer;
@@ -41,11 +42,15 @@ use url::Url;
 
 use s3::{S3, Written};
 use signed::Trust;
-use transfer::{Body, Version};
+use transfer::{Body, Object, Version};
 pub(crate) use transfer::{Digest, Fetched, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
 const LIST_WRITES: usize = 8;
+/// An object that is there and that no list names yet is taken as sent for this long after
+/// it was written. Past that it is sent again, so that a collection of the remote, which
+/// goes by when an object was written, does not take it from under a push.
+const REUSE_FOR: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct Remote {
     place: Place,
@@ -136,23 +141,74 @@ impl Remote {
         }
     }
 
-    /// How many bytes the object under `name` has, if there is one.
-    async fn size(&self, name: &str) -> anyhow::Result<Option<u64>> {
+    /// The object under `name`, if there is one.
+    async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         let _permit = self.traffic.permit().await?;
-        self.patiently(|| self.size_once(name)).await
+        self.patiently(|| self.found_once(name)).await
     }
 
-    async fn size_once(&self, name: &str) -> anyhow::Result<Option<u64>> {
+    async fn found_once(&self, name: &str) -> anyhow::Result<Option<Object>> {
         match &self.place {
             Place::Dir(dir) => {
                 self.traffic.operations.fetch_add(1, Ordering::Relaxed);
                 match tokio::fs::metadata(dir.join(name)).await {
-                    Ok(found) => Ok(Some(found.len())),
+                    Ok(found) => Ok(Some(Object {
+                        name: name.to_owned(),
+                        len: found.len(),
+                        written: found.modified()?,
+                    })),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(e).with_context(|| format!("looking for {name}")),
                 }
             }
-            Place::S3(s3) => s3.size(name).await,
+            Place::S3(s3) => s3.found(name).await,
+        }
+    }
+
+    /// Whether the object under `name` is there with `len` bytes and need not be sent. One
+    /// that has been there for longer than [`REUSE_FOR`] is sent again, which tells a
+    /// collection of the remote that it is wanted.
+    async fn holds(&self, name: &str, len: u64) -> anyhow::Result<bool> {
+        let fresh = |it: &Object| it.written.elapsed().is_ok_and(|age| age < REUSE_FOR);
+        Ok(self.found(name).await?.is_some_and(|it| it.len == len && fresh(&it)))
+    }
+
+    /// The objects whose names start with `prefix`, which ends a directory.
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+        let _permit = self.traffic.permit().await?;
+        self.patiently(|| self.list_once(prefix)).await
+    }
+
+    async fn list_once(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+        match &self.place {
+            Place::Dir(dir) => {
+                self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+                let (dir, prefix) = (dir.join(prefix), prefix.to_owned());
+                tokio::task::spawn_blocking(move || list_dir(&dir, &prefix)).await?
+            }
+            Place::S3(s3) => s3.list(prefix).await,
+        }
+    }
+
+    /// Removes the object under `name`.
+    async fn delete(&self, name: &str) -> anyhow::Result<()> {
+        self.may_write()?;
+        let _permit = self.traffic.permit().await?;
+        self.patiently(|| self.delete_once(name)).await
+    }
+
+    async fn delete_once(&self, name: &str) -> anyhow::Result<()> {
+        match &self.place {
+            Place::Dir(dir) => {
+                self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+                match tokio::fs::remove_file(dir.join(name)).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(e).with_context(|| format!("removing {name}"))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Place::S3(s3) => s3.delete(name).await,
         }
     }
 
@@ -221,6 +277,21 @@ impl Remote {
         name: &str,
         extend: impl Fn(&str) -> String,
     ) -> anyhow::Result<()> {
+        self.rewrite_list(name, extend, true).await
+    }
+
+    /// As [`Self::extend_list`], for lines being taken out: a list this machine would not
+    /// add to is left as it is, and that is an error.
+    async fn shrink_list(&self, name: &str, shrink: impl Fn(&str) -> String) -> anyhow::Result<()> {
+        self.rewrite_list(name, shrink, false).await
+    }
+
+    async fn rewrite_list(
+        &self,
+        name: &str,
+        rewrite: impl Fn(&str) -> String,
+        anew: bool,
+    ) -> anyhow::Result<()> {
         for _ in 0..LIST_WRITES {
             let read = self.read_small(name).await?;
             let text = match &read {
@@ -234,12 +305,13 @@ impl Remote {
                     ""
                 }
                 // Signing it would be vouching for it.
-                Err(e) => {
+                Err(e) if anew => {
                     eprintln!("remote: {e:#}: it is written anew");
                     ""
                 }
+                Err(e) => return Err(e),
             };
-            let next = self.trust.seal(name, &extend(lines)).into_bytes();
+            let next = self.trust.seal(name, &rewrite(lines)).into_bytes();
             let read_at = read.as_ref().map(|it| &it.1);
             if let Written::Done = self.write_small(name, next, read_at).await? {
                 return Ok(());
@@ -268,7 +340,7 @@ impl Remote {
         name: &str,
         bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
-        if self.size(name).await? != Some(bytes.len() as u64) {
+        if !self.holds(name, bytes.len() as u64).await? {
             // Whoever else writes it writes the same bytes.
             self.write_small(name, bytes, None).await?;
         }
@@ -283,6 +355,28 @@ impl Remote {
     pub(crate) fn traffic(&self) -> &Traffic {
         &self.traffic
     }
+}
+
+/// The files of a directory of a directory remote, named as objects are. No directory is
+/// no files.
+fn list_dir(dir: &Path, prefix: &str) -> anyhow::Result<Vec<Object>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("listing {prefix}")),
+    };
+    let mut objects = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let found = entry.metadata()?;
+        let Some(name) = entry.file_name().to_str().map(|it| format!("{prefix}{it}")) else {
+            continue;
+        };
+        if found.is_file() {
+            objects.push(Object { name, len: found.len(), written: found.modified()? });
+        }
+    }
+    Ok(objects)
 }
 
 /// Copies a file into a directory remote so that it is there whole or not at all.
@@ -503,7 +597,7 @@ async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Resul
             packed: Some((packed, packed_size)),
         };
         let (object, _) = listed.object(&pack);
-        if remote.size(&object).await? == Some(packed_size) {
+        if remote.holds(&object, packed_size).await? {
             return Ok((listed, 0));
         }
         remote.send_file(&object, &aside, packed_size).await?;
@@ -685,6 +779,8 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
 const USAGE: &str = "usage: rustd cache push|pull REMOTE [PROJECT]\n       \
                      rustd cache stats\n       \
                      rustd cache gc [--max SIZE]\n       \
+                     rustd cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
+                     [--dry-run]\n       \
                      rustd cache verify\n       \
                      rustd cache keygen FILE";
 
@@ -693,6 +789,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let Some(verb) = args.next() else { bail!(USAGE) };
     if verb == "keygen" {
         return signed::keygen(Path::new(&args.next().context(USAGE)?));
+    }
+    let mut args = args.peekable();
+    if verb == "gc" && args.next_if(|it| it == "--remote").is_some() {
+        return collect_remote(args);
     }
     let store = PathBuf::from(std::env::var_os("RUSTD_CACHE").context("RUSTD_CACHE is not set")?);
     match verb.as_str() {
@@ -722,6 +822,35 @@ fn transfer_command(
         done
     })?;
     println!("{done} in {:.1?}", start.elapsed());
+    Ok(())
+}
+
+/// `rustd cache gc --remote REMOTE`: takes out of the remote what its lists no longer
+/// name, and of its lists what is old or held twice. An age is a count and `s`, `m`, `h`
+/// or `d`.
+fn collect_remote(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(remote) = args.next() else { bail!(USAGE) };
+    let mut ages = collect::Ages { unlisted: collect::Ages::UNLISTED, listed: None, dry: false };
+    while let Some(flag) = args.next() {
+        let mut age = || {
+            let age = args.next().context(USAGE)?;
+            collect::parse_age(&age).with_context(|| format!("`{age}` is not an age"))
+        };
+        match flag.as_str() {
+            "--unlisted-after" => ages.unlisted = age()?,
+            "--older-than" => ages.listed = Some(age()?),
+            "--dry-run" => ages.dry = true,
+            _ => bail!(USAGE),
+        }
+    }
+    let start = Instant::now();
+    let done = runtime()?.block_on(async {
+        let remote = Remote::open(&remote).await?;
+        let done = collect::collect(&remote, &ages).await;
+        eprintln!("remote: {}", remote.traffic);
+        done
+    })?;
+    println!("{done}\nin {:.1?}", start.elapsed());
     Ok(())
 }
 
