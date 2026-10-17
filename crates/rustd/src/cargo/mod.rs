@@ -156,7 +156,9 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
         Subcommand::Test => {
             let code = run::tests(asked, state, cwd)?;
             let stopped = code != 0 && !asked.flags.no_fail_fast;
-            if stopped || asked.flags.selects_targets || !state.doc_tests {
+            // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
+            let picked = asked.flags.selects_targets || !asked.positional.is_empty();
+            if stopped || picked || !state.doc_tests {
                 return Ok(code);
             }
             say::fallback("doc tests are built by rustdoc", "running `cargo test --doc`");

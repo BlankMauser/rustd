@@ -555,10 +555,15 @@ fn other_toolchain() -> Option<String> {
     })
 }
 
-/// What the checkouts of one repository share: the repository's own directory, which a git
-/// worktree names in its `.git` file. A directory that is not a worktree is its own.
+/// What the checkouts of one repository share: the repository's own directory, which is
+/// `.git` in the first checkout and is named by the `.git` file of a worktree. A directory
+/// that is no checkout is its own.
 fn repository(root: &Path) -> PathBuf {
-    let named = std::fs::read_to_string(root.join(".git")).ok();
+    let git = root.join(".git");
+    if git.is_dir() {
+        return git;
+    }
+    let named = std::fs::read_to_string(&git).ok();
     let common = named.as_deref().and_then(|it| {
         // `gitdir: /repo/.git/worktrees/name`
         let dir = Path::new(it.strip_prefix("gitdir:")?.trim());
