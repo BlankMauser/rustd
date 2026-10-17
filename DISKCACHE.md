@@ -220,13 +220,22 @@ Regression gate, both backends, all exit 0:
 | `splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
-| `worktrees.py` | 52 of 52 | 52 of 52 |
+| `worktrees.py` | 52 of 52 (58 of 58 after the merge) | 52 of 52 (58 of 58) |
+| `keys.py` (after the merge) | 26 of 26, 4 open | 26 of 26, 4 open |
 
 Remote, by hand: a daemon with `RUSTD_REMOTE` set to a directory pushed 1 pack (1769
 records); a second daemon with an empty store pulled it and compiled 0 functions.
 
 The four store harnesses are added to `.github/workflows/rustd.yaml` (100 kills, 4
-rounds of damage). That workflow has not run on this branch as of writing.
+rounds of damage). On the first push of this branch (run 39025671387) all four passed
+on GitHub's runners under both backends, and so did fmt and the tests. The run as a
+whole failed on `difftest.py` and one case of `breakers.py`, because the workflow set
+`RUST_BACKTRACE` and the backtraces of rustc's program and rustd's differ; that is
+fixed on `rustd-collate` (`e64b0d2d8f`), which is merged into this branch.
+
+The merge also brought `keys.py`, which builds with the store another build filled
+after each thing code depends on has changed. With this branch's store: 26 of 26
+right and the 4 cases it lists as open, under both backends.
 
 ## What went wrong on the way
 
