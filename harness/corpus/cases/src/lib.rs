@@ -5,6 +5,8 @@
 // `box` patterns are unstable: the case is for a nightly toolchain only.
 #![cfg_attr(feature = "nightly", feature(box_patterns))]
 
+pub mod stabilized;
+
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
         let (product, overflow) = a.overflowing_mul(b);

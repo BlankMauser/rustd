@@ -830,7 +830,8 @@ enum InstanceDef {
 /// What a call transfers control to.
 enum Callee<'db> {
     Instance(InstanceDef, GenericArgs<'db>),
-    Pointer(Value, ExternAbi),
+    /// With how many of the arguments are for named parameters, when the rest are for `...`.
+    Pointer(Value, ExternAbi, Option<usize>),
 }
 
 /// Stitches compiled functions into one object: gives every function and data object they
@@ -1064,10 +1065,12 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     {
         dump_mir(body);
     }
-    let abi = FunctionSignature::of(db, func).abi;
+    let signature = FunctionSignature::of(db, func);
+    let (abi, variadic) = (signature.abi, signature.is_varargs());
     let args = GenericArgs::new_from_slice(&[]).store();
     compile(db, env, Some(body), track_caller(db, func), |fx| {
         fx.abi = abi;
+        fx.variadic = variadic;
         fx.args = Some(args);
         fx.codegen()
     })
@@ -1122,27 +1125,72 @@ fn compiled_instance<'db>(
     };
     let body = &*body;
     let dump = std::env::var("RUSTD_DUMP_MIR").ok();
-    let (tracked, abi) = match instance.def {
+    let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);
             if dump.as_deref() == Some(signature.name.as_str()) {
                 dump_mir(body);
             }
-            (track_caller(db, func), signature.abi)
+            (track_caller(db, func), signature.abi, signature.is_varargs())
         }
         _ => {
             if dump.as_deref() == Some("{closure}") {
                 dump_mir(body);
             }
-            (false, ExternAbi::Rust)
+            (false, ExternAbi::Rust, false)
         }
     };
     let args = instance.args.clone();
     compile(db, env, Some(body), tracked, |fx| {
         fx.abi = abi;
+        fx.variadic = variadic;
         fx.args = Some(args);
         fx.codegen()
     })
+}
+
+/// How many of the registers of x86-64's System V convention the named parameters of a
+/// variadic function take. What is left of them holds the first of the variable arguments.
+#[derive(Clone, Copy)]
+struct VariadicRegisters {
+    ints: u32,
+    floats: u32,
+}
+
+impl VariadicRegisters {
+    const INTS: u32 = 6;
+    const FLOATS: u32 = 8;
+    /// The size of where `va_arg` expects the registers saved: the integer ones, then 16
+    /// bytes for each vector one.
+    const SAVED: u32 = Self::INTS * 8 + Self::FLOATS * 16;
+
+    fn named(sig: &Signature) -> Result<Self> {
+        let mut named = VariadicRegisters { ints: 0, floats: 0 };
+        for param in &sig.params {
+            match param.value_type {
+                _ if param.purpose != ArgumentPurpose::Normal
+                    && param.purpose != ArgumentPurpose::StructReturn =>
+                {
+                    unsupported!("a variadic function with a named parameter on the stack")
+                }
+                ty if ty.is_int() && ty.bytes() <= 8 => named.ints += 1,
+                types::F32 | types::F64 => named.floats += 1,
+                ty => unsupported!("a variadic function with a named {ty}"),
+            }
+        }
+        if named.ints > Self::INTS || named.floats > Self::FLOATS {
+            unsupported!("a variadic function with a named parameter on the stack");
+        }
+        Ok(named)
+    }
+
+    /// Adds the registers the named parameters left, and the stack past them, to `sig`, so
+    /// that the function is given all of them whatever it was called with.
+    fn rest(self, sig: &mut Signature) {
+        sig.params.extend((self.ints..Self::INTS).map(|_| AbiParam::new(types::I64)));
+        sig.params.extend((self.floats..Self::FLOATS).map(|_| AbiParam::new(types::F64)));
+        sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+    }
 }
 
 /// The body of an instance that is not a shim, with the instance's types in place of the
@@ -1639,6 +1687,7 @@ fn build<'db>(
         deferred_clears: Vec::new(),
         ret_mode: PassMode::Ignore,
         tracked,
+        variadic: false,
         abi: ExternAbi::Rust,
         location: None,
         span: MirSpan::Unknown,
@@ -3407,6 +3456,8 @@ struct FunctionCx<'cx, 'db> {
     /// Whether the function is `#[track_caller]` and so takes its caller's location as a last,
     /// hidden argument.
     tracked: bool,
+    /// The function takes `...`, and its last parameter is the list of what came for that.
+    variadic: bool,
     /// The calling convention of the function being built.
     abi: ExternAbi,
     location: Option<Value>,
@@ -4389,8 +4440,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn codegen(&mut self) -> Result<()> {
         let body = self.body.expect("MIR body");
-        let FnAbi { ret, args: param_modes } = self.body_abi(body, self.abi)?;
+        let FnAbi { ret, args: mut param_modes } = self.body_abi(body, self.abi)?;
         self.ret_mode = ret;
+        if self.variadic {
+            // The list is made here of what came, and is not itself something that came.
+            param_modes.pop();
+        }
         let param_layouts = body
             .param_locals
             .iter()
@@ -4399,6 +4454,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut sig = self.signature(&param_modes, ret);
         if self.tracked {
             sig.params.push(AbiParam::new(ptr()));
+        }
+        let named = self.variadic.then(|| VariadicRegisters::named(&sig)).transpose()?;
+        if let Some(named) = named {
+            if (self.cg.target.call_conv, self.cg.target.arch)
+                != (isa::CallConv::SystemV, Arch::X86_64)
+                || !matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. })
+            {
+                unsupported!("a function that takes `...` for this target");
+            }
+            named.rest(&mut sig);
         }
         self.builder.func.signature = sig;
 
@@ -4425,6 +4490,36 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         if self.tracked {
             self.location = incoming.next();
+        }
+        if let Some(named) = named {
+            let list = *body.param_locals.last().expect("the list of a variadic function");
+            let layout = self.layout(body.locals[list].ty.as_ref())?;
+            if layout.size.bytes() != 24 {
+                unsupported!("a `VaList` that is not the one of this target");
+            }
+            let addr = self.stack_slot(&layout);
+            let saved = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                VariadicRegisters::SAVED,
+                4,
+            ));
+            let saved = self.builder.ins().stack_addr(ptr(), saved, 0);
+            for offset in (named.ints..VariadicRegisters::INTS).map(|at| at * 8).chain(
+                (named.floats..VariadicRegisters::FLOATS)
+                    .map(|at| VariadicRegisters::INTS * 8 + at * 16),
+            ) {
+                let value = incoming.next().expect("a register of the variable arguments");
+                self.builder.ins().store(MEM, value, saved, offset as i32);
+            }
+            let stack = incoming.next().expect("the variable arguments on the stack");
+            let ints = self.builder.ins().iconst(types::I32, i64::from(named.ints * 8));
+            let floats = i64::from(VariadicRegisters::INTS * 8 + named.floats * 16);
+            let floats = self.builder.ins().iconst(types::I32, floats);
+            self.builder.ins().store(MEM, ints, addr, 0);
+            self.builder.ins().store(MEM, floats, addr, 4);
+            self.builder.ins().store(MEM, stack, addr, 8);
+            self.builder.ins().store(MEM, saved, addr, 16);
+            self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
         // An `async` body keeps its locals in the future, where they survive a return.
         let frame = match body.coroutine {
@@ -6210,8 +6305,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
         let abi = self.fn_abi(sig.abi(), sig.output(), sig.inputs().iter().copied())?;
-        let sig = self.signature(&abi.args, abi.ret);
+        let mut sig = self.signature(&abi.args, abi.ret);
+        self.declare_variadic(callee, &mut sig)?;
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
+    }
+
+    /// Makes `sig`, of the named parameters of `func`, the one `func` is defined with when it
+    /// takes `...` and is compiled here: every call of it declares it the same.
+    fn declare_variadic(&self, func: FunctionId, sig: &mut Signature) -> Result<()> {
+        let signature = FunctionSignature::of(self.cg.db, func);
+        if signature.is_varargs()
+            && signature.has_body()
+            && (self.cg.target.call_conv, self.cg.target.arch)
+                == (isa::CallConv::SystemV, Arch::X86_64)
+        {
+            VariadicRegisters::named(sig)?.rest(sig);
+        }
+        Ok(())
     }
 
     /// The discriminant of the enum at `addr`, as a `to`.
@@ -6767,8 +6877,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (addr, _) = self.operand(func)?;
             let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
             let values = self.operands(args)?;
-            let abi = fn_ty.fn_sig(self.interner).abi();
-            self.emit_call(Callee::Pointer(pointer, abi), &values, dst, dst_ty.ty)?;
+            let sig = fn_ty.fn_sig(self.interner);
+            let named = sig.c_variadic().then(|| sig.inputs().skip_binder().len());
+            self.emit_call(Callee::Pointer(pointer, sig.abi(), named), &values, dst, dst_ty.ty)?;
             return self.finish_call(destination, target);
         }
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
@@ -6919,7 +7030,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                     (rest, _) => values.extend_from_slice(rest),
                 }
-                let callee = Callee::Pointer(pointer, ExternAbi::Rust);
+                let callee = Callee::Pointer(pointer, ExternAbi::Rust, None);
                 return self.emit_call(callee, &values, dst, dst_ty);
             }
         }
@@ -7000,7 +7111,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::FnPtr(..) => {
                 let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
                 let abi = ty.fn_sig(self.interner).abi();
-                self.emit_call(Callee::Pointer(pointer, abi), &values, dst, dst_ty)
+                self.emit_call(Callee::Pointer(pointer, abi, None), &values, dst, dst_ty)
             }
             TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
                 let (id, parent_args) = match ty.kind() {
@@ -7177,7 +7288,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().store(MEM, location, slot, 0);
             values.push((slot, thin_ty));
         }
-        self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust), &values, dst, dst_ty)
+        self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust, None), &values, dst, dst_ty)
     }
 
     /// The principal trait of `dyn_ty`, as implemented by `self_ty`.
@@ -7548,7 +7659,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => {
                 let receiver = receiver.expect("a fn pointer is only reified for a vtable");
                 let pointer = self.builder.ins().load(ptr(), MEM, receiver, 0);
-                self.emit_call(Callee::Pointer(pointer, fn_sig.abi()), &values, dst, dst_ty)?;
+                self.emit_call(Callee::Pointer(pointer, fn_sig.abi(), None), &values, dst, dst_ty)?;
             }
         }
         let mut results = Vec::new();
@@ -7904,6 +8015,31 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// Calls `callee` with `values`, which are what `sig` says, and stores the result in `dst`.
+    fn call_as(
+        &mut self,
+        callee: Callee<'db>,
+        sig: Signature,
+        values: &[Value],
+        ret_mode: PassMode,
+        dst: Value,
+        ret_layout: &Layout,
+    ) -> Result<()> {
+        let results = match callee {
+            Callee::Instance(def, generic_args) => {
+                let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.invoke(callee, values)
+            }
+            Callee::Pointer(pointer, ..) => {
+                let sig = self.builder.import_signature(sig);
+                self.invoke_indirect(sig, pointer, values)
+            }
+        };
+        self.receive(ret_mode, &mut results.into_iter(), dst, ret_layout);
+        Ok(())
+    }
+
     /// Passes the arguments, which live at the given addresses, the way the Rust ABI wants them
     /// and stores the result in `dst`.
     fn emit_call(
@@ -7919,7 +8055,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 FunctionSignature::of(self.cg.db, func).abi
             }
             Callee::Instance(..) => ExternAbi::Rust,
-            Callee::Pointer(_, abi) => abi,
+            Callee::Pointer(_, abi, _) => abi,
         };
         let FnAbi { ret: ret_mode, args: arg_modes } =
             self.fn_abi(abi, dst_ty, args.iter().map(|&(_, ty)| ty))?;
@@ -7938,99 +8074,95 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             sig.params.push(AbiParam::new(ptr()));
             values.push(self.caller_location()?);
         }
-        let results = match callee {
-            Callee::Instance(def, generic_args) => {
-                let variadic = matches!(def, InstanceDef::Fn(func)
-                    if FunctionSignature::of(self.cg.db, func).is_varargs());
-                if variadic && Target::current().is_wasm() {
-                    // The arguments after the named ones are written to memory, each at its
-                    // own alignment, and the function is given where.
-                    let InstanceDef::Fn(func) = def else { unreachable!() };
-                    let named = FunctionSignature::of(self.cg.db, func).params.len();
-                    if arg_modes.iter().any(|mode| !matches!(mode, PassMode::Direct(_))) {
-                        unsupported!("variadic call with an argument that is not one scalar");
-                    }
-                    let rest = values.split_off(named);
-                    sig.params.truncate(named);
-                    sig.params.push(AbiParam::new(ptr()));
-                    let mut offsets = Vec::with_capacity(rest.len());
-                    let mut size = 0u32;
-                    for &value in &rest {
-                        let bytes = self.builder.func.dfg.value_type(value).bytes();
-                        size = size.next_multiple_of(bytes);
-                        offsets.push(size);
-                        size += bytes;
-                    }
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        size.max(1),
-                        4,
-                    ));
-                    let buffer = self.builder.ins().stack_addr(ptr(), slot, 0);
-                    for (value, offset) in rest.into_iter().zip(offsets) {
-                        self.builder.ins().store(MEM, value, buffer, offset as i32);
-                    }
-                    values.push(buffer);
-                }
-                let variadic = variadic && !Target::current().is_wasm();
-                if variadic {
-                    // Each call of a variadic function has a signature of its own, and the
-                    // function is declared with the one of its named parameters.
-                    let InstanceDef::Fn(func) = def else { unreachable!() };
-                    let named = FunctionSignature::of(self.cg.db, func).params.len();
-                    let named = arg_modes[..named]
-                        .iter()
-                        .map(|&mode| {
-                            let mut params = Vec::new();
-                            self.push_abi_params(mode, &mut params);
-                            params.len()
-                        })
-                        .sum::<usize>()
-                        + usize::from(matches!(ret_mode, PassMode::Indirect));
-                    let mut declared = sig.clone();
-                    declared.params.truncate(named);
-                    let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
-                    let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-                    let floats = sig.params.iter().any(|param| param.value_type.is_float());
-                    let mut pointer = self.builder.ins().func_addr(ptr(), callee);
-                    match (self.cg.target.call_conv, self.cg.target.arch) {
-                        (isa::CallConv::AppleAarch64, _) => {
-                            self.apple_variadic(&mut sig, &mut values, named)
-                        }
-                        (isa::CallConv::SystemV, Arch::X86_64) if floats => {
-                            pointer = self.counted_variadic(&mut sig, &mut values, pointer)?;
-                        }
-                        (isa::CallConv::WindowsFastcall, _) if floats => {
-                            // The callee reads its variable arguments from where it saved the
-                            // integer registers, so a float goes in one of those.
-                            for (param, value) in
-                                sig.params[named..].iter_mut().zip(&mut values[named..])
-                            {
-                                if param.value_type == types::F64 {
-                                    let flags = MemFlagsData::new();
-                                    *value = self.builder.ins().bitcast(types::I64, flags, *value);
-                                    *param = AbiParam::new(types::I64);
-                                }
-                            }
-                        }
-                        // The variable arguments are passed as named ones are.
-                        (isa::CallConv::SystemV, Arch::Aarch64) => (),
-                        _ if floats => unsupported!("float passed to a variadic function"),
-                        _ => (),
-                    }
-                    let sig = self.builder.import_signature(sig);
-                    self.invoke_indirect(sig, pointer, &values)
-                } else {
-                    let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
-                    let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-                    self.invoke(callee, &values)
-                }
+        // How many of the arguments are for named parameters, when the rest are for `...`.
+        let named = match callee {
+            Callee::Instance(InstanceDef::Fn(func), _) => {
+                let signature = FunctionSignature::of(self.cg.db, func);
+                signature.is_varargs().then(|| signature.params.len())
             }
-            Callee::Pointer(pointer, _) => {
-                let sig = self.builder.import_signature(sig);
-                self.invoke_indirect(sig, pointer, &values)
-            }
+            Callee::Instance(..) => None,
+            Callee::Pointer(_, _, named) => named,
         };
+        let Some(named) = named else {
+            return self.call_as(callee, sig, &values, ret_mode, dst, &ret_layout);
+        };
+        if Target::current().is_wasm() {
+            // The arguments after the named ones are written to memory, each at its
+            // own alignment, and the function is given where.
+            if arg_modes.iter().any(|mode| !matches!(mode, PassMode::Direct(_))) {
+                unsupported!("variadic call with an argument that is not one scalar");
+            }
+            let rest = values.split_off(named);
+            sig.params.truncate(named);
+            sig.params.push(AbiParam::new(ptr()));
+            let mut offsets = Vec::with_capacity(rest.len());
+            let mut size = 0u32;
+            for &value in &rest {
+                let bytes = self.builder.func.dfg.value_type(value).bytes();
+                size = size.next_multiple_of(bytes);
+                offsets.push(size);
+                size += bytes;
+            }
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size.max(1),
+                4,
+            ));
+            let buffer = self.builder.ins().stack_addr(ptr(), slot, 0);
+            for (value, offset) in rest.into_iter().zip(offsets) {
+                self.builder.ins().store(MEM, value, buffer, offset as i32);
+            }
+            values.push(buffer);
+            return self.call_as(callee, sig, &values, ret_mode, dst, &ret_layout);
+        }
+        // Each call of a variadic function has a signature of its own, and the
+        // function is declared with the one of its named parameters.
+        let named = arg_modes[..named]
+            .iter()
+            .map(|&mode| {
+                let mut params = Vec::new();
+                self.push_abi_params(mode, &mut params);
+                params.len()
+            })
+            .sum::<usize>()
+            + usize::from(matches!(ret_mode, PassMode::Indirect));
+        let mut pointer = match callee {
+            Callee::Instance(def, generic_args) => {
+                let mut declared = sig.clone();
+                declared.params.truncate(named);
+                if let InstanceDef::Fn(func) = def {
+                    self.declare_variadic(func, &mut declared)?;
+                }
+                let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().func_addr(ptr(), callee)
+            }
+            Callee::Pointer(pointer, ..) => pointer,
+        };
+        let floats = sig.params.iter().any(|param| param.value_type.is_float());
+        match (self.cg.target.call_conv, self.cg.target.arch) {
+            (isa::CallConv::AppleAarch64, _) => self.apple_variadic(&mut sig, &mut values, named),
+            (isa::CallConv::SystemV, Arch::X86_64) if floats => {
+                pointer = self.counted_variadic(&mut sig, &mut values, pointer)?;
+            }
+            (isa::CallConv::WindowsFastcall, _) if floats => {
+                // The callee reads its variable arguments from where it saved the
+                // integer registers, so a float goes in one of those.
+                for (param, value) in sig.params[named..].iter_mut().zip(&mut values[named..]) {
+                    if param.value_type == types::F64 {
+                        let flags = MemFlagsData::new();
+                        *value = self.builder.ins().bitcast(types::I64, flags, *value);
+                        *param = AbiParam::new(types::I64);
+                    }
+                }
+            }
+            // The variable arguments are passed as named ones are.
+            (isa::CallConv::SystemV, Arch::Aarch64) => (),
+            _ if floats => unsupported!("float passed to a variadic function"),
+            _ => (),
+        }
+        let sig = self.builder.import_signature(sig);
+        let results = self.invoke_indirect(sig, pointer, &values);
         self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
     }
@@ -8224,6 +8356,52 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("overflow_checks", []) => {
                 let value = self.builder.ins().iconst(types::I8, 1);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("va_arg", [list]) => {
+                if (self.cg.target.call_conv, self.cg.target.arch)
+                    != (isa::CallConv::SystemV, Arch::X86_64)
+                {
+                    unsupported!("intrinsic `va_arg` for this target");
+                }
+                let scalar = self.scalar_of(dst_ty)?;
+                if scalar.ty.bytes() > 8 {
+                    unsupported!("`va_arg` of {dst_ty:?}");
+                }
+                // An argument is in the registers the function saved while its kind of
+                // register lasts, and on the stack after that.
+                let (at, step, end) = match scalar.ty.is_float() {
+                    false => (0, 8, VariadicRegisters::INTS * 8),
+                    true => (4, 16, VariadicRegisters::SAVED),
+                };
+                let (list, _) = self.load_scalar(list)?;
+                let offset = self.builder.ins().load(types::I32, MEM, list, at);
+                let [saved, stack, done] = [(); 3].map(|()| self.builder.create_block());
+                self.builder.append_block_param(done, ptr());
+                let fits = self.builder.ins().icmp_imm(
+                    IntCC::UnsignedLessThanOrEqual,
+                    offset,
+                    i64::from(end - step),
+                );
+                self.builder.ins().brif(fits, saved, &[], stack, &[]);
+
+                self.builder.switch_to_block(saved);
+                let area = self.builder.ins().load(ptr(), MEM, list, 16);
+                let wide = self.builder.ins().uextend(ptr(), offset);
+                let from = self.builder.ins().iadd(area, wide);
+                let next = self.builder.ins().iadd_imm(offset, i64::from(step));
+                self.builder.ins().store(MEM, next, list, at);
+                self.builder.ins().jump(done, &[from.into()]);
+
+                self.builder.switch_to_block(stack);
+                let from = self.builder.ins().load(ptr(), MEM, list, 8);
+                let next = self.builder.ins().iadd_imm(from, 8);
+                self.builder.ins().store(MEM, next, list, 8);
+                self.builder.ins().jump(done, &[from.into()]);
+
+                self.builder.switch_to_block(done);
+                let from = self.builder.block_params(done)[0];
+                let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("transmute" | "transmute_unchecked" | "black_box" | "likely" | "unlikely", [arg]) => {

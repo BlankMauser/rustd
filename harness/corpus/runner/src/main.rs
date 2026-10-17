@@ -413,6 +413,43 @@ fn main() {
     println!("async_closures {:?}", cases::async_closures::run());
     println!("async_closures more {:?}", cases::async_closures::more());
     println!("async_items {:?}", cases::async_items::run());
+    println!("stabilized let_chains {:?}", cases::stabilized::let_chains());
+    println!("stabilized if_let_guard {:?}", cases::stabilized::if_let_guard());
+    println!("stabilized trait_upcasting {:?}", cases::stabilized::trait_upcasting());
+    println!("stabilized cfg_select {:?}", cases::stabilized::cfg_select());
+    println!("stabilized generic_arg_infer {:?}", cases::stabilized::generic_arg_infer());
+    println!("stabilized repr128 {:?}", cases::stabilized::repr128());
+    println!("stabilized precise_capturing {:?}", cases::stabilized::precise_capturing());
+    #[cfg(panic = "unwind")]
+    println!("stabilized never {:?}", cases::stabilized::never());
+    println!("stabilized pc_trait {:?}", cases::stabilized::pc_trait());
+    println!("stabilized pc_free {:?}", cases::stabilized::pc_free());
+    println!("stabilized pc_plain {:?}", cases::stabilized::pc_plain());
+    println!("stabilized pc_s2 {:?}", cases::stabilized::pc_s2());
+    println!("stabilized pc_s3 {:?}", cases::stabilized::pc_s3());
+    println!("stabilized pc_s4 {:?}", cases::stabilized::pc_s4());
+    #[cfg(panic = "unwind")]
+    println!("stabilized never_more {:?}", cases::stabilized::never_more());
+    #[cfg(not(target_family = "wasm"))]
+    println!("stabilized c_variadic {:?}", cases::stabilized::c_variadic());
+    #[cfg(not(target_family = "wasm"))]
+    println!("stabilized c_variadic_stack {:?}", cases::stabilized::c_variadic_stack());
+    #[cfg(unix)]
+    println!("stabilized variadic_floats {:?}", cases::stabilized::variadic_floats());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized naked_functions {:?}", cases::stabilized::x86::naked_functions());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized asm_goto {:?}", cases::stabilized::x86::asm_goto());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized asm_cfg {:?}", cases::stabilized::x86::asm_cfg());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized target_feature_11 {:?}", cases::stabilized::x86::target_feature_11());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized varargs_abi {:?}", cases::stabilized::x86::varargs_abi());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
+    #[cfg(all(target_arch = "x86_64", unix))]
+    println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
     #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());

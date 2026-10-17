@@ -3463,6 +3463,9 @@ pub fn lower_body_to_mir<'db>(
         };
         let mut param_tys = callable_sig.inputs().iter().copied();
         let self_param = self_param.and_then(|id| Some((id, param_tys.next()?)));
+        // The signature has no type for `...`, whose pattern is the last and binds the list.
+        let list = params.last().filter(|_| callable_sig.c_variadic());
+        let param_tys = param_tys.chain(list.map(|list| infer.pat_ty(list.formal)));
 
         lower_to_mir_with_store(
             db,
