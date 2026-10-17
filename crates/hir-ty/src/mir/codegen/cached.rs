@@ -277,20 +277,24 @@ impl Entry {
     /// told from another, whose entries would then be taken for its own.
     ///
     /// An entry kept with what a debugger is told is not the one kept without.
-    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
+    ///
+    /// `checks_overflow` is whether the crates cargo builds have `-C overflow-checks`, when
+    /// they agree: code of the standard library that takes the setting of its callers has the
+    /// same name in a build with the checks and in one without.
+    pub(super) fn key(name: &str, debug: bool, checks_overflow: Option<bool>) -> Option<[u8; KEY]> {
         static COMPILER: OnceLock<Option<[u8; KEY]>> = OnceLock::new();
         let compiler = COMPILER.get_or_init(|| {
             let program = std::fs::read(std::env::current_exe().ok()?).ok()?;
             Some(Sha256::digest(program).into())
         });
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 3");
+        hasher.update(b"rustd entry 4");
         hasher.update((*compiler)?);
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
         hasher.update(super::Target::selected().ok()?.triple());
-        hasher.update([0, debug as u8]);
+        hasher.update([0, debug as u8, checks_overflow.map_or(2, u8::from)]);
         hasher.update(name);
         Some(hasher.finalize().into())
     }
@@ -335,6 +339,8 @@ pub(super) struct Entries {
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
+    /// Whether the build checks arithmetic for overflow: see [`Entry::key`].
+    checks_overflow: Option<bool>,
     known: Mutex<Known>,
 }
 
@@ -359,8 +365,12 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(store: &'static Store, debug: bool) -> Entries {
-        Entries { store, debug, known: Mutex::default() }
+    pub(super) fn new(
+        store: &'static Store,
+        debug: bool,
+        checks_overflow: Option<bool>,
+    ) -> Entries {
+        Entries { store, debug, checks_overflow, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -383,7 +393,10 @@ impl Entries {
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
-            .then(|| Entry::decode(self.store.get(&Entry::key(name, self.debug)?)?))
+            .then(|| {
+                let key = Entry::key(name, self.debug, self.checks_overflow)?;
+                Entry::decode(self.store.get(&key)?)
+            })
             .flatten()
             .map(Arc::new);
         self.known().entries.insert(Arc::from(name), entry.clone());
