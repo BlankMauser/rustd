@@ -16,7 +16,7 @@ RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail 
                      jumps, so a frame the cargo build prints may be missing: those are counted.
 --only NAME          one of: corpus stress rung2 edits cost
 """
-import os, re, shutil, subprocess, sys, tempfile, time
+import os, re, shutil, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -186,10 +186,65 @@ def verify(tally, what, binary):
     tally.say(f"{what}: llvm-dwarfdump --verify", verdict, said[:80] or f"{ours} units of rustd's")
 
 
+def frames_of(binary):
+    """Where the code of each frame an unwinder finds starts and ends: the ones in the table
+    the `PT_GNU_EH_FRAME` program header leads to. A splice adds frames to that table that
+    no section of the file is said to hold."""
+    data = open(binary, "rb").read()
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    headers = [struct.unpack_from("<IIQQQQQQ", data, phoff + i * phentsize) for i in range(phnum)]
+    loads = [(vaddr, offset, filesz) for kind, _, offset, vaddr, _, filesz, _, _ in headers if kind == 1]
+
+    def at(address):
+        return next(offset + address - vaddr for vaddr, offset, filesz in loads if vaddr <= address < vaddr + filesz)
+
+    def pointer(encoding, address):
+        """The address written at `address` as `encoding` says, and how many bytes it takes."""
+        size, form = {0x00: (8, "<Q"), 0x03: (4, "<I"), 0x04: (8, "<Q"), 0x0b: (4, "<i"), 0x0c: (8, "<q")}[encoding & 0x0f]
+        value, = struct.unpack_from(form, data, at(address))
+        return value + (address if encoding & 0x70 == 0x10 else 0), size
+
+    def code_encoding(common):
+        """How the frames of the common entry at `common` write where their code starts."""
+        rest = at(common) + 9
+        end = data.index(b"\0", rest)
+        letters, rest = data[rest:end], end + 1
+        for _ in range(4):
+            while data[rest] & 0x80:
+                rest += 1
+            rest += 1
+        for letter in letters[1:]:
+            if letter == ord("R"):
+                return data[rest]
+            if letter == ord("L"):
+                rest += 1
+            elif letter == ord("P"):
+                rest += 1 + pointer(data[rest], 0)[1]
+        return 0
+
+    table = next((vaddr for kind, _, _, vaddr, _, _, _, _ in headers if kind == 0x6474e550), None)
+    if table is None:
+        return {}
+    _, frame_encoding, count_encoding, table_encoding = data[at(table):at(table) + 4]
+    _, size = pointer(frame_encoding, table + 4)
+    count, counted = pointer(count_encoding, table + 4 + size)
+    assert table_encoding == 0x3b, f"a search table written as {table_encoding:#x}"
+    ends = {}
+    for i in range(count):
+        _, frame = struct.unpack_from("<ii", data, at(table + 4 + size + counted + i * 8))
+        frame += table
+        encoding = code_encoding(frame + 4 - struct.unpack_from("<I", data, at(frame + 4))[0])
+        start, size_of = pointer(encoding, frame + 8)
+        length, _ = pointer(encoding & 0x0f, frame + 8 + size_of)
+        ends[start] = start + length
+    return ends
+
+
 def unwinding(tally, what, binary):
     """Whether the functions a debugger is told of are the ones an unwinder is told of.
 
-    Every run of code in a unit of rustd's has to begin where an entry of `.eh_frame` begins and
+    Every run of code in a unit of rustd's has to begin where a frame of the unwinder's begins and
     end no earlier than it. It may end later: a function shorter than a jump to another place is
     filled up to the length of one, for an edit to put that jump there, and the fill is not code
     to unwind from. A `#[naked]` function is its assembly, which says nothing of unwinding and has
@@ -199,8 +254,7 @@ def unwinding(tally, what, binary):
     for unit in units.split("DW_TAG_compile_unit")[1:]:
         if re.search(r'DW_AT_producer\s+\("rustd ', unit):
             ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
-    frames = subprocess.run([DWARFDUMP, "--eh-frame", binary], capture_output=True, text=True).stdout
-    ends = {int(a, 16): int(b, 16) for a, b in re.findall(r"FDE cie=\S+ pc=([0-9a-f]+)\.\.\.([0-9a-f]+)", frames)}
+    ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
     lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
