@@ -253,6 +253,8 @@ enum Field {
     Address,
     /// A distance, in 4 bytes.
     Distance,
+    /// A distance, in 8 bytes.
+    FarDistance,
     /// The distance of a `b` or `bl` in instructions, in 26 bits: 128 MB either way.
     Branch,
     /// The distance of an `adrp` in pages of 4 KB, in 21 bits: 4 GB either way.
@@ -304,6 +306,7 @@ impl Machine {
             Machine::Aarch64 => match r_type {
                 elf::R_AARCH64_ABS64 => (Fixup::Absolute, Field::Address),
                 elf::R_AARCH64_PREL32 => (Fixup::Relative, Field::Distance),
+                elf::R_AARCH64_PREL64 => (Fixup::Relative, Field::FarDistance),
                 elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => (Fixup::Relative, Field::Branch),
                 elf::R_AARCH64_ADR_PREL_PG_HI21 => (Fixup::Relative, Field::Page),
                 elf::R_AARCH64_ADD_ABS_LO12_NC | elf::R_AARCH64_LDST8_ABS_LO12_NC => {
@@ -421,6 +424,7 @@ impl Field {
         match self {
             Field::Address => bytes[..8].copy_from_slice(&to.to_le_bytes()),
             Field::Distance => bytes[..4].copy_from_slice(&relative(to, place)?.to_le_bytes()),
+            Field::FarDistance => bytes[..8].copy_from_slice(&to.wrapping_sub(place).to_le_bytes()),
             Field::Branch => {
                 let distance = to.wrapping_sub(place) as i64;
                 ensure!(distance % 4 == 0, "a branch to between two instructions");
@@ -448,7 +452,7 @@ impl Field {
 
     fn len(self) -> usize {
         match self {
-            Field::Address => 8,
+            Field::Address | Field::FarDistance => 8,
             _ => 4,
         }
     }
@@ -1493,5 +1497,11 @@ mod tests {
         assert!(machine.redirect(last + 4, old, 8).is_err());
         assert!(machine.redirect(old + (5 << 30), old, 64).is_err());
         assert!(Field::InPage(3).fill(&mut [0; 4], 0x7ffc, 0).is_err());
+        // A distance of 8 bytes has room for what one of 4 turns down.
+        let (to, place, mut distance) = (0x10000u64, 0x10000 + (5 << 30), [0; 8]);
+        assert!(Field::Distance.fill(&mut distance, to, place).is_err());
+        Field::FarDistance.fill(&mut distance, to, place).unwrap();
+        assert_eq!(i64::from_le_bytes(distance), -(5 << 30));
+        assert_eq!(Field::FarDistance.len(), 8);
     }
 }

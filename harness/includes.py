@@ -120,10 +120,10 @@ def follow(files, steps):
             verdict = "REFUSED"
         else:
             verdict = "same" if run(binary) == run(built(reference, "sinc")) else "DIFFERENT OUTPUT"
-        made = linked(seen)
-        if how and not verdict.isupper() and how[0] not in made:
-            verdict = f"NOT {how[0]}: {made}"[:60]
-        wrong += verdict.isupper()
+        made, failed = linked(seen), verdict.isupper()
+        if how and not failed and how[0] not in made:
+            verdict, failed = f"NOT {how[0]}: {made}"[:60], True
+        wrong += failed
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()
     print(f"{len(steps) - wrong} of {len(steps)} right; log {log_path}")
