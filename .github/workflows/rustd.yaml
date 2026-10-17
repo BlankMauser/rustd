@@ -51,8 +51,8 @@ jobs:
         working-directory: harness
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=0
-          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -63,7 +63,8 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
-          exit $failed
+          echo "failed:${failed:- none}"
+          test -z "$failed"
 
   macos:
     name: macOS arm64 (${{ matrix.backend }})
@@ -94,8 +95,8 @@ jobs:
         working-directory: harness
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=0
-          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -109,4 +110,5 @@ jobs:
           run worktrees.py --join --together
           run worktrees.py --overlay
           run keys.py
-          exit $failed
+          echo "failed:${failed:- none}"
+          test -z "$failed"
