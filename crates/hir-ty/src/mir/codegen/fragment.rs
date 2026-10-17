@@ -175,8 +175,9 @@ pub(super) struct Recorder<'db> {
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
-    /// The assembly of the function, when it is a `#[naked]` one.
-    pub(super) naked: Option<String>,
+    /// The assembly of the function, when it is a `#[naked]` one, and what each operand of
+    /// it that is a `sym` names.
+    pub(super) naked: Option<(String, Vec<Option<ModuleRelocTarget>>)>,
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
     span_ids: FxHashMap<MirSpan, u32>,
