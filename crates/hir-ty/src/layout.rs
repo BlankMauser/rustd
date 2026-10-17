@@ -13,7 +13,7 @@ use rustc_abi::{
     AddressSpace, BackendRepr, FieldsShape, Float, Integer, LayoutCalculator, Niche, Primitive,
     ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange,
 };
-use rustc_index::IndexVec;
+use rustc_index::{IndexVec, bit_set::BitMatrix};
 use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
@@ -349,34 +349,14 @@ pub fn layout_of_ty_query(
             cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
         }
         TyKind::Coroutine(id, args) => {
-            // What was captured, then everything `CoroutineFrame` describes. A local only
-            // holds a value some of the time, so nothing here is a niche.
+            // Laid out as rustc lays it out, which a program can tell by the size: what was
+            // captured and where the body left off, then for each place it yields what is kept
+            // there, one such set over another. `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
             let body = db
                 .monomorphized_mir_body_for_coroutine(id.0, parent_args.store(), trait_env.clone())
                 .map_err(|_| LayoutError::Unknown)?;
-            let opaque = |size, align| {
-                let mut layout = LayoutData::unit(dl, true);
-                layout.size = size;
-                layout.align = align;
-                layout
-            };
-            let word = Size::from_bytes(8);
-            let word =
-                opaque(word, rustc_abi::AbiAlign::new(rustc_abi::Align::from_bytes(8).unwrap()));
-            let mut fields = Vec::new();
-            for ty in rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty()) {
-                let layout = db.layout_of_ty(ty.store(), trait_env.clone())?;
-                fields.push(opaque(layout.size, layout.align));
-            }
-            // The body declares a local for every binding of the function around it.
-            let mut used = rustc_hash::FxHashSet::default();
-            let mut places = body.clone();
-            places.walk_places(|place| {
-                used.insert(place.local);
-            });
-            // A local that holds nothing whenever the body yields lives on the stack of `poll`.
             let held = body.locals_held_across_yields(|local| {
                 crate::drop::has_drop_glue(
                     &infer_ctxt,
@@ -384,61 +364,50 @@ pub fn layout_of_ty_query(
                     trait_env.param_env(db),
                 ) != crate::drop::DropGlue::None
             });
-            // The locals come after everything else, where two that never hold a value at once
-            // share memory: the futures of the arms of a `match`, each awaited in its arm.
-            let first_local = fields.len();
-            let mut in_frame = Vec::new();
-            for (at, &id) in held.locals.iter().enumerate() {
-                if used.contains(&id) {
-                    let layout = db.layout_of_ty(body.locals[id].ty.clone(), trait_env.clone())?;
-                    if layout.size.bytes() != 0 {
-                        in_frame.push((at, layout.size, layout.align));
+            let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
+                .iter()
+                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            // A local only holds a value some of the time, so nothing of it is a niche.
+            let locals = held
+                .locals
+                .iter()
+                .map(|&local| {
+                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                    let mut layout = LayoutData::unit(dl, true);
+                    layout.size = of.size;
+                    layout.align = of.align;
+                    Ok(layout)
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?;
+            let flags: Vec<Layout> = held
+                .flagged()
+                .map(|at| {
+                    let bits = Integer::from_size(Size::from_bytes(held.flag_bytes(at)))
+                        .expect("a flag of one to eight bytes");
+                    Layout::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false)))
+                })
+                .collect();
+            let mut prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
+            prefix.extend(&flags);
+            let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
+            let locals = locals.iter().collect::<Vec<_>>();
+            let locals = locals.iter().collect::<IndexVec<usize, _>>();
+            // The body has not started, has returned or has panicked, and holds nothing then.
+            let mut kept: IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, usize>> =
+                IndexVec::from_elem_n(IndexVec::new(), CoroutineFrame::SUSPENDED);
+            kept.extend(held.yields.iter().map(|it| it.kept.iter().copied().collect()));
+            let mut conflicts = BitMatrix::new(locals.len(), locals.len());
+            for a in 0..locals.len() {
+                for b in 0..locals.len() {
+                    if held.conflict(a, b) {
+                        conflicts.insert(a, b);
                     }
                 }
             }
-            // Only the held locals have a part in the layout: a body that changes in what it
-            // does between two yields keeps its layout, and so does everything that holds it.
-            for _ in &held.locals {
-                fields.push(opaque(Size::ZERO, rustc_abi::AbiAlign::new(dl.i8_align)));
-            }
-            fields.extend(held.locals.iter().map(|_| word.clone()));
-            fields.push(word);
-            let fields = fields.iter().collect::<Vec<_>>();
-            let fields = fields.iter().collect::<IndexVec<_, _>>();
-            let mut layout =
-                cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?;
-            layout.largest_niche = None;
-            layout.backend_repr = BackendRepr::Memory { sized: true };
-            // The largest first, each at the lowest offset clear of the ones it can't share
-            // memory with.
-            in_frame.sort_by_key(|&(at, size, align)| {
-                (std::cmp::Reverse(size), std::cmp::Reverse(align.abi), at)
-            });
-            let FieldsShape::Arbitrary { offsets, .. } = &mut layout.fields else {
-                return Err(LayoutError::Unknown);
-            };
-            let start = layout.size;
-            let mut placed: Vec<(usize, Size, Size)> = Vec::new();
-            for &(at, size, align) in &in_frame {
-                let mut taken: Vec<(Size, Size)> = placed
-                    .iter()
-                    .filter(|&&(other, ..)| held.conflict(at, other))
-                    .map(|&(_, from, to)| (from, to))
-                    .collect();
-                taken.sort();
-                let mut offset = start.align_to(align.abi);
-                for (from, to) in taken {
-                    if from < offset + size && offset < to {
-                        offset = to.align_to(align.abi);
-                    }
-                }
-                placed.push((at, offset, offset + size));
-                offsets[RustcFieldIdx::new(first_local + at)] = offset;
-                layout.size = layout.size.max(offset + size);
-                layout.align = layout.align.max(align);
-            }
-            layout.size = layout.size.align_to(layout.align.abi);
-            layout
+            let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
+            let state = &state;
+            cx.calc.coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
         }
         TyKind::CoroutineClosure(_, args) => {
             return db
@@ -675,26 +644,57 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
     Scalar::Initialized { value, valid_range: WrappingRange::full(value.size(dl)) }
 }
 
-/// Where an `async` block keeps what has to survive from one `poll` to the next, as fields of
-/// its layout that follow the captures: the locals of its body that may hold a value when it
-/// yields, in the order of `HeldLocals`, a word of drop flags for each of those, and a word
-/// saying where the body left off.
+/// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of
+/// its layout are the captures, the drop flags of each held local that needs them, and
+/// the state: where the body left off. The held locals are fields of its variants, one for
+/// each place the body yields at.
 #[derive(Debug, Clone, Copy)]
 pub struct CoroutineFrame {
     pub upvars: usize,
-    pub locals: usize,
+    pub flags: usize,
 }
 
 impl CoroutineFrame {
-    pub fn local(self, index: usize) -> usize {
+    /// The first of the states that are a place the body yielded at; before it come not yet
+    /// started, returned and panicked.
+    pub const SUSPENDED: usize = 3;
+
+    /// The flag of the `index`th of the locals that have one.
+    pub fn drop_flag(self, index: usize) -> usize {
         self.upvars + index
     }
 
-    pub fn drop_flag(self, index: usize) -> usize {
-        self.upvars + self.locals + index
+    /// Where the `index`th of the held locals is in the future: among what is kept at any of
+    /// the places it is kept at, which are one place.
+    pub fn local_offset(
+        layout: &Layout,
+        held: &crate::mir::HeldLocals,
+        index: usize,
+    ) -> Option<Size> {
+        let Variants::Multiple { variants, .. } = &layout.variants else { return None };
+        held.yields.iter().zip(variants.iter().skip(Self::SUSPENDED)).find_map(|(point, kept)| {
+            let field = point.kept.iter().position(|&it| it == index)?;
+            Some(kept.field_offsets[RustcFieldIdx::new(field)])
+        })
+    }
+
+    /// The integer the state is, as wide as rustc has it.
+    pub fn state_of(layout: &Layout) -> Option<Scalar> {
+        match &layout.variants {
+            Variants::Multiple { tag, .. } => Some(*tag),
+            _ => None,
+        }
+    }
+
+    fn state_scalar(yields: usize) -> Scalar {
+        let last = (Self::SUSPENDED + yields - 1) as u128;
+        Scalar::Initialized {
+            value: Primitive::Int(Integer::fit_unsigned(last), false),
+            valid_range: WrappingRange { start: 0, end: last },
+        }
     }
 
     pub fn state(self) -> usize {
-        self.upvars + 2 * self.locals
+        self.upvars + self.flags
     }
 }

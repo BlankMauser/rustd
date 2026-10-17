@@ -3859,7 +3859,8 @@ impl Impl {
                     .for_self_ty(&simplified_ty, &mut extend_with_impls);
             }
         }
-        result
+        // An impl in a block is one of its crate as well as of the block.
+        result.into_iter().unique().collect()
     }
 
     pub fn all_for_trait(db: &dyn HirDatabase, trait_: Trait) -> Vec<Impl> {
@@ -3879,7 +3880,8 @@ impl Impl {
         {
             handle_impls(impls);
         }
-        all
+        // An impl in a block is one of its crate as well as of the block.
+        all.into_iter().unique().collect()
     }
 
     pub fn trait_(self, db: &dyn HirDatabase) -> Option<Trait> {

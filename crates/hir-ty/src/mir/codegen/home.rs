@@ -18,6 +18,7 @@ use salsa::plumbing::FromId as _;
 use crate::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    method_resolution::loaded_crates,
     next_solver::{DbInterner, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
@@ -137,7 +138,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
 /// Picks the crate each instance is compiled as.
 #[derive(Default)]
 pub(super) struct Homes {
-    /// What each crate can see: itself and everything it depends on.
+    /// What each crate can see: itself and the crates whose impls it knows.
     sees: FxHashMap<Crate, FxHashSet<Crate>>,
 }
 
@@ -162,7 +163,7 @@ impl Homes {
             let sees = self
                 .sees
                 .entry(krate)
-                .or_insert_with(|| krate.transitive_deps(db).into_iter().collect());
+                .or_insert_with(|| loaded_crates(db, krate).iter().copied().collect());
             mentions.crates.iter().all(|it| sees.contains(it))
         });
         match home {

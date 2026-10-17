@@ -9,7 +9,7 @@ use hir_def::{
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -1066,12 +1066,24 @@ pub struct CoroutineLocals {
     pub context: LocalId,
 }
 
-/// The locals of an `async` block that may hold a value when it yields, in the order the body
-/// declares them, and which of them may hold a value at the same time as which.
+/// The locals an `async` block keeps from one `poll` to the next, in the order the body
+/// declares them: at each place it yields, the ones that hold a value then and are used after.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldLocals {
     pub locals: Vec<LocalId>,
+    /// The places the body yields at, in the order of the states of the future.
+    pub yields: Vec<YieldPoint>,
     conflicts: Vec<bool>,
+    flagged: Vec<bool>,
+    /// How many parts of each may be moved out on their own.
+    parts: Vec<u32>,
+}
+
+/// One `await`: where the body goes on from, and which of the held locals are kept over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YieldPoint {
+    pub resume: BasicBlockId,
+    pub kept: Vec<usize>,
 }
 
 impl HeldLocals {
@@ -1084,6 +1096,38 @@ impl HeldLocals {
     pub fn conflict(&self, a: usize, b: usize) -> bool {
         self.conflicts[a * self.locals.len() + b]
     }
+
+    /// Whether the future has to say if the local holds a value: where it yields does not say
+    /// it, or a part of the value may be gone.
+    pub fn is_flagged(&self, at: usize) -> bool {
+        self.flagged[at]
+    }
+
+    /// The size of the flag of a flagged local: a bit for the whole and one for each part that
+    /// may be gone.
+    pub fn flag_bytes(&self, at: usize) -> u64 {
+        match self.parts[at] {
+            0..8 => 1,
+            8..16 => 2,
+            16..32 => 4,
+            _ => 8,
+        }
+    }
+
+    /// The held locals whose flag is in the future, in order.
+    pub fn flagged(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.locals.len()).filter(|&at| self.flagged[at])
+    }
+}
+
+/// What a block does with a local, as `MirBody::accesses` tells it.
+enum Access {
+    Read,
+    /// The whole of it is given a value, or its storage ends.
+    Write,
+    Borrow,
+    /// A part of it is used as an operand, and so perhaps moved out.
+    Part(StoredProjection),
 }
 
 impl MirBody<'_> {
@@ -1214,38 +1258,97 @@ impl MirBody<'_> {
             }
             successors
         };
-        let mut entry: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
-        entry.insert(self.start_block, start);
-        let mut across = vec![false; self.locals.len()];
-        let mut worklist = vec![self.start_block];
-        while let Some(id) = worklist.pop() {
-            let mut held = entry[id].clone();
-            let successors = transfer(id, &mut held, &mut |_, _| (), &mut |held| {
-                for (across, &held) in across.iter_mut().zip(held) {
-                    *across |= held;
-                }
-            });
-            for successor in successors {
-                match entry.get_mut(successor) {
-                    Some(known) => {
-                        let mut grew = false;
-                        for (known, &held) in known.iter_mut().zip(&held) {
-                            grew |= held && !*known;
-                            *known |= held;
+        // What is held on entry to each block: on some way to it, or on every way.
+        let solve = |on_every_way: bool| {
+            let mut entry: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+            entry.insert(self.start_block, start.clone());
+            let mut worklist = vec![self.start_block];
+            while let Some(id) = worklist.pop() {
+                let mut held = entry[id].clone();
+                let successors = transfer(id, &mut held, &mut |_, _| (), &mut |_| ());
+                for successor in successors {
+                    match entry.get_mut(successor) {
+                        Some(known) => {
+                            let mut changed = false;
+                            for (known, &held) in known.iter_mut().zip(&held) {
+                                let joined =
+                                    if on_every_way { *known && held } else { *known || held };
+                                changed |= joined != *known;
+                                *known = joined;
+                            }
+                            if changed {
+                                worklist.push(successor);
+                            }
                         }
-                        if grew {
+                        None => {
+                            entry.insert(successor, held.clone());
                             worklist.push(successor);
                         }
                     }
-                    None => {
-                        entry.insert(successor, held.clone());
-                        worklist.push(successor);
-                    }
                 }
             }
+            entry
+        };
+        let entry = solve(false);
+        let surely = solve(true);
+        let at_yield = |entry: &ArenaMap<BasicBlockId, Vec<bool>>, id: BasicBlockId| {
+            let mut held = entry[id].clone();
+            let mut at = Vec::new();
+            transfer(id, &mut held, &mut |_, _| (), &mut |held| at = held.to_vec());
+            at
+        };
+        // A value nothing reads after the yield need not be kept, unless it has a destructor to
+        // run or something may point at it.
+        let (live, borrowed, parted) = self.liveness();
+        let mut across = vec![false; self.locals.len()];
+        let mut unsure = vec![false; self.locals.len()];
+        let mut points = Vec::new();
+        for (id, block) in self.basic_blocks.iter() {
+            let Some(TerminatorKind::Yield { resume, .. }) =
+                block.terminator.as_ref().map(|it| &it.kind)
+            else {
+                continue;
+            };
+            if !entry.contains_idx(id) {
+                continue;
+            }
+            let (may, must) = (at_yield(&entry, id), at_yield(&surely, id));
+            let kept: Vec<bool> = (0..self.locals.len())
+                .map(|at| {
+                    // What `poll` is given is given again.
+                    !start[at] && may[at] && (moved[at] || borrowed[at] || live[*resume][at])
+                })
+                .collect();
+            for at in 0..self.locals.len() {
+                across[at] |= kept[at];
+                unsure[at] |= kept[at] && !must[at];
+            }
+            points.push((*resume, kept));
         }
         let locals: Vec<LocalId> =
             self.locals.iter().map(|(local, _)| local).filter(|&it| across[index(it)]).collect();
+        let yields = points
+            .into_iter()
+            .map(|(resume, kept)| YieldPoint {
+                resume,
+                kept: (0..locals.len()).filter(|&at| kept[index(locals[at])]).collect(),
+            })
+            .collect();
+        let flagged = locals
+            .iter()
+            .map(|&it| moved[index(it)] && (unsure[index(it)] || !parted[index(it)].is_empty()))
+            .collect();
+        // Each of the elements of a subslice is a part.
+        let parts = locals
+            .iter()
+            .map(|&it| {
+                let parts = parted[index(it)].iter().map(|part| match part.as_slice().last() {
+                    Some(ProjectionElem::Subslice { .. }) => u64::BITS,
+                    _ => 1,
+                });
+                parts.sum()
+            })
+            .collect();
         // Two of them that may hold a value at once can't share memory. With what is held on
         // entry to each block known, one more pass over the blocks finds every such pair.
         let mut slot = vec![None; self.locals.len()];
@@ -1292,7 +1395,180 @@ impl MirBody<'_> {
                 }
             }
         }
-        HeldLocals { locals, conflicts }
+        HeldLocals { locals, yields, conflicts, flagged, parts }
+    }
+
+    /// The locals read after the start of each block before they are written, the ones
+    /// borrowed anywhere, and the parts of each that are used as an operand.
+    fn liveness(
+        &self,
+    ) -> (ArenaMap<BasicBlockId, Vec<bool>>, Vec<bool>, Vec<FxHashSet<StoredProjection>>) {
+        let index = |local: LocalId| local.into_raw().into_u32() as usize;
+        let count = self.locals.len();
+        let (mut borrowed, mut parted) = (vec![false; count], vec![FxHashSet::default(); count]);
+        let mut live: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+        let mut written: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+        let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
+        for (id, _) in self.basic_blocks.iter() {
+            let (mut reads, mut writes) = (vec![false; count], vec![false; count]);
+            let next = self.accesses(id, &mut |local, access| match access {
+                Access::Read => reads[index(local)] |= !writes[index(local)],
+                Access::Write => writes[index(local)] = true,
+                Access::Borrow => borrowed[index(local)] = true,
+                Access::Part(part) => {
+                    parted[index(local)].insert(part);
+                }
+            });
+            live.insert(id, reads);
+            written.insert(id, writes);
+            successors.insert(id, next);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (id, _) in self.basic_blocks.iter() {
+                for &successor in &successors[id] {
+                    for at in 0..count {
+                        if live[successor][at] && !written[id][at] && !live[id][at] {
+                            live[id][at] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        (live, borrowed, parted)
+    }
+
+    /// Tells `f` of what a block does with locals, in the order it does it, and returns the
+    /// blocks that follow. Dropping a local is not among it: that reads nothing of a value
+    /// without a destructor, and one with a destructor is kept regardless.
+    fn accesses(
+        &self,
+        id: BasicBlockId,
+        f: &mut dyn FnMut(LocalId, Access),
+    ) -> SmallVec<[BasicBlockId; 2]> {
+        fn indices(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            for elem in place.projection.as_slice() {
+                if let ProjectionElem::Index(local) = elem {
+                    f(*local, Access::Read);
+                }
+            }
+        }
+        fn read(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            indices(place, f);
+            f(place.local, Access::Read);
+        }
+        fn write(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            indices(place, f);
+            let whole = place.projection.as_slice().is_empty();
+            f(place.local, if whole { Access::Write } else { Access::Read });
+        }
+        fn is_within(place: &StoredPlace) -> bool {
+            !place.projection.as_slice().contains(&ProjectionElem::Deref)
+        }
+        fn operand(operand: &Operand, f: &mut dyn FnMut(LocalId, Access)) {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+                read(place, f);
+                if !place.projection.as_slice().is_empty() && is_within(place) {
+                    f(place.local, Access::Part(place.projection.clone()));
+                }
+            }
+        }
+        let block = &self.basic_blocks[id];
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Assign(place, rvalue) => {
+                    match rvalue {
+                        Rvalue::UnaryOp(_, it)
+                        | Rvalue::Cast(_, it, _)
+                        | Rvalue::Repeat(it, _)
+                        | Rvalue::Use(it) => operand(it, f),
+                        Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                            operand(lhs, f);
+                            operand(rhs, f);
+                        }
+                        Rvalue::Aggregate(_, operands) => {
+                            operands.iter().for_each(|it| operand(it, f));
+                        }
+                        Rvalue::Ref(_, from) => {
+                            read(from, f);
+                            if is_within(from) {
+                                f(from.local, Access::Borrow);
+                            }
+                        }
+                        Rvalue::CopyForDeref(from)
+                        | Rvalue::Discriminant(from)
+                        | Rvalue::Len(from) => read(from, f),
+                        Rvalue::ThreadLocalRef(n)
+                        | Rvalue::AddressOf(n)
+                        | Rvalue::BinaryOp(n)
+                        | Rvalue::NullaryOp(n) => match *n {},
+                    }
+                    write(place, f);
+                }
+                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                    f(*local, Access::Write)
+                }
+                StatementKind::InlineAsm(asm) => {
+                    for it in &asm.operands {
+                        match it {
+                            AsmOperand::Reg { input, output, .. } => {
+                                input.iter().for_each(|it| operand(it, f));
+                                output.iter().for_each(|it| write(it, f));
+                            }
+                            AsmOperand::Const(it) => operand(it, f),
+                        }
+                    }
+                }
+                StatementKind::FakeRead(_) | StatementKind::Deinit(_) | StatementKind::Nop => (),
+            }
+        }
+        let mut successors = SmallVec::new();
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::SwitchInt { discr, targets }) => {
+                operand(discr, f);
+                successors.extend(targets.all_targets().iter().copied());
+            }
+            Some(
+                TerminatorKind::Goto { target }
+                | TerminatorKind::FalseEdge { real_target: target, .. }
+                | TerminatorKind::FalseUnwind { real_target: target, .. },
+            ) => successors.push(*target),
+            Some(TerminatorKind::Drop { place, target, .. }) => {
+                indices(place, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::DropAndReplace { place, value, target, .. }) => {
+                operand(value, f);
+                write(place, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::Call { func, args, destination, target, .. }) => {
+                operand(func, f);
+                args.iter().for_each(|it| operand(it, f));
+                write(destination, f);
+                successors.extend(*target);
+            }
+            Some(TerminatorKind::Assert { cond, target, .. }) => {
+                operand(cond, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::Yield { value, resume_arg, resume, .. }) => {
+                operand(value, f);
+                write(resume_arg, f);
+                successors.push(*resume);
+            }
+            Some(
+                TerminatorKind::UnwindResume
+                | TerminatorKind::CoroutineDrop
+                | TerminatorKind::Abort
+                | TerminatorKind::Return
+                | TerminatorKind::Unreachable,
+            )
+            | None => (),
+        }
+        successors
     }
 
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {

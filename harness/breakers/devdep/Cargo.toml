@@ -6,6 +6,7 @@ publish = false
 
 [dev-dependencies]
 helper = { path = "helper" }
+unnamed = { path = "unnamed" }
 
 [workspace]
 
