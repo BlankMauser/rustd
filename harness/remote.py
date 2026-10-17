@@ -221,6 +221,36 @@ class Machine:
             raise SystemExit(f"rustd failed:\n{out.stderr[-3000:]}")
         return out.stderr, time.time() - start
 
+    def daemon(self, crates, env):
+        """Starts a daemon for the program and waits for its first build. Returns it and where it listens."""
+        rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
+        symbols = [x for rlib in rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
+        obj, self.program = os.path.join(self.out, "rustd.o"), os.path.join(self.out, "program")
+        link = linkline.with_output(linkline.ahead(list(self.link_args), [obj], RUSTD), self.program)
+        self.count = getattr(self, "count", 0) + 1
+        socket, self.log = os.path.join(self.out, f"socket{self.count}"), os.path.join(self.out, f"daemon{self.count}.log")
+        daemon = subprocess.Popen(
+            [RUSTD, self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj, "--socket", socket,
+             "--link-cmd", shlex.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
+            env={**self.env, **env})
+        while "watching" not in self.heard():
+            if daemon.poll() is not None:
+                raise SystemExit(f"the daemon did not start: {self.log}")
+            time.sleep(0.05)
+        return daemon, socket
+
+    def heard(self):
+        return open(self.log).read()
+
+    def edit(self, socket, note):
+        """Changes `main` and has the daemon build it. Returns how long the daemon took, if it built."""
+        path = os.path.join(self.ws, "app/src/main.rs")
+        text = open(path).read()
+        open(path, "w").write(text.replace("fn main() {", f'fn main() {{\n    println!("{note}");', 1))
+        start = time.time()
+        asked = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=120, env=self.env)
+        return time.time() - start if asked.returncode == 0 and note in self.run() else None
+
     def run(self, program=None, args=()):
         ran = subprocess.run([*RUNNER, program or self.program, *args], capture_output=True, text=True, timeout=60)
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -723,6 +753,82 @@ def collected(top, remote):
           f"{twice} packs, then {len(once)}; " + collect.stdout.splitlines()[0][:70] if collect.stdout else collect.stderr[-80:])
 
 
+def until(holds, seconds=20):
+    """Waits for `holds()` to be true, and says whether it came to be."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if holds():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def kept(top, remote, crates, target, workspace):
+    """A daemon that stays: it pushes on a schedule and when it ends, and pulls when the manifest changed."""
+    print(f"{remote.name}: a daemon that stays", flush=True)
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"d-{remote.name}-{it}", remote) for it in "ab")
+    a.checkout(workspace)
+    a.cargo(target)
+    packs = lambda: [it for it in bucket.objects() if it.startswith("packs/")]
+    listed = lambda: len((bucket.get("manifests/default") or b"").splitlines())
+
+    daemon, socket = a.daemon(crates, {"RUSTD_REMOTE": address, "RUSTD_REMOTE_PUSH_EVERY": "2s"})
+    try:
+        check("what the first build compiled is sent without being asked, small as it is",
+              until(lambda: listed() >= 1) and len(packs()) == listed(), f"{listed()} packs listed")
+        first = listed()
+        took = a.edit(socket, "edited once")
+        check("what an edit compiled is sent on the schedule", took is not None and until(lambda: listed() > first),
+              f"{listed()} packs listed")
+
+        # Another machine adds to the manifest; the daemon has it after its next build lacks something.
+        other = b.add_pack(filler(f"{remote.name} from another machine", 256 << 10))
+        out = b.rustd("cache", "push", address)
+        took = a.edit(socket, "edited twice")
+        check("a build that lacks something has the daemon pull when the manifest changed",
+              out.returncode == 0 and took is not None and until(lambda: other in a.packs())
+              and "the manifest of `default` has changed" in a.heard(), a.heard().count("has changed"))
+        looks = a.heard().count("has changed")
+        took = a.edit(socket, "edited thrice")
+        time.sleep(6)
+        check("and does not pull when it did not", took is not None and a.heard().count("has changed") == looks)
+
+        if remote.proxy:
+            remote.proxy.clear()
+            remote.proxy.hold = 3
+            took = a.edit(socket, "edited while the remote is slow")
+            remote.proxy.hold = 0
+            check("no build waits for the remote", took is not None and took < 3, f"{took and round(took, 2)}s with every request held 3s")
+    finally:
+        daemon.terminate()
+        ended = daemon.wait(timeout=90)
+    ok, counted, _ = a.cache("stats")
+    out = a.rustd("cache", "push", address)
+    check("told to end, the daemon ends as it was told, with nothing left to send", ended == -signal.SIGTERM and ok
+          and counted.get("open packs") == 0 and out.returncode == 0 and out.stdout.startswith("0 packs added"),
+          f"exit {ended}; {out.stdout.strip()[:40]}")
+
+    daemon, socket = a.daemon(crates, {"RUSTD_REMOTE": address, "RUSTD_REMOTE_PUSH_EVERY": "off"})
+    try:
+        time.sleep(1)
+        before = listed()
+        took = a.edit(socket, "edited with no schedule")
+        time.sleep(4)
+        unsent = listed()
+    finally:
+        daemon.terminate()
+        ended = daemon.wait(timeout=90)
+    check("with the schedule off an edit is sent when the daemon ends and not before",
+          took is not None and unsent == before and ended == -signal.SIGTERM and listed() == before + 1,
+          f"{before}, {unsent}, then {listed()} packs listed")
+    c = Machine(top, f"d-{remote.name}-c", remote)
+    c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
+    log, _ = c.build(crates, env={"RUSTD_REMOTE": address})
+    check("another machine builds the edited program and compiles nothing", compiled(log) == 0 and "edited with no schedule" in c.run(),
+          f"{compiled(log)} compiled")
+
+
 def packs_fetched(remote):
     """How many fetches of packs the proxy saw since it was last asked, or `None` without a proxy."""
     if not remote.proxy:
@@ -951,6 +1057,7 @@ def checks():
                 over_tls(top, remote)
             stored(top, remote)
             collected(top, remote)
+            kept(top, remote, crates, target, workspace)
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)

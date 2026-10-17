@@ -170,6 +170,14 @@ pub fn fetch_missing_with(fetch: FetchMissing) {
     _ = FETCH_MISSING.set(fetch);
 }
 
+/// Seals what the store of this process has open, however little it is, so that it can be
+/// sent to other machines now. Between builds a small pack is otherwise left open.
+pub fn seal_open() {
+    if let Some(store) = Store::global() {
+        store.settle(1);
+    }
+}
+
 /// The format of the pack that starts with these bytes, if they start a pack of any.
 pub fn pack_format(start: &[u8]) -> Option<u32> {
     let (format, name) = start.get(..MAGIC.len())?.split_last()?;
@@ -971,8 +979,13 @@ impl Store {
     /// other daemons sealed. What is not written by the time the daemon ends is compiled
     /// again by the next.
     pub(super) fn flush(&self) {
+        self.settle(self.tuning.seal_at);
+    }
+
+    /// As [`Self::flush`], sealing the open pack if it has `seal_at` bytes.
+    fn settle(&self, seal_at: u64) {
         let sealed = match self.writer.lock() {
-            Ok(mut writer) => writer.settle(&self.dir, self.tuning.seal_at),
+            Ok(mut writer) => writer.settle(&self.dir, seal_at),
             Err(_) => false,
         };
         self.mark_used();

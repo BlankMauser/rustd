@@ -7,7 +7,9 @@
 //! the packs its builds were served from. A push sends the packs the manifest lacks and
 //! adds them to it; a pull fetches the ones it lists that are not here. With
 //! `RUSTD_REMOTE_LAZY` the daemon fetches the keys only, and a pack when a build first asks
-//! for a key it holds.
+//! for a key it holds. A daemon that stays goes on in `keeper.rs`: it pulls again when a
+//! build lacked something and the manifest has changed, and pushes on a schedule and when
+//! it is told to end.
 //!
 //! What is fetched becomes a pack of the store like any other: it is written the way the
 //! store writes its own, counts toward `RUSTD_CACHE_MAX`, and can be evicted and fetched
@@ -18,6 +20,7 @@
 //! is what `signed.rs` is for. `RUSTD_REMOTE_READONLY` keeps a machine from writing at all.
 
 mod collect;
+mod keeper;
 mod s3;
 mod signed;
 mod transfer;
@@ -958,6 +961,11 @@ pub(crate) struct Shared {
     remote: Arc<Remote>,
     project: String,
     runtime: Arc<Runtime>,
+    /// Whether packs are left on the remote until a build asks for a key of theirs.
+    lazy: bool,
+    /// How often what the daemon compiled is sent while it runs, if on a schedule at all.
+    push_every: Option<Duration>,
+    asked: Arc<keeper::Asked>,
 }
 
 impl Shared {
@@ -968,34 +976,49 @@ impl Shared {
         let remote = std::env::var("RUSTD_REMOTE").ok()?;
         let opened = runtime().and_then(|runtime| {
             let project = project_name(std::env::var("RUSTD_PROJECT").ok())?;
+            let push_every = keeper::push_every_from_env()?;
             let remote = Arc::new(runtime.block_on(Remote::open(&remote))?);
-            Ok(Shared { store, remote, project, runtime: Arc::new(runtime) })
+            let lazy = std::env::var_os("RUSTD_REMOTE_LAZY").is_some_and(|it| it != "0");
+            let (runtime, asked) = (Arc::new(runtime), Arc::default());
+            Ok(Shared { store, remote, project, runtime, lazy, push_every, asked })
         });
         opened.inspect_err(|e| eprintln!("remote: {e:#}")).ok()
     }
 
     /// Fetches what the project's manifest lists, or with `RUSTD_REMOTE_LAZY` only what
     /// tells which pack holds which key, leaving each pack to the first build that asks.
+    /// From here on the store asks this remote for the keys it lacks.
     pub(crate) fn pull(&self) {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
-        let lazy = std::env::var_os("RUSTD_REMOTE_LAZY").is_some_and(|it| it != "0");
         let done = self.runtime.block_on(async {
-            if lazy {
-                let lazy = Lazy::load(self).await?;
-                let said = format!(
-                    "{} keys in {} packs to fetch from",
-                    lazy.holder.len(),
-                    lazy.packs.len()
-                );
-                hir_ty::mir::codegen::fetch_missing_with(Box::new(move |key| lazy.fetch(key)));
-                Ok(said)
-            } else {
-                pull(&self.store, &self.remote, &self.project).await
-            }
+            self.asked.see(self.manifest_now().await);
+            self.pull_as_set().await
         });
+        let asked = self.asked.clone();
+        hir_ty::mir::codegen::fetch_missing_with(Box::new(move |key| asked.fetch(key)));
         self.report(done, start);
+    }
+
+    /// A pull the way the daemon is set to pull: of every pack, or of what says where the
+    /// keys are.
+    async fn pull_as_set(&self) -> anyhow::Result<String> {
+        if !self.lazy {
+            return pull(&self.store, &self.remote, &self.project).await;
+        }
+        let lazy = Lazy::load(self).await?;
+        let said =
+            format!("{} keys in {} packs to fetch from", lazy.holder.len(), lazy.packs.len());
+        self.asked.fetch_from(lazy);
+        Ok(said)
+    }
+
+    /// What the project's manifest hashes to now: `None` when there is none or it cannot
+    /// be read.
+    async fn manifest_now(&self) -> Option<Digest> {
+        let read = self.remote.read_small(&Manifest::at(&self.project)).await;
+        Some(Digest::of(&read.ok()??.0))
     }
 
     pub(crate) fn push(&self) {
