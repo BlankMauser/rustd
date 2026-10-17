@@ -30,7 +30,6 @@
 use std::{
     fs::{File, OpenOptions},
     mem::offset_of,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     thread::JoinHandle,
     time::SystemTime,
@@ -45,6 +44,7 @@ use object::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 mod macho;
+mod pe;
 
 /// The executable of the last full link, which is read on a thread of its own while the
 /// daemon waits for the next edit.
@@ -53,9 +53,9 @@ pub(crate) struct Linked(JoinHandle<anyhow::Result<Baseline>>);
 impl Linked {
     /// Starts reading the executable the linker just wrote at `binary` from `patch` and the
     /// rest of the link line. The patch is read here and now: the next edit writes another.
-    pub(crate) fn read(binary: PathBuf, patch: &Path) -> Linked {
-        let patch = std::fs::read(patch);
-        Linked(std::thread::spawn(move || Baseline::read(binary, &patch?)))
+    pub(crate) fn read(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
+        let (patch, object) = (std::fs::read(patch), object.to_owned());
+        Linked(std::thread::spawn(move || Baseline::read(binary, &patch?, &object)))
     }
 
     pub(crate) fn baseline(self) -> anyhow::Result<Baseline> {
@@ -80,6 +80,7 @@ pub(crate) struct Baseline {
 enum Executable {
     Elf(Image),
     MachO(macho::Image),
+    Pe(pe::Image),
 }
 
 /// What a splice did, for the log.
@@ -89,7 +90,8 @@ pub(crate) struct Spliced {
 }
 
 impl Baseline {
-    fn read(path: PathBuf, patch: &[u8]) -> anyhow::Result<Baseline> {
+    /// Reads the executable at `path`, which was linked with `patch` ahead of `object`.
+    fn read(path: PathBuf, patch: &[u8], object: &Path) -> anyhow::Result<Baseline> {
         let file = File::open(&path)?;
         let stamp = Stamp::of(&file)?;
         // SAFETY: the daemon is the one that has the link write the file, and it does not
@@ -97,6 +99,10 @@ impl Baseline {
         let bytes = unsafe { memmap2::Mmap::map(&file)? };
         let image = match object::FileKind::parse(&*bytes)? {
             object::FileKind::MachO64 => Executable::MachO(macho::Image::read(&bytes)?),
+            object::FileKind::Pe64 => {
+                let object = std::fs::read(object)?;
+                Executable::Pe(pe::Image::read(&bytes, &path, &[patch, &object])?)
+            }
             _ => Executable::Elf(Image::read(&bytes)?),
         };
         let patch = object::File::parse(patch)?;
@@ -115,38 +121,77 @@ impl Baseline {
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
     pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {
-        let image = match &self.image {
-            Executable::Elf(image) => image,
+        let (addition, len) = match &self.image {
+            Executable::Elf(image) => {
+                let patch = Patch::read(patch, image)?;
+                self.has_baked(patch.replaced.iter().map(|it| it.name))?;
+                (patch.place(image)?, image.len)
+            }
+            Executable::Pe(image) => {
+                let patch = pe::Patch::read(patch, image)?;
+                self.has_baked(patch.defined())?;
+                (patch.place(image)?, image.len)
+            }
             Executable::MachO(image) => {
                 let Baseline { path, baked, undo, stamp, .. } = self;
                 return macho::splice(image, path, baked, undo, stamp, patch);
             }
         };
-        let patch = Patch::read(patch, image)?;
-        let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(&**it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
-        let addition = patch.place(image)?;
 
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         ensure!(Stamp::of(&file)? == self.stamp, "the executable was written by someone else");
         for (offset, bytes) in self.undo.drain(..).rev() {
-            file.write_all_at(&bytes, offset)?;
+            write_all_at(&file, &bytes, offset)?;
         }
-        file.set_len(image.len)?;
-        file.write_all_at(&addition.appended, addition.offset)?;
-        file.write_all_at(&addition.headers, addition.headers_offset)?;
+        file.set_len(len)?;
+        write_all_at(&file, &addition.appended, addition.offset)?;
+        write_all_at(&file, &addition.headers, addition.headers_offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
-            file.read_exact_at(&mut old, *offset)?;
+            read_exact_at(&file, &mut old, *offset)?;
             self.undo.push((*offset, old));
-            file.write_all_at(bytes, *offset)?;
+            write_all_at(&file, bytes, *offset)?;
         }
         self.stamp = Stamp::of(&file)?;
         Ok(Spliced { redirected: addition.redirected, appended: addition.appended.len() })
     }
+}
+
+impl Baseline {
+    /// Whether a patch that defines `defined` has every function of the patch the
+    /// executable was linked with.
+    fn has_baked<'a>(&self, defined: impl Iterator<Item = &'a [u8]>) -> anyhow::Result<()> {
+        let defined: FxHashSet<&[u8]> = defined.collect();
+        ensure!(
+            self.baked.iter().all(|it| defined.contains(&**it)),
+            "a function the executable was linked with a patch of is as it first was"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(mut file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+#[cfg(windows)]
+fn read_exact_at(mut file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
 }
 
 #[derive(PartialEq)]

@@ -78,10 +78,9 @@ def main():
         fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        link = linkline.ahead(link, [patch, obj], RUSTD)
-        link[link.index("-o") + 1] = binary
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link), "symbols": symbols}
+        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link), "symbols": symbols}
     first = programs["sapp"]
     out = open(log_path, "a")
     daemon = subprocess.Popen(

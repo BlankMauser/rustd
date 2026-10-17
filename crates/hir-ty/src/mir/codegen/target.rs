@@ -47,12 +47,15 @@ impl Arch {
 pub enum ObjectFormat {
     Elf,
     MachO,
+    Coff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnwindFormat {
     /// DWARF call frame information in `.eh_frame`, landing pads in `.gcc_except_table`.
     EhFrame,
+    /// The unwind codes of Windows in `.pdata` and `.xdata`, see `unwind::seh`.
+    Seh,
 }
 
 impl Target {
@@ -102,7 +105,7 @@ impl Target {
             Some("aarch64") => Arch::Aarch64,
             _ => return Err(format!("rustd emits no code for the architecture of {triple}")),
         };
-        let system = parts.find(|part| matches!(*part, "linux" | "darwin"));
+        let system = parts.find(|part| matches!(*part, "linux" | "darwin" | "windows"));
         // Cranelift's names for the C convention: `SystemV` is the psABI's on x86-64 and
         // AAPCS64 on AArch64, which Apple's differs from in what goes on the stack.
         let (object_format, unwind, call_conv) = match (system, arch) {
@@ -110,7 +113,11 @@ impl Target {
             (Some("darwin"), Arch::Aarch64) => {
                 (ObjectFormat::MachO, UnwindFormat::EhFrame, CallConv::AppleAarch64)
             }
-            // FIXME: x86-64 Mach-O has no splice and no thread locals written for it.
+            (Some("windows"), Arch::X86_64) if triple.ends_with("-msvc") => {
+                (ObjectFormat::Coff, UnwindFormat::Seh, CallConv::WindowsFastcall)
+            }
+            // FIXME: x86-64 Mach-O and AArch64 PE have no splice written for them, and the
+            // GNU flavour of Windows unwinds another way than the tables of `unwind::seh`.
             _ => return Err(format!("rustd emits no code for the system of {triple}")),
         };
         Ok(Target { triple: triple.to_owned(), arch, object_format, call_conv, unwind })
@@ -120,24 +127,45 @@ impl Target {
         &self.triple
     }
 
+    /// Whether a call can name its landing pad and the pad is entered with the exception in a
+    /// register, as Cranelift has it for the calling conventions it knows the register of.
+    pub fn exception_in_register(&self) -> bool {
+        self.call_conv.supports_exceptions()
+    }
+
     /// The processor code is made for: the baseline of the target, as rustc compiles for.
     pub fn cpu(&self) -> &'static str {
         match (self.arch, self.object_format) {
             (Arch::X86_64, _) => "x86-64",
             (Arch::Aarch64, ObjectFormat::MachO) => "apple-m1",
-            (Arch::Aarch64, ObjectFormat::Elf) => "generic",
+            (Arch::Aarch64, ObjectFormat::Elf | ObjectFormat::Coff) => "generic",
         }
     }
 
     /// The code generator for the target. `regalloc` names Cranelift's register allocator.
     pub(super) fn isa(&self, regalloc: &str) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
-        flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-        let tls_model = match self.object_format {
-            ObjectFormat::Elf => "elf_gd",
-            ObjectFormat::MachO => "macho",
+        // An image of PE reaches all of itself relative to the instruction, and what it
+        // imports through the stubs the linker adds: there is no table of addresses to go
+        // through.
+        let (pic, tls_model) = match self.object_format {
+            ObjectFormat::Elf => ("true", "elf_gd"),
+            ObjectFormat::MachO => ("true", "macho"),
+            ObjectFormat::Coff => ("false", "coff"),
         };
+        flags.set("is_pic", pic).map_err(|e| e.to_string())?;
         flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
+        if self.object_format == ObjectFormat::Coff {
+            // Windows commits a stack one page at a time, as the guard page below the last
+            // is touched: a frame larger than a page has to touch each on its way down.
+            flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
+            flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
+        }
+        if !self.exception_in_register() {
+            // The pads of a convention Cranelift has no landing pads for take the exception
+            // from the frame (see `unwind::seh`), which the frame pointer finds.
+            flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
+        }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
         flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;

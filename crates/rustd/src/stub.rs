@@ -6,7 +6,7 @@
 //! What runs during the build is told from the rest by `--target`, which cargo passes for
 //! the program's crates alone when it is given one itself.
 
-use std::{ffi::OsString, os::unix::process::CommandExt as _, path::Path, process::Command};
+use std::{ffi::OsString, path::Path, process::Command};
 
 use anyhow::Context as _;
 
@@ -61,7 +61,21 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         args[source] = path.into();
     }
-    Err(Command::new(rustc).args(args).exec().into())
+    run(Command::new(rustc).args(args))
+}
+
+/// Becomes rustc.
+#[cfg(unix)]
+fn run(rustc: &mut Command) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    Err(rustc.exec().into())
+}
+
+/// Windows has no process become another: rustc runs below this one, which ends as it did.
+#[cfg(windows)]
+fn run(rustc: &mut Command) -> anyhow::Result<()> {
+    let status = rustc.status()?;
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 fn valued<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {

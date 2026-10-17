@@ -1,13 +1,14 @@
 """linkline.py: a link line with rustd's objects ahead of what rustc built of the same crates.
 
 Both define the same names, and rustd's have to be the ones that stay. An ELF linker keeps the
-first definition when told to. Apple's linker has no flag for it, so there rustc's objects and
+first definition when told to, and so does a linker of the `link.exe` kind. Apple's linker has no flag for it, so there rustc's objects and
 archives are replaced by copies whose definitions are weak (`rustd weaken`): a weak definition
 gives way to one that is not, and to a weak one before it on the line.
 """
-import os, subprocess, sys
+import os, shlex, subprocess, sys
 
 MACHO = sys.platform == "darwin"
+WINDOWS = os.name == "nt"
 THEIRS = (".rlib", ".rcgu.o")
 
 
@@ -16,10 +17,39 @@ def first_of_rustc(link):
     return next(i for i, a in enumerate(link) if a.endswith(THEIRS))
 
 
+def msvc(link):
+    """Whether the line is one of a linker of the `link.exe` kind."""
+    return "/NOLOGO" in link
+
+
+def output_of(link):
+    """The file the line links."""
+    if msvc(link):
+        return next(a for a in link if a.upper().startswith("/OUT:"))[len("/OUT:"):]
+    return link[link.index("-o") + 1]
+
+
+def with_output(link, path):
+    """The line with the linked file written to `path`."""
+    if msvc(link):
+        return [f"/OUT:{path}" if a.upper().startswith("/OUT:") else a for a in link]
+    link = list(link)
+    link[link.index("-o") + 1] = path
+    return link
+
+
+def join(link):
+    """The line as `--link-cmd` takes it: what the platform's shell would run."""
+    return subprocess.list2cmdline(link) if WINDOWS else shlex.join(link)
+
+
 def ahead(link, objects, rustd):
     """`link` with `objects` before rustc's, and the linker told that the first definition stays."""
     link = list(link)
     first = first_of_rustc(link)
+    if msvc(link):
+        link[first:first] = [*objects, "/FORCE:MULTIPLE", "/IGNORE:4006"]
+        return link
     if not MACHO:
         link[first:first] = [*objects, "-Wl,--allow-multiple-definition"]
         return link

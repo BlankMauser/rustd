@@ -22,7 +22,8 @@ os.environ.setdefault("CARGO_INCREMENTAL", "0")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # A sweep runs against a copy, so rebuilding rustd meanwhile does not change it under the sweep.
-RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
+WINDOWS = os.name == "nt"
+RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd" + (".exe" if WINDOWS else ""))
 
 
 def host():
@@ -60,11 +61,33 @@ def profile_dir(target_dir, profile="debug"):
     return os.path.join(target_dir, *([TARGET] if TARGET else []), profile)
 
 
+def toolchain():
+    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+    return sysroot, host()
+
+
 def linker_line(output):
-    """The line of `--print link-args`, as the arguments from the linker driver on."""
-    args = shlex.split(next(l for l in output.splitlines() if '"-o" "' in l))
-    # The environment the driver runs in comes first, as assignments.
-    return args[next(i for i, a in enumerate(args) if "=" not in a):]
+    """The line of `--print link-args`, as the arguments from the linker on: the C compiler
+    where it drives the linker, and a linker of the `link.exe` kind (rustc's own `rust-lld`,
+    or MSVC's) for the MSVC target."""
+    for line in output.splitlines():
+        if '"' not in line:
+            continue
+        try:
+            args = shlex.split(line)
+        except ValueError:
+            continue
+        if "-o" in args:
+            # The environment the driver runs in comes first, as assignments.
+            return args[next(i for i, a in enumerate(args) if "=" not in a):]
+        for at, arg in enumerate(args[:8]):
+            if os.path.basename(arg).lower().removesuffix(".exe") in ("rust-lld", "lld-link", "link") and "/NOLOGO" in args:
+                if arg == "rust-lld":
+                    # rustc finds its own linker beside itself rather than on PATH.
+                    sysroot, triple = toolchain()
+                    arg = os.path.join(sysroot, "lib", "rustlib", triple, "bin", "rust-lld.exe")
+                return [arg, *args[at + 1:]]
+    raise SystemExit(f"no linker line:\n{output[-3000:]}")
 
 
 def sysroot_rlibs():
@@ -112,7 +135,7 @@ class Fixture:
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
         self.link_args = [a for a in linker_line(out.stdout + out.stderr) if not a.endswith("symbols.o")]
-        self.reference = self.link_args[self.link_args.index("-o") + 1]
+        self.reference = linkline.output_of(self.link_args)
         # The target's own objects too: a crate rustd rebuilds may be the one being linked.
         self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
 
@@ -151,10 +174,10 @@ class Fixture:
         else:
             args = linkline.ahead(args, objects, RUSTD)
         self.binary = os.path.join(self.work, "bin-rustd")
-        args[args.index("-o") + 1] = self.binary
+        args = linkline.with_output(args, self.binary)
         run = subprocess.run(args, capture_output=True, text=True)
         if run.returncode != 0:
-            raise SystemExit(f"link failed:\n{run.stderr[-3000:]}")
+            raise SystemExit(f"link failed:\n{(run.stderr + run.stdout)[-3000:]}")
 
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]

@@ -323,6 +323,12 @@ impl<'db> Recorder<'db> {
         config
     }
 
+    /// Whether what another object defines is reached as what this one does: the linker of
+    /// a PE image puts a stub where an import is called, and there is no other way.
+    fn within_image(&self) -> bool {
+        self.isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
+    }
+
     /// Names a requested function in `func`. Whether the function ends up in this object is
     /// not known here, so it is reached the way a function of another object is.
     pub(super) fn declare_func_in_func(&self, id: FuncId, func: &mut ir::Function) -> ir::FuncRef {
@@ -335,7 +341,7 @@ impl<'db> Recorder<'db> {
         func.import_function(ir::ExtFuncData {
             name: ir::ExternalName::user(name),
             signature,
-            colocated: false,
+            colocated: self.within_image(),
             patchable: false,
         })
     }
@@ -358,7 +364,7 @@ impl<'db> Recorder<'db> {
             name: ir::ExternalName::user(name),
             offset: ir::immediates::Imm64::new(0),
             // Only a static can be another object's.
-            colocated: !matches!(request, DataRequest::Static(_)),
+            colocated: self.within_image() || !matches!(request, DataRequest::Static(_)),
             tls,
         })
     }

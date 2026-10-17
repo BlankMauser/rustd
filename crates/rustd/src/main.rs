@@ -26,7 +26,6 @@ use ide_db::base_db::SourceDatabase as _;
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -59,6 +58,12 @@ use syntax::{
     match_ast,
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+// The same sockets, which the standard library does not have on Windows.
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use crate::{
     splice::{Baseline, Linked, Spliced},
@@ -134,7 +139,7 @@ impl Args {
 
     /// The directory of the project, which cargo runs rustc in.
     fn root(&self) -> anyhow::Result<PathBuf> {
-        let mut root = std::fs::canonicalize(&self.project)?;
+        let mut root = dunce::canonicalize(&self.project)?;
         if root.is_file() {
             root.pop();
         }
@@ -851,7 +856,7 @@ struct Checkouts {
 
 impl Checkouts {
     fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
-        let project = std::fs::canonicalize(project)?;
+        let project = dunce::canonicalize(project)?;
         let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
     }
@@ -868,7 +873,7 @@ impl Checkouts {
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
-        let project = std::fs::canonicalize(project).ok()?;
+        let project = dunce::canonicalize(project).ok()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
             if self.splits[at].is_some() {
@@ -976,7 +981,7 @@ impl Checkouts {
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> Option<View> {
-        let project = std::fs::canonicalize(project).ok()?;
+        let project = dunce::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
             return Some(View { base: root.clone(), over: root.clone(), project });
         }
@@ -1063,7 +1068,7 @@ impl Checkouts {
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
                 splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
-                roots.push((std::fs::canonicalize(project)?, over));
+                roots.push((dunce::canonicalize(project)?, over));
                 continue;
             }
             splits.push(None);
@@ -1080,7 +1085,7 @@ impl Checkouts {
                     TargetDirectoryConfig::Directory(target.to_owned());
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            roots.push((std::fs::canonicalize(project)?, root));
+            roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
@@ -1721,6 +1726,7 @@ fn link(
     cmd: Option<&str>,
     splice: Option<&Path>,
     patch: Option<&Path>,
+    object: &Path,
     patched: bool,
 ) -> anyhow::Result<()> {
     static SPLICING: std::sync::LazyLock<bool> =
@@ -1735,10 +1741,12 @@ fn link(
     let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
     let mut declined = String::new();
+    let running = splice.map_or(Ok(false), set_aside)?;
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
+            _ if running => Err(anyhow::anyhow!("the executable is running")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => {
                 let spliced = std::fs::read(patch)
                     .map_err(anyhow::Error::from)
@@ -1762,14 +1770,73 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
-    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
+    let status = shell(cmd).status()?;
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status})");
     if let (Some(binary), Some(patch)) = (splice, patch) {
-        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch));
+        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
         LINKED.lock().unwrap().insert(binary.to_owned(), linked);
     }
     Ok(())
+}
+
+/// Whether the executable at `binary` runs, in which case Windows lets nothing write it, and
+/// it is moved aside: it runs on there, and the link writes a new one. It is deleted once it
+/// has exited, by the first link to come after.
+#[cfg(windows)]
+fn set_aside(binary: &Path) -> anyhow::Result<bool> {
+    const SHARING_VIOLATION: i32 = 32;
+    let name = binary.file_name().context("an executable without a name")?.to_owned();
+    let siblings = binary.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
+    for sibling in siblings {
+        let sibling = sibling?;
+        let is_aside = sibling.path().extension() == Some("running".as_ref())
+            && sibling.file_name().as_encoded_bytes().starts_with(name.as_encoded_bytes());
+        if is_aside {
+            // The one that still runs stays.
+            let _ = std::fs::remove_file(sibling.path());
+        }
+    }
+    match std::fs::OpenOptions::new().write(true).open(binary) {
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {}
+        _ => return Ok(false),
+    }
+    static ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
+    let mut moved = binary.as_os_str().to_owned();
+    moved.push(format!(".{}-{aside}.running", std::process::id()));
+    std::fs::rename(binary, &moved).context("moving the running executable aside")?;
+    Ok(true)
+}
+
+/// Whether the executable at `binary` runs, which is nothing to a link on Unix: the linker
+/// writes a new file in its place.
+#[cfg(unix)]
+fn set_aside(_: &Path) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// The command that runs the line `cmd` as the platform's shell would.
+#[cfg(unix)]
+fn shell(cmd: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(cmd);
+    shell
+}
+
+/// The command that runs the line `cmd`. It is the command line of the process as it is:
+/// `cmd.exe` takes no line as long as the one a link has.
+#[cfg(windows)]
+fn shell(cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    let cmd = cmd.trim_start();
+    let (program, rest) = match cmd.strip_prefix('"').and_then(|it| it.split_once('"')) {
+        Some(quoted) => quoted,
+        None => cmd.split_once(char::is_whitespace).unwrap_or((cmd, "")),
+    };
+    let mut command = Command::new(program);
+    command.raw_arg(rest);
+    command
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -2672,7 +2739,13 @@ fn main() -> anyhow::Result<()> {
     report(&cold);
     memory::report(&mut db, "build")?;
     report_stats(&known.stats);
-    link(args.link_cmd.as_deref(), args.splice.as_deref(), args.patch.as_deref(), false)?;
+    link(
+        args.link_cmd.as_deref(),
+        args.splice.as_deref(),
+        args.patch.as_deref(),
+        &args.out,
+        false,
+    )?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
@@ -3364,8 +3437,14 @@ fn main() -> anyhow::Result<()> {
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let linked = std::thread::spawn(move || {
-                let failed =
-                    link(link_cmd.as_deref(), splice.as_deref(), spliced.as_deref(), patched).err();
+                let failed = link(
+                    link_cmd.as_deref(),
+                    splice.as_deref(),
+                    spliced.as_deref(),
+                    &object,
+                    patched,
+                )
+                .err();
                 if failed.is_none() {
                     as_built.lock().unwrap().insert(object, from);
                 }
@@ -3553,9 +3632,7 @@ impl Program {
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
-            use std::os::unix::fs::MetadataExt;
-            let inode = |path: &Path| std::fs::metadata(path).ok().map(|it| (it.dev(), it.ino()));
-            if inode(whole) != inode(&args.out) {
+            if !same_file::is_same_file(whole, &args.out).unwrap_or(false) {
                 _ = std::fs::remove_file(&args.out);
                 if std::fs::hard_link(whole, &args.out).is_err() {
                     std::fs::copy(whole, &args.out)?;
@@ -3593,8 +3670,8 @@ impl Program {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
             let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
-            let unlinked = link(cmd, splice, patch, patched).err().map(|it| it.to_string());
-            failed = failed.or(unlinked);
+            let unlinked = link(cmd, splice, patch, &args.out, patched).err();
+            failed = failed.or(unlinked.map(|it| it.to_string()));
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
@@ -3666,7 +3743,7 @@ impl Program {
 
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
-    Ok(VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?)))
+    Ok(VfsPath::from(AbsPathBuf::assert_utf8(dunce::canonicalize(path)?)))
 }
 
 fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {

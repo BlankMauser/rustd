@@ -219,8 +219,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        link = linkline.ahead(link, [patch, obj], RUSTD)
-        link[link.index("-o") + 1] = binary
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
         for path in (socket, binary):
             if os.path.exists(path):
                 os.remove(path)
@@ -229,7 +228,7 @@ def main():
         splice = ["--binary", binary]
         daemon = subprocess.Popen(
             [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
-             "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols], stderr=out, stdout=out)
+             "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
                 print("    daemon does not start on this source", flush=True)

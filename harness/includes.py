@@ -69,12 +69,11 @@ def follow(files, steps):
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    link = linkline.ahead(link, [patch, obj], RUSTD)
-    link[link.index("-o") + 1] = binary
+    link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
     splice = ["--binary", binary]
-    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols]
+    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():

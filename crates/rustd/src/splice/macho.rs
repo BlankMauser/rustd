@@ -20,7 +20,6 @@
 
 use std::{
     fs::{File, OpenOptions},
-    os::unix::fs::FileExt,
     path::Path,
 };
 
@@ -223,7 +222,7 @@ impl Signature {
             .filter(|page| *page < kept)
             .collect();
         for index in pages {
-            file.read_exact_at(&mut page, (index * Self::PAGE) as u64)?;
+            super::read_exact_at(&file, &mut page, (index * Self::PAGE) as u64)?;
             hashes[index * Self::HASH..][..Self::HASH].copy_from_slice(&Sha256::digest(&page));
         }
         for page in added.chunks(Self::PAGE) {
@@ -1472,14 +1471,14 @@ pub(super) fn splice(
     let written = (|| -> anyhow::Result<Stamp> {
         let file = OpenOptions::new().read(true).write(true).open(&copy)?;
         for (offset, bytes) in undo.drain(..).rev() {
-            file.write_all_at(&bytes, offset)?;
+            super::write_all_at(&file, &bytes, offset)?;
         }
         file.set_len(addition.offset)?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
-            file.read_exact_at(&mut old, *offset)?;
+            super::read_exact_at(&file, &mut old, *offset)?;
             undo.push((*offset, old));
-            file.write_all_at(bytes, *offset)?;
+            super::write_all_at(&file, bytes, *offset)?;
         }
         let signature = image.signature.of(
             &file,
@@ -1487,8 +1486,8 @@ pub(super) fn splice(
             &addition.overwritten,
             &addition.appended,
         )?;
-        file.write_all_at(&addition.appended, addition.offset)?;
-        file.write_all_at(&signature, addition.offset + addition.appended.len() as u64)?;
+        super::write_all_at(&file, &addition.appended, addition.offset)?;
+        super::write_all_at(&file, &signature, addition.offset + addition.appended.len() as u64)?;
         std::fs::rename(&copy, path)?;
         Stamp::of(&file)
     })();

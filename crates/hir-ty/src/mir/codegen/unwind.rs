@@ -1,5 +1,6 @@
 //! Unwind tables (`.eh_frame`) and landing pads (`.gcc_except_table`), without which a panic
-//! cannot cross a function we compiled. Ported from rustc's Cranelift backend.
+//! cannot cross a function we compiled. Ported from rustc's Cranelift backend. Windows has
+//! tables of its own, which are in [`seh`].
 
 use cranelift_codegen::{
     Context, FinalizedMachExceptionHandler,
@@ -23,6 +24,7 @@ use cranelift_object::{
 };
 
 mod gcc_except_table;
+pub(super) mod seh;
 
 use gcc_except_table::{
     Action, ActionKind, ActionTable, CallSite, CallSiteTable, GccExceptTable, TypeInfoTable,
@@ -59,6 +61,7 @@ pub(super) struct FunctionUnwind {
 enum Frame {
     Cranelift(cranelift_codegen::isa::unwind::systemv::UnwindInfo),
     Rows(FrameRows),
+    Windows(seh::Frame),
 }
 
 /// The rules of a function's `.eh_frame` entry, each with the offset in the function it
@@ -118,10 +121,13 @@ impl FrameRule {
 impl FunctionUnwind {
     pub(super) fn of(isa: &dyn TargetIsa, context: &Context) -> Result<Option<Self>, String> {
         let Some(code) = context.compiled_code() else { return Ok(None) };
-        let Some(UnwindInfo::SystemV(info)) =
-            code.create_unwind_info(isa).map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
+        let info = match code.create_unwind_info(isa).map_err(|e| e.to_string())? {
+            Some(UnwindInfo::SystemV(info)) => info,
+            Some(UnwindInfo::WindowsX64(info)) => {
+                let (frame, landing_pads) = seh::function(code, &info)?;
+                return Ok(Some(FunctionUnwind { frame: Frame::Windows(frame), landing_pads }));
+            }
+            _ => return Ok(None),
         };
 
         let mut table = GccExceptTable {
@@ -174,8 +180,10 @@ impl FunctionUnwind {
         FunctionUnwind { frame: Frame::Rows(rows), landing_pads }
     }
 
-    fn fde(&self, address: Address) -> FrameDescriptionEntry {
-        match &self.frame {
+    /// The function's `.eh_frame` entry, which a frame of Windows has none of.
+    fn fde(&self, address: Address) -> Option<FrameDescriptionEntry> {
+        Some(match &self.frame {
+            Frame::Windows(_) => return None,
             Frame::Cranelift(info) => info.to_fde(address),
             Frame::Rows(FrameRows { len, rows }) => {
                 let mut fde = FrameDescriptionEntry::new(address, *len);
@@ -184,13 +192,14 @@ impl FunctionUnwind {
                 }
                 fde
             }
-        }
+        })
     }
 }
 
 pub(super) struct UnwindContext {
     frame_table: FrameTable,
     cies: Option<Cies>,
+    seh: seh::Tables,
 }
 
 /// The entries functions share: one that names the personality, for functions with landing
@@ -204,8 +213,10 @@ struct Cies {
 impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
-        let Some(mut cie) = module.isa().create_systemv_cie() else {
-            return Ok(UnwindContext { frame_table, cies: None });
+        let seh = seh::Tables::default();
+        let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
+        let Some(mut cie) = module.isa().create_systemv_cie().filter(|_| dwarf) else {
+            return Ok(UnwindContext { frame_table, cies: None, seh });
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
@@ -243,6 +254,7 @@ impl UnwindContext {
             return Ok(UnwindContext {
                 cies: Some(Cies { with_landing_pads, plain }),
                 frame_table,
+                seh,
             });
         }
         // It must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
@@ -267,7 +279,17 @@ impl UnwindContext {
         ));
 
         let with_landing_pads = frame_table.add_cie(cie);
-        Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table })
+        Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table, seh })
+    }
+
+    /// The function `symbol` names, when it is one this object has for its own unwinding
+    /// rather than one the build has.
+    pub(super) fn runtime(
+        &mut self,
+        module: &mut dyn Module,
+        symbol: &str,
+    ) -> Result<Option<FuncId>, String> {
+        self.seh.runtime(module, symbol)
     }
 
     /// Records the frame layout and the landing pads of a compiled function.
@@ -277,8 +299,11 @@ impl UnwindContext {
         func: FuncId,
         unwind: &FunctionUnwind,
     ) -> Result<(), String> {
+        if let Frame::Windows(frame) = &unwind.frame {
+            return self.seh.add_function(module, func, frame, unwind.landing_pads.as_ref());
+        }
         let Some(cies) = self.cies else { return Ok(()) };
-        let mut fde = unwind.fde(address_for_func(func));
+        let Some(mut fde) = unwind.fde(address_for_func(func)) else { return Ok(()) };
         let Some(landing_pads) = &unwind.landing_pads else {
             self.frame_table.add_fde(cies.plain, fde);
             return Ok(());
@@ -299,6 +324,7 @@ impl UnwindContext {
     }
 
     pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<(), String> {
+        self.seh.emit(product)?;
         let mut eh_frame = EhFrame::from(WriterRelocate::new());
         self.frame_table.write_eh_frame(&mut eh_frame).map_err(|e| e.to_string())?;
         if eh_frame.0.writer.slice().is_empty() {

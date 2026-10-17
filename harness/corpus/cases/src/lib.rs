@@ -4841,6 +4841,8 @@ pub mod trivial_bounds {
 
 /// One variadic function called with different numbers of arguments.
 pub mod variadic {
+    // The C runtime of MSVC has `snprintf` in its headers, and in this library for the rest.
+    #[cfg_attr(target_env = "msvc", link(name = "legacy_stdio_definitions"))]
     unsafe extern "C" {
         fn snprintf(buf: *mut u8, len: usize, format: *const u8, ...) -> i32;
     }
