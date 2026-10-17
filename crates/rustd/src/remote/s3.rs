@@ -24,6 +24,7 @@ use aws_sdk_s3::{
     primitives::{ByteStream, Length},
     types::{CompletedMultipartUpload, CompletedPart},
 };
+use aws_smithy_http_client::{Builder as HttpClients, tls};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use url::Url;
 
@@ -74,7 +75,10 @@ impl S3 {
             .read_timeout(patience)
             .operation_attempt_timeout(patience)
             .build();
-        let mut loader = aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts);
+        let tls = tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring);
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
+            .timeout_config(timeouts)
+            .http_client(HttpClients::new().tls_provider(tls).build_https());
         for (name, value) in spec.query_pairs() {
             match &*name {
                 "endpoint" => endpoint = Some(value.into_owned()),

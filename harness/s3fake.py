@@ -4,7 +4,7 @@ spoil what is in it without rustd), and a proxy that counts the requests and bre
 
 Nothing here is rustd's: the client is the standard library's, so that a mistake in how rustd
 signs or addresses is not made twice."""
-import datetime, hashlib, hmac, http.client, os, re, select, shutil, signal, socket, subprocess, threading, time
+import datetime, hashlib, hmac, http.client, os, re, select, shutil, signal, socket, ssl, subprocess, threading, time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -34,8 +34,9 @@ def wait_for(port, seconds=30):
 
 class Server:
     """An S3 service on this machine, which can be killed and started again on the same data."""
-    def __init__(self, kind, binary, top):
-        self.kind, self.binary, self.dir = kind, binary, os.path.join(top, kind)
+    def __init__(self, kind, binary, top, certs=None):
+        """`certs` is a directory with `public.crt` and `private.key` for a MinIO that speaks TLS."""
+        self.kind, self.binary, self.dir, self.certs = kind, binary, os.path.join(top, kind), certs
         self.port, self.process = free_port(50000), None
         os.makedirs(self.dir, exist_ok=True)
         self.log = open(os.path.join(top, kind + ".log"), "ab")
@@ -45,7 +46,7 @@ class Server:
             env = {**os.environ, "MINIO_ROOT_USER": ACCESS, "MINIO_ROOT_PASSWORD": SECRET, "MINIO_DOMAIN": "localhost",
                    "HOME": self.dir}
             command = [self.binary, "server", self.dir, "--address", f"127.0.0.1:{self.port}", "--console-address",
-                       f"127.0.0.1:{free_port()}"]
+                       f"127.0.0.1:{free_port()}", *(["--certs-dir", self.certs] if self.certs else [])]
         else:
             config = os.path.join(self.dir, "s3.json")
             open(config, "w").write('{"identities":[{"name":"rustd","credentials":[{"accessKey":"%s","secretKey":"%s"}],'
@@ -69,7 +70,9 @@ class Server:
 
 class Bucket:
     """A bucket as the harness reads and writes it: signed requests, addressed by path."""
-    def __init__(self, endpoint, bucket, prefix="", access=ACCESS, secret=SECRET, region="us-east-1", token=None):
+    def __init__(self, endpoint, bucket, prefix="", access=ACCESS, secret=SECRET, region="us-east-1", token=None, ca=None):
+        """`ca` is the file of the certificate an `https` endpoint of the harness's own is trusted by."""
+        self.ca = ca
         url = urllib.parse.urlsplit(endpoint)
         self.secure, self.host = url.scheme == "https", url.netloc
         self.bucket, self.prefix = bucket, prefix
@@ -94,7 +97,11 @@ class Bucket:
             key_ = hmac.new(key_, part.encode(), hashlib.sha256).digest()
         signature = hmac.new(key_, to_sign.encode(), hashlib.sha256).hexdigest()
         headers["authorization"] = f"AWS4-HMAC-SHA256 Credential={self.access}/{scope}, SignedHeaders={signed}, Signature={signature}"
-        connection = (http.client.HTTPSConnection if self.secure else http.client.HTTPConnection)(self.host, timeout=60)
+        if self.secure:
+            trusted = ssl.create_default_context(cafile=self.ca)
+            connection = http.client.HTTPSConnection(self.host, timeout=60, context=trusted)
+        else:
+            connection = http.client.HTTPConnection(self.host, timeout=60)
         try:
             connection.request(method, path + ("?" + canonical_query if canonical_query else ""), body=body, headers=headers)
             response = connection.getresponse()

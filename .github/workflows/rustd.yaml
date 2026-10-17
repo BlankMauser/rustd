@@ -45,6 +45,17 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
           sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb gcc-aarch64-linux-gnu musl-tools qemu-user
+      # MinIO as one program in the home directory, which is where remote.py looks for it and
+      # needs it: it kills the service and starts it again. The image is the one that is still
+      # published; the runner's docker takes a file out of it without root.
+      - name: MinIO
+        run: |
+          image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
+          mkdir -p "$HOME/s3tools"
+          container=$(docker create "$image")
+          docker cp "$container:/usr/bin/minio" "$HOME/s3tools/minio"
+          docker rm "$container"
+          "$HOME/s3tools/minio" --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p rustd --release --features llvm
       - name: Harnesses
@@ -69,4 +80,5 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          run remote.py
           exit $failed

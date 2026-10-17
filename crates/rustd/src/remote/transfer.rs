@@ -262,12 +262,19 @@ impl Partial {
         Digest(self.hash.clone().finalize().into())
     }
 
-    /// Gives the file its name, which is when anything else starts to read it.
+    /// Gives the file its name, which is when anything else starts to read it. A file that
+    /// cannot be given it is removed: the last of its bytes may not have been written.
     async fn seal(mut self, to: &Path) -> anyhow::Result<()> {
-        self.file.flush().await?;
+        let flushed = self.file.flush().await;
         let (file, from, to) = (self.file.into_std().await, self.path, to.to_owned());
-        tokio::task::spawn_blocking(move || name_file_whole(&file, &from, &to)).await??;
-        Ok(())
+        let named = tokio::task::spawn_blocking(move || {
+            let named = flushed.and_then(|()| name_file_whole(&file, &from, &to));
+            if named.is_err() {
+                _ = std::fs::remove_file(&from);
+            }
+            named
+        });
+        Ok(named.await??)
     }
 
     async fn discard(self) {

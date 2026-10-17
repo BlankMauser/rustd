@@ -542,6 +542,35 @@ fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<Digest>, 
     (fit.into_iter().map(|(pack, _)| pack).collect(), over.len())
 }
 
+/// The packs of `missing` that have a key the store lacks, and how many have none. A store
+/// makes one pack of many small ones, so a pack that is not there by name may be there by
+/// what is in it. A list of keys that cannot be had leaves its pack to be fetched.
+async fn lacking(
+    remote: &Remote,
+    dir: StoreDir,
+    missing: Vec<(Digest, Listed)>,
+) -> anyhow::Result<(Vec<(Digest, Listed)>, usize)> {
+    let here = tokio::task::spawn_blocking(move || dir.keys()).await??;
+    // A store with nothing in it lacks them all, and no list has to be fetched to know.
+    if here.is_empty() || missing.is_empty() {
+        return Ok((missing, 0));
+    }
+    let here = &here;
+    let asked = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
+        let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await;
+        let all_here = keys.is_ok_and(|keys| {
+            !keys.is_empty()
+                && keys
+                    .chunks_exact(32)
+                    .all(|key| <&[u8; 32]>::try_from(key).is_ok_and(|key| here.contains(key)))
+        });
+        ((pack, listed), all_here)
+    }));
+    let asked: Vec<_> = asked.buffered(remote.traffic.jobs()).collect().await;
+    let (here_already, lacking): (Vec<_>, Vec<_>) = asked.into_iter().partition(|it| it.1);
+    Ok((lacking.into_iter().map(|it| it.0).collect(), here_already.len()))
+}
+
 /// Removes the packs that have gone unused the longest until the store is under its limit,
 /// which what was just fetched may have put it over.
 async fn keep_under(dir: StoreDir, limit: Option<u64>) -> anyhow::Result<String> {
@@ -563,6 +592,7 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
         return Ok(format!("`{project}` has no manifest on the remote: nothing fetched"));
     };
     let (missing, other_format) = manifest.missing(&local);
+    let (missing, here_already) = lacking(remote, StoreDir::at(store), missing).await?;
     let (fit, over) = fitting(missing, limit);
     let fetch = |pack: Digest| {
         let (from, to) = (pack_object(&pack), store.join(pack_file(&pack)));
@@ -576,6 +606,9 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
     );
     if other_format != 0 {
         said += &format!(", {other_format} of another format left");
+    }
+    if here_already != 0 {
+        said += &format!(", {here_already} that are in other packs of the store passed over");
     }
     if over != 0 {
         said += &format!(", {over} left that do not fit under RUSTD_CACHE_MAX");

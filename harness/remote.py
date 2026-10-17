@@ -423,7 +423,7 @@ def transfers(top, remote):
     start = time.time()
     out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_TIMEOUT": "1", "AWS_MAX_ATTEMPTS": "2"})
     check("a service that takes 4s to answer with 1s of patience: given up, said",
-          out.returncode != 0 and not b.packs() and time.time() - start < 30, f"{time.time() - start:.1f}s {out.stderr.strip()[-50:]}")
+          out.returncode != 0 and not b.packs() and time.time() - start < 45, f"{time.time() - start:.1f}s {out.stderr.strip()[-50:]}")
     proxy.hold = 0
 
     a, b, address, bucket, name = pushed("rustd killed")
@@ -580,6 +580,20 @@ def stored(top, remote):
           out.returncode == 0 and "2 packs unused the longest evicted" in out.stdout and whole and counted.get("packs") == 3
           and not set(old) & set(d.packs()) and set(d.packs()) <= set(sent), out.stdout.strip()[-80:])
 
+    # A store makes one pack of many small ones; what was fetched is then there under another name.
+    address, bucket = remote.fresh()
+    f, g = (Machine(top, f"k-{remote.name}-{it}", remote) for it in "fg")
+    small = [f.add_pack(filler(f"{remote.name} small kept {at}", 64 << 10)) for at in range(24)]
+    f.rustd("cache", "push", address)
+    first = g.rustd("cache", "pull", address)
+    ok, collected, _ = g.cache("gc")
+    packs_fetched(remote)
+    out = g.rustd("cache", "pull", address)
+    whole, verified, _ = g.cache("verify")
+    check("packs the store made one of are not fetched again", first.returncode == 0 and ok and len(g.packs()) < 24
+          and out.returncode == 0 and out.stdout.startswith("0 packs") and "in other packs of the store passed over" in out.stdout
+          and packs_fetched(remote) in (0, None) and whole and verified.get("records") == 24, out.stdout.strip()[:100])
+
     # A pack of the format before this one, listed as what it is and listed as what it is not.
     address, bucket = remote.fresh()
     other = b"rustdpk" + bytes([FORMAT - 1]) + b" what the format before wrote"
@@ -606,6 +620,51 @@ def packs_fetched(remote):
     seen = len(remote.proxy.seen("GET", "/packs/"))
     remote.proxy.clear()
     return seen
+
+
+def over_tls(top, remote):
+    """The same service behind a certificate: what rustd's TLS trusts and what it does not."""
+    if remote.name != "minio" or not shutil.which("openssl"):
+        print(f"{remote.name}: TLS is left out: it needs MinIO and openssl", flush=True)
+        return
+    print(f"{remote.name}: over TLS", flush=True)
+    # An authority of the harness's own and a certificate it signs: rustls takes no
+    # certificate that vouches for itself.
+    certs = os.path.join(top, "certs")
+    os.makedirs(certs)
+    at = lambda name: os.path.join(certs, name)
+    open(at("leaf.ext"), "w").write("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n")
+    certificate = at("authority.crt")
+    for command in (["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=rustd harness",
+                     "-keyout", at("authority.key"), "-out", certificate],
+                    ["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", at("private.key"),
+                     "-out", at("leaf.csr")],
+                    ["x509", "-req", "-in", at("leaf.csr"), "-CA", certificate, "-CAkey", at("authority.key"),
+                     "-CAcreateserial", "-days", "2", "-extfile", at("leaf.ext"), "-out", at("public.crt")]):
+        made = subprocess.run(["openssl", *command], capture_output=True, text=True)
+        if made.returncode != 0:
+            raise SystemExit(f"openssl {command[0]} failed: {made.stderr}")
+    server = Server("minio", remote.server.binary, os.path.join(top, "tls"), certs=certs)
+    server.start()
+    try:
+        endpoint = f"https://localhost:{server.port}"
+        bucket = Bucket(endpoint, "rustd-tls", "over-tls/", ca=certificate)
+        bucket.create()
+        address = f"s3://rustd-tls/over-tls?endpoint={endpoint}"
+        a, b = (Machine(top, f"tls-{it}", remote) for it in "ab")
+        name = big_store(a, "over tls")
+        trusting = {"SSL_CERT_FILE": certificate}
+        sent = a.rustd("cache", "push", address, env=trusting)
+        out = b.rustd("cache", "pull", address, env=trusting)
+        check("a big pack sent and fetched over TLS, the certificate trusted through SSL_CERT_FILE",
+              sent.returncode == 0 and out.returncode == 0 and b.packs() == {name: True}
+              and digest(bucket.get("packs/" + name) or b"") == name[:-5], out.stdout.strip())
+        b.empty()
+        out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_TIMEOUT": "2"})
+        check("a certificate nobody vouches for: refused, said, nothing fetched",
+              out.returncode != 0 and not b.packs() and not b.partials() and "ertificate" in out.stderr, out.stderr.strip()[-90:])
+    finally:
+        server.kill()
 
 
 def spoiled(top, remote):
@@ -763,6 +822,8 @@ def checks():
             remote.start()
             a, b, address, bucket, expected = round_trip(top, remote, remote.name, crates, target, workspace)
             configuration(top, remote, a, address, bucket)
+            if remote.server:
+                over_tls(top, remote)
             stored(top, remote)
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)

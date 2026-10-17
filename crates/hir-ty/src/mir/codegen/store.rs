@@ -448,6 +448,19 @@ impl StoreDir {
         Ok(self.names()?.into_iter().filter(|it| is_pack(it)).collect())
     }
 
+    /// The keys, as they are on disk, of the records of the sealed packs that are as they
+    /// were written. A collection makes one pack of many, so what a store holds is told by
+    /// its keys and not by the names of its packs.
+    pub fn keys(&self) -> io::Result<FxHashSet<[u8; KEY]>> {
+        let mut keys = FxHashSet::default();
+        for name in self.packs()? {
+            // Evicted since it was listed.
+            let Ok(pack) = std::fs::read(self.dir.join(name)) else { continue };
+            keys.extend(records(&pack).0.into_iter().map(|it| it.key));
+        }
+        Ok(keys)
+    }
+
     /// Seals the open packs that daemons that are gone left behind, as far as their records
     /// are whole. Returns how many there were.
     pub fn adopt(&self) -> usize {
@@ -1533,6 +1546,7 @@ mod tests {
         assert_eq!(pack_keys(name, &bytes).unwrap(), keys);
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
+        assert_eq!(StoreDir::at(&dir).keys().unwrap(), keys.into_iter().collect());
         assert!(pack_keys(name, &bytes).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
