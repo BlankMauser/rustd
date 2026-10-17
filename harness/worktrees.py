@@ -23,6 +23,10 @@ SUM = "items.iter().sum()"
 # Not the same in any two checkouts from the start.
 NOTE = "app/src/note.txt"
 MORE = "app/src/more.rs"
+# Of the workspace and of no package.
+SHARED = "shared.txt"
+# Not the same in any two runs either: with `RUSTD_CACHE` a run has what the last one compiled.
+RUN = os.getpid()
 # (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
@@ -54,6 +58,8 @@ STEPS = [
        "pub fn here() -> &'static str {\n    env!(\"CARGO_MANIFEST_DIR\")\n}\n\npub fn seeded() -> u32 {"),
       (1, APP, 'println!("{}", HERE);', 'println!("{} {}", HERE, smid::here());')],
      [1, 0, 2, 1], []),
+    ("that file edited in one", [(2, SHARED, f"shared of 2 in {RUN}", "shared anew")], [0, 2, 1], []),
+    ("and made what another has", [(2, SHARED, "shared anew", f"shared of 0 in {RUN}")], [2, 1, 0], []),
 ]
 # Cargo may build that checkout another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
@@ -99,7 +105,13 @@ def main():
         text = open(main_rs).read()
         assert "fn main() {" in text
         text += '\nconst HERE: &str = env!("CARGO_MANIFEST_DIR");\n'
-        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);', 1))
+        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);\n    println!("shared {}", smid::shared());', 1))
+        # A crate no step edits includes a file of the workspace that is outside its package.
+        open(os.path.join(ws, SHARED), "w").write(f"shared of {at} in {RUN}")
+        mid_rs = os.path.join(ws, MID)
+        text = open(mid_rs).read()
+        assert "pub fn seeded() -> u32 {" in text
+        open(mid_rs, "w").write(text.replace("pub fn seeded() -> u32 {", "pub fn shared() -> &'static str {\n    include_str!(\"../../shared.txt\")\n}\n\npub fn seeded() -> u32 {", 1))
         # A checkout read as the first one links what rustc built of the first.
         if not (OVERLAY and checkouts):
             fx = Fixture(ws, crates, ["-p", "sapp"])

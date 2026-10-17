@@ -57,6 +57,9 @@ crossbeam-channel's `tick` test binary differed once in the rerun with the same 
 printed and nothing from valgrind, and matched in three runs after; it measures intervals of
 time.
 
+tokio with `--features full` on 1.99 (`cratetest.py vendor/tokio --features full`): 155 test binaries, 1018 tests,
+all matching, and no function left to rustc (296,088 of 296,088, counting a function once for each binary it is in).
+
 ## How it was run
 
 - Libraries: `harness/cratesweep.sh <out> <crate-version>...` downloads each crate from
