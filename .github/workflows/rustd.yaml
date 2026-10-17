@@ -97,6 +97,18 @@ jobs:
           run storeshared.py
           echo "failed:${failed:- none}"
           test -z "$failed"
+      # TEMPORARY: what a machine and a context for each function cost next to ones kept.
+      - name: Machine per function (measurement)
+        if: always() && matrix.backend == 'llvm' && matrix.os == 'ubuntu-24.04-arm'
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          unset RUSTD_BACKEND RUSTD_OPT RUSTD_EMIT
+          measure() { for i in 1 2 3; do python3 backends.py corpus runner cases --bin runner --levels 0f,2f --out "$RUNNER_TEMP/$1-$i.md" > /dev/null 2>&1; echo "$1 $i"; grep "^| llvm\|phases\|left" "$RUNNER_TEMP/$1-$i.md"; done; }
+          measure kept
+          sed -i 's/const MODULES: usize = 1024;/const MODULES: usize = 1;/' ../crates/hir-ty/src/mir/codegen/llvm.rs
+          (cd .. && cargo build -p rustd --release --features llvm)
+          measure each
 
   windows-checks:
     name: fmt and tests (windows)
