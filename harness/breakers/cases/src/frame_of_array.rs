@@ -27,8 +27,23 @@ fn through_closure(depth: usize, above: usize) -> usize {
     frame
 }
 
-/// How many arrays of 50k fit in one frame of `recurse`, and in one of `through_closure` with
-/// the frame of its closure.
-pub fn run() -> (usize, usize) {
-    (recurse(1, 0) / 50000, through_closure(1, 0) / 50000)
+#[inline(never)]
+fn make(byte: u8) -> [u8; 50000] {
+    [byte; 50000]
+}
+
+#[inline(never)]
+fn of_a_call(depth: usize, above: usize) -> usize {
+    let array = make(42);
+    let here = black_box(array.as_ptr() as usize);
+    let frame = if depth == 0 { above - here } else { of_a_call(depth - 1, here) };
+    black_box(&array);
+    frame
+}
+
+/// How many arrays of 50k fit in one frame of `recurse`, in one of `through_closure` with the
+/// frame of its closure, and in one of `of_a_call`: curve25519-dalek's tests keep five tables
+/// that calls return, of 950k together, on a stack of 2MB.
+pub fn run() -> (usize, usize, usize) {
+    (recurse(1, 0) / 50000, through_closure(1, 0) / 50000, of_a_call(1, 0) / 50000)
 }

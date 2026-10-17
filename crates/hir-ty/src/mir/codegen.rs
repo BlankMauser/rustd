@@ -10859,6 +10859,25 @@ fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     temps
 }
 
+/// The local a call returns into, for each block that only that call leads to.
+fn returned_into(body: &MirBody<'_>) -> FxHashMap<BasicBlockId, LocalId> {
+    let mut entries: FxHashMap<BasicBlockId, usize> = FxHashMap::default();
+    let mut returned = FxHashMap::default();
+    for (id, block) in body.basic_blocks.iter() {
+        for successor in body.accesses(id, &mut |_, _| ()) {
+            *entries.entry(successor).or_default() += 1;
+        }
+        if let Some(TerminatorKind::Call { destination, target: Some(target), .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
+            && destination.projection.as_slice().is_empty()
+        {
+            returned.insert(*target, destination.local);
+        }
+    }
+    returned.retain(|block, _| entries[block] == 1 && *block != body.start_block);
+    returned
+}
+
 /// The temporaries a `let` is initialized through, each with the binding it is copied to right
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
@@ -10869,10 +10888,11 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
     if body.coroutine.is_some() {
         return forwarded;
     }
-    for (_, block) in body.basic_blocks.iter() {
+    let returned_into = returned_into(body);
+    for (id, block) in body.basic_blocks.iter() {
         // The temporary written last, by a statement of this block or by the call that led
         // here, and whether the binding's storage has started since.
-        let mut written = None;
+        let mut written = returned_into.get(&id).map(|&temp| (temp, None));
         for statement in &block.statements {
             match &statement.kind {
                 StatementKind::StorageLive(local) => {
@@ -10899,7 +10919,6 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
                 _ => written = None,
             }
         }
-        // FIXME: a temporary a call returns into is copied in the block the call leads to.
     }
     if forwarded.is_empty() {
         return forwarded;
