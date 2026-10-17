@@ -5,8 +5,8 @@ usage: apps.py <name> [--stage build,workload,perf,tests,edits] [--json out.json
        apps.py --table <dir of json>
 
 <name> is an entry of apps/apps.json. The checkout (APPS_DIR/<name>, cloned at `rev`) gets
-every dependency of the registry as a path dependency (`cargo vendor` and a `[patch]` table in
-`.cargo/config.toml`), which makes each a crate rustd compiles. The stages:
+the source of every dependency in a directory beside it (`cargo vendor`, and the source
+replacement it prints in `.cargo/config.toml`), at the locked versions. The stages:
 
 build     cargo builds the program for the link line; rustd compiles every crate linked into
           it and links its objects ahead of rustc's. Then the same with rustd as cargo's
@@ -22,7 +22,7 @@ edits     the daemon holds the program; each edit of `edits` is timed to a linke
 The backend is the environment's, as for the other harnesses: `RUSTD_BACKEND`, `RUSTD_OPT`,
 `RUSTD_EMIT`.
 """
-import argparse, json, os, re, resource, shlex, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -31,8 +31,7 @@ from difftest import Fixture, RUSTD, bucket, host, sysroot_rlibs
 
 APPS_DIR = os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps")
 SPECS = os.path.join(HERE, "apps", "apps.json")
-# A dependency at a path is linted as the workspace is, and one that denies warnings must
-# still build.
+# A dependency that denies warnings must still build.
 FLAGS = "-C link-dead-code --cap-lints allow"
 STAGES = ["build", "workload", "perf", "tests", "edits"]
 
@@ -62,29 +61,18 @@ def checkout(name, spec):
 
 
 def localize(ws):
-    """Makes every package of the registry or of a git repository one at a path."""
+    """Puts the source of every dependency in a directory beside the workspace and has cargo
+    take it from there, so the versions built are the locked ones and rustd reads the files
+    cargo compiles."""
     config = os.path.join(ws, ".cargo", "config.toml")
-    marker = "# apps.py: dependencies at paths\n"
+    marker = "# apps.py: dependencies in a directory\n"
     if os.path.exists(config) and marker in open(config).read():
         return
     vendor = os.path.abspath(ws).rstrip("/") + "-vendor"
-    sh(["cargo", "vendor", "--versioned-dirs", vendor], ws)
-    meta = json.loads(sh(["cargo", "metadata", "--format-version", "1"], ws)[1].stdout)
-    tables = {}
-    for package in meta["packages"]:
-        if not package["source"]:
-            continue
-        kind, url = package["source"].split("+", 1)
-        key = "crates-io" if kind == "registry" else json.dumps(re.split("[?#]", url)[0])
-        directory = os.path.join(vendor, f"{package['name']}-{package['version']}")
-        entry = f'{json.dumps(package["name"] + "-" + package["version"])} = {{ package = "{package["name"]}", path = {json.dumps(directory)} }}'
-        tables.setdefault(key, []).append(entry)
+    replaced = sh(["cargo", "vendor", "--locked", "--versioned-dirs", vendor], ws)[1].stdout
     os.makedirs(os.path.dirname(config), exist_ok=True)
     with open(config, "a") as out:
-        out.write("\n" + marker)
-        for key, entries in tables.items():
-            out.write(f"[patch.{key}]\n" + "\n".join(sorted(entries)) + "\n")
-    sh(["cargo", "metadata", "--format-version", "1"], ws)
+        out.write("\n" + marker + replaced)
 
 
 class App(Fixture):
@@ -101,7 +89,7 @@ class App(Fixture):
 
     def rustc_build(self):
         """Cargo's build, with rustd in rustc's place for every crate when the program is
-        rustd's alone: a dependency at a path is not of the workspace to cargo."""
+        rustd's alone: a dependency is not of the workspace to cargo."""
         if self.alone:
             os.environ.update(RUSTC_WRAPPER=RUSTD)
         try:
@@ -181,7 +169,7 @@ def build(ws, spec, result, alone):
     except SystemExit as failed:
         result[key] = {"error": str(failed)[-1500:], "work": fx.work, **(fx.summary() if fx.reports else {})}
         missing = sorted(set(re.findall(r"undefined symbol: (.*)", str(failed))))
-        print(f"{key}: FAILED {str(failed)[-300:]}")
+        print(f"{key}: FAILED {str(failed)[-3000:]}")
         for symbol in missing[:20]:
             print(f"  undefined {symbol[:200]}")
         reasons(result[key])
@@ -225,38 +213,109 @@ def setup(ws, spec):
         open(done, "w").close()
 
 
+class Served:
+    """The program as a server on a free local port for as long as the block runs, when the
+    application is one (`serve` are its arguments); `{port}` in a command line is its port."""
+
+    def __init__(self, fx, binary):
+        self.fx, self.binary, self.child, self.port = fx, binary, None, 0
+
+    def __enter__(self):
+        serve = self.fx.spec.get("serve")
+        if serve is None:
+            return self
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        self.child = subprocess.Popen([self.fx.argv0, *self.args(serve)], executable=self.binary, cwd=self.fx.ws,
+                                      env=self.fx.run_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and self.child.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                return self
+            except OSError:
+                time.sleep(0.05)
+        self.__exit__()
+        raise SystemExit(f"the server did not start: {self.child.stderr.read().decode(errors='replace')[-2000:]}")
+
+    def __exit__(self, *_):
+        if self.child:
+            self.child.kill()
+            self.child.wait()
+
+    def args(self, argv):
+        return [arg.replace("{port}", str(self.port)) for arg in argv]
+
+    def behaviour(self, run):
+        """A command line of the program, or of a tool (`{"tool": [...]}`) that talks to it."""
+        if isinstance(run, dict):
+            ran = subprocess.run(self.args(run["tool"]), capture_output=True, stdin=subprocess.DEVNULL,
+                                 timeout=600, cwd=self.fx.ws)
+            return ran.returncode, self.fx.scrub(ran.stdout), self.fx.scrub(ran.stderr)
+        self.fx.run_args = self.args(run)
+        return self.fx.behaviour(self.binary)
+
+    def seconds(self, argv, rounds=3):
+        """The fastest of a few runs of a command line of the program."""
+        times = []
+        for _ in range(rounds):
+            began = time.monotonic()
+            subprocess.run([self.fx.argv0, *self.args(argv)], executable=self.binary, cwd=self.fx.ws,
+                           capture_output=True, stdin=subprocess.DEVNULL, env=self.fx.run_env)
+            times.append(time.monotonic() - began)
+        return round(min(times), 3)
+
+    def load(self, argv):
+        """Requests a second that wrk got out of the server, and how many were not answered
+        with success."""
+        out = subprocess.run(self.args(argv), capture_output=True, text=True, cwd=self.fx.ws).stdout
+        rate = re.search(r"Requests/sec:\s*([0-9.]+)", out)
+        failed = re.search(r"Non-2xx or 3xx responses: (\d+)", out)
+        errors = re.search(r"Socket errors: (.*)", out)
+        return {"rps": float(rate.group(1)) if rate else 0.0, "failed": int(failed.group(1)) if failed else 0,
+                "errors": errors.group(1) if errors else ""}
+
+
+def name_of(run):
+    return shlex.join(run["tool"] if isinstance(run, dict) else run)
+
+
 def workload(fx, spec, debug, result):
+    """Every command line with cargo's program, then with rustd's, in the same order: a
+    server keeps what the earlier ones did to it."""
+    seen = []
+    for binary in (debug, fx.binary):
+        with Served(fx, binary) as served:
+            seen.append([served.behaviour(run) for run in spec["runs"]])
     differing = []
-    for run in spec["runs"]:
-        fx.run_args = run
-        want, got = fx.behaviour(debug), fx.behaviour(fx.binary)
+    for run, want, got in zip(spec["runs"], *seen):
         if want != got:
-            differing.append(shlex.join(run))
+            differing.append(name_of(run))
             tail = got[2].decode(errors="replace").strip().splitlines()[-2:]
-            print(f"  DIFFERS `{shlex.join(run)}`: rustc status {want[0]}, rustd status {got[0]}: "
+            print(f"  DIFFERS `{name_of(run)}`: rustc status {want[0]}, rustd status {got[0]}: "
                   f"{difftest.symptom(want, got)} {' | '.join(tail)[:300]}")
     result["workload"] = {"runs": len(spec["runs"]), "differing": differing}
     print(f"workload: {len(spec['runs']) - len(differing)} of {len(spec['runs'])} command lines the same")
 
 
-def best(fx, binary, argv, rounds=3):
-    """The fastest of a few runs, in seconds."""
-    times = []
-    for _ in range(rounds):
-        began = time.monotonic()
-        subprocess.run([fx.argv0, *argv], executable=binary, cwd=fx.ws, capture_output=True,
-                       stdin=subprocess.DEVNULL, env=fx.run_env)
-        times.append(time.monotonic() - began)
-    return round(min(times), 3)
-
-
 def perf(fx, spec, debug, release, result):
-    argv = spec["bench"]
-    result["perf"] = {"bench": shlex.join(argv), "rustd_s": best(fx, fx.binary, argv),
-                      "debug_s": best(fx, debug, argv), "release_s": best(fx, release, argv),
-                      "debug_size": os.path.getsize(debug), "release_size": os.path.getsize(release)}
-    row = result["perf"]
-    print(f"perf `{row['bench']}`: rustd {row['rustd_s']} s, rustc debug {row['debug_s']} s, release {row['release_s']} s")
+    """`bench` timed, or `load` put on the server, with each of the three programs."""
+    row = {"debug_size": os.path.getsize(debug), "release_size": os.path.getsize(release)}
+    for key, binary in (("rustd", fx.binary), ("debug", debug), ("release", release)):
+        with Served(fx, binary) as served:
+            if "load" in spec:
+                row.update({f"{key}_{k}": v for k, v in served.load(spec["load"]).items()})
+            else:
+                row[f"{key}_s"] = served.seconds(spec["bench"])
+    result["perf"] = row
+    if "load" in spec:
+        row["bench"] = shlex.join(spec["load"])
+        print(f"load `{row['bench']}`: rustd {row['rustd_rps']} requests/s ({row['rustd_failed']} failed), "
+              f"rustc debug {row['debug_rps']} ({row['debug_failed']}), release {row['release_rps']} ({row['release_failed']})")
+    else:
+        row["bench"] = shlex.join(spec["bench"])
+        print(f"perf `{row['bench']}`: rustd {row['rustd_s']} s, rustc debug {row['debug_s']} s, release {row['release_s']} s")
 
 
 def main():
@@ -287,7 +346,7 @@ def main():
     if fx and "workload" in stages:
         workload(fx, spec, debug, result)
         ok = ok and not result["workload"]["differing"]
-    if fx and "perf" in stages and "bench" in spec:
+    if fx and "perf" in stages and ("bench" in spec or "load" in spec):
         release, result["release_cold_s"] = reference(ws, spec, "release")
         perf(fx, spec, debug, release, result)
     if fx and "tests" in stages:
