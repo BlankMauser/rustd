@@ -144,6 +144,8 @@ def difference(ours, theirs):
     """`None` when the two are the same, or the first thing that is not."""
     if ours == theirs:
         return None
+    if not isinstance(ours, tuple):
+        return f"{ours!r} for {theirs!r}"
     for mine, other in zip(ours, theirs):
         if mine != other:
             if isinstance(mine, collections.Counter):
