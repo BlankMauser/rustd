@@ -237,8 +237,8 @@ class Case:
         link = self.link
         obj, patch, binary = (os.path.join(self.work, f"daemon.{n}") for n in ("o", "patch.o", "bin"))
         socket, log_path = os.path.join(self.work, "rustd.sock"), os.path.join(self.work, "daemon.log")
-        line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
-        ask = ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
+        self.daemon_files = (obj, patch, binary)
+        ask = self.ask(link, env)
         log = open(log_path, "a")
         daemon = subprocess.Popen(
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), *self.rustd_args, "--socket", socket, *ask],
@@ -252,6 +252,18 @@ class Case:
         finally:
             daemon.kill()
 
+    def ask(self, link, env):
+        """What a client names the program by, and how it is linked with what cargo built."""
+        obj, patch, binary = self.daemon_files
+        line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
+        return ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
+
+    def asked(self, env):
+        """The program as cargo links it now: what a client sends after cargo has built again.
+        Nothing when cargo does not build it, where the daemon is to say why by itself."""
+        link = self.link_line(env)
+        return [] if link is None else ["--crate", self.crates[0], *self.ask(link, env)]
+
     def step(self, step, env, daemon, socket, binary):
         for path, old, new in step.get("edit", []):
             text = open(os.path.join(self.ws, path)).read()
@@ -260,8 +272,10 @@ class Case:
         for path, text in step.get("write", {}).items():
             open(os.path.join(self.ws, path), "w").write(text)
         env.update(step.get("env", {}))
+        for command in step.get("run", []):
+            subprocess.run(command, shell=True, cwd=self.ws, check=True, capture_output=True, env=env)
         time.sleep(0.02)
-        reply = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=300, env=env)
+        reply = subprocess.run([RUSTD, "sync", socket, *self.asked(env)], capture_output=True, text=True, timeout=300, env=env)
         reply = (reply.stdout + reply.stderr).strip()
         artifact = self.cargo(env)
         expect = step.get("expect", "same")
