@@ -263,7 +263,8 @@ impl<'db> Filler<'db> {
                         for operand in &mut asm.operands {
                             match operand {
                                 super::AsmOperand::Reg { input: Some(value), .. }
-                                | super::AsmOperand::Const(value) => self.fill_operand(value)?,
+                                | super::AsmOperand::Const(value)
+                                | super::AsmOperand::Sym(value) => self.fill_operand(value)?,
                                 super::AsmOperand::Reg { input: None, .. }
                                 | super::AsmOperand::Label => (),
                             }

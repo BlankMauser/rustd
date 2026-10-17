@@ -365,6 +365,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 ];
                 context.struct_type(&fields, false).fn_type(&params, false)
             }
+            // AArch64 has eight registers of each kind for what comes back, and LLVM gives
+            // the fields of a struct the next of its kind in order, as Cranelift does values.
+            many if crate::mir::codegen::Target::current().arch
+                == crate::mir::codegen::target::Arch::Aarch64
+                && many.len() <= 8 =>
+            {
+                let fields = many
+                    .iter()
+                    .map(|it| Self::basic_type(context, it.value_type))
+                    .collect::<Lowered<Vec<_>>>()?;
+                context.struct_type(&fields, false).fn_type(&params, false)
+            }
             _ => return Err(Unhandled::Shape("more than two return values")),
         })
     }
@@ -784,11 +796,24 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 Opcode::GetFramePointer
                     if crate::mir::codegen::Target::current().exception_in_register() =>
                 {
+                    use crate::mir::codegen::target::{Arch, ObjectFormat};
+                    let target = crate::mir::codegen::Target::current();
                     let pointer = self.context.ptr_type(AddressSpace::default());
-                    let own = self.context.i32_type().const_zero();
-                    let frame =
-                        self.intrinsic("llvm.frameaddress", &[pointer.into()], &[own.into()])?;
-                    self.set(inst, Operand::Pointer(frame.into_pointer_value()));
+                    let frame = if (target.arch, target.object_format)
+                        == (Arch::Aarch64, ObjectFormat::Elf)
+                    {
+                        // What is asked for is where Cranelift has the frame pointer and the
+                        // return address: right below what the caller left on the stack.
+                        // LLVM has the registers it saves between the two here.
+                        let entry = self.intrinsic("llvm.sponentry", &[pointer.into()], &[])?;
+                        let below = self.immediate(self.context.i64_type(), -16, true);
+                        self.offset(entry.into_pointer_value(), below)?
+                    } else {
+                        let own = self.context.i32_type().const_zero();
+                        self.intrinsic("llvm.frameaddress", &[pointer.into()], &[own.into()])?
+                            .into_pointer_value()
+                    };
+                    self.set(inst, Operand::Pointer(frame));
                 }
                 // Asked for by a guarded call alone, to look at the slot of the frame its
                 // exception arrives in. LLVM lays out the frame, so the slot is one of the
