@@ -258,6 +258,18 @@ impl<'db> Recorder<'db> {
         (self.requests, layouts)
     }
 
+    /// The bytes of each data object asked for so far that is read-only and points nowhere,
+    /// by its place among the requests: what a load from it is known to give.
+    #[cfg(feature = "llvm")]
+    pub(super) fn constants(&self) -> impl Iterator<Item = (u32, &[u8])> + '_ {
+        self.requests.datas.iter().enumerate().filter_map(|(index, data)| match data {
+            DataRequest::Blob { blob, .. } if blob.points_nowhere() => {
+                Some((index as u32, blob.bytes()))
+            }
+            _ => None,
+        })
+    }
+
     #[cfg(feature = "llvm")]
     pub(super) fn mark(&self) -> Mark {
         Mark { funcs: self.requests.funcs.len(), datas: self.requests.datas.len() }

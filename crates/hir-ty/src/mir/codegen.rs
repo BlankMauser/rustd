@@ -3812,6 +3812,17 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Whether the bytes are all there is to it, with no address among them.
+    #[cfg(feature = "llvm")]
+    fn points_nowhere(&self) -> bool {
+        self.relocs.is_empty() && self.fn_relocs.is_empty()
+    }
+
+    #[cfg(feature = "llvm")]
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
     fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
         self.bytes[offset..offset + word()].fill(0);
