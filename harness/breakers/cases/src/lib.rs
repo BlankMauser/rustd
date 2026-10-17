@@ -38,4 +38,6 @@ cases![
     fragment_token,
     blanket_in_fn,
     lifetime_only_callee,
+    panic_columns,
+    panic_column_width,
 ];

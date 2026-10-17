@@ -44,6 +44,7 @@ use rustc_type_ir::inherent::{
 use salsa::plumbing::{AsId, FromId};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
 use triomphe::Arc;
+use unicode_width::UnicodeWidthChar;
 
 use crate::mir::is_by_move_coroutine;
 use crate::{
@@ -74,8 +75,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
     PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
-    eval::interpret_mir, monomorphization::monomorphized, monomorphized_promoted_mir_body_query,
-    return_slot,
+    eval::interpret_mir, lower::is_builtin_index, monomorphization::monomorphized,
+    monomorphized_promoted_mir_body_query, return_slot,
 };
 
 mod asm;
@@ -1619,20 +1620,54 @@ fn source_location<'db>(
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
-    let mut range = source.value.syntax_node_ptr().text_range();
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
-        // A method call is reported from the method's name on.
-        let root = source.file_id.parse_or_expand(db);
-        let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
-    }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
-        // An index is reported from its bracket on.
-        let root = source.file_id.parse_or_expand(db);
-        let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
-    }
+    let range = match span {
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+        _ => source.value.syntax_node_ptr().text_range(),
+    };
     location_of(db, source.file_id, range)
+}
+
+/// The part of an expression that rustc's span of it covers where it panics: a method call
+/// from the method's name on, an index through `Index` from its bracket on, and any other
+/// expression together with the parentheses it is written in.
+fn reported_range(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -1719,8 +1754,23 @@ fn location_of(
     let before = text.get(..usize::from(range.start()))?;
     let line_start = before.rfind('\n').map_or(0, |it| it + 1);
     let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
-    let col = before[line_start..].chars().count() + 1;
+    let col = before[line_start..].chars().map(column_width).sum::<usize>() + 1;
     Some((file_id, line as u32, col as u32))
+}
+
+/// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
+/// its display width, four for a tab, and one for the control characters rustc prints a
+/// visible character for.
+fn column_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        '\0'..='\u{8}'
+        | '\u{b}'..='\u{1f}'
+        | '\u{7f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}' => 1,
+        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
+    }
 }
 
 fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {

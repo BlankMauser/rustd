@@ -3536,3 +3536,16 @@ fn word_bytes(value: usize) -> Box<[u8]> {
     let word = crate::mir::codegen::Target::current().word();
     value.to_le_bytes()[..word].into()
 }
+
+/// Whether `base[index]` reads an array or a slice in place by a `usize`, and is not a call
+/// of `Index::index`.
+pub(crate) fn is_builtin_index(infer: &InferenceResult, base: ExprId, index: ExprId) -> bool {
+    let adjusted = |expr: ExprId| {
+        let adjustments = infer.expr_adjustments.get(&expr);
+        adjustments
+            .and_then(|it| it.last())
+            .map_or_else(|| infer.expr_ty(expr), |it| it.target.as_ref())
+    };
+    matches!(adjusted(index).kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize))
+        && matches!(adjusted(base).strip_reference().kind(), TyKind::Array(..) | TyKind::Slice(..))
+}
