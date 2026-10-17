@@ -50,6 +50,8 @@ cases![
     const_pattern_other_variant,
     crlf_literal,
     dyn_lifetime_upcast,
+    format_of_macro,
     late_import_macro,
+    line_continuation,
     static_in_static,
 ];

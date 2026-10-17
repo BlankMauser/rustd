@@ -3554,6 +3554,11 @@ impl<'db> ExprCollector<'db> {
     fn expand_macros_to_string(&mut self, expr: ast::Expr) -> Option<(ast::String, bool)> {
         let m = match expr {
             ast::Expr::MacroExpr(m) => m,
+            // An expression a macro was given is in parentheses where the macro puts it.
+            ast::Expr::ParenExpr(inner) => {
+                let (text, _) = self.expand_macros_to_string(inner.expr()?)?;
+                return Some((text, false));
+            }
             ast::Expr::Literal(l) => {
                 return match l.kind() {
                     ast::LiteralKind::String(s) => Some((s, true)),

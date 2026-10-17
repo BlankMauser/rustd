@@ -11,7 +11,12 @@ two";
 const CONTINUED: &str = "one \
     two";
 
-pub fn run() -> (&'static str, &'static str, &'static [u8], &'static str, String) {
-    (PLAIN, RAW, BYTES, CONTINUED, format!("{}
+const THROUGH_MACRO: &str = stringify!("one
+two");
+
+type Literals = (&'static str, &'static str, &'static [u8], &'static str, &'static str, String);
+
+pub fn run() -> Literals {
+    (PLAIN, RAW, BYTES, CONTINUED, THROUGH_MACRO, format!("{}
 {}", 1, 2))
 }

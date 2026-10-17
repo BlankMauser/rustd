@@ -293,12 +293,14 @@ fn unescaped_str(text: &str, raw: bool) -> Result<Cow<'_, str>, EscapeError> {
             buf.push_str(&text[..prev_end]);
             buf.push(c);
         }
-        (Err(e), _) => has_error = Some(e),
+        (Err(e), _) if e.is_fatal() => has_error = Some(e),
+        // A warning about a line continuation, which gives no character.
+        (Err(_), _) => {}
     });
 
     match (has_error, buf.capacity() == 0) {
         (Some(e), _) => Err(e),
-        (None, true) => Ok(Cow::Borrowed(text)),
+        (None, true) => Ok(Cow::Borrowed(&text[..prev_end])),
         (None, false) => Ok(Cow::Owned(buf)),
     }
 }
@@ -346,7 +348,9 @@ fn unescaped_byte_str(text: &str, raw: bool) -> Result<Cow<'_, [u8]>, EscapeErro
                 buf.extend_from_slice(&text.as_bytes()[..prev_end]);
                 buf.push(b);
             }
-            (Err(e), _) => has_error = Some(e),
+            (Err(e), _) if e.is_fatal() => has_error = Some(e),
+            // A warning about a line continuation, which gives no character.
+            (Err(_), _) => {}
         }
     });
 
@@ -405,12 +409,14 @@ fn unescaped_c_str(text: &str, raw: bool) -> Result<Cow<'_, [u8]>, EscapeError> 
             buf.extend(&text.as_bytes()[..prev_end]);
             extend_unit(&mut buf, u);
         }
-        (Err(e), _) => has_error = Some(e),
+        (Err(e), _) if e.is_fatal() => has_error = Some(e),
+        // A warning about a line continuation, which gives no character.
+        (Err(_), _) => {}
     });
 
     match (has_error, buf.capacity() == 0) {
         (Some(e), _) => Err(e),
-        (None, true) => Ok(Cow::Borrowed(text.as_bytes())),
+        (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
         (None, false) => Ok(Cow::Owned(buf)),
     }
 }
