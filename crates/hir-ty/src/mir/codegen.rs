@@ -44,6 +44,7 @@ use rustc_type_ir::inherent::{
 use salsa::plumbing::{AsId, FromId};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
+use unicode_width::UnicodeWidthChar;
 
 use crate::mir::is_by_move_coroutine;
 use crate::{
@@ -75,8 +76,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
     PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp,
-    eval::interpret_mir, monomorphization::monomorphized, monomorphized_promoted_mir_body_query,
-    return_slot,
+    eval::interpret_mir, lower::is_builtin_index, monomorphization::monomorphized,
+    monomorphized_promoted_mir_body_query, return_slot,
 };
 
 mod asm;
@@ -1849,25 +1850,60 @@ fn source_location<'db>(
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
-    let mut range = source.value.syntax_node_ptr().text_range();
     if let MirSpan::ExprEnd(_) = span {
         // The brace that closes a block, which is where rustc has a scope left.
+        let range = source.value.syntax_node_ptr().text_range();
         let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
         return location_of(db, source.file_id, TextRange::new(last?, range.end()));
     }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
-        // A method call is reported from the method's name on.
-        let root = source.file_id.parse_or_expand(db);
-        let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
-    }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
-        // An index is reported from its bracket on.
-        let root = source.file_id.parse_or_expand(db);
-        let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
-        range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
-    }
+    let range = match span {
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+        _ => source.value.syntax_node_ptr().text_range(),
+    };
     location_of(db, source.file_id, range)
+}
+
+/// The part of an expression that rustc's span of it covers where it panics: a method call
+/// from the method's name on, an index through `Index` from its bracket on, and any other
+/// expression together with the parentheses it is written in.
+fn reported_range(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -1954,8 +1990,23 @@ fn location_of(
     let before = text.get(..usize::from(range.start()))?;
     let line_start = before.rfind('\n').map_or(0, |it| it + 1);
     let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
-    let col = before[line_start..].chars().count() + 1;
+    let col = before[line_start..].chars().map(column_width).sum::<usize>() + 1;
     Some((file_id, line as u32, col as u32))
+}
+
+/// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
+/// its display width, four for a tab, and one for the control characters rustc prints a
+/// visible character for.
+fn column_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        '\0'..='\u{8}'
+        | '\u{b}'..='\u{1f}'
+        | '\u{7f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}' => 1,
+        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
+    }
 }
 
 fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {
@@ -2091,6 +2142,7 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        index_spans: Default::default(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -4054,6 +4106,8 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The index expression each local that holds an index was made for.
+    index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -5462,6 +5516,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.index_spans = index_spans(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -5480,6 +5535,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                     StatementKind::Deinit(_) => unsupported!("deinit"),
                     StatementKind::InlineAsm(asm) => self.inline_asm(asm)?,
+                    // A place that is matched on and not read is still indexed, and the
+                    // index is checked: `let _ = items[at]` panics when `at` is out of bounds.
+                    StatementKind::FakeRead(place) if is_indexed(place) => {
+                        self.place(place)?;
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::FakeRead(_)
@@ -5512,6 +5572,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
+        let mut parted: Vec<LocalId> = Vec::new();
+        for moved in &self.moved_paths {
+            if !parted.contains(&moved.local) {
+                parted.push(moved.local);
+            }
+        }
+        let parted_at_end = body.parted_at_block_ends(&parted, |place| self.moves_part(place));
         let drops = std::mem::take(&mut self.deferred_drops);
         let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
             true => FxHashMap::default(),
@@ -5520,6 +5587,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (block, place, target, span, from) in drops {
             self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
+            // A local that has not lost a part on any way here is dropped as one value.
+            let whole = parted
+                .iter()
+                .position(|&it| it == place.local)
+                .is_none_or(|at| !parted_at_end[from][at]);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
@@ -5538,7 +5610,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let dropped = self.builder.create_block();
                     self.guarded(
                         |this| {
-                            this.drop_place(&place, dropped)?;
+                            this.drop_place(&place, false, dropped)?;
                             this.builder.switch_to_block(dropped);
                             Ok(())
                         },
@@ -5550,7 +5622,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     )?;
                     self.builder.ins().jump(target, &[]);
                 }
-                _ => self.drop_place(&place, target)?,
+                _ => self.drop_place(&place, whole, target)?,
             }
         }
         self.moved_here = None;
@@ -5635,10 +5707,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some((path, ty))
     }
 
-    /// Says that the fields of `place` are all there again, after an assignment to it.
+    /// Whether using `place` as an operand moves a part out of its local, as far as is known.
+    fn moves_part(&self, place: &StoredPlace) -> bool {
+        let is_moved = |path: &Vec<u32>| {
+            self.moved_paths.iter().any(|it| it.local == place.local && it.path == *path)
+        };
+        self.moved_out_paths(place).is_none_or(|paths| paths.iter().any(is_moved))
+    }
+
+    /// Says that the fields of `place` are all there again, after an assignment to it. A
+    /// subslice of an array is its elements, as it is for a move out.
     fn clear_moved(&mut self, place: &StoredPlace) {
         if !self.drop_flags.contains_idx(place.local)
-            || self.field_path(place).is_none_or(|it| it.is_empty())
+            || self.moved_out_paths(place).is_none_or(|it| it.iter().any(Vec::is_empty))
         {
             return;
         }
@@ -5651,11 +5732,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn clear_moved_now(&mut self, place: &StoredPlace) {
-        let (Some(&flag), Some(path)) = (self.drop_flags.get(place.local), self.field_path(place))
+        let (Some(&flag), Some(paths)) =
+            (self.drop_flags.get(place.local), self.moved_out_paths(place))
         else {
             return;
         };
-        let within = |it: &&MovedPath| it.local == place.local && it.path.starts_with(&path);
+        let within = |it: &&MovedPath| {
+            it.local == place.local && paths.iter().any(|path| it.path.starts_with(path))
+        };
         let mask = self.moved_paths.iter().filter(within).fold(0u64, |mask, it| mask | 1 << it.bit);
         if mask != 0 {
             let state = flag.load(&mut self.builder);
@@ -5678,8 +5762,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(bit)
     }
 
-    /// Drops what is left of a place, which is nothing if its local holds no value.
-    fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
+    /// Drops what is left of a place, which is nothing if its local holds no value. `whole`
+    /// says that no part of the local can have been moved out.
+    fn drop_place(&mut self, place: &StoredPlace, whole: bool, target: ir::Block) -> Result<()> {
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -5697,7 +5782,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let local = place.local;
         let place = self.place_ref(place)?;
-        self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        if whole {
+            self.drop_value(place.addr, place.meta, place.ty.ty)?;
+        } else {
+            self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        }
         self.builder.ins().jump(target, &[]);
         Ok(())
     }
@@ -6094,7 +6183,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
                     let index = self.builder.ins().load(ptr(), MEM, self.locals[*local].addr, 0);
+                    // An index out of bounds is reported at the index expression, which may be
+                    // an operand of the statement that reads it.
+                    let statement = self.span;
+                    self.span = self.index_spans.get(local).copied().unwrap_or(statement);
                     addr = self.element(addr, meta, prev.ty, index)?;
+                    self.span = statement;
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -10325,7 +10419,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
                 self.at(end);
             }
-            self.drop_place(&place, next)?;
+            self.drop_place(&place, false, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
@@ -11208,6 +11302,24 @@ fn dump_mir(body: &MirBody<'_>) {
             eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
         }
     }
+}
+
+/// Whether a place is an element of an array or slice at an index that is only known when
+/// the program runs.
+fn is_indexed(place: &StoredPlace) -> bool {
+    place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_)))
+}
+
+/// Where each local of a body starts to live. A local that holds the index of `base[index]`
+/// starts at that expression.
+fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+    statements
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => Some((local, statement.span)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The locals a body drops whole, in the order of the blocks that drop them when each block
