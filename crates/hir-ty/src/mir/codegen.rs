@@ -1904,6 +1904,8 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        argument_temps: Default::default(),
+        handed_over: Vec::new(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -3705,6 +3707,11 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The temporaries that are written once and are then an argument of a call, whole.
+    argument_temps: rustc_hash::FxHashSet<LocalId>,
+    /// Where the arguments of the call being compiled are that the callee can have as they
+    /// are, those of `argument_temps`.
+    handed_over: Vec<Value>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -4509,8 +4516,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     values.push(self.load_cast(unit, part, left.min(Size::from_bytes(step))));
                 }
             }
+            // The callee owns the memory it is handed: a temporary nothing else reads is that
+            // already.
+            PassMode::Indirect if self.handed_over.contains(&addr) => values.push(addr),
             PassMode::Indirect => {
-                // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
@@ -5081,6 +5090,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.argument_temps = argument_temps(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -7311,7 +7321,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.deferred_drops.push((block, place.clone(), *target));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
-                self.call(func, args, destination, *target)?
+                self.handed_over = args
+                    .iter()
+                    .filter_map(|it| match &it.kind {
+                        OperandKind::Copy(place) | OperandKind::Move(place) => Some(place),
+                        _ => None,
+                    })
+                    .filter(|it| self.argument_temps.contains(&it.local))
+                    .map(|it| self.locals[it.local].addr)
+                    .collect();
+                let called = self.call(func, args, destination, *target);
+                self.handed_over.clear();
+                called?
             }
             _ => unsupported!("terminator {terminator:?}"),
         }
@@ -10767,6 +10788,46 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
             block.terminator.as_ref().map(|it| &it.kind)
         {
             args.iter().for_each(|it| operand(it, &mut held));
+        }
+    }
+    temps
+}
+
+/// The temporaries that are written once and read once, as a whole argument of the call their
+/// block ends in: what the call is given is a value nothing else reads afterwards.
+fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    body.clone().walk_places(|place| *mentions.entry(place.local).or_default() += 1);
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    let mut temps = rustc_hash::FxHashSet::default();
+    for (_, block) in body.basic_blocks.iter() {
+        let Some(TerminatorKind::Call { args, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+        else {
+            continue;
+        };
+        // Written in the block that ends in the call, so once for every time it is passed.
+        let written = |local: LocalId| {
+            block.statements.iter().any(|it| {
+                matches!(&it.kind, StatementKind::Assign(to, _)
+                    if to.local == local && to.projection.as_slice().is_empty())
+            })
+        };
+        for arg in args.iter() {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &arg.kind
+                && place.projection.as_slice().is_empty()
+                && mentions.get(&place.local) == Some(&2)
+                && !bound.contains(&place.local)
+                && written(place.local)
+            {
+                temps.insert(place.local);
+            }
         }
     }
     temps
