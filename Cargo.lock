@@ -3737,6 +3737,7 @@ dependencies = [
  "cfg",
  "dunce",
  "ed25519-dalek",
+ "find-msvc-tools",
  "futures-util",
  "getrandom 0.3.4",
  "hir",

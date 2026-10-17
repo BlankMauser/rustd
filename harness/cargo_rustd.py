@@ -120,7 +120,7 @@ def alive(pid):
 
 def timed(argv, cwd, env, timeout=7200):
     began = time.time()
-    ran = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    ran = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     return time.time() - began, ran
 
 
@@ -264,8 +264,8 @@ def project(name, spec, work):
         wrong = difference(compare(mine), compare(other))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
-            open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w").write(mine.stdout + mine.stderr)
-            open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w").write(other.stdout + other.stderr)
+            open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
+            open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w", encoding="utf-8").write(other.stdout + other.stderr)
         print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
 
     def runs(label):
@@ -491,7 +491,8 @@ def table(rows):
 def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or list(PROJECTS)
-    work = tempfile.mkdtemp(prefix="rustd-cargo-")
+    # As the daemon names it: with no link and no short name in it.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-"))
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:

@@ -2418,6 +2418,13 @@ fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
     Some(format!("{module} has errors, `cargo check` shows them: {why}"))
 }
 
+/// The text of the source file at `path` as the database has it.
+fn source_on_disk(path: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    let rust = path.extension().is_some_and(|it| it == "rs");
+    Ok(if rust { load_cargo::source_text(text) } else { text })
+}
+
 /// A file whose changes the daemon picks up.
 enum Watched {
     Source(vfs::FileId),
@@ -3079,6 +3086,10 @@ fn end_with_input() {
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    #[cfg(windows)]
+    if let Some(script) = cargo::script::stood_in_front_of() {
+        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {
@@ -3759,7 +3770,7 @@ fn main() -> anyhow::Result<()> {
                 if switched.iter().any(|base| file.path.starts_with(base)) {
                     file.mtime = now;
                     let same = match file.file {
-                        Watched::Source(id) => std::fs::read_to_string(&on_disk)
+                        Watched::Source(id) => source_on_disk(&on_disk)
                             .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
                         Watched::Included(ref path) => db.included_is_read(path),
                     };
@@ -3822,7 +3833,8 @@ fn main() -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
+                    let text = source_on_disk(&db.on_disk(path))?;
+                    change.change_file(*id, Some(text));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),
