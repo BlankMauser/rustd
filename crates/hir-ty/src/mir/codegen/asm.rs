@@ -11,7 +11,10 @@ use std::{
 
 use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
-use object::{Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, elf, pe};
+use object::{
+    Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
+    RelocationTarget, elf, macho, pe,
+};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
@@ -475,14 +478,100 @@ pub(super) struct Assembled {
 pub(super) struct Named {
     pub(super) offset: u32,
     pub(super) kind: Reloc,
+    /// The type ELF has for it, when Cranelift has no kind for that and `kind` stands in:
+    /// see [`Code::elf_types`](super::fragment::Code).
+    pub(super) elf_type: Option<u32>,
     /// The index of the operand.
     pub(super) operand: u32,
     pub(super) addend: i64,
 }
 
 /// The relocations a `sym` is assembled to, each with the number it is stored as.
-const RELOCS: [Reloc; 4] =
-    [Reloc::X86PCRel4, Reloc::X86CallPLTRel4, Reloc::X86GOTPCRel4, Reloc::Abs8];
+const RELOCS: [Reloc; 9] = [
+    Reloc::X86PCRel4,
+    Reloc::X86CallPLTRel4,
+    Reloc::X86GOTPCRel4,
+    Reloc::Abs8,
+    Reloc::Arm64Call,
+    Reloc::Aarch64AdrPrelPgHi21,
+    Reloc::Aarch64AddAbsLo12Nc,
+    Reloc::Aarch64AdrGotPage21,
+    Reloc::Aarch64Ld64GotLo12Nc,
+];
+
+impl Named {
+    /// What Cranelift calls the relocation an assembler wrote for a `sym`, by the format
+    /// of the object and the architecture, and the type ELF has for it where Cranelift has
+    /// no kind that says as much.
+    fn kind(
+        format: BinaryFormat,
+        arch: Architecture,
+        flags: RelocationFlags,
+    ) -> Option<(Reloc, Option<u32>)> {
+        let kind = match (format, arch, flags) {
+            (BinaryFormat::Elf, Architecture::X86_64, RelocationFlags::Elf { r_type }) => {
+                match r_type {
+                    elf::R_X86_64_PC32 => Reloc::X86PCRel4,
+                    elf::R_X86_64_PLT32 => Reloc::X86CallPLTRel4,
+                    // The forms a linker may relax are loads from the GOT like any other.
+                    elf::R_X86_64_GOTPCREL
+                    | elf::R_X86_64_GOTPCRELX
+                    | elf::R_X86_64_REX_GOTPCRELX => Reloc::X86GOTPCRel4,
+                    elf::R_X86_64_64 => Reloc::Abs8,
+                    _ => return None,
+                }
+            }
+            (BinaryFormat::Elf, Architecture::Aarch64, RelocationFlags::Elf { r_type }) => {
+                match r_type {
+                    // A jump out of the function is a call that does not come back.
+                    elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => Reloc::Arm64Call,
+                    elf::R_AARCH64_ADR_PREL_PG_HI21 => Reloc::Aarch64AdrPrelPgHi21,
+                    elf::R_AARCH64_ADD_ABS_LO12_NC => Reloc::Aarch64AddAbsLo12Nc,
+                    elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
+                    elf::R_AARCH64_LD64_GOT_LO12_NC => Reloc::Aarch64Ld64GotLo12Nc,
+                    elf::R_AARCH64_ABS64 => Reloc::Abs8,
+                    // The low bits of an address in a load or store go in in units of what
+                    // it moves: the kind of an `add` stands in.
+                    elf::R_AARCH64_LDST8_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST16_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST32_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST64_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
+                        return Some((Reloc::Aarch64AddAbsLo12Nc, Some(r_type)));
+                    }
+                    _ => return None,
+                }
+            }
+            (BinaryFormat::Coff, Architecture::X86_64, RelocationFlags::Coff { typ }) => {
+                match typ {
+                    pe::IMAGE_REL_AMD64_ADDR64 => Reloc::Abs8,
+                    // The numbered forms say how many bytes of the instruction follow the
+                    // field, which `object` has put in the addend.
+                    pe::IMAGE_REL_AMD64_REL32
+                    | pe::IMAGE_REL_AMD64_REL32_1
+                    | pe::IMAGE_REL_AMD64_REL32_2
+                    | pe::IMAGE_REL_AMD64_REL32_3
+                    | pe::IMAGE_REL_AMD64_REL32_4
+                    | pe::IMAGE_REL_AMD64_REL32_5 => Reloc::X86PCRel4,
+                    _ => return None,
+                }
+            }
+            (BinaryFormat::MachO, Architecture::Aarch64, RelocationFlags::MachO { r_type, .. }) => {
+                match r_type {
+                    macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
+                    macho::ARM64_RELOC_PAGE21 => Reloc::Aarch64AdrPrelPgHi21,
+                    macho::ARM64_RELOC_PAGEOFF12 => Reloc::Aarch64AddAbsLo12Nc,
+                    macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Reloc::Aarch64AdrGotPage21,
+                    macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
+                    macho::ARM64_RELOC_UNSIGNED => Reloc::Abs8,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        Some((kind, None))
+    }
+}
 
 impl Assembled {
     /// The bytes the store keeps.
@@ -493,6 +582,7 @@ impl Assembled {
             let kind = RELOCS.iter().position(|it| *it == named.kind).unwrap_or(RELOCS.len());
             bytes.extend_from_slice(&named.offset.to_le_bytes());
             bytes.push(kind as u8);
+            bytes.extend_from_slice(&named.elf_type.unwrap_or(0).to_le_bytes());
             bytes.extend_from_slice(&named.operand.to_le_bytes());
             bytes.extend_from_slice(&named.addend.to_le_bytes());
         }
@@ -502,14 +592,17 @@ impl Assembled {
     fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
         let (len, rest) = bytes.split_first_chunk()?;
         let (code, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
-        let (records, []) = rest.as_chunks::<17>() else { return None };
+        let (records, []) = rest.as_chunks::<21>() else { return None };
         let relocs = records.iter().map(|record| {
             let (offset, rest) = record.split_first_chunk()?;
             let (&kind, rest) = rest.split_first()?;
+            let (elf_type, rest) = rest.split_first_chunk()?;
             let (operand, rest) = rest.split_first_chunk()?;
             Some(Named {
                 offset: u32::from_le_bytes(*offset),
                 kind: *RELOCS.get(usize::from(kind))?,
+                // No relocation that is read has the type 0.
+                elf_type: Some(u32::from_le_bytes(*elf_type)).filter(|it| *it != 0),
                 operand: u32::from_le_bytes(*operand),
                 addend: i64::from_le_bytes(rest.try_into().ok()?),
             })
@@ -523,7 +616,7 @@ impl Assembled {
 pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
     static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"rustd asm 2");
+    hasher.update(b"rustd asm 3");
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
@@ -638,6 +731,7 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
     let bytes = section.data().map_err(|e| failed(&e))?;
     let start = symbol.address() - section.address();
     let mut code = bytes[start as usize..].to_vec();
+    let format = file.format();
     // FIXME: a block that names a symbol of its own, or has data in another section.
     let relocs = section.relocations().map(|(offset, relocation)| {
         let operand = match relocation.target() {
@@ -645,30 +739,18 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
             _ => None,
         };
         let operand = operand
-            .and_then(|it| it.name().ok()?.strip_prefix(SYM)?.parse().ok())
+            .and_then(|it| {
+                let name = it.name().ok()?;
+                // Mach-O has an underscore before every name of C.
+                let name = match format {
+                    BinaryFormat::MachO => name.strip_prefix('_')?,
+                    _ => name,
+                };
+                name.strip_prefix(SYM)?.parse().ok()
+            })
             .ok_or("inline assembly that names a symbol")?;
-        let kind = match relocation.flags() {
-            RelocationFlags::Elf { r_type: elf::R_X86_64_PC32 } => Reloc::X86PCRel4,
-            RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 } => Reloc::X86CallPLTRel4,
-            RelocationFlags::Elf {
-                r_type:
-                    elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX,
-            } => Reloc::X86GOTPCRel4,
-            RelocationFlags::Elf { r_type: elf::R_X86_64_64 }
-            | RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 } => Reloc::Abs8,
-            // The numbered forms say how many bytes of the instruction follow the field,
-            // which `object` has put in the addend.
-            RelocationFlags::Coff {
-                typ:
-                    pe::IMAGE_REL_AMD64_REL32
-                    | pe::IMAGE_REL_AMD64_REL32_1
-                    | pe::IMAGE_REL_AMD64_REL32_2
-                    | pe::IMAGE_REL_AMD64_REL32_3
-                    | pe::IMAGE_REL_AMD64_REL32_4
-                    | pe::IMAGE_REL_AMD64_REL32_5,
-            } => Reloc::X86PCRel4,
-            _ => return Err("inline assembly that names a symbol in a way that is not read"),
-        };
+        let (kind, elf_type) = Named::kind(format, file.architecture(), relocation.flags())
+            .ok_or("inline assembly that names a symbol in a way that is not read")?;
         let offset = offset.checked_sub(start).ok_or("inline assembly before its function")?;
         let mut addend = relocation.addend();
         if relocation.has_implicit_addend() {
@@ -686,7 +768,7 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
                 _ => i64::from(i32::from_le_bytes([held[0], held[1], held[2], held[3]])),
             };
         }
-        Ok(Named { offset: offset as u32, kind, operand, addend })
+        Ok(Named { offset: offset as u32, kind, elf_type, operand, addend })
     });
     let relocs = relocs.collect::<Result<_, &str>>()?;
     Ok(Assembled { code, relocs })

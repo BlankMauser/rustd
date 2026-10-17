@@ -85,6 +85,12 @@ pub(super) struct Code {
     pub(super) bytes: Vec<u8>,
     pub(super) align: u64,
     pub(super) relocs: Vec<ModuleReloc>,
+    /// The relocations of `relocs`, by where they are, that Cranelift has no kind for, with
+    /// the type ELF has for each: the low bits of an address in an AArch64 load or store,
+    /// which go in in units of what it moves, and whatever the assembly of a function
+    /// names a symbol with. The kind in `relocs` stands in for it, and the object is given
+    /// the relocation when it is finished.
+    pub(super) elf_types: Vec<(u32, u32)>,
     pub(super) unwind: Option<FunctionUnwind>,
     /// Which statement the code is of, from each offset where that changes.
     pub(super) lines: Vec<LineRow>,
@@ -110,6 +116,7 @@ impl PartialEq for Code {
             && self.signature == other.signature
             && self.unwind == other.unwind
             && self.lines == other.lines
+            && self.elf_types == other.elf_types
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
                 a.offset == b.offset

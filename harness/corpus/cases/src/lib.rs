@@ -3,7 +3,7 @@
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
 // `box` patterns are unstable: the case is for a nightly toolchain only.
-#![cfg_attr(feature = "nightly", feature(box_patterns))]
+#![cfg_attr(feature = "nightly", feature(box_patterns, c_variadic_int128))]
 
 pub mod stabilized;
 

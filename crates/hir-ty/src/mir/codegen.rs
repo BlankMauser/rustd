@@ -228,6 +228,12 @@ enum PassMode {
         count: u8,
         skipped: u8,
     },
+    /// A 128-bit integer that AAPCS64 has on the stack whole, for want of two integer
+    /// registers, after the `skipped` registers that were left, which the convention takes
+    /// out of use.
+    Stacked {
+        skipped: u8,
+    },
     Indirect,
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
@@ -890,6 +896,8 @@ struct ObjectCodegen<'a, 'db> {
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     own_statics: OwnStatics,
+    /// What `finish` adds to the object of the relocations of the functions defined.
+    elf_relocs: Vec<ElfReloc>,
     statics: FxHashMap<StaticId, DataId>,
     /// Statics nothing exports and nothing can write to, which we give a copy of the value.
     frozen_statics: FxHashMap<StaticId, DataId>,
@@ -1048,6 +1056,48 @@ fn target_with_frame_pointer() -> Result<&'static isa::OwnedTargetIsa> {
 
 const LARGE: usize = 50_000;
 
+/// A relocation of a function that Cranelift has no kind for, which the object is given
+/// once Cranelift has written it: see [`Code::elf_types`].
+struct ElfReloc {
+    func: FuncId,
+    reloc: ModuleReloc,
+    r_type: u32,
+}
+
+impl ElfReloc {
+    fn add(
+        &self,
+        product: &mut cranelift_object::ObjectProduct,
+    ) -> std::result::Result<(), String> {
+        use cranelift_object::object::{self, write};
+        if product.object.format() != object::BinaryFormat::Elf {
+            return Err("a relocation by its ELF type in an object that is not ELF".to_owned());
+        }
+        let symbol = match self.reloc.name {
+            ModuleRelocTarget::User { namespace: 0, index } => {
+                product.function_symbol(FuncId::from_u32(index))
+            }
+            ModuleRelocTarget::User { namespace: 1, index } => {
+                product.data_symbol(DataId::from_u32(index))
+            }
+            ref other => return Err(format!("a relocation by its ELF type against {other}")),
+        };
+        let own = product.object.symbol(product.function_symbol(self.func));
+        let write::SymbolSection::Section(section) = own.section else {
+            return Err("a function that is not in a section".to_owned());
+        };
+        let relocation = write::Relocation {
+            offset: own.value + u64::from(self.reloc.offset),
+            symbol,
+            addend: self.reloc.addend,
+            flags: object::RelocationFlags::Elf {
+                r_type: object::elf::RelocationType(self.r_type),
+            },
+        };
+        product.object.add_relocation(section, relocation).map_err(|e| e.to_string())
+    }
+}
+
 fn selected_target() -> Result<&'static Target> {
     Target::selected().map_err(CodegenError::Backend)
 }
@@ -1202,6 +1252,9 @@ struct VariadicRegisters {
     arch: Arch,
     ints: u32,
     floats: u32,
+    /// How many bytes of the caller's stack the named parameters take, which the variable
+    /// arguments there come after.
+    stack: u32,
 }
 
 impl VariadicRegisters {
@@ -1215,7 +1268,10 @@ impl VariadicRegisters {
     }
 
     fn named(sig: &Signature, arch: Arch) -> Result<Self> {
-        let mut named = VariadicRegisters { arch, ints: 0, floats: 0 };
+        let mut named = VariadicRegisters { arch, ints: 0, floats: 0, stack: 0 };
+        if arch == Arch::Aarch64 {
+            return named.aapcs64(sig);
+        }
         for param in &sig.params {
             match param.value_type {
                 // AAPCS64 has a register of its own for where the result goes.
@@ -1234,6 +1290,42 @@ impl VariadicRegisters {
             unsupported!("a variadic function with a named parameter on the stack");
         }
         Ok(named)
+    }
+
+    /// Where AAPCS64, as Cranelift has it, puts the named parameters: in the next register
+    /// of their kind, or on the stack when those are out, in eight bytes each and a 128-bit
+    /// integer in sixteen at a multiple of sixteen.
+    fn aapcs64(mut self, sig: &Signature) -> Result<Self> {
+        let each = Self::int_count(self.arch);
+        for param in &sig.params {
+            let on_stack = match param.value_type {
+                // The address of what is returned has a register of its own.
+                _ if param.purpose == ArgumentPurpose::StructReturn => continue,
+                _ if param.purpose != ArgumentPurpose::Normal => {
+                    unsupported!("a variadic function with a named aggregate on the stack")
+                }
+                types::I128 => {
+                    let first = self.ints + self.ints % 2;
+                    if first + 2 <= each {
+                        self.ints = first + 2;
+                        continue;
+                    }
+                    16
+                }
+                ty if ty.is_int() && self.ints < each => {
+                    self.ints += 1;
+                    continue;
+                }
+                types::F32 | types::F64 if self.floats < Self::FLOATS => {
+                    self.floats += 1;
+                    continue;
+                }
+                ty if ty.is_int() || ty.is_float() && ty.bytes() <= 8 => 8,
+                ty => unsupported!("a variadic function with a named {ty}"),
+            };
+            self.stack = self.stack.next_multiple_of(on_stack) + on_stack;
+        }
+        Ok(self)
     }
 
     /// Turns down named parameters that Apple's AArch64 convention has on the stack, where
@@ -1861,6 +1953,11 @@ fn compile<'db>(
                 bytes: assembled.code.clone(),
                 align: 16,
                 relocs,
+                elf_types: assembled
+                    .relocs
+                    .iter()
+                    .filter_map(|named| Some((named.offset, named.elf_type?)))
+                    .collect(),
                 unwind: None,
                 lines: Vec::new(),
             }
@@ -1999,6 +2096,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .iter()
                 .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
                 .collect(),
+            elf_types: Vec::new(),
             unwind: FunctionUnwind::of(isa, ctx)?,
             lines: LineRow::of_ranges(
                 compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
@@ -2032,6 +2130,7 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
         bytes,
         align: 1,
         relocs,
+        elf_types: Vec::new(),
         unwind: None,
         lines: Vec::new(),
     })
@@ -2144,6 +2243,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             type_ids: FxHashMap::default(),
             misfit: false,
             own_statics,
+            elf_relocs: Vec::new(),
         })
     }
 
@@ -2153,6 +2253,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
+        for reloc in &self.elf_relocs {
+            reloc.add(&mut product).map_err(CodegenError::Backend)?;
+        }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         if let Some(debug) = self.debug {
             debug.emit(&mut product).map_err(CodegenError::Backend)?;
@@ -2832,7 +2935,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn define_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) -> Result<()> {
-        self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
+        if code.elf_types.is_empty() {
+            self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
+        } else {
+            // Cranelift is given the relocations it has a kind for, and `finish` adds the
+            // others to the object.
+            let elf_type = |reloc: &ModuleReloc| {
+                code.elf_types.iter().find(|(offset, _)| *offset == reloc.offset).map(|it| it.1)
+            };
+            let (by_type, plain): (Vec<_>, Vec<_>) =
+                relocs.iter().cloned().partition(|reloc| elf_type(reloc).is_some());
+            self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
+            self.elf_relocs.extend(by_type.into_iter().filter_map(|reloc| {
+                let r_type = elf_type(&reloc)?;
+                Some(ElfReloc { func: id, reloc, r_type })
+            }));
+        }
         if let Some(unwind) = &code.unwind {
             self.unwind
                 .add_function(&mut self.module, id, unwind)
@@ -4195,7 +4313,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
-                PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
+                PassMode::Uniform { .. } | PassMode::Stacked { .. } => {
+                    unreachable!("x86-64 has no uniform aggregate")
+                }
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             modes.push(match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -4247,16 +4367,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if wide {
                         // Cranelift starts it at an even register, or puts it on the stack
                         // whole. The registers it did not fit in stay free there, where
-                        // the convention has them out of use: turn down what would use one.
-                        *used += *used % even;
-                        if *used + 2 > REGS && *used < REGS {
-                            unsupported!("a 128-bit argument that the registers left do not hold");
+                        // the convention has them out of use.
+                        let skipped = REGS - *used;
+                        if *used + *used % even + 2 <= REGS {
+                            *used += *used % even + 2;
+                            PassMode::Direct(scalar)
+                        } else {
+                            *used = REGS;
+                            PassMode::Stacked { skipped }
                         }
-                        *used = (*used + 2).min(REGS);
                     } else {
                         *used = (*used + 1).min(REGS);
+                        PassMode::Direct(scalar)
                     }
-                    PassMode::Direct(scalar)
                 }
                 Aapcs64::Floats { unit, count } if floats + count <= REGS => {
                     floats += count;
@@ -4274,11 +4397,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if ints + odd + count <= REGS {
                         ints += odd + count;
                         Self::aapcs64_ints(size, odd)
-                    } else if align > 8 {
-                        // FIXME: the stack is where it goes, at an address that is a
-                        // multiple of sixteen, which the units of a `Uniform` are not at.
-                        unsupported!("an aggregate aligned to 16 bytes passed on the stack");
                     } else {
+                        // On the stack, where rustc has it in eight-byte units whatever
+                        // its alignment: at the next multiple of eight.
                         let skipped = REGS - ints;
                         ints = REGS;
                         PassMode::Uniform { unit: types::I64, count, skipped }
@@ -4559,6 +4680,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Uniform { unit, count, skipped } => {
                 params.extend((0..skipped + count).map(|_| AbiParam::new(unit)))
             }
+            PassMode::Stacked { skipped } => {
+                params.extend((0..skipped).map(|_| AbiParam::new(types::I64)));
+                params.push(AbiParam::new(types::I128));
+            }
             PassMode::Indirect => params.push(AbiParam::new(ptr())),
             PassMode::OnStack(size) => {
                 params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size)))
@@ -4627,6 +4752,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     values.push(self.load_cast(unit, part, left.min(Size::from_bytes(step))));
                 }
             }
+            PassMode::Stacked { skipped } => {
+                for _ in 0..skipped {
+                    values.push(self.zero(types::I64));
+                }
+                values.push(self.builder.ins().load(types::I128, MEM, addr, 0));
+            }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
@@ -4678,6 +4809,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let left = layout.size - Size::from_bytes(index * step);
                     self.store_cast(value, part, left.min(Size::from_bytes(step)));
                 }
+            }
+            PassMode::Stacked { skipped } => {
+                for _ in 0..skipped {
+                    next();
+                }
+                let value = next();
+                self.builder.ins().store(MEM, value, addr, 0);
             }
         }
     }
@@ -4927,10 +5065,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if named.arch == Arch::Aarch64 {
                 // The list has where each kind of saved register ends, and how far before
                 // that the next one is. The arguments on the stack are above the frame
-                // pointer and the return address: no named parameter is among them. Asking
-                // for the frame pointer here is what has `emit` keep one.
+                // pointer and the return address, the named ones first. Asking for the
+                // frame pointer here is what has `emit` keep one.
                 let frame = self.builder.ins().get_frame_pointer(ptr());
-                let stack = self.builder.ins().iadd_imm(frame, 16);
+                let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named.stack));
                 let ints_end = self.builder.ins().iadd_imm(saved, i64::from(int_count * 8));
                 let floats_end =
                     self.builder.ins().iadd_imm(saved, i64::from(int_count * 8 + floats_bytes));
@@ -8919,11 +9057,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 let arch = self.cg.target.arch;
                 let scalar = self.scalar_of(dst_ty)?;
-                if scalar.ty.bytes() > 8 {
+                // A 128-bit integer is in two registers that start at an even one, or in
+                // sixteen bytes of the stack at a multiple of sixteen.
+                let wide = scalar.ty == types::I128 && arch == Arch::Aarch64;
+                if scalar.ty.bytes() > 8 && !wide {
                     unsupported!("`va_arg` of {dst_ty:?}");
                 }
                 let float = scalar.ty.is_float();
-                let step = if float { VariadicRegisters::FLOAT_BYTES } else { 8 };
+                let step = match (float, wide) {
+                    (true, _) => VariadicRegisters::FLOAT_BYTES,
+                    (false, true) => 16,
+                    (false, false) => 8,
+                };
                 let (list, _) = self.load_scalar(list)?;
                 let [saved, stack, done] = [(); 3].map(|()| self.builder.create_block());
                 self.builder.append_block_param(done, ptr());
@@ -8933,19 +9078,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // The list counts up to zero, from the end of what was saved.
                     let (at, end) = if float { (28, 16) } else { (24, 8) };
                     let offset = self.builder.ins().load(types::I32, MEM, list, at);
-                    let fits = self.builder.ins().icmp_imm(
-                        IntCC::SignedLessThanOrEqual,
-                        offset,
-                        -i64::from(step),
-                    );
+                    let some = self.builder.create_block();
+                    let none =
+                        self.builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, offset, 0);
+                    self.builder.ins().brif(none, stack, &[], some, &[]);
+
+                    // What does not fit in the registers left takes them out of use.
+                    self.builder.switch_to_block(some);
+                    let offset = match wide {
+                        true => {
+                            let up = self.builder.ins().iadd_imm(offset, 15);
+                            self.builder.ins().band_imm(up, -16)
+                        }
+                        false => offset,
+                    };
+                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
+                    self.builder.ins().store(MEM, next, list, at);
+                    let fits = self.builder.ins().icmp_imm(IntCC::SignedLessThanOrEqual, next, 0);
                     self.builder.ins().brif(fits, saved, &[], stack, &[]);
 
                     self.builder.switch_to_block(saved);
                     let area = self.builder.ins().load(ptr(), MEM, list, end);
-                    let wide = self.builder.ins().sextend(ptr(), offset);
-                    let from = self.builder.ins().iadd(area, wide);
-                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
-                    self.builder.ins().store(MEM, next, list, at);
+                    let far = self.builder.ins().sextend(ptr(), offset);
+                    let from = self.builder.ins().iadd(area, far);
                     self.builder.ins().jump(done, &[from.into()]);
                     0
                 } else {
@@ -8976,7 +9131,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
                 self.builder.switch_to_block(stack);
                 let from = self.builder.ins().load(ptr(), MEM, list, stack_at);
-                let next = self.builder.ins().iadd_imm(from, 8);
+                let from = match wide {
+                    true => {
+                        let up = self.builder.ins().iadd_imm(from, 15);
+                        self.builder.ins().band_imm(up, -16)
+                    }
+                    false => from,
+                };
+                let next = self.builder.ins().iadd_imm(from, if wide { 16 } else { 8 });
                 self.builder.ins().store(MEM, next, list, stack_at);
                 self.builder.ins().jump(done, &[from.into()]);
 
