@@ -63,7 +63,7 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
 
     // test block_items
     // fn a() { fn b() {} }
-    let m = match items::opt_item(p, m, false) {
+    let m = match items::opt_item(p, m, false, false) {
         Ok(()) => return,
         Err(m) => m,
     };

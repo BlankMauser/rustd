@@ -38,8 +38,8 @@ impl<'db> InferenceContext<'db> {
                                 PlaceOp::Deref,
                             ) {
                                 self.table.register_predicates(infer_ok.obligations);
+                                *d = OverloadedDeref(mutability);
                             }
-                            *d = OverloadedDeref(mutability);
                         }
                     }
                     Adjust::Borrow(b) => match b {

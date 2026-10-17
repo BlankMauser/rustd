@@ -48,7 +48,7 @@ use hir_def::{
 };
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_symbol, link_name,
+    exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -330,25 +330,42 @@ impl Resolver<'_> {
         generic(hir::Impl::from(imp).into())
     }
 
-    /// rustc's `StableCrateId` of a crate it built something of.
+    /// rustc's `StableCrateId` of a crate it built something of. A crate of the checkout is
+    /// one rustc built when a file of the link is its own: the standard library has private
+    /// copies of crates (memchr, hashbrown) whose names a dependency at a path has too.
     fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let ours = !krate.data(self.db).origin.is_lang();
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+        let root = self.crate_root(krate)?;
+        if ours && !self.table.links(name.crate_name().as_str(), &root) {
+            return None;
+        }
+        self.table.stable_crate_id(name.crate_name().as_str(), &root)
+    }
+
+    /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
+    /// of is spelled with its own id, so that no symbol of another crate of its name (the
+    /// standard library's memchr) is taken for one of its items.
+    fn crate_path(&self, krate: Crate) -> Option<String> {
+        let name = krate.display_name(self.db)?;
+        match self.own_crate_id(krate.into()) {
+            Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
+            None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
+        }
     }
 
     /// What stands for a crate of the checkout that rustc built nothing of, the same after
     /// every edit: its name and where in the checkout its source starts.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+        if krate.data(self.db).origin.is_lang() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
         let name = Crate::from(krate).display_name(self.db)?;
         let root = self.crate_root(krate.into())?;
         let root = self.inside(&root).unwrap_or(&root);
         let named = format!("rustd crate {} {}", name.crate_name(), root.display());
-        let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
-        Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
+        Some(short_hash(&named))
     }
 
     /// The file the crate's source starts at.
@@ -408,11 +425,7 @@ impl Resolver<'_> {
     /// function, closure, constant or static the block is in, which only the syntax knows.
     fn scope_path(&self, module: Module) -> Option<String> {
         if module.nearest_non_block_module(self.db) == module {
-            let krate = module.krate(self.db);
-            let krate_name = krate.display_name(self.db)?;
-            let mut path = self
-                .table
-                .crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
+            let mut path = self.crate_path(module.krate(self.db))?;
             for segment in module.path_segments(self.db) {
                 path.push_str("::");
                 path.push_str(segment.as_str());
@@ -631,18 +644,25 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = symbol {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name, unless an
-        // `extern` block declares it, and it is defined elsewhere under the name it links to.
+        // rustc has built nothing of the crate: the function is ours to name, unless it is
+        // declared in an `extern` block, where what it links to names it.
+        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
+            return None;
+        }
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
-        if let Some(symbol) = link_name(self.db, func) {
-            return Some(symbol);
+        match hir_ty::mir::codegen::block_place(self.db, self, func) {
+            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
+            None => Some(format!("rustd.{id:x}.{path}")),
         }
-        Some(format!("rustd.{id:x}.{path}"))
     }
 
     fn defines(&self, symbol: &str) -> bool {
         self.table.defines(symbol)
+    }
+
+    fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
+        self.own_crate_id(krate).is_none()
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
@@ -798,6 +818,12 @@ impl SymbolResolver for Resolver<'_> {
     }
 }
 
+/// The first eight bytes of the SHA-256 of a text.
+fn short_hash(text: &str) -> u64 {
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes());
+    u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
+}
+
 /// Whether rustc numbers the node as a closure: a closure, or an `async` block.
 fn is_closure(node: &SyntaxNode) -> bool {
     ast::ClosureExpr::can_cast(node.kind())
@@ -890,17 +916,7 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
-    let is_file = krate.ends_with(".rs");
-    let mut found: Vec<_> = Crate::all(db)
-        .into_iter()
-        .filter(|it| match is_file {
-            // Named from the checkout, or in full.
-            true => crate_root_file(db, *it).is_some_and(|root| {
-                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
-            }),
-            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
-        })
-        .collect();
+    let mut found = crates_called(db, krate, args);
     // A dependency may be another version of the crate being built, and another checkout
     // has a crate of its name too.
     let of_checkout = |krate: &Crate| args.members.contains(&(*krate).into());
@@ -909,6 +925,40 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
     }
     anyhow::ensure!(!found.is_empty(), "crate {krate} not found in workspace");
     Ok(found)
+}
+
+/// Every crate called `krate`, of the checkout or not.
+fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
+    let is_file = krate.ends_with(".rs");
+    Crate::all(db)
+        .into_iter()
+        .filter(|it| match is_file {
+            // Named from the checkout, or in full.
+            true => crate_root_file(db, *it).is_some_and(|root| {
+                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+            }),
+            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        })
+        .collect()
+}
+
+/// The crates called `krate` to build: the ones rustc built into this program, when it built
+/// any, which may be a crate of the checkout and a dependency of the same name both. Otherwise
+/// what `crates_named` finds.
+fn crates_to_build(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    krate: &str,
+    args: &Args,
+) -> anyhow::Result<Vec<Crate>> {
+    let linked = |krate: &Crate| {
+        let name = krate.display_name(db);
+        let root = crate_root_file(db, *krate);
+        name.zip(root).is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+    };
+    let mut called = crates_called(db, krate, args);
+    called.retain(linked);
+    if called.is_empty() { crates_named(db, krate, args) } else { Ok(called) }
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -1774,18 +1824,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        let mut named = crates_named(db, krate, args)?;
-        // Of the crates of the name, the ones rustc built into this program, when it built any.
-        let linked = |krate: &Crate| {
-            let name = krate.display_name(db);
-            let root = crate_root_file(db, *krate);
-            name.zip(root)
-                .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
-        };
-        if named.iter().any(linked) {
-            named.retain(linked);
-        }
-        for krate in named {
+        for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
             let listed = listed.of(db, krate);
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
