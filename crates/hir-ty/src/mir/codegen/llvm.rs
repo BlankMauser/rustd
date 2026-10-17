@@ -9,12 +9,13 @@
 //! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
 //! compiled by Cranelift instead.
 
-use std::{cell::RefCell, collections::hash_map::Entry, fmt};
+use std::{cell::RefCell, collections::hash_map::Entry, fmt, sync::Once};
 
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     OptimizationLevel,
     context::Context,
+    llvm_sys::support::LLVMParseCommandLineOptions,
     passes::PassBuilderOptions,
     targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
@@ -102,6 +103,20 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| format!("inline assembly: {e}"))
 }
 
+/// Turns LLVM's SLP vectorizer off for the process. LLVM 20.1's makes one store of several
+/// equal rows of an array of `i128` with lanes of it left as poison, so that part of the
+/// array is never written (`breakers/cases/src/repeat_rows.rs`). The `default<O2>` pipeline
+/// turns the pass on whatever its options say, which leaves the flag the pass itself reads.
+fn disable_slp_vectorizer() {
+    static DISABLED: Once = Once::new();
+    DISABLED.call_once(|| {
+        let arguments = [c"rustd".as_ptr(), c"-vectorize-slp=false".as_ptr()];
+        // SAFETY: the two arguments are C strings that outlive the call, and LLVM is given
+        // their number.
+        unsafe { LLVMParseCommandLineOptions(2, arguments.as_ptr(), std::ptr::null()) }
+    });
+}
+
 impl Optimization {
     fn pipeline(self) -> Option<&'static str> {
         match self.passes {
@@ -164,6 +179,7 @@ impl Machine {
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
+        disable_slp_vectorizer();
         match emitted.arch {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),

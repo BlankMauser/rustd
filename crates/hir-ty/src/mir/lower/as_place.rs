@@ -222,13 +222,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Expr::Index { base, index } => {
                 let base_ty = self.expr_ty_after_adjustments(*base);
-                let index_ty = self.expr_ty_after_adjustments(*index);
-                if !matches!(index_ty.kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize))
-                    || !matches!(
-                        base_ty.strip_reference().kind(),
-                        TyKind::Array(..) | TyKind::Slice(..)
-                    )
-                {
+                if !is_builtin_index(self.infer, *base, *index) {
                     let Some(index_fn) = self.infer.method_resolution(expr_id) else {
                         return Err(MirLowerError::UnresolvedMethod(
                             "[overloaded index]".to_owned(),

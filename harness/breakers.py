@@ -19,6 +19,8 @@ OPEN = {
     "future_unwind_flags",
     "fragment_edition_through_macro",
     "assert_long_expression",
+    "assert_message",
+    "unreachable_arm_move",
 }
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
 LEFT = {"caller_in_constant", "empty_array_by_impl"}
