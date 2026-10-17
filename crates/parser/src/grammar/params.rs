@@ -98,6 +98,10 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
         // extern "C" { fn printf(format: *const i8, ..., _: u8) -> i32; }
         Flavor::FnDef | Flavor::FnPointer if p.eat(T![...]) => {}
 
+        // test fn_def_param_unnamed_2015 2015
+        // trait T { fn f(&self, Self, &u8, Vec<u8>, x: u8, mut y: u8, (a, b): (u8, u8), S(c): S); }
+        Flavor::FnDef if is_unnamed_param(p) => types::type_(p),
+
         // test fn_def_param
         // fn foo(..., (x, y): (i32, i32)) {}
         Flavor::FnDef => {
@@ -144,6 +148,22 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
         }
     }
     m.complete(p, PARAM);
+}
+
+/// Whether a parameter of a function is only its type, which the 2015 edition takes in a
+/// trait. rustc tells by the name and colon a named one starts with; what else may start the
+/// pattern a function with a body has is taken for one.
+fn is_unnamed_param(p: &Parser<'_>) -> bool {
+    const PATTERN_ONLY_FIRST: TokenSet = TokenSet::new(&[T!['('], T!['['], T![ref]]);
+    if p.current_edition().at_least_2018() || p.at_ts(PATTERN_ONLY_FIRST) {
+        return false;
+    }
+    let name = usize::from(p.at(T![&]) || p.at(T![mut]));
+    let named = matches!(p.nth(name), IDENT | UNDERSCORE)
+        && p.nth(name + 1) == T![:]
+        && !p.nth_at(name + 1, T![::]);
+    let destructured = p.at(IDENT) && matches!(p.nth(1), T!['('] | T!['{']);
+    !named && !destructured
 }
 
 fn variadic_param(p: &mut Parser<'_>) -> bool {

@@ -1,0 +1,142 @@
+SOURCE_FILE
+  TRAIT
+    COMMENT "// 2015"
+    WHITESPACE "\n"
+    TRAIT_KW "trait"
+    WHITESPACE " "
+    NAME
+      IDENT "T"
+    WHITESPACE " "
+    ASSOC_ITEM_LIST
+      L_CURLY "{"
+      WHITESPACE " "
+      FN
+        FN_KW "fn"
+        WHITESPACE " "
+        NAME
+          IDENT "f"
+        PARAM_LIST
+          L_PAREN "("
+          SELF_PARAM
+            AMP "&"
+            NAME
+              SELF_KW "self"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    SELF_TYPE_KW "Self"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            REF_TYPE
+              AMP "&"
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "Vec"
+                  GENERIC_ARG_LIST
+                    L_ANGLE "<"
+                    TYPE_ARG
+                      PATH_TYPE
+                        PATH
+                          PATH_SEGMENT
+                            NAME_REF
+                              IDENT "u8"
+                    R_ANGLE ">"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            IDENT_PAT
+              NAME
+                IDENT "x"
+            COLON ":"
+            WHITESPACE " "
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            IDENT_PAT
+              MUT_KW "mut"
+              WHITESPACE " "
+              NAME
+                IDENT "y"
+            COLON ":"
+            WHITESPACE " "
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            TUPLE_PAT
+              L_PAREN "("
+              IDENT_PAT
+                NAME
+                  IDENT "a"
+              COMMA ","
+              WHITESPACE " "
+              IDENT_PAT
+                NAME
+                  IDENT "b"
+              R_PAREN ")"
+            COLON ":"
+            WHITESPACE " "
+            TUPLE_TYPE
+              L_PAREN "("
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+              COMMA ","
+              WHITESPACE " "
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+              R_PAREN ")"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            TUPLE_STRUCT_PAT
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "S"
+              L_PAREN "("
+              IDENT_PAT
+                NAME
+                  IDENT "c"
+              R_PAREN ")"
+            COLON ":"
+            WHITESPACE " "
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "S"
+          R_PAREN ")"
+        SEMICOLON ";"
+      WHITESPACE " "
+      R_CURLY "}"
+  WHITESPACE "\n"

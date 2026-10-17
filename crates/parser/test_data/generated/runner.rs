@@ -271,6 +271,13 @@ mod ok {
     #[test]
     fn fn_def_param() { run_and_expect_no_errors("test_data/parser/inline/ok/fn_def_param.rs"); }
     #[test]
+    fn fn_def_param_unnamed_2015() {
+        run_and_expect_no_errors_with_edition(
+            "test_data/parser/inline/ok/fn_def_param_unnamed_2015.rs",
+            crate::Edition::Edition2015,
+        );
+    }
+    #[test]
     fn fn_pointer_param_ident_path() {
         run_and_expect_no_errors("test_data/parser/inline/ok/fn_pointer_param_ident_path.rs");
     }
