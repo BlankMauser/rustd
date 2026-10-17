@@ -84,6 +84,10 @@ less work than cargo. Get things working first, then optimise.
   build, a build with nothing changed and four kinds of edit against cargo, with the daemon's
   peak memory and whether each edit was spliced. Writes JSON; `--compare BASELINE` fails over a
   threshold. Results are in `PERF.md`.
+- `harness/fuzz/fuzz.py smoke` and `fuzz.py run --seed S --rounds N`: programs made by
+  `harness/fuzz/gen.py` from a seed, built by cargo and by rustd under each backend, and run. A
+  case whose output differs, a function left to rustc or a rustd crash is reduced and written to
+  `harness/fuzz/found/`. What it has found is in [FUZZ.md](FUZZ.md).
 - A Cranelift panic costs one function (reported as `backend panic`), not the run.
 
 Bugs it has found so far:
