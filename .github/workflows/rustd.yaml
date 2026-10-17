@@ -108,6 +108,8 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          # Generated programs on fixed seeds. Only x86-64 has been fuzzed so far.
+          if [ "$(uname -m)" = x86_64 ]; then run fuzz/fuzz.py smoke --backends "$RUSTD_BACKEND"; fi
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
