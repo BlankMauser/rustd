@@ -4957,9 +4957,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let forwarded = forwarded_temps(body);
         let used = used_locals(body);
+        let renamed = renamed_temps(body, &forwarded, |local| {
+            has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
+                != DropGlue::None
+        });
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local)
                 || forwarded.contains_key(&local)
+                || renamed.contains_key(&local)
                 || !used.contains(&local)
             {
                 continue;
@@ -4998,6 +5003,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         for (temp, to) in forwarded {
             self.locals.insert(temp, self.locals[to]);
+        }
+        for (&temp, &of) in &renamed {
+            self.locals.insert(temp, self.locals[of]);
         }
         let mut frame_flags = Vec::new();
         let mut kept_flags = Vec::new();
@@ -6494,8 +6502,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         match rvalue {
             Rvalue::Use(operand) => {
                 let (src, ty) = self.operand(operand)?;
-                let size = self.layout(ty)?.size;
-                self.copy(dst, src, size);
+                if src != dst {
+                    let size = self.layout(ty)?.size;
+                    self.copy(dst, src, size);
+                }
             }
             Rvalue::CopyForDeref(place) => {
                 let (src, ty) = self.place(place)?;
@@ -10824,6 +10834,20 @@ fn used_locals(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
 fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
     body.clone().walk_places(|place| *mentions.entry(place.local).or_default() += 1);
+    // Dropping what was passed drops nothing, and a fake read reads nothing.
+    for (_, block) in body.basic_blocks.iter() {
+        let fake = block.statements.iter().filter_map(|it| match &it.kind {
+            StatementKind::FakeRead(place) => Some(place),
+            _ => None,
+        });
+        let dropped = match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Drop { place, .. }) => Some(place),
+            _ => None,
+        };
+        for place in fake.chain(dropped) {
+            *mentions.entry(place.local).or_default() -= 1;
+        }
+    }
     let bound: rustc_hash::FxHashSet<LocalId> = body
         .binding_locals
         .values()
@@ -10857,6 +10881,78 @@ fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The temporaries that are a local under another name, each with that local: `wrap(node)`
+/// moves `node` to a temporary and passes the temporary. A value that is dropped is not copied,
+/// so the local holds nothing once it is moved, and it holds nothing else later when the move
+/// is all that is written to the temporary and the local is written once as well.
+fn renamed_temps(
+    body: &MirBody<'_>,
+    forwarded: &FxHashMap<LocalId, LocalId>,
+    is_dropped: impl Fn(LocalId) -> bool,
+) -> FxHashMap<LocalId, LocalId> {
+    let mut renamed = FxHashMap::default();
+    if body.coroutine.is_some() {
+        return renamed;
+    }
+    let mut writes: FxHashMap<LocalId, usize> =
+        body.param_locals.iter().map(|&it| (it, 1)).collect();
+    let mut moves = Vec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Assign(to, rvalue) => {
+                    *writes.entry(to.local).or_default() += 1;
+                    if let Rvalue::Use(Operand {
+                        kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                        ..
+                    }) = rvalue
+                        && to.projection.as_slice().is_empty()
+                        && from.projection.as_slice().is_empty()
+                    {
+                        moves.push((to.local, from.local));
+                    }
+                }
+                StatementKind::InlineAsm(_) => return renamed,
+                _ => (),
+            }
+        }
+        if let Some(
+            TerminatorKind::Call { destination: place, .. }
+            | TerminatorKind::DropAndReplace { place, .. },
+        ) = block.terminator.as_ref().map(|it| &it.kind)
+        {
+            *writes.entry(place.local).or_default() += 1;
+        }
+    }
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    let once = |local: LocalId| writes.get(&local) == Some(&1);
+    for (temp, of) in moves {
+        if once(temp)
+            && once(of)
+            && !bound.contains(&temp)
+            && !forwarded.contains_key(&temp)
+            && !body.promoted_locals.iter().any(|it| it.0 == of)
+            && is_dropped(temp)
+        {
+            renamed.insert(temp, of);
+        }
+    }
+    // The local may be the temporary of another move itself.
+    let named = |mut local: LocalId| {
+        while let Some(&of) = renamed.get(&local) {
+            local = of;
+        }
+        local
+    };
+    renamed.iter().map(|(&temp, &of)| (temp, named(of))).collect()
 }
 
 /// The local a call returns into, for each block that only that call leads to.

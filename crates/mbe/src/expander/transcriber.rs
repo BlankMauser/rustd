@@ -6,7 +6,6 @@ use span::{Edition, Span};
 use stdx::itertools::Itertools;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
-use super::TokensOrigin;
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
