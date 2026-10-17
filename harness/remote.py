@@ -627,7 +627,9 @@ def stored(top, remote):
     whole, verified, _ = g.cache("verify")
     check("packs the store made one of are not fetched again", first.returncode == 0 and ok and len(g.packs()) < 24
           and out.returncode == 0 and out.stdout.startswith("0 packs") and "in other packs of the store passed over" in out.stdout
-          and packs_fetched(remote) in (0, None) and whole and verified.get("records") == 24, out.stdout.strip()[:100])
+          and packs_fetched(remote) in (0, None) and whole and verified.get("records") == 24,
+          f"{out.stdout.strip()[:100]}; first {first.stdout.strip()[:120]}; merged {collected.get('merged packs')}, "
+          f"{len(g.packs())} packs, {verified.get('records')} records; {out.stderr.strip()[:300]}")
 
     # A pack of the format before this one, listed as what it is and listed as what it is not.
     address, bucket = remote.fresh()

@@ -55,6 +55,12 @@ PROJECTS = {
         run=["--plain", "--color=never", "rustfmt.toml"],
         edits=[("src/bin/bat/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
+    # Its own unit tests: the tests of its commands build projects with the cargo under test.
+    "cargo": dict(
+        repo="rust-lang/cargo", tag="0.99.0",
+        run=["--list"], test=["--lib"],
+        edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
     "hyperfine": dict(
         repo="sharkdp/hyperfine", tag="v1.19.0",
         run=["--help"],
@@ -238,6 +244,10 @@ def project(name, spec, work):
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w").write(mine.stdout + mine.stderr)
             open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w").write(other.stdout + other.stderr)
         print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
+        # What the tests that failed here alone said.
+        said = wrong and re.search(r"^failures:\n(.*?)^failures:", mine.stdout, re.M | re.S)
+        if said:
+            print("".join(f"      {line}\n" for line in said[1].splitlines()[:60]), end="", flush=True)
 
     def runs(label):
         if "serves" in spec:

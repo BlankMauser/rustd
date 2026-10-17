@@ -179,7 +179,13 @@ fn read_lines_within<const LINES: usize>(
     timeout: Duration,
 ) -> io::Result<[String; LINES]> {
     check_peer(stream)?;
-    stream.set_read_timeout(Some(timeout))?;
+    match stream.set_read_timeout(Some(timeout)) {
+        // macOS says so of a socket whose other end is closed already. What that end wrote
+        // before is still read, and the end of it is no wait.
+        Err(error)
+            if cfg!(target_vendor = "apple") && error.kind() == io::ErrorKind::InvalidInput => {}
+        set => set?,
+    }
     let mut lines = BufReader::new(stream.take(longest));
     let mut read = [const { String::new() }; LINES];
     for line in &mut read {
