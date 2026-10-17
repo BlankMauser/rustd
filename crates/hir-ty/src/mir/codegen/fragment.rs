@@ -175,6 +175,8 @@ pub(super) struct Recorder<'db> {
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
     pub(super) target: &'static Target,
+    /// Whether the crate compiling the function has `-C overflow-checks`.
+    pub(super) checked: bool,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -197,11 +199,13 @@ impl<'db> Recorder<'db> {
         db: &'db dyn HirDatabase,
         isa: &'static dyn TargetIsa,
         target: &'static Target,
+        checked: bool,
     ) -> Self {
         Recorder {
             db,
             isa,
             target,
+            checked,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -288,7 +292,8 @@ impl<'db> Recorder<'db> {
             rustc_type_ir::RegionKind::ReBound(..) => region,
             _ => Region::new_erased(interner),
         });
-        let instance = Instance { def, args: args.store() };
+        let checked = super::compiled_checked(self.db, def, args, self.checked);
+        let instance = Instance { def, args: args.store(), checked };
         Ok(self.func(FuncTarget::Instance(instance, env.store()), sig))
     }
 

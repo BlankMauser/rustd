@@ -12,8 +12,7 @@
       "what": "`RUSTFLAGS` of the client is another",
       "env": {
         "RUSTFLAGS": "-C debug-assertions=on"
-      },
-      "expect": "refused"
+      }
     }
   ]
 }

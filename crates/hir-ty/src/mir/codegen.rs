@@ -33,7 +33,7 @@ use hir_def::{
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use la_arena::ArenaMap;
-use rustc_abi::{ExternAbi, Integer, Size};
+use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
@@ -98,8 +98,9 @@ pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArgume
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{
-    Collected, FORMAT as STORE_FORMAT, Stats, StoreDir, Verified, compiles_against, is_pack,
-    limit_from_env, pack_name, parse_size, write_file_whole,
+    Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
+    fetch_missing_with, is_pack, limit_from_env, name_file_whole, pack_format, pack_keys,
+    pack_name, parse_size, write_file_whole,
 };
 mod type_id;
 mod unwind;
@@ -815,6 +816,8 @@ pub struct Phases {
 struct Instance {
     def: InstanceDef,
     args: StoredGenericArgs,
+    /// Whether the crate that compiles it has `-C overflow-checks`: see [`compiled_checked`].
+    checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1101,7 +1104,8 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     let signature = FunctionSignature::of(db, func);
     let (abi, variadic) = (signature.abi, signature.is_varargs());
     let args = GenericArgs::new_from_slice(&[]).store();
-    compile(db, env, Some(body), track_caller(db, func), |fx| {
+    let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
+    compile(db, env, Some(body), track_caller(db, func), checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1119,13 +1123,24 @@ fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
     Some(krate.cfg_options(db).check_atom(&flag))
 }
 
-/// Whether the crates cargo builds have `-C overflow-checks`, when they all agree.
-#[salsa::tracked(returns(copy))]
-fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
-    let crates = base_db::all_crates(db);
-    let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
-    let first = settings.next()?;
-    settings.all(|it| it == first).then_some(first)
+/// Whether the code of `def` that a function compiled with `asking` calls is compiled with
+/// `-C overflow-checks`. rustc compiles a function once, in the crate it is written in, when
+/// it has no generic parameters and is not `#[inline]`; anything else it compiles in each
+/// crate that uses it, with the flags of that crate. What the standard library has of the
+/// first kind and exports no symbol for is compiled by its user too.
+fn compiled_checked(
+    db: &dyn HirDatabase,
+    def: InstanceDef,
+    args: GenericArgs<'_>,
+    asking: bool,
+) -> bool {
+    let InstanceDef::Fn(func) = def else { return asking };
+    let own = args.iter().all(|arg| arg.region().is_some())
+        && !AttrFlags::query(db, func.into()).contains(AttrFlags::IS_INLINE);
+    match crate_checks_overflow(db, func.krate(db)) {
+        Some(checked) if own => checked,
+        _ => asking,
+    }
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -1133,7 +1148,8 @@ fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
 fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
     let krate = main.krate(db);
     let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
-    compile(db, env, None, false, |fx| fx.start_shim(main))
+    let checked = crate_checks_overflow(db, krate).unwrap_or(false);
+    compile(db, env, None, false, checked, |fx| fx.start_shim(main))
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
@@ -1148,7 +1164,7 @@ fn compiled_instance<'db>(
     let ty = || instance.args.as_ref().type_at(0);
     let body = match instance.def {
         InstanceDef::DropGlue => {
-            return compile(db, env, None, false, |fx| {
+            return compile(db, env, None, false, instance.checked, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
                 if std::env::var_os("RUSTD_DUMP_CLIF").is_some() {
@@ -1159,16 +1175,18 @@ fn compiled_instance<'db>(
         }
         InstanceDef::CallOnceShim => {
             let args = instance.args.as_ref();
-            return compile(db, env, None, false, |fx| match args.len() {
+            return compile(db, env, None, false, instance.checked, |fx| match args.len() {
                 1 => fx.call_once_shim(ty()),
                 _ => fx.call_once_by_pointer(args),
             });
         }
         InstanceDef::FnPointerShim => {
-            return compile(db, env, None, false, |fx| fx.fn_pointer_shim(ty()));
+            return compile(db, env, None, false, instance.checked, |fx| fx.fn_pointer_shim(ty()));
         }
         InstanceDef::ReifyShim { receiver } => {
-            return compile(db, env, None, false, |fx| fx.reify_shim(ty(), receiver));
+            return compile(db, env, None, false, instance.checked, |fx| {
+                fx.reify_shim(ty(), receiver)
+            });
         }
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)
@@ -1193,7 +1211,7 @@ fn compiled_instance<'db>(
         }
     };
     let args = instance.args.clone();
-    compile(db, env, Some(body), tracked, |fx| {
+    compile(db, env, Some(body), tracked, instance.checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1641,7 +1659,8 @@ impl TheirStatics {
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
-    let mut cg = Recorder::new(db, &**target()?, selected_target()?);
+    let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
+    let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
     let env =
         ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -1835,7 +1854,7 @@ pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String>
 }
 
 /// The symbol an item of an `extern` block links to.
-fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
         return None;
     };
@@ -1850,10 +1869,11 @@ fn compile<'db>(
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
+    checked: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
-    let mut cg = Recorder::new(db, isa, selected_target()?);
+    let mut cg = Recorder::new(db, isa, selected_target()?, checked);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
@@ -1941,6 +1961,8 @@ fn build<'db>(
         drop_flags: ArenaMap::new(),
         moved_paths: Vec::new(),
         deferred_drops: Vec::new(),
+        at: None,
+        moved_here: None,
         cleanup: None,
         inner_pad: None,
         drop_order: Vec::new(),
@@ -2150,10 +2172,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| {
-                    let checked = build_checks_overflow(db);
-                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked))
-                }),
+                .map(|store| std::sync::Arc::new(cached::Entries::new(store, debugged))),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2498,8 +2517,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed += 1;
             return;
         };
-        let checked = build_checks_overflow(self.db);
-        let Some(key) = cached::Entry::key(&name, debug.is_some(), checked) else { return };
+        let Some(key) = cached::Entry::key(&name, debug.is_some()) else { return };
         let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if !check && store.has(&key) {
             return;
@@ -2526,6 +2544,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
             }
         }
+    }
+
+    /// Whether the instance is compiled with the flags of the crate its function is written
+    /// in, as the copy under the symbol of the function is. A crate that uses an `#[inline]`
+    /// function of another compiles a copy with its own.
+    fn as_its_crate_compiles(&self, instance: &Instance) -> bool {
+        let InstanceDef::Fn(func) = instance.def else { return false };
+        crate_checks_overflow(self.db, func.krate(self.db)).is_none_or(|it| it == instance.checked)
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.
@@ -2576,7 +2602,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
-                if stable::StableNames::of_checkout(&name) && self.root_named(&name).is_some() {
+                if stable::StableNames::of_checkout(&name)
+                    && self.as_its_crate_compiles(callee)
+                    && self.root_named(&name).is_some()
+                {
                     CachedTarget::Root(name.as_ref().to_owned())
                 } else {
                     CachedTarget::Named(name.as_ref().to_owned())
@@ -3119,6 +3148,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
+            && self.as_its_crate_compiles(instance)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
                 || !returns_async_block(self.db, func))
@@ -3694,6 +3724,14 @@ struct Relocations<'a, 'db> {
     defined: FxHashMap<usize, DataId>,
 }
 
+impl Relocations<'_, '_> {
+    /// The alignment to give the data object made for the memory at `start`: what const eval
+    /// made it with, or where it does not say, the most a value could need.
+    fn align_of(&self, start: usize) -> u64 {
+        self.map.align_at(start).map_or(16, |align| align as u64)
+    }
+}
+
 /// Whether a data object can be the same object as another with the same content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum DataIdentity {
@@ -3798,6 +3836,9 @@ impl DropFlag {
     }
 }
 
+/// A field of a local, by the fields that lead to it.
+type FieldOfLocal = (LocalId, Vec<u32>);
+
 struct MovedPath {
     local: LocalId,
     path: Vec<u32>,
@@ -3828,9 +3869,14 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target, and the
-    /// statement the drop is of.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, MirSpan)>,
+    /// The block to generate each `Drop` terminator in, with its place and target, the
+    /// statement the drop is of, and the block of the body it ends.
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, MirSpan, BasicBlockId)>,
+    /// The block of the body being generated.
+    at: Option<BasicBlockId>,
+    /// While a `Drop` terminator is generated: the fields that may be moved out of their
+    /// locals when the body gets to it.
+    moved_here: Option<FxHashSet<FieldOfLocal>>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -4204,6 +4250,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut modes = Vec::new();
         for ty in args {
+            if self.decays_in_c(ty)? {
+                int_regs = int_regs.saturating_sub(1);
+                modes.push(PassMode::Indirect);
+                continue;
+            }
             let mode = self.c_pass_mode(ty)?;
             let (ints, sses) = match mode {
                 PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (0, 0),
@@ -4253,7 +4304,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let (mut ints, mut floats) = (0u8, 0u8);
         let mut modes = Vec::new();
         for ty in args {
-            modes.push(match self.aapcs64_class(ty)? {
+            let class = match self.decays_in_c(ty)? {
+                true => Aapcs64::Memory,
+                false => self.aapcs64_class(ty)?,
+            };
+            modes.push(match class {
                 Aapcs64::Ignore => PassMode::Ignore,
                 Aapcs64::Scalar(scalar) => {
                     let (used, wide) = match scalar.ty {
@@ -4445,6 +4500,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // MSVC passes an argument of no size by reference.
             return Ok(if is_ret { PassMode::Ignore } else { PassMode::Indirect });
         }
+        if !is_ret && self.decays_in_c(ty)? {
+            return Ok(PassMode::Indirect);
+        }
         Ok(match (layout.backend_repr, layout.size.bytes()) {
             (BackendRepr::SimdVector { .. }, _) => unsupported!("vector in the C ABI"),
             (BackendRepr::Scalar(scalar), size) if size <= 8 => {
@@ -4459,6 +4517,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (_, 8) => PassMode::Cast(types::I64),
             _ => PassMode::Indirect,
         })
+    }
+
+    /// Whether a C function is handed the address of a `ty` where Rust hands over the value,
+    /// as C does with a `va_list` that is an array. Mirrors rustc's
+    /// `TyAndLayout::pass_indirectly_in_non_rustic_abis`, which looks through transparent
+    /// wrappers for a struct marked `#[rustc_pass_indirectly_in_non_rustic_abis]`.
+    fn decays_in_c(&self, ty: Ty<'db>) -> Result<bool> {
+        let TyKind::Adt(def, subst) = ty.kind() else { return Ok(false) };
+        let AdtId::StructId(id) = def.def_id() else { return Ok(false) };
+        let db = self.cg.db;
+        if AttrFlags::query(db, id.into())
+            .contains(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+        {
+            return Ok(true);
+        }
+        let transparent = AttrFlags::repr(db, id.into())
+            .is_some_and(|repr| repr.flags.contains(ReprFlags::IS_TRANSPARENT));
+        if !transparent {
+            return Ok(false);
+        }
+        for (_, field) in db.field_types(id.into()).iter() {
+            let field = field.ty().instantiate(self.interner, subst).skip_norm_wip();
+            if !self.layout(field)?.is_1zst() {
+                return self.decays_in_c(field);
+            }
+        }
+        Ok(false)
     }
 
     /// How the C ABI passes one value when registers are left for it.
@@ -4819,7 +4904,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn body_types(&self, def: InstanceDef, args: GenericArgs<'db>) -> Result<&'db BodyTypes> {
-        let instance = Instance { def, args: args.store() };
+        // The types of a body are the same however it is compiled.
+        let instance = Instance { def, args: args.store(), checked: false };
         body_types(self.cg.db, instance, self.env.store()).as_ref().map_err(Clone::clone)
     }
 
@@ -5162,6 +5248,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.builder.switch_to_block(self.blocks[id]);
+            self.at = Some(id);
             for statement in &block.statements {
                 self.at(statement.span);
                 match &statement.kind {
@@ -5206,7 +5293,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target, span) in std::mem::take(&mut self.deferred_drops) {
+        let drops = std::mem::take(&mut self.deferred_drops);
+        let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
+            true => FxHashMap::default(),
+            false => self.moved_where_blocks_end(body),
+        };
+        for (block, place, target, span, from) in drops {
+            self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
@@ -5241,6 +5334,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 _ => self.drop_place(&place, target)?,
             }
         }
+        self.moved_here = None;
         // So is dropping a suspended future, which drops the same locals as unwinding does.
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
@@ -5552,16 +5646,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let layout = self.layout(ty)?;
             let mut fields: Vec<_> = fields.into_iter().enumerate().collect();
             if matches!(ty.kind(), TyKind::Array(..)) {
-                // An array that has lost elements drops what is left from the back, except
-                // that a run of whole elements is dropped front to back.
+                // An array that may have lost elements drops what is left from the back,
+                // except that a run of whole elements is dropped front to back.
                 let mut runs: Vec<Vec<(usize, Ty<'db>)>> = Vec::new();
                 let mut in_run = false;
                 for (i, field) in fields {
                     path.push(i as u32);
-                    let whole = !self
-                        .moved_paths
-                        .iter()
-                        .any(|it| it.local == local && it.path.starts_with(path));
+                    let whole = !self.may_have_lost(local, path);
                     path.pop();
                     match runs.last_mut() {
                         Some(run) if whole && in_run => run.push((i, field)),
@@ -5589,6 +5680,83 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         Ok(())
+    }
+
+    /// Whether something may be moved out of the field at `path` of `local` where the drop
+    /// being generated is. Without a place in the body to ask about, anything the function
+    /// moves out anywhere counts.
+    fn may_have_lost(&self, local: LocalId, path: &[u32]) -> bool {
+        self.moved_paths.iter().filter(|it| it.local == local && it.path.starts_with(path)).any(
+            |it| match &self.moved_here {
+                Some(moved) => moved.contains(&(local, it.path.clone())),
+                None => true,
+            },
+        )
+    }
+
+    /// The fields that may be moved out of their locals where each block ends: moved out on
+    /// some way there, and not assigned since.
+    fn moved_where_blocks_end(
+        &self,
+        body: &MirBody<'db>,
+    ) -> FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> {
+        let mut starts: FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> = FxHashMap::default();
+        let mut ends = FxHashMap::default();
+        starts.insert(body.start_block, FxHashSet::default());
+        let mut pending = vec![body.start_block];
+        while let Some(id) = pending.pop() {
+            let mut moved = starts[&id].clone();
+            self.moves_of_block(&body.basic_blocks[id], &mut moved);
+            for next in successors(body, id) {
+                let known = starts.entry(next).or_insert_with(|| {
+                    pending.push(next);
+                    FxHashSet::default()
+                });
+                let before = known.len();
+                known.extend(moved.iter().cloned());
+                if known.len() != before && !pending.contains(&next) {
+                    pending.push(next);
+                }
+            }
+            ends.insert(id, moved);
+        }
+        ends
+    }
+
+    /// Follows a block: adds the fields it moves out to `moved`, and takes out the ones it
+    /// assigns.
+    fn moves_of_block(&self, block: &crate::mir::BasicBlock, moved: &mut FxHashSet<FieldOfLocal>) {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                operands_of(rvalue).into_iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(place, moved);
+            }
+        }
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Call { args, destination, .. }) => {
+                args.iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(destination, moved);
+            }
+            Some(TerminatorKind::DropAndReplace { place, value, .. }) => {
+                self.note_move(value, moved);
+                self.note_assignment(place, moved);
+            }
+            _ => (),
+        }
+    }
+
+    fn note_move(&self, operand: &Operand, moved: &mut FxHashSet<FieldOfLocal>) {
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else { return };
+        if self.drop_flags.contains_idx(place.local) {
+            let paths = self.moved_out_paths(place).unwrap_or_default();
+            moved.extend(paths.into_iter().map(|path| (place.local, path)));
+        }
+    }
+
+    fn note_assignment(&self, place: &StoredPlace, moved: &mut FxHashSet<FieldOfLocal>) {
+        if let Some(path) = self.field_path(place) {
+            moved.retain(|(local, field)| *local != place.local || !field.starts_with(&path));
+        }
     }
 
     /// Field types can still be projections such as `<str as ToOwned>::Owned`.
@@ -6133,7 +6301,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 let at = addr - start;
                 match pointee.kind() {
@@ -6329,7 +6497,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 // What the allocation is of is not known here, so as in a union, every word
                 // of it that is the address of something const eval kept is taken to be one.
@@ -6603,7 +6771,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let (src, ty) = self.operand(operand)?;
                 let size = self.layout(ty)?.size;
-                if len <= 16 {
+                if len == 0 {
+                    // No element takes a moved value, so it ends here. A constant was never made.
+                    if matches!(operand.kind, OperandKind::Move(_)) {
+                        self.drop_value(src, None, ty)?;
+                    }
+                } else if size.bytes() == 0 {
+                    // Elements that take no room are not written, however many there are.
+                } else if len <= 16 {
                     for i in 0..len as u64 {
                         let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
                         self.copy(element, src, size);
@@ -7205,11 +7380,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if written_with == Some(false) || (written_with.is_none() && !inherits) {
             return Ok(false);
         }
-        match build_checks_overflow(db) {
-            Some(checked) => Ok(checked),
-            // The body is compiled by whichever crate uses it, and that is not known here.
-            None => unsupported!("overflow checks differ between the packages of the build"),
-        }
+        Ok(self.cg.checked)
     }
 
     /// Branches to a panic when `overflow` is set, if the body is one that checks.
@@ -7398,7 +7569,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target, self.span));
+                let Some(from) = self.at else { unsupported!("drop outside a block") };
+                self.deferred_drops.push((block, place.clone(), *target, self.span, from));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -8899,10 +9071,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("overflow_checks", []) => {
-                let Some(checked) = build_checks_overflow(self.cg.db) else {
-                    unsupported!("overflow checks differ between the packages of the build");
-                };
-                let value = self.builder.ins().iconst(types::I8, i64::from(checked));
+                let value = self.builder.ins().iconst(types::I8, i64::from(self.cg.checked));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])
@@ -9891,18 +10060,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Drops every local that holds a value. Each is dropped at where `ends` has it, if that is
     /// given, and where the code being generated is otherwise.
     fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
-        // Locals the body never drops come first, last declared first, and of those the
-        // operands of the expression that unwound before the temporaries it borrowed, which
-        // live to the end of the statement. The rest go in the order the body drops them when
-        // nothing unwinds, which is innermost scope first.
-        let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
-        locals.reverse();
-        let rank = |local: &LocalId| match self.drop_order.iter().position(|it| it == local) {
-            Some(at) => at + 2,
-            None => !self.operand_temps.contains(local) as usize,
-        };
-        locals.sort_by_key(rank);
-        for local in locals {
+        for local in self.unwinding_order() {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
@@ -9928,6 +10086,37 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         ends
+    }
+
+    /// The locals with a drop flag in the order a landing pad drops them.
+    fn unwinding_order(&self) -> Vec<LocalId> {
+        let body = self.body.expect("MIR body");
+        let named: rustc_hash::FxHashSet<LocalId> =
+            body.binding_locals.values().chain(&body.param_locals).copied().collect();
+        let flagged = |local: &LocalId| self.drop_flags.contains_idx(*local);
+        let mut undropped: Vec<LocalId> = self
+            .drop_flags
+            .iter()
+            .map(|(local, _)| local)
+            .filter(|local| !self.drop_order.contains(local))
+            .collect();
+        undropped.reverse();
+        // Temporaries the body never drops are moved by the expression that made them, so one
+        // that still holds a value belongs to the expression that unwound: its operands come
+        // first, before the temporaries it borrowed, which live to the end of the statement.
+        // The rest go in the order the body drops them when nothing unwinds, which is innermost
+        // scope first.
+        let (variables, mut order): (Vec<LocalId>, Vec<LocalId>) =
+            undropped.into_iter().partition(|local| named.contains(local));
+        order.sort_by_key(|local| !self.operand_temps.contains(local));
+        order.extend(self.drop_order.iter().copied().filter(flagged));
+        // A variable the body never drops is in a scope no path leaves by its end. It goes
+        // after what its scope holds and before the variables declared ahead of it.
+        for variable in variables {
+            let outer = order.iter().position(|it| named.contains(it) && *it < variable);
+            order.insert(outer.unwrap_or(order.len()), variable);
+        }
+        order
     }
 
     fn store_state(&mut self, state: Value, ty: Type, value: i64) {
@@ -10882,23 +11071,41 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
     forwarded
 }
 
-fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
-    let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
-        match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
-            Some(
-                TerminatorKind::Goto { target }
-                | TerminatorKind::Drop { target, .. }
-                | TerminatorKind::DropAndReplace { target, .. }
-                | TerminatorKind::Assert { target, .. }
-                | TerminatorKind::FalseEdge { real_target: target, .. }
-                | TerminatorKind::FalseUnwind { real_target: target, .. },
-            ) => vec![*target],
-            Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
-            Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
-            _ => Vec::new(),
+/// The blocks a block goes on to when nothing unwinds.
+fn successors(body: &MirBody<'_>, id: BasicBlockId) -> Vec<BasicBlockId> {
+    match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+        Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
+        Some(
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::DropAndReplace { target, .. }
+            | TerminatorKind::Assert { target, .. }
+            | TerminatorKind::FalseEdge { real_target: target, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, .. },
+        ) => vec![*target],
+        Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
+        Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
+        _ => Vec::new(),
+    }
+}
+
+/// The operands an rvalue reads.
+fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::UnaryOp(_, it)
+        | Rvalue::Cast(_, it, _)
+        | Rvalue::Repeat(it, _)
+        | Rvalue::Use(it) => {
+            vec![it]
         }
-    };
+        Rvalue::CheckedBinaryOp(_, left, right) => vec![left, right],
+        Rvalue::Aggregate(_, operands) => operands.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
+    let successors = |id| successors(body, id);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut post_order = Vec::new();
     let mut stack = vec![(body.start_block, successors(body.start_block))];

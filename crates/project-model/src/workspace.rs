@@ -414,7 +414,10 @@ impl ProjectWorkspace {
                 .expect("failed to spawn thread");
             let cargo_env = Builder::new()
                 .name("ProjectWorkspace::cargo_env".to_owned())
-                .spawn_scoped(s, move || cargo_config_env(&config_file, &config.extra_env))
+                .spawn_scoped(s, move || {
+                    let told = !config.extra_env_for_commands_only;
+                    cargo_config_env(&config_file, &config.extra_env, told)
+                })
                 .expect("failed to spawn thread");
             thread::Result::Ok((
                 rustc_cfg.join()?,
@@ -432,9 +435,11 @@ impl ProjectWorkspace {
                 Err(e) => std::panic::resume_unwind(e),
             };
 
-        for (key, value) in config.extra_env.iter() {
-            if let Some(value) = value {
-                cargo_env.insert(key.clone(), value.clone());
+        if !config.extra_env_for_commands_only {
+            for (key, value) in config.extra_env.iter() {
+                if let Some(value) = value {
+                    cargo_env.insert(key.clone(), value.clone());
+                }
             }
         }
 
@@ -608,7 +613,8 @@ impl ProjectWorkspace {
             config.no_deps,
         );
         let cargo_script = fetch_metadata.exec(false, &|_| ()).ok().map(|(ws, error)| {
-            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env);
+            let told = !config.extra_env_for_commands_only;
+            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env, told);
             (
                 CargoWorkspace::new(ws, detached_file.clone(), cargo_config_extra_env, false),
                 WorkspaceBuildScripts::default(),

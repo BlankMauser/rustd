@@ -7,7 +7,6 @@
   "steps": [
     {
       "what": "the value in the configuration changes",
-      "expect": "refused",
       "edit": [
         [
           ".cargo/config.toml",

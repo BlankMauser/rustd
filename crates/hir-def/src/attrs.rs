@@ -161,6 +161,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
             match second_segment {
                 None => match &*first_segment {
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
+                    "inline" if !tt.syntax().text().contains_char('n') => {
+                        attr_flags.insert(AttrFlags::IS_INLINE)
+                    }
                     "doc" => extract_doc_tt_attr(attr_flags, tt),
                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
@@ -232,12 +235,16 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
                     "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
+                    "rustc_pass_indirectly_in_non_rustic_abis" => {
+                        attr_flags.insert(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+                    }
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
                     "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
+                    "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
                     "rustc_inherit_overflow_checks" => {
                         attr_flags.insert(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
                     }
@@ -367,6 +374,9 @@ bitflags::bitflags! {
         const RUSTC_PROMOTABLE = 1 << 55;
         const HAS_DEFINE_OPAQUE = 1 << 56;
         const RUSTC_INHERIT_OVERFLOW_CHECKS = 1 << 57;
+        const RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 58;
+        /// `#[inline]` or `#[inline(always)]`: the crates that use the function compile it.
+        const IS_INLINE = 1 << 59;
     }
 }
 
