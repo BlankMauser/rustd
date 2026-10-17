@@ -84,7 +84,8 @@ rustd falls back to cargo, with the reason on one line, for:
   `lto`, `panic = "abort"`, instrumentation: rustd's code is debug-quality and what rustc
   inlined of a function is not replaced by rustd's copy of it;
 - `RUSTFLAGS` and `-C target-cpu`/`target-feature`: the daemon loads the workspace without
-  them;
+  them. `target-feature=+crt-static` alone is served: it says how the C runtime is linked,
+  which the link line and the cfg cargo reports already have;
 - a target rustd does not emit for, or links differently from ELF (the link line is rewritten
   for ELF linkers only so far);
 - a change to a manifest, `Cargo.lock`, `.cargo/config.toml`, the toolchain file;
@@ -175,15 +176,14 @@ Both the daemon's socket and each worker's go through `socket.rs`.
   two daemons started together one gets the lock; the other exits and its client connects to
   the winner. A worker that loses is an error to whoever started it.
 
-Windows. The code compiles the same paths there with `uds-windows`, with the directory
-check and the peer check as no-ops, and I have not run it on Windows. The equivalent there
-is: keep the socket under `%LOCALAPPDATA%\rustd`, whose access control list is inherited
-from the user's profile and admits the user, SYSTEM and Administrators; verify the
-directory's owner SID and DACL with `GetNamedSecurityInfoW` in place of the mode check; and
-for the peer, since AF_UNIX on Windows has no `SO_PEERCRED`, either rely on the directory's
-ACL (what the code does today) or move the transport to a named pipe created with a security
-descriptor for the user's SID and check the client with `GetNamedPipeClientProcessId` and the
-token of that process. The lock file works as it is (`File::try_lock` is `LockFileEx`).
+Windows. The same paths run there over `uds-windows`, with the checks done in
+`socket/windows.rs`. The daemon's directory is refused unless the user owns it and its access
+control list admits nobody but the user, SYSTEM and Administrators (`GetNamedSecurityInfoW`
+in place of the mode check); one the daemon creates is given such a list, protected from
+what its parent would have it inherit, and so is the socket. AF_UNIX on Windows has no
+`SO_PEERCRED`: the peer is found with `SIO_AF_UNIX_GETPEERPID` and the user of its process
+token is compared with the daemon's. The lock file works as it is (`File::try_lock` is
+`LockFileEx`). `WINDOWS.md` has what else `cargo rustd` needed there.
 This is open work, not done.
 
 Tests, in `socket.rs`: `the_directory_and_the_socket_are_the_users_alone`,
@@ -357,9 +357,9 @@ of the crate has (`eprintln!`, `Command::new`), which I left.
   `RUSTFLAGS` are cargo's entirely. Serving them needs the worker keyed by profile and flags
   and the optimised backend checked against rustc's optimised output.
 - The two just differences seen in ten runs are unexplained.
-- Windows and macOS: the entry point is written to compile there (the link plan refuses
-  anything but ELF, so every build would go to cargo) and has not been built or run on
-  either. The Windows socket hardening is described above and not implemented.
+- macOS: the entry point is written to compile there (the link plan refuses a Mach-O link
+  line, so every build would go to cargo) and has not been built or run. Windows x86-64 MSVC
+  is served; `WINDOWS.md` has the results.
 - The peer check is not tested against a second user.
 - Projects were checked with the Cranelift backend only. The LLVM backend was run through
   the regression gate, not through `cargo_rustd.py`.
