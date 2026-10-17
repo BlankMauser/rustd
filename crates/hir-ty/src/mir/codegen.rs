@@ -1760,6 +1760,17 @@ fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The symbol a static of an `extern` block links to.
+fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+    let signature = StaticSignature::of(db, id);
+    if !signature.flags.contains(StaticFlags::EXTERN) {
+        return None;
+    }
+    let name =
+        AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone());
+    Some(name.as_str().to_owned())
+}
+
 /// Builds the IR of one function and runs Cranelift on it.
 fn compile<'db>(
     db: &'db dyn HirDatabase,
@@ -2793,6 +2804,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 self.want_requested(&compiled.requests);
             }
+            return Ok(data);
+        }
+        if let Some(symbol) = static_link_name(db, id) {
+            let thread_local = is_thread_local(db, id);
+            let data = self.module.declare_data(&symbol, Linkage::Import, false, thread_local)?;
+            self.imported_statics.insert(id, data);
             return Ok(data);
         }
         let node = patch::Node::Static(id);
@@ -9280,6 +9297,67 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let cleared = self.builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
                     let value = self.builder.ins().select(cleared, zero, found);
                     self.builder.ins().store(MEM, value, dst, i as i32);
+                }
+            }
+            ("x86.sse2.psad.bw" | "x86.avx2.psad.bw" | "x86.avx512.psad.bw.512", [a, b]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 64 bits are the sum of how far apart eight bytes of the two are.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(8) {
+                    let mut sum = self.builder.ins().iconst(types::I64, 0);
+                    for byte in lane..lane + 8 {
+                        let l = self.builder.ins().load(types::I8, MEM, a, byte);
+                        let r = self.builder.ins().load(types::I8, MEM, b, byte);
+                        let more = self.builder.ins().umax(l, r);
+                        let less = self.builder.ins().umin(l, r);
+                        let apart = self.builder.ins().isub(more, less);
+                        let apart = self.builder.ins().uextend(types::I64, apart);
+                        sum = self.builder.ins().iadd(sum, apart);
+                    }
+                    self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            ("x86.sse2.pmadd.wd" | "x86.avx2.pmadd.wd" | "x86.avx512.pmaddw.d.512", [a, b]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 32 bits are the sum of the products of two pairs of signed words.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(4) {
+                    let mut sum = self.builder.ins().iconst(types::I32, 0);
+                    for word in [lane, lane + 2] {
+                        let l = self.builder.ins().load(types::I16, MEM, a, word);
+                        let r = self.builder.ins().load(types::I16, MEM, b, word);
+                        let l = self.builder.ins().sextend(types::I32, l);
+                        let r = self.builder.ins().sextend(types::I32, r);
+                        let product = self.builder.ins().imul(l, r);
+                        sum = self.builder.ins().iadd(sum, product);
+                    }
+                    self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            (
+                "x86.ssse3.pmadd.ub.sw.128" | "x86.avx2.pmadd.ub.sw" | "x86.avx512.pmaddubs.w.512",
+                [a, b],
+            ) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 16 bits are the saturated sum of two products: an unsigned byte of
+                // `a` by a signed one of `b`.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(2) {
+                    let mut sum = self.builder.ins().iconst(types::I32, 0);
+                    for byte in [lane, lane + 1] {
+                        let l = self.builder.ins().load(types::I8, MEM, a, byte);
+                        let r = self.builder.ins().load(types::I8, MEM, b, byte);
+                        let l = self.builder.ins().uextend(types::I32, l);
+                        let r = self.builder.ins().sextend(types::I32, r);
+                        let product = self.builder.ins().imul(l, r);
+                        sum = self.builder.ins().iadd(sum, product);
+                    }
+                    let most = self.builder.ins().iconst(types::I32, i64::from(i16::MAX));
+                    let least = self.builder.ins().iconst(types::I32, i64::from(i16::MIN));
+                    let sum = self.builder.ins().smin(sum, most);
+                    let sum = self.builder.ins().smax(sum, least);
+                    let sum = self.builder.ins().ireduce(types::I16, sum);
+                    self.builder.ins().store(MEM, sum, dst, lane);
                 }
             }
             ("x86.xgetbv", [register]) => {
