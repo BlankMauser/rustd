@@ -52,4 +52,5 @@ cases![
     unmatched_array_drop,
     for_tail_temporaries,
     if_let_temporaries,
+    guard_subslice_restored,
 ];

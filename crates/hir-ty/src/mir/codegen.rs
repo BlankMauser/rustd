@@ -5141,10 +5141,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.moved_out_paths(place).is_none_or(|paths| paths.iter().any(is_moved))
     }
 
-    /// Says that the fields of `place` are all there again, after an assignment to it.
+    /// Says that the fields of `place` are all there again, after an assignment to it. A
+    /// subslice of an array is its elements, as it is for a move out.
     fn clear_moved(&mut self, place: &StoredPlace) {
         if !self.drop_flags.contains_idx(place.local)
-            || self.field_path(place).is_none_or(|it| it.is_empty())
+            || self.moved_out_paths(place).is_none_or(|it| it.iter().any(Vec::is_empty))
         {
             return;
         }
@@ -5157,11 +5158,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn clear_moved_now(&mut self, place: &StoredPlace) {
-        let (Some(&flag), Some(path)) = (self.drop_flags.get(place.local), self.field_path(place))
+        let (Some(&flag), Some(paths)) =
+            (self.drop_flags.get(place.local), self.moved_out_paths(place))
         else {
             return;
         };
-        let within = |it: &&MovedPath| it.local == place.local && it.path.starts_with(&path);
+        let within = |it: &&MovedPath| {
+            it.local == place.local && paths.iter().any(|path| it.path.starts_with(path))
+        };
         let mask = self.moved_paths.iter().filter(within).fold(0u64, |mask, it| mask | 1 << it.bit);
         if mask != 0 {
             let state = flag.load(&mut self.builder);
