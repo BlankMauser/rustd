@@ -87,6 +87,7 @@ mod backend;
 pub use backend::Backend;
 mod cached;
 mod debuginfo;
+pub use debuginfo::Sidecar;
 mod float_pair;
 mod fragment;
 mod home;
@@ -155,6 +156,12 @@ pub trait SymbolResolver {
     /// The directory the names of [`Self::source_path`] are relative to, when the build is
     /// to tell a debugger where its code comes from.
     fn debug_directory(&self) -> Option<String> {
+        None
+    }
+    /// The file a debugger reads the entries of the code from, when the build keeps them
+    /// apart from what it links: the object itself, which has them in sections a linker
+    /// leaves out.
+    fn debug_apart(&self) -> Option<String> {
         None
     }
     /// Whether a debugger is told of the variables of the code too, and not of its lines
@@ -298,6 +305,8 @@ pub struct CodegenUnit {
     /// With [`Rejections::patching`], an object to link ahead of the last `object`: its
     /// definitions replace those of the same name there.
     pub patch: Option<Vec<u8>>,
+    /// The files that go with `object`: what a debugger reads that is kept apart from it.
+    pub apart: Vec<Sidecar>,
     /// Roots that were compiled, with their exported symbol.
     pub compiled: Vec<(FunctionId, String)>,
     /// Roots that have to come from rustc.
@@ -374,6 +383,7 @@ impl CodegenUnit {
                 let unit = CodegenUnit {
                     object: None,
                     patch: Some(patch.object),
+                    apart: Vec::new(),
                     compiled: base.compiled.clone(),
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
@@ -559,13 +569,14 @@ impl CodegenUnit {
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
                 let start = stdx::time::Instant::now();
-                let object = cg.finish()?;
+                let (object, apart) = cg.finish()?;
                 stats.phases.object = start.elapsed();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
                 let patch = if patching { Some(patch::empty_object()?) } else { None };
                 return Ok(CodegenUnit {
                     object: Some(object),
                     patch,
+                    apart,
                     compiled,
                     skipped,
                     instances,
@@ -2216,8 +2227,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
+        // A patch is added to a program that is linked already, and is read with it.
+        let apart = symbols.debug_apart().filter(|_| base.is_none());
         let debug = symbols.debug_directory().and_then(|directory| {
-            DebugContext::new(module.isa(), &directory, symbols.describes_variables())
+            DebugContext::new(module.isa(), &directory, symbols.describes_variables(), apart)
         });
         let debugged = debug.is_some();
         Ok(ObjectCodegen {
@@ -2282,17 +2295,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         })
     }
 
-    fn finish(mut self) -> Result<Vec<u8>> {
+    /// The object, and the files of what a debugger reads that is kept apart from it.
+    fn finish(mut self) -> Result<(Vec<u8>, Vec<Sidecar>)> {
         if Target::current().writes_wasm_objects() {
-            return self.finish_wasm();
+            return Ok((self.finish_wasm()?, Vec::new()));
         }
         self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
-        if let Some(debug) = self.debug {
-            debug.emit(&mut product).map_err(CodegenError::Backend)?;
-        }
-        product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
+        let apart = match self.debug {
+            Some(debug) => debug.emit(&mut product).map_err(CodegenError::Backend)?,
+            None => Vec::new(),
+        };
+        let object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        Ok((object, apart))
     }
 
     /// The object as a relocatable wasm object. Nothing unwinds there, so there are no

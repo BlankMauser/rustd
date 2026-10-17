@@ -11,6 +11,7 @@
 //! A variable is told of when it is kept in one slot of the frame for as long as the function
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
+mod split;
 mod types;
 
 pub(super) use types::Types;
@@ -18,16 +19,17 @@ pub(super) use types::Types;
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
-        self, DW_AT_artificial, DW_AT_byte_size, DW_AT_comp_dir, DW_AT_const_value, DW_AT_count,
-        DW_AT_data_member_location, DW_AT_decl_file, DW_AT_decl_line, DW_AT_discr,
-        DW_AT_discr_value, DW_AT_encoding, DW_AT_enum_class, DW_AT_frame_base, DW_AT_high_pc,
-        DW_AT_language, DW_AT_linkage_name, DW_AT_location, DW_AT_low_pc, DW_AT_name,
-        DW_AT_producer, DW_AT_ranges, DW_AT_stmt_list, DW_AT_type, DW_TAG_array_type,
-        DW_TAG_base_type, DW_TAG_enumeration_type, DW_TAG_enumerator, DW_TAG_formal_parameter,
-        DW_TAG_lexical_block, DW_TAG_member, DW_TAG_namespace, DW_TAG_pointer_type,
-        DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type,
-        DW_TAG_template_type_parameter, DW_TAG_union_type, DW_TAG_variable, DW_TAG_variant,
-        DW_TAG_variant_part, DwAte, Encoding, Format, LineEncoding, RunTimeEndian, SectionId,
+        self, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_artificial, DW_AT_byte_size,
+        DW_AT_comp_dir, DW_AT_const_value, DW_AT_count, DW_AT_data_member_location,
+        DW_AT_decl_file, DW_AT_decl_line, DW_AT_discr, DW_AT_discr_value, DW_AT_encoding,
+        DW_AT_enum_class, DW_AT_frame_base, DW_AT_high_pc, DW_AT_language, DW_AT_linkage_name,
+        DW_AT_location, DW_AT_low_pc, DW_AT_name, DW_AT_producer, DW_AT_ranges, DW_AT_stmt_list,
+        DW_AT_type, DW_TAG_array_type, DW_TAG_base_type, DW_TAG_enumeration_type,
+        DW_TAG_enumerator, DW_TAG_formal_parameter, DW_TAG_lexical_block, DW_TAG_member,
+        DW_TAG_namespace, DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_subprogram,
+        DW_TAG_subrange_type, DW_TAG_template_type_parameter, DW_TAG_union_type, DW_TAG_variable,
+        DW_TAG_variant, DW_TAG_variant_part, DwAte, Encoding, Format, LineEncoding, RunTimeEndian,
+        SectionId,
         write::{
             Address, AttributeValue, DwarfUnit, EndianVec, Expression, FileId, LineProgram,
             LineString, Location, LocationList, Range, RangeList, Result as WriteResult, Sections,
@@ -45,8 +47,9 @@ use cranelift_object::{
         write::{Relocation, SymbolId},
     },
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use serde_derive::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 
 /// The statement the code of a function is of from `offset` on, as an index into the
 /// statements the function was built from.
@@ -377,10 +380,17 @@ pub(super) struct DebugContext {
     dwarf: DwarfUnit,
     /// The units that have all their functions.
     full: Vec<gimli::write::Unit>,
+    /// What the names of the files the entries of the units are read from start with, when
+    /// they are kept apart from what is linked, and the units that are.
+    apart: Option<(String, Vec<split::Apart>)>,
+    /// What tells the unit functions are being added to from another: what was added.
+    id: FxHasher,
     encoding: Encoding,
     directory: Vec<u8>,
     files: FxHashMap<String, FileId>,
     ranges: Vec<Range>,
+    /// The addresses the entries of a unit kept apart name by their place in this list.
+    addresses: Vec<Address>,
     types: FxHashMap<SharedType, UnitEntryId>,
     /// The modules and functions of the unit that a type is written in, by their paths.
     namespaces: FxHashMap<String, UnitEntryId>,
@@ -406,7 +416,14 @@ impl DebugContext {
     /// The unit of an object for `isa` whose files are named from `directory`, or `None`
     /// where the tables are not written yet: only ELF has them. The variables of the
     /// functions are left out unless `variables` asks for them.
-    pub(super) fn new(isa: &dyn TargetIsa, directory: &str, variables: bool) -> Option<Self> {
+    /// Their entries are kept apart from what is linked when `apart` names the file a
+    /// debugger reads them from.
+    pub(super) fn new(
+        isa: &dyn TargetIsa,
+        directory: &str,
+        variables: bool,
+        apart: Option<String>,
+    ) -> Option<Self> {
         if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf
             || super::Target::current().is_wasm()
         {
@@ -417,6 +434,9 @@ impl DebugContext {
         let mut context = DebugContext {
             dwarf: DwarfUnit::new(encoding),
             full: Vec::new(),
+            apart: apart.map(|name| (name, Vec::new())),
+            id: FxHasher::default(),
+            addresses: Vec::new(),
             encoding,
             directory: directory.as_bytes().to_vec(),
             files: FxHashMap::default(),
@@ -440,16 +460,29 @@ impl DebugContext {
             LineString::String(b"<rustd>".to_vec()),
             None,
         );
-        let producer = dwarf.strings.add(concat!("rustd ", env!("CARGO_PKG_VERSION")));
-        let name = dwarf.strings.add("<rustd>");
-        let directory = dwarf.strings.add(self.directory.clone());
-        let root = dwarf.unit.get_mut(dwarf.unit.root());
-        root.set(DW_AT_producer, AttributeValue::StringRef(producer));
+        let producer = self.text(concat!("rustd ", env!("CARGO_PKG_VERSION")).as_bytes());
+        let name = self.text(b"<rustd>");
+        let directory = self.text(&self.directory.clone());
+        let unit = &mut self.dwarf.unit;
+        let root = unit.get_mut(unit.root());
+        root.set(DW_AT_producer, producer);
         root.set(DW_AT_language, AttributeValue::Language(gimli::DW_LANG_Rust));
-        root.set(DW_AT_name, AttributeValue::StringRef(name));
-        root.set(DW_AT_comp_dir, AttributeValue::StringRef(directory));
-        root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
-        root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
+        root.set(DW_AT_name, name);
+        // Where the code and its lines are is the skeleton's to say of a unit kept apart.
+        if self.apart.is_none() {
+            root.set(DW_AT_comp_dir, directory);
+            root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
+            root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
+        }
+    }
+
+    /// A name as an entry has it: among the strings of the object, or in the entry itself
+    /// when it is kept apart, where there are no strings to share.
+    fn text(&mut self, text: &[u8]) -> AttributeValue {
+        match self.apart {
+            Some(_) => AttributeValue::String(text.to_vec()),
+            None => AttributeValue::StringRef(self.dwarf.strings.add(text)),
+        }
     }
 
     /// Ends the unit functions were added to, which is left out when it has none, and
@@ -458,6 +491,7 @@ impl DebugContext {
         let next = gimli::write::Unit::new(self.encoding, LineProgram::none());
         let mut unit = std::mem::replace(&mut self.dwarf.unit, next);
         let ranges = std::mem::take(&mut self.ranges);
+        let id = std::mem::take(&mut self.id).finish();
         self.files.clear();
         self.types.clear();
         self.namespaces.clear();
@@ -465,8 +499,18 @@ impl DebugContext {
         if ranges.is_empty() {
             return;
         }
-        let ranges = unit.ranges.add(RangeList(ranges));
         let root = unit.root();
+        let addresses = std::mem::take(&mut self.addresses);
+        if let Some((name, apart)) = &mut self.apart {
+            let lines = std::mem::replace(&mut unit.line_program, LineProgram::none());
+            let root = unit.get_mut(root);
+            let name = split::file(name, apart.len()).into_bytes();
+            root.set(DW_AT_GNU_dwo_name, AttributeValue::String(name));
+            root.set(DW_AT_GNU_dwo_id, AttributeValue::Data8(id));
+            apart.push(split::Apart { unit, lines, ranges, addresses, id });
+            return;
+        }
+        let ranges = unit.ranges.add(RangeList(ranges));
         unit.get_mut(root).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
         self.full.push(unit);
     }
@@ -623,8 +667,8 @@ impl DebugContext {
             entry.set(DW_AT_data_member_location, AttributeValue::Udata(tag.offset));
             unit.get_mut(part).set(DW_AT_discr, AttributeValue::UnitRef(member));
             if tag.states {
-                let name = self.dwarf.strings.add("__state");
-                self.dwarf.unit.get_mut(member).set(DW_AT_name, AttributeValue::StringRef(name));
+                let name = self.text(b"__state");
+                self.dwarf.unit.get_mut(member).set(DW_AT_name, name);
             }
         }
         let states = tag.is_some_and(|it| it.states);
@@ -690,9 +734,9 @@ impl DebugContext {
     }
 
     fn named(&mut self, parent: UnitEntryId, tag: gimli::DwTag, name: &str) -> UnitEntryId {
-        let name = self.dwarf.strings.add(name.as_bytes());
+        let name = self.text(name.as_bytes());
         let entry = self.dwarf.unit.add(parent, tag);
-        self.dwarf.unit.get_mut(entry).set(DW_AT_name, AttributeValue::StringRef(name));
+        self.dwarf.unit.get_mut(entry).set(DW_AT_name, name);
         entry
     }
 
@@ -750,16 +794,39 @@ impl DebugContext {
             Some(parent) => self.block(function, start, debug, blocks, *parent)?,
             None => function,
         };
-        // One address for the linker to fill in, and the rest counted from it.
-        let within = ranges
-            .iter()
-            .map(|&(from, to)| Range::OffsetPair { begin: from.into(), end: to.into() });
-        let ranges = std::iter::once(Range::BaseAddress { address: start }).chain(within).collect();
-        let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
         let block = self.dwarf.unit.add(parent, DW_TAG_lexical_block);
-        self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
+        if let &[(from, to)] = ranges.as_slice()
+            && self.apart.is_some()
+        {
+            self.code(block, past(start, from), (to - from).into());
+        } else {
+            // One address for the linker to fill in, and the rest counted from it.
+            let within = ranges
+                .iter()
+                .map(|&(from, to)| Range::OffsetPair { begin: from.into(), end: to.into() });
+            let ranges =
+                std::iter::once(Range::BaseAddress { address: start }).chain(within).collect();
+            let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
+            self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
+        }
         blocks[scope as usize] = Some(block);
         Some(block)
+    }
+
+    /// Says of `entry` that its code is the `length` bytes from `begin`. An entry kept apart
+    /// names no address, only the place of one among those the object keeps: that is written
+    /// as a plain number, which [`split`] says is such a place.
+    fn code(&mut self, entry: UnitEntryId, begin: Address, length: u64) {
+        let low = match self.apart {
+            Some(_) => {
+                self.addresses.push(begin);
+                AttributeValue::Udata(self.addresses.len() as u64 - 1)
+            }
+            None => AttributeValue::Address(begin),
+        };
+        let entry = self.dwarf.unit.get_mut(entry);
+        entry.set(DW_AT_low_pc, low);
+        entry.set(DW_AT_high_pc, AttributeValue::Udata(length));
     }
 
     /// Where a variable of a function is, or `None` where it is nowhere to be read.
@@ -806,15 +873,20 @@ impl DebugContext {
         let file = |place: &Place| files.get(place.file as usize).copied();
         self.ranges.push(Range::StartLength { begin: start, length: len.into() });
 
-        let name = self.dwarf.strings.add(debug.name.as_bytes());
-        let linkage_name = self.dwarf.strings.add(debug.linkage_name.as_bytes());
+        debug.linkage_name.hash(&mut self.id);
+        len.hash(&mut self.id);
+        for (offset, place) in &debug.rows {
+            (offset, place.line, place.column).hash(&mut self.id);
+        }
+        let name = self.text(debug.name.as_bytes());
+        let linkage_name = self.text(debug.linkage_name.as_bytes());
         let unit = &mut self.dwarf.unit;
         let function = unit.add(unit.root(), DW_TAG_subprogram);
         let entry = unit.get_mut(function);
-        entry.set(DW_AT_name, AttributeValue::StringRef(name));
-        entry.set(DW_AT_linkage_name, AttributeValue::StringRef(linkage_name));
-        entry.set(DW_AT_low_pc, AttributeValue::Address(start));
-        entry.set(DW_AT_high_pc, AttributeValue::Udata(len.into()));
+        entry.set(DW_AT_name, name);
+        entry.set(DW_AT_linkage_name, linkage_name);
+        self.code(function, start, len.into());
+        let entry = self.dwarf.unit.get_mut(function);
         if let Some(declared) = &debug.declared
             && let Some(file) = file(declared)
         {
@@ -850,69 +922,106 @@ impl DebugContext {
     }
 
     /// Writes the sections into the object, when it has a function to describe.
-    pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<(), String> {
+    /// Answers the files of what is kept apart from it.
+    pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         self.end_unit();
-        if self.full.is_empty() || product.object.format() != BinaryFormat::Elf {
-            return Ok(());
+        if product.object.format() != BinaryFormat::Elf {
+            return Ok(Vec::new());
         }
-        let mut dwarf = gimli::write::Dwarf::new();
-        (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
-        for unit in self.full {
-            dwarf.units.add(unit);
-        }
-        let mut sections = Sections::new(SectionWriter::default());
-        dwarf.write(&mut sections).map_err(|e| e.to_string())?;
-
-        let mut placed = FxHashMap::default();
-        sections.for_each(|id, section: &SectionWriter| {
-            if !section.bytes.slice().is_empty() {
-                let kind = match id {
-                    SectionId::DebugStr | SectionId::DebugLineStr => SectionKind::DebugString,
-                    _ => SectionKind::Debug,
-                };
-                let name = id.name().as_bytes().to_vec();
-                let placed_at = product.object.add_section(Vec::new(), name, kind);
-                product.object.section_mut(placed_at).set_data(section.bytes.slice().to_vec(), 1);
-                placed.insert(id, placed_at);
+        let (sections, files) = match self.apart {
+            Some((name, apart)) => {
+                let mut split =
+                    split::Split::new(self.encoding, self.directory, name, &product.object);
+                for unit in apart {
+                    split.add(unit)?;
+                }
+                split.finish()
             }
-            Ok::<_, String>(())
-        })?;
-        sections.for_each(|id, section: &SectionWriter| {
-            let Some(&at) = placed.get(&id) else { return Ok(()) };
-            for reloc in &section.relocs {
-                let (symbol, addend) = match reloc.target {
-                    Target::Function(func) => function_place(product, func),
-                    Target::Section(section) => {
-                        let Some(&section) = placed.get(&section) else {
-                            return Err(format!("{} points to a section left out", id.name()));
-                        };
-                        (product.object.section_symbol(section), 0)
-                    }
-                };
-                let flags = RelocationFlags::Generic {
-                    kind: RelocationKind::Absolute,
-                    encoding: RelocationEncoding::Generic,
-                    size: reloc.size * 8,
-                };
-                product
-                    .object
-                    .add_relocation(
-                        at,
-                        Relocation {
-                            offset: reloc.offset,
-                            symbol,
-                            flags,
-                            addend: addend + reloc.addend,
-                        },
-                    )
-                    .map_err(|e| e.to_string())?;
+            None => {
+                if self.full.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut dwarf = gimli::write::Dwarf::new();
+                (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
+                for unit in self.full {
+                    dwarf.units.add(unit);
+                }
+                let mut written = Sections::new(SectionWriter::default());
+                dwarf.write(&mut written).map_err(|e| e.to_string())?;
+                let mut sections = Vec::new();
+                written.for_each(|id, section: &SectionWriter| {
+                    sections.push(Section { id, written: section.clone() });
+                    Ok::<_, String>(())
+                })?;
+                (sections, Vec::new())
             }
-            Ok(())
-        })
+        };
+        place(product, sections)?;
+        Ok(files)
     }
 }
 
-/// The address `by` bytes past `start`.
+/// One section of what a debugger reads that is linked into the program.
+struct Section {
+    id: SectionId,
+    written: SectionWriter,
+}
+
+/// A file beside the object with the entries of one unit kept apart from it.
+pub struct Sidecar {
+    /// Where the unit left in the object says the file is.
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Writes the sections into the object, each with what the linker is to fill in.
+fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), String> {
+    let mut placed = FxHashMap::default();
+    let mut linked = Vec::new();
+    // A section with nothing in it is still there when another says where in it to read.
+    let read: Vec<SectionId> = (sections.iter().flat_map(|it| &it.written.relocs))
+        .filter_map(|it| match it.target {
+            Target::Section(section) => Some(section),
+            Target::Function(_) => None,
+        })
+        .collect();
+    for Section { id, written } in sections {
+        if written.bytes.slice().is_empty() && !read.contains(&id) {
+            continue;
+        }
+        let kind = match id {
+            SectionId::DebugStr | SectionId::DebugLineStr => SectionKind::DebugString,
+            _ => SectionKind::Debug,
+        };
+        let at = product.object.add_section(Vec::new(), id.name().as_bytes().to_vec(), kind);
+        product.object.section_mut(at).set_data(written.bytes.slice().to_vec(), 1);
+        placed.insert(id, at);
+        linked.push((id, at, written.relocs));
+    }
+    for (id, at, relocs) in linked {
+        for reloc in &relocs {
+            let (symbol, addend) = match reloc.target {
+                Target::Function(func) => function_place(product, func),
+                Target::Section(section) => {
+                    let Some(&section) = placed.get(&section) else {
+                        return Err(format!("{} points to a section left out", id.name()));
+                    };
+                    (product.object.section_symbol(section), 0)
+                }
+            };
+            let flags = RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: reloc.size * 8,
+            };
+            let relocation =
+                Relocation { offset: reloc.offset, symbol, flags, addend: addend + reloc.addend };
+            product.object.add_relocation(at, relocation).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// The path a type named `name` is written at and its name there, as in `a::b` and `C<d::E>`.
 /// A name that is not a path, like that of a tuple or of a pointer, is in nothing.
 fn within(name: &str) -> (Option<&str>, &str) {
@@ -925,6 +1034,7 @@ fn within(name: &str) -> (Option<&str>, &str) {
     (Some(path), &name[path.len() + 2..])
 }
 
+/// The address `by` bytes past `start`.
 fn past(start: Address, by: CodeOffset) -> Address {
     match start {
         Address::Constant(start) => Address::Constant(start + u64::from(by)),
@@ -965,6 +1075,15 @@ struct Reloc {
 struct SectionWriter {
     relocs: Vec<Reloc>,
     bytes: EndianVec<RunTimeEndian>,
+}
+
+impl SectionWriter {
+    /// Adds what `other` has to the end, with what the linker is to fill in of it.
+    fn append(&mut self, other: &SectionWriter) {
+        let at = self.bytes.len() as u64;
+        self.relocs.extend(other.relocs.iter().map(|it| Reloc { offset: it.offset + at, ..*it }));
+        self.bytes.write(other.bytes.slice()).expect("a vector takes all it is given");
+    }
 }
 
 impl Default for SectionWriter {

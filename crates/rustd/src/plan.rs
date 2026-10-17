@@ -134,14 +134,42 @@ enum Stripped {
     Named(String),
 }
 
-/// What a build tells a debugger of its code.
+/// What a build tells a debugger of its code, and where that is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Described {
+    pub(crate) level: Level,
+    pub(crate) kept: Kept,
+}
+
+impl Described {
+    pub(crate) const NOTHING: Described = Described { level: Level::Nothing, kept: Kept::Linked };
+
+    /// The most either tells, kept the furthest from the program either keeps it.
+    fn or(self, other: Described) -> Described {
+        Described { level: self.level.max(other.level), kept: self.kept.max(other.kept) }
+    }
+}
+
+/// How much a build tells a debugger of its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Described {
+pub(crate) enum Level {
     Nothing,
     /// Which line each instruction is of, and the functions.
     Lines,
     /// The variables and their types as well.
     Full,
+}
+
+/// Where what a debugger reads of the code is kept (`split-debuginfo`). The lines are with
+/// the program always.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Kept {
+    /// In the program, which the linker copies it into.
+    Linked,
+    /// In the objects the program was linked from, which the program names.
+    Objects,
+    /// In one package next to the program.
+    Package,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -190,14 +218,14 @@ impl Profile {
     /// What the profile has a debugger told. Where the profile asks for it to be kept apart
     /// from the program, which rustd does not do, that is the reason not to build.
     pub(crate) fn described(&self) -> anyhow::Result<Described> {
-        let described = match &self.debuginfo {
-            DebugLevel::Number(0) => Described::Nothing,
-            DebugLevel::Number(1) => Described::Lines,
-            DebugLevel::Number(2) => Described::Full,
+        let level = match &self.debuginfo {
+            DebugLevel::Number(0) => Level::Nothing,
+            DebugLevel::Number(1) => Level::Lines,
+            DebugLevel::Number(2) => Level::Full,
             DebugLevel::Named(name) => match name.as_str() {
-                "none" => Described::Nothing,
-                "line-directives-only" | "line-tables-only" | "limited" => Described::Lines,
-                "full" => Described::Full,
+                "none" => Level::Nothing,
+                "line-directives-only" | "line-tables-only" | "limited" => Level::Lines,
+                "full" => Level::Full,
                 _ => anyhow::bail!("`debug = \"{name}\"`: rustd does not know the level"),
             },
             DebugLevel::Number(level) => {
@@ -214,17 +242,18 @@ impl Profile {
             },
             Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
         };
-        if stripped || described == Described::Nothing {
-            return Ok(Described::Nothing);
+        if stripped || level == Level::Nothing {
+            return Ok(Described::NOTHING);
         }
-        match self.split_debuginfo.as_deref() {
-            None | Some("off") => Ok(described),
-            Some(split) => anyhow::bail!(
-                "`split-debuginfo = \"{split}\"`: rustd writes what a debugger reads into the \
-                 object and the program, and has no `.dwo`, `.dwp` or `.dSYM` to keep it in. \
-                 Build with `split-debuginfo = \"off\"`, or with `debug = false`"
-            ),
-        }
+        let kept = match self.split_debuginfo.as_deref() {
+            None | Some("off") => Kept::Linked,
+            Some("unpacked") => Kept::Objects,
+            Some("packed") => Kept::Package,
+            Some(split) => {
+                anyhow::bail!("`split-debuginfo = \"{split}\"`: rustd does not know the setting")
+            }
+        };
+        Ok(Described { level, kept })
     }
 
     /// Whether rustc compiles the whole program again when it links it.
@@ -428,9 +457,9 @@ impl Plan {
     /// What the build has a debugger told of the packages cargo was asked to build: the
     /// most any of them asks for, which is one answer for all the code rustd writes.
     pub(crate) fn described(&self) -> anyhow::Result<Described> {
-        let mut described = Described::Nothing;
+        let mut described = Described::NOTHING;
         for built in self.packages.values().filter(|it| it.primary) {
-            described = described.max(built.profile.described()?);
+            described = described.or(built.profile.described()?);
         }
         Ok(described)
     }

@@ -972,7 +972,7 @@ impl Base {
         }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
         let start = stdx::time::Instant::now();
-        let object = cg.finish()?;
+        let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
         Ok(Ok(Patch { object, bodies, phases }))
     }

@@ -33,6 +33,7 @@ use crate::{
     drop::{DropGlue, has_drop_glue},
     generics::generics,
     layout::CoroutineFrame,
+    layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
     mir::is_by_move_coroutine,
     mir::type_name::rustc_debug_name,
@@ -344,13 +345,22 @@ impl<'db> Types<'db> {
             return Some(DebugType::Pointer { name: of.name, to: self.followed(to, pointers) });
         }
         let usize = Ty::new_uint(self.interner, UintTy::Usize);
-        let (names, first, second) = match to.kind() {
+        let tail = self.tail(to);
+        let (names, first, second) = match tail.kind() {
             TyKind::Str | TyKind::Slice(_) => {
-                let element = match to.kind() {
+                let first = match to.kind() {
                     TyKind::Slice(element) => element,
-                    _ => Ty::new_uint(self.interner, UintTy::U8),
+                    TyKind::Str => Ty::new_uint(self.interner, UintTy::U8),
+                    _ => to,
                 };
-                let first = self.ty(Ty::new_imm_ptr(self.interner, element), pointers)?;
+                let first = match first == to {
+                    true => {
+                        let name = format!("*const {}", self.name(to)?);
+                        let whole = DebugType::Pointer { name, to: self.followed(to, pointers) };
+                        self.unnamed(whole)
+                    }
+                    false => self.ty(Ty::new_imm_ptr(self.interner, first), pointers)?,
+                };
                 (["data_ptr", "length"], first, self.ty(usize, pointers)?)
             }
             TyKind::Dynamic(bounds, _) => {
@@ -360,7 +370,7 @@ impl<'db> Types<'db> {
                 };
                 let slots = match bounds.principal() {
                     Some(principal) => {
-                        let principal = principal.with_self_ty(self.interner, to);
+                        let principal = principal.with_self_ty(self.interner, tail);
                         let principal =
                             self.interner.instantiate_bound_regions_with_erased(principal);
                         VtableLayout::of(self.interner, principal).slots.len()
@@ -381,6 +391,17 @@ impl<'db> Types<'db> {
             Field { name: names[1].to_owned(), offset: word, ty: second },
         ];
         Some(DebugType::Struct(Aggregate { fields, ..of }))
+    }
+
+    /// The part of a type whose size is not known until the program runs: the type, or the
+    /// last field of a struct or a tuple, down to one that is neither.
+    fn tail(&self, of: Ty<'db>) -> Ty<'db> {
+        let normalize = |ty| {
+            ObligationCtxt::new(&self.infcx)
+                .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
+                .unwrap_or(ty)
+        };
+        struct_tail_erasing_lifetimes(self.db, of, &normalize)
     }
 
     /// A type that is part of the one being told of and is no type of the program's.

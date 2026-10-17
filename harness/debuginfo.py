@@ -372,18 +372,20 @@ def jumps_away(binary, name):
     """Whether the function rustd compiled under that name leaves by jumping to another one
     rather than calling it, so that it has no frame while the other runs. Its range is what the
     debug info says, and the jump is read from the disassembly; None where that cannot be read."""
-    said = subprocess.run([DWARFDUMP, f"--name={name}", binary], capture_output=True, text=True).stdout
+    said = dumped(binary, f"--name={name}")
     entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it]
     if not entries and re.fullmatch(r"\w+(::\w+)*", name):
         # A function with a symbol of its own is named by its last part and its mangled path.
         parts = name.split("::")
-        said = subprocess.run([DWARFDUMP, f"--name={parts[-1]}", binary], capture_output=True, text=True).stdout
+        said = dumped(binary, f"--name={parts[-1]}")
         mangled = "".join(f"{len(part)}{part}" for part in parts)
         entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it
                    and re.search(rf'DW_AT_linkage_name\s+\("_R\w*?{mangled}"\)', it)]
     ranges = [(low.group(1), high.group(1)) for it in entries
               if (low := re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", it))
               and (high := re.search(r"DW_AT_high_pc\s+\((0x[0-9a-f]+)\)", it))]
+    # A function whose entry is kept apart from the program has its code as a list of one range.
+    ranges += [ends for it in entries for ends in re.findall(r"\[(0x[0-9a-f]+), (0x[0-9a-f]+)\)", it)]
     if not ranges or not shutil.which("objdump"):
         return None
     for low, high in ((int(low, 16), int(high, 16)) for low, high in ranges):
@@ -427,10 +429,25 @@ def compare(tally, what, theirs, ours, binary=None):
     tally.say(what, "DIFFERENT" if differ else "same", more + (f"; {differ} differ, first {shown}" if differ else ""))
 
 
+def dumped(binary, *what):
+    """What `llvm-dwarfdump` says of the program, read from the files beside it too where a
+    unit's entries are kept apart (split DWARF), with their addresses as the program has them."""
+    return subprocess.run([DWARFDUMP, "--dwo", *what, binary], capture_output=True, text=True).stdout
+
+
+def units(binary):
+    """What each unit's own entry says. A unit kept apart is two entries, the one left in the
+    program with the addresses and the one beside it with the producer: they are put together."""
+    heads = [it.split("\n\n")[0] for it in dumped(binary, "--debug-info", "--show-children=0").split("DW_TAG_compile_unit")[1:]]
+    ident = lambda head: (re.search(r"DW_AT_GNU_dwo_id\s+\((\w+)\)", head) or [None, None])[1]
+    left = {ident(head): head for head in heads if ident(head) and "DW_AT_producer" not in head}
+    return [head + left.get(ident(head), "") for head in heads if "DW_AT_producer" in head or ident(head) not in left]
+
+
 def verify(tally, what, binary):
+    """Whether `llvm-dwarfdump --verify` finds the program sound."""
     read = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True)
-    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
-    ours = len(re.findall(r'DW_AT_producer\s+\("rustd ', units))
+    ours = sum(bool(re.search(r'DW_AT_producer\s+\("rustd ', unit)) for unit in units(binary))
     wrong = read.returncode != 0 or "No errors." not in read.stdout
     said = next((l for l in read.stdout.splitlines() if "error" in l.lower()), "")
     verdict = "INVALID" if wrong else "sound" if ours else "NO UNIT"
@@ -494,12 +511,10 @@ def frames_of(binary):
 
 def own_ranges(binary):
     """Where the code of each function of rustd's is, as its units say."""
-    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
     ours = set()
-    for unit in units.split("DW_TAG_compile_unit")[1:]:
+    for unit in units(binary):
         if re.search(r'DW_AT_producer\s+\("rustd ', unit):
-            # The unit's own entry ends at the first empty line; what follows is of its functions.
-            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit.split("\n\n")[0])}
+            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
     return ours
 
 
@@ -586,8 +601,7 @@ def profiler(tally, what, binary, cwd, crates):
 
 
 def unit_of(binary, address):
-    found = subprocess.run([DWARFDUMP, f"--lookup={address:#x}", binary], capture_output=True, text=True).stdout
-    producer = re.search(r'DW_AT_producer\s+\("([^"]*)"\)', found)
+    producer = re.search(r'DW_AT_producer\s+\("([^"]*)"\)', dumped(binary, f"--lookup={address:#x}"))
     return producer.group(1) if producer else "nothing"
 
 
@@ -723,9 +737,8 @@ def edits(tally):
 
 def described(binary):
     """How many functions rustd's units tell a debugger of, and how many variables in them."""
-    dumped = subprocess.run([DWARFDUMP, "--debug-info", binary], capture_output=True, text=True).stdout
     functions = variables = 0
-    for unit in dumped.split("DW_TAG_compile_unit")[1:]:
+    for unit in dumped(binary, "--debug-info").split("DW_TAG_compile_unit")[1:]:
         if re.search(r'DW_AT_producer\s+\("rustd', unit):
             functions += unit.count("DW_TAG_subprogram")
             variables += unit.count("DW_TAG_variable") + unit.count("DW_TAG_formal_parameter")
@@ -784,6 +797,12 @@ def printed_by(debugger, binary, cwd, place, names):
     return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
 
 
+# What lldb says of a block in several runs of a unit kept apart (split DWARF 4): it reads the
+# list of the runs without the unit's base in `.debug_ranges`, in a rustc build of more than one
+# unit as well, and shows no name of the block.
+LLDB_NO_RANGES = "which has a base that is less than the function's low PC"
+
+
 def lldb_path():
     """The search path `rust-lldb` finds an `lldb` on, or None: distributions name theirs by version."""
     if shutil.which("lldb"):
@@ -804,7 +823,7 @@ def shown_by_lldb(binary, cwd, file, line, names):
         found = re.search(rf"^\(lldb\) frame variable {re.escape(name)}\n(.*?)(?=^\(lldb\) )", ran.stdout, re.S | re.M)
         # An address of nothing stays what it is: lldb shows bytes it has no place for as zeros.
         shown[name] = re.sub(r"0x0*[1-9a-f][0-9a-f]*", "0x..", found.group(1).strip()) if found and found.group(1).strip() else None
-    return shown
+    return shown, ran.stderr.count(LLDB_NO_RANGES)
 
 
 def agreement(names, theirs, ours, lost=()):
@@ -846,10 +865,15 @@ def rich(tally):
     else:
         tally.say("rich: rust-gdb shows them", "not looked at", "no rust-gdb to ask")
     if shutil.which("rust-lldb") and lldb_path():
-        theirs = shown_by_lldb(reference, ws, MAIN, line, RICH)
+        theirs, _ = shown_by_lldb(reference, ws, MAIN, line, RICH)
+        ours, unread = shown_by_lldb(fx.binary, ws, MAIN, line, RICH)
         # lldb shows zeros where a value is there in part, so what gdb found to be so is not held against it.
-        same, _, said = agreement(RICH, theirs, shown_by_lldb(fx.binary, ws, MAIN, line, RICH), lost)
-        tally.say("rich: rust-lldb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
+        same, _, said = agreement(RICH, theirs, ours, lost)
+        if unread and not same:
+            tally.say("rich: rust-lldb shows them", "not looked at",
+                      f"this lldb reads {unread} runs of blocks kept apart from the wrong place; {said}")
+        else:
+            tally.say("rich: rust-lldb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
     else:
         tally.say("rich: rust-lldb shows them", "not looked at", "no rust-lldb or no lldb to ask")
 
@@ -938,26 +962,41 @@ def settings(tally):
             for name in names:
                 del os.environ[name]
 
-    for what, profile, lines, locals_ in (
-            ("debug = true", {}, True, True),
-            ("debug = \"line-tables-only\"", {"debug": "line-tables-only"}, True, False),
-            ("debug = 1", {"debug": "1"}, True, False),
-            ("strip = \"debuginfo\"", {"strip": "debuginfo"}, False, False),
-            ("strip = true", {"strip": "true"}, False, False),
-            ("split-debuginfo = \"off\"", {"split_debuginfo": "off"}, True, True),
-            ("split-debuginfo = \"packed\"", {"split_debuginfo": "packed"}, None, None),
-            ("split-debuginfo = \"unpacked\"", {"split_debuginfo": "unpacked"}, None, None),
-            ("split-debuginfo = \"packed\" with debug = false", {"split_debuginfo": "packed", "debug": "false"}, False, False)):
-        has, count, refused = built(**profile)
-        if lines is None:
-            reason = re.search(r"`split-debuginfo.*", refused or "", re.S)
-            tally.say(f"profile: {what}", "refused" if reason else "NOT REFUSED",
-                      " ".join(reason.group(0).split())[:110] if reason else (refused or "it built")[-110:])
-        else:
-            followed = has == lines and bool(count) == locals_
-            tally.say(f"profile: {what}", "followed" if followed else "NOT FOLLOWED",
-                      refused[-110:] if refused else f"{'lines' if has else 'nothing'}, {count} variables")
+    line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
+    names = [name for name, _ in LOCALS]
 
+    def shown():
+        """What gdb prints of the function's values in the program as it was last built."""
+        return printed_by("gdb", fx.binary, ws, f"{MAIN}:{line}", names)
+
+    def apart():
+        """How many units of rustd's in the program have their entries in a file beside its object, which is there."""
+        named = re.findall(rf'DW_AT_producer\s+\("rustd .*?DW_AT_GNU_dwo_name\s+\("({re.escape(fx.objects[0])}[^"]*\.dwo)"\)', "".join(units(fx.binary)), re.S)
+        return sum(os.path.exists(name) for name in named)
+
+    linked = None
+    for what, profile, lines, locals_, split in (
+            ("debug = true", {}, True, True, False),
+            ("debug = \"line-tables-only\"", {"debug": "line-tables-only"}, True, False, False),
+            ("debug = 1", {"debug": "1"}, True, False, False),
+            ("strip = \"debuginfo\"", {"strip": "debuginfo"}, False, False, False),
+            ("strip = true", {"strip": "true"}, False, False, False),
+            ("split-debuginfo = \"off\"", {"split_debuginfo": "off"}, True, True, False),
+            ("split-debuginfo = \"packed\"", {"split_debuginfo": "packed"}, True, True, True),
+            ("split-debuginfo = \"unpacked\"", {"split_debuginfo": "unpacked"}, True, True, True),
+            ("split-debuginfo = \"packed\" with debug = false", {"split_debuginfo": "packed", "debug": "false"}, False, False, False)):
+        has, count, refused = built(**profile)
+        followed = has == lines and bool(count) == locals_
+        more = refused[-110:] if refused else f"{'lines' if has else 'nothing'}, {count} variables"
+        if followed and locals_:
+            values, kept = shown(), apart()
+            linked = linked or values
+            followed = values == linked and bool(kept) == split
+            more += f", {kept} units kept apart, gdb prints {sum(v is not None for v in values.values())} of {len(names)} values"
+            more += "" if values == linked else " which are not the ones it prints of the program that has them linked"
+        tally.say(f"profile: {what}", "followed" if followed else "NOT FOLLOWED", more)
+        if split and not refused:
+            verify(tally, f"profile: {what}", fx.binary)
 
 def sections(path):
     """The size of an object, and of the sections of it a debugger reads."""

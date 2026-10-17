@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use super::units::Record;
+use super::{package, units::Record};
 
 /// What the linker is told so that the first definition of a name is the one that stays.
 const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
@@ -38,6 +38,10 @@ pub(crate) struct Plan {
     pub(crate) left_to_rustc: Vec<PathBuf>,
     /// The copies of rustc's output the plan names, which have to stay.
     pub(crate) copies: Vec<PathBuf>,
+    /// The package rustc wrote of what a debugger reads of the program it linked, when the
+    /// profile keeps that in one (`split-debuginfo = "packed"`).
+    #[serde(default)]
+    pub(crate) package: Option<PathBuf>,
     /// The newest record the plan was made from.
     pub(crate) stamp: u128,
 }
@@ -70,6 +74,9 @@ impl Plan {
             unit_test,
             left_to_rustc: Vec::new(),
             copies: Vec::new(),
+            package: (unit.codegen("split-debuginfo") == Some("packed"))
+                .then(|| link.output().map(|it| package::beside(Path::new(it))))
+                .flatten(),
             stamp: unit.stamp,
         };
         for arg in &mut link.args {
@@ -158,6 +165,12 @@ impl LinkLine {
         let elf = args.iter().any(|it| it == "-o")
             && !args.iter().any(|it| it == "/NOLOGO" || it == "-flavor" || it == "-arch");
         elf.then(|| LinkLine { env, linker: words[first].clone(), args })
+    }
+
+    /// The executable the line links.
+    fn output(&self) -> Option<&str> {
+        let at = self.args.iter().position(|it| it == "-o")?;
+        self.args.get(at + 1).map(|it| &**it)
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
@@ -272,6 +285,7 @@ mod tests {
             unit_test: false,
             left_to_rustc: Vec::new(),
             copies: Vec::new(),
+            package: None,
             stamp: 0,
         };
         let response = dir.join("link.args");

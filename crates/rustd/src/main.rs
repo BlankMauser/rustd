@@ -245,7 +245,7 @@ impl Args {
             profile: profile.unwrap_or_else(|| "dev".to_owned()),
             also,
             target,
-            debug: plan::Described::Nothing,
+            debug: plan::Described::NOTHING,
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
@@ -264,6 +264,9 @@ struct Resolver<'a> {
     contents: &'a content::Contents,
     /// What the code has a debugger told.
     debug: plan::Described,
+    /// The object the entries a debugger reads are kept in, when they are kept apart from
+    /// the program.
+    apart: Option<PathBuf>,
     listed: &'a Listed,
 }
 
@@ -565,7 +568,7 @@ impl SymbolResolver for Resolver<'_> {
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
-                let debug = self.debug;
+                let (debug, apart) = (self.debug, self.apart.clone());
                 let listed = self.listed;
                 scope.spawn(move || {
                     let resolver = Resolver {
@@ -576,6 +579,7 @@ impl SymbolResolver for Resolver<'_> {
                         rustc_commit,
                         contents,
                         debug,
+                        apart,
                         listed,
                     };
                     hir::attach_db(&db, || {
@@ -606,11 +610,15 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        (self.debug != plan::Described::Nothing).then(|| self.root.to_string_lossy().into_owned())
+        (self.debug.level != plan::Level::Nothing).then(|| self.root.to_string_lossy().into_owned())
     }
 
     fn describes_variables(&self) -> bool {
-        self.debug == plan::Described::Full
+        self.debug.level == plan::Level::Full
+    }
+
+    fn debug_apart(&self) -> Option<String> {
+        self.apart.as_ref().map(|it| it.to_string_lossy().into_owned())
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
@@ -986,12 +994,13 @@ impl Checkouts {
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
         // An override for measuring one against the other.
-        let debug = match std::env::var("RUSTD_DEBUGINFO").ok().as_deref() {
-            Some("0") => plan::Described::Nothing,
-            Some("lines") => plan::Described::Lines,
-            Some(_) => plan::Described::Full,
-            None => self.debug[at],
+        let level = match std::env::var("RUSTD_DEBUGINFO").ok().as_deref() {
+            Some("0") => plan::Level::Nothing,
+            Some("lines") => plan::Level::Lines,
+            Some(_) => plan::Level::Full,
+            None => self.debug[at].level,
         };
+        let debug = plan::Described { level, ..self.debug[at] };
         Ok(Parts { root, base, members, debug })
     }
 
@@ -1479,7 +1488,7 @@ fn workspace_at(
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
-    let mut debug = plan::Described::Nothing;
+    let mut debug = plan::Described::NOTHING;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1769,6 +1778,7 @@ fn build(
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;
+    let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
     let resolver = Resolver {
         db,
         table,
@@ -1777,6 +1787,7 @@ fn build(
         rustc_commit: Default::default(),
         contents,
         debug,
+        apart,
         listed,
     };
     let hir_db: &dyn HirDatabase = db;
@@ -1883,6 +1894,10 @@ fn build(
         // A patch defines again what the object does, and the linker of Mach-O takes two
         // definitions of a name only when one of them gives way.
         weaken::definitions(object);
+        // The files a debugger is sent to are there before the object that sends it.
+        for file in &unit.apart {
+            replace(Path::new(&file.name), &file.bytes)?;
+        }
         replace(&args.out, object)?;
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     cli::{Invocation, Subcommand, worker_env},
     daemon::{self, Checkout, WorkerConfig},
+    package,
     plan::Plan,
     script,
     units::{self, Record, stamp_now, stamp_of},
@@ -327,10 +328,15 @@ impl State {
     pub(crate) fn install(&self) -> anyhow::Result<()> {
         for program in &self.programs {
             let Some((checkout, at)) = program.asked_as else { continue };
-            let built = &self.checkouts[checkout].programs[at].binary;
-            if !same_file::is_same_file(built, &program.executable).unwrap_or(false) {
-                place(built, &program.executable)
-                    .with_context(|| format!("installing {}", program.executable.display()))?;
+            let plan = &self.checkouts[checkout].programs[at];
+            install(&plan.binary, &program.executable)?;
+            if let Some(rustcs) = &plan.package {
+                let package = package::beside(&plan.binary);
+                if !package::is_current(&package, &[&plan.object, rustcs]) {
+                    package::pack(&plan.binary, rustcs, &package)
+                        .with_context(|| format!("packing {}", package.display()))?;
+                }
+                install(&package, &package::beside(&program.executable))?;
             }
         }
         Ok(())
@@ -477,6 +483,14 @@ impl State {
         }
         Ok(state)
     }
+}
+
+/// Has `to` be the file `built` is, when it is not.
+fn install(built: &Path, to: &Path) -> anyhow::Result<()> {
+    if same_file::is_same_file(built, to).unwrap_or(false) {
+        return Ok(());
+    }
+    place(built, to).with_context(|| format!("installing {}", to.display()))
 }
 
 /// Has `to` be the file `from` is, under a second name: what was at `to` stays as it is
