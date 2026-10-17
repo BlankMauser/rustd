@@ -669,6 +669,68 @@
   "bench": [
    "prompt",
    "--terminal-width=100"
+  ],
+  "edits": [
+   {
+    "file": "src/bug_report.rs",
+    "old": "        let link = make_github_issue_link(&issue_body);\n",
+    "new": "        let link = make_github_issue_link(&issue_body);\n        let _edited = 41;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/config.rs",
+    "old": "        let config = config.into();\n",
+    "new": "        let config = config.into();\n        let _edited = 50;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/configs/directory.rs",
+    "old": "            Either::First(vec) => vec.is_empty(),\n",
+    "new": "            Either::First(vec) => vec.len() == 0,\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/configs/mod.rs",
+    "old": "        let full_cfg = Value::try_from(FullConfig::default()).unwrap();\n",
+    "new": "        let full_cfg = Value::try_from(FullConfig::default()).unwrap();\n        let _edited = 362;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/configure.rs",
+    "old": "        if key.is_empty() {\n",
+    "new": "        if key.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/formatter/string_formatter.rs",
+    "old": "            if textgroup.format.is_empty() {\n",
+    "new": "            if textgroup.format.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/logger.rs",
+    "old": "                Err(err) => return eprintln!(\"Log file writer mutex was poisoned: {err:?}\"),\n",
+    "new": "                Err(err) => return eprintln!(\"Log file writer mutex was poisoned indeed: {err:?}\"),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/main.rs",
+    "old": "                println!(\"Supported modules list\");\n",
+    "new": "                println!(\"Supported modules list indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/modules/time.rs",
+    "old": "            .map_err(|err| format!(\"Invalid timezone offset: {err:?}\"))?;\n",
+    "new": "            .map_err(|err| format!(\"Invalid timezone offset indeed: {err:?}\"))?;\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/print.rs",
+    "old": "        eprintln!(\"Error writing preset to stdout: {err}\");\n",
+    "new": "        eprintln!(\"Error writing preset to stdout indeed: {err}\");\n",
+    "what": "a word in a message"
+   }
   ]
  },
  "numeric": {
@@ -1112,6 +1174,68 @@
    "metadata",
    "--format-version",
    "1"
+  ],
+  "edits": [
+   {
+    "file": "src/bin/cargo/cli.rs",
+    "old": "        let nightly_features_allowed = matches!(&*features::channel(), \"nightly\" | \"dev\");\n",
+    "new": "        let nightly_features_allowed = matches!(&*features::channel(), \"nightly\" | \"dev\");\n        let _edited = 35;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/add.rs",
+    "old": "                    let candidates = get_registry_candidates();\n",
+    "new": "                    let candidates = get_registry_candidates();\n                    let _edited = 150;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/build.rs",
+    "old": "        let artifact_dir = artifact_dir.resolve_path(gctx);\n",
+    "new": "        let artifact_dir = artifact_dir.resolve_path(gctx);\n        let _edited = 58;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/install.rs",
+    "old": "        if k.is_empty() {\n",
+    "new": "        if k.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/commands/locate_project.rs",
+    "old": "            s => bail!(\"invalid message format specifier: `{}`\", s),\n",
+    "new": "            s => bail!(\"invalid message format specifier indeed: `{}`\", s),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/bin/cargo/commands/remove.rs",
+    "old": "        assert!(!target.is_empty(), \"Target specification may not be empty\");\n",
+    "new": "        assert!(!target.len() == 0, \"Target specification may not be empty\");\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/commands/rustc.rs",
+    "old": "            .filter(|s| !s.is_empty())\n",
+    "new": "            .filter(|s| !s.len() == 0)\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/main.rs",
+    "old": "        anyhow::bail!(\"subcommand is required, but `{alias_name}` is empty\");\n",
+    "new": "        anyhow::bail!(\"subcommand is required indeed, but `{alias_name}` is empty\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/compiler/build_runner/compilation_files.rs",
+    "old": "            panic!(\"doc tests do not have an out dir\");\n",
+    "new": "            panic!(\"doc tests do not have an out dir indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/compiler/compile_kind.rs",
+    "old": "            bail!(\"target was empty\");\n",
+    "new": "            bail!(\"target was empty indeed\");\n",
+    "what": "a word in a message"
+   }
   ]
  },
  "rust-analyzer": {
@@ -1351,6 +1475,68 @@
   ],
   "bench": [
    "--health"
+  ],
+  "edits": [
+   {
+    "file": "helix-term/src/application.rs",
+    "old": "        let mut theme_parent_dirs = vec![helix_loader::config_dir()];\n",
+    "new": "        let mut theme_parent_dirs = vec![helix_loader::config_dir()];\n        let _edited = 104;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/args.rs",
+    "old": "        let mut args = Args::default();\n",
+    "new": "        let mut args = Args::default();\n        let _edited = 27;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/commands.rs",
+    "old": "        let response = call.await?;\n",
+    "new": "        let response = call.await?;\n        let _edited = 190;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/commands/dap.rs",
+    "old": "        bail!(\"Workspace is not trusted. Run `:workspace-trust` to enable the debug adapter.\");\n",
+    "new": "        bail!(\"Workspace is not trusted indeed. Run `:workspace-trust` to enable the debug adapter.\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/lsp.rs",
+    "old": "            let err = format!(\"failed to open path: {:?}: {:?}\", path, err);\n",
+    "new": "            let err = format!(\"failed to open path indeed: {:?}: {:?}\", path, err);\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/syntax.rs",
+    "old": "            return async { Err(anyhow::anyhow!(\"Current working directory does not exist\")) }\n",
+    "new": "            return async { Err(anyhow::anyhow!(\"Current working directory does not exist indeed\")) }\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/typed.rs",
+    "old": "        _ => bail!(\"invalid line ending\"),\n",
+    "new": "        _ => bail!(\"invalid line ending indeed\"),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/compositor.rs",
+    "old": "            if cx.editor.macro_replaying.is_empty() {\n",
+    "new": "            if cx.editor.macro_replaying.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "helix-term/src/handlers/completion/item.rs",
+    "old": "            CompletionItems::Lsp(items) => items.is_empty(),\n",
+    "new": "            CompletionItems::Lsp(items) => items.len() == 0,\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "helix-term/src/handlers/completion/request.rs",
+    "old": "        if !requests.is_empty() {\n",
+    "new": "        if !requests.len() == 0 {\n",
+    "what": "a condition rewritten"
+   }
   ]
  },
  "alacritty": {
@@ -1526,6 +1712,68 @@
    "ALL",
    "--statistics",
    "crates/ruff_linter/resources/test/fixtures"
+  ],
+  "edits": [
+   {
+    "file": "crates/ruff/src/args.rs",
+    "old": "        let mut overrides = Configuration::default();\n",
+    "new": "        let mut overrides = Configuration::default();\n        let _edited = 741;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/cache.rs",
+    "old": "        let metadata = path.metadata()?;\n",
+    "new": "        let metadata = path.metadata()?;\n        let _edited = 41;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/commands/add_noqa.rs",
+    "old": "            let source_type = SourceType::from(resolved_file.path());\n",
+    "new": "            let source_type = SourceType::from(resolved_file.path());\n            let _edited = 64;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/commands/format.rs",
+    "old": "                            let edit = if formatted.is_empty() {\n",
+    "new": "                            let edit = if formatted.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/commands/show_settings.rs",
+    "old": "        bail!(\"No files found under the given path\");\n",
+    "new": "        bail!(\"No files found under the given path indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/lib.rs",
+    "old": "                if !diagnostics.inner.is_empty() {\n",
+    "new": "                if !diagnostics.inner.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/printer.rs",
+    "old": "        if statistics.is_empty() {\n",
+    "new": "        if statistics.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/resolve.rs",
+    "old": "        bail!(\"Working directory does not exist\")\n",
+    "new": "        bail!(\"Working directory does not exist indeed\")\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/commands/format.rs",
+    "old": "                    write!(f, \"{header} {err}\", header = \"Failed to read:\".bold())\n",
+    "new": "                    write!(f, \"{header} {err}\", header = \"Failed to read indeed:\".bold())\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/commands/show_settings.rs",
+    "old": "    writeln!(writer, \"Resolved settings for: \\\"{}\\\"\", path.display())?;\n",
+    "new": "    writeln!(writer, \"Resolved settings for indeed: \\\"{}\\\"\", path.display())?;\n",
+    "what": "a word in a message"
+   }
   ]
  }
 }
