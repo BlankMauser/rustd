@@ -101,6 +101,23 @@ fn records(pack: &[u8]) -> (Vec<([u8; KEY], std::ops::Range<usize>, u32)>, usize
     (found, at)
 }
 
+/// The keys of the records of a pack that are whole, in the order they were added.
+pub fn pack_keys(pack: &[u8]) -> Vec<[u8; KEY]> {
+    records(pack).0.into_iter().map(|(key, ..)| key).collect()
+}
+
+/// Asked for a key that no sealed pack of the store has: brings the pack that has it into
+/// the store's directory, if it knows of one, and says whether it is there now.
+pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
+
+static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+
+/// Has the store of this process ask `fetch` for the keys it lacks, from now on. Only the
+/// first call counts.
+pub fn fetch_missing_with(fetch: FetchMissing) {
+    _ = FETCH_MISSING.set(fetch);
+}
+
 /// Seals the open packs in a store that daemons that are gone left behind.
 pub fn seal_left_open(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -201,7 +218,15 @@ impl Store {
 
     /// The value of a key, if a sealed pack has it as it was written.
     pub(super) fn get(&self, key: &[u8; KEY]) -> Option<&'static [u8]> {
-        let value = *self.sealed.read().ok()?.index.get(key)?;
+        let known = |key| self.sealed.read().ok()?.index.get(key).copied();
+        let value = match known(key) {
+            Some(value) => value,
+            None if FETCH_MISSING.get().is_some_and(|fetch| fetch(key)) => {
+                self.refresh();
+                known(key)?
+            }
+            None => return None,
+        };
         (crc32fast::hash(value.bytes) == value.checksum).then_some(value.bytes)
     }
 

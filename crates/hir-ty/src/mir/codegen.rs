@@ -95,7 +95,7 @@ mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 
 pub use patch::{Stale, StaleSteps};
-pub use store::{pack_name, seal_left_open};
+pub use store::{fetch_missing_with, pack_keys, seal_left_open};
 mod type_id;
 mod unwind;
 mod vtable;
