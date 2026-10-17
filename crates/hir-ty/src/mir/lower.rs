@@ -3271,8 +3271,7 @@ fn lower_closure_body<'db>(
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
     let is_by_ref_closure = receiver == Receiver::Borrowed;
-    let mut upvar_map: FxHashMap<LocalId, Vec<Capture<'_>>> =
-        FxHashMap::default();
+    let mut upvar_map: FxHashMap<LocalId, Vec<Capture<'_>>> = FxHashMap::default();
     for (capture_idx, capture) in captures.into_iter().enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
