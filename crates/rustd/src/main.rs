@@ -1300,6 +1300,10 @@ fn built_features(
     let mut command = Command::new("cargo");
     command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
     command.arg("--manifest-path").arg(manifest);
+    // Cargo reads `.cargo/config.toml` from where it runs, not from where the manifest is.
+    if let Some(directory) = manifest.parent() {
+        command.current_dir(directory);
+    }
     if let CargoFeatures::Selected { features, .. } = &cargo_config.features
         && !features.is_empty()
     {
