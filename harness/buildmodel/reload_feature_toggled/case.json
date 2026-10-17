@@ -14,7 +14,8 @@
           "features = []",
           "features = [\"loud\"]"
         ]
-      ]
+      ],
+      "clients": 6
     },
     {
       "what": "a default feature of the package is turned on",
@@ -24,7 +25,8 @@
           "default = []",
           "default = [\"wide\"]"
         ]
-      ]
+      ],
+      "clients": 6
     },
     {
       "what": "and both off",
@@ -39,7 +41,8 @@
           "default = [\"wide\"]",
           "default = []"
         ]
-      ]
+      ],
+      "clients": 6
     }
   ]
 }

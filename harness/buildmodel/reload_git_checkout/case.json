@@ -9,19 +9,22 @@
       "what": "the other commit is checked out",
       "run": [
         "git checkout -q two"
-      ]
+      ],
+      "clients": 6
     },
     {
       "what": "and the first again",
       "run": [
         "git checkout -q one"
-      ]
+      ],
+      "clients": 6
     },
     {
       "what": "and the other once more",
       "run": [
         "git checkout -q two"
-      ]
+      ],
+      "clients": 6
     }
   ]
 }

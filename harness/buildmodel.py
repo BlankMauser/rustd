@@ -35,7 +35,9 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   expect    "supported" (the default) or "refused"
   fails     cargo itself turns the project down, and so must rustd
   steps     [{"what": .., "edit": [[file, old, new]], "write": {file: text}, "env": {..},
+              "run": [shell commands in the project], "clients": how many ask at once,
               "expect": "same" | "refused"}]
+            After each step cargo builds again and the client names what it linked.
 """
 from concurrent.futures import ThreadPoolExecutor
 import argparse, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
@@ -283,8 +285,16 @@ class Case:
         for command in step.get("run", []):
             subprocess.run(command, shell=True, cwd=self.ws, check=True, capture_output=True, env=env)
         time.sleep(0.02)
-        reply = subprocess.run([RUSTD, "sync", socket, *self.asked(env)], capture_output=True, text=True, timeout=300, env=env)
+        ask = [RUSTD, "sync", socket, *self.asked(env)]
+        # Clients that ask at once race the reload: each is answered from one model.
+        racing = [subprocess.Popen(ask, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                  for _ in range(step.get("clients", 1) - 1)]
+        reply = subprocess.run(ask, capture_output=True, text=True, timeout=300, env=env)
         reply = (reply.stdout + reply.stderr).strip()
+        for other in racing:
+            said = other.communicate(timeout=300)[0].strip()
+            if not said.startswith("ok"):
+                reply = said
         artifact = self.cargo(env)
         expect = step.get("expect", "same")
         if daemon.poll() is not None:
