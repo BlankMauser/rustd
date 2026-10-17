@@ -359,12 +359,17 @@ def backtraces(binary, cwd, env=None):
     return panics(ran.stderr)
 
 
+BEHIND = "behind rustc"
+
+
 class Tally:
     def __init__(self):
-        self.wrong, self.lines = 0, []
+        self.wrong, self.open, self.lines = 0, 0, []
 
     def say(self, what, verdict, more=""):
         self.wrong += verdict.isupper()
+        # Open: nothing shown is wrong, but rustc -O -g shows a value this has optimized out.
+        self.open += verdict == BEHIND
         print(f"{what:58} {verdict:14} {more}", flush=True)
 
 
@@ -770,9 +775,10 @@ def variables(tally):
     gone = [name for name, _ in LOCALS if printed[name] and OPTIMIZED_OUT in printed[name].group(1)]
     wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS
              if name not in right and name not in gone]
-    tally.say("locals: gdb prints them", "printed" if not wrong else "NOT AS THEY ARE",
+    fine, said = lost(gone, kept_by_rustc(ws, {f"{MAIN}:{line}": gone} if gone else {}))
+    tally.say("locals: gdb prints them", "NOT AS THEY ARE" if wrong else "printed" if fine else BEHIND,
               f"{len(right)} of {len(LOCALS)}, {len(gone)} optimized out, {count} described in {functions} functions"
-              + (f", but {wrong[0][:50]}" if wrong else ""))
+              + (f", but {wrong[0][:50]}" if wrong else "") + said)
 
 
 def callers(tally):
@@ -797,6 +803,36 @@ def printed_by(debugger, binary, cwd, place, names):
                          capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300)
     found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
     return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+
+
+def kept_by_rustc(ws, asked):
+    """Which of the values the optimizer of rustd's build did away with rustc's keeps: the
+    names gdb prints a value for at the same place of `rustc -O -g` on the same source, at
+    the level rustd optimizes at. `asked` is the names by their place. What rustc keeps,
+    rustd has to: LLVM has the value. The result is those names, each with its place."""
+    if not asked:
+        return []
+    env = dict(os.environ, CARGO_PROFILE_RELEASE_DEBUG="true", CARGO_TARGET_DIR=os.path.join(ws, "target-optimized"),
+               CARGO_PROFILE_RELEASE_OPT_LEVEL=os.environ.get("RUSTD_OPT", "2"))
+    out = subprocess.run(["cargo", "build", "--release", "-p", "sline"], cwd=ws, capture_output=True, text=True, env=env)
+    if out.returncode != 0:
+        raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
+    binary = os.path.join(ws, "target-optimized", "release", "sline")
+    kept = []
+    for place, names in asked.items():
+        theirs = printed_by("gdb", binary, ws, place, names)
+        kept += [f"{name} at {place}" for name in names
+                 if theirs[name] and not any(it in theirs[name] for it in (OPTIMIZED_OUT, "<synthetic pointer>", "not available"))]
+    return kept
+
+
+def lost(gone, kept):
+    """What is said of the values optimized out, and whether none of them is one rustc keeps."""
+    if not gone:
+        return True, ""
+    if kept:
+        return False, f"; rustc -O -g keeps {len(kept)} of them: {', '.join(kept)[:160]}"
+    return True, f"; rustc -O -g has none of them either: {', '.join(gone)[:200]}"
 
 
 # What lldb says of a block in several runs of a unit kept apart (split DWARF 4): it reads the
@@ -856,21 +892,22 @@ def rich(tally):
     verify(tally, "rich", fx.binary)
     reference = os.path.join(ws, "target", "debug", "sline")
     line = RICH_MAIN[:RICH_MAIN.index('println!("{}", sum)')].count("\n") + 1
-    lost = []
+    gone = []
     if shutil.which("rust-gdb"):
         theirs = printed_by("rust-gdb", reference, ws, f"{MAIN}:{line}", RICH)
         # A name of rustd's own for the table a `dyn` pointer has is no part of what is shown.
         ours = {name: it and re.sub(r" <\.L[^>]*>", "", it)
                 for name, it in printed_by("rust-gdb", fx.binary, ws, f"{MAIN}:{line}", RICH).items()}
-        same, lost, said = agreement(RICH, theirs, ours)
-        tally.say("rich: rust-gdb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
+        same, gone, said = agreement(RICH, theirs, ours)
+        fine, more = lost(gone, kept_by_rustc(ws, {f"{MAIN}:{line}": gone} if gone else {}))
+        tally.say("rich: rust-gdb shows them", "NOT AS RUSTC'S" if not same else "as rustc's" if fine else BEHIND, said + more)
     else:
         tally.say("rich: rust-gdb shows them", "not looked at", "no rust-gdb to ask")
     if shutil.which("rust-lldb") and lldb_path():
         theirs, _ = shown_by_lldb(reference, ws, MAIN, line, RICH)
         ours, unread = shown_by_lldb(fx.binary, ws, MAIN, line, RICH)
         # lldb shows zeros where a value is there in part, so what gdb found to be so is not held against it.
-        same, _, said = agreement(RICH, theirs, ours, lost)
+        same, _, said = agreement(RICH, theirs, ours, gone)
         if unread and not same:
             tally.say("rich: rust-lldb shows them", "not looked at",
                       f"this lldb reads {unread} runs of blocks kept apart from the wrong place; {said}")
@@ -902,9 +939,10 @@ def shapes(tally):
     unknown = [name for name in TYPES if theirs[name] is None]
     gone = [name for name in TYPES if ours[name] and OPTIMIZED_OUT in ours[name]]
     wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in TYPES if ours[name] != theirs[name] and name not in gone]
-    tally.say("types: the debugger shows them", "as rustc's" if not wrong and not unknown else "NOT AS RUSTC'S",
+    fine, said = lost(gone, kept_by_rustc(ws, {place: gone} if gone else {}))
+    tally.say("types: the debugger shows them", "NOT AS RUSTC'S" if wrong or unknown else "as rustc's" if fine else BEHIND,
               f"{len(TYPES) - len(wrong) - len(gone)} of {len(TYPES)}, {len(gone)} optimized out"
-              + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else ""))
+              + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else "") + said)
 
 
 def scopes(tally):
@@ -923,8 +961,8 @@ def scopes(tally):
     fx.rustd_build()
     verify(tally, "scopes", fx.binary)
     stops = [at + 1 for at, line in enumerate(SCOPES_MAIN.split("\n")) if "// stop" in line]
-    asked = right = gone = unknown = 0
-    wrong = []
+    asked = right = unknown = 0
+    wrong, gone = [], {}
     for line in stops:
         theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, f"{MAIN}:{line}", SCOPED)
         ours = printed_by(debugger, fx.binary, ws, f"{MAIN}:{line}", SCOPED)
@@ -934,12 +972,14 @@ def scopes(tally):
                 right += 1
                 unknown += theirs[name] is None
             elif ours[name] and OPTIMIZED_OUT in ours[name]:
-                gone += 1
+                gone.setdefault(f"{MAIN}:{line}", []).append(name)
             else:
                 wrong.append(f"{name} at line {line} = {ours[name]}, not {theirs[name]}")
-    tally.say("scopes: names by their block", "as rustc's" if not wrong else "NOT AS RUSTC'S",
-              f"{right} of {asked} at {len(stops)} lines ({unknown} of them not a name there), {gone} optimized out"
-              + (f", but {'; '.join(wrong[:3])[:200]}" if wrong else ""))
+    names = [f"{name} at line {place.rsplit(':', 1)[1]}" for place, at in gone.items() for name in at]
+    fine, said = lost(names, kept_by_rustc(ws, gone))
+    tally.say("scopes: names by their block", "NOT AS RUSTC'S" if wrong else "as rustc's" if fine else BEHIND,
+              f"{right} of {asked} at {len(stops)} lines ({unknown} of them not a name there), {len(names)} optimized out"
+              + (f", but {'; '.join(wrong[:3])[:200]}" if wrong else "") + said)
 
 
 def settings(tally):
@@ -1056,7 +1096,8 @@ def main():
     for name, part in parts.items():
         if only in (None, name):
             part()
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'} ({'llvm' if LLVM else 'cranelift'})")
+    left = f", {tally.open} open" if tally.open else ""
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}{left} ({'llvm' if LLVM else 'cranelift'})")
     sys.exit(1 if tally.wrong else 0)
 
 
