@@ -2754,18 +2754,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn define_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) -> Result<()> {
-        // Cranelift is given the relocations it has a kind for, and `finish` adds the
-        // others to the object.
-        let elf_type = |reloc: &ModuleReloc| {
-            code.elf_types.iter().find(|(offset, _)| *offset == reloc.offset).map(|it| it.1)
-        };
-        let (by_type, plain): (Vec<_>, Vec<_>) =
-            relocs.iter().cloned().partition(|reloc| elf_type(reloc).is_some());
-        self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
-        self.elf_relocs.extend(by_type.into_iter().filter_map(|reloc| {
-            let r_type = elf_type(&reloc)?;
-            Some(ElfReloc { func: id, reloc, r_type })
-        }));
+        if code.elf_types.is_empty() {
+            self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
+        } else {
+            // Cranelift is given the relocations it has a kind for, and `finish` adds the
+            // others to the object.
+            let elf_type = |reloc: &ModuleReloc| {
+                code.elf_types.iter().find(|(offset, _)| *offset == reloc.offset).map(|it| it.1)
+            };
+            let (by_type, plain): (Vec<_>, Vec<_>) =
+                relocs.iter().cloned().partition(|reloc| elf_type(reloc).is_some());
+            self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
+            self.elf_relocs.extend(by_type.into_iter().filter_map(|reloc| {
+                let r_type = elf_type(&reloc)?;
+                Some(ElfReloc { func: id, reloc, r_type })
+            }));
+        }
         if let Some(unwind) = &code.unwind {
             self.unwind
                 .add_function(&mut self.module, id, unwind)
