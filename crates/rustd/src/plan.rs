@@ -1,13 +1,10 @@
 //! What cargo builds: the units of a build of one package, with the features and the profile
 //! of each. `cargo metadata` has neither as a build of a single package has them.
 
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{collections::BTreeSet, path::Path, process::Stdio, str::FromStr};
 
 use anyhow::Context;
+use cargo_platform::{Cfg, Platform};
 use cfg::{CfgAtom, CfgDiff};
 use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -55,6 +52,52 @@ pub(crate) struct Built {
     pub(crate) primary: bool,
 }
 
+/// What a build is for and who asks for it.
+pub(crate) struct Asked<'a> {
+    /// The triple built for.
+    pub(crate) triple: &'a str,
+    /// What `rustc --print cfg` says of the triple.
+    pub(crate) cfg: &'a [CfgAtom],
+    /// The variables of the process that asks, where they are not those of this one.
+    pub(crate) env: &'a FxHashMap<String, Option<String>>,
+}
+
+impl Asked<'_> {
+    fn var(&self, name: &str) -> Option<String> {
+        match self.env.get(name) {
+            Some(value) => value.clone(),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    /// cargo, run in `dir` as whoever asks would run it.
+    fn cargo(&self, dir: &Path) -> std::process::Command {
+        let mut command = toolchain::command("cargo", dir, self.env);
+        // The unit graph and `cargo config get` are not stable yet.
+        command.env("RUSTC_BOOTSTRAP", "1").stdin(Stdio::null());
+        command
+    }
+
+    /// Whether the key of a `[target]` table of cargo's configuration names what is built for.
+    fn is(&self, key: &str) -> bool {
+        if key == self.triple {
+            return true;
+        }
+        let cfg: Vec<Cfg> = self
+            .cfg
+            .iter()
+            .filter_map(|atom| match atom {
+                CfgAtom::Flag(name) => Cfg::from_str(name.as_str()).ok(),
+                CfgAtom::KeyValue { key, value } => {
+                    Cfg::from_str(&format!("{key}={:?}", value.as_str())).ok()
+                }
+            })
+            .collect();
+        key.starts_with("cfg(")
+            && Platform::from_str(key).is_ok_and(|it| it.matches(self.triple, &cfg))
+    }
+}
+
 /// The settings of a profile that change what a program does.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct Profile {
@@ -63,6 +106,16 @@ pub(crate) struct Profile {
     pub(crate) debug_assertions: bool,
     pub(crate) overflow_checks: bool,
     pub(crate) panic: PanicStrategy,
+    debuginfo: DebugInfo,
+}
+
+/// How much a profile has rustc say of where code is from, as cargo's unit graph has it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum DebugInfo {
+    Level(u8),
+    /// `line-tables-only` and `line-directives-only`.
+    Named(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -98,6 +151,7 @@ impl Profile {
             debug_assertions,
             overflow_checks: flags.overflow_checks.or(named_overflow).unwrap_or(debug_assertions),
             panic: flags.panic.unwrap_or(self.panic),
+            debuginfo: flags.debuginfo.clone().unwrap_or_else(|| self.debuginfo.clone()),
             ..self.clone()
         }
     }
@@ -105,6 +159,14 @@ impl Profile {
     /// Whether rustc compiles the whole program again when it links it.
     fn links_from_bitcode(&self) -> bool {
         matches!(self.lto.as_str(), "fat" | "thin" | "true")
+    }
+
+    /// Whether the code is to say which lines it is of.
+    pub(crate) fn debug(&self) -> bool {
+        match &self.debuginfo {
+            DebugInfo::Level(level) => *level != 0,
+            DebugInfo::Named(name) => name != "none",
+        }
     }
 
     /// What the profile changes of the cfg `rustc --print cfg -O` reports.
@@ -134,25 +196,26 @@ struct Flags {
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
     panic: Option<PanicStrategy>,
+    debuginfo: Option<DebugInfo>,
     lto: bool,
 }
 
 impl Flags {
-    /// The flags cargo passes in `dir` for `triple`: the first of `CARGO_ENCODED_RUSTFLAGS`,
-    /// `RUSTFLAGS`, the `[target]` tables and `[build]` of the configuration that has any.
-    fn of(dir: &Path, triple: &str) -> anyhow::Result<Flags> {
-        if let Ok(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+    /// The flags cargo passes in `dir` for what is `asked`: the first of
+    /// `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, the `[target]` tables that name what is built
+    /// for and `[build]` of the configuration that has any.
+    fn of(dir: &Path, asked: &Asked<'_>) -> anyhow::Result<Flags> {
+        if let Some(encoded) = asked.var("CARGO_ENCODED_RUSTFLAGS") {
             return Ok(Flags::parse(encoded.split('\u{1f}')));
         }
-        if let Ok(flags) = std::env::var("RUSTFLAGS") {
+        if let Some(flags) = asked.var("RUSTFLAGS") {
             return Ok(Flags::parse(flags.split_whitespace()));
         }
-        let mut command = Command::new("cargo");
+        let mut command = asked.cargo(dir);
         // `cargo config get` is how cargo says what its configuration files and variables
-        // come to, and it is not stable yet.
-        command.env("RUSTC_BOOTSTRAP", "1").current_dir(dir);
+        // come to.
         command.args(["-Z", "unstable-options", "config", "get", "--format", "json"]);
-        let output = command.stdin(Stdio::null()).output().context("running `cargo config`")?;
+        let output = command.output().context("running `cargo config`")?;
         anyhow::ensure!(
             output.status.success(),
             "`cargo config get` failed: {}",
@@ -160,18 +223,14 @@ impl Flags {
         );
         let config: Config =
             serde_json::from_slice(&output.stdout).context("reading cargo's configuration")?;
-        let mut of_target = Vec::new();
-        for (key, table) in &config.target {
-            let Some(flags) = &table.rustflags else { continue };
-            if key == triple {
-                of_target.extend(flags.words());
-            } else if key.starts_with("cfg(") {
-                anyhow::bail!(
-                    "rustflags of `[target.'{key}']` in cargo's configuration: rustd does not \
-                     tell which targets a cfg there is of, name the triple"
-                );
-            }
-        }
+        // The table of the triple, then those of a cfg in the order of their keys.
+        let mut tables: Vec<_> = config.target.iter().filter(|(key, _)| asked.is(key)).collect();
+        tables.sort_by_key(|(key, _)| (key.starts_with("cfg("), key.as_str()));
+        let of_target: Vec<&str> = tables
+            .iter()
+            .filter_map(|(_, table)| table.rustflags.as_ref())
+            .flat_map(Words::words)
+            .collect();
         if !of_target.is_empty() {
             return Ok(Flags::parse(of_target.into_iter()));
         }
@@ -183,6 +242,7 @@ impl Flags {
         while let Some(word) = words.next() {
             let option = match word {
                 "-O" => "opt-level=3",
+                "-g" => "debuginfo=2",
                 "-C" => words.next().unwrap_or_default(),
                 _ => match word.strip_prefix("-C") {
                     Some(option) => option,
@@ -199,6 +259,12 @@ impl Flags {
                 "opt-level" => flags.opt_level = Some(value.to_owned()),
                 "debug-assertions" => flags.debug_assertions = on,
                 "overflow-checks" => flags.overflow_checks = on,
+                "debuginfo" => {
+                    flags.debuginfo = Some(match value.parse() {
+                        Ok(level) => DebugInfo::Level(level),
+                        Err(_) => DebugInfo::Named(value.to_owned()),
+                    })
+                }
                 "panic" if value == "abort" => flags.panic = Some(PanicStrategy::Abort),
                 "panic" if value == "unwind" => flags.panic = Some(PanicStrategy::Unwind),
                 "lto" => flags.lto = on != Some(false),
@@ -248,12 +314,15 @@ pub(crate) struct Plan {
 
 impl Plan {
     /// Asks cargo for the units of the build `selection` names of the package of `manifest`.
-    pub(crate) fn of(manifest: &Path, selection: &Selection, triple: &str) -> anyhow::Result<Plan> {
-        let mut command = Command::new("cargo");
+    pub(crate) fn of(
+        manifest: &Path,
+        selection: &Selection,
+        asked: &Asked<'_>,
+    ) -> anyhow::Result<Plan> {
         // The unit graph is the only place cargo says which features and which profile each
-        // package of one build has, and it is not stable yet.
+        // package of one build has.
         let dir = manifest.parent().unwrap_or(Path::new("."));
-        command.env("RUSTC_BOOTSTRAP", "1").current_dir(dir);
+        let mut command = asked.cargo(dir);
         command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
         command.arg("--manifest-path").arg(manifest);
         command.arg("--profile").arg(&selection.profile);
@@ -278,7 +347,7 @@ impl Plan {
         if selection.dev_deps {
             command.arg("--all-targets");
         }
-        let output = command.stdin(Stdio::null()).output().context("running `cargo build`")?;
+        let output = command.output().context("running `cargo build`")?;
         anyhow::ensure!(
             output.status.success(),
             "`cargo build --unit-graph` failed: {}",
@@ -286,7 +355,12 @@ impl Plan {
         );
         let graph: UnitGraph =
             serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")?;
-        graph.plan(&Flags::of(dir, triple)?)
+        graph.plan(&Flags::of(dir, asked)?)
+    }
+
+    /// Whether the packages cargo was asked to build are to say which lines their code is of.
+    pub(crate) fn debug(&self) -> bool {
+        self.packages.values().any(|it| it.primary && it.profile.debug())
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
