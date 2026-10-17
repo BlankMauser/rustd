@@ -28,6 +28,7 @@ cases![
     prefetch,
     simd_reduce,
     simd_lanes,
+    simd_packs,
     simd_sums,
     variant_alias,
     two_bitflags,

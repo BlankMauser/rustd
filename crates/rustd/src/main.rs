@@ -315,6 +315,7 @@ impl Resolver<'_> {
         }
     }
 
+    /// What stands for a crate of the checkout that rustc built nothing of, the same after
     /// every edit: its name and where in the checkout its source starts.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         if krate.data(self.db).origin.is_lang() || self.rustc_crate_id(krate).is_some() {
@@ -324,8 +325,7 @@ impl Resolver<'_> {
         let root = self.crate_root(krate.into())?;
         let root = self.inside(&root).unwrap_or(&root);
         let named = format!("rustd crate {} {}", name.crate_name(), root.display());
-        let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
-        Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
+        Some(short_hash(&named))
     }
 
     /// The file the crate's source starts at.
@@ -562,7 +562,10 @@ impl SymbolResolver for Resolver<'_> {
         }
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
-        Some(format!("rustd.{id:x}.{path}"))
+        match hir_ty::mir::codegen::block_place(self.db, self, func) {
+            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
+            None => Some(format!("rustd.{id:x}.{path}")),
+        }
     }
 
     fn defines(&self, symbol: &str) -> bool {
@@ -709,6 +712,12 @@ impl SymbolResolver for Resolver<'_> {
         let item = ModuleDef::from(item);
         self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
     }
+}
+
+/// The first eight bytes of the SHA-256 of a text.
+fn short_hash(text: &str) -> u64 {
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes());
+    u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
 }
 
 /// Whether rustc numbers the node as a closure: a closure, or an `async` block.
