@@ -412,6 +412,85 @@ pub fn c_variadic_stack() -> (f64, f64, f64) {
     }
 }
 
+/// Named parameters that the registers do not hold: the variable arguments follow them on
+/// the stack. Only where rustd compiles such a function.
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded(
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    h: u64,
+    i: u8,
+    j: u32,
+    k: u128,
+    l: u16,
+    x0: f64,
+    x1: f64,
+    x2: f64,
+    x3: f64,
+    x4: f64,
+    x5: f64,
+    x6: f64,
+    x7: f64,
+    y: f32,
+    z: f64,
+    count: u32,
+    mut args: ...
+) -> f64 {
+    let ints = a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8;
+    let spilled = i as u128 * 9 + j as u128 * 10 + k * 11 + l as u128 * 12;
+    let mut total = ints as f64 + spilled as f64 + [x0, x1, x2, x3, x4, x5, x6, x7].iter().sum::<f64>() + y as f64 + z * 13.0;
+    for at in 0..count {
+        total = total * 2.0
+            + match at % 2 {
+                0 => unsafe { args.next_arg::<u64>() as f64 },
+                _ => unsafe { args.next_arg::<f64>() },
+            };
+    }
+    total
+}
+#[cfg(target_vendor = "apple")]
+pub fn c_variadic_named_stack() -> (f64, f64) {
+    unsafe {
+        (
+            crowded(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1 << 66, 12, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 0.25, 0.75, 0),
+            crowded(
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 0.25, 0.75, 5, 13u64, 1.5f64, 14u64, 2.5f64,
+                15u64,
+            ),
+        )
+    }
+}
+
+/// A 128-bit variable argument, which is at a multiple of sixteen bytes where the variable
+/// arguments are on the stack.
+#[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+unsafe extern "C" fn widest(count: u32, mut args: ...) -> u128 {
+    let mut total = 0u128;
+    for at in 0..count {
+        total = total.wrapping_mul(3).wrapping_add(match at % 3 {
+            0 => unsafe { args.next_arg::<u32>() as u128 },
+            1 => unsafe { args.next_arg::<u128>() },
+            _ => unsafe { args.next_arg::<i128>() as u128 },
+        });
+    }
+    total
+}
+#[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+pub fn c_variadic_wide() -> (u128, u128) {
+    unsafe {
+        (
+            widest(3, 1u32, 1u128 << 100, -5i128),
+            widest(7, 1u32, 2u128, -3i128, 4u32, u128::MAX, i128::MIN, 5u32),
+        )
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", unix))]
 pub mod x86 {
     use std::arch::{asm, naked_asm};

@@ -449,6 +449,13 @@ fn main() {
     println!("stabilized c_variadic {:?}", cases::stabilized::c_variadic());
     #[cfg(not(target_family = "wasm"))]
     println!("stabilized c_variadic_stack {:?}", cases::stabilized::c_variadic_stack());
+    #[cfg(target_vendor = "apple")]
+    println!(
+        "stabilized c_variadic_named_stack {:?}",
+        cases::stabilized::c_variadic_named_stack()
+    );
+    #[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+    println!("stabilized c_variadic_wide {:?}", cases::stabilized::c_variadic_wide());
     #[cfg(unix)]
     println!("stabilized variadic_floats {:?}", cases::stabilized::variadic_floats());
     #[cfg(all(target_arch = "x86_64", unix))]

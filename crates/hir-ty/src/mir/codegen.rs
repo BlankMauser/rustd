@@ -1213,28 +1213,6 @@ impl VariadicRegisters {
         Ok(named)
     }
 
-    /// Turns down named parameters that Apple's AArch64 convention has on the stack, where
-    /// the variable arguments then do not start.
-    fn all_in_registers(sig: &Signature) -> Result<()> {
-        const EACH: u32 = 8;
-        let (mut ints, mut floats) = (0, 0);
-        for param in &sig.params {
-            match param.value_type {
-                // The address of what is returned has a register of its own.
-                _ if param.purpose == ArgumentPurpose::StructReturn => (),
-                ty if param.purpose == ArgumentPurpose::Normal && ty.is_int() => {
-                    ints += ty.bytes().div_ceil(8)
-                }
-                types::F32 | types::F64 if param.purpose == ArgumentPurpose::Normal => floats += 1,
-                ty => unsupported!("a variadic function with a named {ty}"),
-            }
-        }
-        if ints > EACH || floats > EACH {
-            unsupported!("a variadic function with a named parameter on the stack");
-        }
-        Ok(())
-    }
-
     /// Adds the registers the named parameters left to `sig`, so that the function is given
     /// all of them whatever it was called with, and on x86-64 the stack past them. Cranelift
     /// has no such parameter for AArch64, where the frame pointer finds the stack.
@@ -1294,8 +1272,11 @@ impl HomedRegisters {
 enum Variadic {
     SystemV(VariadicRegisters),
     Windows(HomedRegisters),
-    /// All of them on the stack, right above the frame record.
-    Apple,
+    /// All of them on the stack, after the `named` bytes of it that the named parameters
+    /// take.
+    Apple {
+        named: u32,
+    },
 }
 
 impl Variadic {
@@ -1308,8 +1289,7 @@ impl Variadic {
             }
             Some(VariableArguments::Homed) => Some(Variadic::Windows(HomedRegisters::named(sig)?)),
             Some(VariableArguments::Stack) => {
-                VariadicRegisters::all_in_registers(sig)?;
-                Some(Variadic::Apple)
+                Some(Variadic::Apple { named: Self::apple_stack(sig)? })
             }
             None => None,
         })
@@ -1319,8 +1299,34 @@ impl Variadic {
         match self {
             Variadic::SystemV(named) => named.rest(sig),
             Variadic::Windows(named) => named.rest(sig),
-            Variadic::Apple => (),
+            Variadic::Apple { .. } => (),
         }
+    }
+
+    /// How many bytes of stack the named parameters of `sig` take under Apple's AArch64
+    /// convention: the ones the eight registers of their kind do not hold, each at a
+    /// multiple of its own size. The variable arguments start at the next multiple of eight.
+    fn apple_stack(sig: &Signature) -> Result<u32> {
+        const EACH: u32 = 8;
+        let (mut ints, mut floats, mut stack) = (0, 0, 0u32);
+        for param in &sig.params {
+            let ty = param.value_type;
+            let used = match param.purpose {
+                // The address of what is returned has a register of its own.
+                ArgumentPurpose::StructReturn => continue,
+                ArgumentPurpose::Normal if ty.is_int() => &mut ints,
+                ArgumentPurpose::Normal if ty == types::F32 || ty == types::F64 => &mut floats,
+                _ => unsupported!("a variadic function with a named {ty}"),
+            };
+            // A 128-bit integer is in two registers or in none.
+            let registers = ty.bytes().div_ceil(8);
+            if *used + registers <= EACH {
+                *used += registers;
+            } else {
+                stack = stack.next_multiple_of(ty.bytes()) + ty.bytes();
+            }
+        }
+        Ok(stack.next_multiple_of(8))
     }
 }
 
@@ -4725,18 +4731,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
-        if let Some(Variadic::Apple) = variadic {
+        if let Some(Variadic::Apple { named }) = variadic {
             let list = *body.param_locals.last().expect("the list of a variadic function");
             let layout = self.layout(body.locals[list].ty.as_ref())?;
             if layout.size.bytes() != 8 {
                 unsupported!("a `VaList` that is not the one of this target");
             }
             let addr = self.stack_slot(&layout);
-            // The named parameters are all in registers, so the first of the variable ones
-            // is the first thing the caller left on the stack: what is right above the
-            // frame record, which is the frame pointer and the return address.
+            // What the caller left on the stack is right above the frame record, which is
+            // the frame pointer and the return address: the named parameters that are
+            // there, then the variable ones.
             let frame = self.builder.ins().get_frame_pointer(ptr());
-            let stack = self.builder.ins().iadd_imm(frame, 16);
+            let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named));
             self.builder.ins().store(MEM, stack, addr, 0);
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
@@ -8583,13 +8589,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ) =>
             {
                 let scalar = self.scalar_of(dst_ty)?;
-                if scalar.ty.bytes() > 8 {
+                let bytes = i64::from(scalar.ty.bytes());
+                let homed = self.cg.target.variable_arguments() == Some(VariableArguments::Homed);
+                if bytes > 8 && homed {
                     unsupported!("`va_arg` of {dst_ty:?}");
                 }
-                // The list is the address of the next argument, each of them in eight bytes.
+                // The list is the address of the next argument, each of them in eight bytes,
+                // or in as many as it is wide, at a multiple of that.
                 let (list, _) = self.load_scalar(list)?;
-                let from = self.builder.ins().load(ptr(), MEM, list, 0);
-                let next = self.builder.ins().iadd_imm(from, 8);
+                let mut from = self.builder.ins().load(ptr(), MEM, list, 0);
+                if bytes > 8 {
+                    from = self.builder.ins().iadd_imm(from, bytes - 1);
+                    from = self.builder.ins().band_imm(from, -bytes);
+                }
+                let next = self.builder.ins().iadd_imm(from, bytes.max(8));
                 self.builder.ins().store(MEM, next, list, 0);
                 let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
                 self.builder.ins().store(MEM, value, dst, 0);

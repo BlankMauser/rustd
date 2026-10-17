@@ -2,8 +2,9 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-// `box` patterns are unstable: the case is for a nightly toolchain only.
-#![cfg_attr(feature = "nightly", feature(box_patterns))]
+// `box` patterns and 128-bit variable arguments are unstable: the cases are for a nightly
+// toolchain only.
+#![cfg_attr(feature = "nightly", feature(box_patterns, c_variadic_int128))]
 
 pub mod stabilized;
 
