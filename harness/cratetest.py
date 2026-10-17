@@ -120,7 +120,7 @@ def main():
     if lib:
         tests.append((UNIT, lib))
     tests = [(t, path) for t, path in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
-    results, shared = [], {}
+    results, shared, left_out = [], {}, []
     for test, path in tests:
         print(f"--- {test}", flush=True)
         fx = TestFixture(a.crate_dir, crate, test, path, shared, a.features, a.skip)
@@ -131,10 +131,13 @@ def main():
             # rustd sees the crate with its default features, so only those are tested.
             if "requires the features" in str(e):
                 print("left out: needs features that are off by default")
+                left_out.append({"test": test, "why": "needs features"})
                 continue
             # rustc could not build it either: a dev-dependency the published crate lacks, say.
             if str(e).startswith("cargo failed"):
                 print(f"left out: rustc does not build it: {str(e)[-300:]}")
+                errors = re.findall(r"^error(?:\[E\d+\])?: .*", str(e), re.M)
+                left_out.append({"test": test, "why": "cargo fails", "error": (errors or [str(e)[-200:]])[0][:200]})
                 continue
             print(f"ERROR: {str(e)[:1500]}")
             results.append({"match": False, "tests_run": 0, "error": str(e)[:300], "crates": {},
@@ -147,19 +150,21 @@ def main():
         results.append(result)
     ok = all(r["match"] for r in results)
     total = sum(r["tests_run"] for r in results)
+    merged = {"fixture": crate, "match": ok, "tests_run": total,
+              "crates": results[0]["crates"] if results else {},
+              "binaries": results, "left_out": left_out,
+              "culprits": [c for r in results for c in r.get("culprits", [])]}
     # A crate rustd compiled nothing of matches rustc by construction, which is no result.
-    if ok and not sum(c["compiled"] for r in results for c in r["crates"].values()):
+    untested = ok and not sum(c["compiled"] for r in results for c in r["crates"].values())
+    if untested:
+        merged["untested"] = True
         print(f"UNTESTED: {len(results)} test binaries, {total} tests, no function from rustd")
-        sys.exit(2)
-    print(f"{'MATCH' if ok else 'MISMATCH'}: {len(results)} test binaries, {total} tests")
+    else:
+        print(f"{'MATCH' if ok else 'MISMATCH'}: {len(results)} test binaries, {total} tests")
     if a.json:
-        merged = {"fixture": crate, "match": ok, "tests_run": total,
-                  "crates": results[0]["crates"] if results else {},
-                  "binaries": results,
-                  "culprits": [c for r in results for c in r.get("culprits", [])]}
         json.dump(merged, open(a.json, "w"), indent=1)
     discard(results)
-    sys.exit(0 if ok else 1)
+    sys.exit(2 if untested else 0 if ok else 1)
 
 
 main()
