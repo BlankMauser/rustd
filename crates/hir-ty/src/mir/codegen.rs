@@ -6486,9 +6486,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // An index out of bounds is reported at the index expression, which may be
                     // an operand of the statement that reads it.
                     let statement = self.span;
-                    self.span = self.index_spans.get(local).copied().unwrap_or(statement);
+                    self.at(self.index_spans.get(local).copied().unwrap_or(statement));
                     addr = self.element(addr, meta, prev.ty, index)?;
-                    self.span = statement;
+                    self.at(statement);
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
