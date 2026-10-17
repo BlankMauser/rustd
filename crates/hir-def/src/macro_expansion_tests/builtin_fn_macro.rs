@@ -172,10 +172,10 @@ fn main() {
 macro_rules! env {() => {}}
 
 fn main() {
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
 }
 "##]],
     );

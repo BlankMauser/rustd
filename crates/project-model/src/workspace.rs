@@ -29,7 +29,10 @@ use crate::{
     build_dependencies::{BuildScriptOutput, ProcMacroDylibPath},
     cargo_config_file::CargoConfigFile,
     cargo_workspace::{CargoMetadataConfig, DepKind, FetchMetadata, PackageData, RustLibSource},
-    env::{cargo_config_env, inject_cargo_env, inject_cargo_package_env, inject_rustc_tool_env},
+    env::{
+        cargo_config_env, inject_cargo_env, inject_cargo_executables_env, inject_cargo_package_env,
+        inject_rustc_tool_env,
+    },
     project_json::{Crate, CrateArrayIdx},
     sysroot::RustLibSrcWorkspace,
     toolchain_info::{QueryConfig, rustc_cfg, target_data, target_tuple, version},
@@ -443,7 +446,8 @@ impl ProjectWorkspace {
                 "Failed to read Cargo metadata from Cargo.toml file {cargo_toml}, {toolchain:?}",
             )
         })?;
-        let cargo = CargoWorkspace::new(meta, cargo_toml.clone(), cargo_env, false);
+        let mut cargo = CargoWorkspace::new(meta, cargo_toml.clone(), cargo_env, false);
+        cargo.set_executables(config.executables.clone());
         if let Some(loaded_sysroot) = loaded_sysroot {
             tracing::info!(src_root = ?sysroot.rust_lib_src_root(), root = %loaded_sysroot, "Loaded sysroot");
             sysroot.set_workspace(loaded_sysroot);
@@ -1701,6 +1705,9 @@ fn add_target_crate_root(
     inject_cargo_package_env(&mut env, pkg);
     inject_cargo_env(&mut env, cargo_path);
     inject_rustc_tool_env(&mut env, cargo_crate_name, kind);
+    if matches!(kind, TargetKind::Test | TargetKind::Bench) {
+        inject_cargo_executables_env(&mut env, cargo, pkg);
+    }
 
     if let Some(envs) = build_data.map(|(it, _)| &it.envs) {
         env.extend_from_other(envs);

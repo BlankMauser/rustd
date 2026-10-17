@@ -1254,6 +1254,15 @@ impl Checkouts {
     }
 }
 
+/// The directory cargo put the executables of the build in: the one its `deps`, where the
+/// libraries of the build are, is in.
+fn executables_of(symbol_files: &[PathBuf]) -> Option<AbsPathBuf> {
+    let deps = symbol_files.iter().filter_map(|file| file.parent());
+    let deps = deps.filter(|deps| deps.file_name().is_some_and(|name| name == "deps"));
+    let built = deps.filter_map(Path::parent).next()?;
+    AbsPathBuf::try_from(built.to_str()?).ok()
+}
+
 /// The parts of a checkout that a build of it is told.
 struct Parts {
     root: PathBuf,
@@ -2872,6 +2881,7 @@ fn main() -> anyhow::Result<()> {
             features: args.features.clone(),
             no_default_features: false,
         },
+        executables: executables_of(&args.symbol_files),
         ..Default::default()
     };
     let load_config = LoadCargoConfig {

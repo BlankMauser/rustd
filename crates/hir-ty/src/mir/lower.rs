@@ -3085,6 +3085,19 @@ fn mir_body_for_coroutine_cycle_result<'db>(
     Err(MirLowerError::Loop)
 }
 
+/// Refuses a body with a macro call that failed to expand: what stands in for the expansion
+/// is a guess, where rustc stops.
+fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+    for (_, call) in source_map.macro_calls() {
+        if let Some(error) = &call.parse_macro_expansion(db).err {
+            let message = error.render_to_string(db).message;
+            not_supported!("macro call that failed to expand: {message}");
+        }
+    }
+    Ok(())
+}
+
 /// How the body of a closure gets at what the closure captured.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Receiver {
@@ -3114,6 +3127,7 @@ fn lower_closure_body<'db>(
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
+    check_expansions(db, body_owner)?;
     let Expr::Closure { args, body: root, .. } = &store[expr] else {
         implementation_error!("closure expression is not closure");
     };
@@ -3430,6 +3444,7 @@ pub fn promoted_mir_body_query<'db>(
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return Err(MirLowerError::HasErrors);
     }
+    check_expansions(db, def)?;
     let mut ctx = MirLowerCtx::new(db, def, store, infer);
     // The value itself, before what borrowing or indexing it adjusts it to.
     ctx.result.locals.alloc(Local { ty: ctx.expr_ty_without_adjust(expr).store() });
@@ -3514,6 +3529,7 @@ pub fn lower_to_mir_with_store<'db>(
     params: impl Iterator<Item = (PatId, Ty<'db>)> + Clone,
     self_param: Option<(BindingId, Ty<'db>)>,
 ) -> Result<'db, MirBody<'db>> {
+    check_expansions(db, owner)?;
     if infer.has_type_mismatches() || infer.is_erroneous() {
         if std::env::var_os("RUSTD_DUMP_ERRORS").is_some() {
             for (expr, data) in store.exprs() {

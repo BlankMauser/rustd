@@ -976,14 +976,14 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
-        // The only variable rust-analyzer ever sets is `OUT_DIR`, so only diagnose that to avoid
-        // unnecessary diagnostics for eg. `CARGO_PKG_NAME`.
-        if key.as_str() == "OUT_DIR" {
-            err = Some(ExpandError::other(
-                span,
-                r#"`OUT_DIR` not set, build scripts may have failed to run"#,
-            ));
-        }
+        err = Some(ExpandError::other(
+            span,
+            if key.as_str() == "OUT_DIR" {
+                r#"`OUT_DIR` not set, build scripts may have failed to run"#.to_owned()
+            } else {
+                format!("environment variable `{}` not defined at compile time", key.as_str())
+            },
+        ));
 
         // If the variable is unset, still return a dummy string to help type inference along.
         // We cannot use an empty string here, because for
