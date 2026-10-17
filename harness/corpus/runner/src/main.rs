@@ -451,6 +451,11 @@ fn main() {
     println!("stabilized c_variadic_stack {:?}", cases::stabilized::c_variadic_stack());
     #[cfg(target_vendor = "apple")]
     println!(
+        "stabilized c_variadic_named_wide {:?}",
+        cases::stabilized::c_variadic_named_wide()
+    );
+    #[cfg(target_vendor = "apple")]
+    println!(
         "stabilized c_variadic_named_stack {:?}",
         cases::stabilized::c_variadic_named_stack()
     );

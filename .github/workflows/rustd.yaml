@@ -64,3 +64,49 @@ jobs:
           run worktrees.py
           run keys.py
           exit $failed
+
+  macos:
+    name: macOS arm64 (${{ matrix.backend }})
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          brew install llvm@20
+          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+        if: matrix.backend == 'cranelift'
+      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
+        if: matrix.backend == 'cranelift'
+      - run: cargo build -p rustd --release --features llvm
+      - name: Harnesses
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          failed=0
+          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run difftest.py corpus --bin runner --crate cases --layouts
+          run programs.py
+          run stress.py
+          run breakers.py
+          run unwinds.py
+          run splices.py
+          run asmedits.py
+          run deps.py
+          run includes.py
+          run worktrees.py
+          run worktrees.py --join --together
+          run worktrees.py --overlay
+          run keys.py
+          exit $failed

@@ -1323,6 +1323,8 @@ impl Variadic {
             if *used + registers <= EACH {
                 *used += registers;
             } else {
+                // And nothing after it is in a register of that kind.
+                *used = EACH;
                 stack = stack.next_multiple_of(ty.bytes()) + ty.bytes();
             }
         }
@@ -8625,7 +8627,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     from = self.builder.ins().iadd_imm(from, bytes - 1);
                     from = self.builder.ins().band_imm(from, -bytes);
                 }
-                let next = self.builder.ins().iadd_imm(from, bytes.max(8));
+                let next = self.builder.ins().iadd_imm(from, (bytes + 7) & !7);
                 self.builder.ins().store(MEM, next, list, 0);
                 let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
                 self.builder.ins().store(MEM, value, dst, 0);

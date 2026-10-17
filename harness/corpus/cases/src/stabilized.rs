@@ -454,6 +454,63 @@ unsafe extern "C" fn crowded(
     }
     total
 }
+/// A 128-bit integer and a pair that the registers left do not hold, and what follows them.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Pair {
+    pub a: u64,
+    pub b: u64,
+}
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded_wide(
+    a: [u64; 7],
+    b: u128,
+    c: u8,
+    count: u32,
+    mut args: ...
+) -> u128 {
+    let mut total = a.iter().sum::<u64>() as u128 + b * 3 + c as u128 * 5;
+    for _ in 0..count {
+        total = total * 7 + unsafe { args.next_arg::<u64>() as u128 };
+    }
+    total
+}
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded_pair(
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    p: Pair,
+    h: u16,
+    q: Pair,
+    count: u32,
+    mut args: ...
+) -> u64 {
+    let mut total = a + b + c + d + e + f + g + p.a * 3 + p.b * 5 + h as u64 * 7 + q.a * 11 + q.b;
+    for _ in 0..count {
+        total = total * 13 + unsafe { args.next_arg::<u32>() as u64 };
+    }
+    total
+}
+#[cfg(target_vendor = "apple")]
+pub fn c_variadic_named_wide() -> (u128, u128, u64, u64) {
+    let (p, q) = (Pair { a: 21, b: 22 }, Pair { a: 23, b: 24 });
+    unsafe {
+        (
+            crowded_wide([1, 2, 3, 4, 5, 6, 7], 1 << 90, 9, 0),
+            crowded_wide([1, 2, 3, 4, 5, 6, 7], 1 << 90, 9, 3, 10u64, 11u64, 12u64),
+            crowded_pair(1, 2, 3, 4, 5, 6, 7, p, 8, q, 0),
+            crowded_pair(1, 2, 3, 4, 5, 6, 7, p, 8, q, 2, 31u32, 32u32),
+        )
+    }
+}
 #[cfg(target_vendor = "apple")]
 pub fn c_variadic_named_stack() -> (f64, f64) {
     unsafe {
