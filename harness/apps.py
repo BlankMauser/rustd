@@ -86,6 +86,7 @@ class App(Fixture):
         self.scrubbed = spec.get("scrub", [])
         self.argv0 = spec.get("bin", spec["package"])
         self.run_env = {**os.environ, **spec.get("env", {})}
+        self.stdin = None
 
     def rustc_build(self):
         """Cargo's build, with rustd in rustc's place for every crate when the program is
@@ -127,9 +128,10 @@ class App(Fixture):
         self.link_secs = time.monotonic() - began
 
     def behaviour(self, binary):
+        stdin = open(os.path.join(self.ws, self.stdin), "rb") if self.stdin else subprocess.DEVNULL
         try:
             run = subprocess.run([self.argv0, *self.run_args], executable=binary, capture_output=True,
-                                 stdin=subprocess.DEVNULL, timeout=600, cwd=self.ws, env=self.run_env)
+                                 stdin=stdin, timeout=600, cwd=self.ws, env=self.run_env)
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""
         return run.returncode, self.scrub(run.stdout), self.scrub(run.stderr)
@@ -193,9 +195,9 @@ def reasons(row):
         print(f"  {count:5} {reason}\n        {row['examples'][reason]}")
 
 
-def reference(ws, spec, profile):
+def reference(ws, spec, profile, timed=False):
     """Cargo's own build of the program without the harness's flags, timed when it is from
-    nothing; returns (program, seconds or None)."""
+    nothing or when asked; returns (program, seconds or None)."""
     target = os.path.join(ws, "target-" + profile)
     name = spec.get("bin", spec["package"])
     program = os.path.join(target, profile, name)
@@ -204,7 +206,7 @@ def reference(ws, spec, profile):
     argv = ["cargo", "build", "-p", spec["package"], *spec.get("cargo_args", []),
             *(["--release"] if profile == "release" else [])]
     secs, _ = sh(argv, ws, env)
-    return program, round(secs, 1) if cold else None
+    return program, round(secs, 1) if cold or timed else None
 
 
 def setup(ws, spec):
@@ -252,11 +254,15 @@ class Served:
 
     def behaviour(self, run):
         """A command line of the program, or of a tool (`{"tool": [...]}`) that talks to it."""
-        if isinstance(run, dict):
+        if isinstance(run, dict) and "tool" in run:
             ran = subprocess.run(self.args(run["tool"]), capture_output=True, stdin=subprocess.DEVNULL,
                                  timeout=600, cwd=self.fx.ws)
             return ran.returncode, self.fx.scrub(ran.stdout), self.fx.scrub(ran.stderr)
-        self.fx.run_args = self.args(run)
+        if isinstance(run, dict):
+            # The program reads the file `stdin` names.
+            self.fx.run_args, self.fx.stdin = self.args(run["args"]), run["stdin"]
+        else:
+            self.fx.run_args, self.fx.stdin = self.args(run), None
         return self.fx.behaviour(self.binary)
 
     def seconds(self, argv, rounds=3):
@@ -281,7 +287,9 @@ class Served:
 
 
 def name_of(run):
-    return shlex.join(run["tool"] if isinstance(run, dict) else run)
+    if isinstance(run, dict):
+        return shlex.join(run["tool"]) if "tool" in run else f"{shlex.join(run['args'])} < {run['stdin']}"
+    return shlex.join(run)
 
 
 def workload(fx, spec, debug, result):
@@ -334,6 +342,8 @@ def main():
     spec = json.load(open(SPECS))[a.name]
     stages = a.stage.split(",")
     out = os.path.abspath(a.json) if a.json else None
+    # What the build scripts of the application read.
+    os.environ.update(spec.get("build_env", {}))
     ws = checkout(a.name, spec)
     localize(ws)
     os.environ["RUSTFLAGS"] = FLAGS

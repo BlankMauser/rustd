@@ -101,6 +101,79 @@
    "../ripgrep-vendor",
    "-j",
    "1"
+  ],
+  "edit_check": [
+   "--stats",
+   "-n",
+   "-C",
+   "1",
+   "--trim",
+   "fn main",
+   "crates/core",
+   "--sort",
+   "path"
+  ],
+  "edits": [
+   {
+    "file": "crates/core/main.rs",
+    "old": "{matches} matches\n",
+    "new": "{matches} matches found\n",
+    "what": "a word in the statistics"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "self.matches += n;",
+    "new": "self.matches += n * 2;",
+    "what": "matches counted twice"
+   },
+   {
+    "file": "crates/printer/src/standard.rs",
+    "old": "separator_context: Arc::new(Some(b\"--\".to_vec())),",
+    "new": "separator_context: Arc::new(Some(b\"~~\".to_vec())),",
+    "what": "the default context separator"
+   },
+   {
+    "file": "crates/printer/src/util.rs",
+    "old": "b'\\t' | b'\\n' | b'\\x0B' | b'\\x0C' | b'\\r' | b' ' => true,",
+    "new": "b'\\n' | b'\\x0B' | b'\\x0C' | b'\\r' | b' ' => true,",
+    "what": "a tab is not trimmed"
+   },
+   {
+    "file": "crates/core/main.rs",
+    "old": "{searches} files searched\n",
+    "new": "{searches} files looked at\n",
+    "what": "another word in the statistics"
+   },
+   {
+    "file": "crates/printer/src/standard.rs",
+    "old": "        let n = DecimalFormatter::new(line_number);\n        self.std.write_spec(self.config().colors.line(), n.as_bytes())?;",
+    "new": "        let n = DecimalFormatter::new(line_number + 1000);\n        self.std.write_spec(self.config().colors.line(), n.as_bytes())?;",
+    "what": "line numbers offset"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "    /// Add to the total number of matches.\n",
+    "new": "    /// Half of what was counted, rounded up.\n    fn halved(n: u64) -> u64 {\n        n.div_ceil(2)\n    }\n\n    /// Add to the total number of matches.\n",
+    "what": "a new function"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "self.matches += n * 2;",
+    "new": "self.matches += Self::halved(n * 2);",
+    "what": "a call of the new function"
+   },
+   {
+    "file": "crates/printer/src/summary.rs",
+    "old": "count.max(1)",
+    "new": "count.max(2)",
+    "what": "a floor of a count"
+   },
+   {
+    "file": "crates/core/main.rs",
+    "old": "{bytes_printed} bytes printed\n",
+    "new": "{bytes_printed} bytes printed ({matches} matches)\n",
+    "what": "a format argument used twice"
+   }
   ]
  },
  "fd": {
@@ -484,7 +557,11 @@
  "starship": {
   "repo": "https://github.com/starship/starship",
   "rev": "2d8741e4830273ff2bec1fe45e1e7fe6aa979cf4",
-  "package": "starship", "cargo_args": ["--bin", "starship"],
+  "package": "starship",
+  "cargo_args": [
+   "--bin",
+   "starship"
+  ],
   "env": {
    "STARSHIP_CONFIG": "/dev/null",
    "STARSHIP_CACHE": "/tmp/starship-apps-cache",
@@ -883,6 +960,540 @@
    "client",
    "{port}",
    "400"
+  ]
+ },
+ "cargo": {
+  "repo": "https://github.com/rust-lang/cargo",
+  "rev": "5f94df4789f005f9a352888e8355ffc645b7ed0e",
+  "package": "cargo",
+  "cargo_args": [
+   "--bin",
+   "cargo"
+  ],
+  "scrub": [
+   "in [0-9.]+s",
+   "[0-9.]+(MiB|KiB|GiB|B) total"
+  ],
+  "env": {
+   "CARGO_TERM_COLOR": "never",
+   "CARGO_NET_OFFLINE": "true"
+  },
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--list"
+   ],
+   [
+    "help",
+    "build"
+   ],
+   [
+    "metadata",
+    "--format-version",
+    "1",
+    "--no-deps"
+   ],
+   [
+    "tree",
+    "-p",
+    "cargo-platform",
+    "--edges",
+    "normal"
+   ],
+   [
+    "tree",
+    "-p",
+    "cargo",
+    "--depth",
+    "1",
+    "--edges",
+    "normal",
+    "--prefix",
+    "none"
+   ],
+   [
+    "pkgid",
+    "-p",
+    "cargo-util"
+   ],
+   [
+    "locate-project",
+    "--workspace"
+   ],
+   [
+    "clean",
+    "--target-dir",
+    ".apps-target"
+   ],
+   [
+    "build",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1"
+   ],
+   [
+    "build",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1",
+    "--message-format",
+    "json"
+   ],
+   [
+    "test",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1",
+    "--lib"
+   ],
+   [
+    "build",
+    "-p",
+    "no-such-package"
+   ],
+   [
+    "frobnicate"
+   ],
+   [
+    "metadata",
+    "--format-version",
+    "1",
+    "--manifest-path",
+    "no/such/Cargo.toml"
+   ]
+  ],
+  "bench": [
+   "metadata",
+   "--format-version",
+   "1"
+  ]
+ },
+ "rust-analyzer": {
+  "repo": "https://github.com/rust-lang/rust-analyzer",
+  "rev": "70e0c46be740a471bcc95f2be290f4bbfdcffd87",
+  "package": "rust-analyzer",
+  "cargo_args": [
+   "--bin",
+   "rust-analyzer"
+  ],
+  "scrub": [
+   "[0-9.]+(ms|s)\\b",
+   "\\d+(mb|kb|b)\\b",
+   "[0-9]+ ?(MB|GB|KB)"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   {
+    "args": [
+     "parse"
+    ],
+    "stdin": "crates/stdx/src/lib.rs"
+   },
+   {
+    "args": [
+     "symbols"
+    ],
+    "stdin": "crates/stdx/src/lib.rs"
+   },
+   {
+    "args": [
+     "highlight"
+    ],
+    "stdin": "crates/stdx/src/process.rs"
+   },
+   [
+    "lsif",
+    "lib/la-arena"
+   ],
+   [
+    "diagnostics",
+    "lib/la-arena"
+   ],
+   [
+    "analysis-stats",
+    "--randomize",
+    "lib/line-index"
+   ],
+   [
+    "analysis-stats",
+    "lib/la-arena"
+   ],
+   [
+    "unresolved-references",
+    "lib/la-arena"
+   ],
+   [
+    "ssr",
+    "$a.len() == 0 ==>> $a.is_empty()"
+   ],
+   [
+    "no-such-command"
+   ],
+   [
+    "lsif",
+    "no/such/dir"
+   ]
+  ],
+  "bench": [
+   "analysis-stats",
+   "lib/la-arena"
+  ]
+ },
+ "nushell": {
+  "repo": "https://github.com/nushell/nushell",
+  "rev": "85aae22da8e8c010e782d011b07c46bc7d703fb8",
+  "package": "nu",
+  "cargo_args": [
+   "--bin",
+   "nu"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "1..2000 | each {|x| $x * $x mod 7} | math sum"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "open Cargo.toml | get package | select name edition | to json"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "open Cargo.lock | get package | where name =~ \"^nu\" | get name | str join \",\""
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "ls crates | get name | sort | first 20 | to nuon"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "glob crates/nu-parser/src/*.rs | sort | each {|f| open --raw $f | lines | length} | math sum"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "\"the quick brown fox\" | split words | each {|w| $w | str capitalize | str reverse} | to json -r"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "[[a b]; [1 2] [3 4] [5 6]] | update a {|r| $r.a * 10} | table"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "def fib [n: int] { if $n < 2 { $n } else { (fib ($n - 1)) + (fib ($n - 2)) } }; fib 18"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "{a: 1, b: [1 2 3], c: {d: \"x\"}} | to yaml"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "help commands | length"
+   ],
+   [
+    "-n",
+    "-c",
+    "use std/assert; assert equal (1 + 1) 2; \"std ok\""
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "1 / 0"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "no-such-command 1"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "let x = [1 2 3; $x.9"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "-n",
+   "--no-std-lib",
+   "-c",
+   "def fib [n: int] { if $n < 2 { $n } else { (fib ($n - 1)) + (fib ($n - 2)) } }; fib 22"
+  ]
+ },
+ "helix": {
+  "repo": "https://github.com/helix-editor/helix",
+  "rev": "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc",
+  "package": "helix-term",
+  "bin": "hx",
+  "cargo_args": [
+   "--bin",
+   "hx"
+  ],
+  "build_env": {
+   "HELIX_DISABLE_AUTO_GRAMMAR_BUILD": "1"
+  },
+  "env": {
+   "HELIX_RUNTIME": "runtime",
+   "HOME": "/tmp/apps-helix-home",
+   "XDG_CONFIG_HOME": "/tmp/apps-helix-home/config",
+   "XDG_CACHE_HOME": "/tmp/apps-helix-home/cache"
+  },
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--health"
+   ],
+   [
+    "--health",
+    "rust"
+   ],
+   [
+    "--health",
+    "languages"
+   ],
+   [
+    "--health",
+    "no-such-language"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "-c",
+    "no/such/config.toml",
+    "--health",
+    "toml"
+   ]
+  ],
+  "bench": [
+   "--health"
+  ]
+ },
+ "alacritty": {
+  "repo": "https://github.com/alacritty/alacritty",
+  "rev": "542147067dd016fc5f49120ef0ba605a98a4e3a7",
+  "package": "alacritty",
+  "env": {
+   "HOME": "/tmp/apps-alacritty-home",
+   "XDG_RUNTIME_DIR": "/tmp/apps-alacritty-home",
+   "WAYLAND_DISPLAY": "",
+   "DISPLAY": ""
+  },
+  "setup": [
+   "printf 'font:\\n  size: 11.5\\nwindow:\\n  padding:\\n    x: 4\\n    y: 6\\ncolors:\\n  primary:\\n    background: \"0x101010\"\\nkey_bindings:\\n  - { key: V, mods: Control|Shift, action: Paste }\\n' > .apps-old.yml"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    ".apps-old.yml"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    "alacritty/alacritty.toml"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    "no-such.yml"
+   ],
+   [
+    "msg",
+    "create-window"
+   ],
+   [
+    "msg",
+    "--help"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "--config-file",
+    "no-such.toml",
+    "--print-events",
+    "--hold",
+    "--bad"
+   ]
+  ],
+  "bench": [
+   "migrate",
+   "--dry-run",
+   "-c",
+   ".apps-old.yml"
+  ]
+ },
+ "ruff": {
+  "repo": "https://github.com/astral-sh/ruff",
+  "rev": "8d122c1fd2b8f16d494ff8a8f8ee6f264bba7ceb",
+  "package": "ruff",
+  "cargo_args": [
+   "--bin",
+   "ruff"
+  ],
+  "scrub": [
+   "in [0-9.]+(ms|s)"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "linter"
+   ],
+   [
+    "rule",
+    "E501"
+   ],
+   [
+    "rule",
+    "--all",
+    "--output-format",
+    "json"
+   ],
+   [
+    "config"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "ALL",
+    "--output-format",
+    "concise",
+    "crates/ruff_linter/resources/test/fixtures/pycodestyle"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "E,F,B,UP",
+    "--output-format",
+    "json",
+    "crates/ruff_linter/resources/test/fixtures/pyflakes"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "ALL",
+    "--statistics",
+    "crates/ruff_linter/resources/test/fixtures"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "UP,SIM",
+    "--diff",
+    "crates/ruff_linter/resources/test/fixtures/pyupgrade"
+   ],
+   [
+    "format",
+    "--isolated",
+    "--no-cache",
+    "--diff",
+    "crates/ruff_python_formatter/resources/test/fixtures/black"
+   ],
+   [
+    "format",
+    "--isolated",
+    "--no-cache",
+    "--check",
+    "crates/ruff_python_formatter/resources/test/fixtures/ruff"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--show-settings",
+    "scripts"
+   ],
+   [
+    "check",
+    "no/such/file.py"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "check",
+   "--isolated",
+   "--no-cache",
+   "--select",
+   "ALL",
+   "--statistics",
+   "crates/ruff_linter/resources/test/fixtures"
   ]
  }
 }
