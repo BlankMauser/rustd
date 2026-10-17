@@ -249,6 +249,10 @@ fn record(key: &[u8; KEY], value: &[u8], len: u32) -> Vec<u8> {
 }
 
 /// Has the directory's entries on disk, so that a rename in it outlasts a loss of power.
+///
+/// Everything the store syncs goes through [`File::sync_all`]. On macOS that is
+/// `fcntl(F_FULLFSYNC)`, which has the drive write its cache out, and not `fsync`, which
+/// there only hands the data to the drive.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     if cfg!(unix) {
         File::open(dir)?.sync_all()?;

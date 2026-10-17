@@ -19,6 +19,7 @@
 //! can, and takes the place of the executable when it is whole.
 
 use std::{
+    collections::hash_map::Entry,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
 };
@@ -936,8 +937,8 @@ impl<'a> Patch<'a> {
                 _ => vec![relocation.symbol],
             };
             for symbol in symbols {
-                if !targets.contains_key(&symbol) {
-                    targets.insert(symbol, patch.target(symbol, image)?);
+                if let Entry::Vacant(unknown) = targets.entry(symbol) {
+                    unknown.insert(patch.target(symbol, image)?);
                 }
             }
             let target = targets[&relocation.symbol];
