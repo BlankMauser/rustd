@@ -26,7 +26,7 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::Body,
-    hir::ExprId,
+    hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
@@ -65,10 +65,10 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
-use self::debuginfo::{DebugContext, FunctionDebug, LineRow};
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
-    Requests,
+    Requests, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -1615,6 +1615,38 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
+/// What a debugger is told of `variables`, which are of the body of `owner`. A name the body
+/// gives to more than one local is left out: nothing says yet from where to where each of
+/// them is the one meant. So is a variable of a type that is not told of.
+fn described_variables(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    env: &StoredParamEnvAndCrate,
+    variables: &[Variable],
+) -> Vec<VariableDebug> {
+    let body = Body::of(db, owner);
+    let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
+    for (_, binding) in body.bindings() {
+        *uses.entry(&binding.name).or_default() += 1;
+    }
+    let types = debuginfo::Types::new(db, env.as_ref(db));
+    variables
+        .iter()
+        .filter_map(|variable| {
+            let name = &body[variable.binding].name;
+            if uses.get(name) != Some(&1) {
+                return None;
+            }
+            Some(VariableDebug {
+                name: name.as_str().to_owned(),
+                param: variable.param,
+                ty: types.describe(variable.ty.as_ref())?,
+                offset: variable.offset,
+            })
+        })
+        .collect()
+}
+
 /// File, line and column of a place in a body, as rustc reports them.
 #[salsa::tracked]
 fn source_location<'db>(
@@ -1803,9 +1835,30 @@ fn compile<'db>(
         Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
         _ => None,
     };
+    let variables = variables(&ctx, std::mem::take(&mut cg.named));
+    let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, source, layouts })
+    Ok(CompiledFunction { requests, code, source, variables, layouts })
+}
+
+/// Where the slots of named locals ended up in the frame Cranelift laid out. None of them
+/// is known when the code is another backend's, which keeps locals where it likes.
+fn variables(
+    ctx: &cranelift_codegen::Context,
+    named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
+) -> Vec<Variable> {
+    let Some(frame) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) else {
+        return Vec::new();
+    };
+    let to_fp = i64::from(frame.frame_to_fp_offset);
+    named
+        .into_iter()
+        .filter_map(|(binding, param, ty, slot)| {
+            let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
+            Some(Variable { binding, param, ty, offset })
+        })
+        .collect()
 }
 
 fn build<'db>(
@@ -1853,6 +1906,7 @@ fn build<'db>(
         suspended_drop: None,
     };
     fill(&mut fx)?;
+    fx.note_variables();
     fx.builder.seal_all_blocks();
     let config = fx.cg.target_config();
     let guarded = fx.guarded;
@@ -2345,6 +2399,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let place = debug.place(file, line, column);
                 debug.row(row.offset, place);
             }
+        }
+        if let Some((owner, _)) = &compiled.source
+            && let Some((env, variables)) = &compiled.variables
+        {
+            debug.variables = described_variables(self.db, *owner, env, variables);
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
@@ -7135,6 +7194,31 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let value = self.builder.ins().iconst(types::I32, number as i64);
         self.builder.ins().store(MEM, value, addr, 0);
         Ok(Some(addr))
+    }
+
+    /// Notes the locals a debugger can be told of: the ones written with a name whose value
+    /// is in a stack slot of its own. A closure's are left out, where a name may be of what
+    /// the closure captured.
+    fn note_variables(&mut self) {
+        let Some(body) = self.body else { return };
+        if !matches!(body.owner, InferBodyId::DefWithBodyId(_)) || !body.upvar_locals.is_empty() {
+            return;
+        }
+        for (binding, &local) in body.binding_locals.iter() {
+            let Some(&LocalSlot { addr, borrowed: false }) = self.locals.get(local) else {
+                continue;
+            };
+            let dfg = &self.builder.func.dfg;
+            let ir::ValueDef::Result(inst, 0) = dfg.value_def(addr) else { continue };
+            let ir::InstructionData::StackAddr { stack_slot, offset, .. } = dfg.insts[inst] else {
+                continue;
+            };
+            if i32::from(offset) == 0 {
+                let param = body.param_locals.contains(&local);
+                let ty = body.locals[local].ty.clone();
+                self.cg.named.push((binding, param, ty, stack_slot));
+            }
+        }
     }
 
     /// Has what is built from here on be of the statement at `span`.

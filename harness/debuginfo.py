@@ -75,6 +75,28 @@ fn main() {
     println!("{}", walk(2));
 }
 """
+LOCALS_MAIN = """struct Point { x: i32, y: i64 }
+struct Pair(u8, f64);
+
+fn area(width: u32, scale: f32, name: &str) -> u32 {
+    let point = Point { x: 3, y: -4 };
+    let pair = Pair(7, 1.5);
+    let list = [1u16, 2, 3];
+    let tuple = (true, 'c', 9u64);
+    let sum = width + point.x as u32 + pair.0 as u32 + list[1] as u32 + tuple.2 as u32;
+    let borrowed = &point;
+    println!("{} {} {} {}", sum, scale, name, borrowed.y);
+    sum
+}
+
+fn main() {
+    println!("{}", area(10, 2.5, "abc"));
+}
+"""
+# What gdb is to print of each, stopped at the `println!` of `area`.
+LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline::Point {x: 3, y: -4}"),
+          ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
+          ("*borrowed", "sline::Point {x: 3, y: -4}")]
 # (what the step is, [(old, new)])
 EDITS = [
     ("nothing edited", []),
@@ -164,6 +186,54 @@ def verify(tally, what, binary):
     tally.say(f"{what}: llvm-dwarfdump --verify", verdict, said[:80] or f"{ours} units of rustd's")
 
 
+def unwinding(tally, what, binary):
+    """Whether the functions a debugger is told of are the ones an unwinder is told of.
+
+    Every run of code in a unit of rustd's has to begin where an entry of `.eh_frame` begins and
+    end no earlier than it. It may end later: a function shorter than a jump to another place is
+    filled up to the length of one, for an edit to put that jump there, and the fill is not code
+    to unwind from. A `#[naked]` function is its assembly, which says nothing of unwinding and has
+    no lines either: one with no entry and no line is that."""
+    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
+    ours = set()
+    for unit in units.split("DW_TAG_compile_unit")[1:]:
+        if re.search(r'DW_AT_producer\s+\("rustd ', unit):
+            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
+    frames = subprocess.run([DWARFDUMP, "--eh-frame", binary], capture_output=True, text=True).stdout
+    ends = {int(a, 16): int(b, 16) for a, b in re.findall(r"FDE cie=\S+ pc=([0-9a-f]+)\.\.\.([0-9a-f]+)", frames)}
+    bare = sorted((a, b) for a, b in ours if a not in ends)
+    rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
+    lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
+    without = sum(any(a <= row < b for row in lined) for a, b in bare)
+    beyond = sum(a in ends and ends[a] > b for a, b in ours)
+    filled = sum(a in ends and ends[a] < b for a, b in ours)
+    verdict = "NO FUNCTIONS" if not ours else "DISAGREE" if without or beyond else "agree"
+    tally.say(f"{what}: .eh_frame and the ranges", verdict,
+              f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone")
+
+
+def profiler(tally, what, binary, cwd, crates):
+    """Whether perf, unwinding by `.eh_frame`, names the functions of `crates` and their lines."""
+    perf = shutil.which("perf")
+    data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
+    record = perf and subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
+                                     cwd=cwd, capture_output=True, text=True)
+    if not perf or record.returncode != 0 or not os.path.exists(data):
+        # Not a verdict on the binary: the machine does not let this user profile.
+        tally.say(f"{what}: perf", "not run", "no perf here, or it may not sample: see kernel.perf_event_paranoid")
+        return
+    script = subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
+    frames = re.findall(r"^\s+[0-9a-f]+ (\S+)\n\s+(\S+)$", script, re.M)
+    mine = [(name, line) for name, line in frames if any(f"{len(c)}{c}" in name or f"{c}::" in name for c in crates)]
+    lost = [name for name, line in mine if not re.search(r"\.rs:\d+$", line)]
+    stacks = [stack for stack in script.split("\n\n") if stack.strip()]
+    through = sum(bool(re.search(r"4main\b|::main\b", stack)) for stack in stacks)
+    verdict = "NO SAMPLES" if not mine else "NO LINE" if lost else "NOT UNWOUND" if not through else "named"
+    tally.say(f"{what}: perf, unwinding by .eh_frame", verdict,
+              f"{len(mine)} frames of rustd's functions in {len(stacks)} samples, {len(lost)} without a line, {through} samples back to main"
+              + (f": {lost[0][:60]}" if lost else ""))
+
+
 def unit_of(binary, address):
     found = subprocess.run([DWARFDUMP, f"--lookup={address:#x}", binary], capture_output=True, text=True).stdout
     producer = re.search(r'DW_AT_producer\s+\("([^"]*)"\)', found)
@@ -234,10 +304,15 @@ def program(tally, what, workspace, crates, package, inject=None):
     theirs, ours = backtraces(fx.reference, fx.ws, env), backtraces(fx.binary, fx.ws, env)
     compare(tally, f"{what}: frames of each panic", theirs, ours)
     verify(tally, what, fx.binary)
+    unwinding(tally, what, fx.binary)
     if place := call_site(ours):
         debugger(tally, what, fx.binary, fx.ws, place[2:], env)
     else:
         tally.say(f"{what}: gdb", "NO PLACE")
+    functions, count = described(fx.binary)
+    tally.say(f"{what}: what a debugger is told of", "counted", f"{functions} functions, {count} parameters and locals in them")
+    if not inject:
+        profiler(tally, what, fx.binary, fx.ws, crates + [package])
     return fx
 
 
@@ -285,12 +360,53 @@ def edits(tally):
             continue
         compare(tally, f"edits: {what} ({how})", backtraces(built(reference, "sline"), ws), backtraces(binary, ws))
         verify(tally, f"edits: {what}", binary)
+        unwinding(tally, f"edits: {what}", binary)
     ours = backtraces(binary, ws)
     if place := call_site(ours):
         debugger(tally, "edits: the last binary", binary, ws, place[2:])
     daemon.kill()
     if os.environ.get("RUSTD_SPLICE") != "0":
         tally.say("edits: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")
+
+
+def described(binary):
+    """How many functions rustd's units tell a debugger of, and how many variables in them."""
+    dumped = subprocess.run([DWARFDUMP, "--debug-info", binary], capture_output=True, text=True).stdout
+    functions = variables = 0
+    for unit in dumped.split("DW_TAG_compile_unit")[1:]:
+        if re.search(r'DW_AT_producer\s+\("rustd', unit):
+            functions += unit.count("DW_TAG_subprogram")
+            variables += unit.count("DW_TAG_variable") + unit.count("DW_TAG_formal_parameter")
+    return functions, variables
+
+
+def variables(tally):
+    """Whether gdb prints the parameters and locals of a function of rustd's as they are.
+
+    Only the frames Cranelift lays out say where a local is kept, so under LLVM none is to be
+    told of, and one that is would be a guess."""
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-locals-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+    fx.rustd_build()
+    verify(tally, "locals", fx.binary)
+    line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
+    commands = ["set pagination off", "set startup-with-shell off", f"break {MAIN}:{line}", "run",
+                *[x for name, _ in LOCALS for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+    ran = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], fx.binary],
+                         capture_output=True, text=True, errors="replace", cwd=ws, timeout=300)
+    printed = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name, _ in LOCALS}
+    right = [name for name, value in LOCALS if printed[name] and printed[name].group(1) == value]
+    functions, count = described(fx.binary)
+    if LLVM:
+        return tally.say("locals: gdb prints them", "GUESSED" if count else "not told of",
+                         f"{count} described in {functions} functions: LLVM's frames are not read back yet")
+    wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS if name not in right]
+    tally.say("locals: gdb prints them", "printed" if not wrong else "NOT AS THEY ARE",
+              f"{len(right)} of {len(LOCALS)}" + (f", but {wrong[0][:50]}" if wrong else ""))
 
 
 def sections(path):
@@ -338,6 +454,7 @@ def main():
         "rung2": lambda: program(tally, "rung2", os.path.join(HERE, "rung2"), ["rung2"], "rung2",
                                  ("src/main.rs", ".map_ok(|it| it + 1)", ".map_ok(|it| {\n        " + PANIC + "\n        it + 1\n    })")),
         "edits": lambda: edits(tally),
+        "locals": lambda: variables(tally),
         "cost": lambda: cost(tally),
     }
     for name, part in parts.items():

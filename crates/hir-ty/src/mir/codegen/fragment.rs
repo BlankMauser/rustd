@@ -11,7 +11,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId};
+use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId, hir::BindingId};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -129,8 +129,21 @@ pub struct CompiledFunction {
     /// The body the function was compiled from and the statements of it that
     /// [`Code::lines`] index. Looked up when stitching, like a [`DataRequest::Location`].
     pub(super) source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    /// The named locals of the body a debugger can be told of, whose types are of `.0`.
+    pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
+}
+
+/// A local written with a name that is kept in one slot of the frame for as long as the
+/// function runs.
+#[derive(PartialEq)]
+pub(super) struct Variable {
+    pub(super) binding: BindingId,
+    pub(super) param: bool,
+    pub(super) ty: StoredTy,
+    /// Where the slot is from the frame pointer.
+    pub(super) offset: i64,
 }
 
 /// The value of a static rustc exports no symbol for.
@@ -167,6 +180,9 @@ pub(super) struct Recorder<'db> {
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
     span_ids: FxHashMap<MirSpan, u32>,
+    /// The locals written with a name that have a stack slot of their own, and whether each
+    /// is a parameter.
+    pub(super) named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
 }
 
 impl<'db> Recorder<'db> {
@@ -189,6 +205,7 @@ impl<'db> Recorder<'db> {
             naked: None,
             spans: Vec::new(),
             span_ids: FxHashMap::default(),
+            named: Vec::new(),
         }
     }
 

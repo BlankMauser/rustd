@@ -7,17 +7,27 @@
 //! an edit above the function leaves alone. The lines are looked up when the function is
 //! stitched into an object ([`FunctionDebug`]), and all functions of the object share one
 //! compilation unit ([`DebugContext`]).
+//!
+//! A variable is told of when it is kept in one slot of the frame for as long as the function
+//! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
+
+mod types;
+
+pub(super) use types::Types;
 
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
-        self, DW_AT_comp_dir, DW_AT_decl_file, DW_AT_decl_line, DW_AT_high_pc, DW_AT_language,
-        DW_AT_linkage_name, DW_AT_low_pc, DW_AT_name, DW_AT_producer, DW_AT_ranges,
-        DW_AT_stmt_list, DW_TAG_subprogram, Encoding, Format, LineEncoding, RunTimeEndian,
-        SectionId,
+        self, DW_AT_byte_size, DW_AT_comp_dir, DW_AT_count, DW_AT_data_member_location,
+        DW_AT_decl_file, DW_AT_decl_line, DW_AT_encoding, DW_AT_frame_base, DW_AT_high_pc,
+        DW_AT_language, DW_AT_linkage_name, DW_AT_location, DW_AT_low_pc, DW_AT_name,
+        DW_AT_producer, DW_AT_ranges, DW_AT_stmt_list, DW_AT_type, DW_TAG_array_type,
+        DW_TAG_base_type, DW_TAG_formal_parameter, DW_TAG_member, DW_TAG_pointer_type,
+        DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_variable, DwAte,
+        Encoding, Format, LineEncoding, Register, RunTimeEndian, SectionId,
         write::{
-            Address, AttributeValue, DwarfUnit, EndianVec, FileId, LineProgram, LineString, Range,
-            RangeList, Result as WriteResult, Sections, Writer,
+            Address, AttributeValue, DwarfUnit, EndianVec, Expression, FileId, LineProgram,
+            LineString, Range, RangeList, Result as WriteResult, Sections, UnitEntryId, Writer,
         },
     },
     ir,
@@ -79,6 +89,50 @@ pub(super) struct Place {
     pub(super) column: u32,
 }
 
+/// What a debugger is told of a type: its name, its size, and what it is made of as far as
+/// that is told.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(super) enum DebugType {
+    /// A number, a `bool` or a `char`, whose bytes are read as the `DW_ATE_*` of `encoding`.
+    Base {
+        name: String,
+        size: u64,
+        encoding: u8,
+    },
+    /// A pointer of one word. `to` is `None` where what it points to is not told.
+    Pointer {
+        name: String,
+        to: Option<Box<DebugType>>,
+    },
+    Array {
+        of: Box<DebugType>,
+        len: u64,
+    },
+    /// A struct, a tuple, or a pointer of two words. One without fields may have some that
+    /// are not told.
+    Struct {
+        name: String,
+        size: u64,
+        fields: Vec<Field>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(super) struct Field {
+    pub(super) name: String,
+    pub(super) offset: u64,
+    pub(super) ty: DebugType,
+}
+
+/// A parameter or a `let` of a function, and where its value is from the frame pointer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct VariableDebug {
+    pub(super) name: String,
+    pub(super) param: bool,
+    pub(super) ty: DebugType,
+    pub(super) offset: i64,
+}
+
 /// What a debugger is told about one function, with nothing in it that depends on where the
 /// function ends up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,11 +147,19 @@ pub(super) struct FunctionDebug {
     pub(super) declared: Option<Place>,
     /// Where the code is from, from each offset on, in the order of the offsets.
     pub(super) rows: Vec<(CodeOffset, Place)>,
+    pub(super) variables: Vec<VariableDebug>,
 }
 
 impl FunctionDebug {
     pub(super) fn new(name: String, linkage_name: String) -> Self {
-        FunctionDebug { name, linkage_name, files: Vec::new(), declared: None, rows: Vec::new() }
+        FunctionDebug {
+            name,
+            linkage_name,
+            files: Vec::new(),
+            declared: None,
+            rows: Vec::new(),
+            variables: Vec::new(),
+        }
     }
 
     /// The place of `line` and `column` in the file rustc calls `file`.
@@ -123,6 +185,9 @@ pub(super) struct DebugContext {
     dwarf: DwarfUnit,
     files: FxHashMap<String, FileId>,
     ranges: Vec<Range>,
+    types: FxHashMap<DebugType, UnitEntryId>,
+    /// The register a frame is found by, where variables are told of.
+    frame: Option<Register>,
 }
 
 impl DebugContext {
@@ -156,7 +221,16 @@ impl DebugContext {
         root.set(DW_AT_comp_dir, AttributeValue::StringRef(directory));
         root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
         root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
-        Some(DebugContext { dwarf, files: FxHashMap::default(), ranges: Vec::new() })
+        // FIXME: variables are told of on x86-64 alone, by `rbp`.
+        let frame = (isa.triple().architecture == target_lexicon::Architecture::X86_64)
+            .then_some(gimli::X86_64::RBP);
+        Some(DebugContext {
+            dwarf,
+            files: FxHashMap::default(),
+            ranges: Vec::new(),
+            types: FxHashMap::default(),
+            frame,
+        })
     }
 
     fn file(&mut self, name: &str) -> FileId {
@@ -168,6 +242,79 @@ impl DebugContext {
         let id = program.add_file(LineString::String(name.as_bytes().to_vec()), directory, None);
         self.files.insert(name.to_owned(), id);
         id
+    }
+
+    /// The entry of `ty`, which every variable of the type shares.
+    fn ty(&mut self, ty: &DebugType) -> UnitEntryId {
+        if let Some(&entry) = self.types.get(ty) {
+            return entry;
+        }
+        let root = self.dwarf.unit.root();
+        let entry = match ty {
+            DebugType::Base { name, size, encoding } => {
+                let entry = self.named(root, DW_TAG_base_type, name);
+                let unit = self.dwarf.unit.get_mut(entry);
+                unit.set(DW_AT_byte_size, AttributeValue::Udata(*size));
+                unit.set(DW_AT_encoding, AttributeValue::Encoding(DwAte(*encoding)));
+                entry
+            }
+            DebugType::Pointer { name, to } => {
+                let to = to.as_ref().map(|to| self.ty(to));
+                let entry = self.named(root, DW_TAG_pointer_type, name);
+                if let Some(to) = to {
+                    self.dwarf.unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(to));
+                }
+                entry
+            }
+            DebugType::Array { of, len } => {
+                let of = self.ty(of);
+                let unit = &mut self.dwarf.unit;
+                let entry = unit.add(root, DW_TAG_array_type);
+                unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(of));
+                let range = unit.add(entry, DW_TAG_subrange_type);
+                unit.get_mut(range).set(DW_AT_count, AttributeValue::Udata(*len));
+                entry
+            }
+            DebugType::Struct { name, size, fields } => {
+                let entry = self.named(root, DW_TAG_structure_type, name);
+                self.dwarf.unit.get_mut(entry).set(DW_AT_byte_size, AttributeValue::Udata(*size));
+                for field in fields {
+                    let ty = self.ty(&field.ty);
+                    let member = self.named(entry, DW_TAG_member, &field.name);
+                    let member = self.dwarf.unit.get_mut(member);
+                    member.set(DW_AT_type, AttributeValue::UnitRef(ty));
+                    member.set(DW_AT_data_member_location, AttributeValue::Udata(field.offset));
+                }
+                entry
+            }
+        };
+        self.types.insert(ty.clone(), entry);
+        entry
+    }
+
+    fn named(&mut self, parent: UnitEntryId, tag: gimli::DwTag, name: &str) -> UnitEntryId {
+        let name = self.dwarf.strings.add(name.as_bytes());
+        let entry = self.dwarf.unit.add(parent, tag);
+        self.dwarf.unit.get_mut(entry).set(DW_AT_name, AttributeValue::StringRef(name));
+        entry
+    }
+
+    /// Tells of the variables of the function at `function`.
+    fn variables(&mut self, function: UnitEntryId, variables: &[VariableDebug]) {
+        let Some(frame) = self.frame.filter(|_| !variables.is_empty()) else { return };
+        let mut base = Expression::new();
+        base.op_reg(frame);
+        self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
+        for variable in variables {
+            let ty = self.ty(&variable.ty);
+            let tag = if variable.param { DW_TAG_formal_parameter } else { DW_TAG_variable };
+            let entry = self.named(function, tag, &variable.name);
+            let mut place = Expression::new();
+            place.op_fbreg(variable.offset);
+            let entry = self.dwarf.unit.get_mut(entry);
+            entry.set(DW_AT_type, AttributeValue::UnitRef(ty));
+            entry.set(DW_AT_location, AttributeValue::Exprloc(place));
+        }
     }
 
     /// Describes the function `func` of the module, which is `len` bytes of code.
@@ -183,8 +330,8 @@ impl DebugContext {
         let name = self.dwarf.strings.add(debug.name.as_bytes());
         let linkage_name = self.dwarf.strings.add(debug.linkage_name.as_bytes());
         let unit = &mut self.dwarf.unit;
-        let entry = unit.add(unit.root(), DW_TAG_subprogram);
-        let entry = unit.get_mut(entry);
+        let function = unit.add(unit.root(), DW_TAG_subprogram);
+        let entry = unit.get_mut(function);
         entry.set(DW_AT_name, AttributeValue::StringRef(name));
         entry.set(DW_AT_linkage_name, AttributeValue::StringRef(linkage_name));
         entry.set(DW_AT_low_pc, AttributeValue::Address(start));
@@ -195,6 +342,7 @@ impl DebugContext {
             entry.set(DW_AT_decl_file, AttributeValue::FileIndex(Some(file)));
             entry.set(DW_AT_decl_line, AttributeValue::Udata(declared.line.into()));
         }
+        self.variables(function, &debug.variables);
 
         // The code ahead of the first statement sets the frame up, which is of the line the
         // function is declared on, or of the first statement when that line is not known.
