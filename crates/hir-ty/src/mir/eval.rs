@@ -2377,6 +2377,37 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         }
     }
 
+    /// Whether no value of the type has a pointer in it, so that its bytes mean the same
+    /// wherever they are read. A type this cannot see through is taken to hold one.
+    fn holds_no_pointer(&self, ty: Ty<'db>) -> bool {
+        match ty.kind() {
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
+                true
+            }
+            TyKind::Array(inner, _) | TyKind::Pat(inner, _) => self.holds_no_pointer(inner),
+            TyKind::Tuple(fields) => fields.iter().all(|it| self.holds_no_pointer(it)),
+            TyKind::Adt(adt, subst) => {
+                let variants: Vec<VariantId> = match adt.def_id() {
+                    AdtId::StructId(it) => vec![it.into()],
+                    AdtId::UnionId(it) => vec![it.into()],
+                    AdtId::EnumId(it) => it
+                        .enum_variants(self.db)
+                        .variants
+                        .values()
+                        .map(|&(v, _)| v.into())
+                        .collect(),
+                };
+                variants.into_iter().all(|variant| {
+                    self.db.field_types(variant).iter().all(|(_, field)| {
+                        let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                        self.holds_no_pointer(field)
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn create_memory_map(
         &self,
         bytes: &[u8],
@@ -2479,18 +2510,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             let addr = Address::from_bytes(addr)?;
                             let b = this.read_memory(addr, size)?;
                             mm.insert(addr.to_usize(), b.into());
-                            let scalars = check_inner.is_some_and(|ty| {
-                                matches!(
-                                    ty.kind(),
-                                    TyKind::Bool
-                                        | TyKind::Char
-                                        | TyKind::Int(_)
-                                        | TyKind::Uint(_)
-                                        | TyKind::Float(_)
-                                )
-                            });
+                            // Elements that take no room may be `usize::MAX` in number.
+                            let plain = element_size == 0
+                                || check_inner.is_some_and(|ty| this.holds_no_pointer(ty));
                             if let Some(ty) = check_inner
-                                && !scalars
+                                && !plain
                             {
                                 for i in 0..count {
                                     let offset = element_size * i;
@@ -2507,6 +2531,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                     }
                 }
+                TyKind::Array(inner, _) if this.holds_no_pointer(inner) => {}
                 TyKind::Array(inner, len) => {
                     let len = match try_const_usize(this.db, len) {
                         Some(it) => it as usize,

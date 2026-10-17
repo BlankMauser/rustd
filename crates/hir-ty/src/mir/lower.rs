@@ -727,34 +727,27 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.outlive_if_let();
                 }
                 let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
-                let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
-                    if let Some(bound) = &bound {
-                        this.emit_drop_and_storage_dead_for_scope(
-                            bound,
-                            &mut block,
-                            (*condition).into(),
-                        );
-                    }
-                    block
-                };
+                let span = MirSpan::from(*condition);
                 let start_of_then = self.new_basic_block();
                 let end_of_then = self
                     .lower_expr_to_place(*then_branch, place, start_of_then)?
-                    .map(|block| drop_bound(self, block));
+                    .map(|block| self.end_of_branch(&bound, block, span));
+                self.forget_branch(&bound);
                 let start_of_else = self.new_basic_block();
                 // From the 2024 edition on, the `else` branch runs after the drops.
                 let early = self.edition().at_least_2024();
-                let else_block =
-                    if early { drop_bound(self, start_of_else) } else { start_of_else };
+                let else_block = match early {
+                    true => self.end_of_branch(&bound, start_of_else, span),
+                    false => start_of_else,
+                };
                 let end_of_else = if let Some(else_branch) = else_branch {
                     self.lower_expr_to_place(*else_branch, place, else_block)?
                 } else {
                     Some(else_block)
                 };
-                let end_of_else = if early {
-                    end_of_else
-                } else {
-                    end_of_else.map(|block| drop_bound(self, block))
+                let end_of_else = match early {
+                    true => end_of_else,
+                    false => end_of_else.map(|block| self.end_of_branch(&bound, block, span)),
                 };
                 if let Some(bindings) = bindings {
                     bindings.pop_assume_dropped(self);
@@ -1214,47 +1207,46 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let target_ty = self.infer.expr_ty(expr_id);
                     // A variant named as a value casts to its discriminant; one named as
                     // its constructor function is a function like any other.
-                    let (it, source_ty, current) =
-                        if let Some(VariantId::EnumVariantId(variant_id)) =
-                            self.infer.variant_resolution_for_expr(*expr)
-                            && !matches!(source_ty.kind(), TyKind::FnDef(..))
-                        {
-                            self.lower_variant_discriminant(current, variant_id)?
-                        } else if let TyKind::Adt(adt, _) = source_ty.kind()
-                            && adt.is_enum()
-                        {
-                            let Some((enum_place, current)) =
-                                self.lower_expr_as_place(current, *expr, true)?
-                            else {
-                                return Ok(None);
-                            };
-                            let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
-                            let discr_place: Place<'db> =
-                                self.temp(discr_ty, current, expr_id.into())?.into();
-
-                            self.push_assignment(
-                                current,
-                                discr_place,
-                                Rvalue::Discriminant(enum_place.store()),
-                                expr_id.into(),
-                            );
-                            (
-                                Operand {
-                                    kind: OperandKind::Copy(discr_place.store()),
-                                    span: Some(expr_id.into()),
-                                },
-                                discr_ty,
-                                current,
-                            )
-                        } else {
-                            let Some((it, current)) =
-                                self.lower_expr_to_some_operand(*expr, current)?
-                            else {
-                                return Ok(None);
-                            };
-                            // The operand carries the cast's coercion, e.g. fn item to pointer.
-                            (it, self.expr_ty_after_adjustments(*expr), current)
+                    let (it, source_ty, current) = if let Some(VariantId::EnumVariantId(variant_id)) =
+                        self.infer.variant_resolution_for_expr(*expr)
+                        && !matches!(source_ty.kind(), TyKind::FnDef(..))
+                    {
+                        self.lower_variant_discriminant(current, variant_id)?
+                    } else if let TyKind::Adt(adt, _) = source_ty.kind()
+                        && adt.is_enum()
+                    {
+                        let Some((enum_place, current)) =
+                            self.lower_expr_as_place(current, *expr, true)?
+                        else {
+                            return Ok(None);
                         };
+                        let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
+                        let discr_place: Place<'db> =
+                            self.temp(discr_ty, current, expr_id.into())?.into();
+
+                        self.push_assignment(
+                            current,
+                            discr_place,
+                            Rvalue::Discriminant(enum_place.store()),
+                            expr_id.into(),
+                        );
+                        (
+                            Operand {
+                                kind: OperandKind::Copy(discr_place.store()),
+                                span: Some(expr_id.into()),
+                            },
+                            discr_ty,
+                            current,
+                        )
+                    } else {
+                        let Some((it, current)) =
+                            self.lower_expr_to_some_operand(*expr, current)?
+                        else {
+                            return Ok(None);
+                        };
+                        // The operand carries the cast's coercion, e.g. fn item to pointer.
+                        (it, self.expr_ty_after_adjustments(*expr), current)
+                    };
                     // `f as *const ()` and `f as usize` go through a function pointer.
                     let (it, source_ty) = if let TyKind::FnDef(..) = source_ty.kind()
                         && !matches!(target_ty.kind(), TyKind::FnPtr(..))
@@ -2947,6 +2939,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             implementation_error!("Mismatched count between drop scope push and pops");
         }
         Ok(current)
+    }
+
+    /// Where a branch of an `if` that has a `let` ends: what the condition bound is dropped,
+    /// after the temporaries the branch left to the `if`. `bound` is the scope of the `if` as
+    /// its condition left it.
+    fn end_of_branch(
+        &mut self,
+        bound: &Option<DropScope>,
+        mut block: BasicBlockId,
+        span: MirSpan,
+    ) -> BasicBlockId {
+        if let (Some(_), Some(scope)) = (bound, self.drop_scopes.last().cloned()) {
+            self.emit_drop_and_storage_dead_for_scope(&scope, &mut block, span);
+        }
+        block
+    }
+
+    /// Takes out of the scope of an `if` what the branch that was just lowered left to it:
+    /// the other branch never had those.
+    fn forget_branch(&mut self, bound: &Option<DropScope>) {
+        if let (Some(bound), Some(scope)) = (bound, self.drop_scopes.last_mut()) {
+            scope.locals.clone_from(&bound.locals);
+        }
     }
 
     /// Before the 2024 edition the temporaries of what an `if let` matches on live as long as

@@ -15,7 +15,8 @@ fn mark(n: u8, log: &RefCell<Vec<u8>>) {
 }
 
 /// tests/ui/drop/drop-order-comparisons.rs: before the 2024 edition the temporaries of what
-/// an `if let` matches on live to the end of the statement the `if` is in.
+/// an `if let` matches on live to the end of the statement the `if` is in, and those of an
+/// `if let` at the end of a branch to the end of that branch.
 #[inline(never)]
 pub fn if_let_outlives(log: &RefCell<Vec<u8>>) {
     _ = (
@@ -33,5 +34,11 @@ pub fn if_let_outlives(log: &RefCell<Vec<u8>>) {
         },
         mark(6, log),
         Noisy(7, log),
-    );
+    );    _ = {
+        if let Some(_) = Some(Noisy(11, log)) {
+            if let Some(_) = Some(Noisy(10, log)).as_ref() {
+                mark(9, log);
+            }
+        }
+    };
 }

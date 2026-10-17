@@ -564,6 +564,7 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="forget the results kept under --work")
     ap.add_argument("--json")
     a = ap.parse_args()
+    a.work = os.path.abspath(a.work)
 
     units, excluded = select(os.path.abspath(a.checkout), a.filter)
     if a.rerun:

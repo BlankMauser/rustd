@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FEATURE = re.compile(r"^#!\[(?:cfg_attr\([^\n]*?, *)?feature\((?:[^()]|\([^()]*\))*\)\)?\]\n", re.M | re.S)
 HEADER = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))? )?(?:(?:const|async|unsafe|default|extern(?: \"[\w-]+\")?) )*"
-    r"(?:fn|mod|impl|struct|enum|union|trait|use|static|const|type)\b|^\s*macro_rules!|^\s*[\w:]+! *[({\[]")
+    r"(?:fn|mod|impl|struct|enum|union|trait|use|static|const|type|extern crate)\b|^\s*macro_rules!|^\s*[\w:]+! *[({\[]")
 ATTRIBUTE = re.compile(r"^\s*(#\[|///|//)")
 TEST = re.compile(r"^\s*#\[test\]", re.M)
 # What does not count when brackets are matched: comments, strings and character literals.

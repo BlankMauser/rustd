@@ -44,10 +44,28 @@ fn guards_in_turn(log: &RefCell<Vec<u8>>) {
     }
 }
 
+#[inline(never)]
+fn refuses(log: &RefCell<Vec<u8>>) -> bool {
+    log.borrow_mut().push(31);
+    false
+}
+
+/// The arm that follows a failed guard finds the array whole, and so it is dropped from the front.
+#[inline(never)]
+fn array_whole_again(log: &RefCell<Vec<u8>>) {
+    match [Noisy(33, log), Noisy(34, log), Noisy(35, log)] {
+        [_x, _, _y] if refuses(log) => unreachable!(),
+        _ => {
+            let _a = Noisy(32, log);
+        }
+    }
+}
+
 pub fn run() -> Vec<u8> {
     let log = RefCell::new(Vec::new());
     guard_succeeds(&log);
     guard_fails(&log);
     guards_in_turn(&log);
+    array_whole_again(&log);
     log.into_inner()
 }

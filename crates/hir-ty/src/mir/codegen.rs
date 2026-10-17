@@ -1801,6 +1801,8 @@ fn build<'db>(
         drop_flags: ArenaMap::new(),
         moved_paths: Vec::new(),
         deferred_drops: Vec::new(),
+        at: None,
+        moved_here: None,
         cleanup: None,
         inner_pad: None,
         drop_order: Vec::new(),
@@ -3541,6 +3543,9 @@ impl DropFlag {
     }
 }
 
+/// A field of a local, by the fields that lead to it.
+type FieldOfLocal = (LocalId, Vec<u32>);
+
 struct MovedPath {
     local: LocalId,
     path: Vec<u32>,
@@ -3571,8 +3576,14 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
+    /// The block to generate each `Drop` terminator in, with its place and target, and the
+    /// block of the body it ends.
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, BasicBlockId)>,
+    /// The block of the body being generated.
+    at: Option<BasicBlockId>,
+    /// While a `Drop` terminator is generated: the fields that may be moved out of their
+    /// locals when the body gets to it.
+    moved_here: Option<FxHashSet<FieldOfLocal>>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -4900,6 +4911,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.builder.switch_to_block(self.blocks[id]);
+            self.at = Some(id);
             for statement in &block.statements {
                 self.span = statement.span;
                 match &statement.kind {
@@ -4944,7 +4956,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+        let drops = std::mem::take(&mut self.deferred_drops);
+        let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
+            true => FxHashMap::default(),
+            false => self.moved_where_blocks_end(body),
+        };
+        for (block, place, target, from) in drops {
+            self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
@@ -4978,6 +4996,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 _ => self.drop_place(&place, target)?,
             }
         }
+        self.moved_here = None;
         // So is dropping a suspended future, which drops the same locals as unwinding does.
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
@@ -5288,16 +5307,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let layout = self.layout(ty)?;
             let mut fields: Vec<_> = fields.into_iter().enumerate().collect();
             if matches!(ty.kind(), TyKind::Array(..)) {
-                // An array that has lost elements drops what is left from the back, except
-                // that a run of whole elements is dropped front to back.
+                // An array that may have lost elements drops what is left from the back,
+                // except that a run of whole elements is dropped front to back.
                 let mut runs: Vec<Vec<(usize, Ty<'db>)>> = Vec::new();
                 let mut in_run = false;
                 for (i, field) in fields {
                     path.push(i as u32);
-                    let whole = !self
-                        .moved_paths
-                        .iter()
-                        .any(|it| it.local == local && it.path.starts_with(path));
+                    let whole = !self.may_have_lost(local, path);
                     path.pop();
                     match runs.last_mut() {
                         Some(run) if whole && in_run => run.push((i, field)),
@@ -5325,6 +5341,83 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         Ok(())
+    }
+
+    /// Whether something may be moved out of the field at `path` of `local` where the drop
+    /// being generated is. Without a place in the body to ask about, anything the function
+    /// moves out anywhere counts.
+    fn may_have_lost(&self, local: LocalId, path: &[u32]) -> bool {
+        self.moved_paths.iter().filter(|it| it.local == local && it.path.starts_with(path)).any(
+            |it| match &self.moved_here {
+                Some(moved) => moved.contains(&(local, it.path.clone())),
+                None => true,
+            },
+        )
+    }
+
+    /// The fields that may be moved out of their locals where each block ends: moved out on
+    /// some way there, and not assigned since.
+    fn moved_where_blocks_end(
+        &self,
+        body: &MirBody<'db>,
+    ) -> FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> {
+        let mut starts: FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> = FxHashMap::default();
+        let mut ends = FxHashMap::default();
+        starts.insert(body.start_block, FxHashSet::default());
+        let mut pending = vec![body.start_block];
+        while let Some(id) = pending.pop() {
+            let mut moved = starts[&id].clone();
+            self.moves_of_block(&body.basic_blocks[id], &mut moved);
+            for next in successors(body, id) {
+                let known = starts.entry(next).or_insert_with(|| {
+                    pending.push(next);
+                    FxHashSet::default()
+                });
+                let before = known.len();
+                known.extend(moved.iter().cloned());
+                if known.len() != before && !pending.contains(&next) {
+                    pending.push(next);
+                }
+            }
+            ends.insert(id, moved);
+        }
+        ends
+    }
+
+    /// Follows a block: adds the fields it moves out to `moved`, and takes out the ones it
+    /// assigns.
+    fn moves_of_block(&self, block: &crate::mir::BasicBlock, moved: &mut FxHashSet<FieldOfLocal>) {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                operands_of(rvalue).into_iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(place, moved);
+            }
+        }
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Call { args, destination, .. }) => {
+                args.iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(destination, moved);
+            }
+            Some(TerminatorKind::DropAndReplace { place, value, .. }) => {
+                self.note_move(value, moved);
+                self.note_assignment(place, moved);
+            }
+            _ => (),
+        }
+    }
+
+    fn note_move(&self, operand: &Operand, moved: &mut FxHashSet<FieldOfLocal>) {
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else { return };
+        if self.drop_flags.contains_idx(place.local) {
+            let paths = self.moved_out_paths(place).unwrap_or_default();
+            moved.extend(paths.into_iter().map(|path| (place.local, path)));
+        }
+    }
+
+    fn note_assignment(&self, place: &StoredPlace, moved: &mut FxHashSet<FieldOfLocal>) {
+        if let Some(path) = self.field_path(place) {
+            moved.retain(|(local, field)| *local != place.local || !field.starts_with(&path));
+        }
     }
 
     /// Field types can still be projections such as `<str as ToOwned>::Owned`.
@@ -7065,7 +7158,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target));
+                let Some(from) = self.at else { unsupported!("drop outside a block") };
+                self.deferred_drops.push((block, place.clone(), *target, from));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -10529,23 +10623,41 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
     forwarded
 }
 
-fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
-    let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
-        match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
-            Some(
-                TerminatorKind::Goto { target }
-                | TerminatorKind::Drop { target, .. }
-                | TerminatorKind::DropAndReplace { target, .. }
-                | TerminatorKind::Assert { target, .. }
-                | TerminatorKind::FalseEdge { real_target: target, .. }
-                | TerminatorKind::FalseUnwind { real_target: target, .. },
-            ) => vec![*target],
-            Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
-            Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
-            _ => Vec::new(),
+/// The blocks a block goes on to when nothing unwinds.
+fn successors(body: &MirBody<'_>, id: BasicBlockId) -> Vec<BasicBlockId> {
+    match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+        Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
+        Some(
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::DropAndReplace { target, .. }
+            | TerminatorKind::Assert { target, .. }
+            | TerminatorKind::FalseEdge { real_target: target, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, .. },
+        ) => vec![*target],
+        Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
+        Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
+        _ => Vec::new(),
+    }
+}
+
+/// The operands an rvalue reads.
+fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::UnaryOp(_, it)
+        | Rvalue::Cast(_, it, _)
+        | Rvalue::Repeat(it, _)
+        | Rvalue::Use(it) => {
+            vec![it]
         }
-    };
+        Rvalue::CheckedBinaryOp(_, left, right) => vec![left, right],
+        Rvalue::Aggregate(_, operands) => operands.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
+    let successors = |id| successors(body, id);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut post_order = Vec::new();
     let mut stack = vec![(body.start_block, successors(body.start_block))];

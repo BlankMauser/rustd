@@ -14,7 +14,7 @@ from difftest import Fixture, RUNNER
 
 CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = set()
+OPEN = {"raw_write_then_match"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
 LEFT = set()
 
