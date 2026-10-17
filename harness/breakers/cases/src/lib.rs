@@ -35,6 +35,8 @@ cases![
     const_pattern,
     cfg_variant_match,
     powi,
+    wide_bit_set,
+    destructure_assign_try,
     static_str_array,
     type_id_const_arg,
     simd_sums,
