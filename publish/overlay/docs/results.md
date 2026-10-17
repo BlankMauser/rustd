@@ -23,7 +23,29 @@ Run on Linux x86-64 (8 CPUs, 31 GB) with Rust 1.99.0 at f191c6e42a, the commit t
 documents were written against. rustd was built with `cargo build -p rustd --release`.
 Source trees and scratch directories were on tmpfs.
 
-<!-- LOCAL-GATE -->
+The gate, from `harness/` with `RUSTD_BIN` set and `TMPDIR` on tmpfs:
+
+<!-- LOCAL-GATE: replace this table when the gate is rerun. -->
+
+| Harness | Cranelift | LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`) |
+|---|---|---|
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from rustd, 0 of 893 layouts differ | LLVM-CORPUS |
+| `programs.py` | 22 of 22 | LLVM-PROGRAMS |
+| `stress.py` | 99 of 99, 0 restarts | LLVM-STRESS |
+| `breakers.py` | 58 of 58, 7 open, 0 functions skipped | LLVM-BREAKERS |
+| `unwinds.py` | 8 of 8 | LLVM-UNWINDS |
+| `splices.py` | 71 of 71 | LLVM-SPLICES |
+| `asmedits.py` | 10 of 10 | LLVM-ASMEDITS |
+| `includes.py` | 9 of 9 | LLVM-INCLUDES |
+| `worktrees.py` | 62 of 62 | LLVM-WORKTREES |
+| `keys.py` | 46 of 46, 0 open | LLVM-KEYS |
+| `fuzz/fuzz.py smoke` | 2 programs, 505 functions compiled, 0 differences, 0 crashes, 0 left to rustc | LLVM-FUZZ |
+| `debuginfo.py` | all right | LLVM-DEBUGINFO |
+| `backends.py corpus runner cases --bin runner --levels 2f` | does not apply | LLVM-BACKENDS |
+
+The seven "open" breakers are the five known differences and the two known refusals
+listed in [support.md](support.md). Not run here: `buildmodel.py`, `farsplices.py`, the
+four store harnesses, `remote.py` and `cargo_rustd.py`.
 
 By hand, with `cargo rustd` from that build:
 
@@ -326,9 +348,9 @@ Where reports disagree, this file follows the later one.
 | Corpus on Windows | 827 of 827 (WINDOWS.md) | 830 of 830 (PLAT-ABI2.md) |
 | Corpus on macOS | 816 of 816 (MACOS-ABI2.md), 826 of 828 (PLAT-ABI2.md, before a254756b77) | 828 of 828 |
 | Corpus on AArch64 | 817 of 817 (AARCH64.md) | 825 of 825 |
-| `breakers.py` | 25 of 25, 0 open (BREAKERS.md, BUILDMODEL.md, CARGO.md, DEBUGINFO.md) | 43 of 43, 5 open (RUSTCSUITES.md, PLAT-ABI2.md). Cases were added from rustc's suites and the fuzzer, five of them open |
-| `keys.py` | 26 of 26, 4 open (AARCH64.md, WINDOWS.md, MACOS-ABI2.md, DISKCACHE.md); 46 of 46 (BUILDMODEL.md) | 36 of 36, 0 open (CARGO.md, PLAT-ABI2.md) |
-| `worktrees.py` | 52 of 52 (DEBUGINFO.md), 62 of 62 (BUILDMODEL.md) | 58 of 58 (PLAT-ABI2.md) |
+| `breakers.py` | 25 of 25, 0 open (BREAKERS.md, BUILDMODEL.md, CARGO.md, DEBUGINFO.md); 43 of 43, 5 open (RUSTCSUITES.md, PLAT-ABI2.md) | 58 of 58, 7 open (section 1). Cases were added from rustc's suites and the fuzzer |
+| `keys.py` | 26 of 26, 4 open (AARCH64.md, WINDOWS.md, MACOS-ABI2.md, DISKCACHE.md); 36 of 36, 0 open (CARGO.md, PLAT-ABI2.md) | 46 of 46, 0 open (BUILDMODEL.md, and section 1). The count depends on which branches were merged; none is open at the head |
+| `worktrees.py` | 52 of 52 (DEBUGINFO.md), 58 of 58 (PLAT-ABI2.md) | 62 of 62 (BUILDMODEL.md, and section 1) |
 | `buildmodel.py` | 97 of 97 per backend (BUILDMODEL.md); 179 of 180 with `cross_aarch64` under LLVM not finishing (CARGO.md) | 180 of 180 (PLAT-ABI2.md) |
 | Store platforms | "Linux x86-64 only" (DISKCACHE.md) | store harnesses pass in CI on Windows and macOS too (PLAT-ABI2.md) |
 | S3 | "The S3 remote path was not exercised" (DISKCACHE.md) | exercised against MinIO and SeaweedFS (REMOTE.md); real AWS still not run |
