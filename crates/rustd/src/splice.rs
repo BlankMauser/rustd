@@ -1218,8 +1218,8 @@ impl<'a> Patch<'a> {
         let page = image.page();
         let machine = image.machine;
         let (stub_len, stub_align) = machine.stub();
-        let (offset, base) = image
-            .behind(image.len.next_multiple_of(page), image.end().next_multiple_of(page));
+        let (offset, base) =
+            image.behind(image.len.next_multiple_of(page), image.end().next_multiple_of(page));
         let relocations = image.relocations.as_ref().filter(|_| image.pie);
         ensure!(!image.pie || relocations.is_some(), "an executable the loader fixes nothing in");
         let fixed_up = if image.pie { self.stored + self.slots.len() } else { 0 };

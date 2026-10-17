@@ -10,8 +10,8 @@ use hir_def::{
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
-        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat,
-        PatId, RecordLitField, RecordSpread,
+        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, LoopSource,
+        MatchArm, Pat, PatId, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -19,7 +19,7 @@ use hir_def::{
     signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
 };
 use hir_expand::name::Name;
-use itertools::{EitherOrBoth, Itertools};
+use itertools::{Either, EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -100,6 +100,10 @@ struct MirLowerCtx<'a, 'db> {
     extended_temporaries: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
+    /// The expressions that end their own temporaries: the body, and from the 2024 edition the
+    /// tail of a block. The operands of such an expression are in one scope with its
+    /// temporaries, where those of any other expression are in a scope inside it.
+    ends_temporaries: FxHashSet<ExprId>,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -255,6 +259,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             super_let: None,
+            ends_temporaries: FxHashSet::default(),
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -732,14 +737,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // What `if let` binds, and the temporaries of what it matches on, are dropped
                 // when the branch that was taken ends.
                 let bindings = self.has_let(*condition).then(|| self.push_drop_scope());
-                let (discr, current) = if plain {
-                    let Some(it) = self.lower_expr_to_some_operand(*condition, current)? else {
-                        if let Some(bindings) = bindings {
-                            bindings.pop_assume_dropped(self);
-                        }
-                        return Ok(None);
-                    };
-                    it
+                let branches = match self.store[*condition] {
+                    Expr::Let { pat, expr } => {
+                        Some(self.lower_if_let(*condition, pat, expr, current)?)
+                    }
+                    _ => None,
+                };
+                let condition_value = if let Some(branches) = branches {
+                    branches.map(Either::Right)
+                } else if plain {
+                    self.lower_expr_to_some_operand(*condition, current)?.map(Either::Left)
                 } else {
                     // The condition's temporaries are dropped before either branch runs.
                     let ty = Ty::new_bool(self.interner());
@@ -754,45 +761,61 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         kind: OperandKind::Copy(result.store()),
                         span: Some((*condition).into()),
                     };
-                    (discr, current)
+                    Some(Either::Left((discr, current)))
                 };
-                if bindings.is_some() && !self.edition().at_least_2024() {
-                    self.outlive_if_let();
-                }
+                let Some(condition_value) = condition_value else {
+                    if let Some(bindings) = bindings {
+                        bindings.pop_assume_dropped(self);
+                    }
+                    return Ok(None);
+                };
+                let (start_of_then, start_of_else) = match condition_value {
+                    Either::Right(branches) => branches,
+                    Either::Left((discr, current)) => {
+                        let (start_of_then, start_of_else) =
+                            (self.new_basic_block(), self.new_basic_block());
+                        self.set_terminator(
+                            current,
+                            TerminatorKind::SwitchInt {
+                                discr,
+                                targets: SwitchTargets::static_if(1, start_of_then, start_of_else),
+                            },
+                            expr_id.into(),
+                        );
+                        (start_of_then, start_of_else)
+                    }
+                };
                 let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
-                let span = MirSpan::from(*condition);
-                let start_of_then = self.new_basic_block();
+                let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
+                    if let Some(bound) = &bound {
+                        this.emit_drop_and_storage_dead_for_scope(
+                            bound,
+                            &mut block,
+                            (*condition).into(),
+                        );
+                    }
+                    block
+                };
                 let end_of_then = self
-                    .lower_expr_to_place(*then_branch, place, start_of_then)?
-                    .map(|block| self.end_of_branch(&bound, block, span));
-                self.forget_branch(&bound);
-                let start_of_else = self.new_basic_block();
+                    .lower_branch_to_place(*then_branch, place, start_of_then)?
+                    .map(|block| drop_bound(self, block));
                 // From the 2024 edition on, the `else` branch runs after the drops.
                 let early = self.edition().at_least_2024();
-                let else_block = match early {
-                    true => self.end_of_branch(&bound, start_of_else, span),
-                    false => start_of_else,
-                };
+                let else_block =
+                    if early { drop_bound(self, start_of_else) } else { start_of_else };
                 let end_of_else = if let Some(else_branch) = else_branch {
-                    self.lower_expr_to_place(*else_branch, place, else_block)?
+                    self.lower_branch_to_place(*else_branch, place, else_block)?
                 } else {
                     Some(else_block)
                 };
-                let end_of_else = match early {
-                    true => end_of_else,
-                    false => end_of_else.map(|block| self.end_of_branch(&bound, block, span)),
+                let end_of_else = if early {
+                    end_of_else
+                } else {
+                    end_of_else.map(|block| drop_bound(self, block))
                 };
                 if let Some(bindings) = bindings {
                     bindings.pop_assume_dropped(self);
                 }
-                self.set_terminator(
-                    current,
-                    TerminatorKind::SwitchInt {
-                        discr,
-                        targets: SwitchTargets::static_if(1, start_of_then, start_of_else),
-                    },
-                    expr_id.into(),
-                );
                 Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()))
             }
             Expr::Let { pat, expr } => {
@@ -865,7 +888,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 let callee_ty = self.expr_ty_after_adjustments(*callee);
@@ -891,7 +914,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             place,
                             current,
                             self.is_uninhabited(expr_id),
-                            expr_id.into(),
+                            expr_id,
                         )
                     }
                     TyKind::FnPtr(..) => {
@@ -906,7 +929,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             place,
                             current,
                             self.is_uninhabited(expr_id),
-                            expr_id.into(),
+                            expr_id,
                         )
                     }
                     TyKind::Closure(_, _) => {
@@ -934,13 +957,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     place,
                     current,
                     self.is_uninhabited(expr_id),
-                    expr_id.into(),
+                    expr_id,
                 )
             }
             Expr::Match { expr, arms } => {
+                // The temporaries of what a `for` iterates over are dropped where the loop
+                // ends, wherever the loop is written.
+                let temporaries = self.is_for_loop(arms).then(|| self.push_drop_scope());
                 let Some((cond_place, mut current)) =
                     self.lower_expr_as_place(current, *expr, true)?
                 else {
+                    if let Some(temporaries) = temporaries {
+                        temporaries.pop_assume_dropped(self);
+                    }
                     return Ok(None);
                 };
                 self.push_fake_read(current, cond_place, expr_id.into());
@@ -1051,7 +1080,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 if self.is_unterminated(current) {
                     self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
                 }
-                Ok(end)
+                match (temporaries, end) {
+                    (Some(temporaries), Some(end)) => {
+                        Ok(Some(temporaries.pop_and_drop(self, end, expr_id.into())))
+                    }
+                    (Some(temporaries), None) => {
+                        temporaries.pop_assume_dropped(self);
+                        Ok(None)
+                    }
+                    (None, end) => Ok(end),
+                }
             }
             Expr::Continue { label } => {
                 let loop_data = match label {
@@ -1140,6 +1178,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 match variant_id {
                     VariantId::EnumVariantId(_) | VariantId::StructId(_) => {
                         let mut operands = vec![None; variant_fields.fields().len()];
+                        let declared = self.declared_locals();
                         for RecordLitField { name, expr } in fields.iter() {
                             let field_id =
                                 variant_fields.field(name).ok_or(MirLowerError::UnresolvedField)?;
@@ -1150,6 +1189,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             current = c;
                             operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                         }
+                        self.declare_operands_last(expr_id, declared, operands.iter().flatten());
                         // The fields are evaluated in the order written, and the base after
                         // them.
                         let spread_place = match *spread {
@@ -1375,7 +1415,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 // `-128i8` is that number, not the negation of one `i8` does not have.
@@ -1454,7 +1494,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 if let hir_def::hir::BinaryOp::Assignment { op: Some(op) } = op {
@@ -1674,7 +1714,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Closure { closure_kind, .. } => not_supported!("{closure_kind:?} closure"),
             Expr::Tuple { exprs } => {
-                let Some(values) = exprs
+                let declared = self.declared_locals();
+                let Some(values): Option<Box<[Operand]>> = exprs
                     .iter()
                     .map(|it| {
                         let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)? else {
@@ -1687,6 +1728,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 else {
                     return Ok(None);
                 };
+                self.declare_operands_last(expr_id, declared, values.iter());
                 let r = Rvalue::Aggregate(
                     AggregateKind::Tuple(self.expr_ty_without_adjust(expr_id).store()),
                     values,
@@ -1704,7 +1746,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             ));
                         }
                     };
-                    let Some(values) = elements
+                    let declared = self.declared_locals();
+                    let Some(values): Option<Box<[Operand]>> = elements
                         .iter()
                         .map(|it| {
                             let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)?
@@ -1718,6 +1761,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     else {
                         return Ok(None);
                     };
+                    self.declare_operands_last(expr_id, declared, values.iter());
                     let r = Rvalue::Aggregate(AggregateKind::Array(elem_ty.store()), values);
                     self.push_assignment(current, place, r, expr_id.into());
                     Ok(Some(current))
@@ -2025,6 +2069,99 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok((operand, discr_ty, current))
     }
 
+    /// Lowers `let pat = scrutinee` where it is the whole condition of an `if`, in the scope
+    /// the `if` has made for it, and gives the blocks to go on in when the pattern matches and
+    /// when it does not. No block is on both ways, so what is known of the value where the
+    /// pattern did not match stays known.
+    fn lower_if_let(
+        &mut self,
+        condition: ExprId,
+        pat: PatId,
+        scrutinee: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(BasicBlockId, BasicBlockId)>> {
+        let Some((place, current)) = self.lower_expr_as_place(current, scrutinee, true)? else {
+            return Ok(None);
+        };
+        if !self.edition().at_least_2024() {
+            self.outlive_innermost_scope();
+        }
+        self.push_fake_read(current, place, condition.into());
+        let resolver_guard =
+            self.resolver.update_to_inner_scope(self.db, self.store_owner, condition);
+        let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
+        self.resolver.reset_to_guard(resolver_guard);
+        Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
+    }
+
+    /// Hands what the innermost scope has declared to the scope around it. Before the 2024
+    /// edition the temporaries of what an `if let` matches on live as long as those of the
+    /// expression the `if` is in, and only what the pattern binds ends with the branch.
+    fn outlive_innermost_scope(&mut self) {
+        if let [.., outer, scope] = &mut self.drop_scopes[..] {
+            outer.locals.append(&mut scope.locals);
+        }
+    }
+
+    /// Whether these are the arms of the `match` that a `for` loop is written as.
+    fn is_for_loop(&self, arms: &[MatchArm]) -> bool {
+        matches!(arms, [arm] if matches!(
+            self.store[arm.expr],
+            Expr::Loop { source: LoopSource::ForLoop, .. }
+        ))
+    }
+
+    /// Lowers a branch of an `if`. Its temporaries are dropped where the branch ends, also
+    /// those of the tail of a block that would otherwise live as long as the statement the
+    /// `if` is in.
+    fn lower_branch_to_place(
+        &mut self,
+        branch: ExprId,
+        place: Place<'db>,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let temporaries = self.push_drop_scope();
+        let Some(current) = self.lower_expr_to_place(branch, place, current)? else {
+            temporaries.pop_assume_dropped(self);
+            return Ok(None);
+        };
+        Ok(Some(temporaries.pop_and_drop(self, current, branch.into())))
+    }
+
+    /// How many locals the innermost scope has declared: where the operands of an expression
+    /// that is about to be lowered will start.
+    fn declared_locals(&self) -> usize {
+        self.drop_scopes.last().map_or(0, |it| it.locals.len())
+    }
+
+    /// Declares the operands of `owner`, an aggregate or a call, after everything else that
+    /// was declared since `declared`, so that they are dropped first. rustc keeps the operands
+    /// in the scope of the expression they are operands of: when a later operand panics, the
+    /// earlier ones are dropped before the temporaries that live to the end of the statement.
+    /// An expression that ends its own temporaries has them in that same scope, in the order
+    /// they were made.
+    fn declare_operands_last<'o>(
+        &mut self,
+        owner: ExprId,
+        declared: usize,
+        operands: impl Iterator<Item = &'o Operand>,
+    ) {
+        if self.ends_temporaries.contains(&owner) {
+            return;
+        }
+        let Some(scope) = self.drop_scopes.last_mut() else { return };
+        for operand in operands {
+            let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+                continue;
+            };
+            let found = scope.locals.iter().skip(declared).position(|&it| it == place.local);
+            if let Some(at) = found.filter(|_| place.projection.as_slice().is_empty()) {
+                let local = scope.locals.remove(declared + at);
+                scope.locals.push(local);
+            }
+        }
+    }
+
     fn lower_call_and_args(
         &mut self,
         func: Operand,
@@ -2032,8 +2169,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         mut current: BasicBlockId,
         is_uninhabited: bool,
-        span: MirSpan,
+        call: ExprId,
     ) -> Result<'db, Option<BasicBlockId>> {
+        let declared = self.declared_locals();
         let Some(args) = args
             .map(|arg| {
                 if let Some((temp, c)) = self.lower_expr_to_some_operand(arg, current)? {
@@ -2047,7 +2185,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
-        self.lower_call(func, args.into(), place, current, is_uninhabited, span)
+        self.declare_operands_last(call, declared, args.iter());
+        self.lower_call(func, args.into(), place, current, is_uninhabited, call.into())
     }
 
     fn lower_call(
@@ -2504,7 +2643,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
-                        let held = self.drop_scopes.last().map_or(0, |it| it.locals.len());
+                        let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                         self.extend_temporaries(*expr_id, *pat);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
@@ -2535,7 +2674,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 self.set_terminator(else_block, TerminatorKind::Unreachable, span);
                             }
                             (Some(else_block), Some(else_branch)) => {
-                                self.lower_let_else(else_block, *else_branch, held, span)?;
+                                self.lower_let_else(else_block, *else_branch, declared, span)?;
                             }
                         }
                         current = temporaries.pop_and_drop(self, current, span);
@@ -2576,16 +2715,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
         }
         if let Some(tail) = tail {
+            // Before the 2024 edition the temporaries of a block's tail live as long as those
+            // of the expression the block is in. The edition is the one the block was written
+            // in, which for a macro's block is the macro's.
+            let edition = self.store.block_edition(block).unwrap_or_else(|| self.edition());
+            if edition.at_least_2024() {
+                self.ends_temporaries.insert(tail);
+            }
             let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
                 scope.pop_assume_dropped(self);
                 return Ok(None);
             };
             current = c;
-            // Before the 2024 edition the temporaries of a block's tail live as long as those
-            // of the expression the block is in. The edition is the one the block was written
-            // in, which for a macro's block is the macro's.
-            let edition = self.store.block_edition(block).unwrap_or_else(|| self.edition());
             if !edition.at_least_2024()
                 && let [.., outer, scope] = &mut self.drop_scopes[..]
                 && declared <= scope.locals.len()
@@ -2601,6 +2743,40 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
+    }
+
+    /// Lowers the `else` of a `let`, which runs when the pattern did not match. The temporaries
+    /// of the initializer are dropped before it runs: the value that was matched, and the ones
+    /// that would have lived on to the end of the block, which are the locals of the block from
+    /// `declared` on.
+    fn lower_let_else(
+        &mut self,
+        mut else_block: BasicBlockId,
+        else_branch: ExprId,
+        declared: usize,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let [.., block, temporaries] = &mut self.drop_scopes[..] else {
+            return Err(MirLowerError::ImplementationError("`let` outside a block".into()));
+        };
+        let extended = block.locals.split_off(declared.min(block.locals.len()));
+        let held = [
+            DropScope { locals: extended, temporaries: true },
+            DropScope { locals: std::mem::take(&mut temporaries.locals), temporaries: true },
+        ];
+        for scope in held.iter().rev() {
+            self.emit_drop_and_storage_dead_for_scope(scope, &mut else_block, span);
+        }
+        let lowered = self.lower_expr_as_place(else_block, else_branch, true);
+        let [extended, statement] = held;
+        if let [.., block, temporaries] = &mut self.drop_scopes[..] {
+            block.locals.extend(extended.locals);
+            temporaries.locals = statement.locals;
+        }
+        if let Some((_, end)) = lowered? {
+            self.set_terminator(end, TerminatorKind::Unreachable, span);
+        }
+        Ok(())
     }
 
     fn lower_params_and_bindings(
@@ -2976,72 +3152,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(current)
     }
 
-    /// Where a branch of an `if` that has a `let` ends: what the condition bound is dropped,
-    /// after the temporaries the branch left to the `if`. `bound` is the scope of the `if` as
-    /// its condition left it.
-    fn end_of_branch(
-        &mut self,
-        bound: &Option<DropScope>,
-        mut block: BasicBlockId,
-        span: MirSpan,
-    ) -> BasicBlockId {
-        if let (Some(_), Some(scope)) = (bound, self.drop_scopes.last().cloned()) {
-            self.emit_drop_and_storage_dead_for_scope(&scope, &mut block, span);
-        }
-        block
-    }
-
-    /// Takes out of the scope of an `if` what the branch that was just lowered left to it:
-    /// the other branch never had those.
-    fn forget_branch(&mut self, bound: &Option<DropScope>) {
-        if let (Some(bound), Some(scope)) = (bound, self.drop_scopes.last_mut()) {
-            scope.locals.clone_from(&bound.locals);
-        }
-    }
-
-    /// Before the 2024 edition the temporaries of what an `if let` matches on live as long as
-    /// those of the expression the `if` is in. Only what it binds ends with its branches.
-    fn outlive_if_let(&mut self) {
-        let bindings: FxHashSet<LocalId> =
-            self.result.binding_locals.iter().map(|(_, &local)| local).collect();
-        if let [.., outer, scope] = &mut self.drop_scopes[..] {
-            let (bound, temporaries) =
-                scope.locals.drain(..).partition(|local| bindings.contains(local));
-            scope.locals = bound;
-            outer.locals.extend::<Vec<LocalId>>(temporaries);
-        }
-    }
-
-    /// The `else` of a `let ... else`, entered when the pattern did not match. The value and
-    /// the temporaries of the initializer are dropped before the block runs, those that would
-    /// have lived to the end of the enclosing block too: they are its locals from `held` on.
-    fn lower_let_else(
-        &mut self,
-        mut current: BasicBlockId,
-        else_branch: ExprId,
-        held: usize,
-        span: MirSpan,
-    ) -> Result<'db, ()> {
-        let take = |scope: &mut DropScope| std::mem::take(&mut scope.locals);
-        let locals = self.drop_scopes.last_mut().map(take).unwrap_or_default();
-        let dropped = DropScope { locals, temporaries: true };
-        self.emit_drop_and_storage_dead_for_scope(&dropped, &mut current, span);
-        let extended = match self.drop_scopes.iter().rev().nth(1) {
-            Some(block) => block.locals.get(held..).unwrap_or_default().to_vec(),
-            None => Vec::new(),
-        };
-        let extended = DropScope { locals: extended, temporaries: true };
-        self.emit_drop_and_storage_dead_for_scope(&extended, &mut current, span);
-        let lowered = self.lower_expr_as_place(current, else_branch, true);
-        if let Some(scope) = self.drop_scopes.last_mut() {
-            scope.locals = dropped.locals;
-        }
-        if let Some((_, end)) = lowered? {
-            self.set_terminator(end, TerminatorKind::Unreachable, span);
-        }
-        Ok(())
-    }
-
     /// Drops the value an assignment is about to overwrite.
     fn drop_assigned(
         &mut self,
@@ -3347,8 +3457,7 @@ fn lower_closure_body<'db>(
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
     let is_by_ref_closure = receiver == Receiver::Borrowed;
-    let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
-        FxHashMap::default();
+    let mut upvar_map: FxHashMap<LocalId, Vec<Capture<'_>>> = FxHashMap::default();
     for (capture_idx, capture) in captures.into_iter().enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
@@ -3390,6 +3499,7 @@ fn lower_closure_body<'db>(
     }
 
     ctx.resolver.reset_to_guard(resolver_guard);
+    ctx.ends_temporaries.insert(*root);
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());
@@ -3412,49 +3522,28 @@ fn lower_closure_body<'db>(
             }
         }
     }
+    // What a pattern without bindings matches on is not read, so it is not captured either.
+    for (_, block) in ctx.result.basic_blocks.iter_mut() {
+        block.statements.retain(|statement| match &statement.kind {
+            StatementKind::FakeRead(place) => upvar_map
+                .get(&place.local)
+                .is_none_or(|captures| captured_place(db, captures, place).is_some()),
+            _ => true,
+        });
+    }
     let mut err = None;
     ctx.result.walk_places(|mir_place| {
-        let mir_projections = mir_place.projection.as_slice();
         if let Some(hir_places) = upvar_map.get(&mir_place.local) {
-            let projections = hir_places.iter().find_map(|hir_place| {
-                let iter = mir_projections
-                    .iter()
-                    .cloned()
-                    .zip_longest(convert_closure_capture_projections(db, &hir_place.0.place))
-                    .enumerate();
-
-                for (idx, item) in iter {
-                    match item {
-                        EitherOrBoth::Both(mir, hir) => {
-                            if mir != hir {
-                                // Not this place.
-                                return None;
-                            }
-                        }
-                        EitherOrBoth::Right(_) => {
-                            // FIXME: This can happen in fake reads. I believe this is a bug. So we change the fake read's meaning.
-                            // never!(
-                            //     "mir upvar place shorter than hir upvar place; this should not happen, \
-                            //         capture analysis should have picked the shorter place"
-                            // );
-                            // return None;
-                            return Some((mir_projections.len(), hir_place));
-                        }
-                        // This place, but truncated.
-                        EitherOrBoth::Left(_) => return Some((idx, hir_place)),
-                    }
-                }
-                // Exactly this place.
-                Some((mir_projections.len(), hir_place))
-            });
+            let projections = captured_place(db, hir_places, mir_place);
+            let mir_projections = mir_place.projection.as_slice();
             match projections {
                 Some((skip_projections_up_to, (hir_place, upvar_local, capture_idx))) => {
                     let in_closure = [
                         ProjectionElem::Deref,
-                        ProjectionElem::Field(FieldIndex(*capture_idx as u32)),
+                        ProjectionElem::Field(FieldIndex(capture_idx as u32)),
                     ];
                     let maybe_deref: &[PlaceElem] = if hir_place.is_by_ref() {
-                        mir_place.local = *upvar_local;
+                        mir_place.local = upvar_local;
                         &[ProjectionElem::Deref]
                     } else if is_by_ref_closure {
                         // The closure is called again, so a capture it owns has to be used in
@@ -3462,7 +3551,7 @@ fn lower_closure_body<'db>(
                         mir_place.local = closure_local;
                         &in_closure
                     } else {
-                        mir_place.local = *upvar_local;
+                        mir_place.local = upvar_local;
                         &[]
                     };
                     mir_place.projection = Projection::new_from_iter(
@@ -3488,6 +3577,45 @@ fn lower_closure_body<'db>(
     }
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
+}
+
+/// A capture of a closure, the local it is in while the closure runs, and which capture it is.
+type Capture<'a> = (&'a CapturedPlace, LocalId, usize);
+
+/// The capture that `place` is, or is inside of, or holds, and how many of the projections
+/// of `place` the capture stands for.
+fn captured_place<'a>(
+    db: &dyn HirDatabase,
+    captures: &[Capture<'a>],
+    place: &StoredPlace,
+) -> Option<(usize, Capture<'a>)> {
+    let mir_projections = place.projection.as_slice();
+    captures.iter().find_map(|hir_place| {
+        let iter = mir_projections
+            .iter()
+            .cloned()
+            .zip_longest(convert_closure_capture_projections(db, &hir_place.0.place))
+            .enumerate();
+
+        for (idx, item) in iter {
+            match item {
+                EitherOrBoth::Both(mir, hir) => {
+                    if mir != hir {
+                        // Not this place.
+                        return None;
+                    }
+                }
+                EitherOrBoth::Right(_) => {
+                    // FIXME: This can happen in fake reads. I believe this is a bug. So we change the fake read's meaning.
+                    return Some((mir_projections.len(), *hir_place));
+                }
+                // This place, but truncated.
+                EitherOrBoth::Left(_) => return Some((idx, *hir_place)),
+            }
+        }
+        // Exactly this place.
+        Some((mir_projections.len(), *hir_place))
+    })
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result)]
@@ -3663,6 +3791,7 @@ pub fn lower_to_mir_with_store<'db>(
         if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
     let binding_picker = |b: BindingId| ctx.store.binding_owner(b) == expected_binding_owner;
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
+    ctx.ends_temporaries.insert(root_expr);
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
@@ -3674,4 +3803,17 @@ pub fn lower_to_mir_with_store<'db>(
 fn word_bytes(value: usize) -> Box<[u8]> {
     let word = crate::mir::codegen::Target::current().word();
     value.to_le_bytes()[..word].into()
+}
+
+/// Whether `base[index]` reads an array or a slice in place by a `usize`, and is not a call
+/// of `Index::index`.
+pub(crate) fn is_builtin_index(infer: &InferenceResult, base: ExprId, index: ExprId) -> bool {
+    let adjusted = |expr: ExprId| {
+        let adjustments = infer.expr_adjustments.get(&expr);
+        adjustments
+            .and_then(|it| it.last())
+            .map_or_else(|| infer.expr_ty(expr), |it| it.target.as_ref())
+    };
+    matches!(adjusted(index).kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize))
+        && matches!(adjusted(base).strip_reference().kind(), TyKind::Array(..) | TyKind::Slice(..))
 }
