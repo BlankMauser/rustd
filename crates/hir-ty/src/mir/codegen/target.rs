@@ -248,6 +248,18 @@ impl Target {
         (self.object_format != ObjectFormat::Coff).then_some("inline-asm")
     }
 
+    /// The section a static with a name gets to itself, where a symbol does not say how
+    /// large it is and the section does. Without one a static is as large as the next thing
+    /// in its section is far, which counts what that is aligned by. The linker merges
+    /// these into the section before the `$`, and the name is not one the writer of the
+    /// object would put anything else in.
+    pub fn section_of_static(&self, writable: bool) -> Option<&'static str> {
+        match self.object_format {
+            ObjectFormat::Coff => Some(if writable { ".data$static" } else { ".rdata$static" }),
+            ObjectFormat::Elf | ObjectFormat::MachO | ObjectFormat::Wasm => None,
+        }
+    }
+
     /// The code generator for the target. `regalloc` names Cranelift's register allocator.
     /// With `frame_pointers` every function it compiles keeps one, which a function that
     /// asks for its frame pointer needs.

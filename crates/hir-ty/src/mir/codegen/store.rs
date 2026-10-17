@@ -999,7 +999,10 @@ impl Store {
 
     /// The pack and its records, if it is what its name says. One that is not is removed.
     fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Record>)> {
-        let mut file = match self.dir.open(name, false) {
+        // To write as well where that is allowed, which is what Windows asks of whoever
+        // sets a file's time of last use.
+        let opened = self.dir.open(name, true).or_else(|_| self.dir.open(name, false));
+        let mut file = match opened {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 self.discard(name, &e.to_string());

@@ -58,13 +58,25 @@ def the_users_alone(store):
     print(f"  modes: the store 0700, its {len(open_to)} files 0600")
 
 
+def held_in(path):
+    """The bytes of a file as a store would hold them: a remote sends its packs through zstd,
+    and a path that is looked for is not found in what is compressed."""
+    data = open(path, "rb").read()
+    if not path.endswith(".zst"):
+        return data
+    unpacked = subprocess.run(["zstd", "-d", "-c", "-q"], input=data, capture_output=True)
+    if unpacked.returncode != 0:
+        fail(f"{path} is not zstd: {unpacked.stderr.decode()[-200:]}")
+    return unpacked.stdout
+
+
 def names_no_checkout(checkout, directory, what):
     """Nothing below `directory` has the checkout's place, or the home of the user, in it."""
     places = [checkout.work.encode(), os.path.expanduser("~").encode()]
     read = 0
     for at, _, names in os.walk(directory):
         for name in names:
-            data = open(os.path.join(at, name), "rb").read()
+            data = held_in(os.path.join(at, name))
             read += len(data)
             for place in places:
                 if place in data:
@@ -202,7 +214,7 @@ def another_cargo_home(work):
         fail(f"push: {out}")
     stored = b""
     for what, directory in (("the store", store), ("the remote", remote)):
-        held = b"".join(open(os.path.join(at, name), "rb").read()
+        held = b"".join(held_in(os.path.join(at, name))
                         for at, _, names in os.walk(directory) for name in sorted(names))
         for home in homes:
             if home.encode() in held:

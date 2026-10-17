@@ -1,7 +1,7 @@
 # Security review of the store, the remote and the daemon's boundaries
 
-Branch `rustd-security`, on top of `rustd-collate` at 2da3d6a792, which has the S3 remote
-with its signed lists, compressed packs and `cache gc --remote`. Everything below was
+Branch `rustd-security`, on top of `rustd-collate` at ce52276cf5, which has the S3 remote
+with its signed lists, compressed packs and `cache gc --remote`, and the platform ABI merge. Everything below was
 measured on Linux x86-64 with Rust 1.99.0 and LLVM 20. Where something is an argument and
 not a measurement it says so. The Windows code in this round was compiled for Windows and
 never run; that is said again where it matters.
@@ -871,8 +871,8 @@ Builds and checks:
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 CARGO_TARGET_DIR=target-llvm \
       cargo build -p rustd --release --features llvm                builds
     cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd -p project-model
-                                                                    1015 passed, 0 failed, 1 ignored
-    cargo test --release -p rustd -- remote:: deps::                28 passed
+                                                                    1022 passed, 0 failed, 1 ignored
+    cargo test --release -p rustd -- remote:: deps::                33 passed
     cargo check -p hir-ty --tests --target x86_64-pc-windows-msvc   checks
 
 `cargo xtask tidy` fails, and not from this branch: it objects to two `#[should_panic]`
@@ -905,11 +905,12 @@ RUSTD_EMIT=fast`:
 | `storeshared.py` | 180 builds | 180 builds |
 | `storeguards.py` | all right | all right |
 | `selects.py` | 3 of 3 | 3 of 3 |
-| `remote.py` (MinIO; SeaweedFS is not on this machine) | 85 of 85 | 85 of 85 |
+| `remote.py` (MinIO; SeaweedFS is not on this machine) | 117 of 117 | 117 of 117 |
+| `backends.py corpus runner cases --bin runner --levels 2f` | | exit 0 |
 | `buildmodel.py` (runs both backends itself) | | 194 of 194, 0 WRONG |
 
-The 5 open of `breakers.py` are the ones it lists as open on `rustd-collate`. Of the 85
-checks of `remote.py`, 17 are new here.
+The 5 open of `breakers.py` are the ones it lists as open on `rustd-collate`. Of the 117
+checks of `remote.py`, 25 are new here.
 
 Things in the gate that changed because of this branch, said here so they are not taken
 for noise:
@@ -919,6 +920,9 @@ for noise:
   `<pack>.fetch.tmp` of the S3 remote. Fixed in `Kind::of`.
 - `storeguards.py` failed after the merge on the mode of fetched packs (0644). Fixed in
   `transfer.rs`.
+- `storeguards.py` failed after the round-three merge: it looks for paths in the bytes of
+  the remote, and packs there are now compressed. It unpacks `.zst` objects before it
+  looks.
 - `deps.py` expected the old remote's words for a changed archive. It now expects
   "rejected units/<hash>" and one object counted as rejected.
 - `storefull.py`'s largest disk is 768 KB since last round (the shorter standard-library
