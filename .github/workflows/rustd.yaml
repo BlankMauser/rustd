@@ -1,6 +1,7 @@
 # rustd: the daemon's own checks, on its branches. The harnesses compare what rustd builds
-# with what rustc builds, under both producers, on Linux x86-64 and on Linux AArch64: each
-# on a machine of its own kind, so nothing is cross-compiled or emulated.
+# with what rustc builds, under both producers, on Linux x86-64, Linux AArch64, Windows
+# x86-64 and macOS arm64: each on a machine of its own kind, so nothing is cross-compiled
+# or emulated but what `buildmodel.py` builds for other targets.
 name: rustd
 on:
   push:
@@ -55,19 +56,25 @@ jobs:
       RUSTD_EMIT: fast
     steps:
       - uses: actions/checkout@v6
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0 && rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      # What `buildmodel.py` builds for besides the host.
+      - run: rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
+        if: matrix.os == 'ubuntu-24.04'
       - name: LLVM 20
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb gcc-aarch64-linux-gnu musl-tools qemu-user
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb
+      - name: Cross tools
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p rustd --release --features llvm
       - name: Harnesses
         working-directory: harness
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=0
-          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -81,12 +88,15 @@ jobs:
           run worktrees.py
           run keys.py
           run debuginfo.py
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # The targets it builds for are another architecture and another libc of an
+          # x86-64 host, and it is one producer's.
+          if [ "$(uname -m)" = x86_64 ] && [ "$RUSTD_BACKEND" = cranelift ]; then run buildmodel.py; fi
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
-          exit $failed
+          echo "failed:${failed:- none}"
+          test -z "$failed"
 
   windows-checks:
     name: fmt and tests (windows)
@@ -158,8 +168,8 @@ jobs:
         working-directory: harness
         run: |
           export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
-          failed=0
-          run() { echo "::group::$*"; python "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -170,4 +180,63 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
-          exit $failed
+          # Not run here: `debuginfo.py` reads DWARF with gdb, and the debug info of this
+          # target is not written; `buildmodel.py` builds for Linux targets; `storefull.py`
+          # mounts a tmpfs; `farsplices.py` is about the reach of an AArch64 branch.
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storeshared.py
+          echo "failed:${failed:- none}"
+          test -z "$failed"
+
+  macos:
+    name: macOS arm64 (${{ matrix.backend }})
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          brew install llvm@20
+          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+        if: matrix.backend == 'cranelift'
+      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
+        if: matrix.backend == 'cranelift'
+      - run: cargo build -p rustd --release --features llvm
+      - name: Harnesses
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run difftest.py corpus --bin runner --crate cases --layouts
+          run programs.py
+          run stress.py
+          run breakers.py
+          run unwinds.py
+          run splices.py
+          run asmedits.py
+          run includes.py
+          run worktrees.py
+          run worktrees.py --join --together
+          run worktrees.py --overlay
+          run keys.py
+          # Not run here: `debuginfo.py` reads DWARF with gdb out of an ELF executable;
+          # `buildmodel.py` builds for Linux targets; `storefull.py` mounts a tmpfs;
+          # `farsplices.py` splices, which is not done for Mach-O.
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storeshared.py
+          echo "failed:${failed:- none}"
+          test -z "$failed"
