@@ -60,6 +60,9 @@ STEPS = [
      [1, 0, 2, 1], []),
     ("that file edited in one", [(2, SHARED, f"shared of 2 in {RUN}", "shared anew")], [0, 2, 1], []),
     ("and made what another has", [(2, SHARED, "shared anew", f"shared of 0 in {RUN}")], [2, 1, 0], []),
+    # The checkout is loaded again, and the others are left as they are.
+    ("the manifest of one changed in what no crate reads",
+     [(0, "app/Cargo.toml", "[package]", "[package.metadata]\nnote = 1\n\n[package]")], [1, 2, 0, 1], []),
 ]
 # Cargo may build that checkout another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
