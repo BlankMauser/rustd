@@ -212,7 +212,8 @@ enum PassMode {
     /// Aggregate AAPCS64 hands over in `count` registers of one type, each holding the next
     /// `unit` bytes of it. `skipped` registers of that kind go unused first: the convention
     /// leaves them out when the value has to start at an even register, and takes them all
-    /// out of use when the value has to go to the stack, where the units then land.
+    /// out of use when the value has to go to the stack, where the units then land. A unit
+    /// of 128 bits is the one that is on the stack at a multiple of sixteen bytes.
     Uniform {
         unit: Type,
         count: u8,
@@ -222,6 +223,13 @@ enum PassMode {
     /// The C ABI's by-value aggregate in memory: the caller copies this many bytes into its
     /// outgoing arguments, which Cranelift does given a pointer.
     OnStack(u32),
+}
+
+impl PassMode {
+    /// What fills one register of the kind the units of a `Uniform` go to.
+    fn register(unit: Type) -> Type {
+        if unit == types::I128 { types::I64 } else { unit }
+    }
 }
 
 /// How every value of a call crosses the boundary.
@@ -4005,16 +4013,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if wide {
                         // Cranelift starts it at an even register, or puts it on the stack
                         // whole. The registers it did not fit in stay free there, where
-                        // the convention has them out of use: turn down what would use one.
+                        // the convention has them out of use.
                         *used += *used % even;
-                        if *used + 2 > REGS && *used < REGS {
-                            unsupported!("a 128-bit argument that the registers left do not hold");
-                        }
+                        let skipped = if *used + 2 > REGS { REGS - *used } else { 0 };
                         *used = (*used + 2).min(REGS);
+                        match skipped {
+                            0 => PassMode::Direct(scalar),
+                            _ => PassMode::Uniform { unit: types::I128, count: 1, skipped },
+                        }
                     } else {
                         *used = (*used + 1).min(REGS);
+                        PassMode::Direct(scalar)
                     }
-                    PassMode::Direct(scalar)
                 }
                 Aapcs64::Floats { unit, count } if floats + count <= REGS => {
                     floats += count;
@@ -4032,14 +4042,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     if ints + odd + count <= REGS {
                         ints += odd + count;
                         Self::aapcs64_ints(size, odd)
-                    } else if align > 8 {
-                        // FIXME: the stack is where it goes, at an address that is a
-                        // multiple of sixteen, which the units of a `Uniform` are not at.
-                        unsupported!("an aggregate aligned to 16 bytes passed on the stack");
                     } else {
                         let skipped = REGS - ints;
                         ints = REGS;
-                        PassMode::Uniform { unit: types::I64, count, skipped }
+                        // On the stack, one aligned to sixteen bytes is at a multiple of
+                        // sixteen, as a 128-bit integer is.
+                        match align > 8 {
+                            true => PassMode::Uniform { unit: types::I128, count: 1, skipped },
+                            false => PassMode::Uniform { unit: types::I64, count, skipped },
+                        }
                     }
                 }
                 Aapcs64::Memory => {
@@ -4315,7 +4326,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Cast(ty) => params.push(AbiParam::new(ty)),
             PassMode::CastPair(a, b) => params.extend([AbiParam::new(a), AbiParam::new(b)]),
             PassMode::Uniform { unit, count, skipped } => {
-                params.extend((0..skipped + count).map(|_| AbiParam::new(unit)))
+                params.extend((0..skipped).map(|_| AbiParam::new(PassMode::register(unit))));
+                params.extend((0..count).map(|_| AbiParam::new(unit)));
             }
             PassMode::Indirect => params.push(AbiParam::new(ptr())),
             PassMode::OnStack(size) => {
@@ -4376,7 +4388,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Uniform { unit, count, skipped } => {
                 for _ in 0..skipped {
-                    values.push(self.zero(unit));
+                    values.push(self.zero(PassMode::register(unit)));
                 }
                 let step = u64::from(unit.bytes());
                 for index in 0..u64::from(count) {
