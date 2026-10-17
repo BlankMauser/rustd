@@ -8472,11 +8472,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 sig.params.push(AbiParam::new(ptr()));
                 let catch_sig = self.builder.import_signature(sig);
 
+                // Whether it unwound is an `i32` or a `bool`, by the toolchain.
+                let outcome = self.layout(dst_ty)?.size.bytes();
+                let outcome = Type::int_with_byte_size(outcome as u16).ok_or_else(|| {
+                    CodegenError::Unsupported(format!("`catch_unwind` giving {outcome} bytes"))
+                })?;
                 let returned = self.builder.create_block();
                 let caught = self.builder.create_block();
                 let done = self.builder.create_block();
                 self.builder.append_block_param(caught, ptr());
-                self.builder.append_block_param(done, types::I32);
+                self.builder.append_block_param(done, outcome);
                 if self.cg.target.exception_in_register() {
                     let normal = self.builder.func.dfg.block_call(returned, &[]);
                     let unwound =
@@ -8497,7 +8502,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
 
                 self.builder.switch_to_block(returned);
-                let zero = self.builder.ins().iconst(types::I32, 0);
+                let zero = self.builder.ins().iconst(outcome, 0);
                 self.builder.ins().jump(done, &[zero.into()]);
 
                 self.builder.switch_to_block(caught);
@@ -8515,7 +8520,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let release = self.cg.declare_func_in_func(release, self.builder.func);
                     self.builder.ins().call(release, &[exception]);
                 }
-                let one = self.builder.ins().iconst(types::I32, 1);
+                let one = self.builder.ins().iconst(outcome, 1);
                 self.builder.ins().jump(done, &[one.into()]);
 
                 self.builder.switch_to_block(done);
