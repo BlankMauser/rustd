@@ -4016,7 +4016,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 // Out of registers: an aggregate goes to memory whole. Cranelift moves
                 // anything else to the stack by itself.
-                _ if aggregate => PassMode::OnStack(self.layout(ty)?.size.bytes() as u32),
+                _ if aggregate => {
+                    let size = self.layout(ty)?.size.bytes();
+                    PassMode::OnStack(size.next_multiple_of(8) as u32)
+                }
                 _ => mode,
             });
         }

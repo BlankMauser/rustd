@@ -43,4 +43,5 @@ cases![
     panic_index_operand,
     unwind_operand_order,
     assert_message,
+    stack_aggregate_odd_size,
 ];
