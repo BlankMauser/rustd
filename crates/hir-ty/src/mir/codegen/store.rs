@@ -859,7 +859,14 @@ impl Store {
     fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Record>)> {
         let path = self.dir.dir.join(name);
         // Evicted since it was listed.
-        let mut file = File::open(&path).ok()?;
+        // To write as well where that is allowed, which is what Windows asks of whoever
+        // sets a file's time of last use. Another user's pack is only read.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .or_else(|_| File::open(&path))
+            .ok()?;
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes).ok()?;
         match Pack::check(name, &bytes) {
