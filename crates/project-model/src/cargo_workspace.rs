@@ -138,6 +138,8 @@ pub struct CargoConfig {
     pub config_path: Option<AbsPathBuf>,
     /// Extra env vars to set when invoking the cargo command
     pub extra_env: FxHashMap<String, Option<String>>,
+    /// Whether `extra_env` is only what cargo and rustc are run with, and no crate is told it.
+    pub extra_env_for_commands_only: bool,
     pub invocation_strategy: InvocationStrategy,
     /// Optional path to use instead of `target` when building
     pub target_dir_config: TargetDirectoryConfig,

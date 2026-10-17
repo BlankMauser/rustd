@@ -1,7 +1,7 @@
-//! What a build was loaded from besides the source: cargo's configuration, the flags for
-//! rustc in the environment, and what the build scripts read. The daemon has loaded all three
-//! once. Before each build it looks whether they are still what it loaded, runs the build
-//! scripts again where cargo would, and turns the build down when it would be another one.
+//! What a checkout was loaded from besides the source: its manifests and lock file, cargo's
+//! configuration, the flags for rustc in the environment, and what its build scripts read.
+//! Before each build the daemon looks whether they are still what it loaded, runs the build
+//! scripts again where cargo would, and says which checkouts are to be loaded again.
 
 use std::{
     hash::{Hash as _, Hasher as _},
@@ -10,19 +10,26 @@ use std::{
 
 use ide_db::base_db::Env;
 use project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind, TargetKind};
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 
 /// The variables cargo takes flags for rustc from.
 const FLAGS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"];
 
-/// What the daemon's checkouts were loaded from.
+/// What each of the daemon's checkouts that is loaded in full was loaded from.
 #[derive(Default)]
 pub(crate) struct Inputs {
-    /// The files cargo's configuration is read from, those that are not there too.
-    configs: Vec<Watched>,
-    /// The variables of `FLAGS` as the daemon has them.
+    checkouts: Vec<Checkout>,
+}
+
+/// What the workspace at `root` was loaded from.
+struct Checkout {
+    root: PathBuf,
+    /// The manifests and the lock file, the build scripts cargo finds by their name, and
+    /// the files cargo's configuration is read from: those that are not there too.
+    files: Vec<Watched>,
+    /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
-    scripts: Vec<Scripts>,
+    scripts: Option<Scripts>,
 }
 
 /// A file or a directory, and what it was when the daemon read it.
@@ -55,39 +62,73 @@ struct Scripts {
     variables: Vec<(String, Option<String>)>,
 }
 
+/// The variable `name` as the commands of `config` are run with it.
+fn run_with(config: &CargoConfig, name: &str) -> Option<String> {
+    match config.extra_env.get(name) {
+        Some(value) => value.clone(),
+        None => std::env::var(name).ok(),
+    }
+}
+
 impl Inputs {
-    /// Has the workspace at `project`, loaded with `config`, be one whose inputs are watched.
+    /// Has the workspace at `root`, loaded with `config`, be one whose inputs are watched.
     pub(crate) fn watch(
         &mut self,
-        project: &Path,
+        root: &Path,
         workspace: &ProjectWorkspace,
         config: &CargoConfig,
     ) {
-        for dir in project.ancestors() {
+        let mut files = Vec::new();
+        for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
-                let path = dir.join(".cargo").join(name);
-                if !self.configs.iter().any(|it| it.path == path) {
-                    self.configs.push(Watched::new(path, false));
-                }
+                files.push(Watched::new(dir.join(".cargo").join(name), false));
             }
         }
-        if self.flags.is_empty() {
-            self.flags = FLAGS.iter().map(|&it| (it, std::env::var(it).ok())).collect();
+        for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"] {
+            files.push(Watched::new(root.join(name), false));
         }
-        self.scripts.extend(Scripts::of(workspace, config));
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+            for package in cargo.packages().filter(|&it| cargo[it].is_local) {
+                let manifest: &Path = cargo[package].manifest.as_ref();
+                files.push(Watched::new(manifest.to_owned(), false));
+                // A script that appears there is run without the manifest naming it.
+                files.push(Watched::new(manifest.with_file_name("build.rs"), false));
+            }
+        }
+        let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
+        let scripts = Scripts::of(workspace, config);
+        self.checkouts.retain(|it| it.root != root);
+        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
     }
 
-    /// Why a build for a process with the variables `env` is not one of what the daemon
-    /// loaded, when it is not.
-    pub(crate) fn changed(&mut self, env: &Env) -> Option<String> {
-        let restart = "is not what the daemon loaded, start it again";
-        if let Some(config) = self.configs.iter().find(|it| it.changed()) {
-            return Some(format!("{} {restart}", config.path.display()));
+    /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
+    /// a process with the variables `env`, or with `None` for whoever it was loaded for.
+    /// An error is why its build scripts can't say.
+    pub(crate) fn stale(&mut self, root: &Path, env: Option<&Env>) -> anyhow::Result<bool> {
+        let Some(checkout) = self.checkouts.iter_mut().find(|it| it.root == root) else {
+            return Ok(false);
+        };
+        if checkout.files.iter().any(Watched::changed) {
+            return Ok(true);
         }
-        if let Some((name, _)) = self.flags.iter().find(|(name, was)| env.get(name) != *was) {
-            return Some(format!("`{name}` {restart}"));
+        if let Some(env) = env
+            && checkout.flags.iter().any(|(name, was)| env.get(name) != *was)
+        {
+            return Ok(true);
         }
-        self.scripts.iter_mut().find_map(|it| it.changed(env))
+        match &mut checkout.scripts {
+            Some(scripts) => scripts.changed(env),
+            None => Ok(false),
+        }
+    }
+
+    /// The variables cargo and the build scripts of the checkout at `root` read, as a
+    /// process with `env` has them.
+    pub(crate) fn variables(&self, root: &Path, env: &Env) -> FxHashMap<String, Option<String>> {
+        let scripts = self.checkouts.iter().find(|it| it.root == root);
+        let scripts = scripts.and_then(|it| it.scripts.as_ref());
+        let read = scripts.into_iter().flat_map(|it| it.variables.iter().map(|it| &*it.0));
+        FLAGS.iter().copied().chain(read).map(|it| (it.to_owned(), env.get(it))).collect()
     }
 }
 
@@ -102,7 +143,7 @@ impl Scripts {
             let root: &Path = cargo[package].manifest.parent().as_ref();
             let said = Said::read(out_dir.as_ref());
             variables.extend(said.variables.into_iter().map(|it| {
-                let value = std::env::var(&it).ok();
+                let value = run_with(config, &it);
                 (it, value)
             }));
             if !cargo[package].is_local {
@@ -126,42 +167,39 @@ impl Scripts {
         Some(Scripts { workspace: workspace.clone(), config: config.clone(), files, variables })
     }
 
-    /// Runs the scripts again where cargo would for a process with `env`: why what they say
-    /// is no longer what was loaded, when it is not.
-    fn changed(&mut self, env: &Env) -> Option<String> {
+    /// Runs the scripts again where cargo would for a process with `env`, or with `None`
+    /// for one with the variables they last ran with: whether what they say is no longer
+    /// what was loaded.
+    fn changed(&mut self, env: Option<&Env>) -> anyhow::Result<bool> {
         let files = self.files.iter().any(Watched::changed);
-        let variables = self.variables.iter().any(|(name, was)| env.get(name) != *was);
+        let variables =
+            env.is_some_and(|env| self.variables.iter().any(|(name, was)| env.get(name) != *was));
         if !files && !variables {
-            return None;
+            return Ok(false);
         }
         let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind else {
-            return None;
+            return Ok(false);
         };
         let mut config = self.config.clone();
-        for (name, _) in &self.variables {
-            config.extra_env.insert(name.clone(), env.get(name));
+        for (name, was) in &self.variables {
+            let value = env.map_or_else(|| was.clone(), |env| env.get(name));
+            config.extra_env.insert(name.clone(), value);
         }
-        let said = match self.workspace.run_build_scripts(&config, &|_| {}) {
-            Ok(said) => said,
-            Err(error) => return Some(format!("{error:#}")),
-        };
+        let said = self.workspace.run_build_scripts(&config, &|_| {})?;
         if let Some(error) = said.error() {
-            return Some(format!("a build script failed: {}", error.trim().replace('\n', " ")));
+            anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }
         if said != *loaded {
-            return Some(
-                "what a build script reads has changed and it says something else than when \
-                 the daemon loaded it, start it again"
-                    .to_owned(),
-            );
+            return Ok(true);
         }
         for file in &mut self.files {
             file.stamp = stamp(&file.path, file.package);
         }
         for (name, was) in &mut self.variables {
-            *was = env.get(name);
+            *was = config.extra_env.get(name).cloned().flatten();
         }
-        None
+        self.config = config;
+        Ok(false)
     }
 }
 

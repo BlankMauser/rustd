@@ -808,6 +808,8 @@ pub struct Phases {
 struct Instance {
     def: InstanceDef,
     args: StoredGenericArgs,
+    /// Whether the crate that compiles it has `-C overflow-checks`: see [`compiled_checked`].
+    checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1094,7 +1096,8 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     let signature = FunctionSignature::of(db, func);
     let (abi, variadic) = (signature.abi, signature.is_varargs());
     let args = GenericArgs::new_from_slice(&[]).store();
-    compile(db, env, Some(body), track_caller(db, func), |fx| {
+    let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
+    compile(db, env, Some(body), track_caller(db, func), checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1112,13 +1115,24 @@ fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
     Some(krate.cfg_options(db).check_atom(&flag))
 }
 
-/// Whether the crates cargo builds have `-C overflow-checks`, when they all agree.
-#[salsa::tracked(returns(copy))]
-fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
-    let crates = base_db::all_crates(db);
-    let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
-    let first = settings.next()?;
-    settings.all(|it| it == first).then_some(first)
+/// Whether the code of `def` that a function compiled with `asking` calls is compiled with
+/// `-C overflow-checks`. rustc compiles a function once, in the crate it is written in, when
+/// it has no generic parameters and is not `#[inline]`; anything else it compiles in each
+/// crate that uses it, with the flags of that crate. What the standard library has of the
+/// first kind and exports no symbol for is compiled by its user too.
+fn compiled_checked(
+    db: &dyn HirDatabase,
+    def: InstanceDef,
+    args: GenericArgs<'_>,
+    asking: bool,
+) -> bool {
+    let InstanceDef::Fn(func) = def else { return asking };
+    let own = args.iter().all(|arg| arg.region().is_some())
+        && !AttrFlags::query(db, func.into()).contains(AttrFlags::IS_INLINE);
+    match crate_checks_overflow(db, func.krate(db)) {
+        Some(checked) if own => checked,
+        _ => asking,
+    }
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -1126,7 +1140,8 @@ fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
 fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
     let krate = main.krate(db);
     let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
-    compile(db, env, None, false, |fx| fx.start_shim(main))
+    let checked = crate_checks_overflow(db, krate).unwrap_or(false);
+    compile(db, env, None, false, checked, |fx| fx.start_shim(main))
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
@@ -1141,7 +1156,7 @@ fn compiled_instance<'db>(
     let ty = || instance.args.as_ref().type_at(0);
     let body = match instance.def {
         InstanceDef::DropGlue => {
-            return compile(db, env, None, false, |fx| {
+            return compile(db, env, None, false, instance.checked, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
                 if std::env::var_os("RUSTD_DUMP_CLIF").is_some() {
@@ -1152,16 +1167,18 @@ fn compiled_instance<'db>(
         }
         InstanceDef::CallOnceShim => {
             let args = instance.args.as_ref();
-            return compile(db, env, None, false, |fx| match args.len() {
+            return compile(db, env, None, false, instance.checked, |fx| match args.len() {
                 1 => fx.call_once_shim(ty()),
                 _ => fx.call_once_by_pointer(args),
             });
         }
         InstanceDef::FnPointerShim => {
-            return compile(db, env, None, false, |fx| fx.fn_pointer_shim(ty()));
+            return compile(db, env, None, false, instance.checked, |fx| fx.fn_pointer_shim(ty()));
         }
         InstanceDef::ReifyShim { receiver } => {
-            return compile(db, env, None, false, |fx| fx.reify_shim(ty(), receiver));
+            return compile(db, env, None, false, instance.checked, |fx| {
+                fx.reify_shim(ty(), receiver)
+            });
         }
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)
@@ -1186,7 +1203,7 @@ fn compiled_instance<'db>(
         }
     };
     let args = instance.args.clone();
-    compile(db, env, Some(body), tracked, |fx| {
+    compile(db, env, Some(body), tracked, instance.checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1626,7 +1643,8 @@ impl TheirStatics {
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
-    let mut cg = Recorder::new(db, &**target()?, selected_target()?);
+    let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
+    let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
     let env =
         ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -1835,10 +1853,11 @@ fn compile<'db>(
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
+    checked: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
-    let mut cg = Recorder::new(db, isa, selected_target()?);
+    let mut cg = Recorder::new(db, isa, selected_target()?, checked);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
@@ -2121,10 +2140,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| {
-                    let checked = build_checks_overflow(db);
-                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked))
-                }),
+                .map(|store| std::sync::Arc::new(cached::Entries::new(store, debugged))),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2463,8 +2479,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed += 1;
             return;
         };
-        let checked = build_checks_overflow(self.db);
-        let Some(key) = cached::Entry::key(&name, debug.is_some(), checked) else { return };
+        let Some(key) = cached::Entry::key(&name, debug.is_some()) else { return };
         let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if !check && store.has(&key) {
             return;
@@ -2491,6 +2506,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
             }
         }
+    }
+
+    /// Whether the instance is compiled with the flags of the crate its function is written
+    /// in, as the copy under the symbol of the function is. A crate that uses an `#[inline]`
+    /// function of another compiles a copy with its own.
+    fn as_its_crate_compiles(&self, instance: &Instance) -> bool {
+        let InstanceDef::Fn(func) = instance.def else { return false };
+        crate_checks_overflow(self.db, func.krate(self.db)).is_none_or(|it| it == instance.checked)
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.
@@ -2541,7 +2564,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
-                if stable::StableNames::of_checkout(&name) && self.root_named(&name).is_some() {
+                if stable::StableNames::of_checkout(&name)
+                    && self.as_its_crate_compiles(callee)
+                    && self.root_named(&name).is_some()
+                {
                     CachedTarget::Root(name.as_ref().to_owned())
                 } else {
                     CachedTarget::Named(name.as_ref().to_owned())
@@ -3084,6 +3110,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
+            && self.as_its_crate_compiles(instance)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
                 || !returns_async_block(self.db, func))
@@ -4835,7 +4862,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn body_types(&self, def: InstanceDef, args: GenericArgs<'db>) -> Result<&'db BodyTypes> {
-        let instance = Instance { def, args: args.store() };
+        // The types of a body are the same however it is compiled.
+        let instance = Instance { def, args: args.store(), checked: false };
         body_types(self.cg.db, instance, self.env.store()).as_ref().map_err(Clone::clone)
     }
 
@@ -7297,11 +7325,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if written_with == Some(false) || (written_with.is_none() && !inherits) {
             return Ok(false);
         }
-        match build_checks_overflow(db) {
-            Some(checked) => Ok(checked),
-            // The body is compiled by whichever crate uses it, and that is not known here.
-            None => unsupported!("overflow checks differ between the packages of the build"),
-        }
+        Ok(self.cg.checked)
     }
 
     /// Branches to a panic when `overflow` is set, if the body is one that checks.
@@ -8992,10 +9016,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("overflow_checks", []) => {
-                let Some(checked) = build_checks_overflow(self.cg.db) else {
-                    unsupported!("overflow checks differ between the packages of the build");
-                };
-                let value = self.builder.ins().iconst(types::I8, i64::from(checked));
+                let value = self.builder.ins().iconst(types::I8, i64::from(self.cg.checked));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])

@@ -11,5 +11,5 @@
   "rustd": [
     "--release"
   ],
-  "expect": "refused"
+  "expect": "supported"
 }
