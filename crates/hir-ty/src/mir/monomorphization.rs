@@ -265,7 +265,9 @@ impl<'db> Filler<'db> {
                                 super::AsmOperand::Reg { input: Some(value), .. }
                                 | super::AsmOperand::Const(value) => self.fill_operand(value)?,
                                 super::AsmOperand::Reg { input: None, .. }
-                                | super::AsmOperand::Label => (),
+                                | super::AsmOperand::Label
+                                | super::AsmOperand::Function(_)
+                                | super::AsmOperand::Static(_) => (),
                             }
                         }
                     }

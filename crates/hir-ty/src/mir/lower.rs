@@ -486,7 +486,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands.push(super::AsmOperand::Label);
                             continue;
                         }
-                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                        AsmOperand::Sym(path) => {
+                            let named = self.resolver.resolve_path_in_value_ns_fully(
+                                self.db,
+                                path,
+                                HygieneId::ROOT,
+                            );
+                            operands.push(match named {
+                                Some(ValueNs::StaticId(id)) => super::AsmOperand::Static(id),
+                                Some(ValueNs::FunctionId(id))
+                                    if generics(self.db, id.into()).len(true) == 0 =>
+                                {
+                                    super::AsmOperand::Function(id)
+                                }
+                                _ => not_supported!(
+                                    "a `sym` that is not a static or a function without parameters"
+                                ),
+                            });
+                            continue;
+                        }
                     };
                     let input = match input {
                         Some(input) => {

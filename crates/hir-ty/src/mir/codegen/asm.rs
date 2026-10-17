@@ -9,8 +9,12 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{
+    Architecture, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, elf,
+    macho,
+};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
@@ -20,6 +24,9 @@ mod aarch64;
 
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "rustd_asm_block";
+
+/// What the name of a `sym` operand starts with in the text of a block.
+const SYM: &str = "rustd_asm_sym_";
 
 /// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
 /// control register its argument numbers.
@@ -90,6 +97,22 @@ pub(super) enum Operand<'a> {
     /// A `label` block. The function returns which one the block jumped to, counted from 1,
     /// or 0 when the block ran off its end.
     Label,
+    /// A `sym`, which the text names as [`sym`] does.
+    Sym,
+}
+
+/// A place in assembled code that the address of a `sym` operand goes in.
+pub(super) struct SymReloc {
+    pub(super) offset: u32,
+    pub(super) kind: Reloc,
+    /// Which operand of the block.
+    pub(super) operand: usize,
+    pub(super) addend: i64,
+}
+
+/// The name in the text of a block of what the `sym` that is operand `index` names.
+fn sym(index: usize) -> String {
+    format!("{SYM}{index}")
 }
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
@@ -124,7 +147,12 @@ pub(super) fn naked(
             AsmPiece::Lit(lit) => text.push_str(lit),
             AsmPiece::Operand { index, .. } => match operands.get(*index) {
                 Some(Operand::Const(value)) => _ = write!(text, "{value}"),
-                _ => return Err("a `naked_asm!` operand that is not a constant".to_owned()),
+                Some(Operand::Sym) => text.push_str(&sym(*index)),
+                _ => {
+                    return Err(
+                        "a `naked_asm!` operand that is not a constant or a `sym`".to_owned()
+                    );
+                }
             },
         }
     }
@@ -382,6 +410,9 @@ fn wrapper_x86_64(
                 text.push_str(&label(format, index));
                 continue;
             }
+            // FIXME: the function of a block is kept by its text, which does not say what
+            // the name stands for.
+            (Some(Operand::Sym), _) => return Err("an `asm!` block with a `sym`".to_owned()),
             (_, Some(Reg::Gpr(row))) => {
                 let modifier = modifier.or((classes[index] == "reg_byte").then_some('l'));
                 match modifier {
@@ -467,7 +498,13 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
     let code: Arc<[u8]> = match store.and_then(|it| it.get(&key)) {
         Some(code) => code.into(),
         None => {
-            let code: Arc<[u8]> = Assembler::selected().assemble(triple, text, &key)?.into();
+            let object = Assembler::selected().assemble(triple, text, &key)?;
+            let (code, relocs) = code(&object)?;
+            // FIXME: a block that names a symbol, or has data in another section.
+            if !relocs.is_empty() {
+                return Err("inline assembly that names a symbol".to_owned());
+            }
+            let code: Arc<[u8]> = code.into();
             if let Some(store) = store {
                 store.insert(&key, &code);
             }
@@ -478,6 +515,14 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         assembled.insert(key, code.clone());
     }
     Ok(code)
+}
+
+/// The machine code of the `#[naked]` function that `text` defines, and where in it the
+/// addresses of its `sym` operands go. It is assembled every time: the store keeps code
+/// alone.
+pub(super) fn assemble_naked(triple: &str, text: &str) -> Result<(Vec<u8>, Vec<SymReloc>), String> {
+    let key: [u8; 32] = Sha256::digest(text).into();
+    code(&Assembler::selected().assemble(triple, text, &key)?)
 }
 
 /// What turns the text of a block into an object file.
@@ -499,11 +544,12 @@ impl Assembler {
         }
     }
 
+    /// The object file that `text` is assembled to.
     fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
         match self {
             Assembler::Rustc => run_assembler(triple, text, key),
             #[cfg(feature = "llvm")]
-            Assembler::Llvm => code(&super::llvm::assemble(text)?),
+            Assembler::Llvm => super::llvm::assemble(text),
         }
     }
 }
@@ -544,7 +590,7 @@ fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, St
         .output();
     let code = match output {
         Ok(output) if output.status.success() => {
-            std::fs::read(&object).map_err(|e| failed("no object", &e)).and_then(|it| code(&it))
+            std::fs::read(&object).map_err(|e| failed("no object", &e))
         }
         Ok(output) => Err(failed("rustc", &String::from_utf8_lossy(&output.stderr))),
         Err(e) => Err(failed("rustc did not run", &e)),
@@ -553,8 +599,9 @@ fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, St
     code
 }
 
-/// The bytes of the function in an object that defines it alone.
-fn code(object: &[u8]) -> Result<Vec<u8>, String> {
+/// The bytes of the function in an object that defines it alone, and the relocations in
+/// them against the `sym` operands of its block.
+fn code(object: &[u8]) -> Result<(Vec<u8>, Vec<SymReloc>), String> {
     let failed = |e: &dyn std::fmt::Display| format!("inline assembly: {e}");
     let file = object::File::parse(object).map_err(|e| failed(&e))?;
     let symbol = file
@@ -565,11 +612,57 @@ fn code(object: &[u8]) -> Result<Vec<u8>, String> {
         .section_index()
         .and_then(|it| file.section_by_index(it).ok())
         .ok_or_else(|| failed(&"the function is in no section"))?;
-    // FIXME: a block that names a symbol, or has data in another section.
-    if section.relocations().next().is_some() {
-        return Err("inline assembly that names a symbol".to_owned());
-    }
     let bytes = section.data().map_err(|e| failed(&e))?;
-    let start = (symbol.address() - section.address()) as usize;
-    Ok(bytes[start..].to_vec())
+    let start = symbol.address() - section.address();
+    let mut relocs = Vec::new();
+    for (offset, relocation) in section.relocations() {
+        // FIXME: a block that names a symbol of its own, or has data in another section.
+        let operand = match relocation.target() {
+            RelocationTarget::Symbol(index) => file.symbol_by_index(index).ok(),
+            _ => None,
+        }
+        .and_then(|it| it.name().ok()?.trim_start_matches('_').strip_prefix(SYM)?.parse().ok())
+        .ok_or("inline assembly that names a symbol")?;
+        let kind = SymReloc::kind(file.architecture(), relocation.flags())
+            .ok_or_else(|| format!("a `sym` used as {:?}", relocation.flags()))?;
+        let offset =
+            offset.checked_sub(start).ok_or_else(|| failed(&"code before the function"))?;
+        relocs.push(SymReloc { offset: offset as u32, kind, operand, addend: relocation.addend() });
+    }
+    Ok((bytes[start as usize..].to_vec(), relocs))
+}
+
+impl SymReloc {
+    /// What Cranelift calls the relocation an assembler wrote.
+    fn kind(arch: Architecture, flags: RelocationFlags) -> Option<Reloc> {
+        Some(match (arch, flags) {
+            (Architecture::Aarch64, RelocationFlags::MachO { r_type, .. }) => match r_type {
+                macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
+                macho::ARM64_RELOC_PAGE21 => Reloc::Aarch64AdrPrelPgHi21,
+                macho::ARM64_RELOC_PAGEOFF12 => Reloc::Aarch64AddAbsLo12Nc,
+                macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Reloc::Aarch64AdrGotPage21,
+                macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
+                _ => return None,
+            },
+            (Architecture::Aarch64, RelocationFlags::Elf { r_type }) => match r_type {
+                // A jump out of the function is a call that does not come back.
+                elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => Reloc::Arm64Call,
+                elf::R_AARCH64_ADR_PREL_PG_HI21 => Reloc::Aarch64AdrPrelPgHi21,
+                elf::R_AARCH64_ADD_ABS_LO12_NC => Reloc::Aarch64AddAbsLo12Nc,
+                elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
+                elf::R_AARCH64_LD64_GOT_LO12_NC => Reloc::Aarch64Ld64GotLo12Nc,
+                _ => return None,
+            },
+            (Architecture::X86_64, RelocationFlags::Elf { r_type }) => match r_type {
+                elf::R_X86_64_PLT32 => Reloc::X86CallPLTRel4,
+                elf::R_X86_64_PC32 => Reloc::X86PCRel4,
+                // The relaxable forms are loads from the GOT like any other.
+                elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
+                    Reloc::X86GOTPCRel4
+                }
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
 }

@@ -662,6 +662,44 @@ pub mod arm {
     pub extern "C" fn naked_float(a: f64, b: f64) -> f64 {
         naked_asm!("fadd d0, d0, d1", "ret")
     }
+    extern "C" fn tripled(a: u64) -> u64 {
+        a * 3 + 1
+    }
+    static NAKED_TABLE: [u64; 4] = [11, 22, 33, 44];
+    /// A jump to a function the block names.
+    #[cfg(target_vendor = "apple")]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_jump(a: u64) -> u64 {
+        naked_asm!("add x0, x0, #1", "b {f}", f = sym tripled)
+    }
+    /// A call of one, and a static read by its address.
+    #[cfg(target_vendor = "apple")]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_table(a: u64, at: u64) -> u64 {
+        naked_asm!(
+            "stp x29, x30, [sp, #-32]!",
+            "mov x29, sp",
+            "str x1, [sp, #16]",
+            "bl {f}",
+            "ldr x1, [sp, #16]",
+            "adrp x8, {table}@PAGE",
+            "add x8, x8, {table}@PAGEOFF",
+            "ldr x9, [x8, x1, lsl #3]",
+            "add x0, x0, x9",
+            "adrp x8, {table}@PAGE + 24",
+            "ldr x9, [x8, {table}@PAGEOFF + 24]",
+            "add x0, x0, x9",
+            "ldp x29, x30, [sp], #32",
+            "ret",
+            f = sym tripled,
+            table = sym NAKED_TABLE,
+        )
+    }
+    #[cfg(target_vendor = "apple")]
+    pub fn naked_sym() -> (u64, u64, u64) {
+        (naked_jump(4), naked_table(5, 0), naked_table(6, 2))
+    }
+
     const NAKED_K: u64 = 5 + 2;
     pub fn naked_more() -> (u64, f64, u64) {
         let f: extern "C" fn(u64) -> u64 = naked_const;

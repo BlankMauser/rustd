@@ -472,6 +472,8 @@ fn main() {
     println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
     #[cfg(all(target_arch = "x86_64", unix))]
     println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    println!("stabilized arm naked_sym {:?}", cases::stabilized::arm::naked_sym());
     #[cfg(target_arch = "aarch64")]
     println!("stabilized arm naked_functions {:?}", cases::stabilized::arm::naked_functions());
     #[cfg(target_arch = "aarch64")]

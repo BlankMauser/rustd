@@ -66,7 +66,7 @@ use crate::{
 use hir_def::lang_item::LangItems;
 
 use self::fragment::{
-    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
+    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Naked, Recorder,
     Requests,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
@@ -1776,15 +1776,25 @@ fn compile<'db>(
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
-        Some(text) => Code {
-            signature: ctx.func.signature.clone(),
-            bytes: asm::assemble(&isa.triple().to_string(), &text)
-                .map_err(CodegenError::Unsupported)?
-                .to_vec(),
-            align: 16,
-            relocs: Vec::new(),
-            unwind: None,
-        },
+        Some(Naked { text, syms }) => {
+            let triple = isa.triple().to_string();
+            // What names nothing is in the store, as the function of a block is.
+            let (bytes, relocs) = match syms.is_empty() {
+                true => asm::assemble(&triple, &text).map(|it| (it.to_vec(), Vec::new())),
+                false => asm::assemble_naked(&triple, &text),
+            }
+            .map_err(CodegenError::Unsupported)?;
+            let relocs = relocs
+                .into_iter()
+                .map(|asm::SymReloc { offset, kind, operand, addend }| {
+                    let name = syms.get(&operand).cloned().ok_or_else(|| {
+                        CodegenError::Unsupported("a `sym` the block does not have".to_owned())
+                    })?;
+                    Ok(ModuleReloc { offset, kind, name, addend })
+                })
+                .collect::<Result<_>>()?;
+            Code { signature: ctx.func.signature.clone(), bytes, align: 16, relocs, unwind: None }
+        }
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
     let (requests, layouts) = cg.finish();
@@ -6125,6 +6135,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn inline_asm(&mut self, block: &crate::mir::InlineAsm) -> Result<()> {
         use crate::mir::AsmOperand;
         let mut operands = Vec::with_capacity(block.operands.len());
+        let mut syms = FxHashMap::default();
         for operand in &block.operands {
             operands.push(match operand {
                 AsmOperand::Reg { reg, input, output } => {
@@ -6182,13 +6193,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     })
                 }
                 AsmOperand::Label => asm::Operand::Label,
+                AsmOperand::Function(id) => {
+                    let def = CallableDefId::FunctionId(*id).into();
+                    let ty = Ty::new_fn_def(self.interner, def, GenericArgs::empty());
+                    let func = self.fn_item(ty)?;
+                    syms.insert(operands.len(), ModuleRelocTarget::user(0, func.as_u32()));
+                    asm::Operand::Sym
+                }
+                AsmOperand::Static(id) => {
+                    let data = self.cg.static_data(*id);
+                    syms.insert(operands.len(), ModuleRelocTarget::user(1, data.as_u32()));
+                    asm::Operand::Sym
+                }
             });
         }
         let arch = self.cg.target.arch;
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;
-            self.cg.naked = Some(text);
+            self.cg.naked = Some(Naked { text, syms });
             return Ok(());
         }
         let wrapper = asm::wrapper(&self.cg.target, &block.template, block.options, &operands)

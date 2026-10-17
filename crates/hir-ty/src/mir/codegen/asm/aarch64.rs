@@ -180,6 +180,7 @@ pub(super) fn wrapper(
                 text.push_str(&super::label(format, index));
                 continue;
             }
+            (Some(Operand::Sym), _) => return Err("an `asm!` block with a `sym`".to_owned()),
             (_, Some(Reg::Gpr(number))) => {
                 match modifier {
                     None | Some('x') => _ = write!(text, "x{number}"),

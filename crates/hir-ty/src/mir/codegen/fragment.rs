@@ -80,6 +80,13 @@ pub(super) struct Requests {
     pub(super) datas: Vec<DataRequest>,
 }
 
+/// A `#[naked]` function before it is assembled.
+pub(super) struct Naked {
+    pub(super) text: String,
+    /// What each `sym` operand of its block names, by the index of the operand.
+    pub(super) syms: FxHashMap<usize, ModuleRelocTarget>,
+}
+
 pub(super) struct Code {
     pub(super) signature: Signature,
     pub(super) bytes: Vec<u8>,
@@ -157,7 +164,7 @@ pub(super) struct Recorder<'db> {
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
     /// The assembly of the function, when it is a `#[naked]` one.
-    pub(super) naked: Option<String>,
+    pub(super) naked: Option<Naked>,
 }
 
 impl<'db> Recorder<'db> {
