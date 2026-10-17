@@ -54,6 +54,7 @@ cases![
     static_fn_table,
     panic_with_string,
     stringify_lifetime,
+    concat_module_path,
     static_enum_slice,
     const_none_niche,
     late_import_macro,

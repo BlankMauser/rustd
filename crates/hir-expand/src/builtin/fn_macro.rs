@@ -147,11 +147,15 @@ fn module_path_expand(
     _tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // Just return a dummy result.
+    let placeholder = MODULE_PATH_PLACEHOLDER;
     ExpandResult::ok(quote! {span =>
-         "module::path"
+         #placeholder
     })
 }
+
+/// What `module_path!()` expands to: the expander doesn't know modules, and whoever lowers a
+/// literal with this in it puts the path of the module there.
+pub const MODULE_PATH_PLACEHOLDER: &str = "\u{0}module_path\u{0}";
 
 fn line_expand(
     _db: &dyn SourceDatabase,
