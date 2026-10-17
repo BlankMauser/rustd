@@ -12,7 +12,7 @@ size of the code, and rustd's wall time and peak memory. With `--kernels` the pr
 harness/corpus/kernels: each kernel is then run `--runs` times and its best time reported, next
 to cargo's debug and release builds.
 """
-import os, re, resource, subprocess, sys, time
+import os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -29,16 +29,21 @@ class Compiled:
         crates = [x for c in fx.crates for x in ("--crate", c)]
         start = time.monotonic()
         child = subprocess.Popen([RUSTD, project, *crates, "--out", obj, *symbols],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                  env={**os.environ, "RUSTD_STATS": "1", **env})
         self.stderr = child.stderr.read()
-        _, status, usage = os.wait4(child.pid, 0)
-        # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
-        unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
-        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // unit
+        if hasattr(os, "wait4"):
+            _, status, usage = os.wait4(child.pid, 0)
+            # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
+            unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
+            self.rss_mb = usage.ru_maxrss // unit
+        else:
+            # Windows has no `wait4`: the peak is not measured there.
+            status, self.rss_mb = child.wait(), 0
+        self.wall = time.monotonic() - start
         if status != 0:
             raise SystemExit(f"rustd failed with {name}:\n{self.stderr[-3000:]}")
-        open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w").write(self.stderr)
+        open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w", encoding="utf-8").write(self.stderr)
         # A program rustd cannot link with any producer still says what each producer costs.
         try:
             fx.link([obj])
@@ -71,7 +76,7 @@ def seconds(text):
 
 def run(binary, args):
     """What a program does. A usage line names the program by its file, which differs between builds."""
-    done = subprocess.run([binary, *args], capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL)
+    done = subprocess.run([binary, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800, stdin=subprocess.DEVNULL)
     return done.returncode, done.stdout.replace(os.path.basename(binary), "PROGRAM"), done.stderr
 
 
@@ -147,9 +152,10 @@ def main():
             same = run(it.binary, run_args)[:2] == expected[:2]
             lines.append(f"- {it.name}: the program prints {'the same as' if same else 'SOMETHING ELSE than'} cargo's")
     text = "\n".join(lines) + "\n"
+    sys.stdout.reconfigure(encoding="utf-8")
     print(text)
     if opt("--out"):
-        open(opt("--out"), "w").write(text)
+        open(opt("--out"), "w", encoding="utf-8").write(text)
 
 
 if __name__ == "__main__":
