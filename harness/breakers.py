@@ -12,13 +12,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = set()
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
 LEFT = set()
 # Crates reduced and not fixed, where rustd says so: a function of these is left to rustc.
-LEFT_CRATES = ["fragment"]
+LEFT_CRATES = []
 
 
 def main():
