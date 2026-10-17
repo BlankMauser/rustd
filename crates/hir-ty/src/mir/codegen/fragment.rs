@@ -156,6 +156,8 @@ pub(super) struct Recorder<'db> {
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
+    /// The assembly of the function, when it is a `#[naked]` one.
+    pub(super) naked: Option<String>,
 }
 
 impl<'db> Recorder<'db> {
@@ -175,6 +177,7 @@ impl<'db> Recorder<'db> {
             statics: FxHashMap::default(),
             layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             builder_ctx: FunctionBuilderContext::new(),
+            naked: None,
         }
     }
 

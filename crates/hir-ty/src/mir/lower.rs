@@ -454,9 +454,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let Some(template) = &asm.template else {
                     not_supported!("inline assembly whose template is not known");
                 };
-                if asm.kind != hir_def::hir::InlineAsmKind::Asm {
-                    not_supported!("a function that is assembly alone");
-                }
+                let naked = match asm.kind {
+                    hir_def::hir::InlineAsmKind::Asm => false,
+                    hir_def::hir::InlineAsmKind::NakedAsm => true,
+                    hir_def::hir::InlineAsmKind::GlobalAsm => {
+                        not_supported!("`global_asm!` in a body")
+                    }
+                };
+                let mut labels = Vec::new();
                 let mut operands = Vec::with_capacity(asm.operands.len());
                 for (_, operand) in &asm.operands {
                     let (reg, input, output) = match operand {
@@ -476,7 +481,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands.push(super::AsmOperand::Const(value));
                             continue;
                         }
-                        AsmOperand::Label(_) => not_supported!("inline assembly with a label"),
+                        AsmOperand::Label(block) => {
+                            labels.push(*block);
+                            operands.push(super::AsmOperand::Label);
+                            continue;
+                        }
                         AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
                     };
                     let input = match input {
@@ -505,20 +514,56 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     };
                     operands.push(super::AsmOperand::Reg { reg: reg.clone(), input, output });
                 }
+                let taken: Option<Place<'db>> = if labels.is_empty() {
+                    None
+                } else {
+                    let ty = Ty::new_uint(self.interner(), rustc_type_ir::UintTy::U64);
+                    Some(self.temp(ty, current, expr_id.into())?.into())
+                };
                 self.push_statement(
                     current,
                     StatementKind::InlineAsm(Box::new(super::InlineAsm {
                         template: template.clone(),
                         operands: operands.into(),
                         options: asm.options,
+                        taken: taken.map(|it| it.store()),
+                        naked,
                     }))
                     .with_span(expr_id.into()),
                 );
-                if asm.options.contains(hir_def::hir::AsmOptions::NORETURN) {
-                    self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
-                    return Ok(None);
+                let noreturn = naked || asm.options.contains(hir_def::hir::AsmOptions::NORETURN);
+                let Some(taken) = taken else {
+                    if noreturn {
+                        self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
+                        return Ok(None);
+                    }
+                    return Ok(Some(current));
+                };
+                let end = self.new_basic_block();
+                if noreturn {
+                    self.set_terminator(end, TerminatorKind::Unreachable, expr_id.into());
                 }
-                Ok(Some(current))
+                let mut ends = (!noreturn).then_some(end);
+                let mut targets = Vec::with_capacity(labels.len());
+                for (at, label) in labels.into_iter().enumerate() {
+                    let start = self.new_basic_block();
+                    targets.push((at as u128 + 1, start));
+                    let unit = self.temp(Ty::new_unit(self.interner()), start, label.into())?;
+                    let label_end = self.lower_expr_to_place(label, unit.into(), start)?;
+                    ends = self.merge_blocks(ends, label_end, expr_id.into());
+                }
+                self.set_terminator(
+                    current,
+                    TerminatorKind::SwitchInt {
+                        discr: Operand {
+                            kind: OperandKind::Copy(taken.store()),
+                            span: Some(expr_id.into()),
+                        },
+                        targets: SwitchTargets::new(targets.into_iter(), end),
+                    },
+                    expr_id.into(),
+                );
+                Ok(ends)
             }
             Expr::Missing => {
                 if let Some(f) = self.owner.as_function() {

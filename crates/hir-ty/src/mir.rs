@@ -992,6 +992,11 @@ pub struct InlineAsm {
     pub template: Box<[hir_def::hir::AsmPiece]>,
     pub operands: Box<[AsmOperand]>,
     pub options: hir_def::hir::AsmOptions,
+    /// Where the block says how it ended, when it has labels: 0 for running off its end, and
+    /// otherwise the label it jumped to, counted from 1. A `SwitchInt` follows.
+    pub taken: Option<StoredPlace>,
+    /// The block is the whole of a `#[naked]` function: its code and nothing else.
+    pub naked: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1004,6 +1009,8 @@ pub enum AsmOperand {
         output: Option<StoredPlace>,
     },
     Const(Operand),
+    /// A `label` block, which the template jumps to.
+    Label,
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1200,6 +1207,9 @@ impl MirBody<'_> {
                                 gains(held, index(output.local));
                                 held[index(output.local)] = true;
                             }
+                        }
+                        if let Some(taken) = &asm.taken {
+                            held[index(taken.local)] = true;
                         }
                     }
                     StatementKind::FakeRead(_)
@@ -1520,8 +1530,10 @@ impl MirBody<'_> {
                                 output.iter().for_each(|it| write(it, f));
                             }
                             AsmOperand::Const(it) => operand(it, f),
+                            AsmOperand::Label => (),
                         }
                     }
+                    asm.taken.iter().for_each(|it| write(it, f));
                 }
                 StatementKind::FakeRead(_) | StatementKind::Deinit(_) | StatementKind::Nop => (),
             }
@@ -1630,7 +1642,11 @@ impl MirBody<'_> {
                                     }
                                 }
                                 AsmOperand::Const(value) => for_operand(value, &mut f),
+                                AsmOperand::Label => (),
                             }
+                        }
+                        if let Some(taken) = &mut asm.taken {
+                            f(taken);
                         }
                     }
                     StatementKind::StorageLive(_)

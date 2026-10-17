@@ -49,6 +49,18 @@ pub(super) fn vcvtps2ph(register: &str) -> String {
     text
 }
 
+/// Calls the variadic function whose address is the last argument with the arguments before
+/// it, and says that up to eight vector registers hold arguments. `ints` of those are in
+/// integer registers and `stack` of them on the stack, which says where the address is.
+pub(super) fn counted_variadic(ints: usize, stack: usize) -> String {
+    const ARGUMENTS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    let callee = match ARGUMENTS.get(ints) {
+        Some(register) => format!("mov r11, {register}"),
+        None => format!("mov r11, qword ptr [rsp + {}]", 8 + stack * 8),
+    };
+    format!(".globl {SYMBOL}\n{SYMBOL}:\n{callee}\nmov eax, 8\njmp r11\n")
+}
+
 /// One operand of a block, as the function around it sees it.
 pub(super) enum Operand<'a> {
     Reg {
@@ -59,6 +71,50 @@ pub(super) enum Operand<'a> {
         output: bool,
     },
     Const(i128),
+    /// A `label` block. The function returns which one the block jumped to, counted from 1,
+    /// or 0 when the block ran off its end.
+    Label,
+}
+
+/// The name in a [`Wrapper`] of the label that is operand `index`.
+fn label(index: usize) -> String {
+    format!(".Lrustd_label_{index}")
+}
+
+/// The labels among the operands, by index.
+fn labels<'a>(operands: &'a [Operand<'_>]) -> impl Iterator<Item = usize> + 'a {
+    operands.iter().enumerate().filter(|it| matches!(it.1, Operand::Label)).map(|it| it.0)
+}
+
+/// The text of a `#[naked]` function, which is its template and nothing else.
+pub(super) fn naked(
+    arch: Arch,
+    template: &[AsmPiece],
+    options: AsmOptions,
+    operands: &[Operand<'_>],
+) -> Result<String, String> {
+    let att = options.contains(AsmOptions::ATT_SYNTAX) && arch == Arch::X86_64;
+    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\n");
+    if att {
+        text.push_str(".att_syntax\n");
+    }
+    for piece in template {
+        match piece {
+            AsmPiece::Lit(lit) => text.push_str(lit),
+            AsmPiece::Operand { index, .. } => match operands.get(*index) {
+                Some(Operand::Const(value)) => _ = write!(text, "{value}"),
+                _ => return Err("a `naked_asm!` operand that is not a constant".to_owned()),
+            },
+        }
+    }
+    text.push('\n');
+    if att {
+        text.push_str(".intel_syntax noprefix\n");
+    }
+    match arch {
+        Arch::X86_64 | Arch::Aarch64 => Ok(text),
+        Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
+    }
 }
 
 pub(super) struct Wrapper {
@@ -299,6 +355,10 @@ fn wrapper_x86_64(
                 _ = write!(text, "{value}");
                 continue;
             }
+            (Some(Operand::Label), _) => {
+                text.push_str(&label(index));
+                continue;
+            }
             (_, Some(Reg::Gpr(row))) => {
                 let modifier = modifier.or((classes[index] == "reg_byte").then_some('l'));
                 match modifier {
@@ -331,15 +391,30 @@ fn wrapper_x86_64(
     if att {
         text.push_str(".intel_syntax noprefix\n");
     }
-    if options.contains(AsmOptions::NORETURN) {
-        text.push_str("ud2\n");
-    } else {
+    let returns = !options.contains(AsmOptions::NORETURN);
+    if returns {
         for (reg, size, offset, _, output) in values() {
             if output {
                 let (instruction, reg, memory) = transfer(reg, size, offset)?;
                 _ = writeln!(text, "{instruction} {memory}, {reg}");
             }
         }
+        if labels(operands).next().is_some() {
+            text.push_str("xor eax, eax\n");
+        }
+    } else {
+        text.push_str("ud2\n");
+    }
+    let mut jumped = false;
+    for (at, index) in labels(operands).enumerate() {
+        if returns || jumped {
+            text.push_str("jmp .Lrustd_done\n");
+        }
+        _ = writeln!(text, "{}:\nmov eax, {}", label(index), at + 1);
+        jumped = true;
+    }
+    if returns || jumped {
+        text.push_str(".Lrustd_done:\n");
         for (at, &row) in kept.iter().enumerate() {
             _ = writeln!(text, "mov {}, qword ptr [rbx + {}]", GPR[row][0], kept_at + at * 8);
         }

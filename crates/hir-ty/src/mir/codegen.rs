@@ -1589,7 +1589,19 @@ fn compile<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?);
     let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-    let code = Backend::emit(&mut cg, &mut ctx)?;
+    let code = match cg.naked.take() {
+        // The function is its assembly: what was built of it is only its signature.
+        Some(text) => Code {
+            signature: ctx.func.signature.clone(),
+            bytes: asm::assemble(&isa.triple().to_string(), &text)
+                .map_err(CodegenError::Unsupported)?
+                .to_vec(),
+            align: 16,
+            relocs: Vec::new(),
+            unwind: None,
+        },
+        None => Backend::emit(&mut cg, &mut ctx)?,
+    };
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(CompiledFunction { requests, code, layouts })
@@ -5818,6 +5830,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                 }
                 AsmOperand::Const(value) => {
+                    let value = self.assigned_constant(value).unwrap_or(value);
                     let ty = self.operand_ty(value)?;
                     let bits = match &value.kind {
                         OperandKind::Allocation { allocation }
@@ -5825,6 +5838,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         {
                             let mut bytes = [0; 16];
                             let memory = &allocation.as_ref().memory;
+                            bytes[..memory.len()].copy_from_slice(memory);
+                            Some(u128::from_le_bytes(bytes))
+                        }
+                        OperandKind::Constant { konst, .. }
+                            if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
+                                && let ConstKind::Unevaluated(named) = konst.as_ref().kind() =>
+                        {
+                            let mut bytes = [0; 16];
+                            let memory = &self.eval_const(named)?.memory;
                             bytes[..memory.len()].copy_from_slice(memory);
                             Some(u128::from_le_bytes(bytes))
                         }
@@ -5839,9 +5861,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         _ => bits as i128,
                     })
                 }
+                AsmOperand::Label => asm::Operand::Label,
             });
         }
-        let wrapper = asm::wrapper(self.cg.target.arch, &block.template, block.options, &operands)
+        let arch = self.cg.target.arch;
+        if block.naked {
+            let text = asm::naked(arch, &block.template, block.options, &operands)
+                .map_err(CodegenError::Unsupported)?;
+            self.cg.naked = Some(text);
+            return Ok(());
+        }
+        let wrapper = asm::wrapper(arch, &block.template, block.options, &operands)
             .map_err(CodegenError::Unsupported)?;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -5859,9 +5889,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(ptr()));
+        if block.taken.is_some() {
+            sig.returns.push(AbiParam::new(types::I64));
+        }
         let callee = self.cg.assembly(wrapper.text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-        self.builder.ins().call(callee, &[slot]);
+        let call = self.builder.ins().call(callee, &[slot]);
+        if let Some(taken) = &block.taken {
+            let taken = self.place(taken)?.0;
+            let which = self.builder.inst_results(call)[0];
+            self.builder.ins().store(MEM, which, taken, 0);
+        }
         for (operand, offset) in block.operands.iter().zip(&wrapper.offsets) {
             if let (AsmOperand::Reg { output: Some(output), .. }, Some(offset)) = (operand, offset)
             {
@@ -5873,6 +5911,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         Ok(())
+    }
+
+    /// The constant a temporary holds, when `operand` reads one that was given a constant
+    /// and nothing else: a named constant is lowered to that.
+    fn assigned_constant(&self, operand: &Operand) -> Option<&'db Operand> {
+        let OperandKind::Copy(place) = &operand.kind else { return None };
+        let mut assigned = self.body?.basic_blocks.iter().flat_map(|(_, block)| {
+            block.statements.iter().filter_map(|it| match &it.kind {
+                StatementKind::Assign(to, rvalue) if to.local == place.local => Some((to, rvalue)),
+                _ => None,
+            })
+        });
+        match (assigned.next(), assigned.next()) {
+            (Some((to, Rvalue::Use(constant))), None)
+                if to == place && matches!(constant.kind, OperandKind::Constant { .. }) =>
+            {
+                Some(constant)
+            }
+            _ => None,
+        }
     }
 
     fn load_scalar(&mut self, operand: &Operand) -> Result<(Value, AbiScalar)> {
@@ -7915,33 +7973,56 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     values.push(buffer);
                 }
                 let variadic = variadic && !Target::current().is_wasm();
-                let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 if variadic {
                     // Each call of a variadic function has a signature of its own, and the
-                    // function is declared with only one of them.
-                    if let isa::CallConv::AppleAarch64 = self.cg.target.call_conv {
-                        let InstanceDef::Fn(func) = def else { unreachable!() };
-                        let named = FunctionSignature::of(self.cg.db, func).params.len();
-                        let named = arg_modes[..named]
-                            .iter()
-                            .map(|&mode| {
-                                let mut params = Vec::new();
-                                self.push_abi_params(mode, &mut params);
-                                params.len()
-                            })
-                            .sum::<usize>()
-                            + usize::from(matches!(ret_mode, PassMode::Indirect));
-                        self.apple_variadic(&mut sig, &mut values, named);
-                    } else if sig.params.iter().any(|param| param.value_type.is_float()) {
-                        // FIXME: the callee is told how many vector registers hold arguments,
-                        // which Cranelift has no way to say.
-                        unsupported!("float passed to a variadic function");
+                    // function is declared with the one of its named parameters.
+                    let InstanceDef::Fn(func) = def else { unreachable!() };
+                    let named = FunctionSignature::of(self.cg.db, func).params.len();
+                    let named = arg_modes[..named]
+                        .iter()
+                        .map(|&mode| {
+                            let mut params = Vec::new();
+                            self.push_abi_params(mode, &mut params);
+                            params.len()
+                        })
+                        .sum::<usize>()
+                        + usize::from(matches!(ret_mode, PassMode::Indirect));
+                    let mut declared = sig.clone();
+                    declared.params.truncate(named);
+                    let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
+                    let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                    let floats = sig.params.iter().any(|param| param.value_type.is_float());
+                    let mut pointer = self.builder.ins().func_addr(ptr(), callee);
+                    match (self.cg.target.call_conv, self.cg.target.arch) {
+                        (isa::CallConv::AppleAarch64, _) => {
+                            self.apple_variadic(&mut sig, &mut values, named)
+                        }
+                        (isa::CallConv::SystemV, Arch::X86_64) if floats => {
+                            pointer = self.counted_variadic(&mut sig, &mut values, pointer)?;
+                        }
+                        (isa::CallConv::WindowsFastcall, _) if floats => {
+                            // The callee reads its variable arguments from where it saved the
+                            // integer registers, so a float goes in one of those.
+                            for (param, value) in
+                                sig.params[named..].iter_mut().zip(&mut values[named..])
+                            {
+                                if param.value_type == types::F64 {
+                                    let flags = MemFlagsData::new();
+                                    *value = self.builder.ins().bitcast(types::I64, flags, *value);
+                                    *param = AbiParam::new(types::I64);
+                                }
+                            }
+                        }
+                        // The variable arguments are passed as named ones are.
+                        (isa::CallConv::SystemV, Arch::Aarch64) => (),
+                        _ if floats => unsupported!("float passed to a variadic function"),
+                        _ => (),
                     }
                     let sig = self.builder.import_signature(sig);
-                    let pointer = self.builder.ins().func_addr(ptr(), callee);
                     self.invoke_indirect(sig, pointer, &values)
                 } else {
+                    let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
+                    let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                     self.invoke(callee, &values)
                 }
             }
@@ -7952,6 +8033,37 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
+    }
+
+    /// Makes a call of the variadic function at `callee` say how many vector registers hold
+    /// arguments, as the System V convention of x86-64 has it say in `al`. Cranelift has no
+    /// way to, so the call goes through a function that says it, which takes the address of
+    /// the callee as one more argument after the others. Returns its address.
+    fn counted_variadic(
+        &mut self,
+        sig: &mut Signature,
+        values: &mut Vec<Value>,
+        callee: Value,
+    ) -> Result<Value> {
+        let (mut ints, mut floats, mut stack) = (0, 0, 0);
+        for param in &sig.params {
+            match param.purpose {
+                ArgumentPurpose::Normal | ArgumentPurpose::StructReturn => (),
+                _ => unsupported!("an argument in memory with a float to a variadic function"),
+            }
+            match param.value_type {
+                ty if ty.is_float() && floats < 8 => floats += 1,
+                ty if ty.is_float() => stack += 1,
+                ty if ty.is_int() && ty.bytes() <= 8 && ints < 6 => ints += 1,
+                ty if ty.is_int() && ty.bytes() <= 8 => stack += 1,
+                _ => unsupported!("a float and a wide argument to a variadic function"),
+            }
+        }
+        sig.params.push(AbiParam::new(ptr()));
+        values.push(callee);
+        let through = self.cg.assembly(asm::counted_variadic(ints, stack), sig);
+        let through = self.cg.declare_func_in_func(through, self.builder.func);
+        Ok(self.builder.ins().func_addr(ptr(), through))
     }
 
     /// Makes a call pass what follows its first `named` parameters the way Apple passes the

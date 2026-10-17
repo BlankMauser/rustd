@@ -175,6 +175,10 @@ pub(super) fn wrapper(
                 _ = write!(text, "{value}");
                 continue;
             }
+            (Some(Operand::Label), _) => {
+                text.push_str(&super::label(index));
+                continue;
+            }
             (_, Some(Reg::Gpr(number))) => {
                 match modifier {
                     None | Some('x') => _ = write!(text, "x{number}"),
@@ -193,14 +197,29 @@ pub(super) fn wrapper(
         _ = write!(text, "{}{}", prefix.0, prefix.1);
     }
     text.push('\n');
-    if options.contains(AsmOptions::NORETURN) {
-        text.push_str("brk #1\n");
-    } else {
+    let returns = !options.contains(AsmOptions::NORETURN);
+    if returns {
         for (reg, size, offset, _, output) in values() {
             if output {
                 _ = writeln!(text, "{}", reg.transfer(false, size, offset)?);
             }
         }
+        if super::labels(operands).next().is_some() {
+            text.push_str("mov x0, #0\n");
+        }
+    } else {
+        text.push_str("brk #1\n");
+    }
+    let mut jumped = false;
+    for (at, index) in super::labels(operands).enumerate() {
+        if returns || jumped {
+            text.push_str("b .Lrustd_done\n");
+        }
+        _ = writeln!(text, "{}:\nmov x0, #{}", super::label(index), at + 1);
+        jumped = true;
+    }
+    if returns || jumped {
+        text.push_str(".Lrustd_done:\n");
         for (at, reg) in kept.iter().enumerate() {
             _ = writeln!(text, "{}", reg.transfer(true, 8, at as u32 * 8)?);
         }
