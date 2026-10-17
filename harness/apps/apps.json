@@ -1,0 +1,566 @@
+{
+ "ripgrep": {
+  "repo": "https://github.com/BurntSushi/ripgrep",
+  "rev": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+  "package": "ripgrep",
+  "bin": "rg",
+  "scrub": [
+   "\"nanos\":\\d+",
+   "[0-9.]+s\\b",
+   "[0-9.]+ seconds"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-n",
+    "fn main",
+    "crates/core"
+   ],
+   [
+    "-c",
+    "-i",
+    "regex",
+    "crates",
+    "--sort",
+    "path"
+   ],
+   [
+    "--json",
+    "Searcher",
+    "crates/searcher/src/lib.rs"
+   ],
+   [
+    "-o",
+    "-w",
+    "[A-Z][a-z]+Builder",
+    "crates/printer/src",
+    "--sort",
+    "path"
+   ],
+   [
+    "--files",
+    "crates/globset",
+    "--sort",
+    "path"
+   ],
+   [
+    "-U",
+    "-C",
+    "1",
+    "impl Default[^{]*\\{\\n",
+    "crates/matcher/src/lib.rs"
+   ],
+   [
+    "--stats",
+    "-q",
+    "unsafe",
+    "crates",
+    "-j",
+    "1"
+   ],
+   [
+    "-t",
+    "toml",
+    "-F",
+    "version",
+    "--sort",
+    "path"
+   ],
+   [
+    "-c",
+    "\\w+ing\\b",
+    "../ripgrep-vendor",
+    "--sort",
+    "path"
+   ],
+   [
+    "-i",
+    "-o",
+    "fn \\w+<",
+    "../ripgrep-vendor",
+    "--sort",
+    "path"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "-e",
+    "(unclosed",
+    "crates"
+   ]
+  ],
+  "bench": [
+   "-c",
+   "\\w+ing\\b",
+   "../ripgrep-vendor",
+   "-j",
+   "1"
+  ]
+ },
+ "fd": {
+  "repo": "https://github.com/sharkdp/fd",
+  "rev": "b6ca4e02167833c2c492de6ae9d06b56488d4696",
+  "package": "fd-find",
+  "bin": "fd",
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-e",
+    "rs",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-t",
+    "d",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-g",
+    "*.toml",
+    "-j",
+    "1"
+   ],
+   [
+    "walk",
+    "src",
+    "-x",
+    "echo",
+    "found",
+    "-j",
+    "1"
+   ],
+   [
+    "-S",
+    "+10k",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-d",
+    "1",
+    "-a",
+    "-0",
+    "main",
+    "src"
+   ],
+   [
+    "-e",
+    "rs",
+    "-j",
+    "1",
+    "--base-directory",
+    "../fd-vendor",
+    "-c",
+    "never"
+   ],
+   [
+    "-t",
+    "f",
+    "-g",
+    "*.md",
+    "../fd-vendor",
+    "-j",
+    "1",
+    "-X",
+    "wc",
+    "-c"
+   ],
+   [
+    "--bad-flag"
+   ],
+   [
+    "[invalid",
+    "src"
+   ]
+  ],
+  "bench": [
+   "-e",
+   "rs",
+   "-j",
+   "1",
+   "--base-directory",
+   "../fd-vendor"
+  ]
+ },
+ "bat": {
+  "repo": "https://github.com/sharkdp/bat",
+  "rev": "62b439dae330a8c4d053ff7d8526a6e3697000b9",
+  "package": "bat",
+  "cargo_args": [
+   "--bin",
+   "bat"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-p",
+    "--color=never",
+    "Cargo.toml"
+   ],
+   [
+    "--color=always",
+    "-n",
+    "src/lib.rs"
+   ],
+   [
+    "-A",
+    "--color=never",
+    "-r",
+    "1:20",
+    "src/main.rs"
+   ],
+   [
+    "--list-languages"
+   ],
+   [
+    "--list-themes",
+    "--color=never"
+   ],
+   [
+    "--style=full",
+    "--color=always",
+    "--decorations=always",
+    "--terminal-width=80",
+    "-l",
+    "rust",
+    "src/pager.rs"
+   ],
+   [
+    "--color=always",
+    "--theme=TwoDark",
+    "--style=numbers,grid",
+    "--terminal-width=100",
+    "src/printer.rs",
+    "README.md",
+    "Cargo.lock"
+   ],
+   [
+    "--diff",
+    "--color=never",
+    "src/config.rs"
+   ],
+   [
+    "no-such-file"
+   ]
+  ],
+  "bench": [
+   "--color=always",
+   "--style=full",
+   "--terminal-width=100",
+   "src/printer.rs",
+   "src/controller.rs",
+   "Cargo.lock"
+  ]
+ },
+ "eza": {
+  "repo": "https://github.com/eza-community/eza",
+  "rev": "471bfbc7b03cbac8c738e8d9050edb06ee79132a",
+  "package": "eza",
+  "scrub": [],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-1",
+    "src"
+   ],
+   [
+    "--tree",
+    "--level=3",
+    "src",
+    "--color=always"
+   ],
+   [
+    "-1",
+    "-R",
+    "-a",
+    "src",
+    "--color=never"
+   ],
+   [
+    "-l",
+    "--no-user",
+    "--no-time",
+    "--no-permissions",
+    "--no-filesize",
+    "--git",
+    "src"
+   ],
+   [
+    "--oneline",
+    "--sort=size",
+    "--reverse",
+    "src/output"
+   ],
+   [
+    "-G",
+    "--width=80",
+    "--icons=always",
+    "src/fs"
+   ],
+   [
+    "--tree",
+    "-I",
+    "*.rs",
+    "../eza-vendor",
+    "--color=never",
+    "--level=2"
+   ],
+   [
+    "no-such-file"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "--tree",
+   "--color=always",
+   "../eza-vendor"
+  ]
+ },
+ "tokei": {
+  "repo": "https://github.com/XAMPPRocky/tokei",
+  "rev": "c14f744716272fadeb27a74443cdffa0af35f82f",
+  "package": "tokei",
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "src",
+    "--sort",
+    "code"
+   ],
+   [
+    "--files",
+    "src",
+    "--sort",
+    "lines"
+   ],
+   [
+    "-o",
+    "json",
+    "src"
+   ],
+   [
+    "-t",
+    "Rust,TOML",
+    "."
+   ],
+   [
+    "../tokei-vendor",
+    "--sort",
+    "code"
+   ],
+   [
+    "-e",
+    "*.rs",
+    "../tokei-vendor",
+    "--sort",
+    "files",
+    "-C"
+   ],
+   [
+    "--languages"
+   ],
+   [
+    "no-such-dir"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "cargo_args": [
+   "--features",
+   "json"
+  ],
+  "bench": [
+   "../tokei-vendor"
+  ]
+ },
+ "delta": {
+  "repo": "https://github.com/dandavison/delta",
+  "rev": "3c2269c6b845913965575f11b0196d70ef5352f3",
+  "package": "git-delta",
+  "bin": "delta",
+  "setup": [
+   "diff -u src/delta.rs src/paint.rs > .apps-a.diff; diff -ru src/handlers src/features > .apps-b.diff; true"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--no-gitconfig",
+    "--width=120",
+    "src/delta.rs",
+    "src/paint.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--side-by-side",
+    "--width=160",
+    "--line-numbers",
+    "src/handlers/hunk.rs",
+    "src/handlers/hunk_header.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--color-only",
+    "src/cli.rs",
+    "src/config.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--show-syntax-themes"
+   ],
+   [
+    "--no-gitconfig",
+    "--list-languages"
+   ],
+   [
+    "--no-gitconfig",
+    "--show-config"
+   ],
+   [
+    "--no-gitconfig",
+    "--paging=never",
+    "--diff-so-fancy",
+    "src/align.rs",
+    "src/edits.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "no-such-a",
+    "no-such-b"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "--no-gitconfig",
+   "--side-by-side",
+   "--width=160",
+   "--line-numbers",
+   "src/delta.rs",
+   "src/paint.rs"
+  ]
+ },
+ "starship": {
+  "repo": "https://github.com/starship/starship",
+  "rev": "2d8741e4830273ff2bec1fe45e1e7fe6aa979cf4",
+  "package": "starship",
+  "env": {
+   "STARSHIP_CONFIG": "/dev/null",
+   "STARSHIP_CACHE": "/tmp/starship-apps-cache",
+   "STARSHIP_SHELL": "bash"
+  },
+  "scrub": [
+   "took [0-9a-z.]+",
+   "\\d+(ms|s)\\b"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "print-config",
+    "--default"
+   ],
+   [
+    "preset",
+    "--list"
+   ],
+   [
+    "preset",
+    "nerd-font-symbols"
+   ],
+   [
+    "init",
+    "bash",
+    "--print-full-init"
+   ],
+   [
+    "init",
+    "zsh",
+    "--print-full-init"
+   ],
+   [
+    "module",
+    "directory"
+   ],
+   [
+    "module",
+    "rust"
+   ],
+   [
+    "module",
+    "package"
+   ],
+   [
+    "prompt",
+    "--status=1",
+    "--cmd-duration=5000",
+    "--jobs=2",
+    "--terminal-width=100"
+   ],
+   [
+    "explain"
+   ],
+   [
+    "completions",
+    "fish"
+   ],
+   [
+    "module",
+    "no-such-module"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "prompt",
+   "--terminal-width=100"
+  ]
+ }
+}
