@@ -77,4 +77,5 @@ cases![
     extern_static,
     self_in_async_method,
     macro_expr_semicolon,
+    let_then_panic,
 ];

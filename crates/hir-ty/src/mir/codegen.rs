@@ -5033,11 +5033,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
         }
-        for (temp, to) in forwarded {
-            self.locals.insert(temp, self.locals[to]);
-        }
-        for (&temp, &of) in &renamed {
-            self.locals.insert(temp, self.locals[of]);
+        for &temp in forwarded.keys().chain(renamed.keys()) {
+            let of = aliased_local(temp, &forwarded, &renamed);
+            let Some(&slot) = self.locals.get(of) else {
+                unsupported!("a temporary that stands for a local kept nowhere");
+            };
+            self.locals.insert(temp, slot);
         }
         let mut frame_flags = Vec::new();
         let mut kept_flags = Vec::new();
@@ -10971,6 +10972,7 @@ fn renamed_temps(
             && once(of)
             && !bound.contains(&temp)
             && !forwarded.contains_key(&temp)
+            && !forwarded.contains_key(&of)
             && !body.promoted_locals.iter().any(|it| it.0 == of)
             && is_dropped(temp)
         {
@@ -10985,6 +10987,19 @@ fn renamed_temps(
         local
     };
     renamed.iter().map(|(&temp, &of)| (temp, named(of))).collect()
+}
+
+/// The local whose slot a forwarded or renamed temporary shares: the one it stands for may be
+/// a temporary that stands for another.
+fn aliased_local(
+    temp: LocalId,
+    forwarded: &FxHashMap<LocalId, LocalId>,
+    renamed: &FxHashMap<LocalId, LocalId>,
+) -> LocalId {
+    let next = |local: &LocalId| forwarded.get(local).or_else(|| renamed.get(local)).copied();
+    // No chain is longer than the temporaries there are, unless it is a cycle.
+    let longest = forwarded.len() + renamed.len();
+    std::iter::successors(Some(temp), next).take(longest + 1).last().unwrap_or(temp)
 }
 
 /// The local a call returns into, for each block that only that call leads to.
