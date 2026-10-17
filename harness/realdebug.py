@@ -96,6 +96,12 @@ def driven(argv, cwd, env, serves, times=1):
         return said.read()
 
 
+def told(binary, ws, command):
+    """What gdb says to one command about a program it does not run."""
+    return subprocess.run(["gdb", "-q", "-nx", "-batch", "-ex", command, binary],
+                          capture_output=True, text=True, errors="replace", cwd=ws, timeout=90).stdout
+
+
 def stopped(binary, ws, place, run, serves):
     """What gdb says where it stops at `place`: the function, and each argument and local by name."""
     commands = ["set pagination off", "set confirm off", "set startup-with-shell off", "set print elements 40",
@@ -141,7 +147,9 @@ def debugger(tally, what, reference, binary, ws, spec):
             tally.say(said, "not looked at", "gdb does not stop there in the cargo build")
             continue
         if not ours:
-            tally.say(said, "NOT STOPPED")
+            # Optimized code may have no instruction for a line, and then there is nowhere to stop.
+            empty = LLVM and "contains no code" in told(binary, ws, f"info line {place}")
+            tally.say(said, "no code" if empty else "NOT STOPPED", "the optimizer left the line none" if empty else "")
             continue
         producer = unit_of(binary, ours["at"]) if ours["at"] is not None else "nothing"
         if not producer.startswith("rustd"):

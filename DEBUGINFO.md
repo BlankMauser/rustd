@@ -1,9 +1,11 @@
 # Debug info
 
 Branch `rustd-debuginfo`. Everything here is Linux x86-64 ELF. Mach-O and Windows are design
-notes at the end. The first round (line tables, backtraces, the splice path, Cranelift
-variables) was merged into `rustd-collate`; the second round is on top of `rustd-collate` at
-91c7292532 and is marked "round two" where it changed something.
+notes at the end. Rounds one and two (line tables, backtraces, the splice path, variables and
+types under both backends, profile settings) are in `rustd-collate`. Round three is on top of
+`rustd-collate` at f191c6e42a and is described in "Round three" below; the sections marked
+"round two" are kept as written then, and where they say something else about scopes,
+closures, split debug info, the LLVM counts or cost, "Round three" is right.
 
 ## What there is now
 
@@ -45,6 +47,212 @@ The end of a scope, where its drops run, is given the place of the closing brace
 does. Before this the drops had the line where the scope's expression begins.
 
 Debug info follows the profile; see "Profile settings" below.
+
+## Round three: scopes, richer types, split DWARF, real projects
+
+### At this head
+
+`debuginfo.py` and the whole regression gate pass under both backends on this head (which
+has `rustd-collate` f191c6e42a merged in). What `debuginfo.py` printed:
+
+| part | Cranelift | LLVM -O2 |
+|---|---|---|
+| corpus backtraces | 85 panics, 448 frames, same | 447 frames; 1 function seen to leave by a jump (see "Tail calls") |
+| callers | 6 panics, 19 frames, same | 18 frames, 1 function seen to leave by a jump |
+| `llvm-dwarfdump --verify` | no errors in any binary | no errors in any binary |
+| `.eh_frame` and ranges, corpus | 11,714 functions, 0 disagree | 0 disagree |
+| a line for every instruction | 0 bytes without, 11,714 functions | 0 bytes without |
+| locals (gdb) | 9 of 9 | 8 of 9, 1 optimized out that rustc keeps |
+| types (`rust-gdb`, 21 values) | 21 of 21 | 21 of 21 |
+| scopes (30 names by block) | 30 of 30 | 23 of 30; 7 optimized out, 2 of them kept by rustc |
+| rich (`rust-gdb` and `rust-lldb`, 15 values) | 15 of 15 in both | 14 of 15 in both; the one is lost by rustc too |
+| profile, 11 settings | all followed | all followed |
+| last line | `all right (cranelift)` | `all right, 2 open (llvm)` |
+
+The gate: difftest MATCH with 0 of 893 layouts differing, programs 22 of 22, stress 99 of 99,
+breakers 58 of 58 with 7 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 10, includes
+9 of 9, worktrees 62 of 62, keys 46 of 46 with 0 open, buildmodel 194 of 194 as expected, the
+four store harnesses pass; `cargo fmt` clean, `cargo test` 955 passed, 0 failed, 1 ignored.
+
+Refused, with a reason, when the build is planned: a `debug`, `strip` or `split-debuginfo`
+value rustd does not know. A splice into an executable with compressed debug sections is
+refused and rustd links in full. Nothing else in debug info is refused; `packed` and
+`unpacked` were until this round.
+
+Merging `rustd-collate` 8f21942505 changed where an out-of-bounds index is reported, and the
+line row of the check no longer followed it, so a backtrace had the line of the statement
+where the message had the line of the index expression. The row is now set with the place the
+message uses.
+
+### Lexical scopes
+
+A function's variables are now inside `DW_TAG_lexical_block` entries that follow the blocks
+of the source, so a local shows in the debugger only where it is in scope, and a name bound
+more than once (shadowing, a `match` arm that binds the name of an outer local) has one
+entry per binding. The ranges come from the MIR: every statement knows the expression scope
+it was lowered from, and the line rows of a function give the code of each scope. A binding
+of a `match` arm belongs to the scope of the arm.
+
+`debuginfo.py --only scopes` stops at five lines of a function that binds `value` five
+times and asks the debugger for every name at every stop, 30 questions, and compares with
+the cargo build, including the names that must not be known at a line. Cranelift: 30 of 30.
+LLVM -O2: 23 of 30 with 7 `<optimized out>`, none wrong; see "LLVM and optimized-out values".
+
+### Closures, coroutines, `dyn`, enums
+
+- A closure is a struct whose fields are its captures by name, and the closure's body sees
+  the captures as variables.
+- An `async fn` or `async` block is an enum with the variants rustc gives it: `Unresumed`,
+  `Returned`, `Panicked` and one `SuspendN` per await point, each with the locals that live
+  across that point; the future being awaited is `__awaitee`. Locals of an async body that
+  live in the future are described through the pointer to it.
+- `&dyn Trait` and `Box<dyn Trait>` are a pair of `pointer` and `vtable`. A pointer to a
+  struct that ends in an unsized field (`&Path`) is a fat pointer with its length.
+- Enums have a `DW_TAG_variant_part` with the discriminant and a member per variant, in
+  the shape rustc writes, for tagged enums and for niche ones (`Option<&T>`).
+- Functions and types are nested in `DW_TAG_namespace` entries for their modules, so a
+  debugger prints `krate::module::Type` and can find `krate::module::function`.
+- Closures and async blocks are named as rustc names them for a debugger
+  (`main::{closure#0}`, `{async_block#0}`, environments as `{closure_env#0}`).
+
+`debuginfo.py --only rich` prints 15 such values in `rust-gdb` and in `rust-lldb` and
+compares them with what each prints for the cargo build. Cranelift: 15 of 15 in both.
+LLVM -O2: 14 of 15 in both; the one missing, `object` (a `&dyn` argument), is optimized out
+in `rustc -O -g` as well.
+
+### LLVM and optimized-out values
+
+Before the default passes rustd now runs `sroa,instsimplify,sroa` on each function, so that
+a stack slot the optimizer takes apart is described piece by piece (`DW_OP_piece`) instead
+of being dropped; constants read from read-only data are given to LLVM as constants. With
+that the `types` part is 21 of 21 under LLVM (was 20) and `locals` is 8 of 9 (was 6).
+
+The harness now holds every value LLVM reports as optimized out against a `rustc -O -g`
+build of the same source at the same line (`cargo build --release` with `debug = true` and
+the same opt level). A value rustc does not show either is accepted. A value rustc shows
+makes the row `behind rustc`, which is counted as open in the last line of the script
+(`all right, 2 open (llvm)`) and does not fail it; a wrong value still fails.
+
+What is open by that measure, under LLVM -O2:
+
+| part | value | why rustd loses it |
+|---|---|---|
+| locals | `width` at `main.rs:11` | an argument that is dead after its one use. rustc inlines `area` into `main`, where `width` is the constant 10. rustd compiles `area` alone and its register is reused. |
+| scopes | `step` at `main.rs:16` | the loop variable is the second half of what `Range::next` returns and is never read. rustc inlines `next` and knows the value; rustd calls it, and LLVM drops the unused half of the result. |
+| scopes | `value` at `main.rs:16` | `[step, total]`: the `total` half is described (`DW_OP_piece`), the `step` half is the value above, so gdb shows the array as partly optimized out. |
+
+All three have one cause: rustd compiles every function in a module of its own and does not
+inline, so a value that rustc's inlining turns into a constant or a known register is, for
+rustd's LLVM, the dead result of a call. I tried keeping named locals of up to 16 bytes
+alive to the end of the function with `llvm.fake.use`; the values stayed alive but LLVM
+still marked them unknown inside the loop, and one more value was lost, so it is not in the
+tree. The other five optimized-out answers in `scopes` and the one in `rich` are lost by
+`rustc -O -g` too. Under Cranelift nothing is optimized out.
+
+### Split DWARF
+
+`split-debuginfo = "unpacked"` and `"packed"` are now done rather than refused.
+
+- `unpacked`: each unit of rustd's is a skeleton in the object (`DW_AT_GNU_dwo_name`,
+  `DW_AT_GNU_dwo_id`, the ranges and the address table) and a `.dwo` file beside the object,
+  named `<object>.<n>.dwo`, with the `.debug_*.dwo` sections. This is the GNU extension to
+  DWARF 4, which is what rustc writes at this version.
+- `packed`: the same, and after the link a `.dwp` is written beside the executable from the
+  `.dwo` files and the package rustc wrote for the program it linked, with the `thorin-dwp`
+  library (the one rustc uses).
+- `off` or unset: everything in the object and the executable, as before.
+
+`debuginfo.py --only profile` builds the locals program under each setting and checks that
+the units are kept apart, that the files exist, that gdb prints the same nine values as for
+the linked build, and that `llvm-dwarfdump --verify` has no error.
+
+Limits: the split writer writes little-endian sections and has only been run on Linux
+x86-64. `lldb` 20 reports the ranges of a block in a split DWARF 4 unit as invalid; it does
+the same for a rustc build with `split-debuginfo` of more than one unit, and the script
+counts those messages instead of failing on them. A splice into a program built with split
+debug info has not been tested.
+
+### Real projects
+
+`harness/realdebug.py` clones ripgrep (15.1.0) and axum (`axum-v0.8.6`, the
+`example-hello-world` server), puts one panic into each, builds with cargo and with
+`cargo rustd` in the dev profile, and compares:
+
+    cd harness
+    RUSTD_BIN=$PWD/../target/release/rustd python3 realdebug.py ripgrep axum
+
+| | ripgrep | axum hello-world |
+|---|---|---|
+| `llvm-dwarfdump --verify`, rustd's units | 91 units, 0 errors | sound |
+| gdb: stop at each place, name the same arguments and locals as the cargo build, same plain values | 6 places, all as cargo's | 3 of 5 as cargo's; 2 not compared, see below |
+| panic with `RUST_BACKTRACE=1`, frames of the workspace by file:line | 5 frames, same | 6 frames, same |
+| `perf record --call-graph dwarf`, `perf report` | 146 symbols, 50 of rustd's functions, 0 without a name | 124 symbols, 66 of rustd's, 0 without a name |
+| `perf script` lines | 133 frames in rustd's functions, 0 without a line | 63 frames, 0 without a line |
+| `addr2line` at the start of every rustd function | 23,153 functions, 0 without a name, 0 without a line | 7,653 functions, 0 and 0 |
+
+These are Cranelift numbers, taken on the head before the merge of `rustd-collate`
+8f21942505 and not taken again since.
+
+Under LLVM (`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`), at this head:
+
+| | ripgrep | axum hello-world |
+|---|---|---|
+| `llvm-dwarfdump --verify`, rustd's units | 91 units, 0 errors | 30 units, 0 errors |
+| gdb places | 5 of 6 as cargo's; at one, `let mut searched = false;`, the optimizer left the line no code | 3 of 5 as cargo's, 1 value optimized out; 2 not compared, see below |
+| panic frames | 5, same | 6, same |
+| `perf report` | 107 symbols, 15 of rustd's functions, 0 without a name | 52 symbols, 17 of rustd's, 0 without a name |
+| `perf script` lines | 108 frames in rustd's functions, 0 without a line | 39 frames, 0 without a line |
+| `addr2line` | 23,260 functions, 0 and 0 | 7,581 functions, 0 and 0 |
+
+A place where optimized code has no instruction is reported as `no code` and passes only
+under LLVM and only if gdb itself says the line "contains no code". Two of the five axum
+places (the handler's line and one in `axum::serve`) are `not looked at` under either backend
+because gdb does not stop there in the cargo build within the script's 90 seconds, so there
+is nothing to compare with; I have not found out why. The script is not part of the gate or
+of CI, since it clones from GitHub.
+
+Getting there fixed things the small fixtures had not shown: fat pointers to structs with an
+unsized tail were opaque; functions were not nested under their module, so gdb printed bare
+names; compiler-made locals had names; rows of code written inside a macro inside a closure
+pointed at the enclosing function; the code that drops everything when a future is dropped
+half-way had the line of the `async` block, so a breakpoint there stopped in the drop path
+(it is now laid out as cold code at the end); and perf could not unwind through spliced
+code, because the segment a splice appends was not as far from the unwind table in the file
+as in memory. `Image::behind` in `crates/rustd/src/splice.rs` now places it so.
+
+### A line for every instruction
+
+`debuginfo.py` walks every function of rustd's against `.debug_line` in every binary it
+builds and fails if any byte of one has no row (`a line for every instruction`). Before the
+fix 1,056 of 11,647 corpus functions had no row at all: drop glue, `call_once` and reify
+shims, and functions with no statement of their own such as the outer half of an
+`async fn`. Each now has one row for where it is written, as rustc has it. `#[naked]`
+functions have none, as under `rustc -g`.
+
+### Cost
+
+`debuginfo.py --only cost`: compile and link of the corpus `cases` object, best of three,
+with `RUSTD_DEBUGINFO=0` and without.
+
+| | Cranelift | LLVM -O2 |
+|---|---:|---:|
+| Compile + link, no debug | 5.69 s | 6.69 s |
+| Compile + link, debug | 6.73 s (+18.3%) | 7.72 s (+15.4%) |
+| Object, no debug | 41,500,464 | 37,074,800 |
+| Object, debug | 50,533,848 (+21.8%) | 47,080,264 (+27.0%) |
+| Sections a debugger reads | 4,717,348 | 4,886,745 |
+| Their relocations | 4,316,036 | 5,118,719 |
+| Binary, no debug | 86,999,056 | 83,614,040 |
+| Binary, debug | 91,716,400 | 88,500,784 |
+
+Measured on a quiet machine at this head; the time differs by a point or two between runs
+(Cranelift gave +16.7%, +19.2% and +18.3% on three occasions).
+
+Round two had +13.4% and +10.4% in time and +16.0% and +20.4% in object size. The growth
+since is the lexical blocks, the captures and coroutine variants, the namespaces, and the
+one row for each function that had none. I have not profiled this round's additions; the
+relocations of the debug sections are now as large as the sections themselves, and
+addressing a unit relative to one symbol (DWARF 5 `addrx`) is the first thing to try.
 
 ## Variables and types (round two)
 
@@ -88,8 +296,8 @@ described in full:
   (`rust-gdb`) look for. The harness compares what `rust-gdb` prints for a `Vec`, a `String`
   and a slice of the `Vec` with what it prints for the cargo build.
 
-A closure, a `dyn` pointer and whatever else there is are still described by name and size
-only.
+Closures, coroutines and `dyn` pointers were name and size only in round two; see "Round
+three".
 
 With `debug = "line-tables-only"` (or `1`, `limited`) the variables and types are left out
 and only the line tables and subprograms are written.
@@ -140,7 +348,7 @@ bounds check now takes its location from the index expression.
 The settings come from the build-model's plan (`crates/rustd/src/plan.rs`, which takes them
 from cargo's unit graph); `Cargo.toml` is not parsed again and `profile.rs` is not touched.
 `Profile::described` turns `debuginfo`, `split_debuginfo` and `strip` into one of three
-answers, nothing, lines, or full, or into a refusal:
+answers, nothing, lines, or full, with where it is kept, or into a refusal:
 
 | setting | what rustd does |
 |---|---|
@@ -150,15 +358,14 @@ answers, nothing, lines, or full, or into a refusal:
 | any other `debug` value | refused: "rustd does not know the level" |
 | `strip = "debuginfo"` or `"symbols"` (`true`) | no debug sections, whatever `debug` says |
 | `split-debuginfo = "off"`, or not set | as above |
-| `split-debuginfo = "packed"` or `"unpacked"` with debug info on | refused, see below |
+| `split-debuginfo = "unpacked"` with debug info on | a `.dwo` beside each object (round three) |
+| `split-debuginfo = "packed"` with debug info on | the same, and a `.dwp` beside the executable (round three) |
+| any other `split-debuginfo` or `strip` value | refused: "rustd does not know the setting" |
 | `split-debuginfo` set with debug info off or stripped | accepted, there is nothing to split |
 
-The refusal reads: "`split-debuginfo = "packed"`: rustd writes what a debugger reads into the
-object and the program, and has no `.dwo`, `.dwp` or `.dSYM` to keep it in. Build with
-`split-debuginfo = "off"`, or with `debug = false`". The build fails with it when it is
-planned. I refused rather than implemented it because split DWARF on ELF needs DWARF 5
-skeleton units and a `.dwp` packer (see "What is open"), and silently writing unsplit debug
-info into the binary is not what the profile asked for.
+Round two refused `packed` and `unpacked`; they are done now, see "Split DWARF" under "Round
+three". What is still refused is a value of `debug`, `strip` or `split-debuginfo` that rustd
+does not know, and the build fails with that reason when it is planned.
 
 `strip = "symbols"` also asks for the symbol table to go. That is the linker's work and is
 not done by this code.
@@ -166,8 +373,9 @@ not done by this code.
 When several packages are built with different profiles, the most any of the packages cargo
 was asked to build wants is used for all of rustd's code. The harness changes the setting
 nine times in one workspace and checks the object after each. `RUSTD_DEBUGINFO=0|lines|1`
-overrides it for measuring. A project cargo does not plan still falls back to
-`profile.rs`, which only knows on and off.
+overrides it for measuring. Since the build model's second round `profile.rs` is gone: the
+setting is a `plan::Described` read from the unit graph and kept through a reload, and a
+project cargo does not plan gets no debug info.
 
 ## What is independent of the object format, and where a new one plugs in
 
@@ -261,7 +469,7 @@ All on one machine, Linux x86-64, Rust 1.99.0, LLVM 20, at the head of this bran
     RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast RUSTD_BIN=$PWD/../target-llvm/release/rustd python3 debuginfo.py
 
 `debuginfo.py` exits 0 under both backends ("all right").
-`--only corpus|stress|rung2|edits|callers|locals|types|profile|cost` runs one part. The
+`--only corpus|stress|rung2|edits|callers|locals|types|scopes|rich|profile|cost` runs one part. The
 programs used are the corpus runner, the `stress` workspace (three crates), `rung2`, and
 small programs the script writes itself.
 
@@ -321,7 +529,7 @@ Variables (`locals`): gdb stops in a function with three parameters and six loca
 prints each (`u32`, `f32`, `&str`, a struct, a tuple struct, an array, a tuple, and a
 dereferenced reference). A value passes if it is right or if gdb says `<optimized out>`; a
 wrong value or an unknown name fails. Cranelift: 9 of 9 right. LLVM -O2: 6 of 9 right and 3
-`<optimized out>`. In the larger programs rustd describes 15,946 parameters and locals across
+`<optimized out>` in round two, 8 of 9 now. In the larger programs rustd describes 15,946 parameters and locals across
 11,647 functions in the corpus, 3,006 in 1,834 for stress, 3,139 in 3,039 for rung2, the same
 count under both backends.
 
@@ -332,12 +540,12 @@ tuple-like, unit), a fieldless enum with explicit discriminants, `Some(42)`, `No
 `Option<&Point>` both ways (a niche), `Result<u8, String>`, a `Vec<i32>`, a `String`, a slice
 of the `Vec`, a union, a dereferenced reference and a sum. What rustd's binary prints has to
 be what the cargo build's prints, character for character apart from addresses. Cranelift:
-21 of 21. LLVM -O2: 20 of 21 and one `<optimized out>` (the second field of the tuple struct,
-which the optimizer splits apart).
+21 of 21. LLVM -O2: 20 of 21 in round two with one `<optimized out>` (the second field of the
+tuple struct, which the optimizer splits apart), 21 of 21 now.
 
 Profile (`profile`, round two): the nine settings in the table under "Profile settings", in
-one workspace one after the other. All followed or refused as the table says, under both
-backends.
+one workspace one after the other. All followed or refused as the table said then, under both
+backends; there are eleven now, with the split settings followed.
 
 lldb and addr2line were tried by hand on the locals program and are not in the script:
 `addr2line -f -C -e bin 0x47387` gave `sline::area` and `src/main.rs:5`; `lldb-20 -b` with a
@@ -460,20 +668,20 @@ see "Tail calls, inlining and `#[track_caller]`". If rustd starts inlining (LLVM
 functions, or MIR inlining) the entries have to be added at the same time, or backtraces
 will lose frames.
 
-Scopes. Variables have no `DW_TAG_lexical_block`, so a local shows in the debugger from the
-start of the function, with garbage in it until it is assigned. Because of that, a name that
-the body binds more than once is not described at all (the debugger could not tell which one
-is meant). Locals that Cranelift keeps in a register, locals of closures and of `async`
-bodies, and unsized locals are not described either. In the corpus this leaves 15,946
-described; I did not count how many rustc describes for the same code. The writer and the
-data model have lexical blocks (`Scope`, `DW_TAG_lexical_block`); what is missing is the
-lowering recording which code belongs to which block.
+Under LLVM -O2 three values that `rustc -O -g` shows are `<optimized out>`: `width` in the
+`locals` part, `step` and the `step` half of `value` in `scopes`. The cause and what was
+tried are under "LLVM and optimized-out values". Closing it needs rustd's LLVM to see the
+callee, that is inlining, which also needs `DW_TAG_inlined_subroutine` (above).
 
-Closures, coroutines and `dyn` pointers are described by name and size only. A closure's
-captures have a layout rustd knows, so that is the next type to add.
+Locals that Cranelift keeps in a register and unsized locals are not described. I did not
+count how many variables rustc describes for the same code.
 
-A project that cargo does not plan gets its setting from `profile.rs`, which reads `debug` as
-on or off and does not know `strip` or `split-debuginfo`.
+Split debug info and the splice. A splice into a program built with `split-debuginfo` other
+than `off` has not been tested, and neither has a real project with it; only the `profile`
+part of the harness builds that way. The split writer is little-endian only.
+
+The real-project check (`realdebug.py`) is not in the gate or in CI: it clones from GitHub
+and takes minutes.
 
 After a splice, the `.eh_frame` section header still covers only the linker's frames. The
 frames of spliced code are in the appended segment and are in the `.eh_frame_hdr` search
@@ -492,20 +700,7 @@ The coroutine drop frame name (`X` where rustc says `core::ptr::drop_glue::<X>`)
 above. Fixing it means emitting a real drop-glue function for coroutines instead of polling
 with a null context.
 
-Split debug info is refused, not done. On ELF it needs DWARF 5 (or the GNU extension to 4):
-a skeleton unit in the object with `DW_AT_dwo_name`, the real unit in a `.dwo` with
-`.debug_*.dwo` sections and an address table so the `.dwo` has no relocations, and for
-`packed` a `.dwp` made from the `.dwo` files after the link. I have not checked how much of
-that gimli's writer does. The splice path would have to keep the `.dwo` of patched code next to the binary as
-well. A week, most of it the splice path and the harness. Compressed debug sections in the
-executable make the splice fall back to a full link.
-
-Under LLVM a variable the optimizer keeps in registers for only part of a function is
-described for those ranges only, and one it splits into pieces (SROA) is `<optimized out>`
-entirely. My reading, not measured, is that LLVM can only describe the pieces
-(`DW_OP_piece`) of a variable whose type it knows the fields of, and rustd gives it a made-up
-integer of the slot's size. Telling LLVM the real types through DIBuilder would then fix it,
-and would mean two writers of types. Not started.
+Compressed debug sections in the executable make the splice fall back to a full link.
 
 gdb prints a warning about `.debug_gdb_scripts` for these binaries; it comes from rustc's
 std objects and is the same for the cargo build.
