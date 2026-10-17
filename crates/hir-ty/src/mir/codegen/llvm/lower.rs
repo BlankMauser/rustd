@@ -697,6 +697,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     self.builder.build_fence(AtomicOrdering::SequentiallyConsistent, false, "")?;
                 }
                 Opcode::Nop => {}
+                // Where the exception arrives in a register, the frame pointer is read for
+                // what the caller left above the frame, so it is the one of LLVM's frame.
+                Opcode::GetFramePointer
+                    if crate::mir::codegen::Target::current().exception_in_register() =>
+                {
+                    let pointer = self.context.ptr_type(AddressSpace::default());
+                    let own = self.context.i32_type().const_zero();
+                    let frame =
+                        self.intrinsic("llvm.frameaddress", &[pointer.into()], &[own.into()])?;
+                    self.set(inst, Operand::Pointer(frame.into_pointer_value()));
+                }
                 // Asked for by a guarded call alone, to look at the slot of the frame its
                 // exception arrives in. LLVM lays out the frame, so the slot is one of the
                 // function's own, and this is where it would be the slot of the frame.

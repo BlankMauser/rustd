@@ -14,7 +14,7 @@ use object::{Object, ObjectSection, ObjectSymbol};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use super::{Arch, store::Store};
+use super::{Arch, ObjectFormat, Target, store::Store};
 
 mod aarch64;
 
@@ -88,8 +88,13 @@ pub(super) enum Operand<'a> {
 }
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
-fn label(index: usize) -> String {
-    format!(".Lrustd_label_{index}")
+fn label(format: ObjectFormat, index: usize) -> String {
+    format!("{}rustd_label_{index}", format.local_label())
+}
+
+/// The name in a [`Wrapper`] of where every way out of the block meets.
+fn done(format: ObjectFormat) -> String {
+    format!("{}rustd_done", format.local_label())
 }
 
 /// The labels among the operands, by index.
@@ -257,7 +262,7 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
 
 /// The function for a block, in the assembly of the architecture.
 pub(super) fn wrapper(
-    arch: Arch,
+    target: &Target,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
@@ -265,15 +270,17 @@ pub(super) fn wrapper(
     if options.contains(AsmOptions::MAY_UNWIND) {
         return Err("inline assembly that unwinds".to_owned());
     }
-    match arch {
-        Arch::X86_64 => wrapper_x86_64(template, options, operands),
-        Arch::Aarch64 => aarch64::wrapper(template, options, operands),
+    let format = target.object_format;
+    match target.arch {
+        Arch::X86_64 => wrapper_x86_64(format, template, options, operands),
+        Arch::Aarch64 => aarch64::wrapper(format, template, options, operands),
         Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
 
 /// The function for a block on x86-64.
 fn wrapper_x86_64(
+    format: ObjectFormat,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
@@ -367,7 +374,7 @@ fn wrapper_x86_64(
                 continue;
             }
             (Some(Operand::Label), _) => {
-                text.push_str(&label(index));
+                text.push_str(&label(format, index));
                 continue;
             }
             (_, Some(Reg::Gpr(row))) => {
@@ -419,13 +426,13 @@ fn wrapper_x86_64(
     let mut jumped = false;
     for (at, index) in labels(operands).enumerate() {
         if returns || jumped {
-            text.push_str("jmp .Lrustd_done\n");
+            _ = writeln!(text, "jmp {}", done(format));
         }
-        _ = writeln!(text, "{}:\nmov eax, {}", label(index), at + 1);
+        _ = writeln!(text, "{}:\nmov eax, {}", label(format, index), at + 1);
         jumped = true;
     }
     if returns || jumped {
-        text.push_str(".Lrustd_done:\n");
+        _ = writeln!(text, "{}:", done(format));
         for (at, &row) in kept.iter().enumerate() {
             _ = writeln!(text, "mov {}, qword ptr [rbx + {}]", GPR[row][0], kept_at + at * 8);
         }

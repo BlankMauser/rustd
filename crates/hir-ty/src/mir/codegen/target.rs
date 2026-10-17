@@ -48,6 +48,15 @@ impl Arch {
     }
 }
 
+/// Where the variable arguments of a C function are when it is entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableArguments {
+    /// In the registers the named parameters left, then on the stack: x86-64's System V.
+    Registers,
+    /// On the stack, eight bytes each, whatever registers are left: Apple's AArch64.
+    Stack,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectFormat {
     Elf,
@@ -55,6 +64,16 @@ pub enum ObjectFormat {
     Coff,
     /// Relocatable WebAssembly objects.
     Wasm,
+}
+
+impl ObjectFormat {
+    /// What a label starts with for the assembler to keep it out of the symbols.
+    pub(super) fn local_label(self) -> &'static str {
+        match self {
+            ObjectFormat::MachO => "L",
+            ObjectFormat::Elf | ObjectFormat::Coff | ObjectFormat::Wasm => ".L",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +208,24 @@ impl Target {
         self.call_conv.supports_exceptions()
     }
 
+    /// Where a function that takes `...` finds its variable arguments, for the conventions a
+    /// definition of one is compiled for.
+    pub fn variable_arguments(&self) -> Option<VariableArguments> {
+        match (self.call_conv, self.arch) {
+            (CallConv::SystemV, Arch::X86_64) => Some(VariableArguments::Registers),
+            (CallConv::AppleAarch64, Arch::Aarch64) => Some(VariableArguments::Stack),
+            _ => None,
+        }
+    }
+
+    /// Whether code reads the frame pointer, which every function then has to keep.
+    fn reads_frame_pointer(&self) -> bool {
+        // The pads of a convention Cranelift has no landing pads for take the exception
+        // from the frame (see `unwind::seh`), which the frame pointer finds. Variable
+        // arguments that are all on the stack are found from it too.
+        !self.exception_in_register() || self.variable_arguments() == Some(VariableArguments::Stack)
+    }
+
     /// The processor code is made for: the baseline of the target, as rustc compiles for.
     pub fn cpu(&self) -> &'static str {
         match (self.arch, self.object_format) {
@@ -226,9 +263,7 @@ impl Target {
             flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
             flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
         }
-        if !self.exception_in_register() {
-            // The pads of a convention Cranelift has no landing pads for take the exception
-            // from the frame (see `unwind::seh`), which the frame pointer finds.
+        if self.reads_frame_pointer() {
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;

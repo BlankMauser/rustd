@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 
-use super::{Operand, SYMBOL, Wrapper};
+use super::{ObjectFormat, Operand, SYMBOL, Wrapper};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reg {
@@ -96,6 +96,7 @@ impl Reg {
 }
 
 pub(super) fn wrapper(
+    format: ObjectFormat,
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
@@ -176,7 +177,7 @@ pub(super) fn wrapper(
                 continue;
             }
             (Some(Operand::Label), _) => {
-                text.push_str(&super::label(index));
+                text.push_str(&super::label(format, index));
                 continue;
             }
             (_, Some(Reg::Gpr(number))) => {
@@ -213,13 +214,13 @@ pub(super) fn wrapper(
     let mut jumped = false;
     for (at, index) in super::labels(operands).enumerate() {
         if returns || jumped {
-            text.push_str("b .Lrustd_done\n");
+            _ = writeln!(text, "b {}", super::done(format));
         }
-        _ = writeln!(text, "{}:\nmov x0, #{}", super::label(index), at + 1);
+        _ = writeln!(text, "{}:\nmov x0, #{}", super::label(format, index), at + 1);
         jumped = true;
     }
     if returns || jumped {
-        text.push_str(".Lrustd_done:\n");
+        _ = writeln!(text, "{}:", super::done(format));
         for (at, reg) in kept.iter().enumerate() {
             _ = writeln!(text, "{}", reg.transfer(true, 8, at as u32 * 8)?);
         }
