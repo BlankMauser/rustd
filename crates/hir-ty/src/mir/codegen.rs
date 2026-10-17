@@ -4969,6 +4969,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                     StatementKind::Deinit(_) => unsupported!("deinit"),
                     StatementKind::InlineAsm(asm) => self.inline_asm(asm)?,
+                    // A place that is matched on and not read is still indexed, and the
+                    // index is checked: `let _ = items[at]` panics when `at` is out of bounds.
+                    StatementKind::FakeRead(place) if is_indexed(place) => {
+                        self.place(place)?;
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::FakeRead(_)
@@ -10445,6 +10450,12 @@ fn dump_mir(body: &MirBody<'_>) {
             eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
         }
     }
+}
+
+/// Whether a place is an element of an array or slice at an index that is only known when
+/// the program runs.
+fn is_indexed(place: &StoredPlace) -> bool {
+    place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_)))
 }
 
 /// Where each local of a body starts to live. A local that holds the index of `base[index]`

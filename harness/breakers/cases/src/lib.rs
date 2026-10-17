@@ -47,4 +47,5 @@ cases![
     repeat_rows,
     if_branch_temporaries,
     uncaptured_scrutinee,
+    unread_index,
 ];

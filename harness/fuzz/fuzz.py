@@ -15,7 +15,7 @@ found in the run is counted and not reduced a second time.
 
 RUSTD_BIN names the rustd under test. The exit status is 1 when there is a finding.
 """
-import argparse, collections, json, os, re, resource, shutil, subprocess, sys, tempfile, time
+import argparse, collections, contextlib, json, os, re, resource, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -80,6 +80,9 @@ class Project:
     def rustd(self, backend):
         """Builds with rustd under a backend and compares. Returns the findings and the functions compiled."""
         os.environ.update(BACKENDS[backend])
+        # rustd appends the layouts of every build to this, and nothing here reads it.
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.fx.layout_log)
         try:
             self.fx.rustd_build()
         except SystemExit as error:
