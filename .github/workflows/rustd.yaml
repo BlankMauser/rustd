@@ -1,5 +1,6 @@
 # rustd: the daemon's own checks, on its branches. The harnesses compare what rustd builds
-# with what rustc builds, under both producers.
+# with what rustc builds, under both producers, on Linux x86-64 and on Linux AArch64: each
+# on a machine of its own kind, so nothing is cross-compiled or emulated.
 name: rustd
 on:
   push:
@@ -17,8 +18,16 @@ env:
 
 jobs:
   checks:
-    name: fmt and tests
-    runs-on: ubuntu-24.04
+    name: fmt and tests${{ matrix.suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            suffix: ""
+          - os: ubuntu-24.04-arm
+            suffix: " (aarch64)"
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
@@ -27,13 +36,19 @@ jobs:
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
   harness:
-    name: harness (${{ matrix.backend }})
-    runs-on: ubuntu-24.04
+    name: harness (${{ matrix.backend }}${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-24.04
+            suffix: ""
+          - os: ubuntu-24.04-arm
+            suffix: ", aarch64"
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
@@ -59,6 +74,8 @@ jobs:
           run breakers.py
           run unwinds.py
           run splices.py
+          # A branch reaches 128 MB on AArch64, and the splice has to get past that.
+          if [ "$(uname -m)" = aarch64 ]; then RUSTD_SPLICE=1 run farsplices.py; fi
           run asmedits.py
           run includes.py
           run worktrees.py

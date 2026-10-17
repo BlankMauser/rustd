@@ -1011,6 +1011,9 @@ pub enum AsmOperand {
     Const(Operand),
     /// A `label` block, which the template jumps to.
     Label,
+    /// A function or a static, which the template names: a constant of the type of the
+    /// function, or the static.
+    Sym(Operand),
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1530,7 +1533,7 @@ impl MirBody<'_> {
                                 output.iter().for_each(|it| write(it, f));
                             }
                             AsmOperand::Const(it) => operand(it, f),
-                            AsmOperand::Label => (),
+                            AsmOperand::Label | AsmOperand::Sym(_) => (),
                         }
                     }
                     asm.taken.iter().for_each(|it| write(it, f));
@@ -1642,7 +1645,7 @@ impl MirBody<'_> {
                                     }
                                 }
                                 AsmOperand::Const(value) => for_operand(value, &mut f),
-                                AsmOperand::Label => (),
+                                AsmOperand::Label | AsmOperand::Sym(_) => (),
                             }
                         }
                         if let Some(taken) = &mut asm.taken {

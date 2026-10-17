@@ -486,7 +486,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands.push(super::AsmOperand::Label);
                             continue;
                         }
-                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                        AsmOperand::Sym(path) => {
+                            // Inference does not look at the path, so the generic
+                            // arguments of what it names are not known here.
+                            let hygiene = self.store.expr_path_hygiene(expr_id);
+                            let named = self
+                                .resolver
+                                .resolve_path_in_value_ns_fully(self.db, path, hygiene);
+                            let symbol = match named {
+                                Some(ValueNs::StaticId(id)) => {
+                                    Operand { kind: OperandKind::Static(id), span: None }
+                                }
+                                Some(ValueNs::FunctionId(id))
+                                    if generics(self.db, id.into()).len(false) == 0 =>
+                                {
+                                    Operand::from_fn(self.db, id, GenericArgs::empty())
+                                }
+                                Some(ValueNs::FunctionId(_)) => {
+                                    not_supported!("inline assembly with a `sym` that is generic")
+                                }
+                                _ => not_supported!(
+                                    "inline assembly with a `sym` that is not a function or a static"
+                                ),
+                            };
+                            operands.push(super::AsmOperand::Sym(symbol));
+                            continue;
+                        }
                     };
                     let input = match input {
                         Some(input) => {

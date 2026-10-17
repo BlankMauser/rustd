@@ -520,6 +520,34 @@ pub mod x86 {
         }
         out
     }
+
+    /// A symbol in the assembly of a function that is nothing but assembly, as ELF has
+    /// its relocations.
+    #[cfg(target_os = "linux")]
+    pub mod symbols {
+        use std::arch::naked_asm;
+
+        extern "C" fn sym_target(a: u64) -> u64 {
+            a * 3 + 1
+        }
+        static SYM_DATA: u64 = 1000;
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym(a: u64) -> u64 {
+            naked_asm!("jmp {f}", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_call(a: u64) -> u64 {
+            naked_asm!("push rbp", "call {f}", "add rax, 500", "pop rbp", "ret", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_data(a: u64) -> u64 {
+            naked_asm!("mov rax, [rip + {d}]", "add rax, rdi", "ret", d = sym SYM_DATA)
+        }
+        pub fn naked_sym_operands() -> (u64, u64, u64) {
+            let f: extern "C" fn(u64) -> u64 = naked_sym;
+            (naked_sym(5) + f(1), naked_sym_call(2), naked_sym_data(3))
+        }
+    }
 }
 
 /// What `x86` has, in AArch64 assembly.
@@ -615,5 +643,175 @@ pub mod arm {
             out.push(v);
         }
         out
+    }
+
+    /// A symbol in the assembly of a function that is nothing but assembly, as ELF has
+    /// its relocations.
+    #[cfg(target_os = "linux")]
+    pub mod symbols {
+        use std::arch::naked_asm;
+
+        extern "C" fn sym_target(a: u64) -> u64 {
+            a * 3 + 1
+        }
+        extern "C" fn sym_other(a: u32) -> u64 {
+            a as u64 + 500
+        }
+        static SYM_DATA: u64 = 1000;
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym(a: u64) -> u64 {
+            naked_asm!("b {f}", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_call(a: u32) -> u64 {
+            naked_asm!(
+                "stp x29, x30, [sp, #-16]!",
+                "bl {f}",
+                "bl {g}",
+                "ldp x29, x30, [sp], #16",
+                "ret",
+                f = sym sym_other,
+                g = sym sym_target,
+            )
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_data(a: u64) -> u64 {
+            naked_asm!(
+                "adrp x1, {d}",
+                "ldr x1, [x1, :lo12:{d}]",
+                "add x0, x0, x1",
+                "ret",
+                d = sym SYM_DATA,
+            )
+        }
+        pub fn naked_sym_operands() -> (u64, u64, u64) {
+            let f: extern "C" fn(u64) -> u64 = naked_sym;
+            (naked_sym(5) + f(1), naked_sym_call(2), naked_sym_data(3))
+        }
+    }
+
+    // Sixteen bytes aligned to sixteen that the integer registers left do not hold: on the
+    // stack whole, and the registers left are out of use for what follows.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub struct Aligned {
+        pub a: u64,
+        pub b: u32,
+    }
+    pub extern "C" fn wide_late(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, x: u128, h: u64, y: i128,
+    ) -> u128 {
+        let small = a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h;
+        x.wrapping_mul(3).wrapping_add(small as u128).wrapping_sub(y as u128)
+    }
+    pub extern "C" fn wide_fits(a: u64, b: u64, c: u64, d: u64, e: u64, x: u128, h: u64) -> u128 {
+        x ^ ((a + b + c + d + e) as u128) << 64 ^ h as u128
+    }
+    pub extern "C" fn aligned_late(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, x: Aligned, h: u64, y: Aligned,
+    ) -> u64 {
+        a + b + c + d + e + f + g + x.a * 10 + x.b as u64 * 100 + h * 1000 + y.a * 7 + y.b as u64
+    }
+    pub fn wide_stack() -> (u128, u128, u64, u128) {
+        let wide: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u128, u64, i128) -> u128 =
+            wide_late;
+        let (x, y) = (Aligned { a: 3, b: 4 }, Aligned { a: 5, b: 6 });
+        (
+            wide_late(1, 2, 3, 4, 5, 6, 7, 1 << 90 | 9, 8, -5),
+            wide(7, 6, 5, 4, 3, 2, 1, u128::MAX - 2, 11, i128::MIN + 3),
+            aligned_late(1, 2, 3, 4, 5, 6, 7, x, 8, y),
+            wide_fits(1, 2, 3, 4, 5, 1 << 100 | 1 << 20, 6),
+        )
+    }
+
+    // Variable arguments of 128 bits, which come in two registers that start at an even one
+    // or in sixteen bytes of the stack at a multiple of sixteen.
+    #[inline(never)]
+    fn stir(total: u128, at: u32) -> u128 {
+        std::hint::black_box(total.rotate_left(at % 7) ^ at as u128)
+    }
+    #[cfg(feature = "nightly")]
+    pub unsafe extern "C" fn va_wide(count: u32, mut args: ...) -> u128 {
+        let mut total = 0u128;
+        for at in 0..count {
+            let next = match at % 4 {
+                0 => unsafe { args.next_arg::<u128>() },
+                1 => unsafe { args.next_arg::<u64>() as u128 },
+                2 => unsafe { args.next_arg::<f64>() as u128 },
+                _ => unsafe { args.next_arg::<i128>() as u128 },
+            };
+            // The call has the function keep registers of its caller's.
+            total = stir(total.wrapping_mul(31).wrapping_add(next), at);
+        }
+        total
+    }
+    /// Named parameters that the registers do not hold: the variable ones follow them on
+    /// the stack.
+    pub unsafe extern "C" fn va_named(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64,
+        p: f64, q: f64, r: f64, s: f64, t: f64, u: f64, v: f64, w: f64, x: f32,
+        wide: u128, count: u32, mut args: ...
+    ) -> f64 {
+        let mut total = (a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h + 9 * i) as f64
+            + p + q * 2.0 + r * 3.0 + s * 4.0 + t * 5.0 + u * 6.0 + v * 7.0 + w * 8.0
+            + x as f64 * 9.0 + (wide >> 64) as f64 + wide as u64 as f64;
+        for at in 0..count {
+            total = stir(at as u128, at) as f64
+                + total * 2.0
+                + match at % 3 {
+                    0 => unsafe { args.next_arg::<i64>() as f64 },
+                    1 => unsafe { args.next_arg::<f64>() },
+                    _ => unsafe { args.next_arg::<u32>() as f64 },
+                };
+        }
+        total
+    }
+    /// A named 128-bit parameter with one register left for it.
+    #[cfg(feature = "nightly")]
+    pub unsafe extern "C" fn va_named_wide(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, wide: i128, mut args: ...
+    ) -> i128 {
+        let first = unsafe { args.next_arg::<i64>() } as i128;
+        let second = unsafe { args.next_arg::<i128>() };
+        let third = unsafe { args.next_arg::<f64>() } as i128;
+        wide + first * 3 + second * 5 + third * 7 + (a + b + c + d + e + f + g) as i128
+    }
+    pub fn va_named_args() -> (f64, f64, f64) {
+        let through: unsafe extern "C" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            f64, f64, f64, f64, f64, f64, f64, f64, f32,
+            u128, u32, ...
+        ) -> f64 = va_named;
+        unsafe {
+            (
+                va_named(
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5,
+                    5u128 << 64 | 6, 0,
+                ),
+                va_named(
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5,
+                    5u128 << 64 | 6, 5, -4i64, 0.25f64, 70u32, 12i64, 8.0f64,
+                ),
+                through(
+                    9, 8, 7, 6, 5, 4, 3, 2, 1, 8.5, 7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5,
+                    1u128 << 64 | 2, 3, i64::MIN, -0.5f64, u32::MAX,
+                ),
+            )
+        }
+    }
+    #[cfg(feature = "nightly")]
+    pub fn va_wide_args() -> (u128, u128, u128, i128) {
+        let through: unsafe extern "C" fn(u32, ...) -> u128 = va_wide;
+        unsafe {
+            (
+                va_wide(0),
+                va_wide(4, 1u128 << 100, 5u64, 2.5f64, -3i128),
+                through(
+                    10, 7u128, 1u64, 0.5f64, i128::MAX, u128::MAX, 2u64, 9.75f64, -1i128,
+                    3u128 << 64, u64::MAX,
+                ),
+                va_named_wide(1, 2, 3, 4, 5, 6, 7, -1i128 << 80, 11i64, 13i128 << 66, 2.0f64),
+            )
+        }
     }
 }

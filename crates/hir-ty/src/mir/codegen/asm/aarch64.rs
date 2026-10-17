@@ -180,6 +180,10 @@ pub(super) fn wrapper(
                 text.push_str(&super::label(format, index));
                 continue;
             }
+            (Some(Operand::Sym), _) => {
+                text.push_str(&super::symbol(index));
+                continue;
+            }
             (_, Some(Reg::Gpr(number))) => {
                 match modifier {
                     None | Some('x') => _ = write!(text, "x{number}"),

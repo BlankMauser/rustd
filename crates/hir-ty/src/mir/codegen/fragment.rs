@@ -85,6 +85,12 @@ pub(super) struct Code {
     pub(super) bytes: Vec<u8>,
     pub(super) align: u64,
     pub(super) relocs: Vec<ModuleReloc>,
+    /// The relocations of `relocs`, by where they are, that Cranelift has no kind for, with
+    /// the type ELF has for each: the low bits of an address in an AArch64 load or store,
+    /// which go in in units of what it moves, and whatever the assembly of a function
+    /// names a symbol with. The kind in `relocs` stands in for it, and the object is given
+    /// the relocation when it is finished.
+    pub(super) elf_types: Vec<(u32, u32)>,
     pub(super) unwind: Option<FunctionUnwind>,
 }
 
@@ -107,6 +113,7 @@ impl PartialEq for Code {
             && self.align == other.align
             && self.signature == other.signature
             && self.unwind == other.unwind
+            && self.elf_types == other.elf_types
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
                 a.offset == b.offset
@@ -143,6 +150,12 @@ pub(super) struct Mark {
     pub(super) datas: usize,
 }
 
+/// The assembly of a `#[naked]` function, and what each operand of it that is a symbol names.
+pub(super) struct Naked {
+    pub(super) text: String,
+    pub(super) symbols: Vec<(usize, ModuleRelocTarget)>,
+}
+
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
@@ -157,7 +170,7 @@ pub(super) struct Recorder<'db> {
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
     /// The assembly of the function, when it is a `#[naked]` one.
-    pub(super) naked: Option<String>,
+    pub(super) naked: Option<Naked>,
 }
 
 impl<'db> Recorder<'db> {

@@ -90,6 +90,67 @@ pub(super) enum Operand<'a> {
     /// A `label` block. The function returns which one the block jumped to, counted from 1,
     /// or 0 when the block ran off its end.
     Label,
+    /// A function or a static the block names.
+    Sym,
+}
+
+/// What the text of a function calls the symbol that is operand `index`: a name nothing
+/// defines, which the relocations of the assembled function are found by.
+fn symbol(index: usize) -> String {
+    format!("rustd_sym_{index}")
+}
+
+/// A function as the assembler made it.
+#[derive(Debug)]
+pub(super) struct Assembled {
+    pub(super) bytes: Vec<u8>,
+    pub(super) relocs: Vec<SymbolReloc>,
+}
+
+/// A relocation of an assembled function against the symbol that is operand `operand`, by
+/// the type ELF has for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SymbolReloc {
+    pub(super) offset: u32,
+    pub(super) r_type: u32,
+    pub(super) operand: u32,
+    pub(super) addend: i64,
+}
+
+impl Assembled {
+    const RELOC: usize = 20;
+
+    /// As the store keeps it: the relocations, then the code.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = (self.relocs.len() as u32).to_le_bytes().to_vec();
+        for reloc in &self.relocs {
+            out.extend(reloc.offset.to_le_bytes());
+            out.extend(reloc.r_type.to_le_bytes());
+            out.extend(reloc.operand.to_le_bytes());
+            out.extend(reloc.addend.to_le_bytes());
+        }
+        out.extend(&self.bytes);
+        out
+    }
+
+    fn from_bytes(stored: &[u8]) -> Option<Assembled> {
+        let (count, rest) = stored.split_first_chunk::<4>()?;
+        let (relocs, bytes) =
+            rest.split_at_checked(u32::from_le_bytes(*count) as usize * Self::RELOC)?;
+        let word = |from: &[u8]| u32::from_le_bytes(from.try_into().expect("four bytes"));
+        let relocs = relocs
+            .as_chunks::<{ Self::RELOC }>()
+            .0
+            .iter()
+            .map(|it| SymbolReloc {
+                offset: word(&it[..4]),
+                r_type: word(&it[4..8]),
+                operand: word(&it[8..12]),
+                addend: i64::from_le_bytes(it[12..].try_into().expect("eight bytes")),
+            })
+            .collect();
+        Some(Assembled { bytes: bytes.to_vec(), relocs })
+    }
 }
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
@@ -124,6 +185,15 @@ pub(super) fn naked(
             AsmPiece::Lit(lit) => text.push_str(lit),
             AsmPiece::Operand { index, .. } => match operands.get(*index) {
                 Some(Operand::Const(value)) => _ = write!(text, "{value}"),
+                // FIXME: the other object formats, whose relocations are not read back.
+                Some(Operand::Sym) if Target::selected()?.object_format == ObjectFormat::Elf => {
+                    text.push_str(&symbol(*index))
+                }
+                Some(Operand::Sym) => {
+                    return Err(
+                        "a `naked_asm!` operand that is a symbol, for this target".to_owned()
+                    );
+                }
                 _ => return Err("a `naked_asm!` operand that is not a constant".to_owned()),
             },
         }
@@ -382,6 +452,10 @@ fn wrapper_x86_64(
                 text.push_str(&label(format, index));
                 continue;
             }
+            (Some(Operand::Sym), _) => {
+                text.push_str(&symbol(index));
+                continue;
+            }
             (_, Some(Reg::Gpr(row))) => {
                 let modifier = modifier.or((classes[index] == "reg_byte").then_some('l'));
                 match modifier {
@@ -451,10 +525,10 @@ fn wrapper_x86_64(
 
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// store keeps the code, as it does a compiled function's.
-pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
-    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<[u8]>>>> = OnceLock::new();
+pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
+    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"rustd asm 1");
+    hasher.update(b"rustd asm 2");
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
@@ -464,12 +538,12 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         return Ok(code);
     }
     let store = Store::global();
-    let code: Arc<[u8]> = match store.and_then(|it| it.get(&key)) {
-        Some(code) => code.into(),
+    let code = match store.and_then(|it| it.get(&key)).and_then(Assembled::from_bytes) {
+        Some(code) => Arc::new(code),
         None => {
-            let code: Arc<[u8]> = Assembler::selected().assemble(triple, text, &key)?.into();
+            let code = Arc::new(Assembler::selected().assemble(triple, text, &key)?);
             if let Some(store) = store {
-                store.insert(&key, &code);
+                store.insert(&key, &code.to_bytes());
             }
             code
         }
@@ -499,7 +573,7 @@ impl Assembler {
         }
     }
 
-    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
         match self {
             Assembler::Rustc => run_assembler(triple, text, key),
             #[cfg(feature = "llvm")]
@@ -510,7 +584,7 @@ impl Assembler {
 
 /// FIXME: this runs rustc, which is the one assembler sure to be there and to read what
 /// `asm!` is written in. An assembler in this process would do without the files.
-fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
     // Two threads may be assembling the same text.
     static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -553,8 +627,8 @@ fn run_assembler(triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, St
     code
 }
 
-/// The bytes of the function in an object that defines it alone.
-fn code(object: &[u8]) -> Result<Vec<u8>, String> {
+/// The function in an object that defines it alone.
+fn code(object: &[u8]) -> Result<Assembled, String> {
     let failed = |e: &dyn std::fmt::Display| format!("inline assembly: {e}");
     let file = object::File::parse(object).map_err(|e| failed(&e))?;
     let symbol = file
@@ -565,11 +639,46 @@ fn code(object: &[u8]) -> Result<Vec<u8>, String> {
         .section_index()
         .and_then(|it| file.section_by_index(it).ok())
         .ok_or_else(|| failed(&"the function is in no section"))?;
-    // FIXME: a block that names a symbol, or has data in another section.
-    if section.relocations().next().is_some() {
-        return Err("inline assembly that names a symbol".to_owned());
+    let start = symbol.address() - section.address();
+    // FIXME: a block that names a symbol of its own choosing, or has data in another
+    // section.
+    let named = || "inline assembly that names a symbol".to_owned();
+    let mut relocs = Vec::new();
+    for (offset, reloc) in section.relocations() {
+        let (object::RelocationFlags::Elf { r_type }, object::RelocationTarget::Symbol(target)) =
+            (reloc.flags(), reloc.target())
+        else {
+            return Err(named());
+        };
+        let target = file.symbol_by_index(target).map_err(|e| failed(&e))?;
+        let operand = target
+            .name()
+            .ok()
+            .filter(|_| target.is_undefined())
+            .and_then(|it| it.strip_prefix("rustd_sym_")?.parse().ok())
+            .ok_or_else(named)?;
+        let offset = offset.checked_sub(start).ok_or_else(named)? as u32;
+        relocs.push(SymbolReloc { offset, r_type, operand, addend: reloc.addend() });
     }
     let bytes = section.data().map_err(|e| failed(&e))?;
-    let start = (symbol.address() - section.address()) as usize;
-    Ok(bytes[start..].to_vec())
+    Ok(Assembled { bytes: bytes[start as usize..].to_vec(), relocs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Assembled, SymbolReloc};
+
+    #[test]
+    fn assembled_is_stored_whole() {
+        let assembled = Assembled {
+            bytes: vec![1, 2, 3, 4, 5],
+            relocs: vec![
+                SymbolReloc { offset: 4, r_type: 283, operand: 0, addend: -8 },
+                SymbolReloc { offset: 12, r_type: 286, operand: 3, addend: 1 << 40 },
+            ],
+        };
+        let read = Assembled::from_bytes(&assembled.to_bytes()).unwrap();
+        assert_eq!((read.bytes, read.relocs), (assembled.bytes, assembled.relocs));
+        assert!(Assembled::from_bytes(&[2, 0, 0, 0, 9]).is_none());
+    }
 }

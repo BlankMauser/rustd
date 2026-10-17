@@ -97,6 +97,7 @@ pub(super) struct CachedCode {
     bytes: Vec<u8>,
     align: u64,
     relocs: Vec<CachedReloc>,
+    elf_types: Vec<(u32, u32)>,
     unwind: Option<FunctionUnwind>,
 }
 
@@ -123,6 +124,7 @@ impl From<&Code> for CachedCode {
                     addend: it.addend,
                 })
                 .collect(),
+            elf_types: code.elf_types.clone(),
             unwind: code.unwind.clone(),
         }
     }
@@ -148,6 +150,7 @@ impl CachedCode {
                     addend: it.addend,
                 })
                 .collect(),
+            elf_types: self.elf_types.clone(),
             unwind: self.unwind.clone(),
         }
     }
@@ -181,7 +184,7 @@ impl StoredCode {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 1");
+        hasher.update(b"rustd llvm 2");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
         for (_, name) in func.params.user_named_funcs().iter() {
