@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """storefull.py: a store on a disk that has no room.
 
-The store is on a small file system of its own (a tmpfs, mounted with sudo), and a file next
-to it takes up all but so many bytes, so that the daemon runs out of room at another place
+The store is on a small file system of its own (a tmpfs, mounted with sudo; on macOS an HFS+
+disk image that `hdiutil` makes and attaches, which needs no sudo), and a file next to it takes up all but so many bytes, so that the daemon runs out of room at another place
 each time: before it can say which format the store is of, when it opens its pack, in the
 middle of the records, and when it seals. Each time:
 
@@ -40,9 +40,16 @@ class Disk:
     def __init__(self, work):
         self.at = os.path.join(work, "disk")
         os.mkdir(self.at)
-        options = f"size={SIZE},uid={os.getuid()},gid={os.getgid()},mode=700"
-        mounted = subprocess.run(["sudo", "-n", "mount", "-t", "tmpfs", "-o", options, "tmpfs", self.at],
-                                 capture_output=True, text=True)
+        if sys.platform == "darwin":
+            image = os.path.join(work, "disk.dmg")
+            made = subprocess.run(["hdiutil", "create", "-size", str(SIZE), "-fs", "HFS+", "-volname", "rustdfull", image],
+                                  capture_output=True, text=True)
+            mounted = made if made.returncode != 0 else subprocess.run(
+                ["hdiutil", "attach", image, "-nobrowse", "-owners", "off", "-mountpoint", self.at], capture_output=True, text=True)
+        else:
+            options = f"size={SIZE},uid={os.getuid()},gid={os.getgid()},mode=700"
+            mounted = subprocess.run(["sudo", "-n", "mount", "-t", "tmpfs", "-o", options, "tmpfs", self.at],
+                                     capture_output=True, text=True)
         if mounted.returncode != 0:
             fail(f"a small file system could not be mounted (sudo is needed): {mounted.stderr.strip()}")
         self.store, self.ballast = os.path.join(self.at, "store"), os.path.join(self.at, "ballast")
@@ -63,12 +70,16 @@ class Disk:
         return self.free()
 
     def unmount(self):
-        subprocess.run(["sudo", "-n", "umount", self.at], capture_output=True)
+        leave = ["hdiutil", "detach", "-force", self.at] if sys.platform == "darwin" else ["sudo", "-n", "umount", self.at]
+        subprocess.run(leave, capture_output=True)
 
 
 def built_without(checkout, disk, room):
     """A daemon on a store with `room` bytes builds, and says what it could not keep."""
     shutil.rmtree(disk.store, ignore_errors=True)
+    # A directory takes room too where the file system is not one of memory.
+    if os.path.exists(disk.ballast):
+        os.remove(disk.ballast)
     os.mkdir(disk.store)
     left = disk.leave(room)
     checkout.set(room % 7)

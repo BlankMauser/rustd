@@ -2172,10 +2172,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
+        let macho = product.object.format() == cranelift_object::object::BinaryFormat::MachO;
+        let debugged = self.debug.is_some();
         if let Some(debug) = self.debug {
             debug.emit(&mut product).map_err(CodegenError::Backend)?;
         }
-        product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
+        let mut object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        if macho && debugged {
+            DebugContext::settle_macho(&mut object).map_err(CodegenError::Backend)?;
+        }
+        Ok(object)
     }
 
     /// The object as a relocatable wasm object. Nothing unwinds there, so there are no

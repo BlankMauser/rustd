@@ -51,12 +51,11 @@ pub(super) fn emit(
     } else {
         optimization
     };
-    let context = Context::create();
-    let module = context.create_module("rustd");
-    Machine::with(optimization, |machine| {
+    Machine::with(optimization, |machine, context| {
+        let module = context.create_module("rustd");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
-        tally.time(Phase::Lower, || lower::Lowering::lower(&context, &module, func))?;
+        tally.time(Phase::Lower, || lower::Lowering::lower(context, &module, func))?;
         if std::env::var_os("RUSTD_DUMP_LLVM").is_some() {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }
@@ -86,9 +85,8 @@ pub(super) fn emit(
 /// FIXME: assembly LLVM rejects ends the process: its default diagnostic handler exits on an
 /// error, and inkwell has no way to set another.
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    let context = Context::create();
-    let module = context.create_module("rustd_asm");
-    Machine::with(Optimization::NONE, |machine| {
+    Machine::with(Optimization::NONE, |machine, context| {
+        let module = context.create_module("rustd_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
@@ -127,22 +125,35 @@ impl Optimization {
 
 /// The target as LLVM knows it. One per thread and level: making one costs more than a
 /// small function does.
-struct Machine;
+struct Machine {
+    /// Ahead of the context, which it has to be dropped before.
+    target: TargetMachine,
+    /// The context of the module emitted last. The instruction selector of the target keeps
+    /// the source location it saw last, which is metadata of that context, and lets go of
+    /// it when it starts on the next function: the context has to be there until then.
+    emitted: Option<Context>,
+}
 
 impl Machine {
+    /// Runs `work` with the target and a context of its own for what it emits.
     fn with<T>(
         optimization: Optimization,
-        work: impl FnOnce(&TargetMachine) -> Result<T, Unhandled>,
+        work: impl FnOnce(&TargetMachine, &Context) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
-            static MACHINES: RefCell<FxHashMap<Optimization, TargetMachine>> = RefCell::default();
+            static MACHINES: RefCell<FxHashMap<Optimization, Machine>> = RefCell::default();
         }
         MACHINES.with_borrow_mut(|machines| {
             let machine = match machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),
-                Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
+                Entry::Vacant(slot) => {
+                    slot.insert(Machine { target: Self::create(optimization)?, emitted: None })
+                }
             };
-            work(machine)
+            let context = Context::create();
+            let done = work(&machine.target, &context);
+            machine.emitted = Some(context);
+            done
         })
     }
 

@@ -1839,10 +1839,7 @@ fn link(
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
             _ if running => Err(anyhow::anyhow!("the executable is running")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => {
-                let spliced = std::fs::read(patch)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|patch| baseline.splice(&patch));
-                spliced.map(|spliced| (baseline, spliced))
+                baseline.splice(patch).map(|spliced| (baseline, spliced))
             }
             Some(Ok(_)) => Err(anyhow::anyhow!("another executable is asked for")),
             Some(Err(why)) => Err(why),

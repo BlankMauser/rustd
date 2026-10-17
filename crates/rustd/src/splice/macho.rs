@@ -20,7 +20,7 @@
 
 use std::{
     fs::{File, OpenOptions},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail, ensure};
@@ -90,6 +90,8 @@ pub(super) struct Image {
     /// Where the first section starts in the file: the load commands end before it.
     room: usize,
     segments: Vec<Segment>,
+    /// How many sections the segments have: a symbol says which it is in by its number.
+    sections: usize,
     /// Where `commands` has what refers into `__LINKEDIT`.
     at: Commands,
     symbols: FxHashMap<Box<[u8]>, Named>,
@@ -512,6 +514,7 @@ impl Image {
             commands: commands.to_vec(),
             room,
             segments,
+            sections: sections.len(),
             at,
             symbols,
             imports,
@@ -1062,7 +1065,7 @@ impl<'a> Patch<'a> {
     }
 
     /// Lays the patch out where `__LINKEDIT` is and gives everything in it its address.
-    fn place(&self, image: &Image) -> anyhow::Result<Addition> {
+    fn place(&self, image: &Image, object: &DebugObject) -> anyhow::Result<Addition> {
         let linkedit = image.linkedit();
         let (offset, base) = (linkedit.offset, linkedit.address);
         let old_frames = image.frames.bytes.len().next_multiple_of(8);
@@ -1088,6 +1091,7 @@ impl<'a> Patch<'a> {
             placed.insert(index, reserve(self.file.section_by_index(index)?.size() as usize, 8));
         }
         let frames_end = reserve(0, 1);
+        let code_at = frames_end;
         let (mut stubs_at, mut code_end, mut data_at) = (0, 0, 0);
         for (segment, sections) in self.sections.iter().enumerate() {
             for &index in sections {
@@ -1302,6 +1306,32 @@ impl<'a> Patch<'a> {
             redirected += 1;
         }
 
+        // The debug map of the functions, which says they are described by the patch.
+        let mut starts: Vec<u64> =
+            self.file.symbols().filter(|it| it.is_definition()).map(|it| it.address()).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let mut functions = Vec::new();
+        for symbol in self.file.symbols().filter(|it| it.is_definition()) {
+            let Some(index) = symbol.section_index().filter(|it| self.code.contains(it)) else {
+                continue;
+            };
+            let name = symbol.name_bytes()?;
+            // What the assembler names for itself, which a linker leaves out.
+            if name.starts_with(b"l") || name.starts_with(b"L") {
+                continue;
+            }
+            let section = self.file.section_by_index(index)?;
+            let next = starts.get(starts.partition_point(|it| *it <= symbol.address()));
+            let end = section.address() + section.size();
+            functions.push(Function {
+                name,
+                address: base + placed[&index] + symbol.address() - section.address(),
+                size: next.map_or(end, |next| end.min(*next)) - symbol.address(),
+            });
+        }
+        let map = DebugMap { object, functions };
+
         let mut rebases: Vec<u64> = image.rebases.clone();
         let statics: Vec<Defined> = self.in_place.values().flatten().map(|it| it.old).collect();
         rebases
@@ -1314,7 +1344,8 @@ impl<'a> Patch<'a> {
         let text = (base, data_at);
         let data = (base + data_at, linkedit_at - data_at);
         let tables = [(unwind_at, unwind.len()), (frames_at, (frames_end - frames_at) as usize)];
-        let layout = Layout { text, data, tables, rebases, renamed };
+        let code = (base + code_at, code_end - code_at);
+        let layout = Layout { text, data, code, tables, rebases, renamed, map };
         let (commands, linkedit) = layout.linked(image, offset + linkedit_at)?;
         ensure!(
             commands.len() <= image.room,
@@ -1327,11 +1358,68 @@ impl<'a> Patch<'a> {
     }
 }
 
+/// The patch as the file a debugger reads what describes its code from.
+pub(in crate::splice) struct DebugObject {
+    pub(in crate::splice) path: PathBuf,
+    /// When it was written, in seconds: a debugger does not read one written since.
+    pub(in crate::splice) modified: u64,
+}
+
+/// A function of the patch, by where the executable now has it.
+struct Function<'a> {
+    name: &'a [u8],
+    address: u64,
+    size: u64,
+}
+
+/// What the symbol table says of the new code for a debugger: which object describes it,
+/// and where each function of that object is. A linker writes the same of every object.
+struct DebugMap<'a> {
+    object: &'a DebugObject,
+    functions: Vec<Function<'a>>,
+}
+
+impl DebugMap<'_> {
+    /// The entries of the symbol table, and the strings they name, which go `strings` into
+    /// the string table. The code is in the section numbered `section`.
+    fn written(&self, strings: u32, section: u8) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        // An entry of no name names the empty string the rest start with.
+        let mut names = vec![0];
+        let mut name = |bytes: &[u8]| -> anyhow::Result<u32> {
+            let at = strings + u32::try_from(names.len())?;
+            names.extend_from_slice(bytes);
+            names.push(0);
+            Ok(at)
+        };
+        let mut entries = Vec::new();
+        let mut entry = |name: u32, kind: u8, section: u8, described: u16, value: u64| {
+            entries.extend_from_slice(&name.to_le_bytes());
+            entries.extend_from_slice(&[kind, section]);
+            entries.extend_from_slice(&described.to_le_bytes());
+            entries.extend_from_slice(&value.to_le_bytes());
+        };
+        let path = name(self.object.path.as_os_str().as_encoded_bytes())?;
+        entry(path, macho::N_SO, 0, 0, 0);
+        entry(path, macho::N_OSO, 0, 1, self.object.modified);
+        for function in &self.functions {
+            entry(strings, macho::N_BNSYM, section, 0, function.address);
+            entry(name(function.name)?, macho::N_FUN, section, 0, function.address);
+            entry(strings, macho::N_FUN, 0, 0, function.size);
+            entry(strings, macho::N_ENSYM, section, 0, function.address);
+        }
+        entry(strings, macho::N_SO, 1, 0, 0);
+        Ok((entries, names))
+    }
+}
+
 /// Where the splice put what the load commands and `__LINKEDIT` have to say.
-struct Layout {
+struct Layout<'a> {
     /// The address and length of each new segment.
     text: (u64, u64),
     data: (u64, u64),
+    /// The address and length of what the first has of the patch: its code.
+    code: (u64, u64),
+    map: DebugMap<'a>,
     /// `__unwind_info` and `__eh_frame`, by where the first segment has them.
     tables: [(u64, usize); 2],
     rebases: Vec<u64>,
@@ -1339,7 +1427,7 @@ struct Layout {
     renamed: Vec<(u64, u64)>,
 }
 
-impl Layout {
+impl Layout<'_> {
     /// The header and load commands, and `__LINKEDIT` up to its signature at `offset`.
     fn linked(&self, image: &Image, offset: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         let old = image.linkedit();
@@ -1365,7 +1453,7 @@ impl Layout {
             command
         };
         let run = macho::VM_PROT_READ | macho::VM_PROT_EXECUTE;
-        added.extend(segment(b"__RUSTD_TEXT", self.text, run, 2));
+        added.extend(segment(b"__RUSTD_TEXT", self.text, run, 3));
         for (table, (at, len)) in [&image.unwind, &image.frames].into_iter().zip(self.tables) {
             let mut section = commands[table.header..table.header + SECTION].to_vec();
             put64(&mut section, 32, self.text.0 + at);
@@ -1374,6 +1462,17 @@ impl Layout {
             added.extend(section);
             commands[table.header + 2..table.header + 9].copy_from_slice(b"_rustd_");
         }
+        // The code is in a section of its own, for the symbols of it to be in one.
+        let mut section = vec![0; SECTION];
+        section[..6].copy_from_slice(b"__text");
+        section[16..28].copy_from_slice(b"__RUSTD_TEXT");
+        put64(&mut section, 32, self.code.0);
+        put64(&mut section, 40, self.code.1);
+        put32(&mut section, 48, u32::try_from(self.code.0 - old.address + old.offset)?);
+        put32(&mut section, 52, 2);
+        put32(&mut section, 64, macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS);
+        added.extend(section);
+        let code_section = u8::try_from(image.sections + 3).context("too many sections")?;
         added.extend(segment(
             b"__RUSTD_DATA",
             self.data,
@@ -1396,13 +1495,41 @@ impl Layout {
         let mut linkedit = image.linkedit[..within].to_vec();
         linkedit.extend_from_slice(&stream);
         linkedit.extend_from_slice(&image.linkedit[within + len as usize..]);
+        // The debug map goes behind the symbols private to their objects, which the others
+        // and what refers to them by number follow. An executable without such symbols was
+        // linked to have nothing for a debugger, and gets nothing.
+        let (symbols, dynamic) = (image.at.symbols, image.at.indirect);
+        let locals = u32_at(&commands, dynamic + 8)? + u32_at(&commands, dynamic + 12)?;
+        let strings_len = u32_at(&commands, symbols + 20)?;
+        let (entries, names) = match locals {
+            0 => (Vec::new(), Vec::new()),
+            _ => self.map.written(strings_len, code_section)?,
+        };
+        let mapped = u64::from(u32_at(&commands, symbols + 8)?) + u64::from(locals) * NLIST as u64;
+        ensure!(mapped >= rebases + len, "symbols ahead of the fixups");
         let moved = |at: u64| match at {
             0 => 0,
             at if at < rebases + len => at - old.offset + offset,
-            at => at - old.offset + offset + stream.len() as u64 - len,
+            at if at < mapped => at - old.offset + offset + stream.len() as u64 - len,
+            at => at - old.offset + offset + stream.len() as u64 - len + entries.len() as u64,
         };
+        let at = (mapped - old.offset + stream.len() as u64 - len) as usize;
+        ensure!(at <= linkedit.len(), "symbols past the end");
+        linkedit.splice(at..at, entries.iter().copied());
+        let added_symbols = u32::try_from(entries.len() / NLIST)?;
+        let indirect = (moved(u64::from(u32_at(&commands, dynamic + 56)?)) - offset) as usize;
+        for nth in 0..u32_at(&commands, dynamic + 60)? as usize {
+            let symbol = u32_at(&linkedit, indirect + nth * 4)?;
+            let numbered =
+                symbol & (macho::INDIRECT_SYMBOL_LOCAL | macho::INDIRECT_SYMBOL_ABS) == 0;
+            if numbered && symbol >= locals {
+                put32(&mut linkedit, indirect + nth * 4, symbol + added_symbols);
+            }
+        }
         for (entry, address) in &self.renamed {
-            put64(&mut linkedit, (moved(*entry) - offset) as usize + 8, *address);
+            let entry = (moved(*entry) - offset) as usize;
+            linkedit[entry + 5] = code_section;
+            put64(&mut linkedit, entry + 8, *address);
         }
         // The signature is looked for right behind the strings, which end the rest, at the
         // next multiple of sixteen: what filled up to the old one is not kept.
@@ -1414,6 +1541,7 @@ impl Layout {
             "strings that are not the last of `__LINKEDIT`"
         );
         linkedit.truncate((strings - offset) as usize);
+        linkedit.extend_from_slice(&names);
         linkedit.resize(linkedit.len().next_multiple_of(16), 0);
         let signed = offset + linkedit.len() as u64;
         let signature = image.signature.len(signed) as u64;
@@ -1426,6 +1554,11 @@ impl Layout {
             let at = moved(u64::from(u32_at(&commands, field)?));
             put32(&mut commands, field, u32::try_from(at)?);
         }
+        for field in [symbols + 12, dynamic + 12, dynamic + 16, dynamic + 24] {
+            let count = u32_at(&commands, field)?;
+            put32(&mut commands, field, count + added_symbols);
+        }
+        put32(&mut commands, symbols + 20, strings_len + u32::try_from(names.len())?);
         put32(&mut commands, fixups + 8, u32::try_from(offset + within as u64)?);
         put32(&mut commands, fixups + 12, u32::try_from(stream.len())?);
         put32(&mut commands, image.at.signature + 8, u32::try_from(signed)?);
@@ -1464,6 +1597,7 @@ pub(super) fn splice(
     undo: &mut Vec<(u64, Vec<u8>)>,
     stamp: &mut Stamp,
     patch: &[u8],
+    object: &DebugObject,
 ) -> anyhow::Result<Spliced> {
     let patch = Patch::read(patch, image)?;
     let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
@@ -1471,7 +1605,7 @@ pub(super) fn splice(
         baked.iter().all(|it| defined.contains(&**it)),
         "a function the executable was linked with a patch of is as it first was"
     );
-    let addition = patch.place(image)?;
+    let addition = patch.place(image, object)?;
 
     ensure!(Stamp::of(&File::open(path)?)? == *stamp, "the executable was written by someone else");
     let mut copy = path.as_os_str().to_owned();

@@ -191,7 +191,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             pads: FxHashMap::default(),
             frame: None,
             arrival: None,
-            marks: (target.object_format == ObjectFormat::Elf)
+            marks: matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO)
                 .then(|| Marks::new(module, function)),
         };
         lowering.body()?;

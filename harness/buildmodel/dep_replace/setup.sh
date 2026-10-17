@@ -3,7 +3,7 @@ set -e
 mkdir -p registry/index/3/d registry/crates stage/dep-0.1.0
 cp -r published/Cargo.toml published/src stage/dep-0.1.0/
 tar -czf registry/crates/dep-0.1.0.crate -C stage dep-0.1.0
-sum=$(sha256sum registry/crates/dep-0.1.0.crate | cut -d' ' -f1)
+sum=$(shasum -a 256 registry/crates/dep-0.1.0.crate | cut -d' ' -f1)
 echo '{"name":"dep","vers":"0.1.0","deps":[],"cksum":"'$sum'","features":{},"yanked":false}' > registry/index/3/d/dep
 rm -rf stage
 sed "s|@HERE@|$PWD|" Cargo.toml.in > Cargo.toml

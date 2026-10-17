@@ -37,7 +37,9 @@ use cranelift_module::FuncId;
 use cranelift_object::{
     ObjectProduct,
     object::{
-        BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind,
+        self, BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind,
+        macho,
+        read::macho::{MachHeader, Section as _, Segment as _},
         write::{Relocation, SymbolId},
     },
 };
@@ -192,10 +194,10 @@ pub(super) struct DebugContext {
 
 impl DebugContext {
     /// The unit of an object for `isa` whose files are named from `directory`, or `None`
-    /// where the tables are not written yet: only ELF has them.
+    /// where the tables are not written yet: ELF and Mach-O have them.
     pub(super) fn new(isa: &dyn TargetIsa, directory: &str) -> Option<Self> {
-        if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf
-            || super::Target::current().is_wasm()
+        use target_lexicon::BinaryFormat::{Elf, Macho};
+        if !matches!(isa.triple().binary_format, Elf | Macho) || super::Target::current().is_wasm()
         {
             return None;
         }
@@ -221,9 +223,12 @@ impl DebugContext {
         root.set(DW_AT_comp_dir, AttributeValue::StringRef(directory));
         root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
         root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
-        // FIXME: variables are told of on x86-64 alone, by `rbp`.
-        let frame = (isa.triple().architecture == target_lexicon::Architecture::X86_64)
-            .then_some(gimli::X86_64::RBP);
+        // FIXME: variables are told of where the frame pointer is known by name here.
+        let frame = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_64 => Some(gimli::X86_64::RBP),
+            target_lexicon::Architecture::Aarch64(_) => Some(gimli::AArch64::X29),
+            _ => None,
+        };
         Some(DebugContext {
             dwarf,
             files: FxHashMap::default(),
@@ -372,9 +377,12 @@ impl DebugContext {
 
     /// Writes the sections into the object, when it has a function to describe.
     pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<(), String> {
-        if self.ranges.is_empty() || product.object.format() != BinaryFormat::Elf {
+        if self.ranges.is_empty() {
             return Ok(());
         }
+        // The linker of Mach-O leaves these sections in the object, where a debugger reads
+        // them as they are: an offset into another of them is written out, not relocated.
+        let macho = product.object.format() == BinaryFormat::MachO;
         let ranges = self.dwarf.unit.ranges.add(RangeList(self.ranges));
         let root = self.dwarf.unit.root();
         self.dwarf.unit.get_mut(root).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
@@ -388,8 +396,11 @@ impl DebugContext {
                     SectionId::DebugStr | SectionId::DebugLineStr => SectionKind::DebugString,
                     _ => SectionKind::Debug,
                 };
-                let name = id.name().as_bytes().to_vec();
-                let placed_at = product.object.add_section(Vec::new(), name, kind);
+                let (segment, name) = match macho {
+                    true => (&b"__DWARF"[..], id.name().replacen('.', "__", 1)),
+                    false => (&[][..], id.name().to_owned()),
+                };
+                let placed_at = product.object.add_section(segment.to_vec(), name.into(), kind);
                 product.object.section_mut(placed_at).set_data(section.bytes.slice().to_vec(), 1);
                 placed.insert(id, placed_at);
             }
@@ -400,6 +411,13 @@ impl DebugContext {
             for reloc in &section.relocs {
                 let (symbol, addend) = match reloc.target {
                     Target::Function(func) => function_place(product, func),
+                    Target::Section(_) if macho => {
+                        let value = &reloc.addend.to_le_bytes()[..usize::from(reloc.size)];
+                        product.object.section_mut(at).data_mut()[reloc.offset as usize..]
+                            [..value.len()]
+                            .copy_from_slice(value);
+                        continue;
+                    }
                     Target::Section(section) => {
                         let Some(&section) = placed.get(&section) else {
                             return Err(format!("{} points to a section left out", id.name()));
@@ -427,6 +445,46 @@ impl DebugContext {
             }
             Ok(())
         })
+    }
+
+    /// Makes the addresses the debug sections of the Mach-O object `bytes` hold the ones the
+    /// code has in the object, which is how a reader that relocates nothing finds what they
+    /// are of: [`Self::emit`] left them as offsets into the section they are relocated by.
+    pub(super) fn settle_macho(bytes: &mut [u8]) -> Result<(), String> {
+        let malformed = |e: object::read::Error| e.to_string();
+        let endian = object::LittleEndian;
+        let header =
+            macho::MachHeader64::<object::LittleEndian>::parse(&*bytes, 0).map_err(malformed)?;
+        let mut sections = Vec::new();
+        let mut commands = header.load_commands(endian, &*bytes, 0).map_err(malformed)?;
+        while let Some(command) = commands.next().map_err(malformed)? {
+            if let Some((segment, data)) = command.segment_64().map_err(malformed)? {
+                sections.extend_from_slice(segment.sections(endian, data).map_err(malformed)?);
+            }
+        }
+        let mut settled = Vec::new();
+        for section in sections.iter().filter(|it| it.segment_name() == b"__DWARF") {
+            for reloc in section.relocations(endian, &*bytes).map_err(malformed)? {
+                let reloc = reloc.info(endian);
+                let target = (reloc.r_symbolnum as usize).checked_sub(1);
+                let Some(target) = target.and_then(|it| sections.get(it)) else {
+                    return Err("a debug section relocated by no section".to_owned());
+                };
+                if reloc.r_extern || reloc.r_type != macho::ARM64_RELOC_UNSIGNED {
+                    return Err("a debug section relocated by more than an address".to_owned());
+                }
+                let at = section.offset(endian) as usize + reloc.r_address as usize;
+                settled.push((at, 1usize << reloc.r_length, target.addr(endian)));
+            }
+        }
+        for (at, size, address) in settled {
+            let place = bytes.get_mut(at..at + size).ok_or("a relocation outside the object")?;
+            let mut value = [0; 8];
+            value[..size].copy_from_slice(place);
+            let value = u64::from_le_bytes(value).wrapping_add(address);
+            place.copy_from_slice(&value.to_le_bytes()[..size]);
+        }
+        Ok(())
     }
 }
 

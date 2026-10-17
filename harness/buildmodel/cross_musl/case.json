@@ -4,5 +4,6 @@
   "crates": [
     "app"
   ],
-  "target": "x86_64-unknown-linux-musl"
+  "target": "x86_64-unknown-linux-musl",
+  "hosts": "-linux-"
 }

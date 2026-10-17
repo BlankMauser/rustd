@@ -14,6 +14,7 @@ A row is one of
   supported  the same output, every function of the named crates compiled by rustd
   refused    rustd said why it does not build this, and built nothing that runs differently
   WRONG      different output, a crash, or a refusal without a reason
+  skipped    the case is not one of this host (`hosts` in its `case.json`), and nothing was built
 and the run fails on any WRONG row and on any row that is not what its `case.json` expects.
 
 `case.json`:
@@ -28,6 +29,8 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   cargo     more arguments to cargo: ["--release"], ["--features", "x"]
   rustd     more arguments to rustd
   target    the triple to build for when it is not the host
+  hosts     what the triple of the host has to contain for the case to mean anything: "-linux-"
+            for one that needs a Linux cross toolchain. Elsewhere the row is `skipped`, and says so
   env       the environment of both builds
   run       a script of the case that runs what was built in place of running it directly;
             it is given ARTIFACT, and RUSTD_OBJECTS with rustd's objects for the second build
@@ -144,7 +147,7 @@ class Case:
         mine, other = ("target-ref", "target") if "/target-ref/" in artifact else ("target", "target-ref")
         libraries = [d for t in (mine, other) for d in glob.glob(os.path.join(self.ws, t, "**", "deps"), recursive=True)]
         libraries += glob.glob(os.path.join(self.sysroot(env), "lib", "rustlib", "*", "lib"))
-        env = {**env, "LD_LIBRARY_PATH": ":".join(libraries)}
+        env = {**env, "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH": ":".join(libraries)}
         try:
             run = subprocess.run(command, cwd=self.ws, capture_output=True, timeout=120, env=env)
         except subprocess.TimeoutExpired:
@@ -236,7 +239,9 @@ class Case:
         """Runs the steps of the case against one daemon: (what, verdict, detail) of each."""
         link = self.link
         obj, patch, binary = (os.path.join(self.work, f"daemon.{n}") for n in ("o", "patch.o", "bin"))
-        socket, log_path = os.path.join(self.work, "rustd.sock"), os.path.join(self.work, "daemon.log")
+        # Not in the scratch copy: the path of a socket is at most 104 bytes on macOS.
+        short = tempfile.mkdtemp(prefix="bm-", dir="/tmp")
+        socket, log_path = os.path.join(short, "rustd.sock"), os.path.join(self.work, "daemon.log")
         line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
         ask = ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
         log = open(log_path, "a")
@@ -251,6 +256,7 @@ class Case:
             return [self.step(step, env, daemon, socket, binary) for step in self.spec["steps"]]
         finally:
             daemon.kill()
+            shutil.rmtree(short, ignore_errors=True)
 
     def step(self, step, env, daemon, socket, binary):
         for path, old, new in step.get("edit", []):
@@ -281,6 +287,8 @@ class Case:
     def row(self):
         """The case's line of the table."""
         steps = []
+        if self.spec.get("hosts", "") not in host():
+            return ("skipped", f"a case of hosts with `{self.spec['hosts']}` in their triple, and this is {host()}", steps)
         if "unbuilt" in self.spec:
             return ("refused", self.spec["unbuilt"], steps)
         env = dict(self.env)
@@ -330,7 +338,7 @@ def differ(want, got):
 def said(why):
     """A reason as the table has it: without the scratch directory, which is another each run."""
     why = re.sub(r"^(Error: )?(daemon: )?(error: )?", "", why)
-    return re.sub(r"/tmp/rustd-bm-[^/ ]*/", "", why).replace("|", "/")[:240]
+    return re.sub(r"\S*/rustd-bm-[^/ ]*/", "", why).replace("|", "/")[:240]
 
 
 def main():
@@ -350,7 +358,7 @@ def main():
         for case, (verdict, detail, steps) in zip(cases, rows):
             name, backend = case.name, case.backend
             expect = case.spec.get("expect", "supported")
-            unexpected = verdict != "WRONG" and verdict != expect
+            unexpected = verdict not in ("WRONG", "skipped", expect)
             failed = verdict == "WRONG" or unexpected or any(s[1] == "WRONG" for s in steps)
             bad += failed
             print(f"{name:34} {backend:9} {verdict:9} {'(expected ' + expect + ') ' if unexpected else ''}{detail[:200]}", flush=True)
@@ -362,7 +370,8 @@ def main():
     if a.table:
         write_table(a.table, table)
     wrong = sum(t[3] == "WRONG" or any(s[1] == "WRONG" for s in t[5]) for t in table)
-    print(f"{len(table) - bad} of {len(table)} as expected, {wrong} WRONG")
+    skipped = sum(t[3] == "skipped" for t in table)
+    print(f"{len(table) - bad - skipped} of {len(table) - skipped} as expected, {wrong} WRONG, {skipped} skipped for the host")
     sys.exit(1 if bad else 0)
 
 

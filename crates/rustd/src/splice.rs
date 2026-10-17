@@ -134,7 +134,8 @@ impl Baseline {
 
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
-    pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {
+    pub(crate) fn splice(&mut self, written: &Path) -> anyhow::Result<Spliced> {
+        let patch = &*std::fs::read(written)?;
         let (addition, len) = match &self.image {
             Executable::Elf(image) => {
                 let patch = Patch::read(patch, image)?;
@@ -154,7 +155,12 @@ impl Baseline {
             }
             Executable::MachO(image) => {
                 let Baseline { path, baked, undo, stamp, .. } = self;
-                return macho::splice(image, path, baked, undo, stamp, patch);
+                let modified = std::fs::metadata(written)?.modified()?;
+                let object = macho::DebugObject {
+                    path: std::path::absolute(written)?,
+                    modified: modified.duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+                };
+                return macho::splice(image, path, baked, undo, stamp, patch, &object);
             }
         };
 

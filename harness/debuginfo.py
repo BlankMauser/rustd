@@ -9,6 +9,12 @@ workspace's own files that the cargo build prints: the same functions at the sam
 `llvm-dwarfdump --verify` has to find nothing wrong with any of the binaries, and gdb has to stop
 at a line of a function rustd compiled, say where it is, and step to other lines of it.
 
+On macOS the linker leaves the DWARF in the objects and names them in the executable's debug map.
+The backtraces, lldb (in gdb's place) and `atos` all read it through that map; what is verified
+and counted is the dSYM `dsymutil` gathers through it, which has to come out without a warning
+about an object of rustd's. DEBUGINFO_LLDB names the debugger to run where plain `lldb` may not
+take over a process (`sudo -n lldb`).
+
 Then the cost: the time and the size of the corpus's object with and without debug info, and
 whether rustd leaves it out when the profile says `debug = false`.
 
@@ -16,7 +22,7 @@ RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail 
                      jumps, so a frame the cargo build prints may be missing: those are counted.
 --only NAME          one of: corpus stress rung2 edits cost
 """
-import os, re, shutil, struct, subprocess, sys, tempfile, time
+import os, re, shlex, shutil, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -25,7 +31,11 @@ import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs, built
 
 LLVM = os.environ.get("RUSTD_BACKEND") == "llvm"
-DWARFDUMP = shutil.which("llvm-dwarfdump") or shutil.which("llvm-dwarfdump-20") or "/usr/lib/llvm-20/bin/llvm-dwarfdump"
+MACHO = sys.platform == "darwin"
+DWARFDUMP = (shutil.which("llvm-dwarfdump") or shutil.which("llvm-dwarfdump-20")
+             or ("dwarfdump" if MACHO else "/usr/lib/llvm-20/bin/llvm-dwarfdump"))
+LLDB = shlex.split(os.environ.get("DEBUGINFO_LLDB", "lldb"))
+DEBUGGER = "lldb" if MACHO else "gdb"
 PANIC = 'if std::env::var_os("DEBUGINFO_PANIC").is_some() { drop(std::panic::take_hook()); panic!("deliberate"); }'
 # What rustc calls the code that drops a coroutine, which rustd has the coroutine itself do.
 DROP_GLUE = re.compile(r"^core::ptr::drop_glue::<(.*)>$")
@@ -93,10 +103,15 @@ fn main() {
     println!("{}", area(10, 2.5, "abc"));
 }
 """
-# What gdb is to print of each, stopped at the `println!` of `area`.
-LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline::Point {x: 3, y: -4}"),
-          ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
-          ("*borrowed", "sline::Point {x: 3, y: -4}")]
+# What gdb is to print of each, stopped at the `println!` of `area`, and what lldb is, which has
+# no notion of Rust and prints them as the C they would be.
+LOCALS = [("width", "10", "10"), ("scale", "2.5", "2.5"), ("name", '"abc"', '(data_ptr = "abc", length = 3)'),
+          ("point", "sline::Point {x: 3, y: -4}", "(x = 3, y = -4)"),
+          ("pair", "sline::Pair (7, 1.5)", "(__0 = '\\a', __1 = 1.5)"),
+          ("list", "[1, 2, 3]", "([0] = 1, [1] = 2, [2] = 3)"),
+          ("tuple", "(true, 99 'c', 9)", "(__0 = true, __1 = U+0x00000063 U'c', __2 = 9)"), ("sum", "31", "31"),
+          ("*borrowed", "sline::Point {x: 3, y: -4}", "(x = 3, y = -4)")]
+LOCALS = [(name, lldb if MACHO else gdb) for name, gdb, lldb in LOCALS]
 # (what the step is, [(old, new)])
 EDITS = [
     ("nothing edited", []),
@@ -176,20 +191,65 @@ def compare(tally, what, theirs, ours):
     tally.say(what, "DIFFERENT" if differ else "same", more + (f"; {differ} differ, first {shown}" if differ else ""))
 
 
+GATHERED = {}
+
+
+def dwarf(binary):
+    """The file that has the DWARF of `binary`: itself, or on Mach-O the dSYM that `dsymutil`
+    gathers from the objects its debug map names. What `dsymutil` said is kept in GATHERED."""
+    if not MACHO:
+        return binary
+    stat = os.stat(binary)
+    key = (binary, stat.st_mtime_ns, stat.st_size)
+    if key not in GATHERED:
+        # Not beside the executable, where whoever prints a backtrace would read it in place
+        # of the debug map.
+        out = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-dsym-"), "gathered.dSYM")
+        ran = subprocess.run(["dsymutil", binary, "-o", out], capture_output=True, text=True)
+        GATHERED[key] = (out, [l for l in ran.stderr.splitlines() if re.match(r"(warning|error):", l)])
+    return GATHERED[key][0]
+
+
+def debug_map(binary):
+    """The objects of rustd's that the debug map of a Mach-O executable names, and whether each
+    is as the map says: a debugger refuses one written since the time the map has for it, where
+    it has one. rustc has the linker leave the time out."""
+    stabs = subprocess.run(["dsymutil", "-s", binary], capture_output=True, text=True).stdout
+    found = []
+    for stamp, path in re.findall(r"N_OSO\s*\)\s+\S+\s+\S+\s+([0-9a-f]+) '(.*)'", stabs):
+        if "(" in path or not os.path.exists(path):
+            continue
+        units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", path], capture_output=True, text=True).stdout
+        if re.search(r'DW_AT_producer\s+\("rustd ', units):
+            found.append((path, int(stamp, 16) in (0, int(os.stat(path).st_mtime))))
+    return found
+
+
 def verify(tally, what, binary):
-    read = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True)
-    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
+    read = subprocess.run([DWARFDUMP, "--verify", dwarf(binary)], capture_output=True, text=True)
+    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", dwarf(binary)], capture_output=True, text=True).stdout
     ours = len(re.findall(r'DW_AT_producer\s+\("rustd ', units))
     wrong = read.returncode != 0 or "No errors." not in read.stdout
     said = next((l for l in read.stdout.splitlines() if "error" in l.lower()), "")
     verdict = "INVALID" if wrong else "sound" if ours else "NO UNIT"
     tally.say(f"{what}: llvm-dwarfdump --verify", verdict, said[:80] or f"{ours} units of rustd's")
+    if MACHO:
+        objects = debug_map(binary)
+        stale = [path for path, fresh in objects if not fresh]
+        said = [l for l in GATHERED[max(k for k in GATHERED if k[0] == binary)][1]
+                if any(path in l for path, _ in objects) or "rustd" in l.lower()]
+        verdict = "NOT IN THE MAP" if not objects else "STALE" if stale else "WARNED OF" if said else "gathered"
+        tally.say(f"{what}: the debug map and dsymutil", verdict,
+                  (said or stale or [f"{len(objects)} objects of rustd's, as the map says they are"])[0][:100])
 
 
 def frames_of(binary):
     """Where the code of each frame an unwinder finds starts and ends: the ones in the table
     the `PT_GNU_EH_FRAME` program header leads to. A splice adds frames to that table that
     no section of the file is said to hold."""
+    if MACHO:
+        frames = subprocess.run([DWARFDUMP, "--eh-frame", binary], capture_output=True, text=True).stdout
+        return {int(a, 16): int(b, 16) for a, b in re.findall(r"FDE cie=\S+ pc=([0-9a-f]+)\.\.\.([0-9a-f]+)", frames)}
     data = open(binary, "rb").read()
     phoff, = struct.unpack_from("<Q", data, 0x20)
     phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
@@ -241,6 +301,19 @@ def frames_of(binary):
     return ends
 
 
+def runs_of(binary):
+    """Where each run of code that a unit of rustd's describes starts and ends. `dsymutil` joins
+    the runs of a unit that touch, so on Mach-O they are those of the functions in it."""
+    children = [] if MACHO else ["--show-children=0"]
+    units = subprocess.run([DWARFDUMP, "--debug-info", *children, dwarf(binary)], capture_output=True, text=True).stdout
+    form = r"DW_AT_low_pc\s+\(0x([0-9a-f]+)\)\s+DW_AT_high_pc\s+\(0x([0-9a-f]+)\)" if MACHO else r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)"
+    ours = set()
+    for unit in units.split("DW_TAG_compile_unit")[1:]:
+        if re.search(r'DW_AT_producer\s+\("rustd ', unit):
+            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(form, unit)}
+    return ours
+
+
 def unwinding(tally, what, binary):
     """Whether the functions a debugger is told of are the ones an unwinder is told of.
 
@@ -249,15 +322,13 @@ def unwinding(tally, what, binary):
     filled up to the length of one, for an edit to put that jump there, and the fill is not code
     to unwind from. A `#[naked]` function is its assembly, which says nothing of unwinding and has
     no lines either: one with no entry and no line is that."""
-    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
-    ours = set()
-    for unit in units.split("DW_TAG_compile_unit")[1:]:
-        if re.search(r'DW_AT_producer\s+\("rustd ', unit):
-            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
+    ours = runs_of(binary)
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
-    rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
-    lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
+    rows = subprocess.run([DWARFDUMP, "--debug-line", dwarf(binary)], capture_output=True, text=True).stdout if bare else ""
+    # The row that ends a sequence is at the first address past it, which another function may have.
+    lined = sorted({int(a, 16) for a, flags in re.findall(r"^0x([0-9a-f]{16}) +[1-9]\d*(.*)$", rows, re.M)
+                    if "end_sequence" not in flags})
     without = sum(any(a <= row < b for row in lined) for a, b in bare)
     beyond = sum(a in ends and ends[a] > b for a, b in ours)
     filled = sum(a in ends and ends[a] < b for a, b in ours)
@@ -288,14 +359,85 @@ def profiler(tally, what, binary, cwd, crates):
               + (f": {lost[0][:60]}" if lost else ""))
 
 
+def symbolizer(tally, what, binary):
+    """Whether `atos`, which has only the executable and its debug map, says the file and line
+    of the functions rustd compiled: of the first instruction of each that has a line."""
+    starts = {a for a, _ in runs_of(binary)}
+    rows = subprocess.run([DWARFDUMP, "--debug-line", dwarf(binary)], capture_output=True, text=True).stdout
+    # Not the row that ends a sequence, which is at the first address of what follows it.
+    lines = {int(a, 16): line for a, line, flags in re.findall(r"^0x([0-9a-f]{16}) +([1-9]\d*) (.*)$", rows, re.M)
+             if "end_sequence" not in flags}
+    ours = sorted((a, lines[a]) for a in starts if a in lines)
+    if not ours:
+        return tally.say(f"{what}: atos, by the debug map", "NO FUNCTIONS")
+    said = []
+    for at in range(0, len(ours), 500):
+        asked = [f"{a:#x}" for a, _ in ours[at:at + 500]]
+        said += subprocess.run(["atos", "-o", binary, *asked], capture_output=True, text=True).stdout.splitlines()
+    lost = [reply for (a, line), reply in zip(ours, said) if not re.search(rf"\.rs:{line}\)$", reply)]
+    # A function private to its object may have the name of one of another object, and `atos`
+    # then says the line of neither. dsymutil and lldb tell them apart by the object.
+    stabs = subprocess.run(["dsymutil", "-s", binary], capture_output=True, text=True).stdout
+    named = re.findall(r"N_FUN\s*\).* '_(.*)'", stabs)
+    shared = {name for name in named if named.count(name) > 1} if lost else set()
+    alone = [reply for reply in lost if reply.split(" (in ")[0] not in shared]
+    tally.say(f"{what}: atos, by the debug map", "NO LINE" if alone or len(said) != len(ours) else "named",
+              f"{len(ours)} of {len(starts)} functions of rustd's start at a line, {len(lost) - len(alone)} not said for a name"
+              f" two objects have, {len(alone)} others" + (f": {alone[0][-60:]}" if alone else ""))
+
+
 def unit_of(binary, address):
-    found = subprocess.run([DWARFDUMP, f"--lookup={address:#x}", binary], capture_output=True, text=True).stdout
+    found = subprocess.run([DWARFDUMP, f"--lookup={address:#x}", dwarf(binary)], capture_output=True, text=True).stdout
     producer = re.search(r'DW_AT_producer\s+\("([^"]*)"\)', found)
     return producer.group(1) if producer else "nothing"
 
 
+def answers(commands, binary, cwd):
+    """What lldb prints for each of `commands`, in order, or None if it did not come back."""
+    args = [x for c in commands for x in ("-o", c)]
+    try:
+        ran = subprocess.run([*LLDB, "-b", "--no-lldbinit", *args, binary], capture_output=True, text=True,
+                             errors="replace", cwd=cwd, timeout=300)
+    except subprocess.TimeoutExpired:
+        return None
+    parts = re.split(r"^\(lldb\) ", ran.stdout, flags=re.M)[2:]
+    return parts + [""] * (len(commands) - len(parts))
+
+
+def debugger_lldb(tally, what, binary, cwd, place, env):
+    """Has lldb stop at `place` (file:line), say where that is, and step on from there."""
+    file, line = place.rsplit(":", 1)
+    said = f"{what}: lldb at {os.path.basename(file)}:{line}"
+    commands = [*[f"settings set target.env-vars {name}={value}" for name, value in (env or {}).items()],
+                f"breakpoint set -f {file} -l {line}", "run", "thread backtrace -c 3", "image lookup -a $pc",
+                *[x for _ in range(4) for x in ("thread step-in", "frame info")], "process kill"]
+    out = answers(commands, binary, cwd)
+    if out is None:
+        return tally.say(said, "NO ANSWER")
+    out = out[len(env or {}):]
+    stop = re.search(r"stop reason = breakpoint.*?frame #0: \S+ \S+`(.*?) at (\S+?):(\d+)", out[1], re.S)
+    if not stop or stop.group(3) != line or not file.endswith(os.path.basename(stop.group(2))):
+        return tally.say(said, "NOT STOPPED", ((out[0] + out[1]).strip().splitlines() or ["nothing printed"])[-1][:80])
+    address = re.search(r"Address: \S+\[(0x[0-9a-f]+)\]", out[3])
+    if not address:
+        return tally.say(said, "NO ADDRESS")
+    producer = unit_of(binary, int(address.group(1), 16))
+    if not producer.startswith("rustd"):
+        return tally.say(said, "NOT RUSTD'S", f"the code is of {producer}")
+    if not re.search(rf"Summary: .* at \S+:{line}\b", out[3]):
+        return tally.say(said, "NO LINE", out[3].strip()[:80])
+    stepped = {m for part in out[5:12:2] for m in re.findall(r"^frame #0: .*? at (\S+?:\d+)", part, re.M)}
+    stepped = {s for s in stepped if not s.endswith(f":{line}")}
+    if not stepped:
+        return tally.say(said, "NOT STEPPED")
+    frames = len(re.findall(r"^\s+\*? *frame #\d+", out[2], re.M))
+    tally.say(said, "stopped", f"in {stop.group(1)[:40]}, {frames} frames up, stepped to {', '.join(sorted(stepped))[:60]}")
+
+
 def debugger(tally, what, binary, cwd, place, env=None):
     """Has gdb stop at `place` (file:line), say where that is, and step on from there."""
+    if MACHO:
+        return debugger_lldb(tally, what, binary, cwd, place, env)
     commands = ["set pagination off", "set confirm off", "set print demangle off", "set print asm-demangle off",
                 "set startup-with-shell off", f"break {place}", "run", "echo <where>\\n", "bt 3", "echo <mapped>\\n",
                 "info proc mappings", "print/x $pc", "echo <line>\\n", "info line *$pc",
@@ -345,7 +487,7 @@ def call_site(ours):
 def program(tally, what, workspace, crates, package, inject=None):
     ws = workspace
     if inject:
-        ws = tempfile.mkdtemp(prefix=f"rustd-debuginfo-{what}-")
+        ws = os.path.realpath(tempfile.mkdtemp(prefix=f"rustd-debuginfo-{what}-"))
         shutil.copytree(workspace, ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
         path, old, new = inject
         text = open(os.path.join(ws, path)).read()
@@ -362,21 +504,23 @@ def program(tally, what, workspace, crates, package, inject=None):
     if place := call_site(ours):
         debugger(tally, what, fx.binary, fx.ws, place[2:], env)
     else:
-        tally.say(f"{what}: gdb", "NO PLACE")
+        tally.say(f"{what}: {DEBUGGER}", "NO PLACE")
     functions, count = described(fx.binary)
     tally.say(f"{what}: what a debugger is told of", "counted", f"{functions} functions, {count} parameters and locals in them")
-    if not inject:
+    if MACHO:
+        symbolizer(tally, what, fx.binary)
+    elif not inject:
         profiler(tally, what, fx.binary, fx.ws, crates + [package])
     return fx
 
 
 def edits(tally):
     """The program of its own, a step at a time under a daemon."""
-    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-edits-")
+    ws = os.path.realpath(tempfile.mkdtemp(prefix="rustd-debuginfo-edits-"))
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, EDITS_MAIN)):
         open(os.path.join(ws, path), "w").write(text)
-    work = tempfile.mkdtemp(prefix="rustd-debuginfo-out-")
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-debuginfo-out-"))
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
     reference = os.path.join(work, "reference")
     fx = Fixture(ws, ["sline"], ["-p", "sline"])
@@ -425,7 +569,7 @@ def edits(tally):
 
 def described(binary):
     """How many functions rustd's units tell a debugger of, and how many variables in them."""
-    dumped = subprocess.run([DWARFDUMP, "--debug-info", binary], capture_output=True, text=True).stdout
+    dumped = subprocess.run([DWARFDUMP, "--debug-info", dwarf(binary)], capture_output=True, text=True).stdout
     functions = variables = 0
     for unit in dumped.split("DW_TAG_compile_unit")[1:]:
         if re.search(r'DW_AT_producer\s+\("rustd', unit):
@@ -435,11 +579,12 @@ def described(binary):
 
 
 def variables(tally):
-    """Whether gdb prints the parameters and locals of a function of rustd's as they are.
+    """Whether gdb (lldb on macOS) prints the parameters and locals of a function of rustd's as
+    they are.
 
     Only the frames Cranelift lays out say where a local is kept, so under LLVM none is to be
     told of, and one that is would be a guess."""
-    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-locals-")
+    ws = os.path.realpath(tempfile.mkdtemp(prefix="rustd-debuginfo-locals-"))
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
         open(os.path.join(ws, path), "w").write(text)
@@ -448,25 +593,31 @@ def variables(tally):
     fx.rustd_build()
     verify(tally, "locals", fx.binary)
     line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
-    commands = ["set pagination off", "set startup-with-shell off", f"break {MAIN}:{line}", "run",
-                *[x for name, _ in LOCALS for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
-    ran = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], fx.binary],
-                         capture_output=True, text=True, errors="replace", cwd=ws, timeout=300)
-    printed = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name, _ in LOCALS}
+    if MACHO:
+        commands = [f"breakpoint set -f {MAIN} -l {line}", "run", *[f"frame variable {name}" for name, _ in LOCALS], "process kill"]
+        out = answers(commands, fx.binary, ws) or [""] * len(commands)
+        printed = {name: re.search(r"^\(.*?\) \S+ = (.*)", part, re.M) for (name, _), part in zip(LOCALS, out[2:])}
+    else:
+        commands = ["set pagination off", "set startup-with-shell off", f"break {MAIN}:{line}", "run",
+                    *[x for name, _ in LOCALS for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+        ran = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], fx.binary],
+                             capture_output=True, text=True, errors="replace", cwd=ws, timeout=300)
+        printed = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name, _ in LOCALS}
     right = [name for name, value in LOCALS if printed[name] and printed[name].group(1) == value]
     functions, count = described(fx.binary)
     if LLVM:
-        return tally.say("locals: gdb prints them", "GUESSED" if count else "not told of",
+        return tally.say(f"locals: {DEBUGGER} prints them", "GUESSED" if count else "not told of",
                          f"{count} described in {functions} functions: LLVM's frames are not read back yet")
     wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS if name not in right]
-    tally.say("locals: gdb prints them", "printed" if not wrong else "NOT AS THEY ARE",
+    tally.say(f"locals: {DEBUGGER} prints them", "printed" if not wrong else "NOT AS THEY ARE",
               f"{len(right)} of {len(LOCALS)}" + (f", but {wrong[0][:50]}" if wrong else ""))
 
 
 def sections(path):
     """The size of an object, and of the sections of it a debugger reads."""
-    read = subprocess.run(["size", "-A", path], capture_output=True, text=True).stdout
-    debug = sum(int(l.split()[1]) for l in read.splitlines() if l.startswith((".debug_", ".rela.debug_")))
+    size = ["xcrun", "llvm-size"] if MACHO else ["size"]
+    read = subprocess.run([*size, "-A", path], capture_output=True, text=True).stdout
+    debug = sum(int(l.split()[1]) for l in read.splitlines() if l.startswith((".debug_", ".rela.debug_", "__debug_")))
     return os.path.getsize(path), debug
 
 

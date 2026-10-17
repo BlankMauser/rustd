@@ -107,15 +107,19 @@ impl<'data> Emitted<'data> {
     /// Which source location the code is of from each offset on, from the line table: the
     /// lines of it are the source locations `lower` marked the instructions with.
     fn lines(&self) -> Result<Vec<LineRow>, Unhandled> {
-        let Some(section) = self.file.section_by_name(".debug_line") else {
+        let name = match self.file.format() {
+            BinaryFormat::MachO => "__debug_line",
+            _ => ".debug_line",
+        };
+        let Some(section) = self.file.section_by_name(name) else {
             return Ok(Vec::new());
         };
         let malformed = |_| Unhandled::Shape("a line table that does not parse");
         let table = gimli::DebugLine::new(section.data()?, LittleEndian);
         let program = table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(malformed)?;
         let (program, sequences) = program.sequences().map_err(malformed)?;
-        // The function is at the start of the one section of code, which is where a
-        // sequence that is yet to be relocated says it starts.
+        // The function is at the start of the one section of code, which is where the
+        // sequence says it starts.
         let [sequence] = sequences.as_slice() else {
             return Err(Unhandled::Shape("a line table of more than one run of code"));
         };
@@ -123,8 +127,9 @@ impl<'data> Emitted<'data> {
         let mut ranges = Vec::new();
         while let Some((_, row)) = rows.next_row().map_err(malformed)? {
             let line = row.line().map_or(0, |line| line.get());
-            if !row.end_sequence() && line != 0 && row.address() < u64::from(self.code) {
-                ranges.push((row.address() as u32, ir::SourceLoc::new(line as u32)));
+            let offset = row.address() - sequence.start;
+            if !row.end_sequence() && line != 0 && offset < u64::from(self.code) {
+                ranges.push((offset as u32, ir::SourceLoc::new(line as u32)));
             }
         }
         Ok(LineRow::of_ranges(ranges))

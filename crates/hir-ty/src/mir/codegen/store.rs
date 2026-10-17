@@ -387,13 +387,14 @@ impl StoreDir {
 
     fn lock_file(&self) -> io::Result<File> {
         let path = self.dir.join(LOCK_FILE);
-        // Another user's file can be locked without being written.
+        // Another user's file can be locked without being written. When there is none, why
+        // it could not be made is what went wrong: a full disk, say.
         OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
-            .or_else(|_| File::open(&path))
+            .or_else(|made| File::open(&path).map_err(|_| made))
     }
 
     /// Writes a file that readers see all of or not at all, and that is whole after a loss
