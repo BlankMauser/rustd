@@ -31,6 +31,8 @@ BIG = 20 * MIB
 REAL = os.environ.get("RUSTD_S3_REMOTE")
 # An object the harness keeps in a bucket of its own to see that the service reads again.
 PROBE = "harness-probe"
+# The longest a service may be away, in seconds, for a fetch to have to ride it out.
+RIDDEN_OUT = 10
 
 right = total = 0
 def check(what, ok, detail=""):
@@ -455,18 +457,28 @@ def transfers(top, remote):
 
     a, b, address, bucket, name = pushed("server killed and back")
     proxy.rate = 4 * MIB
+    down = []
     def bounce():
         time.sleep(1.5)
         remote.server.kill()
+        start = time.time()
         time.sleep(1)
-        remote.server.start()
+        remote.restart()
+        down.append(time.time() - start)
     bouncing = threading.Thread(target=bounce)
     bouncing.start()
     out = b.rustd("cache", "pull", address)
     bouncing.join()
-    check("the service killed in a fetch and back a second later: taken up",
-          out.returncode == 0 and whole(b, name) and said_number(out.stderr, "transfers resumed") >= 1,
-          out.stderr.strip().split("\n")[0][-70:])
+    # A service is back when it reads again, which is seconds after it listens again and is
+    # not the same every time. rustd waits about 16s for a byte; an outage well under that
+    # has to be ridden out, and a longer one has to end as a service that is gone does.
+    if down[0] < RIDDEN_OUT or out.returncode == 0:
+        taken_up = out.returncode == 0 and whole(b, name) and said_number(out.stderr, "transfers resumed") >= 1
+    else:
+        proxy.rate = None
+        taken_up = out.returncode != 0 and not b.packs() and b.rustd("cache", "pull", address).returncode == 0 and whole(b, name)
+    check("the service killed in a fetch and back: taken up", taken_up,
+          f"reading again after {down[0]:.1f}s; " + out.stderr.strip().split("\n")[0][-90:])
 
     a, b, address, bucket, name = pushed("server killed")
     proxy.rate = 4 * MIB
