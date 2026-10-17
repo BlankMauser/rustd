@@ -347,9 +347,10 @@ address), and become relocations of the function against the function or static 
 function, loads a static, takes the address of one and adds to it in place.
 
 Turned down, with the reason logged: `sym` in `asm!` that is not naked, a `sym` that names
-a generic function or a thread-local static, and a relocation of another kind. The reading
-back is written for ELF too but I only ran it on Windows; the corpus case is
-`cfg(windows)` plus the x86-64 Unix variant of the module, which I did not run.
+a generic function or a thread-local static, and a relocation of another kind. The case is
+in the corpus on x86-64 Unix too and the Linux harness jobs pass with it in CI, but I did
+not check there that rustd compiled it rather than leaving it to rustc. Mach-O relocations
+are not read.
 
 ### CI
 
@@ -366,7 +367,7 @@ file from every other handle, those of the same process too. It reads through th
 that holds the lock now. This is shared code.
 
 The `coverage` workflow fails on this branch as it does on `6d12f21c86`: it is
-rust-analyzer's own, and 18 `hir-ty` tests of type display and incremental queries fail in
+rust-analyzer's own, and 18 tests of `hir-ide` (type display, incremental queries) fail in
 it. I left it alone.
 
 ### Harness results (measured, `3c0a37993e`)
@@ -398,4 +399,4 @@ process read by `option_env!`, and the release profile, each "again" and "elsewh
 
 1. `sym` in `asm!` that is not naked, and `sym` of a generic function.
 2. A variadic function with no named parameter.
-3. The `naked_asm!` relocations on ELF and Mach-O have not been run.
+3. `naked_asm!` with `sym` on Mach-O, and a check on Linux that rustd compiles the ELF case.
