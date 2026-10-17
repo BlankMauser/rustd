@@ -152,6 +152,11 @@ impl LinkLine {
         elf.then(|| LinkLine { env, linker: words[first].clone(), args })
     }
 
+    /// Whether `file` is one of what is linked.
+    pub(crate) fn has(&self, file: &str) -> bool {
+        self.args.iter().any(|it| it == file)
+    }
+
     /// What rustc built that is linked, and the standard library's crates next to it.
     pub(crate) fn rustc_files(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> =

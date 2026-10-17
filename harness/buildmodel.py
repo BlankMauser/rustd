@@ -430,12 +430,20 @@ def doctest_report(stdout):
     """What a run of doctests printed, without what differs from run to run: the order the
     tests finished in, how long they took, and the numbers of the threads."""
     out = re.sub(r"finished in [0-9.]+s", "finished", stdout)
+    # rustdoc builds the examples of an edition 2024 crate as one program and says how long
+    # that took; rustd builds each alone.
+    out = re.sub(r"\nall doctests ran in [0-9.]+s; merged doctests compilation took [0-9.]+s\n", "\n", out)
     out = re.sub(r"thread '(.*?)' \(\d+\) panicked", r"thread '\1' panicked", out)
     blocks = re.split(r"\n(?=---- )", out)
+    # The last failure is followed by the names of all of them and the result.
+    ends = []
+    if len(blocks) > 1:
+        blocks[-1], _, end = blocks[-1].partition("\n\nfailures:\n")
+        ends = sorted(l for l in end.splitlines() if l.startswith("    ")) + [l for l in end.splitlines() if not l.startswith("    ")]
     lines = blocks[0].splitlines()
     tests = sorted(l for l in lines if l.startswith("test ") and not l.startswith("test result"))
     rest = [l for l in lines if l not in tests]
-    return tests + rest + sorted(blocks[1:])
+    return tests + rest + sorted(b.strip("\n") for b in blocks[1:]) + ends
 
 
 def differ(want, got):

@@ -3271,6 +3271,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         let built = build(&db, &table, &args, &mut known, &listed)?;
         eprint!("doctests: ");
         report(&built);
+        doctest::document(&mut db, krate);
         let code = doctest::run(&db, asked, krate, &args.out, emits.triple())?;
         std::process::exit(code);
     }

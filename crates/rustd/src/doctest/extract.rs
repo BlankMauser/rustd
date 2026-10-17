@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use hir::{Adt, AssocItem, HasAttrs, HasSource, Module, ModuleDef};
 use ide_db::{RootDatabase, base_db::SourceDatabase, rust_doc::is_rust_fence};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
-use syntax::{AstNode, TextRange, TextSize};
+use syntax::{AstNode, SyntaxKind, TextRange, TextSize};
 
 /// One code block of the documentation that is a test.
 pub(crate) struct Example {
@@ -118,20 +118,24 @@ impl Found<'_> {
                     self.documented(it, &path);
                     self.items(it.items(db), &path);
                 }
-                ModuleDef::Macro(it) => self.documented(it, &named(it.name(db))),
+                // One of `macro_rules!` is told of where it is written, below.
+                ModuleDef::Macro(it) if !is_macro_rules(db, it) => {
+                    self.documented(it, &named(it.name(db)))
+                }
                 _ => {}
             }
         }
-        for it in module.legacy_macros(db) {
-            // rustdoc has a macro at the root of the crate when it is exported.
-            let path = if is_exported(db, it) { "" } else { path };
+        // A macro is in every module after it: its documentation is where it is written.
+        for it in module.legacy_macros(db).into_iter().filter(|it| is_written_in(db, *it, module)) {
             self.documented(it, &join(path, it.name(db).as_str()));
+        }
+        for it in module.extern_blocks(db) {
+            self.documented(it, path);
         }
         for it in module.impl_defs(db) {
             let Some(source) = it.source(db) else { continue };
             let Some(ty) = source.value.self_ty() else { continue };
-            let ty: String = ty.syntax().text().to_string().split_whitespace().collect();
-            let path = join(path, ty);
+            let path = join(path, shown_type(&ty));
             self.documented(it, &path);
             self.items(it.items(db), &path);
         }
@@ -173,18 +177,13 @@ impl Found<'_> {
     fn documented(&mut self, item: impl HasAttrs, path: &str) {
         let Some(docs) = item.hir_docs(self.db) else { return };
         let text = docs.docs();
-        // Where the documentation starts: a block whose place in a file is not known, one a
-        // macro or `include_str!` wrote, is counted from there.
-        let start = self.place(docs, TextSize::new(0));
+        // rustdoc counts the lines of the text from the line the documentation starts on. That
+        // is not always the line the block is written on: the first line of a `/** */` that
+        // has nothing is not in the text, nor is a `doc` of a `cfg_attr` that is off.
+        let Some((file, first)) = self.start(docs) else { return };
         for block in blocks(text) {
             let Some(marks) = Marks::parse(&block.lang) else { continue };
-            let offset = TextSize::new(block.start as u32);
-            let lines_before = text[..block.start].matches('\n').count();
-            let place = match (self.place(docs, offset), &start) {
-                (Some(place), _) => place,
-                (None, Some((file, line))) => (file.clone(), line + lines_before),
-                (None, None) => continue,
-            };
+            let place = (file.clone(), first + text[..block.start].matches('\n').count());
             if !self.seen.insert((place.0.clone(), place.1, path.to_owned())) {
                 continue;
             }
@@ -198,23 +197,107 @@ impl Found<'_> {
         }
     }
 
-    /// The file and line of the source that `offset` of the documentation is written at.
-    fn place(&self, docs: &hir::Docs, offset: TextSize) -> Option<(PathBuf, usize)> {
-        let (range, _) = docs.find_ast_range(TextRange::empty(offset))?;
-        let file = range.file_id.file_id()?.file_id(self.db);
+    fn path(&self, file: ide_db::base_db::FileId) -> Option<PathBuf> {
         let root = self.db.file_source_root(file).source_root_id(self.db);
         let root = self.db.source_root(root).source_root(self.db);
-        let path = PathBuf::from(root.path_for_file(&file)?.as_path()?.to_string());
-        let line = ide_db::line_index(self.db, file).line_col(range.value.start()).line;
+        Some(PathBuf::from(root.path_for_file(&file)?.as_path()?.to_string()))
+    }
+
+    /// The file the documentation is written in and the line its first comment or attribute
+    /// starts on.
+    fn start(&self, docs: &hir::Docs) -> Option<(PathBuf, usize)> {
+        let db = self.db;
+        // The first character and not the place before it: with nothing written at `mod name;`
+        // that place is in neither file.
+        let first = TextRange::at(TextSize::new(0), TextSize::new(1));
+        let (file, start) = match docs.find_ast_range(first) {
+            Some((range, _)) => {
+                let tree = range.file_id.parse_or_expand(db);
+                let token = tree.token_at_offset(range.value.start()).right_biased()?;
+                // What a macro wrote of its own is where the macro is used, as rustdoc has it.
+                let written =
+                    hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
+                let attr = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::ATTR);
+                let attr = attr.filter(|_| !range.file_id.is_macro());
+                (written.file_id, attr.map_or(written.range, |it| it.text_range()).start())
+            }
+            // The text starts with what a macro wrote, like `include_str!`.
+            None => {
+                let (call, _) = docs.macro_calls().next()?;
+                let call = call.to_in_file_node(db).syntax().original_file_range_rooted(db);
+                let tree = call.file_id.parse(db).syntax_node();
+                let attr = tree.covering_element(call.range).ancestors();
+                let attr = attr.into_iter().find(|it| it.kind() == SyntaxKind::ATTR);
+                if let Some(included) = attr.as_ref().and_then(included) {
+                    let path = self.path(call.file_id.file_id(db))?;
+                    return Some((path.parent()?.join(included), 1));
+                }
+                (call.file_id, attr.map_or(call.range, |it| it.text_range()).start())
+            }
+        };
+        let file = file.file_id(db);
+        let path = self.path(file)?;
+        let line = ide_db::line_index(db, file).line_col(start).line;
         Some((path, line as usize + 1))
     }
 }
 
-fn is_exported(db: &RootDatabase, it: hir::Macro) -> bool {
-    it.source(db).is_some_and(|source| {
-        let attrs = source.value.syntax().children().filter_map(syntax::ast::Attr::cast);
-        attrs.into_iter().any(|it| it.syntax().text().to_string().contains("macro_export"))
-    })
+/// The file a `#[doc = include_str!("file")]` names, as it is written. rustdoc has the
+/// examples of such documentation be in that file, by its lines; not so when the attribute
+/// is in a `cfg_attr` or is what a macro wrote, which are not asked here.
+fn included(attr: &syntax::SyntaxNode) -> Option<String> {
+    let attr = syntax::ast::Attr::cast(attr.clone())?;
+    let syntax::ast::Meta::KeyValueMeta(meta) = attr.meta()? else { return None };
+    let syntax::ast::Expr::MacroExpr(call) = meta.expr()? else { return None };
+    let call = call.macro_call()?;
+    let is_doc = meta.path().is_some_and(|it| it.syntax().text() == "doc");
+    let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
+    let file = call
+        .token_tree()?
+        .syntax()
+        .descendants_with_tokens()
+        .find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
+    (is_doc && includes).then(|| file.value().ok().map(|it| it.into_owned())).flatten()
+}
+
+fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {
+    let source = it.source(db).and_then(|it| it.value.left());
+    matches!(source, Some(syntax::ast::Macro::MacroRules(_)))
+}
+
+/// Whether the macro is one of the items of the module as they are written: its own, or of a
+/// macro that is used there.
+fn is_written_in(db: &RootDatabase, it: hir::Macro, module: Module) -> bool {
+    let Some(source) = it.source(db) else { return false };
+    let written = source.syntax().original_file_range_rooted(db);
+    let tree = written.file_id.parse(db).syntax_node();
+    let around = tree.covering_element(written.range).ancestors();
+    let inline = around.into_iter().find_map(syntax::ast::Module::cast);
+    let inline = inline.map(|it| it.syntax().text_range());
+    let module = module.definition_source(db);
+    module.file_id == hir::HirFileId::from(written.file_id)
+        && match &module.value {
+            hir::ModuleSource::SourceFile(_) => inline.is_none(),
+            hir::ModuleSource::Module(it) => inline == Some(it.syntax().text_range()),
+            hir::ModuleSource::BlockExpr(_) => false,
+        }
+}
+
+/// The type an `impl` is of as rustdoc names it: as the compiler writes it out, where a
+/// reference has its lifetime even when none is written, and with no spaces.
+fn shown_type(ty: &syntax::ast::Type) -> String {
+    let mut shown = String::new();
+    for token in ty.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        if token.kind().is_trivia() {
+            continue;
+        }
+        shown.push_str(token.text());
+        let reference = token.parent().and_then(syntax::ast::RefType::cast);
+        if token.kind() == SyntaxKind::AMP && reference.is_some_and(|it| it.lifetime().is_none()) {
+            shown.push_str("'_");
+        }
+    }
+    shown
 }
 
 /// A code block of a Markdown text.
@@ -296,6 +379,19 @@ mod tests {
             blocks("Text.\n\n```no_run\nlet a = 1;\n```\n\n    let b = 2;\n\n~~~text\nc\n~~~\n");
         let found: Vec<_> = found.iter().map(|it| (it.lang.as_str(), it.code.as_str())).collect();
         assert_eq!(found, [("no_run", "let a = 1;\n"), ("", "let b = 2;\n"), ("text", "c\n")]);
+    }
+
+    #[test]
+    fn type_of_an_impl_as_rustdoc_names_it() {
+        let shown = |ty: &str| {
+            let file = format!("impl<'a, R> T for {ty} {{}}");
+            let file = syntax::ast::SourceFile::parse(&file, syntax::Edition::CURRENT).tree();
+            let found = file.syntax().descendants().find_map(syntax::ast::Impl::cast);
+            shown_type(&found.and_then(|it| it.self_ty()).unwrap())
+        };
+        assert_eq!(shown("&mut Deserializer<R>"), "&'_mutDeserializer<R>");
+        assert_eq!(shown("&'a Map<K, V>"), "&'aMap<K,V>");
+        assert_eq!(shown("IndexMap<K, V, S>"), "IndexMap<K,V,S>");
     }
 
     #[test]

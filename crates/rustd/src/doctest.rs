@@ -86,8 +86,22 @@ impl Wanted {
 /// The flags of rustdoc that take a value and are passed on to rustc for every example.
 const TO_RUSTC: [&str; 6] = ["--cfg", "--check-cfg", "-L", "--extern", "-C", "--cap-lints"];
 
-/// The flags of rustdoc that take a value and say nothing of how an example is built.
-const UNUSED: [&str; 4] = ["--crate-type", "--color", "--error-format", "--diagnostic-width"];
+/// The flags of rustdoc that take a value and say nothing of how an example is built. The
+/// levels of lints are of the documentation itself: rustdoc compiles no example with them.
+const UNUSED: [&str; 12] = [
+    "--crate-type",
+    "--color",
+    "--error-format",
+    "--diagnostic-width",
+    "--allow",
+    "--warn",
+    "--deny",
+    "--forbid",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+];
 
 impl Asked {
     /// Reads rustdoc's arguments. `Err` is why this run is rustdoc's.
@@ -193,6 +207,14 @@ impl Asked {
             args.extend(["--symbols".to_owned(), file.display().to_string()]);
         }
         Ok(Ok(args))
+    }
+
+    /// The file rustc built of the library, as cargo names it with `--extern`.
+    fn library(&self) -> Option<&str> {
+        let externs = self.rustc_args.windows(2).filter(|it| it[0] == "--extern");
+        externs.filter_map(|it| it[1].split_once('=')).find_map(|(name, file)| {
+            (name.rsplit(':').next() == Some(self.crate_name.as_str())).then_some(file)
+        })
     }
 
     /// The object with rustd's code of the library.
@@ -371,6 +393,9 @@ struct Test {
     /// The path and line rustc is to show for the first line of the example.
     shown_path: String,
     line: usize,
+    /// Whether rustdoc builds the example in one program with the others, as it does from
+    /// edition 2024: the test harness of that program names it.
+    in_one: bool,
 }
 
 impl Test {
@@ -386,7 +411,8 @@ impl Test {
         let edition = example.marks.edition.as_deref().unwrap_or(&asked.edition);
         let edition = edition.parse().unwrap_or(Edition::CURRENT);
         let program = Program::of(&example.code, frame, &id, edition);
-        Test { name, marks: example.marks, program, shown_path, line: example.line }
+        let in_one = edition.at_least_2024();
+        Test { name, marks: example.marks, program, shown_path, line: example.line, in_one }
     }
 
     /// The name with what the harness adds for how the example is tested.
@@ -394,6 +420,7 @@ impl Test {
         let how = match &self.marks {
             it if it.compile_fail => " - compile fail",
             it if it.no_run => " - compile",
+            it if it.should_panic && self.in_one => " - should panic",
             _ => "",
         };
         format!("{}{how}", self.name)
@@ -442,13 +469,17 @@ impl Test {
         }
         let binary = dir.join("rust_out");
         let line = asked.link_line(dir)?.context("rustc's link line is of another linker")?;
-        let command = line.command(&[ours], &binary, &dir.join("link.args"))?;
-        let linked = crate::shell(&command).output().context("running the linker")?;
-        anyhow::ensure!(
-            linked.status.success(),
-            "the link with rustd's code failed: {}",
-            String::from_utf8_lossy(&linked.stderr)
-        );
+        // An example that does not name the library is not linked with it: rustd's code of
+        // the library has no place in it either.
+        if asked.library().is_none_or(|it| line.has(it)) {
+            let command = line.command(&[ours], &binary, &dir.join("link.args"))?;
+            let linked = crate::shell(&command).output().context("running the linker")?;
+            anyhow::ensure!(
+                linked.status.success(),
+                "the link with rustd's code failed: {}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+        }
         let ran = match as_asked(&binary).current_dir(&asked.run_in).output() {
             Ok(ran) => ran,
             Err(error) => return Ok(Ended::Failed(format!("Couldn't run the test: {error}"))),
@@ -478,6 +509,18 @@ fn failure(ran: &std::process::Output) -> String {
         }
     }
     shown
+}
+
+/// Has `krate` be read as rustdoc reads a crate whose examples it tests, with `cfg(doc)` and
+/// `cfg(doctest)`: documentation that is only there for them has examples too. The code of
+/// the crate is compiled before, as rustc compiles it.
+pub(crate) fn document(db: &mut RootDatabase, krate: hir::Crate) {
+    use ide_db::base_db::salsa::Setter as _;
+    let krate: ide_db::base_db::Crate = krate.into();
+    let mut cfg = krate.cfg_options(db).clone();
+    cfg.insert_atom(intern::Symbol::intern("doc"));
+    cfg.insert_atom(intern::Symbol::intern("doctest"));
+    krate.set_cfg_options(db).to(cfg);
 }
 
 /// The examples of the library, each as the program rustdoc makes of it, and how many the
@@ -524,7 +567,9 @@ pub(crate) fn run(
                         *next - 1
                     };
                     let Some(test) = tests.get(at) else { break };
-                    let result = test.run(asked, &asked.dir.join(at.to_string()), ours, target);
+                    let dir = asked.dir.join(at.to_string());
+                    let result = test.run(asked, &dir, ours, target);
+                    _ = std::fs::remove_dir_all(&dir);
                     let word = match &result {
                         Ok(Ended::Passed) => "ok",
                         Ok(Ended::Ignored) => "ignored",
