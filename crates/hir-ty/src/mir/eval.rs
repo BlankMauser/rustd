@@ -687,7 +687,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             }
         };
         let span: InFile<SyntaxNodePtr> = match span {
-            MirSpan::ExprId(e) => source_map.expr_syntax(e).ok()?.map(|it| it.into()),
+            MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
+                source_map.expr_syntax(e).ok()?.map(|it| it.into())
+            }
             MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
             MirSpan::BindingId(b) => source_map
                 .patterns_for_binding(b)
