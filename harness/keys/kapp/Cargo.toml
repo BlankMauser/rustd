@@ -8,6 +8,7 @@ extra = ["klib/extra"]
 
 [dependencies]
 klib = { path = "../klib" }
+kdep = { path = "../kdep" }
 
 [lints]
 workspace = true

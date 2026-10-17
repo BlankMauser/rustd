@@ -278,17 +278,15 @@ impl Entry {
     ///
     /// An entry kept with what a debugger is told is not the one kept without.
     ///
-    /// `checks_overflow` is whether the crates cargo builds have `-C overflow-checks`, when
-    /// they agree: code of the standard library that takes the setting of its callers has the
-    /// same name in a build with the checks and in one without.
-    pub(super) fn key(name: &str, debug: bool, checks_overflow: Option<bool>) -> Option<[u8; KEY]> {
+    /// Whether the code checks arithmetic for overflow is in the name.
+    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 5");
+        hasher.update(b"rustd entry 6");
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
         hasher.update(super::Target::selected().ok()?.triple());
-        hasher.update([0, debug as u8, checks_overflow.map_or(2, u8::from)]);
+        hasher.update([0, debug as u8]);
         hasher.update(name);
         Some(hasher.finalize().into())
     }
@@ -333,8 +331,6 @@ pub(super) struct Entries {
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
-    /// Whether the build checks arithmetic for overflow: see [`Entry::key`].
-    checks_overflow: Option<bool>,
     known: Mutex<Known>,
 }
 
@@ -359,12 +355,8 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(
-        store: &'static Store,
-        debug: bool,
-        checks_overflow: Option<bool>,
-    ) -> Entries {
-        Entries { store, debug, checks_overflow, known: Mutex::default() }
+    pub(super) fn new(store: &'static Store, debug: bool) -> Entries {
+        Entries { store, debug, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -388,7 +380,7 @@ impl Entries {
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
             .then(|| {
-                let key = Entry::key(name, self.debug, self.checks_overflow)?;
+                let key = Entry::key(name, self.debug)?;
                 Entry::decode(&self.store.get(&key)?)
             })
             .flatten()
