@@ -468,10 +468,10 @@ fn closures_around(
 ) -> Option<Vec<usize>> {
     let (body, source_map) = Body::with_source_map(db, owner);
     let mut around = Vec::new();
-    if !find_closures(&body, body.root_expr(), target, &mut around) {
+    if !find_closures(body, body.root_expr(), target, &mut around) {
         return None;
     }
-    let order = |closure: ExprId| MacroCalls::around(db, &source_map, closure);
+    let order = |closure: ExprId| MacroCalls::around(db, source_map, closure);
     let mut inside = None;
     let places = around.iter().map(|&closure| {
         let mut beside = Vec::new();
