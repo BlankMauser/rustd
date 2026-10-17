@@ -28,7 +28,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use ide_db::base_db::SourceDatabase as _;
+use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _};
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
@@ -49,7 +49,7 @@ use hir_def::{
 };
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_symbol,
+    exported_symbol, link_name,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -526,6 +526,32 @@ fn rustc_commit(toolchain: &str) -> Option<String> {
     Some(commit.split_once('"')?.0.to_owned())
 }
 
+/// What tells the toolchain whose library was loaded from any other: the name of the built
+/// library the program links, its commit, and the name of its compiler, each of which has
+/// a hash of the toolchain in it. `None` when it has none of them.
+fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String> {
+    let mut identity: Vec<String> = symbol_files
+        .iter()
+        .filter_map(|it| it.file_name()?.to_str())
+        .filter(|it| it.starts_with("libstd-"))
+        .map(str::to_owned)
+        .collect();
+    let toolchain = vfs.iter().find_map(|(_, path)| {
+        let (toolchain, _) = path.as_path()?.as_str().split_once("lib/rustlib/src/rust/")?;
+        Some(toolchain.to_owned())
+    });
+    if let Some(toolchain) = &toolchain {
+        identity.extend(rustc_commit(toolchain));
+        for dir in ["lib", "bin"] {
+            let Ok(entries) = std::fs::read_dir(format!("{toolchain}{dir}")) else { continue };
+            let names = entries.filter_map(|it| it.ok()?.file_name().into_string().ok());
+            identity.extend(names.filter(|it| it.contains("rustc_driver-")));
+        }
+    }
+    identity.sort_unstable();
+    (!identity.is_empty()).then(|| identity.join(" "))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -605,9 +631,13 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = symbol {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name.
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            return Some(symbol);
+        }
         Some(format!("rustd.{id:x}.{path}"))
     }
 
@@ -1432,9 +1462,24 @@ impl ListedCrate {
             .copied()
             .find(|&it| hir::Function::from(it).is_main(db))
             .filter(|_| !has_no_main(db, krate));
-        let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
+        let exported = functions
+            .iter()
+            .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
+            .collect();
         ListedCrate { functions, exported, main }
     }
+}
+
+/// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
+/// through symbols rustc writes for the `#[global_allocator]`, so no call in the source names
+/// these methods, and they run all the same.
+fn serves_allocator(db: &RootDatabase, func: FunctionId) -> bool {
+    let Some(item) = hir::Function::from(func).as_assoc_item(db) else { return false };
+    let AssocItemContainer::Impl(implementation) = item.container(db) else { return false };
+    implementation.trait_(db).is_some_and(|it| {
+        let core = CrateOrigin::Lang(LangCrateOrigin::Core);
+        it.name(db).as_str() == "GlobalAlloc" && it.module(db).krate(db).origin(db) == core
+    })
 }
 
 impl Listed {
@@ -2944,6 +2989,10 @@ fn main() -> anyhow::Result<()> {
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
     let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;
     ide_db::base_db::set_process_env(&mut db, process::own());
+    match toolchain_identity(&vfs, &args.symbol_files) {
+        Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
+        None => eprintln!("store: the toolchain of the library cannot be told from another"),
+    }
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     args.debug = profile::debug(&args.checkout, &args.profile);
