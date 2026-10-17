@@ -62,6 +62,11 @@ impl Target {
 
     /// The triple of what the daemon itself runs on.
     pub fn host() -> &'static str {
+        // The wasm backend writes its own code from Cranelift's IR and only borrows the
+        // settings of an ISA Cranelift has, whatever the compiler itself runs on.
+        if cfg!(feature = "wasm") {
+            return "x86_64-unknown-linux-gnu";
+        }
         // FIXME: the triples of the hosts that have no code emitted for them yet are missing,
         // and `parse` turns those down by name.
         match (std::env::consts::ARCH, std::env::consts::OS) {

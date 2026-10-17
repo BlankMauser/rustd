@@ -88,6 +88,25 @@ impl SymbolTable {
             }
         }
         table.place(unplaced);
+        table.index(symbols);
+        Ok(table)
+    }
+
+    /// The table of the symbols named, for a link that is not read from files.
+    #[allow(dead_code)] // `rustd-wasm` builds this file too, and has no files to read.
+    pub(crate) fn of_names<'a>(names: impl IntoIterator<Item = &'a str>) -> SymbolTable {
+        let mut table = SymbolTable::default();
+        let mut symbols = Vec::new();
+        for name in names {
+            table.add_name(name, &mut symbols);
+        }
+        table.index(symbols);
+        table
+    }
+
+    /// Files the symbols under their paths, once every crate named in one is known.
+    fn index(&mut self, symbols: Vec<Symbol>) {
+        let table = self;
         for Symbol { name, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
@@ -116,7 +135,6 @@ impl SymbolTable {
                 known.push(Placed { name, place });
             }
         }
-        Ok(table)
     }
 
     fn hashed(symbol: &str) -> u64 {
@@ -140,30 +158,34 @@ impl SymbolTable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
-            self.names.insert(Self::hashed(name));
-            // The memory a static points to is a symbol that demangles to the static's path.
-            if name.starts_with("_RNn") {
-                continue;
-            }
-            let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
-            let with_ids = demangled.to_string();
-            for (krate, id) in crate_ids(&with_ids) {
-                match self.crates.get_mut(krate) {
-                    Some(known) if *known != Some(id) => *known = None,
-                    Some(_) => {}
-                    None => {
-                        self.crates.insert(krate.to_owned(), Some(id));
-                    }
+            self.add_name(name, symbols);
+        }
+    }
+
+    fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
+        self.names.insert(Self::hashed(name));
+        // The memory a static points to is a symbol that demangles to the static's path.
+        if name.starts_with("_RNn") {
+            return;
+        }
+        let Ok(demangled) = rustc_demangle::try_demangle(name) else { return };
+        let with_ids = demangled.to_string();
+        for (krate, id) in crate_ids(&with_ids) {
+            match self.crates.get_mut(krate) {
+                Some(known) if *known != Some(id) => *known = None,
+                Some(_) => {}
+                None => {
+                    self.crates.insert(krate.to_owned(), Some(id));
                 }
             }
-            // `{:#}` drops the crate disambiguator hashes.
-            symbols.push(Symbol {
-                name: name.to_owned(),
-                place: V0::place(name),
-                with_ids,
-                path: format!("{demangled:#}"),
-            });
         }
+        // `{:#}` drops the crate disambiguator hashes.
+        symbols.push(Symbol {
+            name: name.to_owned(),
+            place: V0::place(name),
+            with_ids,
+            path: format!("{demangled:#}"),
+        });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when

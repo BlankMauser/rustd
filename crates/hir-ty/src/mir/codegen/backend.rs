@@ -12,8 +12,10 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use stdx::time::Instant;
 
 use super::{CodegenError, Result, fragment::Code, fragment::Recorder};
 
