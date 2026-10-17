@@ -5650,11 +5650,24 @@ pub mod inline_asm {
     }
 
     /// The thread pointer, which nothing but an instruction reads.
+    #[cfg(not(target_vendor = "apple"))]
     fn thread_pointer() -> bool {
         let (first, second): (u64, u64);
         unsafe {
             asm!("mrs {0}, tpidr_el0", out(reg) first, options(nomem, nostack, preserves_flags));
             asm!("mrs {0}, tpidr_el0", out(reg) second);
+        }
+        first != 0 && first == second
+    }
+
+    /// Apple keeps the thread pointer in the read-only register; the other one holds the
+    /// number of the core the thread is on, which is zero on one core and changes.
+    #[cfg(target_vendor = "apple")]
+    fn thread_pointer() -> bool {
+        let (first, second): (u64, u64);
+        unsafe {
+            asm!("mrs {0}, tpidrro_el0", out(reg) first, options(nomem, nostack, preserves_flags));
+            asm!("mrs {0}, tpidrro_el0", out(reg) second);
         }
         first != 0 && first == second
     }
