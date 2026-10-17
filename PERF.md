@@ -144,7 +144,8 @@ Not done yet from the list this file is for:
   been made.
 - No fix has been made. The candidates, from the measurements above, none of them small:
   a refusal costing a whole reload; the first edit after a start with a full store compiling
-  half the program; cargo's generic edit starting over several times.
+  half the program; cargo's generic edit writing the whole object again (why is not measured yet; the
+  cold build's log shows builds of four rounds, so discarded rounds are the first suspect).
 - The frontend errors behind the refused edits (`publish` in cargo after a signature edit is
   taken back, `MatchPattern::eq` in nushell from the start) have not been reduced to cases.
 - The CI job has not run, and its baseline is from another machine than the runner.
