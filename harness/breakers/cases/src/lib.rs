@@ -37,6 +37,7 @@ cases![
     powi,
     avx2_permute,
     macro_statements_as_expr,
+    promoted_unsized,
     dyn_fn_supertrait,
     println_concat,
     wide_bit_set,
