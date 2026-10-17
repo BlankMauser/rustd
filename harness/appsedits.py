@@ -43,7 +43,7 @@ def run(fx, ws, spec, result):
            "--link-cmd", shlex.join(link), "--splice", binary, *symbols]
     log = open(log_path, "a")
     began = time.monotonic()
-    daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask, *fx.rustd_args], stderr=log, stdout=log)
+    daemon = subprocess.Popen([RUSTD, fx.project, "--socket", socket, *ask, *fx.rustd_args], stderr=log, stdout=log)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             result["edits"] = {"error": open(log_path).read()[-1500:]}

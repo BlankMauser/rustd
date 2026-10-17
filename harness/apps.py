@@ -75,6 +75,17 @@ def localize(ws):
         out.write("\n" + marker + replaced)
 
 
+def package_directory(ws, package):
+    """Where the package's manifest is. rustd is asked for the package and not the workspace:
+    a build of one member has the features that member asks for, not every member's."""
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=ws))
+    for found in metadata["packages"]:
+        if found["name"] == package:
+            return os.path.dirname(found["manifest_path"])
+    raise SystemExit(f"no package {package} in {ws}")
+
+
 class App(Fixture):
     """A program and every crate linked into it."""
 
@@ -87,6 +98,7 @@ class App(Fixture):
         self.argv0 = spec.get("bin", spec["package"])
         self.run_env = {**os.environ, **spec.get("env", {})}
         self.stdin = None
+        self.project = package_directory(ws, spec["package"])
 
     def rustc_build(self):
         """Cargo's build, with rustd in rustc's place for every crate when the program is
@@ -109,7 +121,7 @@ class App(Fixture):
         crate = self.crates[0]
         obj, report, log = (os.path.join(self.work, f"all.{ext}") for ext in ("o", "tsv", "stderr"))
         symbols = [x for rlib in self.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        argv = [RUSTD, self.ws, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj,
+        argv = [RUSTD, self.project, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj,
                 "--report", report, *self.rustd_args, *symbols]
         with open(os.path.join(self.work, "all.argv"), "w") as out:
             out.write(shlex.join(argv))
