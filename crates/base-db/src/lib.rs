@@ -103,6 +103,11 @@ impl Files {
         }
     }
 
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.contains_key(&file_id)
+    }
+
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
         match self.files.entry(file_id) {
             Entry::Occupied(mut occupied) => {
