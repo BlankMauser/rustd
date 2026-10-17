@@ -237,9 +237,13 @@ impl Worker {
         command.arg("--out").arg(&first.object).arg("--patch").arg(&first.patch);
         command.arg("--link-cmd").arg(&first.link_cmd).arg("--splice").arg(&first.binary);
         command.arg("--socket").arg(&socket);
-        for file in &first.symbol_files {
-            command.arg("--symbols").arg(file);
-        }
+        // In a file: a program of many crates has more of them than fit the command line
+        // of a process on Windows.
+        let symbols = dir.join("symbols");
+        let listed: String =
+            first.symbol_files.iter().map(|it| format!("{}\n", it.display())).collect();
+        std::fs::write(&symbols, listed)?;
+        command.arg("--symbols-in").arg(&symbols);
         let output = File::create(&log)?;
         command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
         let mut env = crate::process::own();

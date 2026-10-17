@@ -194,6 +194,12 @@ impl Args {
                 "--crate" => krate = Some(value()?),
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
+                "--symbols-in" => {
+                    let listed = value()?;
+                    let listed = std::fs::read_to_string(&listed)
+                        .with_context(|| format!("reading the symbol files in {listed}"))?;
+                    symbol_files.extend(listed.lines().map(PathBuf::from));
+                }
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
                 "--binary" | "--splice" => splice = Some(PathBuf::from(value()?)),
