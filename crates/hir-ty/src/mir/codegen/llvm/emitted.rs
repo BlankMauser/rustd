@@ -34,6 +34,8 @@ pub(super) struct Emitted<'data> {
     /// The sections that are part of the code, in the order they are in `bytes`.
     inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
+    /// How long the function is at the start of `bytes`.
+    code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
 }
@@ -70,6 +72,7 @@ impl<'data> Emitted<'data> {
             placed: FxHashMap::default(),
             inline: Vec::new(),
             bytes: Vec::new(),
+            code: 0,
             align: 1,
             relocs: Vec::new(),
         };
@@ -82,7 +85,7 @@ impl<'data> Emitted<'data> {
             BinaryFormat::Coff => {
                 emitted.place(text, recorder)?;
                 emitted.relocate(recorder)?;
-                emitted.unwind_coff(text)?
+                emitted.unwind_coff()?
             }
             _ => {
                 emitted.place(text, recorder)?;
@@ -92,6 +95,20 @@ impl<'data> Emitted<'data> {
         };
         let Emitted { bytes, align, relocs, .. } = emitted;
         Ok(Code { signature, bytes, align, relocs, unwind })
+    }
+
+    /// Fills the function, which is all of `code`, up to the length of the shortest one
+    /// there may be, and answers how long it is then: what LLVM makes of an empty body is a
+    /// `ret` alone.
+    fn lengthen(code: &mut Vec<u8>) -> Result<u32, Unhandled> {
+        let target = crate::mir::codegen::Target::selected()
+            .map_err(|_| Unhandled::Shape("a target that is not known"))?;
+        if let Some((shortest, filler)) = target.arch.shortest_function()
+            && code.len() < shortest
+        {
+            code.resize(shortest, filler);
+        }
+        Ok(code.len() as u32)
     }
 
     /// Lays out `first` and every section its relocations lead to.
@@ -122,6 +139,9 @@ impl<'data> Emitted<'data> {
             let start = (self.bytes.len() as u64).next_multiple_of(align);
             self.bytes.resize(start as usize, 0);
             self.bytes.extend_from_slice(section.data()?);
+            if index == first {
+                self.code = Self::lengthen(&mut self.bytes)?;
+            }
             self.placed.insert(index, Placement::Inline(start));
             self.inline.push(index);
             for (_, relocation) in section.relocations() {
@@ -301,6 +321,7 @@ impl<'data> Emitted<'data> {
         let section = self.file.section_by_index(text)?;
         self.align = section.align().max(1);
         self.bytes.extend_from_slice(section.data()?);
+        self.code = Self::lengthen(&mut self.bytes)?;
         self.placed.insert(text, Placement::Inline(0));
         self.inline.push(text);
         for (_, relocation) in section.relocations() {
@@ -473,13 +494,20 @@ impl<'data> Emitted<'data> {
     /// The function's entry of `.pdata` as the `UNWIND_INFO` of `.xdata` it names, which is
     /// taken as it is but for the handler: the offsets in it are from the start of the
     /// function.
-    fn unwind_coff(&self, text: SectionIndex) -> Result<Option<FunctionUnwind>, Unhandled> {
+    fn unwind_coff(&self) -> Result<Option<FunctionUnwind>, Unhandled> {
         const MALFORMED: Unhandled = Unhandled::Shape("an unwind table that does not parse");
         /// The first version of `UNWIND_INFO`, without a flag and with those of a handler
         /// that is called both when a handler is looked for and when the frame is unwound.
         const VERSION: u8 = 1;
         const HANDLED: u8 = VERSION | 0b11 << 3;
-        let Some(pdata) = self.file.section_by_name(".pdata") else { return Ok(None) };
+        let code = self.code;
+        // LLVM writes no entry for a function that calls nothing and leaves the stack as it
+        // found it, which the unwinder takes a function without one for. It gets the entry
+        // that says as much: whoever looks for where a function ends looks in `.pdata`.
+        let Some(pdata) = self.file.section_by_name(".pdata") else {
+            let leaf = vec![VERSION, 0, 0, 0];
+            return Ok(Some(FunctionUnwind::from_unwind_info(code, leaf, seh::Pads::default())));
+        };
         let entry = pdata.data()?;
         // Where the function starts, where it ends and where its `UNWIND_INFO` is.
         let &[_, _, _, _, _, _, _, _, a, b, c, d] = entry else {
@@ -508,8 +536,7 @@ impl<'data> Emitted<'data> {
         };
         let mut frame = frame.to_vec();
         frame[0] = VERSION;
-        let code = self.file.section_by_index(text)?.size();
-        Ok(Some(FunctionUnwind::from_unwind_info(code as u32, frame, pads)))
+        Ok(Some(FunctionUnwind::from_unwind_info(code, frame, pads)))
     }
 
     /// The calls with a landing pad of LLVM's table of them, which is a `.gcc_except_table`
