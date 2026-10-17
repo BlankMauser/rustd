@@ -5186,7 +5186,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             path.pop();
                             return dropped;
                         }
-                        this.call_drop_impl(addr, ty)?;
+                        this.call_drop_impl(addr, meta, ty)?;
                         if let AdtId::StructId(id) = adt_def.def_id() {
                             let layout = this.layout(ty)?;
                             this.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
@@ -9752,7 +9752,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ty: Ty<'db>,
     ) -> Result<()> {
         self.guarded(
-            |this| this.call_drop_impl(addr, ty),
+            |this| this.call_drop_impl(addr, meta, ty),
             |this| this.drop_adt_fields(addr, meta, ty),
         )
     }
@@ -9986,6 +9986,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         switch.emit(&mut self.builder, l_discr, done);
                         for (block, variant) in arms {
                             self.builder.switch_to_block(block);
+                            // A constant of a pattern is never in such a variant, and here
+                            // the two are in the same one.
+                            if !self.fields_compare_in_parts(variant.into(), subst, &mut vec![ty]) {
+                                self.builder.ins().jump(differ, &[]);
+                                continue;
+                            }
                             let index = RustcEnumVariantIdx(variant.index(db));
                             let layout = &Layout::for_variant(&layout, index);
                             self.branch_unless_fields_equal(
@@ -10016,6 +10022,46 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether [`Self::branch_unless_equal`] can compare two values of `ty`. `seen` are the
+    /// types that hold this one.
+    fn compares_in_parts(&self, ty: Ty<'db>, seen: &mut Vec<Ty<'db>>) -> bool {
+        let ty = self.normalize(ty);
+        if seen.contains(&ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Str => true,
+            TyKind::Ref(_, inner, _) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+                self.compares_in_parts(inner, seen)
+            }
+            TyKind::Tuple(tys) => tys.iter().all(|ty| self.compares_in_parts(ty, seen)),
+            TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
+                AdtId::UnionId(_) => false,
+                // Each variant is looked at once the two are known to be in it.
+                AdtId::EnumId(_) => true,
+                AdtId::StructId(id) => {
+                    seen.push(ty);
+                    let compares = self.fields_compare_in_parts(id.into(), subst, seen);
+                    seen.pop();
+                    compares
+                }
+            },
+            _ => self.scalar_of(ty).is_ok(),
+        }
+    }
+
+    fn fields_compare_in_parts(
+        &self,
+        variant: VariantId,
+        subst: GenericArgs<'db>,
+        seen: &mut Vec<Ty<'db>>,
+    ) -> bool {
+        self.cg.db.field_types(variant).iter().all(|(_, ty)| {
+            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+            self.compares_in_parts(ty, seen)
+        })
     }
 
     fn branch_unless_fields_equal(
@@ -10122,7 +10168,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.guarded(
                         |this| this.drop_value(pointer, pointee_meta, pointee),
                         |this| {
-                            this.call_drop_impl(addr, ty)?;
+                            this.call_drop_impl(addr, meta, ty)?;
                             this.drop_adt_fields(addr, meta, ty)
                         },
                     )?;
@@ -10348,15 +10394,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(index)
     }
 
-    /// Calls `<ty as Drop>::drop` on the value at `addr`.
-    fn call_drop_impl(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
+    /// Calls `<ty as Drop>::drop` on the value at `addr`, whose metadata is `meta` when the
+    /// type is unsized.
+    fn call_drop_impl(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let Some(drop_fn) = self.interner.lang_items().Drop_drop else {
             unsupported!("no `Drop::drop` lang item");
         };
         let reference =
             Ty::new_ref(self.interner, Region::new_erased(self.interner), ty, Mutability::Mut);
-        let slot = self.scratch();
+        let slot = self.scratch_pair();
         self.builder.ins().store(MEM, addr, slot, 0);
+        if let Some(meta) = meta {
+            self.builder.ins().store(MEM, meta, slot, meta_at());
+        }
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         let unit = Ty::new_unit(self.interner);
         self.call_direct(drop_fn, args, &[(slot, reference)], slot, unit)

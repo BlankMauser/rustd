@@ -44,4 +44,7 @@ cases![
     byte_str_pattern,
     include_not_utf8,
     alias_under_binder,
+    drop_unsized_wrapper,
+    assign_from_break,
+    const_pattern_other_variant,
 ];
