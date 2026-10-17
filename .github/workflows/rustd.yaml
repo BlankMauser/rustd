@@ -88,7 +88,7 @@ jobs:
   windows-harness:
     name: harness (windows, ${{ matrix.backend }})
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -114,9 +114,9 @@ jobs:
         id: llvm
         with:
           path: C:\llvm20
-          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc-pdbutil
       # The release has the libraries, the headers and `llvm-config`, which is all the build
-      # reads. Its libraries want a static libxml2 that it does not have and that nothing
+      # reads, and `llvm-pdbutil`, which debuginfo.py reads a PDB with. Its libraries want a static libxml2 that it does not have and that nothing
       # here calls into, so an archive of nothing stands in for it.
       - name: LLVM 20
         if: steps.llvm.outputs.cache-hit != 'true'
@@ -124,7 +124,7 @@ jobs:
           name="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc"
           curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
           mkdir -p /c/llvm20
-          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe"
+          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe" "$name/bin/llvm-pdbutil.exe"
           rm llvm.tar.xz
           echo '#![no_std]' > nothing.rs
           rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
@@ -153,4 +153,11 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          run debuginfo.py
+          # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
+          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storefull.py
+          run storeshared.py
           exit $failed

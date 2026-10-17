@@ -11,3 +11,6 @@ on_musl = { path = "../on_musl" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 on_arm = { path = "../on_arm" }
+
+[target.'cfg(all(target_arch = "x86_64", target_env = "msvc"))'.dependencies]
+on_msvc = { path = "../on_msvc" }

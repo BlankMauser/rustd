@@ -14,6 +14,7 @@ A row is one of
   supported  the same output, every function of the named crates compiled by rustd
   refused    rustd said why it does not build this, and built nothing that runs differently
   WRONG      different output, a crash, or a refusal without a reason
+  skipped    the case is of another host: a Linux cross target has its linker and runner there
 and the run fails on any WRONG row and on any row that is not what its `case.json` expects.
 
 `case.json`:
@@ -108,6 +109,9 @@ class Case:
         self.work = os.path.join(self.ws, "target-rustd-out")
         os.makedirs(self.work)
         if os.path.exists(os.path.join(self.ws, "setup.sh")):
+            # Where the copy is as a `file://` URL has it, which on Windows is not what `sh` calls it.
+            here = self.ws.replace(os.sep, "/")
+            self.env["BM_HERE"] = here if here.startswith("/") else "/" + here
             setup = subprocess.run(["sh", "setup.sh"], cwd=self.ws, capture_output=True, text=True, env=self.env)
             if setup.returncode != 0:
                 raise Wrong("the case's setup.sh failed: " + (setup.stderr + setup.stdout)[-400:])
@@ -175,7 +179,7 @@ class Case:
             raise Wrong("cargo failed with what rustd needs of it: " + run.stderr[-600:])
         printed = run.stdout + run.stderr
         if whole:
-            printed = "\n".join(l for l in printed.splitlines() if f"/{self.artifact_name()}-" in l)
+            printed = "\n".join(l for l in printed.splitlines() if re.search(rf"[/\\]{re.escape(self.artifact_name())}-", l))
         try:
             line = [a for a in linker_line(printed) if not a.endswith("symbols.o")]
         except SystemExit:
@@ -236,7 +240,8 @@ class Case:
         """Runs the steps of the case against one daemon: (what, verdict, detail) of each."""
         link = self.link
         obj, patch, binary = (os.path.join(self.work, f"daemon.{n}") for n in ("o", "patch.o", "bin"))
-        socket, log_path = os.path.join(self.work, "rustd.sock"), os.path.join(self.work, "daemon.log")
+        # The path of a socket has a limit that the name of a case can take the copy past.
+        socket, log_path = os.path.join(tempfile.mkdtemp(prefix="bm-"), "s"), os.path.join(self.work, "daemon.log")
         line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
         ask = ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
         log = open(log_path, "a")
@@ -251,6 +256,7 @@ class Case:
             return [self.step(step, env, daemon, socket, binary) for step in self.spec["steps"]]
         finally:
             daemon.kill()
+            shutil.rmtree(os.path.dirname(socket), ignore_errors=True)
 
     def step(self, step, env, daemon, socket, binary):
         for path, old, new in step.get("edit", []):
@@ -283,6 +289,8 @@ class Case:
         steps = []
         if "unbuilt" in self.spec:
             return ("refused", self.spec["unbuilt"], steps)
+        if self.target in CROSS and "linux" not in host():
+            return ("skipped", f"{self.target} is built and run from a Linux host: its linker and runner are not of {host()}", steps)
         env = dict(self.env)
         try:
             self.prepare()
@@ -350,7 +358,7 @@ def main():
         for case, (verdict, detail, steps) in zip(cases, rows):
             name, backend = case.name, case.backend
             expect = case.spec.get("expect", "supported")
-            unexpected = verdict != "WRONG" and verdict != expect
+            unexpected = verdict not in ("WRONG", "skipped", expect)
             failed = verdict == "WRONG" or unexpected or any(s[1] == "WRONG" for s in steps)
             bad += failed
             print(f"{name:34} {backend:9} {verdict:9} {'(expected ' + expect + ') ' if unexpected else ''}{detail[:200]}", flush=True)
@@ -362,7 +370,8 @@ def main():
     if a.table:
         write_table(a.table, table)
     wrong = sum(t[3] == "WRONG" or any(s[1] == "WRONG" for s in t[5]) for t in table)
-    print(f"{len(table) - bad} of {len(table)} as expected, {wrong} WRONG")
+    skipped = sum(t[3] == "skipped" for t in table)
+    print(f"{len(table) - bad - skipped} of {len(table) - skipped} as expected, {wrong} WRONG" + (f", {skipped} skipped" if skipped else ""))
     sys.exit(1 if bad else 0)
 
 
