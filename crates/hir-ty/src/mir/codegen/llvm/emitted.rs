@@ -11,7 +11,7 @@ use cranelift_codegen::{
         self, BaseAddresses, CieOrFde, DW_EH_PE_omit, DW_EH_PE_uleb128, EhFrame, EndianSlice,
         LittleEndian, Reader, UnwindSection,
     },
-    ir::{LibCall, Signature},
+    ir::{self, LibCall, Signature},
 };
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
 use object::{
@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 use super::{OWN, Symbol, Unhandled};
 use crate::mir::codegen::{
     ConstBlob,
+    debuginfo::LineRow,
     fragment::{Code, Recorder},
     unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
@@ -38,6 +39,8 @@ pub(super) struct Emitted<'data> {
     code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
+    /// See [`Code::elf_types`].
+    elf_types: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +78,7 @@ impl<'data> Emitted<'data> {
             code: 0,
             align: 1,
             relocs: Vec::new(),
+            elf_types: Vec::new(),
         };
         let unwind = match (emitted.file.format(), emitted.file.architecture()) {
             (BinaryFormat::MachO, _) => {
@@ -98,8 +102,35 @@ impl<'data> Emitted<'data> {
                 emitted.unwind()?
             }
         };
-        let Emitted { bytes, align, relocs, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, unwind })
+        let lines = emitted.lines()?;
+        let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
+        Ok(Code { signature, bytes, align, relocs, elf_types, unwind, lines })
+    }
+
+    /// Which source location the code is of from each offset on, from the line table: the
+    /// lines of it are the source locations `lower` marked the instructions with.
+    fn lines(&self) -> Result<Vec<LineRow>, Unhandled> {
+        let Some(section) = self.file.section_by_name(".debug_line") else {
+            return Ok(Vec::new());
+        };
+        let malformed = |_| Unhandled::Shape("a line table that does not parse");
+        let table = gimli::DebugLine::new(section.data()?, LittleEndian);
+        let program = table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(malformed)?;
+        let (program, sequences) = program.sequences().map_err(malformed)?;
+        // The function is at the start of the one section of code, which is where a
+        // sequence that is yet to be relocated says it starts.
+        let [sequence] = sequences.as_slice() else {
+            return Err(Unhandled::Shape("a line table of more than one run of code"));
+        };
+        let mut rows = program.resume_from(sequence);
+        let mut ranges = Vec::new();
+        while let Some((_, row)) = rows.next_row().map_err(malformed)? {
+            let line = row.line().map_or(0, |line| line.get());
+            if !row.end_sequence() && line != 0 && row.address() < u64::from(self.code) {
+                ranges.push((row.address() as u32, ir::SourceLoc::new(line as u32)));
+            }
+        }
+        Ok(LineRow::of_ranges(ranges))
     }
 
     /// Fills the function, which is all of `code`, up to the length of the shortest one
@@ -430,6 +461,16 @@ impl<'data> Emitted<'data> {
                     elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => Reloc::Arm64Call,
                     elf::R_AARCH64_ADR_PREL_PG_HI21 => Reloc::Aarch64AdrPrelPgHi21,
                     elf::R_AARCH64_ADD_ABS_LO12_NC => Reloc::Aarch64AddAbsLo12Nc,
+                    elf::R_AARCH64_LDST8_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST16_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST32_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST64_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
+                        // The low bits go in in units of what the load or store moves,
+                        // which Cranelift has no kind for: it stands in as an `add`.
+                        self.elf_types.push((offset as u32, r_type));
+                        Reloc::Aarch64AddAbsLo12Nc
+                    }
                     elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
                     elf::R_AARCH64_LD64_GOT_LO12_NC => Reloc::Aarch64Ld64GotLo12Nc,
                     elf::R_AARCH64_TLSDESC_ADR_PAGE21 => Reloc::Aarch64TlsDescAdrPage21,

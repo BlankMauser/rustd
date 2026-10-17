@@ -1011,6 +1011,8 @@ pub enum AsmOperand {
     Const(Operand),
     /// A `label` block, which the template jumps to.
     Label,
+    /// A function or a static, which the template names.
+    Sym(Operand),
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1581,7 +1583,7 @@ impl MirBody<'_> {
                                 input.iter().for_each(|it| operand(it, f));
                                 output.iter().for_each(|it| write(it, f));
                             }
-                            AsmOperand::Const(it) => operand(it, f),
+                            AsmOperand::Const(it) | AsmOperand::Sym(it) => operand(it, f),
                             AsmOperand::Label => (),
                         }
                     }
@@ -1693,7 +1695,9 @@ impl MirBody<'_> {
                                         f(output);
                                     }
                                 }
-                                AsmOperand::Const(value) => for_operand(value, &mut f),
+                                AsmOperand::Const(value) | AsmOperand::Sym(value) => {
+                                    for_operand(value, &mut f)
+                                }
                                 AsmOperand::Label => (),
                             }
                         }
@@ -1772,12 +1776,24 @@ impl MirBody<'_> {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
 pub enum MirSpan {
     ExprId(ExprId),
+    /// Where the expression ends: what leaving a scope does is taken to be written there.
+    ExprEnd(ExprId),
     PatId(PatId),
     BindingId(BindingId),
     SelfParam,
     Unknown,
 }
 impl_from!(ExprId, PatId for MirSpan);
+
+impl MirSpan {
+    /// The end of what this is the whole of.
+    pub fn end(self) -> MirSpan {
+        match self {
+            MirSpan::ExprId(expr) => MirSpan::ExprEnd(expr),
+            other => other,
+        }
+    }
+}
 
 impl From<&ExprId> for MirSpan {
     fn from(value: &ExprId) -> Self {

@@ -32,7 +32,7 @@ use span::Edition;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
-    consteval::ConstEvalError,
+    consteval::{ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     generics::generics,
     infer::{
@@ -491,7 +491,40 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands.push(super::AsmOperand::Label);
                             continue;
                         }
-                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                        AsmOperand::Sym(path) => {
+                            let guard = self.resolver.update_to_inner_scope(
+                                self.db,
+                                self.store_owner,
+                                expr_id,
+                            );
+                            let named = self.resolver.resolve_path_in_value_ns_fully(
+                                self.db,
+                                path,
+                                HygieneId::ROOT,
+                            );
+                            self.resolver.reset_to_guard(guard);
+                            let named = match named {
+                                Some(ValueNs::StaticId(id)) => {
+                                    Operand { kind: OperandKind::Static(id), span: None }
+                                }
+                                // FIXME: one with parameters, whose arguments inference
+                                // does not record for a `sym`.
+                                Some(ValueNs::FunctionId(func))
+                                    if generics(self.db, func.into()).len(true) == 0 =>
+                                {
+                                    Operand::const_zst(Ty::new_fn_def(
+                                        self.interner(),
+                                        CallableDefId::FunctionId(func).into(),
+                                        GenericArgs::empty(),
+                                    ))
+                                }
+                                _ => not_supported!(
+                                    "inline assembly with a `sym` that is not a static or a                                      function without parameters"
+                                ),
+                            };
+                            operands.push(super::AsmOperand::Sym(named));
+                            continue;
+                        }
                     };
                     let input = match input {
                         Some(input) => {
@@ -1245,46 +1278,48 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } else {
                     let source_ty = self.infer.expr_ty(*expr);
                     let target_ty = self.infer.expr_ty(expr_id);
-                    let (it, source_ty, current) =
-                        if let Some(VariantId::EnumVariantId(variant_id)) =
-                            self.infer.variant_resolution_for_expr(*expr)
-                        {
-                            self.lower_variant_discriminant(current, variant_id)?
-                        } else if let TyKind::Adt(adt, _) = source_ty.kind()
-                            && adt.is_enum()
-                        {
-                            let Some((enum_place, current)) =
-                                self.lower_expr_as_place(current, *expr, true)?
-                            else {
-                                return Ok(None);
-                            };
-                            let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
-                            let discr_place: Place<'db> =
-                                self.temp(discr_ty, current, expr_id.into())?.into();
-
-                            self.push_assignment(
-                                current,
-                                discr_place,
-                                Rvalue::Discriminant(enum_place.store()),
-                                expr_id.into(),
-                            );
-                            (
-                                Operand {
-                                    kind: OperandKind::Copy(discr_place.store()),
-                                    span: Some(expr_id.into()),
-                                },
-                                discr_ty,
-                                current,
-                            )
-                        } else {
-                            let Some((it, current)) =
-                                self.lower_expr_to_some_operand(*expr, current)?
-                            else {
-                                return Ok(None);
-                            };
-                            // The operand carries the cast's coercion, e.g. fn item to pointer.
-                            (it, self.expr_ty_after_adjustments(*expr), current)
+                    // A variant named as a value casts to its discriminant; one named as
+                    // its constructor function is a function like any other.
+                    let (it, source_ty, current) = if let Some(VariantId::EnumVariantId(variant_id)) =
+                        self.infer.variant_resolution_for_expr(*expr)
+                        && !matches!(source_ty.kind(), TyKind::FnDef(..))
+                    {
+                        self.lower_variant_discriminant(current, variant_id)?
+                    } else if let TyKind::Adt(adt, _) = source_ty.kind()
+                        && adt.is_enum()
+                    {
+                        let Some((enum_place, current)) =
+                            self.lower_expr_as_place(current, *expr, true)?
+                        else {
+                            return Ok(None);
                         };
+                        let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
+                        let discr_place: Place<'db> =
+                            self.temp(discr_ty, current, expr_id.into())?.into();
+
+                        self.push_assignment(
+                            current,
+                            discr_place,
+                            Rvalue::Discriminant(enum_place.store()),
+                            expr_id.into(),
+                        );
+                        (
+                            Operand {
+                                kind: OperandKind::Copy(discr_place.store()),
+                                span: Some(expr_id.into()),
+                            },
+                            discr_ty,
+                            current,
+                        )
+                    } else {
+                        let Some((it, current)) =
+                            self.lower_expr_to_some_operand(*expr, current)?
+                        else {
+                            return Ok(None);
+                        };
+                        // The operand carries the cast's coercion, e.g. fn item to pointer.
+                        (it, self.expr_ty_after_adjustments(*expr), current)
+                    };
                     // `f as *const ()` and `f as usize` go through a function pointer.
                     let (it, source_ty) = if let TyKind::FnDef(..) = source_ty.kind()
                         && !matches!(target_ty.kind(), TyKind::FnPtr(..))
@@ -1732,22 +1767,39 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     Ok(Some(current))
                 }
                 Array::Repeat { initializer, .. } => {
+                    let TyKind::Array(element, len) = self.expr_ty_without_adjust(expr_id).kind()
+                    else {
+                        return Err(MirLowerError::TypeError(
+                            "Array repeat expression with non array type",
+                        ));
+                    };
                     let Some((init, current)) =
                         self.lower_expr_to_some_operand(*initializer, current)?
                     else {
                         return Ok(None);
                     };
-                    let len = match self.expr_ty_without_adjust(expr_id).kind() {
-                        TyKind::Array(_, len) => len,
-                        _ => {
-                            return Err(MirLowerError::TypeError(
-                                "Array repeat expression with non array type",
-                            ));
+                    if self.names_constant(*initializer) {
+                        let r = Rvalue::Repeat(init, len.store());
+                        self.push_assignment(current, place, r, expr_id.into());
+                        return Ok(Some(current));
+                    }
+                    let span = expr_id.into();
+                    match (&init.kind, try_const_usize(self.db, len)) {
+                        // No element takes the value, so it ends here.
+                        (OperandKind::Copy(value), Some(0)) => {
+                            let value = value.as_ref();
+                            let current = self.drop_assigned(value, element, current, span);
+                            let empty = AggregateKind::Array(element.store());
+                            let r = Rvalue::Aggregate(empty, Box::new([]));
+                            self.push_assignment(current, place, r, span);
+                            Ok(Some(current))
                         }
-                    };
-                    let r = Rvalue::Repeat(init, len.store());
-                    self.push_assignment(current, place, r, expr_id.into());
-                    Ok(Some(current))
+                        _ => {
+                            let r = Rvalue::Repeat(self.moved(init), len.store());
+                            self.push_assignment(current, place, r, span);
+                            Ok(Some(current))
+                        }
+                    }
                 }
             },
             Expr::Literal(l) => {
@@ -2197,6 +2249,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
     }
 
+    /// Whether an expression is a constant item or a `const` block, which an array repeats by
+    /// making it once per element, rather than a value the array takes.
+    fn names_constant(&mut self, expr: ExprId) -> bool {
+        let Expr::Path(path) = &self.store[expr] else {
+            return matches!(self.store[expr], Expr::Const(_));
+        };
+        if let Some((candidate, _)) = self.infer.assoc_resolutions_for_expr(expr) {
+            return matches!(candidate, CandidateId::ConstId(_));
+        }
+        let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
+        let hygiene = self.store.expr_path_hygiene(expr);
+        let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
+        self.resolver.reset_to_guard(guard);
+        matches!(resolved, Some(ValueNs::ConstId(_)))
+    }
+
+    /// The operand that takes the value of the place another operand reads.
+    fn moved(&self, operand: Operand) -> Operand {
+        match operand.kind {
+            OperandKind::Copy(place) => {
+                Operand { kind: OperandKind::Move(place), span: operand.span }
+            }
+            _ => operand,
+        }
+    }
+
     fn is_promotable_unadjusted(&mut self, expr: ExprId) -> bool {
         let scalar = |this: &Self, expr| {
             matches!(
@@ -2222,7 +2300,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
                 self.resolver.reset_to_guard(guard);
                 match resolved {
-                    Some(ValueNs::ConstId(_) | ValueNs::EnumVariantId(_)) => true,
+                    Some(
+                        ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::GenericParam(_),
+                    ) => true,
                     Some(ValueNs::StructId(_)) => {
                         !matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..))
                     }
@@ -3056,7 +3136,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
-        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span);
+        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }
 
@@ -3422,7 +3502,7 @@ fn lower_closure_body<'db>(
     ctx.ends_temporaries.insert(*root);
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());
     }
     if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
         let ready = ctx.poll_variant(true)?;
@@ -3605,7 +3685,7 @@ pub fn promoted_mir_body_query<'db>(
         ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
     {
         let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
     }
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
@@ -3714,7 +3794,7 @@ pub fn lower_to_mir_with_store<'db>(
     ctx.ends_temporaries.insert(root_expr);
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }
     Ok(ctx.result)
 }

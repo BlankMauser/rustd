@@ -23,8 +23,12 @@ use inkwell::{
     basic_block::BasicBlock,
     builder::{Builder, BuilderError},
     context::Context,
+    debug_info::{
+        AsDIScope, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind, DWARFSourceLanguage,
+        DebugInfoBuilder, debug_metadata_version,
+    },
     intrinsics::Intrinsic,
-    module::{Linkage, Module},
+    module::{FlagBehavior, Linkage, Module},
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType},
     values::{
         BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue, FloatValue,
@@ -34,7 +38,10 @@ use inkwell::{
 use rustc_hash::FxHashMap;
 
 use super::{OWN, Unhandled};
-use crate::mir::codegen::unwind::{self, seh::ARRIVAL};
+use crate::mir::codegen::{
+    ObjectFormat,
+    unwind::{self, seh::ARRIVAL},
+};
 
 type Lowered<T> = Result<T, Unhandled>;
 
@@ -93,6 +100,57 @@ pub(super) struct Lowering<'ctx, 'f> {
     frame: Option<BasicBlock<'ctx>>,
     /// Where a guarded call that unwound leaves its exception (see `unwind::seh`).
     arrival: Option<PointerValue<'ctx>>,
+    /// What the line table LLVM writes is told through, where one is read back.
+    marks: Option<Marks<'ctx>>,
+}
+
+/// The source locations of the IR as lines of a file that is not there, for LLVM to say
+/// in its line table which instructions became which code. `emitted` reads the table back.
+struct Marks<'ctx> {
+    builder: DebugInfoBuilder<'ctx>,
+    function: DISubprogram<'ctx>,
+}
+
+impl<'ctx> Marks<'ctx> {
+    fn new(module: &Module<'ctx>, function: FunctionValue<'ctx>) -> Marks<'ctx> {
+        let context = module.get_context();
+        let version = context.i32_type().const_int(debug_metadata_version().into(), false);
+        module.add_basic_value_flag("Debug Info Version", FlagBehavior::Warning, version);
+        let (builder, unit) = module.create_debug_info_builder(
+            false,
+            DWARFSourceLanguage::Rust,
+            "rustd",
+            "",
+            "rustd",
+            false,
+            "",
+            0,
+            "",
+            DWARFEmissionKind::LineTablesOnly,
+            0,
+            false,
+            false,
+            "",
+            "",
+        );
+        let file = unit.get_file();
+        let ty = builder.create_subroutine_type(file, None, &[], DIFlags::ZERO);
+        let subprogram = builder.create_function(
+            unit.as_debug_info_scope(),
+            OWN,
+            None,
+            file,
+            0,
+            ty,
+            false,
+            true,
+            0,
+            DIFlags::ZERO,
+            false,
+        );
+        function.set_subprogram(subprogram);
+        Marks { builder, function: subprogram }
+    }
 }
 
 impl<'ctx, 'f> Lowering<'ctx, 'f> {
@@ -133,8 +191,23 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             pads: FxHashMap::default(),
             frame: None,
             arrival: None,
+            marks: (target.object_format == ObjectFormat::Elf)
+                .then(|| Marks::new(module, function)),
         };
-        lowering.body()
+        lowering.body()?;
+        if let Some(marks) = &lowering.marks {
+            marks.builder.finalize();
+        }
+        Ok(())
+    }
+
+    /// Has what is built next be of the source location `inst` has.
+    fn mark(&self, inst: Inst) {
+        let Some(marks) = &self.marks else { return };
+        let scope = marks.function.as_debug_info_scope();
+        let line = unwind::seh::unguarded(self.func.srcloc(inst)).bits();
+        let location = marks.builder.create_debug_location(self.context, line, 0, scope, None);
+        self.builder.set_current_debug_location(location);
     }
 
     /// 1. Allocas for the stack slots, in a block ahead of the entry block.
@@ -192,6 +265,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         for block in order {
             self.builder.position_at_end(self.blocks[&block]);
             for inst in self.func.layout.block_insts(block) {
+                self.mark(inst);
                 self.inst(inst)?;
             }
         }
@@ -289,6 +363,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     Self::basic_type(context, first.value_type)?,
                     Self::basic_type(context, second.value_type)?,
                 ];
+                context.struct_type(&fields, false).fn_type(&params, false)
+            }
+            // AArch64 has eight registers of each kind for what comes back, and LLVM gives
+            // the fields of a struct the next of its kind in order, as Cranelift does values.
+            many if crate::mir::codegen::Target::current().arch
+                == crate::mir::codegen::target::Arch::Aarch64
+                && many.len() <= 8 =>
+            {
+                let fields = many
+                    .iter()
+                    .map(|it| Self::basic_type(context, it.value_type))
+                    .collect::<Lowered<Vec<_>>>()?;
                 context.struct_type(&fields, false).fn_type(&params, false)
             }
             _ => return Err(Unhandled::Shape("more than two return values")),
@@ -548,7 +634,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             InstructionData::Call { func_ref, .. } => {
                 let callee = self.callee(func_ref)?;
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
-                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                if unwind::seh::is_guarded(self.func.srcloc(inst)) {
                     let (returned, pad) = self.guard();
                     let args = self.invoke_arguments(sig, dfg.inst_args(inst))?;
                     let call =
@@ -566,7 +652,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     return Err(Unhandled::Shape("indirect call without a callee"));
                 };
                 let callee = self.pointer(*callee)?;
-                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                if unwind::seh::is_guarded(self.func.srcloc(inst)) {
                     let (returned, pad) = self.guard();
                     let args = self.invoke_arguments(sig, args)?;
                     let call =
@@ -710,11 +796,24 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 Opcode::GetFramePointer
                     if crate::mir::codegen::Target::current().exception_in_register() =>
                 {
+                    use crate::mir::codegen::target::{Arch, ObjectFormat};
+                    let target = crate::mir::codegen::Target::current();
                     let pointer = self.context.ptr_type(AddressSpace::default());
-                    let own = self.context.i32_type().const_zero();
-                    let frame =
-                        self.intrinsic("llvm.frameaddress", &[pointer.into()], &[own.into()])?;
-                    self.set(inst, Operand::Pointer(frame.into_pointer_value()));
+                    let frame = if (target.arch, target.object_format)
+                        == (Arch::Aarch64, ObjectFormat::Elf)
+                    {
+                        // What is asked for is where Cranelift has the frame pointer and the
+                        // return address: right below what the caller left on the stack.
+                        // LLVM has the registers it saves between the two here.
+                        let entry = self.intrinsic("llvm.sponentry", &[pointer.into()], &[])?;
+                        let below = self.immediate(self.context.i64_type(), -16, true);
+                        self.offset(entry.into_pointer_value(), below)?
+                    } else {
+                        let own = self.context.i32_type().const_zero();
+                        self.intrinsic("llvm.frameaddress", &[pointer.into()], &[own.into()])?
+                            .into_pointer_value()
+                    };
+                    self.set(inst, Operand::Pointer(frame));
                 }
                 // Asked for by a guarded call alone, to look at the slot of the frame its
                 // exception arrives in. LLVM lays out the frame, so the slot is one of the

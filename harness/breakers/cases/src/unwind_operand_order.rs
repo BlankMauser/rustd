@@ -7,7 +7,7 @@
 //! Found later (`fuzz/found/differs-checksum-L8-231-c11.rs`): where the expression ends its
 //! own temporaries, as the tail of a block does from the 2024 edition and a closure's body
 //! without braces does, operands and temporaries are in one scope and are dropped in the
-//! reverse of the order they were made. `breakers_2021::unwind_operand_tail` has the tails
+//! reverse of the order they were made. `breakers2021::unwind_operand_tail` has the tails
 //! before 2024.
 
 use std::cell::RefCell;

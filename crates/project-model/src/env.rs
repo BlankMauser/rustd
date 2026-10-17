@@ -41,10 +41,10 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
         package.readme.as_ref().map(ToString::to_string).unwrap_or_default(),
     );
 
-    env.set(
-        "CARGO_PKG_RUST_VERSION",
-        package.rust_version.as_ref().map(ToString::to_string).unwrap_or_default(),
-    );
+    env.set("CARGO_PKG_RUST_VERSION", package.rust_version_as_written().unwrap_or_default());
+    if package.primary {
+        env.set("CARGO_PRIMARY_PACKAGE", "1");
+    }
 }
 
 pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {
@@ -58,14 +58,25 @@ pub(crate) fn inject_rustc_tool_env(env: &mut Env, cargo_name: &str, kind: Targe
     env.set("CARGO_CRATE_NAME", cargo_name.replace('-', "_"));
 }
 
+/// The variables cargo's configuration has for the crates of a build whose process has
+/// `extra_env` over the variables of this one. Those are among them when `told`.
 pub(crate) fn cargo_config_env(
     config: &Option<CargoConfigFile>,
     extra_env: &FxHashMap<String, Option<String>>,
+    told: bool,
 ) -> Env {
     use toml::de::*;
 
     let mut env = Env::default();
-    env.extend(extra_env.iter().filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))));
+    if told {
+        env.extend(
+            extra_env.iter().filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
+        );
+    }
+    let of_process = |key: &str| match extra_env.get(key) {
+        Some(value) => value.clone(),
+        None => std::env::var(key).ok(),
+    };
 
     let Some(config_reader) = config.as_ref().and_then(|c| c.read()) else {
         return env;
@@ -80,10 +91,7 @@ pub(crate) fn cargo_config_env(
             DeValue::String(s) => {
                 // Plain string entries have no `force` option, so they should not
                 // override existing environment variables (matching Cargo behavior).
-                if extra_env.get(key).is_some_and(Option::is_some) {
-                    continue;
-                }
-                if let Ok(val) = std::env::var(key) { val } else { String::from(s.clone()) }
+                of_process(key).unwrap_or_else(|| String::from(s.clone()))
             }
             DeValue::Table(entry) => {
                 // Each entry MUST have a `value` key.
@@ -94,14 +102,9 @@ pub(crate) fn cargo_config_env(
                     entry.get("force").and_then(|v| v.as_ref().as_bool()).unwrap_or(false);
                 // If the entry already exists in the environment AND the `force` key is not set
                 // to true, use the existing value instead of the config value.
-                if !is_forced {
-                    if extra_env.get(key).is_some_and(Option::is_some) {
-                        continue;
-                    }
-                    if let Ok(val) = std::env::var(key) {
-                        env.insert(key, val);
-                        continue;
-                    }
+                if !is_forced && let Some(val) = of_process(key) {
+                    env.insert(key, val);
+                    continue;
                 }
 
                 if let Some(base) = entry.get("relative").and_then(|v| {
@@ -160,7 +163,7 @@ env.RA_TEST_NOT_AN_OBJECT = "value"
     .iter()
     .map(|(k, v)| (k.to_string(), v.map(str::to_owned)))
     .collect();
-    let env = cargo_config_env(&Some(config), &extra_env);
+    let env = cargo_config_env(&Some(config), &extra_env, true);
     assert_eq!(env.get("RA_TEST_WORKSPACE_DIR").as_deref(), Some(cwd.join("").as_str()));
     assert_eq!(env.get("RA_TEST_RELATIVE").as_deref(), Some(cwd.join("../relative").as_str()));
     assert_eq!(env.get("RA_TEST_INVALID").as_deref(), Some("../relative"));
@@ -197,7 +200,7 @@ env.RA_TEST_PROCESS_ENV_FORCED.force = true
     let raw = raw.lines().map(|l| format!("{l} # {config_path}")).join("\n");
     let config = CargoConfigFile::from_string_for_test(raw);
     let extra_env = FxHashMap::default();
-    let env = cargo_config_env(&Some(config), &extra_env);
+    let env = cargo_config_env(&Some(config), &extra_env, true);
 
     // Plain string form should use process env value, not config value
     assert_eq!(env.get("RA_TEST_PROCESS_ENV_STRING").as_deref(), Some("from_process"));
