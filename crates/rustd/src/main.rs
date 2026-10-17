@@ -2114,8 +2114,11 @@ impl WatchedFile {
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
-    fn sources(vfs: &Vfs) -> Vec<WatchedFile> {
+    /// The files of the VFS that have a text. One that is not UTF-8 has none, and is no
+    /// source of anything.
+    fn sources(vfs: &Vfs, db: &RootDatabase) -> Vec<WatchedFile> {
         vfs.iter()
+            .filter(|(id, _)| db.has_text(*id))
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 WatchedFile::new(Watched::Source(id), path, path)
@@ -2664,7 +2667,7 @@ fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<Wa
             Watched::Included(_) => None,
         })
         .collect();
-    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs())
+    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs(), db)
         .into_iter()
         .filter(|it| !matches!(it.file, Watched::Source(id) if watched.contains(&id)))
         .collect();
@@ -2823,7 +2826,7 @@ fn main() -> anyhow::Result<()> {
         return build_batch(&db, args);
     }
 
-    let mut files = WatchedFile::sources(&vfs);
+    let mut files = WatchedFile::sources(&vfs, &db);
     let sources: Vec<_> = files
         .iter()
         .filter_map(|it| match it.file {
