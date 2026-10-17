@@ -28,7 +28,7 @@ use super::{OWN, Symbol, Unhandled};
 use crate::mir::codegen::{
     ConstBlob,
     fragment::{Code, Recorder},
-    wasm::{ADDRESS_LEN, STACK_POINTER, TYPE_INDEX_LEN, WasmFunction, WasmSignature, WasmType},
+    wasm::{STACK_POINTER, WasmFunction, WasmSignature, WasmType},
 };
 
 const STACK_POINTER_NAME: &str = "__stack_pointer";

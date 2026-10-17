@@ -3,4 +3,5 @@
 # Built by `build-playground.sh`.
 /assets/
 /playground/target/
-/pkg-llvm/
+/pkg-llvm*/
+/node_modules

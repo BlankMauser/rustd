@@ -13,6 +13,8 @@
 use std::{cell::RefCell, collections::hash_map::Entry, fmt};
 
 use cranelift_codegen::ir::{self, Opcode, Type};
+#[cfg(feature = "wasm")]
+use inkwell::targets::TargetMachineOptions;
 use inkwell::{
     OptimizationLevel,
     context::Context,
@@ -43,7 +45,7 @@ const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 const TRIPLE: &str = "wasm32-unknown-unknown";
 /// What every browser the page runs in has, and the hand-written lowering uses too.
 #[cfg(feature = "wasm")]
-const FEATURES: &str = "+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint";
+const FEATURES: &str = "+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint,+multivalue";
 
 pub(super) fn emit(
     recorder: &mut Recorder<'_>,
@@ -168,15 +170,17 @@ impl Machine {
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The linker of the page gives everything a fixed place, so nothing is
         // position-independent.
+        // The ABI is the one where a function gives back two values as two results, as the
+        // hand-written lowering has a 128-bit integer returned, and not through a pointer.
+        let options = TargetMachineOptions::default()
+            .set_cpu("mvp")
+            .set_features(FEATURES)
+            .set_abi("experimental-mv")
+            .set_level(optimization.level())
+            .set_reloc_mode(RelocMode::Static)
+            .set_code_model(CodeModel::Default);
         target
-            .create_target_machine(
-                &triple,
-                "mvp",
-                FEATURES,
-                optimization.level(),
-                RelocMode::Static,
-                CodeModel::Default,
-            )
+            .create_target_machine_from_options(&triple, options)
             .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {TRIPLE}")))
     }
 

@@ -31,6 +31,7 @@ try {
   );
   const fetched = performance.now();
   compiled = await WebAssembly.compile(wasm);
+  const validated = performance.now();
   compiler = await Compiler.load(compiled, pack ? null : core, env);
   let analysis;
   if (pack) {
@@ -43,6 +44,7 @@ try {
       core_bytes: core.length,
       fetch_ms: fetched - started,
       start_ms: performance.now() - fetched,
+      compile_ms: validated - fetched,
       analysis,
     },
   });

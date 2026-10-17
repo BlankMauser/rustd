@@ -864,6 +864,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let value = match opcode {
             Opcode::Iadd => b.build_int_add(l, r, "")?,
             Opcode::Isub => b.build_int_sub(l, r, "")?,
+            Opcode::Imul if WASM && ty.get_bit_width() == 128 => self.wide_product(l, r)?,
             Opcode::Imul => b.build_int_mul(l, r, "")?,
             Opcode::Udiv => b.build_int_unsigned_div(l, r, "")?,
             Opcode::Sdiv => b.build_int_signed_div(l, r, "")?,
@@ -872,6 +873,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             Opcode::Band => b.build_and(l, r, "")?,
             Opcode::Bor => b.build_or(l, r, "")?,
             Opcode::Bxor => b.build_xor(l, r, "")?,
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr
+                if WASM && ty.get_bit_width() == 128 && !r.is_const() =>
+            {
+                self.wide_shift(opcode, l, amount(r)?)?
+            }
             Opcode::Ishl => b.build_left_shift(l, amount(r)?, "")?,
             Opcode::Ushr => b.build_right_shift(l, amount(r)?, false, "")?,
             Opcode::Sshr => b.build_right_shift(l, amount(r)?, true, "")?,
@@ -888,7 +894,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let wide = Self::int_of_width(self.context, ty.get_bit_width() * 2)?;
                 let l = b.build_int_cast_sign_flag(l, wide, signed, "")?;
                 let r = b.build_int_cast_sign_flag(r, wide, signed, "")?;
-                let product = b.build_int_mul(l, r, "")?;
+                let product = match WASM && wide.get_bit_width() == 128 {
+                    true => self.wide_product(l, r)?,
+                    false => b.build_int_mul(l, r, "")?,
+                };
                 let by = wide.const_int(ty.get_bit_width().into(), false);
                 b.build_int_truncate(b.build_right_shift(product, by, false, "")?, ty, "")?
             }
@@ -905,14 +914,19 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             | Opcode::SsubOverflow
             | Opcode::UmulOverflow
             | Opcode::SmulOverflow => {
-                let (value, overflowed) = overflowing(match opcode {
-                    Opcode::UaddOverflow => "llvm.uadd.with.overflow",
-                    Opcode::SaddOverflow => "llvm.sadd.with.overflow",
-                    Opcode::UsubOverflow => "llvm.usub.with.overflow",
-                    Opcode::SsubOverflow => "llvm.ssub.with.overflow",
-                    Opcode::UmulOverflow => "llvm.umul.with.overflow",
-                    _ => "llvm.smul.with.overflow",
-                })?;
+                let multiplies = matches!(opcode, Opcode::UmulOverflow | Opcode::SmulOverflow);
+                let (value, overflowed) = if WASM && multiplies && ty.get_bit_width() == 64 {
+                    self.long_product_overflowing(l, r, opcode == Opcode::SmulOverflow)?
+                } else {
+                    overflowing(match opcode {
+                        Opcode::UaddOverflow => "llvm.uadd.with.overflow",
+                        Opcode::SaddOverflow => "llvm.sadd.with.overflow",
+                        Opcode::UsubOverflow => "llvm.usub.with.overflow",
+                        Opcode::SsubOverflow => "llvm.ssub.with.overflow",
+                        Opcode::UmulOverflow => "llvm.umul.with.overflow",
+                        _ => "llvm.smul.with.overflow",
+                    })?
+                };
                 let results = self.func.dfg.inst_results(inst);
                 let byte = b.build_int_z_extend(overflowed, self.context.i8_type(), "")?;
                 self.values.insert(results[0], Operand::Int(value));
@@ -1160,6 +1174,120 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             self.values.insert(result, value.into());
         }
         Ok(())
+    }
+
+    /// A 128-bit integer shifted by an amount below 128 that is not known, from shifts of its
+    /// halves: LLVM calls `__ashlti3` and the like of its runtime library for one.
+    fn wide_shift(
+        &self,
+        opcode: Opcode,
+        value: IntValue<'ctx>,
+        amount: IntValue<'ctx>,
+    ) -> Lowered<IntValue<'ctx>> {
+        let b = &self.builder;
+        let (wide, long) = (value.get_type(), self.context.i64_type());
+        let constant = |n: u64| long.const_int(n, false);
+        let low = b.build_int_truncate(value, long, "")?;
+        let high = b.build_right_shift(value, wide.const_int(64, false), false, "")?;
+        let high = b.build_int_truncate(high, long, "")?;
+        let amount = b.build_int_truncate(amount, long, "")?;
+        let across = b.build_int_compare(IntPredicate::UGE, amount, constant(64), "")?;
+        let within = b.build_and(amount, constant(63), "")?;
+        // The bits one half gives the other, in two shifts as the amount may be nothing.
+        let rest = b.build_int_sub(constant(63), within, "")?;
+        let (low, high) = if opcode == Opcode::Ishl {
+            let carried = b.build_right_shift(low, constant(1), false, "")?;
+            let carried = b.build_right_shift(carried, rest, false, "")?;
+            let shifted = b.build_left_shift(low, within, "")?;
+            let joined = b.build_or(b.build_left_shift(high, within, "")?, carried, "")?;
+            (
+                b.build_select(across, long.const_zero(), shifted, "")?,
+                b.build_select(across, shifted, joined, "")?,
+            )
+        } else {
+            let signed = opcode == Opcode::Sshr;
+            let carried = b.build_left_shift(high, constant(1), "")?;
+            let carried = b.build_left_shift(carried, rest, "")?;
+            let shifted = b.build_right_shift(high, within, signed, "")?;
+            let joined = b.build_or(b.build_right_shift(low, within, false, "")?, carried, "")?;
+            let emptied = match signed {
+                true => b.build_right_shift(high, constant(63), true, "")?,
+                false => long.const_zero(),
+            };
+            (
+                b.build_select(across, shifted, joined, "")?,
+                b.build_select(across, emptied, shifted, "")?,
+            )
+        };
+        let low = b.build_int_z_extend(low.into_int_value(), wide, "")?;
+        let high = b.build_int_z_extend(high.into_int_value(), wide, "")?;
+        Ok(b.build_or(b.build_left_shift(high, wide.const_int(64, false), "")?, low, "")?)
+    }
+
+    /// The product of two 64-bit integers and whether it overflowed, which LLVM too finds
+    /// by a call of `__multi3`.
+    fn long_product_overflowing(
+        &self,
+        l: IntValue<'ctx>,
+        r: IntValue<'ctx>,
+        signed: bool,
+    ) -> Lowered<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let b = &self.builder;
+        let (long, wide) = (l.get_type(), self.context.i128_type());
+        let l = b.build_int_cast_sign_flag(l, wide, signed, "")?;
+        let r = b.build_int_cast_sign_flag(r, wide, signed, "")?;
+        let product = self.wide_product(l, r)?;
+        let low = b.build_int_truncate(product, long, "")?;
+        let high = b.build_right_shift(product, wide.const_int(64, false), false, "")?;
+        let high = b.build_int_truncate(high, long, "")?;
+        // Without overflow the high half is the sign of the low one, or nothing.
+        let fits = match signed {
+            true => b.build_right_shift(low, long.const_int(63, false), true, "")?,
+            false => long.const_zero(),
+        };
+        Ok((low, b.build_int_compare(IntPredicate::NE, high, fits, "")?))
+    }
+
+    /// The product of two 128-bit integers, from 64-bit multiplications. LLVM calls
+    /// `__multi3` of its runtime library for one where the target has no instruction that
+    /// multiplies to twice the width, and the page has no such library.
+    fn wide_product(&self, l: IntValue<'ctx>, r: IntValue<'ctx>) -> Lowered<IntValue<'ctx>> {
+        let b = &self.builder;
+        let (wide, long) = (l.get_type(), self.context.i64_type());
+        let half = |value: IntValue<'ctx>, high: bool| -> Lowered<IntValue<'ctx>> {
+            let value = match high {
+                true => b.build_right_shift(value, wide.const_int(64, false), false, "")?,
+                false => value,
+            };
+            Ok(b.build_int_truncate(value, long, "")?)
+        };
+        let (l_low, l_high) = (half(l, false)?, half(l, true)?);
+        let (r_low, r_high) = (half(r, false)?, half(r, true)?);
+        // The low halves multiplied to 128 bits, by their own 32-bit halves.
+        let low = long.const_int(u64::from(u32::MAX), false);
+        let shift = long.const_int(32, false);
+        let (a0, a1) =
+            (b.build_and(l_low, low, "")?, b.build_right_shift(l_low, shift, false, "")?);
+        let (b0, b1) =
+            (b.build_and(r_low, low, "")?, b.build_right_shift(r_low, shift, false, "")?);
+        let p00 = b.build_int_mul(a0, b0, "")?;
+        let p01 = b.build_int_mul(a0, b1, "")?;
+        let p10 = b.build_int_mul(a1, b0, "")?;
+        let p11 = b.build_int_mul(a1, b1, "")?;
+        let middle = b.build_right_shift(p00, shift, false, "")?;
+        let middle = b.build_int_add(middle, b.build_and(p01, low, "")?, "")?;
+        let middle = b.build_int_add(middle, b.build_and(p10, low, "")?, "")?;
+        let bottom = b.build_and(p00, low, "")?;
+        let bottom = b.build_or(bottom, b.build_left_shift(middle, shift, "")?, "")?;
+        let top = b.build_int_add(p11, b.build_right_shift(p01, shift, false, "")?, "")?;
+        let top = b.build_int_add(top, b.build_right_shift(p10, shift, false, "")?, "")?;
+        let top = b.build_int_add(top, b.build_right_shift(middle, shift, false, "")?, "")?;
+        // What the high halves add stays within the high half of the product.
+        let top = b.build_int_add(top, b.build_int_mul(l_high, r_low, "")?, "")?;
+        let top = b.build_int_add(top, b.build_int_mul(l_low, r_high, "")?, "")?;
+        let top = b.build_int_z_extend(top, wide, "")?;
+        let top = b.build_left_shift(top, wide.const_int(64, false), "")?;
+        Ok(b.build_or(top, b.build_int_z_extend(bottom, wide, "")?, "")?)
     }
 
     /// The memory routines Cranelift's frontend calls by name, as the intrinsics LLVM has
