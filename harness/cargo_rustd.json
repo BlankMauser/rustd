@@ -8,65 +8,65 @@
    "wrong": [],
    "times": {
     "cold build": [
-     6.93,
-     6.41
+     6.0,
+     6.48
     ],
     "cold run": [
-     0.68,
-     0.45
+     0.6,
+     0.47
     ],
     "warm-up": [
-     7.43,
+     6.87,
      null
     ],
     "warm build": [
      0.02,
-     0.45
+     0.44
     ],
     "warm run": [
      0.03,
-     0.42
+     0.45
     ],
     "cold test": [
-     4.13,
-     5.84
+     2.89,
+     6.13
     ],
     "test warm-up": [
-     4.18,
+     3.87,
      null
     ],
     "warm test": [
-     0.96,
-     1.46
+     0.95,
+     1.35
     ],
     "edit build": [
-     0.32,
-     0.89
+     0.34,
+     0.86
     ],
     "edit run": [
-     0.03,
-     0.5
+     0.04,
+     0.49
     ],
     "edit test": [
-     2.21,
-     1.61
+     2.25,
+     1.6
     ],
     "broken": [
-     0.31,
-     0.22
+     0.38,
+     0.2
     ],
     "mended": [
-     0.17,
-     0.72
+     0.27,
+     0.55
     ],
     "mended run": [
-     0.09,
-     0.55
+     0.04,
+     0.6
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (6s so far)",
+    "cold run": "cargo: the daemon is still loading the workspace (7s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
@@ -75,12 +75,12 @@
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/ripgrep/crates/printer/src/standard.rs changed",
+    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/ripgrep/crates/printer/src/standard.rs changed",
     "broken": "cargo: the crate root has errors, `cargo check` shows them: mismatched types",
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2720574, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2723013, /dev/shm/rustd-cargo-n3hc2hxy/ripgrep/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/c1499e179370ce25/log\n    /dev/shm/rustd-cargo-n3hc2hxy/ripgrep: ready\n  worker: pid 2742046, /dev/shm/rustd-cargo-n3hc2hxy/ripgrep/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/8c9014688332b211/log\n    /dev/shm/rustd-cargo-n3hc2hxy/ripgrep: loading for 5s\n  worker: pid 2742022, /dev/shm/rustd-cargo-n3hc2hxy/ripgrep/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/3d6fd03c7281998b/log\n    /dev/shm/rustd-cargo-n3hc2hxy/ripgrep: loading for 5s\n/dev/shm/rustd-cargo-n3hc2hxy/ripgrep (dev, c5fc3701e6295fa9): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (6s so far)\n/dev/shm/rustd-cargo-n3hc2hxy/ripgrep (test, 91472f59895e5f84): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/ripgrep/crates/printer/src/standard.rs changed\n"
+   "status": "daemon: pid 3852864, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3874245, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/814d6e5afab94bcc/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: loading for 5s\n  worker: pid 3855188, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/aaae1e0d74ee349e/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: ready\n  worker: pid 3874230, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/7b68db9009240efb/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: loading for 5s\n/dev/shm/rustd-cargo-cu96c_gg/ripgrep (dev, 9e5a8950668fc957): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (7s so far)\n/dev/shm/rustd-cargo-cu96c_gg/ripgrep (test, 5fec3c4e1f4b74cf): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/ripgrep/crates/printer/src/standard.rs changed\n"
   },
   {
    "project": "fd",
@@ -88,12 +88,12 @@
    "wrong": [],
    "times": {
     "cold build": [
-     21.2,
-     24.09
+     21.91,
+     21.98
     ],
     "cold run": [
-     0.04,
-     0.61
+     0.06,
+     0.44
     ],
     "warm-up": [
      0.02,
@@ -101,47 +101,47 @@
     ],
     "warm build": [
      0.03,
-     0.39
+     0.55
     ],
     "warm run": [
      0.05,
-     0.43
+     0.55
     ],
     "cold test": [
-     5.65,
-     5.53
+     5.9,
+     5.52
     ],
     "test warm-up": [
-     3.0,
+     3.02,
      null
     ],
     "warm test": [
-     0.62,
-     1.25
+     0.64,
+     1.05
     ],
     "edit build": [
      0.16,
-     0.75
+     0.51
     ],
     "edit run": [
-     0.05,
-     0.5
+     0.04,
+     0.44
     ],
     "edit test": [
-     0.7,
-     1.08
+     0.9,
+     1.03
     ],
     "broken": [
-     0.32,
+     0.57,
      0.23
     ],
     "mended": [
-     0.07,
-     0.45
+     0.17,
+     0.41
     ],
     "mended run": [
-     0.04,
-     0.59
+     0.05,
+     0.42
     ]
    },
    "built": {
@@ -160,7 +160,7 @@
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2754883, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2754886, /dev/shm/rustd-cargo-n3hc2hxy/fd/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/9a88c01a3e63a3a1/log\n    /dev/shm/rustd-cargo-n3hc2hxy/fd: ready\n  worker: pid 2763586, /dev/shm/rustd-cargo-n3hc2hxy/fd/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/b477132492889593/log\n    /dev/shm/rustd-cargo-n3hc2hxy/fd: ready\n  worker: pid 2763589, /dev/shm/rustd-cargo-n3hc2hxy/fd/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/758d3d62d319ce12/log\n    /dev/shm/rustd-cargo-n3hc2hxy/fd: ready\n/dev/shm/rustd-cargo-n3hc2hxy/fd (dev, 8c5e742a1c2683ed): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/fd (test, 3433e28d5c8360c5): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 3887167, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3895887, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/452f0bf08448618f/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n  worker: pid 3887170, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/e8540e94d22ba866/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n  worker: pid 3895884, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/63610fdae8b722b0/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n/dev/shm/rustd-cargo-cu96c_gg/fd (dev, a60aa5a87d0cc04c): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/fd (test, cfc4fe13eeebae56): 2 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "bat",
@@ -168,71 +168,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     18.73,
-     20.97
+     17.47,
+     20.9
     ],
     "cold run": [
      0.6,
-     0.1
+     0.2
     ],
     "warm-up": [
-     7.66,
+     8.5,
      null
     ],
     "warm build": [
      0.02,
-     0.09
+     0.08
     ],
     "warm run": [
      0.03,
-     0.09
+     0.1
     ],
     "cold test": [
-     10.72,
-     16.81
+     10.68,
+     15.38
     ],
     "test warm-up": [
-     8.47,
+     8.51,
      null
     ],
     "warm test": [
-     1.62,
-     1.49
+     1.68,
+     1.46
     ],
     "edit build": [
      0.3,
-     0.52
+     0.53
     ],
     "edit run": [
-     0.03,
+     0.04,
      0.09
     ],
     "edit test": [
-     1.77,
-     1.3
+     1.95,
+     1.33
     ],
     "broken": [
-     0.28,
-     0.23
+     0.38,
+     0.26
     ],
     "mended": [
      0.09,
-     0.48
+     0.5
     ],
     "mended run": [
-     0.05,
-     0.1
+     0.03,
+     0.09
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: /dev/shm/rustd-cargo-n3hc2hxy/bat/.git/index changed while cargo built or the daemon loaded",
+    "cold run": "cargo: /dev/shm/rustd-cargo-cu96c_gg/bat/.git/index changed while cargo built or the daemon loaded",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
     "test warm-up": "ready; ready; ready",
-    "warm test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/bat/target/debug/build/bat-aebca40cab5d476b/out/codegen_static_syntax_mappings.rs changed",
+    "warm test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/bat/target/debug/build/bat-aebca40cab5d476b/out/codegen_static_syntax_mappings.rs changed",
     "edit build": "daemon",
     "edit run": "daemon",
     "edit test": "daemon",
@@ -240,7 +240,7 @@
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2792252, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2800534, /dev/shm/rustd-cargo-n3hc2hxy/bat/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/e056f2f094762572/log\n    /dev/shm/rustd-cargo-n3hc2hxy/bat: ready\n  worker: pid 2805941, /dev/shm/rustd-cargo-n3hc2hxy/bat/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/5f3ecd5be8a58675/log\n    /dev/shm/rustd-cargo-n3hc2hxy/bat: ready\n  worker: pid 2805944, /dev/shm/rustd-cargo-n3hc2hxy/bat/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/e9f91ebea2d9d37f/log\n    /dev/shm/rustd-cargo-n3hc2hxy/bat: ready\n/dev/shm/rustd-cargo-n3hc2hxy/bat (dev, 5119e17e975119f5): 6 builds by the daemon, 1 by cargo\n  1 x /dev/shm/rustd-cargo-n3hc2hxy/bat/.git/index changed while cargo built or the daemon loaded\n/dev/shm/rustd-cargo-n3hc2hxy/bat (test, e4b0465d4c8af408): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/bat/target/debug/build/bat-aebca40cab5d476b/out/codegen_static_syntax_mappings.rs changed\n"
+   "status": "daemon: pid 3924623, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3938399, /dev/shm/rustd-cargo-cu96c_gg/bat/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/887b2bf76a239b77/log\n    /dev/shm/rustd-cargo-cu96c_gg/bat: ready\n  worker: pid 3938396, /dev/shm/rustd-cargo-cu96c_gg/bat/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/9236655c6e9bbaa7/log\n    /dev/shm/rustd-cargo-cu96c_gg/bat: ready\n  worker: pid 3932909, /dev/shm/rustd-cargo-cu96c_gg/bat/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/aeccb0eda8c9632a/log\n    /dev/shm/rustd-cargo-cu96c_gg/bat: ready\n/dev/shm/rustd-cargo-cu96c_gg/bat (dev, 10a6e5334c27e168): 6 builds by the daemon, 1 by cargo\n  1 x /dev/shm/rustd-cargo-cu96c_gg/bat/.git/index changed while cargo built or the daemon loaded\n/dev/shm/rustd-cargo-cu96c_gg/bat (test, 92ae4a8657bfea65): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/bat/target/debug/build/bat-aebca40cab5d476b/out/codegen_static_syntax_mappings.rs changed\n"
   },
   {
    "project": "hyperfine",
@@ -248,65 +248,65 @@
    "wrong": [],
    "times": {
     "cold build": [
-     5.95,
-     6.44
+     5.81,
+     6.79
     ],
     "cold run": [
      0.55,
-     0.34
+     0.42
     ],
     "warm-up": [
-     5.21,
+     5.28,
      null
     ],
     "warm build": [
-     0.02,
-     0.32
+     0.03,
+     0.39
     ],
     "warm run": [
-     0.03,
-     0.34
+     0.04,
+     0.36
     ],
     "cold test": [
-     4.48,
-     5.06
+     4.73,
+     4.92
     ],
     "test warm-up": [
-     2.5,
+     2.77,
      null
     ],
     "warm test": [
-     0.37,
-     0.72
+     0.38,
+     0.82
     ],
     "edit build": [
-     0.05,
-     0.35
+     0.13,
+     0.34
     ],
     "edit run": [
      0.04,
-     0.33
+     0.35
     ],
     "edit test": [
-     0.4,
-     0.72
+     0.6,
+     0.75
     ],
     "broken": [
-     0.26,
-     0.18
+     0.37,
+     0.2
     ],
     "mended": [
-     0.05,
-     0.33
+     0.19,
+     0.34
     ],
     "mended run": [
      0.03,
-     0.38
+     0.39
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (6s so far)",
+    "cold run": "cargo: the daemon is still loading the workspace (7s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
@@ -320,7 +320,7 @@
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2843280, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2848577, /dev/shm/rustd-cargo-n3hc2hxy/hyperfine/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/7236fab45fa53a96/log\n    /dev/shm/rustd-cargo-n3hc2hxy/hyperfine: ready\n  worker: pid 2848574, /dev/shm/rustd-cargo-n3hc2hxy/hyperfine/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/d34bd58c4dc67d01/log\n    /dev/shm/rustd-cargo-n3hc2hxy/hyperfine: ready\n  worker: pid 2845635, /dev/shm/rustd-cargo-n3hc2hxy/hyperfine/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/a34e7bb5725acd02/log\n    /dev/shm/rustd-cargo-n3hc2hxy/hyperfine: ready\n/dev/shm/rustd-cargo-n3hc2hxy/hyperfine (dev, f73339f58c380f8f): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (6s so far)\n/dev/shm/rustd-cargo-n3hc2hxy/hyperfine (test, 89b78760904495b3): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 3975735, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3978042, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/ae12cb0fc91f018c/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n  worker: pid 3980989, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/f56c9585b1ac4b67/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n  worker: pid 3980992, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/98263539fc13a5c4/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n/dev/shm/rustd-cargo-cu96c_gg/hyperfine (dev, ecf6d3ec44663b22): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (7s so far)\n/dev/shm/rustd-cargo-cu96c_gg/hyperfine (test, 707e352a8a78eb42): 2 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "just",
@@ -328,15 +328,15 @@
    "wrong": [],
    "times": {
     "cold build": [
-     8.68,
-     10.74
+     8.89,
+     10.12
     ],
     "cold run": [
-     0.16,
-     0.06
+     0.15,
+     0.07
     ],
     "warm-up": [
-     1.95,
+     2.5,
      null
     ],
     "warm build": [
@@ -344,49 +344,49 @@
      0.06
     ],
     "warm run": [
-     0.05,
-     0.13
+     0.03,
+     0.06
     ],
     "cold test": [
-     8.79,
-     7.14
+     8.65,
+     7.62
     ],
     "test warm-up": [
-     7.79,
+     8.49,
      null
     ],
     "warm test": [
-     1.47,
-     1.53
+     1.54,
+     1.67
     ],
     "edit build": [
-     0.13,
-     0.29
+     0.11,
+     0.28
     ],
     "edit run": [
      0.03,
      0.06
     ],
     "edit test": [
-     1.41,
-     1.03
+     1.34,
+     1.09
     ],
     "broken": [
-     0.2,
-     0.11
+     0.22,
+     0.12
     ],
     "mended": [
-     0.1,
-     0.26
+     0.09,
+     0.27
     ],
     "mended run": [
      0.03,
-     0.06
+     0.12
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (11s so far)",
+    "cold run": "cargo: the daemon is still loading the workspace (10s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
@@ -400,7 +400,7 @@
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2871437, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2871440, /dev/shm/rustd-cargo-n3hc2hxy/just/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/235dd18f7818e635/log\n    /dev/shm/rustd-cargo-n3hc2hxy/just: ready\n  worker: pid 2875395, /dev/shm/rustd-cargo-n3hc2hxy/just/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/19334f4dce4330b9/log\n    /dev/shm/rustd-cargo-n3hc2hxy/just: ready\n  worker: pid 2875398, /dev/shm/rustd-cargo-n3hc2hxy/just/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/d7a9801c2a42ccd5/log\n    /dev/shm/rustd-cargo-n3hc2hxy/just: ready\n/dev/shm/rustd-cargo-n3hc2hxy/just (dev, 20a525220f330f1e): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (11s so far)\n/dev/shm/rustd-cargo-n3hc2hxy/just (test, a304a02bd66146e0): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 4003952, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 4007961, /dev/shm/rustd-cargo-cu96c_gg/just/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/45add88de3aa5f7f/log\n    /dev/shm/rustd-cargo-cu96c_gg/just: ready\n  worker: pid 4007964, /dev/shm/rustd-cargo-cu96c_gg/just/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/19ca0bc5cbb7c094/log\n    /dev/shm/rustd-cargo-cu96c_gg/just: ready\n  worker: pid 4003955, /dev/shm/rustd-cargo-cu96c_gg/just/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/27331cd23bf22074/log\n    /dev/shm/rustd-cargo-cu96c_gg/just: ready\n/dev/shm/rustd-cargo-cu96c_gg/just (dev, a5bc72a1545f87e8): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (10s so far)\n/dev/shm/rustd-cargo-cu96c_gg/just (test, 16856a4f343cef43): 2 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "axum",
@@ -408,23 +408,23 @@
    "wrong": [],
    "times": {
     "cold build": [
-     9.39,
-     10.97
+     9.06,
+     9.2
     ],
     "warm-up": [
-     8.53,
+     3.86,
      null
     ],
     "warm build": [
      0.02,
-     0.11
+     0.13
     ],
     "cold test": [
-     12.21,
-     10.56
+     11.44,
+     10.7
     ],
     "test warm-up": [
-     1.93,
+     2.23,
      null
     ],
     "warm test": [
@@ -432,20 +432,20 @@
      0.13
     ],
     "edit build": [
-     0.08,
+     0.07,
      0.4
     ],
     "edit test": [
      0.12,
-     0.86
+     0.97
     ],
     "broken": [
-     0.26,
-     0.16
+     0.33,
+     0.19
     ],
     "mended": [
-     0.05,
-     0.31
+     0.06,
+     0.44
     ]
    },
    "built": {
@@ -460,7 +460,7 @@
     "broken": "cargo: the crate root has errors, `cargo check` shows them: mismatched types",
     "mended": "daemon"
    },
-   "status": "daemon: pid 2917651, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2917654, /dev/shm/rustd-cargo-n3hc2hxy/axum/examples/hello-world, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/c4dbc7b6ad47aeb3/log\n    /dev/shm/rustd-cargo-n3hc2hxy/axum: ready\n  worker: pid 2926162, /dev/shm/rustd-cargo-n3hc2hxy/axum/examples/testing, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/4d34777d4f9c4e46/log\n    /dev/shm/rustd-cargo-n3hc2hxy/axum: ready\n/dev/shm/rustd-cargo-n3hc2hxy/axum (dev, 00be1222ef233b07): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (11s so far)\n/dev/shm/rustd-cargo-n3hc2hxy/axum (test, 514a817e89905096): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 4050232, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 4050235, /dev/shm/rustd-cargo-cu96c_gg/axum/examples/hello-world, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/034c0e90891bf260/log\n    /dev/shm/rustd-cargo-cu96c_gg/axum: ready\n  worker: pid 4054378, /dev/shm/rustd-cargo-cu96c_gg/axum/examples/testing, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/87fd6a58152364c1/log\n    /dev/shm/rustd-cargo-cu96c_gg/axum: ready\n/dev/shm/rustd-cargo-cu96c_gg/axum (dev, 14ed503fb47e54d2): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (9s so far)\n/dev/shm/rustd-cargo-cu96c_gg/axum (test, def9682185583ad6): 2 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "nushell",
@@ -468,65 +468,65 @@
    "wrong": [],
    "times": {
     "cold build": [
-     44.82,
-     65.71
+     44.12,
+     54.73
     ],
     "cold run": [
-     0.52,
-     0.29
+     0.61,
+     0.3
     ],
     "warm-up": [
-     51.05,
+     42.36,
      null
     ],
     "warm build": [
-     0.02,
-     0.27
+     0.04,
+     0.26
     ],
     "warm run": [
      0.11,
      0.29
     ],
     "cold test": [
-     2.97,
-     2.54
+     3.25,
+     2.37
     ],
     "test warm-up": [
      1.12,
      null
     ],
     "warm test": [
-     0.67,
-     0.6
+     0.69,
+     0.72
     ],
     "edit build": [
-     0.79,
-     1.63
+     0.96,
+     1.65
     ],
     "edit run": [
      0.12,
-     0.32
+     0.3
     ],
     "edit test": [
-     0.89,
-     0.57
+     0.55,
+     0.5
     ],
     "broken": [
-     1.72,
-     0.45
+     1.13,
+     0.65
     ],
     "mended": [
-     0.73,
-     1.45
+     1.12,
+     1.63
     ],
     "mended run": [
-     0.11,
-     0.35
+     0.12,
+     0.29
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (66s so far)",
+    "cold run": "cargo: the daemon is still loading the workspace (55s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
@@ -540,7 +540,7 @@
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 2939827, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2939830, /dev/shm/rustd-cargo-n3hc2hxy/nushell/, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/f8534e94c0ca2c28/log\n    /dev/shm/rustd-cargo-n3hc2hxy/nushell: ready\n  worker: pid 2963035, /dev/shm/rustd-cargo-n3hc2hxy/nushell/crates/nu-path, log /dev/shm/rustd-cargo-n3hc2hxy/home/workers/3025365ba3bac403/log\n    /dev/shm/rustd-cargo-n3hc2hxy/nushell: ready\n/dev/shm/rustd-cargo-n3hc2hxy/nushell (dev, a37ffefd4fd73c8c): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (66s so far)\n/dev/shm/rustd-cargo-n3hc2hxy/nushell (test, 793af4cdc42fee5d): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 4068049, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 4088075, /dev/shm/rustd-cargo-cu96c_gg/nushell/crates/nu-path, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/adcc0062a61325bc/log\n    /dev/shm/rustd-cargo-cu96c_gg/nushell: ready\n  worker: pid 4068052, /dev/shm/rustd-cargo-cu96c_gg/nushell/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/320487ec50deb333/log\n    /dev/shm/rustd-cargo-cu96c_gg/nushell: ready\n/dev/shm/rustd-cargo-cu96c_gg/nushell (dev, 5c3c42e2151b410f): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (55s so far)\n/dev/shm/rustd-cargo-cu96c_gg/nushell (test, be57f9f56845803e): 2 builds by the daemon, 0 by cargo\n"
   }
  ],
  "flags": [
@@ -554,7 +554,7 @@
   [
    "cold",
    "cargo rustd run -- fail",
-   "cargo: the daemon is still loading the workspace (341ms so far)",
+   "cargo: the daemon is still loading the workspace (317ms so far)",
    3,
    "same"
   ],
@@ -673,28 +673,28 @@
   [
    "cold",
    "cargo rustd test greets",
-   "cargo: the daemon is still loading the workspace (471ms so far)",
+   "cargo: the daemon is still loading the workspace (445ms so far)",
    0,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "cargo: the daemon is still loading the workspace (566ms so far)",
+   "cargo: the daemon is still loading the workspace (558ms so far)",
    101,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test",
-   "cargo: the daemon is still loading the workspace (835ms so far)",
+   "cargo: the daemon is still loading the workspace (701ms so far)",
    101,
    "same"
   ],
   [
    "cold",
    "cargo rustd test --no-run",
-   "cargo: the daemon is still loading the workspace (985ms so far)",
+   "cargo: the daemon is still loading the workspace (808ms so far)",
    0,
    "same"
   ],
@@ -960,7 +960,7 @@
   [
    "edit",
    "cargo rustd test",
-   "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/flags/util/src/lib.rs changed",
+   "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/flags/util/src/lib.rs changed",
    101,
    "same"
   ],
@@ -981,28 +981,28 @@
   [
    "edit",
    "cargo rustd test greets",
-   "cargo: the daemon is still loading the workspace (387ms so far)",
+   "cargo: the daemon is still loading the workspace (360ms so far)",
    101,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "cargo: the daemon is still loading the workspace (36ms so far)",
+   "cargo: the daemon is still loading the workspace (42ms so far)",
    101,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test",
-   "cargo: the daemon is still loading the workspace (199ms so far)",
+   "cargo: the daemon is still loading the workspace (165ms so far)",
    101,
    "same"
   ],
   [
    "edit",
    "cargo rustd test --no-run",
-   "cargo: the daemon is still loading the workspace (329ms so far)",
+   "cargo: the daemon is still loading the workspace (269ms so far)",
    0,
    "same"
   ]
@@ -1016,7 +1016,7 @@
   [
    "the first build starts one",
    true,
-   "pid 2975786"
+   "pid 4100807"
   ],
   [
    "a later build is the daemon's, by the same daemon",
@@ -1026,7 +1026,7 @@
   [
    "a worktree is loaded by the same daemon and the same worker",
    true,
-   "workers [2975789]"
+   "workers [4100810]"
   ],
   [
    "a build in the worktree is the daemon's",
@@ -1041,22 +1041,22 @@
   [
    "a client of another build replaces the daemon",
    true,
-   "pid 2975786 then 2977054"
+   "pid 4100807 then 4102008"
   ],
   [
    "the workers of the daemon it replaced are gone",
    true,
-   "[2975789]"
+   "[4100810]"
   ],
   [
    "idle for RUSTD_IDLE_SECS, the daemon and its workers exit",
    true,
-   "daemon 2977343, workers [2977346]"
+   "daemon 4102270, workers [4102273]"
   ],
   [
    "workers exit when the daemon is killed",
    true,
-   "workers [2977954]"
+   "workers [4102943]"
   ],
   [
    "the build after that starts a daemon again and succeeds",
@@ -1065,5 +1065,5 @@
   ]
  ],
  "wrong": [],
- "flags_status": "daemon: pid 2966014, version 0.0.0-2bf2a70-18df4d38235aedc7, exits after 1800s idle\n  worker: pid 2970534, /dev/shm/rustd-cargo-n3hc2hxy/flags/util, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/a3b4e8b5e98e0da2/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n  worker: pid 2966017, /dev/shm/rustd-cargo-n3hc2hxy/flags/, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/33cc29284b7a37c7/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n  worker: pid 2966963, /dev/shm/rustd-cargo-n3hc2hxy/flags/app, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/7073f047470218af/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n  worker: pid 2966609, /dev/shm/rustd-cargo-n3hc2hxy/flags/, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/f2345fe5a79277fe/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n  worker: pid 2967277, /dev/shm/rustd-cargo-n3hc2hxy/flags/app, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/cf6b40869e45f8d1/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: ready\n  worker: pid 2975230, /dev/shm/rustd-cargo-n3hc2hxy/flags/, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/14d521b9c6cfbfb9/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: loading for 430ms\n  worker: pid 2974555, /dev/shm/rustd-cargo-n3hc2hxy/flags/, log /dev/shm/rustd-cargo-n3hc2hxy/home-flags/workers/b91bd9a92edf2b4b/log\n    /dev/shm/rustd-cargo-n3hc2hxy/flags: loading for 871ms\n/dev/shm/rustd-cargo-n3hc2hxy/flags (test, 7ac5335b10a63ca1): 5 builds by the daemon, 9 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-n3hc2hxy/flags/util/src/lib.rs changed\n  1 x the daemon is still loading the workspace (199ms so far)\n  1 x the daemon is still loading the workspace (329ms so far)\n  1 x the daemon is still loading the workspace (36ms so far)\n  1 x the daemon is still loading the workspace (387ms so far)\n  1 x the daemon is still loading the workspace (471ms so far)\n  1 x the daemon is still loading the workspace (566ms so far)\n  1 x the daemon is still loading the workspace (835ms so far)\n  1 x the daemon is still loading the workspace (985ms so far)\n/dev/shm/rustd-cargo-n3hc2hxy/flags (test, f3341c07cb4c61d3): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (test, 2d05212d06c4333a): 1 builds by the daemon, 1 by cargo\n  1 x the daemon has not loaded this build of the workspace\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 83fd301beac827c7): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, db799306e105048f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 438ab0618f96f77e): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 2ba0c172a6b691d0): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 67735db1c822e6a6): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 7bfada0a5a3f7e3c): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 4ee1a7f8d44b039f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, e3d1bad3b95a0075): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-n3hc2hxy/flags (dev, 6879c1594732bd94): 4 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (341ms so far)\n"
+ "flags_status": "daemon: pid 4091034, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 4092360, /dev/shm/rustd-cargo-cu96c_gg/flags/app, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/097b1e4dcd2da708/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4100237, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/d0074e63241607f9/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: loading for 340ms\n  worker: pid 4091037, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/f597c39936a0f344/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4092033, /dev/shm/rustd-cargo-cu96c_gg/flags/app, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/86fc9b75c70fec99/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4099480, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/bcaeb4730bf0e386/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: loading for 766ms\n  worker: pid 4091670, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/084ca4f068ca472b/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4095529, /dev/shm/rustd-cargo-cu96c_gg/flags/util, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/e84eaa32ac546a44/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, 4f0997d91413c7b3): 5 builds by the daemon, 9 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/flags/util/src/lib.rs changed\n  1 x the daemon is still loading the workspace (165ms so far)\n  1 x the daemon is still loading the workspace (269ms so far)\n  1 x the daemon is still loading the workspace (360ms so far)\n  1 x the daemon is still loading the workspace (42ms so far)\n  1 x the daemon is still loading the workspace (445ms so far)\n  1 x the daemon is still loading the workspace (558ms so far)\n  1 x the daemon is still loading the workspace (701ms so far)\n  1 x the daemon is still loading the workspace (808ms so far)\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, 4435ae61cb8f100a): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, b8fcf6862ab2e9be): 1 builds by the daemon, 1 by cargo\n  1 x the daemon has not loaded this build of the workspace\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, f99114aa91dcc129): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, ee8ac764746e7d6b): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, fa47015092d8737b): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 2e40474cf836ca49): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 20d83b5f7e2a30d4): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 76367848f52037db): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 15e57ab1e141ac1f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 8ebafdd1a6c9eb01): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 8155fd112a16c70e): 4 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (317ms so far)\n"
 }

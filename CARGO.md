@@ -166,7 +166,8 @@ Both the daemon's socket and each worker's go through `socket.rs`.
 - The peer. Every accepted connection is asked for its user (`SO_PEERCRED` on Linux,
   `getpeereid` on macOS and the BSDs) and one that is not the daemon's user is refused
   before its request is read.
-- A request is one line of at most 16 MiB, and the client has 10 seconds to send it. Each
+- A request is one line to the daemon and two to a worker (the request, then the variables
+  of the client's process), of at most 16 MiB together, and the client has 10 seconds to send it. Each
   connection is read on a thread of its own, so a client that connects and sends nothing, or
   an endless line, delays nobody else and is dropped with an error.
 - One server per socket. Whoever serves a socket holds an exclusive lock on `<socket>.lock`
@@ -244,7 +245,7 @@ Fixes outside `cargo/` that the real projects needed, all general:
 
 Machine: Linux x86-64, 8 CPUs, 31 GB. Toolchain 1.99.0. Cranelift backend, `target/release/rustd`
 built with `cargo build -p rustd --release` at the head of this branch, which has
-`rustd-collate` f66cd13c10 merged in.
+`rustd-collate` b43304222b merged in.
 
     cd harness && TMPDIR=/dev/shm python3 cargo_rustd.py
 
@@ -265,31 +266,31 @@ one cargo did in its place.
 
 | Project | cold build | warm-up | warm build | cold test | test warm-up | warm test | edit build | edit test | broken | mended | Differences |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| ripgrep 15.1.0 | 6.93 / 6.41 | 7.43 | **0.02** / 0.45 | 4.13 / 5.84 | 4.18 | **0.96** / 1.46 | **0.32** / 0.89 | 2.21 (c) / 1.61 | 0.31 (c) / 0.22 | **0.17** / 0.72 | 0 |
-| fd v10.3.0 | 21.20 / 24.09 | 0.02 | **0.03** / 0.39 | 5.65 / 5.53 | 3.00 | **0.62** / 1.25 | **0.16** / 0.75 | **0.70** / 1.08 | 0.32 (c) / 0.23 | **0.07** / 0.45 | 0 |
-| bat v0.26.0 | 18.73 / 20.97 | 7.66 | **0.02** / 0.09 | 10.72 / 16.81 | 8.47 | 1.62 (c) / 1.49 | **0.30** / 0.52 | **1.77** / 1.30 | 0.28 (c) / 0.23 | **0.09** / 0.48 | 0 |
-| hyperfine v1.19.0 | 5.95 / 6.44 | 5.21 | **0.02** / 0.32 | 4.48 / 5.06 | 2.50 | **0.37** / 0.72 | **0.05** / 0.35 | **0.40** / 0.72 | 0.26 (c) / 0.18 | **0.05** / 0.33 | 0 |
-| just 1.43.0 | 8.68 / 10.74 | 1.95 | **0.02** / 0.06 | 8.79 / 7.14 | 7.79 | **1.47** / 1.53 | **0.13** / 0.29 | **1.41** / 1.03 | 0.20 (c) / 0.11 | **0.10** / 0.26 | 0 |
-| axum axum-v0.8.6 | 9.39 / 10.97 | 8.53 | **0.02** / 0.11 | 12.21 / 10.56 | 1.93 | **0.03** / 0.13 | **0.08** / 0.40 | **0.12** / 0.86 | 0.26 (c) / 0.16 | **0.05** / 0.31 | 0 |
-| nushell 0.108.0 | 44.82 / 65.71 | 51.05 | **0.02** / 0.27 | 2.97 / 2.54 | 1.12 | **0.67** / 0.60 | **0.79** / 1.63 | **0.89** / 0.57 | 1.72 (c) / 0.45 | **0.73** / 1.45 | 0 |
+| ripgrep 15.1.0 | 6.00 / 6.48 | 6.87 | **0.02** / 0.44 | 2.89 / 6.13 | 3.87 | **0.95** / 1.35 | **0.34** / 0.86 | 2.25 (c) / 1.60 | 0.38 (c) / 0.20 | **0.27** / 0.55 | 0 |
+| fd v10.3.0 | 21.91 / 21.98 | 0.02 | **0.03** / 0.55 | 5.90 / 5.52 | 3.02 | **0.64** / 1.05 | **0.16** / 0.51 | **0.90** / 1.03 | 0.57 (c) / 0.23 | **0.17** / 0.41 | 0 |
+| bat v0.26.0 | 17.47 / 20.90 | 8.50 | **0.02** / 0.08 | 10.68 / 15.38 | 8.51 | 1.68 (c) / 1.46 | **0.30** / 0.53 | **1.95** / 1.33 | 0.38 (c) / 0.26 | **0.09** / 0.50 | 0 |
+| hyperfine v1.19.0 | 5.81 / 6.79 | 5.28 | **0.03** / 0.39 | 4.73 / 4.92 | 2.77 | **0.38** / 0.82 | **0.13** / 0.34 | **0.60** / 0.75 | 0.37 (c) / 0.20 | **0.19** / 0.34 | 0 |
+| just 1.43.0 | 8.89 / 10.12 | 2.50 | **0.02** / 0.06 | 8.65 / 7.62 | 8.49 | **1.54** / 1.67 | **0.11** / 0.28 | **1.34** / 1.09 | 0.22 (c) / 0.12 | **0.09** / 0.27 | 0 |
+| axum axum-v0.8.6 | 9.06 / 9.20 | 3.86 | **0.02** / 0.13 | 11.44 / 10.70 | 2.23 | **0.03** / 0.13 | **0.07** / 0.40 | **0.12** / 0.97 | 0.33 (c) / 0.19 | **0.06** / 0.44 | 0 |
+| nushell 0.108.0 | 44.12 / 54.73 | 42.36 | **0.04** / 0.26 | 3.25 / 2.37 | 1.12 | **0.69** / 0.72 | **0.96** / 1.65 | **0.55** / 0.50 | 1.13 (c) / 0.65 | **1.12** / 1.63 | 0 |
 
 Reading it: the cold build is cargo's in both columns (the wrapper adds copying of
 artifacts; the differences there are run-to-run noise of a single run and I would not read
 them as rustd being faster). Warm-up is the time until the daemon has loaded the workspace
-after the cold build, during which builds go to cargo. Edit builds by the daemon took 0.05
-to 0.79 s against 0.29 to 1.63 s for cargo. `broken` always goes to cargo, by design, and
-costs 0.05 to 1.3 s more than cargo alone. Three steps went to cargo for other reasons:
+after the cold build, during which builds go to cargo. Edit builds by the daemon took 0.07
+to 0.96 s against 0.28 to 1.65 s for cargo. `broken` always goes to cargo, by design, and
+costs 0.1 to 0.5 s more than cargo alone. Three steps went to cargo for other reasons:
 ripgrep's edit test (the edit was in a library its unit tests link), bat's warm test (a
 build script's output is newer than the build) and the cold run of most projects (daemon
 still loading).
 
 Runs that did not pass, before the fixes above: fd failed its warm and edit test step on
 every run (the `#[test]` naming bug), and bat was never served (the UTF-8 panic). Two
-differences are not explained, both in just's integration tests, in nine runs of just. In
+differences are not explained, both in just's integration tests, in ten runs of just. In
 one run `delimiters::mismatched_delimiter` failed in the daemon-built test executable and
 passed under cargo. In another, `directories::data_directory` passed on the `cargo rustd`
 side and did not on the plain cargo side, in the cold test step, where cargo built both
-executables; that run later ran out of disk and its output was lost. The other seven runs
+executables; that run later ran out of disk and its output was lost. The other eight runs
 matched. Since the second difference is between two executables cargo built, I infer that
 these tests are sensitive to load on this machine rather than to who compiled them, but I
 have not shown that, and the first one may still be rustd's.
@@ -303,7 +304,8 @@ killed; the next build starts a new daemon.
 
 ### The regression gate
 
-Run on the head of this branch (with `rustd-collate` f66cd13c10 merged), from `harness/`, with `RUSTD_BIN=target/release/rustd`, once
+Run on the head of this branch (with `rustd-collate` b43304222b merged), from `harness/`,
+with `RUSTD_BIN=target/release/rustd` and `TMPDIR=/dev/shm`, once
 with `RUSTD_BACKEND=cranelift` (binary from `cargo build -p rustd --release`) and once with
 `RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast` (binary from
 `LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm`; the
@@ -321,11 +323,25 @@ counts were the same under both:
 | `asmedits.py` | 10 of 10 |
 | `includes.py` | 9 of 9 |
 | `worktrees.py` | 58 of 58 |
-| `keys.py` | 26 of 26; 4 cases the script marks open (`option_env!` and the release profile, twice each) |
+| `keys.py` | 36 of 36, 0 open |
 | `debuginfo.py` | all right |
 
+`buildmodel.py --jobs 6`, which came with that merge and runs both backends itself, gives
+179 of 180 as expected, 0 WRONG. The one is `cross_aarch64` under LLVM: rustd does not
+finish (in one run it exited without a reason, in another it spun inside LLVM's AArch64
+`InstructionSelect`). It is the same row in the CI run of `rustd-collate` at b43304222b
+(run 39031377253), and this branch changes nothing under `crates/hir-ty`, so I take it to
+be the base's and left it.
+
+Merging b43304222b changed what a worker is asked: a request is now two lines, the second
+the variables of the client's process. The bounded, timed read takes both lines, and the
+daemon sends its worker the variables that worker was started with, so a build through
+`cargo rustd` is always for the process the worker was loaded for; a variable rustc
+said a crate read (`env-dep` in its dep-info) is a guard of `cargo rustd`, so when the user
+changes one the build goes to cargo.
+
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p rustd` passed: 928 tests, 0 failed, 1 ignored, of which 27 are rustd's.
+-p syntax -p rustd` passed: 929 tests, 0 failed, 1 ignored, of which 28 are rustd's.
 `cargo clippy -p rustd` reports no errors; the new code has warnings of the kinds the rest
 of the crate has (`eprintln!`, `Command::new`), which I left.
 
@@ -334,7 +350,7 @@ of the crate has (`eprintln!`, `Command::new`), which I left.
 - Fallback is per invocation or per program, not per unit; `--release`, other profiles and
   `RUSTFLAGS` are cargo's entirely. Serving them needs the worker keyed by profile and flags
   and the optimised backend checked against rustc's optimised output.
-- The two just differences seen in nine runs are unexplained.
+- The two just differences seen in ten runs are unexplained.
 - Windows and macOS: the entry point is written to compile there (the link plan refuses
   anything but ELF, so every build would go to cargo) and has not been built or run on
   either. The Windows socket hardening is described above and not implemented.
