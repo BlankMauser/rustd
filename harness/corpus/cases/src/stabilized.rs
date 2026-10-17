@@ -2,6 +2,16 @@
 use std::fmt::Debug;
 
 // let_chains (1.88)
+/// A spin loop's hint to the processor, which is `pause` through an LLVM intrinsic on x86.
+pub fn spin_hint() -> u32 {
+    let mut spins = 0;
+    while spins < 3 {
+        std::hint::spin_loop();
+        spins += 1;
+    }
+    spins
+}
+
 pub fn let_chains() -> Vec<u32> {
     let values = [Some(3u32), None, Some(10), Some(7)];
     let mut out = Vec::new();

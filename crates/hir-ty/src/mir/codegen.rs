@@ -9241,6 +9241,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.builder.inst_results(call)[0];
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            ("x86.sse2.pause", []) => {
+                let sig = self.cg.make_signature();
+                let callee = self.cg.assembly(asm::pause(), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &[]);
+            }
             ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [singles, rounding]) => {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;

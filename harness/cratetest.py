@@ -35,7 +35,9 @@ class TestFixture(Fixture):
         super().rustc_build()
         # A test that names nothing of the crate is linked without it: there is nothing of the
         # crate in the binary for rustd to stand in front of.
-        linked = any(os.path.basename(r).startswith(f"lib{self.crates[0]}-") for r in self.rlibs)
+        # The standard library's own copy of a crate of the same name (hashbrown) is not it.
+        linked = any(os.path.basename(r).startswith(f"lib{self.crates[0]}-") and "/rustlib/" not in r
+                     for r in self.rlibs)
         if len(self.crates) == 2 and not linked:
             print(f"{self.crates[0]} is not linked into this test")
             self.crates = self.crates[1:]

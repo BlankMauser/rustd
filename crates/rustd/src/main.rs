@@ -1235,7 +1235,9 @@ fn workspace_at(
         let built = built_features(manifest.manifest_path().as_ref(), cargo_config, dev_deps)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
-            let key = (cargo[package].name.clone(), cargo[package].version.to_string());
+            let data = &cargo[package];
+            let directory = data.is_local.then(|| PathBuf::from(data.manifest.parent()));
+            let key = (data.name.clone(), data.version.to_string(), directory);
             if let Some(features) = built.get(&key) {
                 cargo.set_active_features(package, features.iter().cloned().collect());
             }
@@ -1259,7 +1261,11 @@ fn report_sharing(db: &RootDatabase) {
     );
 }
 
-/// The features of each package, by name and version, in a build of the package of `manifest`.
+/// A package's name, its version, and its directory when it is built from a path: a member
+/// can depend, through others, on the registry's copy of its own version.
+type BuiltPackage = (String, String, Option<PathBuf>);
+
+/// The features of each package in a build of the package of `manifest`.
 ///
 /// `cargo metadata` unifies features over every member of the workspace, and cargo doesn't
 /// when it builds one of them.
@@ -1268,7 +1274,7 @@ fn built_features(
     manifest: &Path,
     cargo_config: &CargoConfig,
     dev_deps: bool,
-) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
+) -> anyhow::Result<FxHashMap<BuiltPackage, std::collections::BTreeSet<String>>> {
     let edges = if dev_deps { "normal,dev" } else { "normal" };
     let mut command = Command::new("cargo");
     command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
@@ -1288,12 +1294,14 @@ fn built_features(
     for line in String::from_utf8(output.stdout)?.lines() {
         // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
         let Some((package, features)) = line.split_once('|') else { continue };
-        let mut package = package.split(' ');
+        let mut package = package.splitn(3, ' ');
         let (Some(name), Some(version)) = (package.next(), package.next()) else { continue };
         let version = version.trim_start_matches('v');
+        let source = package.next().and_then(|it| it.strip_prefix('(')?.strip_suffix(')'));
+        let directory = source.filter(|it| Path::new(it).is_absolute()).map(PathBuf::from);
         let features = features.trim_end_matches(" (*)").split(',').filter(|it| !it.is_empty());
         built
-            .entry((name.to_owned(), version.to_owned()))
+            .entry((name.to_owned(), version.to_owned(), directory))
             .or_insert_with(std::collections::BTreeSet::new)
             .extend(features.map(str::to_owned));
     }

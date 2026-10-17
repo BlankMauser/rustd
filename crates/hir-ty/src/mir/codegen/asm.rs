@@ -31,6 +31,11 @@ pub(super) fn xgetbv() -> String {
     )
 }
 
+/// The hint a spin loop gives the processor between attempts.
+pub(super) fn pause() -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\npause\nret\n")
+}
+
 /// Returns its first float argument with the second left in the register it was passed in,
 /// which is where a pair of floats is returned.
 pub(super) fn join_floats() -> String {

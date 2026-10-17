@@ -31,6 +31,32 @@ The second pass took the 95 functions and the two differing crates of the first 
 one; the rows "15 to 26" below are what came out of it. What is left is 15 functions of
 generic-array, in one cause, and 2 of tokio's with `--features full`.
 
+## On stable 1.99
+
+The sweep again with `rustc 1.99.0` and the collated branch (`f296858ee3` plus the three fixes
+below), one run, Cranelift: `RUSTD_BIN=.. CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out99
+$(versions)`, then `sweepreport.py ~/sweep/out99`.
+
+| | result |
+|---|---|
+| crates whose tests behave as rustc's | 86 of 86 |
+| tests run and compared | 10745 |
+| functions compiled by rustd, as the sweep ran | 41958 of 41987 (29 left to rustc) |
+| the same after the fixes below, rerun on the four crates they touch | 15 left, all generic-array |
+
+What the 29 were:
+
+| cause | functions | crates | what was done |
+|---|---|---|---|
+| `spin_loop` reaches `_mm_pause`, an LLVM intrinsic with no body, on 1.99 | 5 | crossbeam-channel, futures-util | a one-instruction helper; corpus case `spin_hint` |
+| A member of the workspace and the registry's copy of the same version (ahash, through hashbrown's dev-dependency) were given each other's features, so the copy named a dependency it does not have | 1 | ahash | features are keyed by the package's directory too |
+| The test names nothing of the crate, so the crate is not linked, but the standard library's own `hashbrown` rlib made the harness think it was | 8 | hashbrown | the harness's check; not rustd's |
+| The next trait solver on `GenericArray<T, N>` (as above) | 15 | generic-array | open |
+
+crossbeam-channel's `tick` test binary differed once in the rerun with the same test results
+printed and nothing from valgrind, and matched in three runs after; it measures intervals of
+time.
+
 ## How it was run
 
 - Libraries: `harness/cratesweep.sh <out> <crate-version>...` downloads each crate from

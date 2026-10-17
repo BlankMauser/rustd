@@ -413,6 +413,7 @@ fn main() {
     println!("async_closures {:?}", cases::async_closures::run());
     println!("async_closures more {:?}", cases::async_closures::more());
     println!("async_items {:?}", cases::async_items::run());
+    println!("stabilized spin_hint {:?}", cases::stabilized::spin_hint());
     println!("stabilized let_chains {:?}", cases::stabilized::let_chains());
     println!("stabilized if_let_guard {:?}", cases::stabilized::if_let_guard());
     println!("stabilized trait_upcasting {:?}", cases::stabilized::trait_upcasting());
