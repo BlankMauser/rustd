@@ -3088,6 +3088,7 @@ dependencies = [
  "tar",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
+ "toml",
  "triomphe",
  "uds_windows",
  "ureq",
