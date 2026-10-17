@@ -279,16 +279,25 @@ fn read_lines_within<const LINES: usize>(
     timeout: Duration,
 ) -> io::Result<[String; LINES]> {
     check_peer(stream)?;
-    stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
-    stream.set_read_timeout(Some(timeout))?;
+    unless_hung_up(stream.set_write_timeout(Some(REPLY_TIMEOUT)))?;
+    unless_hung_up(stream.set_read_timeout(Some(timeout)))?;
     let mut lines = BufReader::new(stream.take(longest));
     let mut read = [const { String::new() }; LINES];
     for line in &mut read {
         *line = read_line(&mut lines)?;
     }
     // What a build takes is not the client's to be timed for.
-    stream.set_read_timeout(None)?;
+    unless_hung_up(stream.set_read_timeout(None))?;
     Ok(read)
+}
+
+/// `limited` as it is, but for the refusal macOS gives a time limit on a stream whose peer
+/// has hung up. Nothing waits on such a stream, so it needs no limit.
+fn unless_hung_up(limited: io::Result<()>) -> io::Result<()> {
+    match limited {
+        Err(refused) if refused.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        limited => limited,
+    }
 }
 
 /// The next line of `lines` without its end, when it has one before `lines` is at its limit.
