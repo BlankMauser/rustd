@@ -5,6 +5,7 @@ mod content;
 mod deps;
 mod memory;
 mod outline;
+mod profile;
 mod remote;
 mod splice;
 mod stub;
@@ -109,6 +110,11 @@ struct Args {
     /// The triple to emit code for, when it is not the host: the workspace is loaded as
     /// cargo builds it for that target, and the objects are of its format and architecture.
     target: Option<String>,
+    /// The cargo profile the program is built with, which says whether it has debug
+    /// information.
+    profile: String,
+    /// Whether the code is to say which lines it is of: what `profile` asks for.
+    debug: bool,
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
@@ -166,6 +172,7 @@ impl Args {
         let mut features = Vec::new();
         let mut also = Vec::new();
         let mut target = None;
+        let mut profile = String::from("dev");
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -185,6 +192,7 @@ impl Args {
                 "--dev-deps" => dev_deps = true,
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
+                "--profile" => profile = value()?,
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
@@ -209,6 +217,8 @@ impl Args {
             features,
             also,
             target,
+            profile,
+            debug: false,
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
@@ -225,6 +235,8 @@ struct Resolver<'a> {
     base: Option<PathBuf>,
     rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
+    /// Whether the code is to say which lines it is of.
+    debug: bool,
 }
 
 impl Resolver<'_> {
@@ -499,8 +511,10 @@ impl SymbolResolver for Resolver<'_> {
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
+                let debug = self.debug;
                 scope.spawn(move || {
-                    let resolver = Resolver { db: &db, table, root, base, rustc_commit, contents };
+                    let resolver =
+                        Resolver { db: &db, table, root, base, rustc_commit, contents, debug };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -526,6 +540,10 @@ impl SymbolResolver for Resolver<'_> {
         }
         let relative = self.inside(Path::new(&path));
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    }
+
+    fn debug_directory(&self) -> Option<String> {
+        self.debug.then(|| self.root.to_string_lossy().into_owned())
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
@@ -1527,7 +1545,9 @@ fn build(
     let start = Instant::now();
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
-    let resolver = Resolver { db, table, root, base, rustc_commit: Default::default(), contents };
+    let debug = args.debug;
+    let resolver =
+        Resolver { db, table, root, base, rustc_commit: Default::default(), contents, debug };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
@@ -2197,6 +2217,8 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             features: args.features.clone(),
             also: Vec::new(),
             target: args.target.clone(),
+            profile: args.profile.clone(),
+            debug: args.debug,
             checkout: args.checkout.clone(),
             base: args.base.clone(),
             members: args.members.clone(),
@@ -2692,6 +2714,7 @@ fn main() -> anyhow::Result<()> {
         load(&projects, &cargo_config, load_config, args.cfg_test || args.dev_deps)?;
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
+    args.debug = profile::debug(&args.checkout, &args.profile);
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
 

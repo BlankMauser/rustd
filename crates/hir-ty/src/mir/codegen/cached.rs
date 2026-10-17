@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConstBlob, DataIdentity,
+    debuginfo::{FunctionDebug, LineRow},
     fragment::Code,
     store::{KEY, Store},
     unwind::FunctionUnwind,
@@ -36,6 +37,8 @@ pub(super) struct Entry {
     /// A blob indexes `funcs` and the data before it, as the blobs of `Requests` do.
     pub(super) datas: Vec<CachedData>,
     pub(super) code: CachedCode,
+    /// What a debugger is told about the function, when the build that kept it told one.
+    pub(super) debug: Option<FunctionDebug>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -98,6 +101,7 @@ pub(super) struct CachedCode {
     align: u64,
     relocs: Vec<CachedReloc>,
     unwind: Option<FunctionUnwind>,
+    lines: Vec<LineRow>,
 }
 
 impl PartialEq for CachedCode {
@@ -124,6 +128,7 @@ impl From<&Code> for CachedCode {
                 })
                 .collect(),
             unwind: code.unwind.clone(),
+            lines: code.lines.clone(),
         }
     }
 }
@@ -149,6 +154,7 @@ impl CachedCode {
                 })
                 .collect(),
             unwind: self.unwind.clone(),
+            lines: self.lines.clone(),
         }
     }
 }
@@ -181,9 +187,15 @@ impl StoredCode {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 1");
+        hasher.update(b"rustd llvm 2");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
+        // Nor does it tell which statement an instruction is of, which the code's lines do.
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                hasher.update(func.srcloc(inst).bits().to_le_bytes());
+            }
+        }
         for (_, name) in func.params.user_named_funcs().iter() {
             hasher.update(name.namespace.to_le_bytes());
             hasher.update(name.index.to_le_bytes());
@@ -263,7 +275,9 @@ impl StoredCode {
 impl Entry {
     /// The key of the entry for `name`, or `None` when this build of the compiler cannot be
     /// told from another, whose entries would then be taken for its own.
-    pub(super) fn key(name: &str) -> Option<[u8; KEY]> {
+    ///
+    /// An entry kept with what a debugger is told is not the one kept without.
+    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
         static COMPILER: OnceLock<Option<[u8; KEY]>> = OnceLock::new();
         let compiler = COMPILER.get_or_init(|| {
             let program = std::fs::read(std::env::current_exe().ok()?).ok()?;
@@ -276,7 +290,7 @@ impl Entry {
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
         hasher.update(super::Target::selected().ok()?.triple());
-        hasher.update([0]);
+        hasher.update([0, debug as u8]);
         hasher.update(name);
         Some(hasher.finalize().into())
     }
@@ -319,6 +333,8 @@ impl Entry {
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
     store: &'static Store,
+    /// Whether the entries asked for are the ones with what a debugger is told.
+    debug: bool,
     known: Mutex<Known>,
 }
 
@@ -343,8 +359,8 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(store: &'static Store) -> Entries {
-        Entries { store, known: Mutex::default() }
+    pub(super) fn new(store: &'static Store, debug: bool) -> Entries {
+        Entries { store, debug, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -367,7 +383,7 @@ impl Entries {
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
-            .then(|| Entry::decode(self.store.get(&Entry::key(name)?)?))
+            .then(|| Entry::decode(self.store.get(&Entry::key(name, self.debug)?)?))
             .flatten()
             .map(Arc::new);
         self.known().entries.insert(Arc::from(name), entry.clone());
