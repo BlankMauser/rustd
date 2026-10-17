@@ -528,6 +528,11 @@ impl SymbolResolver for Resolver<'_> {
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
     }
 
+    fn debug_directory(&self) -> Option<String> {
+        let wanted = std::env::var("RUSTD_DEBUGINFO").map_or(true, |it| it != "0");
+        wanted.then(|| self.root.to_string_lossy().into_owned())
+    }
+
     fn function(&self, func: FunctionId) -> Option<String> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);

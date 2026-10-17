@@ -99,7 +99,7 @@ impl<'data> Emitted<'data> {
             }
         };
         let Emitted { bytes, align, relocs, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, unwind })
+        Ok(Code { signature, bytes, align, relocs, unwind, lines: Vec::new() })
     }
 
     /// Fills the function, which is all of `code`, up to the length of the shortest one

@@ -65,6 +65,7 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
     Requests,
@@ -82,6 +83,7 @@ mod asm;
 mod backend;
 pub use backend::Backend;
 mod cached;
+mod debuginfo;
 mod float_pair;
 mod fragment;
 mod home;
@@ -143,6 +145,11 @@ pub trait SymbolResolver {
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    /// The directory the names of [`Self::source_path`] are relative to, when the build is
+    /// to tell a debugger where its code comes from.
+    fn debug_directory(&self) -> Option<String> {
+        None
+    }
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
         false
@@ -842,6 +849,8 @@ struct ObjectCodegen<'a, 'db> {
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     unwind: UnwindContext,
+    /// What a debugger is told about the functions, when the build tells one anything.
+    debug: Option<DebugContext>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1770,12 +1779,17 @@ fn compile<'db>(
             align: 16,
             relocs: Vec::new(),
             unwind: None,
+            lines: Vec::new(),
         },
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
+    let source = match body.map(|body| body.owner) {
+        Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
+        _ => None,
+    };
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, layouts })
+    Ok(CompiledFunction { requests, code, source, layouts })
 }
 
 fn build<'db>(
@@ -1877,6 +1891,9 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
                 .collect(),
             unwind: FunctionUnwind::of(isa, ctx)?,
+            lines: LineRow::of_ranges(
+                compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+            ),
         })
     }));
     match outcome {
@@ -1901,7 +1918,14 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
     for reloc in &mut relocs {
         reloc.offset += body;
     }
-    Ok(Code { signature: func.signature.clone(), bytes, align: 1, relocs, unwind: None })
+    Ok(Code {
+        signature: func.signature.clone(),
+        bytes,
+        align: 1,
+        relocs,
+        unwind: None,
+        lines: Vec::new(),
+    })
 }
 
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
@@ -1946,11 +1970,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
+        // FIXME: a patch says nothing of its code yet.
+        let debug = symbols
+            .debug_directory()
+            .filter(|_| base.is_none())
+            .and_then(|directory| DebugContext::new(module.isa(), &directory));
+        let debugged = debug.is_some();
         Ok(ObjectCodegen {
             db,
             symbols,
             module,
             unwind,
+            debug,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -1994,7 +2025,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store))),
+                .map(|store| std::sync::Arc::new(cached::Entries::new(store, debugged))),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2012,6 +2043,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
+        if let Some(debug) = self.debug {
+            debug.emit(&mut product).map_err(CodegenError::Backend)?;
+        }
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
@@ -2089,6 +2123,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
+        let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), Some(func));
         Ok(symbol)
     }
 
@@ -2259,8 +2295,43 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             );
         }
         let ids = self.stitch(id, compiled)?;
-        self.keep(instance, compiled, &ids);
+        let name = self.callee_name(instance.def).to_owned();
+        let declared = match instance.def {
+            InstanceDef::Fn(func) => Some(func),
+            _ => None,
+        };
+        let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
+        self.keep(instance, compiled, &ids, debug);
         Ok(())
+    }
+
+    /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
+    /// has it, and which line each of its instructions is of. `None` when no debugger is
+    /// told anything.
+    fn describe(
+        &mut self,
+        id: FuncId,
+        compiled: &CompiledFunction,
+        mut debug: FunctionDebug,
+        declared: Option<FunctionId>,
+    ) -> Option<FunctionDebug> {
+        self.debug.as_ref()?;
+        if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
+            debug.declared = Some(debug.place(file, line, column));
+        }
+        if let Some((owner, spans)) = &compiled.source {
+            for row in &compiled.code.lines {
+                let Some(&span) = spans.get(row.span as usize) else { continue };
+                let Some((file, line, column)) = self.location_at(Some((*owner, span))) else {
+                    continue;
+                };
+                let place = debug.place(file, line, column);
+                debug.row(row.offset, place);
+            }
+        }
+        let len = compiled.code.bytes.len() as u32;
+        self.debug.as_mut()?.add_function(id, len, &debug);
+        Some(debug)
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
@@ -2274,20 +2345,26 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Adds a stitched instance to the store, when everything it is and refers to has a name
     /// that another run of the daemon can find it by.
-    fn keep(&mut self, instance: &Instance, compiled: &CompiledFunction, ids: &Resolved) {
+    fn keep(
+        &mut self,
+        instance: &Instance,
+        compiled: &CompiledFunction,
+        ids: &Resolved,
+        debug: Option<FunctionDebug>,
+    ) {
         // What a patch refers to is in its base under names of that one object.
         let Some(store) = store::Store::global().filter(|_| self.base.is_none()) else { return };
         let Some(name) = self.stable_name(instance) else {
             self.kept.unnamed += 1;
             return;
         };
-        let Some(key) = cached::Entry::key(&name) else { return };
+        let Some(key) = cached::Entry::key(&name, debug.is_some()) else { return };
         let stored = store.get(&key);
         let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if stored.is_some() && !check {
             return;
         }
-        let Some(entry) = self.entry(instance, compiled, ids) else {
+        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
@@ -2321,6 +2398,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         instance: &Instance,
         compiled: &CompiledFunction,
         ids: &Resolved,
+        debug: Option<FunctionDebug>,
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let mut funcs = Vec::with_capacity(ids.funcs.len());
@@ -2424,6 +2502,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             funcs,
             datas,
             code: cached::CachedCode::from(&compiled.code),
+            debug,
         })
     }
 
@@ -2523,6 +2602,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let code = entry.code.code();
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
+        if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
+            debug.add_function(id, code.bytes.len() as u32, of);
+        }
         self.bodies += 1;
         self.kept.found += 1;
         Ok(())
@@ -4901,7 +4983,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.builder.switch_to_block(self.blocks[id]);
             for statement in &block.statements {
-                self.span = statement.span;
+                self.at(statement.span);
                 match &statement.kind {
                     // A promoted constant already holds its value.
                     StatementKind::Assign(place, _)
@@ -4921,7 +5003,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let Some(terminator) = &block.terminator else {
                 unsupported!("block without terminator");
             };
-            self.span = terminator.span;
+            self.at(terminator.span);
             let target = match &terminator.kind {
                 // A promoted call already holds its value, and that value is read-only.
                 TerminatorKind::Call { destination, target: Some(target), .. }
@@ -6999,6 +7081,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let value = self.builder.ins().iconst(types::I32, number as i64);
         self.builder.ins().store(MEM, value, addr, 0);
         Ok(Some(addr))
+    }
+
+    /// Has what is built from here on be of the statement at `span`.
+    fn at(&mut self, span: MirSpan) {
+        self.span = span;
+        let loc = self.cg.source_loc(span);
+        self.builder.set_srcloc(loc);
     }
 
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
@@ -9509,7 +9598,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.guarded = true;
         self.builder.set_srcloc(unwind::seh::guarded());
         let call = call(&mut self.builder);
-        self.builder.set_srcloc(ir::SourceLoc::default());
+        self.at(self.span);
         let results = self.builder.inst_results(call).to_vec();
         let frame = self.builder.ins().get_frame_pointer(ptr());
         let exception = self.builder.ins().load(ptr(), MEM, frame, unwind::seh::ARRIVAL);
