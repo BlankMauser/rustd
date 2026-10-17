@@ -3080,6 +3080,7 @@ dependencies = [
  "paths",
  "pdb",
  "project-model",
+ "pulldown-cmark",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rusty-s3",

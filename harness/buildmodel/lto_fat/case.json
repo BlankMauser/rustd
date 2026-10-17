@@ -11,5 +11,9 @@
   "rustd": [
     "--release"
   ],
-  "expect": "refused"
+  "link": [
+    "--config",
+    "profile.release.lto=\"off\""
+  ],
+  "says": "lto: accepted, no cross-function optimization"
 }

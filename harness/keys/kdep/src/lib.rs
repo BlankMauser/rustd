@@ -35,3 +35,9 @@ pub fn widened<T: Into<u8>>(x: T) -> u8 {
 pub fn bumped(x: u8) -> u8 {
     x + std::hint::black_box(1)
 }
+
+/// Small enough that rustc, when it optimises, compiles it in the crate that calls it, which
+/// then decides with the crate it is written in whether it checks.
+pub fn small(x: u8) -> u8 {
+    x + 1
+}

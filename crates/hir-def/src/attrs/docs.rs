@@ -157,8 +157,10 @@ impl Docs {
             &self.docs_source_map
         };
 
-        let after_range =
-            source_map.partition_point(|line| line.string_offset <= string_range.start()) - 1;
+        // Nothing starts at or before the range when the docs have no line that is written out.
+        let after_range = source_map
+            .partition_point(|line| line.string_offset <= string_range.start())
+            .checked_sub(1)?;
         let after_range = &source_map[after_range..];
         let line = after_range.first()?;
         // Unmapped lines (from macro-expanded docs) cannot be mapped back to AST.

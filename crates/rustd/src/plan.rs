@@ -8,10 +8,16 @@ use cargo_platform::{Cfg, Platform};
 use cfg::{CfgAtom, CfgDiff};
 use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
+
+/// What is said of a profile with `lto`. rustd compiles every function alone, so there is
+/// nothing for it to optimize across functions, and the program does what rustc's does: only
+/// how fast and how large it is differ. The libraries it links against are built without.
+const LTO_ACCEPTED: &str = "lto: accepted, no cross-function optimization";
 
 /// Which build of a package the daemon stands in for, as the flags of `cargo build` say it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `cargo rustd` and `rustd` itself both say a build with this.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Selection {
     /// The name of the profile: `dev` unless `--release` or `--profile` says otherwise.
     pub(crate) profile: String,
@@ -40,6 +46,33 @@ impl Default for Selection {
             target: None,
             dev_deps: false,
         }
+    }
+}
+
+impl Selection {
+    /// The selection as flags, which `cargo build` and `rustd` both read. Whether tests are
+    /// built is not among them: cargo and rustd name that differently.
+    pub(crate) fn flags(&self) -> Vec<String> {
+        let mut flags = vec!["--profile".to_owned(), self.profile.clone()];
+        if let Some(target) = &self.target {
+            flags.extend(["--target".to_owned(), target.clone()]);
+        }
+        if !self.features.is_empty() {
+            flags.extend(["--features".to_owned(), self.features.join(",")]);
+        }
+        if self.no_default_features {
+            flags.push("--no-default-features".to_owned());
+        }
+        if self.all_features {
+            flags.push("--all-features".to_owned());
+        }
+        for package in &self.packages {
+            flags.extend(["--package".to_owned(), package.clone()]);
+        }
+        if self.workspace {
+            flags.push("--workspace".to_owned());
+        }
+        flags
     }
 }
 
@@ -310,6 +343,16 @@ impl Words {
 /// The packages of a build by their id, each as it is built for the target.
 pub(crate) struct Plan {
     packages: FxHashMap<String, Built>,
+    lto: bool,
+}
+
+/// What a plan says of a program as a whole.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Whole {
+    /// Whether the code is to say which lines it is of.
+    pub(crate) debug: bool,
+    /// Whether rustc links it from bitcode, with `lto`.
+    pub(crate) lto: bool,
 }
 
 impl Plan {
@@ -325,25 +368,7 @@ impl Plan {
         let mut command = asked.cargo(dir);
         command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
         command.arg("--manifest-path").arg(manifest);
-        command.arg("--profile").arg(&selection.profile);
-        if let Some(target) = &selection.target {
-            command.arg("--target").arg(target);
-        }
-        if !selection.features.is_empty() {
-            command.arg("--features").arg(selection.features.join(","));
-        }
-        if selection.no_default_features {
-            command.arg("--no-default-features");
-        }
-        if selection.all_features {
-            command.arg("--all-features");
-        }
-        for package in &selection.packages {
-            command.arg("--package").arg(package);
-        }
-        if selection.workspace {
-            command.arg("--workspace");
-        }
+        command.args(selection.flags());
         if selection.dev_deps {
             command.arg("--all-targets");
         }
@@ -358,9 +383,10 @@ impl Plan {
         graph.plan(&Flags::of(dir, asked)?)
     }
 
-    /// Whether the packages cargo was asked to build are to say which lines their code is of.
-    pub(crate) fn debug(&self) -> bool {
-        self.packages.values().any(|it| it.primary && it.profile.debug())
+    /// What the plan says of the programs cargo was asked to build.
+    pub(crate) fn whole(&self) -> Whole {
+        let debug = self.packages.values().any(|it| it.primary && it.profile.debug());
+        Whole { debug, lto: self.lto }
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
@@ -427,13 +453,17 @@ impl UnitGraph {
 
     fn plan(self, flags: &Flags) -> anyhow::Result<Plan> {
         let for_target = self.for_target();
-        let from_bitcode =
-            flags.lto || for_target.iter().any(|&it| self.units[it].profile.links_from_bitcode());
+        // The flag is not cargo's to know: the libraries are then built for a link without it
+        // and rustc finds no bitcode in them.
         anyhow::ensure!(
-            !from_bitcode,
-            "`lto` is on: rustc compiles the whole program again as it links it and leaves no \
-             library on the link line for rustd's functions to be linked against"
+            !flags.lto,
+            "`-C lto` is among the flags: rustc compiles the whole program again as it links \
+             it and leaves no library on the link line for rustd's functions to be linked against"
         );
+        let lto = for_target.iter().any(|&it| self.units[it].profile.links_from_bitcode());
+        if lto {
+            eprintln!("{LTO_ACCEPTED}");
+        }
         // A package that is only built for the host, a proc macro, is as that build has it.
         let rank = |index: usize, unit: &Unit| (for_target.contains(&index), unit.is_library());
         let mut best: FxHashMap<&str, (usize, &Unit)> = FxHashMap::default();
@@ -453,6 +483,6 @@ impl UnitGraph {
                 (id.to_owned(), Built { features, profile, primary })
             })
             .collect();
-        Ok(Plan { packages })
+        Ok(Plan { packages, lto })
     }
 }

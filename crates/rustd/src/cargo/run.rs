@@ -73,14 +73,29 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
     }
 }
 
-/// Runs the doc tests with cargo, which has rustdoc build them.
+/// Runs the doc tests with cargo, which hands them to rustd in rustdoc's place: rustd
+/// builds each example as its own program over its code of the library.
 pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
-    let mut cargo = Command::new(cargo_path());
-    cargo.args(["test", "--doc"]).args(&asked.build_args);
+    let mut args = vec!["--doc".to_owned()];
+    args.extend(asked.build_args.iter().cloned());
     if asked.flags.no_fail_fast {
-        cargo.arg("--no-fail-fast");
+        args.push("--no-fail-fast".to_owned());
     }
-    cargo.args(&asked.positional).arg("--").args(&asked.trailing);
+    args.extend(asked.positional.iter().cloned());
+    args.push("--".to_owned());
+    args.extend(asked.trailing.iter().cloned());
+    only_doc_tests(&args)
+}
+
+/// Runs `cargo test` with `args`, which ask for the doc tests alone, with rustd in
+/// rustdoc's place.
+pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
+    let rustdoc = std::env::var_os("RUSTDOC").unwrap_or_else(|| "rustdoc".into());
+    let mut cargo = crate::doctest::as_asked(cargo_path());
+    cargo
+        .env("RUSTDOC", std::env::current_exe().context("finding rustd itself")?)
+        .env(crate::doctest::ENABLED, rustdoc);
+    cargo.arg("test").args(args);
     Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
 }
 

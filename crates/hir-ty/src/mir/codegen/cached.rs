@@ -279,9 +279,13 @@ impl Entry {
     /// An entry kept with what a debugger is told is not the one kept without.
     ///
     /// Whether the code checks arithmetic for overflow is in the name.
-    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
+    ///
+    /// `program` is the one program the entry is of, where what the calls of an entry reach
+    /// is not the same in every program that has a function of its name.
+    pub(super) fn key(name: &str, debug: bool, program: Option<&[u8; 32]>) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 6");
+        hasher.update(b"rustd entry 7");
+        hasher.update(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
@@ -331,6 +335,8 @@ pub(super) struct Entries {
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
+    /// The one program the entries are of, when they are not of any: see [`Entry::key`].
+    program: Option<[u8; 32]>,
     known: Mutex<Known>,
 }
 
@@ -355,8 +361,8 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(store: &'static Store, debug: bool) -> Entries {
-        Entries { store, debug, known: Mutex::default() }
+    pub(super) fn new(store: &'static Store, debug: bool, program: Option<[u8; 32]>) -> Entries {
+        Entries { store, debug, program, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -380,7 +386,7 @@ impl Entries {
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
             .then(|| {
-                let key = Entry::key(name, self.debug)?;
+                let key = Entry::key(name, self.debug, self.program.as_ref())?;
                 Entry::decode(&self.store.get(&key)?)
             })
             .flatten()

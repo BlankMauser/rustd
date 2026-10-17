@@ -100,7 +100,8 @@ impl Plan {
         }
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
-        plan.link_cmd = link.command(&plan, &dir.join("link.args"))?;
+        plan.link_cmd =
+            link.command(&[&plan.patch, &plan.object], &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
     }
 }
@@ -109,19 +110,10 @@ impl Plan {
 fn unsupported(unit: &Record) -> Option<String> {
     let name = &unit.crate_name;
     let off = |value: Option<&str>| matches!(value, None | Some("off" | "no" | "n" | "false"));
-    if !matches!(unit.codegen("opt-level"), None | Some("0")) {
-        let level = unit.codegen("opt-level").unwrap_or_default();
-        return Some(format!("`{name}` is built with opt-level={level}"));
-    }
     if !off(unit.codegen("lto")) || unit.codegen("linker-plugin-lto").is_some() {
         return Some(format!("`{name}` is built with LTO"));
     }
-    if unit.codegen("panic") == Some("abort") {
-        return Some(format!("`{name}` is built with panic=abort"));
-    }
-    for flag in
-        ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"]
-    {
+    for flag in ["instrument-coverage", "profile-generate", "profile-use"] {
         if unit.codegen(flag).is_some() {
             return Some(format!("`{name}` is built with -C {flag}"));
         }
@@ -133,7 +125,7 @@ fn unsupported(unit: &Record) -> Option<String> {
 }
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
-struct LinkLine {
+pub(crate) struct LinkLine {
     env: Vec<(String, String)>,
     linker: String,
     args: Vec<String>,
@@ -141,7 +133,7 @@ struct LinkLine {
 
 impl LinkLine {
     /// `None` for a line that is not `cc`'s for an ELF linker.
-    fn parse(line: &str) -> Option<LinkLine> {
+    pub(crate) fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
         let first = words.iter().position(|it| !is_assignment(it))?;
         let env = words[..first]
@@ -161,7 +153,7 @@ impl LinkLine {
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
-    fn rustc_files(&self) -> Vec<PathBuf> {
+    pub(crate) fn rustc_files(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> =
             self.args.iter().filter(|it| is_rustc_file(it)).map(PathBuf::from).collect();
         let library = files.iter().find_map(|it| {
@@ -182,20 +174,26 @@ impl LinkLine {
         files
     }
 
-    /// The command that links the plan's executable, with its arguments in the file at
-    /// `response`: a line with all of them is longer than a process may be given.
-    fn command(mut self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
+    /// The command that links `binary` with the objects `ahead` before everything rustc
+    /// built, with its arguments in the file at `response`: a line with all of them is longer
+    /// than a process may be given.
+    pub(crate) fn command(
+        mut self,
+        ahead: &[&Path],
+        binary: &Path,
+        response: &Path,
+    ) -> anyhow::Result<String> {
         let first = self
             .args
             .iter()
             .position(|it| is_rustc_file(it))
             .context("nothing of rustc's is linked")?;
-        let ours = [&plan.patch, &plan.object].map(|it| it.display().to_string());
-        self.args.splice(first..first, ours.into_iter().chain([FIRST_DEFINITION_STAYS.to_owned()]));
+        let ours = ahead.iter().map(|it| it.display().to_string());
+        self.args.splice(first..first, ours.chain([FIRST_DEFINITION_STAYS.to_owned()]));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
-            plan.binary.display().to_string();
+            binary.display().to_string();
         let quoted: Vec<String> = self
             .args
             .iter()
@@ -275,7 +273,10 @@ mod tests {
             stamp: 0,
         };
         let response = dir.join("link.args");
-        let command = LinkLine::parse(LINE).unwrap().command(&plan, &response).unwrap();
+        let command = LinkLine::parse(LINE)
+            .unwrap()
+            .command(&[&plan.patch, &plan.object], &plan.binary, &response)
+            .unwrap();
         assert_eq!(command, format!("LC_ALL=C PATH=/t/bin:/usr/bin cc @{}", response.display()));
         // As the driver reads the file: quoted where a shell would need it.
         let args = shlex::split(&std::fs::read_to_string(&response).unwrap()).unwrap();

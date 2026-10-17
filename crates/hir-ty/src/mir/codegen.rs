@@ -91,6 +91,7 @@ pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod llvm;
 mod patch;
+mod settled;
 mod stable;
 mod store;
 mod target;
@@ -156,6 +157,16 @@ pub trait SymbolResolver {
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
         false
+    }
+    /// The `StableCrateId` of each crate that compiled a copy of an instance of a function
+    /// named `function`.
+    fn makers(&self, _function: &str) -> Vec<u64> {
+        Vec::new()
+    }
+    /// The copies rustc made of the instance `symbol` is one of, each with the
+    /// `StableCrateId` of the crate that compiled it.
+    fn copies(&self, _symbol: &str) -> Vec<(String, u64)> {
+        Vec::new()
     }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
@@ -807,7 +818,8 @@ pub struct Phases {
 struct Instance {
     def: InstanceDef,
     args: StoredGenericArgs,
-    /// Whether the crate that compiles it has `-C overflow-checks`: see [`compiled_checked`].
+    /// Whether the crate that compiles it has `-C overflow-checks`: the one that asks for it,
+    /// until [`ObjectCodegen::settled`] says which crate rustc had compile it.
     checked: bool,
 }
 
@@ -892,6 +904,8 @@ struct ObjectCodegen<'a, 'db> {
     bodies: usize,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     own_statics: OwnStatics,
+    /// The crates of the program, when they do not all check overflow alike.
+    mixed: Option<settled::Mixed>,
     statics: FxHashMap<StaticId, DataId>,
     /// Statics nothing exports and nothing can write to, which we give a copy of the value.
     frozen_statics: FxHashMap<StaticId, DataId>,
@@ -1112,26 +1126,6 @@ fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
     }
     let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
     Some(krate.cfg_options(db).check_atom(&flag))
-}
-
-/// Whether the code of `def` that a function compiled with `asking` calls is compiled with
-/// `-C overflow-checks`. rustc compiles a function once, in the crate it is written in, when
-/// it has no generic parameters and is not `#[inline]`; anything else it compiles in each
-/// crate that uses it, with the flags of that crate. What the standard library has of the
-/// first kind and exports no symbol for is compiled by its user too.
-fn compiled_checked(
-    db: &dyn HirDatabase,
-    def: InstanceDef,
-    args: GenericArgs<'_>,
-    asking: bool,
-) -> bool {
-    let InstanceDef::Fn(func) = def else { return asking };
-    let own = args.iter().all(|arg| arg.region().is_some())
-        && !AttrFlags::query(db, func.into()).contains(AttrFlags::IS_INLINE);
-    match crate_checks_overflow(db, func.krate(db)) {
-        Some(checked) if own => checked,
-        _ => asking,
-    }
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -2090,6 +2084,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .debug_directory()
             .and_then(|directory| DebugContext::new(module.isa(), &directory));
         let debugged = debug.is_some();
+        let mixed = settled::Mixed::of(db, symbols, &own_statics.crates);
+        // Without an identity for such a program, nothing of it is kept or found.
+        let program = mixed.as_ref().map(|it| it.key);
+        let store = store::Store::global().filter(|_| program != Some(None));
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -2137,9 +2135,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             stable_names: FxHashMap::default(),
             kept: Kept::default(),
             // A patch gets these from its base, and a check compiles them to compare.
-            entries: store::Store::global()
+            entries: store
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store, debugged))),
+                .map(|store| cached::Entries::new(store, debugged, program.flatten()))
+                .map(std::sync::Arc::new),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2148,6 +2147,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             type_ids: FxHashMap::default(),
             misfit: false,
             own_statics,
+            mixed,
         })
     }
 
@@ -2473,12 +2473,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         debug: Option<FunctionDebug>,
     ) {
         // What a patch refers to is in its base under names of that one object.
-        let Some(store) = store::Store::global().filter(|_| self.base.is_none()) else { return };
+        let program = self.mixed.as_ref().map(|it| it.key);
+        let store = store::Store::global().filter(|_| self.base.is_none() && program != Some(None));
+        let Some(store) = store else { return };
         let Some(name) = self.stable_name(instance) else {
             self.kept.unnamed += 1;
             return;
         };
-        let Some(key) = cached::Entry::key(&name, debug.is_some()) else { return };
+        let key = cached::Entry::key(&name, debug.is_some(), program.flatten().as_ref());
+        let Some(key) = key else { return };
         let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if !check && store.has(&key) {
             return;
@@ -2515,6 +2518,92 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         crate_checks_overflow(self.db, func.krate(self.db)).is_none_or(|it| it == instance.checked)
     }
 
+    /// The instance as the crate rustc had compile it does: `instance` is as the crate that
+    /// asks for it would. See [`settled`].
+    fn settled(&self, instance: &Instance) -> Result<Instance> {
+        let Some(mixed) = &self.mixed else { return Ok(instance.clone()) };
+        let (db, asking) = (self.db, instance.checked);
+        let nameless = || {
+            // Only the crates that made a copy of a function of its name, or of a closure
+            // written in one, can have.
+            let makers = home::written_in(db, instance).map(|func| {
+                let name = FunctionSignature::of(db, func).name.as_str();
+                let makers = self.symbols.makers(name).into_iter();
+                makers.filter_map(|id| mixed.holder(db, id)).collect::<Vec<_>>()
+            });
+            let mentions = home::mentioned_crates(db, instance);
+            let reachable = mixed.reachable(asking, mentions.as_ref(), makers.as_deref());
+            let Some(checked) = reachable else {
+                unsupported!(
+                    "an instance with no name to find rustc's copies by, which a crate with \
+                     other overflow checks may have compiled"
+                );
+            };
+            Ok(checked)
+        };
+        let checked = match instance.def {
+            InstanceDef::Fn(func) => self.settled_function(mixed, func, instance, &nameless)?,
+            InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_) => nameless()?,
+            // No arithmetic of their own, and what they call is settled when they call it.
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => asking,
+        };
+        if checked != asking && self.base.is_some() {
+            unsupported!("a copy rustc compiled with other overflow checks, in a patch");
+        }
+        Ok(Instance { checked, ..instance.clone() })
+    }
+
+    fn settled_function(
+        &self,
+        mixed: &settled::Mixed,
+        func: FunctionId,
+        instance: &Instance,
+        nameless: &dyn Fn() -> Result<bool>,
+    ) -> Result<bool> {
+        let (db, asking) = (self.db, instance.checked);
+        let args = instance.args.as_ref();
+        let checked = if !args.iter().all(|arg| arg.region().is_some()) {
+            let Some(path) = self.instance_path(func, args) else { return nameless() };
+            let copies = self.symbols.path(&path).map(|it| self.symbols.copies(&it));
+            let holders: Vec<_> =
+                copies.iter().flatten().filter_map(|(_, id)| mixed.holder(db, *id)).collect();
+            let Some(checked) = mixed.reached(asking, &holders) else {
+                unsupported!(
+                    "`{path}`, which rustc compiled with and without overflow checks: which \
+                     copy a crate without one of its own calls is rustc's to pick"
+                );
+            };
+            checked
+        } else if AttrFlags::query(db, func.into()).contains(AttrFlags::IS_INLINE) {
+            asking
+        } else {
+            // One copy under the function's symbol when rustc made one. Without, rustc found
+            // the function small enough to compile in each crate that calls it.
+            let own = || self.symbols.function(func).is_some_and(|it| self.symbols.defines(&it));
+            match crate_checks_overflow(db, func.krate(db)) {
+                Some(written_with) => written_with && (asking || own()),
+                None => asking,
+            }
+        };
+        Ok(checked)
+    }
+
+    /// rustc's copy of the instance `symbol` is one of that is compiled as `checked` says.
+    fn rustc_copy(&self, symbol: String, checked: bool) -> Option<String> {
+        let Some(mixed) = &self.mixed else { return Some(symbol) };
+        let copies = self.symbols.copies(&symbol);
+        if copies.is_empty() {
+            return Some(symbol);
+        }
+        let of = |id: u64| mixed.holder(self.db, id).is_some_and(|it| it.1 == checked);
+        copies.into_iter().find(|it| of(it.1)).map(|it| it.0)
+    }
+
     /// The function of the program that an instance without arguments is of, and its symbol.
     fn root_named(&self, name: &str) -> Option<(FunctionId, String)> {
         let of = self.names.functions_named(name);
@@ -2540,7 +2629,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let symbol = decl.linkage_name(id).into_owned();
                 let checked = self.symbols.defines(&symbol);
                 let callee = match &request.target {
-                    FuncTarget::Instance(callee, _) => Some(self.stable_name(callee)),
+                    FuncTarget::Instance(callee, _) => {
+                        let Ok(callee) = self.settled(callee) else {
+                            return self.kept.unkept("unsettled callee");
+                        };
+                        Some(self.stable_name(&callee))
+                    }
                     _ => None,
                 };
                 match callee {
@@ -2559,6 +2653,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     _ => CachedTarget::Import { symbol, checked },
                 }
             } else if let FuncTarget::Instance(callee, _) = &request.target {
+                let Ok(callee) = &self.settled(callee) else {
+                    return self.kept.unkept("unsettled callee");
+                };
                 let Some(name) = self.stable_name(callee) else {
                     return self.kept.unkept("unnamed callee");
                 };
@@ -3105,11 +3202,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: &StoredParamEnvAndCrate,
         sig: &Signature,
     ) -> Result<FuncId> {
+        let instance = &self.settled(instance)?;
         let (def, args) = (instance.def, instance.args.as_ref());
         if let InstanceDef::Fn(func) = def
             && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
             && self.as_its_crate_compiles(instance)
+            && let Some(symbol) = self.rustc_copy(symbol, instance.checked)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
                 || !returns_async_block(self.db, func))
@@ -3335,7 +3434,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let forwarded = self.forwarded.contains(caller)
                     || matches!(caller.def, InstanceDef::Fn(func) if self
                         .instance_path(func, caller.args.as_ref())
-                        .is_some_and(|path| self.symbols.path(&path).is_some()));
+                        .and_then(|path| self.symbols.path(&path))
+                        .is_some_and(|it| self.rustc_copy(it, caller.checked).is_some()));
                 if !forwarded && seen.insert(caller.clone()) {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
@@ -3348,6 +3448,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
         let InstanceDef::Fn(func) = instance.def else { return None };
         let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        let symbol = self.rustc_copy(symbol, instance.checked)?;
         let sig = self.module.declarations().get_function_decl(id).signature.clone();
         let target = self.import(&symbol, &sig).ok()?;
         let mut ctx = self.module.make_context();
@@ -3382,7 +3483,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let types = |args: &[crate::next_solver::GenericArg<'db>]| {
             args.iter()
                 .filter(|it| it.region().is_none())
-                .map(|it| self.symbol_type(it.ty()?))
+                .map(|it| self.symbol_arg(*it))
                 .collect::<Option<Vec<_>>>()
         };
         let parent = crate::generics::generics(db, func.into()).len_parent();
@@ -3513,6 +3614,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// A type as it reads in a demangled rustc symbol. `None` for the types whose spelling
     /// there this does not know: closures, `dyn`, function pointers, anything with a lifetime
     /// argument.
+    /// A type or a `usize` an instance is instantiated with, as rustc's symbols spell it.
+    fn symbol_arg(&self, arg: crate::next_solver::GenericArg<'db>) -> Option<String> {
+        match (arg.ty(), arg.konst()) {
+            (Some(ty), _) => self.symbol_type(ty),
+            (None, Some(len)) => Some(try_const_usize(self.db, len)?.to_string()),
+            (None, None) => None,
+        }
+    }
+
     fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
         use std::fmt::Write;
         let db = self.db;
@@ -3555,9 +3665,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 {
                     args = rest;
                 }
-                let tys = args.iter().map(|it| it.ty()).collect::<Option<Vec<_>>>()?;
-                if !tys.is_empty() {
-                    write!(path, "<{}>", list(&mut tys.into_iter())?).ok()?;
+                let args = args.iter().filter(|it| it.region().is_none());
+                let args = args.map(|it| self.symbol_arg(*it)).collect::<Option<Vec<_>>>()?;
+                if !args.is_empty() {
+                    write!(path, "<{}>", args.join(", ")).ok()?;
                 }
                 path
             }
@@ -3576,12 +3687,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 path
             }
             TyKind::Dynamic(bounds, _) => {
-                let principal = bounds.principal()?.skip_binder();
-                if principal.args.len() != 0 || bounds.projection_bounds().into_iter().count() != 0
-                {
-                    return None;
-                }
+                let principal = bounds.principal()?.no_bound_vars()?;
                 let mut path = format!("dyn {}", self.symbols.item(principal.def_id.0.into())?);
+                let args = principal.args.iter().filter(|it| it.region().is_none());
+                let mut args = args.map(|it| self.symbol_arg(it)).collect::<Option<Vec<_>>>()?;
+                for bound in bounds.projection_bounds() {
+                    let bound = bound.no_bound_vars()?;
+                    let crate::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
+                        return None;
+                    };
+                    let name = hir_def::signatures::TypeAliasSignature::of(db, alias).name.clone();
+                    let ty = rustc_type_ir::inherent::Term::as_type(&bound.term)?;
+                    args.push(format!("{} = {}", name.as_str(), self.symbol_type(ty)?));
+                }
+                if !args.is_empty() {
+                    write!(path, "<{}>", args.join(", ")).ok()?;
+                }
                 for auto in bounds.auto_traits() {
                     write!(path, " + {}", self.symbols.item(auto.0.into())?).ok()?;
                 }

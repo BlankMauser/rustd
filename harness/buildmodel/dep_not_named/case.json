@@ -13,8 +13,37 @@
           "n * 3",
           "n * 4"
         ]
-      ],
-      "expect": "refused"
+      ]
+    },
+    {
+      "what": "a generic function of it that a crate between holds a copy of changes",
+      "edit": [
+        [
+          "outside/dep/src/lib.rs",
+          "+ 100",
+          "+ 1000"
+        ]
+      ]
+    },
+    {
+      "what": "the crate between changes",
+      "edit": [
+        [
+          "outside/mid/src/lib.rs",
+          "* 2 +",
+          "* 5 +"
+        ]
+      ]
+    },
+    {
+      "what": "the dependency changes back",
+      "edit": [
+        [
+          "outside/dep/src/lib.rs",
+          "n * 4",
+          "n * 3"
+        ]
+      ]
     }
   ]
 }

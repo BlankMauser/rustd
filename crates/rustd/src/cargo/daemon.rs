@@ -102,9 +102,8 @@ pub(crate) struct WorkerConfig {
     /// The directory of the package being built, from the root of the checkout.
     pub(crate) project: PathBuf,
     pub(crate) cfg_test: bool,
-    pub(crate) dev_deps: bool,
-    pub(crate) features: Vec<String>,
-    pub(crate) target: Option<String>,
+    /// Which build the worker stands in for, as the daemon's own plan of it has it.
+    pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
 }
@@ -219,17 +218,12 @@ impl Worker {
         let config = &checkout.config;
         let mut command = Command::new(std::env::current_exe()?);
         command.arg(checkout.project());
-        if let Some(target) = &config.target {
-            command.args(["--target", target]);
-        }
+        command.args(config.selection.flags());
         if config.cfg_test {
             command.arg("--cfg-test");
         }
-        if config.dev_deps {
+        if config.selection.dev_deps {
             command.arg("--dev-deps");
-        }
-        if !config.features.is_empty() {
-            command.args(["--features", &config.features.join(",")]);
         }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));

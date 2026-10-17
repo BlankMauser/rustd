@@ -25,6 +25,11 @@ pub(crate) struct SymbolTable {
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
+    /// The copies crates made of one instance, by the symbol without the crate that made it.
+    copies: FxHashMap<String, Vec<String>>,
+    /// The crates that made a copy of an instance of a function, by the function's name
+    /// alone: what there is to go by for an instance whose types cannot be spelled.
+    makers: FxHashMap<String, FxHashSet<u64>>,
 }
 
 struct NestedSymbol {
@@ -172,7 +177,10 @@ impl SymbolTable {
     }
 
     fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
-        self.names.insert(Self::hashed(name));
+        let instance = without_instantiating_crate(name);
+        if self.names.insert(Self::hashed(name)) && instance.len() != name.len() {
+            self.copies.entry(instance.to_owned()).or_default().push(name.to_owned());
+        }
         // The memory a static points to is a symbol that demangles to the static's path.
         if name.starts_with("_RNn") {
             return;
@@ -188,13 +196,15 @@ impl SymbolTable {
                 }
             }
         }
+        let path = format!("{demangled:#}");
+        if instance.len() != name.len()
+            && let Some(maker) = V0::instantiating_crate(name)
+            && let Some(function) = function_name(&path)
+        {
+            self.makers.entry(function).or_default().insert(maker);
+        }
         // `{:#}` drops the crate disambiguator hashes.
-        symbols.push(Symbol {
-            name: name.to_owned(),
-            place: V0::place(name),
-            with_ids,
-            path: format!("{demangled:#}"),
-        });
+        symbols.push(Symbol { name: name.to_owned(), place: V0::place(name), with_ids, path });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
@@ -296,9 +306,39 @@ impl SymbolTable {
         symbols.next().is_none().then_some(&*symbol.name)
     }
 
+    /// The copies of the instance `symbol` is one of, each with rustc's `StableCrateId` of
+    /// the crate that compiled it. None for a symbol that is of one crate only.
+    pub(crate) fn copies(&self, symbol: &str) -> impl Iterator<Item = (&str, u64)> {
+        let copies = self.copies.get(without_instantiating_crate(symbol));
+        copies.into_iter().flatten().filter_map(|it| Some((&**it, V0::instantiating_crate(it)?)))
+    }
+
+    /// rustc's `StableCrateId` of each crate that made a copy of an instance of a function
+    /// named `function`, in any module and of any type.
+    pub(crate) fn makers(&self, function: &str) -> impl Iterator<Item = u64> {
+        self.makers.get(function).into_iter().flatten().copied()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.by_path.len()
     }
+}
+
+/// The name of the function a demangled symbol is an instance of: the last of its path that
+/// is not types or a closure.
+fn function_name(path: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut bare = String::new();
+    for c in path.replace("->", "").chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            _ if depth == 0 => bare.push(c),
+            _ => {}
+        }
+    }
+    let name = bare.rsplit("::").find(|it| !it.is_empty() && !it.starts_with('{'))?;
+    Some(name.to_owned())
 }
 
 /// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
@@ -395,6 +435,18 @@ impl V0<'_> {
     /// that name in what it is written in, `1` for the next.
     fn place(symbol: &str) -> Option<u64> {
         V0 { rest: symbol.strip_prefix("_R")?.as_bytes() }.path()
+    }
+
+    /// The `StableCrateId` of the crate that compiled a copy of an instance, which ends the
+    /// symbol: see [`without_instantiating_crate`].
+    fn instantiating_crate(symbol: &str) -> Option<u64> {
+        let at = without_instantiating_crate(symbol).len();
+        let mut reader = V0 { rest: symbol.as_bytes().get(at..)? };
+        if reader.eat(b'B') {
+            let to = usize::try_from(reader.base62()?).ok()?;
+            reader = V0 { rest: symbol.strip_prefix("_R")?.as_bytes().get(to..)? };
+        }
+        reader.eat(b'C').then(|| reader.disambiguator())?
     }
 
     fn next(&mut self) -> Option<u8> {
@@ -585,7 +637,7 @@ mod tests {
 
     use rustc_hash::FxHashMap;
 
-    use super::{SymbolTable, V0};
+    use super::{SymbolTable, V0, function_name};
 
     fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
         let mut table = SymbolTable::default();
@@ -598,6 +650,21 @@ mod tests {
             table.by_root.iter().map(|(root, id)| (root.display().to_string(), *id)).collect();
         placed.sort();
         placed
+    }
+
+    #[test]
+    fn the_crate_that_compiled_a_copy() {
+        let of_lib = "_RINvCslFwujm09uXn_4kdep3sumhECsjPNOOTmEH7l_4klib";
+        let of_app = "_RINvCslFwujm09uXn_4kdep3sumhECsjSK0TBt3L2V_4kapp";
+        let by_reference = "_RNvXs_NtNtCsevLNFiNqfJP_4core3ops5arithhNtB4_3Add3addB8_";
+        let table = SymbolTable::of_names([of_lib, of_app, by_reference]);
+        let copies: Vec<_> = table.copies(of_app).map(|it| it.0).collect();
+        assert_eq!(copies, [of_lib, of_app]);
+        let ids: Vec<_> = table.copies(of_lib).map(|it| it.1).collect();
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(table.crates["core"], table.copies(by_reference).next().map(|it| it.1));
+        assert_eq!(table.copies("_RNvCslFwujm09uXn_4kdep5small").count(), 0);
+        assert_eq!(table.makers("sum").count(), 2);
     }
 
     #[test]
@@ -622,5 +689,17 @@ mod tests {
         assert_eq!(V0::place(first), Some(0));
         assert_eq!(V0::place(second), Some(1));
         assert_eq!(V0::place(third), Some(2));
+    }
+
+    #[test]
+    fn the_function_a_symbol_is_an_instance_of() {
+        let name = |path| function_name(path).unwrap();
+        assert_eq!(
+            name("std::panic::catch_unwind::<&dyn core::ops::Fn<(), Output = u8>, u8>"),
+            "catch_unwind"
+        );
+        assert_eq!(name("<core::fmt::Arguments>::new::<5, 2>"), "new");
+        assert_eq!(name("<alloc::boxed::Box<fn(u8) -> u8> as core::ops::Drop>::drop"), "drop");
+        assert_eq!(name("kdep::each::<u8, klib::run::{closure#0}>::{closure#1}"), "each");
     }
 }

@@ -281,11 +281,11 @@ def project(name, spec, work):
 
 
 FLAG_WORKSPACE = {
-    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n',
+    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.release]\npanic = "abort"\n',
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
-    "util/src/lib.rs": 'pub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
+    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
-    "app/src/main.rs": 'fn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
+    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n',
@@ -296,6 +296,10 @@ FLAG_CASES = [
     ("run", [], {}),
     ("run", ["--", "fail"], {}),
     ("run", ["--release"], {}),
+    ("run", ["--release", "--", "fail"], {}),
+    ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
+    ("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"}),
+    ("run", ["--no-default-features", "-p", "app"], {}),
     ("run", ["--target", "x86_64-unknown-linux-gnu"], {}),
     ("run", ["-p", "app"], {}),
     ("run", ["--features", "loud", "-p", "app"], {}),
@@ -315,6 +319,8 @@ FLAG_CASES = [
     ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
     ("test", [], {"FLAGS_FAIL": "1"}),
     ("test", ["--no-run"], {}),
+    ("test", ["--doc"], {}),
+    ("test", ["--doc", "--features", "loud", "-p", "util"], {}),
 ]
 
 

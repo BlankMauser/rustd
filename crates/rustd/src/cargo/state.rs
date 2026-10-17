@@ -359,7 +359,7 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
-            profile: if asked.subcommand == Subcommand::Test { "test" } else { "dev" }.to_owned(),
+            profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),
             checkouts: Vec::new(),
@@ -381,9 +381,7 @@ impl State {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
             cfg_test: unit_test,
-            dev_deps: asked.subcommand == Subcommand::Test,
-            features: asked.flags.features.clone(),
-            target: asked.target(),
+            selection: asked.selection(),
             env: worker_env(),
         };
         let checkout = |unit_test: bool| Checkout {

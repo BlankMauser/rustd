@@ -245,6 +245,28 @@ fn is_inert(item: &SyntaxNode) -> bool {
     item.attrs().all(|attr| attr.simple_name().is_some_and(|name| INERT.contains(&name.as_str())))
 }
 
+/// The crate the file is a module of, when that is one of `used`, which the crates in `built`
+/// depend on, and none of `built`: rustc compiled it, and what it compiled is all there is of
+/// it.
+pub(crate) fn left_to_rustc(
+    db: &RootDatabase,
+    built: &[ide_db::base_db::Crate],
+    used: &FxHashSet<ide_db::base_db::Crate>,
+    file: FileId,
+) -> Option<ide_db::base_db::Crate> {
+    let crates = relevant_crates(db, file);
+    if crates.iter().any(|it| built.contains(it)) {
+        return None;
+    }
+    crates.iter().copied().find(|&krate| {
+        used.contains(&krate)
+            && hir_def::nameres::crate_def_map(db, krate)
+                .modules_for_file(db, file)
+                .next()
+                .is_some()
+    })
+}
+
 impl Listed {
     /// Whether the file is a module of a crate that is built, or of one that such a crate uses.
     /// Any file may be one before a crate is listed.
@@ -263,28 +285,6 @@ impl Listed {
                     .next()
                     .is_some()
             })
-    }
-
-    /// The crate the file is a module of, when that is one the crates being built use and
-    /// none of them: rustc compiled it, and what it compiled is all there is of it.
-    pub(crate) fn left_to_rustc(
-        &self,
-        db: &RootDatabase,
-        file: FileId,
-    ) -> Option<ide_db::base_db::Crate> {
-        let built: Vec<_> =
-            self.built.lock().unwrap().iter().map(|&it| ide_db::base_db::Crate::from(it)).collect();
-        let crates = relevant_crates(db, file);
-        if built.is_empty() || crates.iter().any(|it| built.contains(it)) {
-            return None;
-        }
-        crates.iter().copied().find(|&krate| {
-            built.iter().any(|built| built.transitive_deps(db).contains(&krate))
-                && hir_def::nameres::crate_def_map(db, krate)
-                    .modules_for_file(db, file)
-                    .next()
-                    .is_some()
-        })
     }
 
     /// The functions written in the file, or `None` when it has some that are not listed: it
