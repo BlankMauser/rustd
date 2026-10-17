@@ -46,4 +46,5 @@ cases![
     stack_aggregate_odd_size,
     repeat_rows,
     if_branch_temporaries,
+    uncaptured_scrutinee,
 ];

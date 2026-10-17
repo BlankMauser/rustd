@@ -3271,7 +3271,7 @@ fn lower_closure_body<'db>(
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
     let is_by_ref_closure = receiver == Receiver::Borrowed;
-    let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
+    let mut upvar_map: FxHashMap<LocalId, Vec<Capture<'_>>> =
         FxHashMap::default();
     for (capture_idx, capture) in captures.into_iter().enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
@@ -3336,49 +3336,28 @@ fn lower_closure_body<'db>(
             }
         }
     }
+    // What a pattern without bindings matches on is not read, so it is not captured either.
+    for (_, block) in ctx.result.basic_blocks.iter_mut() {
+        block.statements.retain(|statement| match &statement.kind {
+            StatementKind::FakeRead(place) => upvar_map
+                .get(&place.local)
+                .is_none_or(|captures| captured_place(db, captures, place).is_some()),
+            _ => true,
+        });
+    }
     let mut err = None;
     ctx.result.walk_places(|mir_place| {
-        let mir_projections = mir_place.projection.as_slice();
         if let Some(hir_places) = upvar_map.get(&mir_place.local) {
-            let projections = hir_places.iter().find_map(|hir_place| {
-                let iter = mir_projections
-                    .iter()
-                    .cloned()
-                    .zip_longest(convert_closure_capture_projections(db, &hir_place.0.place))
-                    .enumerate();
-
-                for (idx, item) in iter {
-                    match item {
-                        EitherOrBoth::Both(mir, hir) => {
-                            if mir != hir {
-                                // Not this place.
-                                return None;
-                            }
-                        }
-                        EitherOrBoth::Right(_) => {
-                            // FIXME: This can happen in fake reads. I believe this is a bug. So we change the fake read's meaning.
-                            // never!(
-                            //     "mir upvar place shorter than hir upvar place; this should not happen, \
-                            //         capture analysis should have picked the shorter place"
-                            // );
-                            // return None;
-                            return Some((mir_projections.len(), hir_place));
-                        }
-                        // This place, but truncated.
-                        EitherOrBoth::Left(_) => return Some((idx, hir_place)),
-                    }
-                }
-                // Exactly this place.
-                Some((mir_projections.len(), hir_place))
-            });
+            let projections = captured_place(db, hir_places, mir_place);
+            let mir_projections = mir_place.projection.as_slice();
             match projections {
                 Some((skip_projections_up_to, (hir_place, upvar_local, capture_idx))) => {
                     let in_closure = [
                         ProjectionElem::Deref,
-                        ProjectionElem::Field(FieldIndex(*capture_idx as u32)),
+                        ProjectionElem::Field(FieldIndex(capture_idx as u32)),
                     ];
                     let maybe_deref: &[PlaceElem] = if hir_place.is_by_ref() {
-                        mir_place.local = *upvar_local;
+                        mir_place.local = upvar_local;
                         &[ProjectionElem::Deref]
                     } else if is_by_ref_closure {
                         // The closure is called again, so a capture it owns has to be used in
@@ -3386,7 +3365,7 @@ fn lower_closure_body<'db>(
                         mir_place.local = closure_local;
                         &in_closure
                     } else {
-                        mir_place.local = *upvar_local;
+                        mir_place.local = upvar_local;
                         &[]
                     };
                     mir_place.projection = Projection::new_from_iter(
@@ -3412,6 +3391,45 @@ fn lower_closure_body<'db>(
     }
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
+}
+
+/// A capture of a closure, the local it is in while the closure runs, and which capture it is.
+type Capture<'a> = (&'a CapturedPlace, LocalId, usize);
+
+/// The capture that `place` is, or is inside of, or holds, and how many of the projections
+/// of `place` the capture stands for.
+fn captured_place<'a>(
+    db: &dyn HirDatabase,
+    captures: &[Capture<'a>],
+    place: &StoredPlace,
+) -> Option<(usize, Capture<'a>)> {
+    let mir_projections = place.projection.as_slice();
+    captures.iter().find_map(|hir_place| {
+        let iter = mir_projections
+            .iter()
+            .cloned()
+            .zip_longest(convert_closure_capture_projections(db, &hir_place.0.place))
+            .enumerate();
+
+        for (idx, item) in iter {
+            match item {
+                EitherOrBoth::Both(mir, hir) => {
+                    if mir != hir {
+                        // Not this place.
+                        return None;
+                    }
+                }
+                EitherOrBoth::Right(_) => {
+                    // FIXME: This can happen in fake reads. I believe this is a bug. So we change the fake read's meaning.
+                    return Some((mir_projections.len(), *hir_place));
+                }
+                // This place, but truncated.
+                EitherOrBoth::Left(_) => return Some((idx, *hir_place)),
+            }
+        }
+        // Exactly this place.
+        Some((mir_projections.len(), *hir_place))
+    })
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result)]
