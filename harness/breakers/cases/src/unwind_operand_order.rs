@@ -3,8 +3,15 @@
 //! expression they are operands of, and a `&temporary` made on the way lives to the end of
 //! the statement, so rustc drops the operands first. rustd dropped the first operand last,
 //! after the temporaries that were made later than it.
+//!
+//! Found later (`fuzz/found/differs-checksum-L8-231-c11.rs`): where the expression ends its
+//! own temporaries, as the tail of a block does from the 2024 edition and a closure's body
+//! without braces does, operands and temporaries are in one scope and are dropped in the
+//! reverse of the order they were made. `breakers_2021::unwind_operand_tail` has the tails
+//! before 2024.
 
 use std::cell::RefCell;
+use std::hint::black_box;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 thread_local! {
@@ -31,6 +38,10 @@ fn sum(a: &Loud, b: &Loud) -> Loud {
 
 fn take(_a: Loud, _b: Loud, _c: Loud, _d: Loud) {}
 
+fn take_one(items: (Loud, Loud, Loud)) -> Loud {
+    items.0
+}
+
 struct Fields {
     _a: Loud,
     _b: Loud,
@@ -38,7 +49,7 @@ struct Fields {
 }
 
 /// The order in which `f` dropped what it made.
-fn order(f: impl FnOnce()) -> Vec<u32> {
+fn order<T>(f: impl FnOnce() -> T) -> Vec<u32> {
     let _ = catch_unwind(AssertUnwindSafe(f));
     DROPPED.with(|it| it.take())
 }
@@ -58,5 +69,10 @@ pub fn run() -> Vec<Vec<u32>> {
         order(|| {
             let _items = [Loud(1), sum(&Loud(20), &Loud(30)), Loud(3)];
         }),
+        order(|| (Loud(1), sum(&Loud(20), &Loud(30)), Loud(3), none().unwrap())),
+        order(|| -> [Loud; 4] { [Loud(1), sum(&Loud(20), &Loud(30)), Loud(3), none().unwrap()] }),
+        order(|| -> Fields { Fields { _a: Loud(1), _b: sum(&Loud(20), &Loud(30)), _c: none().unwrap() } }),
+        order(|| -> Loud { sum(&Loud(1), &take_one((Loud(2), sum(&Loud(20), &Loud(30)), none().unwrap()))) }),
+        order(|| -> (Loud, Box<Loud>, u32) { (Loud(1), Box::new(sum(&Loud(20), &Loud(30))), 1 / black_box(0)) }),
     ]
 }

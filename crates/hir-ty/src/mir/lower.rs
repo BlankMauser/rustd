@@ -22,7 +22,7 @@ use hir_expand::name::Name;
 use itertools::{Either, EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
@@ -100,9 +100,10 @@ struct MirLowerCtx<'a, 'db> {
     extended_temporaries: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
-    /// Whether what is being lowered is a statement of a block and not its tail: the operands
-    /// of a statement are in a scope of their own, inside that of its temporaries.
-    in_statement: bool,
+    /// The expressions that end their own temporaries: the body, and from the 2024 edition the
+    /// tail of a block. The operands of such an expression are in one scope with its
+    /// temporaries, where those of any other expression are in a scope inside it.
+    ends_temporaries: FxHashSet<ExprId>,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -258,7 +259,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             super_let: None,
-            in_statement: false,
+            ends_temporaries: FxHashSet::default(),
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -854,7 +855,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 let callee_ty = self.expr_ty_after_adjustments(*callee);
@@ -880,7 +881,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             place,
                             current,
                             self.is_uninhabited(expr_id),
-                            expr_id.into(),
+                            expr_id,
                         )
                     }
                     TyKind::FnPtr(..) => {
@@ -895,7 +896,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             place,
                             current,
                             self.is_uninhabited(expr_id),
-                            expr_id.into(),
+                            expr_id,
                         )
                     }
                     TyKind::Closure(_, _) => {
@@ -923,7 +924,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     place,
                     current,
                     self.is_uninhabited(expr_id),
-                    expr_id.into(),
+                    expr_id,
                 )
             }
             Expr::Match { expr, arms } => {
@@ -1155,7 +1156,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             current = c;
                             operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                         }
-                        self.declare_operands_last(declared, operands.iter().flatten());
+                        self.declare_operands_last(expr_id, declared, operands.iter().flatten());
                         // The fields are evaluated in the order written, and the base after
                         // them.
                         let spread_place = match *spread {
@@ -1379,7 +1380,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 // `-128i8` is that number, not the negation of one `i8` does not have.
@@ -1458,7 +1459,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         place,
                         current,
                         self.is_uninhabited(expr_id),
-                        expr_id.into(),
+                        expr_id,
                     );
                 }
                 if let hir_def::hir::BinaryOp::Assignment { op: Some(op) } = op {
@@ -1692,7 +1693,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 else {
                     return Ok(None);
                 };
-                self.declare_operands_last(declared, values.iter());
+                self.declare_operands_last(expr_id, declared, values.iter());
                 let r = Rvalue::Aggregate(
                     AggregateKind::Tuple(self.expr_ty_without_adjust(expr_id).store()),
                     values,
@@ -1725,7 +1726,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     else {
                         return Ok(None);
                     };
-                    self.declare_operands_last(declared, values.iter());
+                    self.declare_operands_last(expr_id, declared, values.iter());
                     let r = Rvalue::Aggregate(AggregateKind::Array(elem_ty.store()), values);
                     self.push_assignment(current, place, r, expr_id.into());
                     Ok(Some(current))
@@ -2081,16 +2082,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.drop_scopes.last().map_or(0, |it| it.locals.len())
     }
 
-    /// Declares the operands of one aggregate or call after everything else that was declared
-    /// since `declared`, so that they are dropped first. rustc keeps the operands in the scope
-    /// of the expression they are operands of: when a later operand panics, the earlier ones
-    /// are dropped before the temporaries that live to the end of the statement.
+    /// Declares the operands of `owner`, an aggregate or a call, after everything else that
+    /// was declared since `declared`, so that they are dropped first. rustc keeps the operands
+    /// in the scope of the expression they are operands of: when a later operand panics, the
+    /// earlier ones are dropped before the temporaries that live to the end of the statement.
+    /// An expression that ends its own temporaries has them in that same scope, in the order
+    /// they were made.
     fn declare_operands_last<'o>(
         &mut self,
+        owner: ExprId,
         declared: usize,
         operands: impl Iterator<Item = &'o Operand>,
     ) {
-        if !self.in_statement {
+        if self.ends_temporaries.contains(&owner) {
             return;
         }
         let Some(scope) = self.drop_scopes.last_mut() else { return };
@@ -2113,7 +2117,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         mut current: BasicBlockId,
         is_uninhabited: bool,
-        span: MirSpan,
+        call: ExprId,
     ) -> Result<'db, Option<BasicBlockId>> {
         let declared = self.declared_locals();
         let Some(args) = args
@@ -2129,8 +2133,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
-        self.declare_operands_last(declared, args.iter());
-        self.lower_call(func, args.into(), place, current, is_uninhabited, span)
+        self.declare_operands_last(call, declared, args.iter());
+        self.lower_call(func, args.into(), place, current, is_uninhabited, call.into())
     }
 
     fn lower_call(
@@ -2552,7 +2556,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
         let enclosing = self.drop_scopes.iter().rposition(|it| !it.temporaries);
         let scope = self.push_drop_scope();
-        let outer_statement = std::mem::replace(&mut self.in_statement, true);
         for statement in statements.iter() {
             match statement {
                 hir_def::hir::Statement::Let {
@@ -2631,18 +2634,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 hir_def::hir::Statement::Item(_) => (),
             }
         }
-        self.in_statement = false;
         if let Some(tail) = tail {
+            // Before the 2024 edition the temporaries of a block's tail live as long as those
+            // of the expression the block is in. The edition is the one the block was written
+            // in, which for a macro's block is the macro's.
+            let edition = self.store.block_edition(block).unwrap_or_else(|| self.edition());
+            if edition.at_least_2024() {
+                self.ends_temporaries.insert(tail);
+            }
             let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
                 scope.pop_assume_dropped(self);
                 return Ok(None);
             };
             current = c;
-            // Before the 2024 edition the temporaries of a block's tail live as long as those
-            // of the expression the block is in. The edition is the one the block was written
-            // in, which for a macro's block is the macro's.
-            let edition = self.store.block_edition(block).unwrap_or_else(|| self.edition());
             if !edition.at_least_2024()
                 && let [.., outer, scope] = &mut self.drop_scopes[..]
                 && declared <= scope.locals.len()
@@ -2656,7 +2661,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 scope.locals.rotate_right(temporaries);
             }
         }
-        self.in_statement = outer_statement;
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
     }
@@ -3415,6 +3419,7 @@ fn lower_closure_body<'db>(
     }
 
     ctx.resolver.reset_to_guard(resolver_guard);
+    ctx.ends_temporaries.insert(*root);
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
@@ -3706,6 +3711,7 @@ pub fn lower_to_mir_with_store<'db>(
         if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
     let binding_picker = |b: BindingId| ctx.store.binding_owner(b) == expected_binding_owner;
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
+    ctx.ends_temporaries.insert(root_expr);
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());

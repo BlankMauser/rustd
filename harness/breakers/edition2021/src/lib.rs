@@ -4,3 +4,4 @@
 pub mod if_branch_temporaries;
 pub mod for_tail_temporaries;
 pub mod if_let_temporaries;
+pub mod unwind_operand_tail;
