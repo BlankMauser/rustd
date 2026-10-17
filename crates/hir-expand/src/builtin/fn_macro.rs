@@ -915,7 +915,10 @@ fn included_bytes<'db>(
 ) -> Option<&'db [u8]> {
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
-    if let Some(file) = db.resolve_path(path) {
+    // A file of the VFS that is not UTF-8 is read from disk like one outside it.
+    if let Some(file) = db.resolve_path(path)
+        && db.has_file_text(file)
+    {
         return Some(db.file_text(file).text(db).as_bytes());
     }
     db.included_file(path)?.bytes(db).as_deref()

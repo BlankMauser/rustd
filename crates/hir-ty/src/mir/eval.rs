@@ -1197,10 +1197,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let mut ty = self.operand_ty(lhs, locals)?;
                 while let TyKind::Ref(_, z, _) = ty.kind() {
                     ty = z;
-                    let size = if ty.is_str() {
+                    // A string or byte string literal pattern against a `str` or a `[u8]`.
+                    let is_bytes = match ty.kind() {
+                        TyKind::Slice(of) => {
+                            matches!(of.kind(), TyKind::Uint(rustc_type_ir::UintTy::U8))
+                        }
+                        _ => ty.is_str(),
+                    };
+                    let size = if is_bytes {
                         if *op != BinOp::Eq {
                             return Err(MirEvalError::NotSupported(
-                                "Only eq is builtin for `str`".to_owned(),
+                                "Only eq is builtin for `str` and `[u8]`".to_owned(),
                             ));
                         }
                         let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);

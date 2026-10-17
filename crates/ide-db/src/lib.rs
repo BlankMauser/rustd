@@ -176,6 +176,10 @@ impl SourceDatabase for RootDatabase {
         self.files.file_text(file_id)
     }
 
+    fn has_file_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.has_file_text(file_id)
+    }
+
     fn set_file_text(&mut self, file_id: vfs::FileId, text: &str) {
         let files = Arc::clone(&self.files);
         files.set_file_text(self, file_id, text);

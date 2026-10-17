@@ -103,6 +103,12 @@ impl Files {
         }
     }
 
+    /// Whether the file was loaded as text. A file of the VFS that is not UTF-8 has an id and
+    /// no text.
+    pub fn has_file_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.contains_key(&file_id)
+    }
+
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
         match self.files.entry(file_id) {
             Entry::Occupied(mut occupied) => {
@@ -349,6 +355,11 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     fn file_text(&self, file_id: vfs::FileId) -> FileText;
 
     fn set_file_text(&mut self, file_id: vfs::FileId, text: &str);
+
+    /// Whether [`SourceDatabase::file_text`] has the file: one that is not UTF-8 has no text.
+    fn has_file_text(&self, _file_id: vfs::FileId) -> bool {
+        true
+    }
 
     fn set_file_text_with_durability(
         &mut self,

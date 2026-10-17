@@ -41,4 +41,7 @@ cases![
     dots_range_pattern,
     wide_shift_amount,
     macro_type_in_block_mod,
+    byte_str_pattern,
+    include_not_utf8,
+    alias_under_binder,
 ];
