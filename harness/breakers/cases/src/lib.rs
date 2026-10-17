@@ -74,4 +74,7 @@ cases![
     glob_of_root,
     unnamed_parameter,
     field_named_as_type,
+    extern_static,
+    self_in_async_method,
+    macro_expr_semicolon,
 ];

@@ -2884,6 +2884,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// The data object of a static: rustc's when it exports one, else our own copy of its value.
+    /// The name the linker knows a static by: one of an `extern` block, or one that an
+    /// attribute exports and rustc's build defines.
+    fn linked_static(&self, id: StaticId) -> Result<Option<intern::Symbol>> {
+        let db = self.db;
+        let signature = StaticSignature::of(db, id);
+        if !signature.flags.contains(StaticFlags::EXTERN) {
+            let exported = AttrFlags::export_name(db, id.into()).or_else(|| {
+                let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
+                unmangled.then(|| signature.name.symbol().clone())
+            });
+            return Ok(exported.filter(|name| self.symbols.defines(name.as_str())));
+        }
+        if *AttrFlags::link_name_from_macro(db, id.into()) {
+            unsupported!("static `{}`, whose `link_name` a macro writes", signature.name.as_str());
+        }
+        let name = AttrFlags::link_name(db, id.into());
+        Ok(Some(name.unwrap_or_else(|| signature.name.symbol().clone())))
+    }
+
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
         let db = self.db;
         let known = [&self.imported_statics, &self.statics, &self.frozen_statics];
@@ -2906,6 +2925,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 self.want_requested(&compiled.requests);
             }
+            return Ok(data);
+        }
+        if let Some(symbol) = self.linked_static(id)? {
+            let thread_local = is_thread_local(db, id);
+            let data =
+                self.module.declare_data(symbol.as_str(), Linkage::Import, false, thread_local)?;
+            self.imported_statics.insert(id, data);
             return Ok(data);
         }
         let node = patch::Node::Static(id);
