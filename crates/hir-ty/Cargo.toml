@@ -27,6 +27,7 @@ tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
+unicode-width.workspace = true
 indexmap.workspace = true
 rustc_apfloat = "0.2.3"
 rustc-stable-hash = "0.1.2"
