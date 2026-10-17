@@ -1168,6 +1168,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 };
                 destination.write_from_interval(self, arg.interval)
             }
+            "black_box" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "black_box arg is not provided".into(),
+                    ));
+                };
+                destination.write_from_interval(self, arg.interval)
+            }
             "ctpop" => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctpop arg is not provided".into()));

@@ -442,6 +442,7 @@ bitflags::bitflags! {
     pub struct MacroRulesLocFlags: u8 {
         const ALLOW_INTERNAL_UNSAFE = 1 << 0;
         const LOCAL_INNER = 1 << 1;
+        const EDITION_PANIC = 1 << 2;
     }
 }
 
@@ -783,6 +784,7 @@ impl MacroId {
                     kind: kind(loc.expander, loc.id.file_id, loc.id.value.upcast()),
                     local_inner: false,
                     allow_internal_unsafe: loc.allow_internal_unsafe,
+                    edition_panic: false,
                     edition: loc.edition,
                 }
             }
@@ -796,6 +798,7 @@ impl MacroId {
                     allow_internal_unsafe: loc
                         .flags
                         .contains(MacroRulesLocFlags::ALLOW_INTERNAL_UNSAFE),
+                    edition_panic: loc.flags.contains(MacroRulesLocFlags::EDITION_PANIC),
                     edition: loc.edition,
                 }
             }
@@ -807,6 +810,7 @@ impl MacroId {
                     kind: MacroDefKind::ProcMacro(loc.id, loc.expander, loc.kind),
                     local_inner: false,
                     allow_internal_unsafe: false,
+                    edition_panic: false,
                     edition: loc.edition,
                 }
             }

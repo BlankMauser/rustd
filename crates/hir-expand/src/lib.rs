@@ -255,6 +255,9 @@ pub struct MacroDefId {
     pub kind: MacroDefKind,
     pub local_inner: bool,
     pub allow_internal_unsafe: bool,
+    /// Whether the macro has `#[allow_internal_unstable(edition_panic)]`: a `panic!` in it is
+    /// of the edition of whoever calls the macro.
+    pub edition_panic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1002,7 +1005,33 @@ pub(crate) fn token_tree_to_syntax_node(
         ExpandTo::Type => syntax_bridge::TopEntryPoint::Type,
         ExpandTo::Expr => syntax_bridge::TopEntryPoint::Expr,
     };
+    let unterminated = match expand_to {
+        ExpandTo::Expr => without_last_semicolon(tt),
+        _ => None,
+    };
+    let tt = unterminated.as_ref().unwrap_or(tt);
     syntax_bridge::token_tree_to_syntax_node(tt, entry_point, &mut |ctx| ctx.edition(db))
+}
+
+/// The tokens before the semicolon an expansion ends in, which rustc drops where the macro is
+/// called as an expression.
+fn without_last_semicolon(tt: &tt::TopSubtree) -> Option<tt::TopSubtree> {
+    let mut rest = tt.token_trees().iter();
+    let start = rest.savepoint();
+    let mut before = rest.from_savepoint(start);
+    let mut last = None;
+    loop {
+        let seen = rest.from_savepoint(start);
+        let Some(token) = rest.next() else { break };
+        before = seen;
+        last = Some(token);
+    }
+    match last? {
+        tt::TtElement::Leaf(tt::Leaf::Punct(punct)) if punct.char == ';' => {
+            Some(tt::TopSubtree::from_token_trees(tt.top_subtree().delimiter, before))
+        }
+        _ => None,
+    }
 }
 
 fn check_tt_count(tt: &tt::TopSubtree) -> Result<(), ExpandResult<()>> {

@@ -840,8 +840,9 @@ fn is_definition(node: &SyntaxNode) -> bool {
 }
 
 /// The place of a node among those of the definition it is written in that `counts` holds
-/// of, in the order rustc comes across them. This is how rustc tells apart the closures
-/// of a function, and the statics of one name that a macro used twice in it declares.
+/// of, in the order rustc comes across them, or none when that order cannot be told. This is
+/// how rustc tells apart the closures of a function, and the statics of one name that a
+/// macro used twice in it declares.
 fn place_in_definition(
     sema: &hir::Semantics<'_, RootDatabase>,
     target: &SyntaxNode,
@@ -853,55 +854,213 @@ fn place_in_definition(
         root = Some(node.clone());
         is_definition(node)
     });
-    let mut earlier = 0;
-    Place { sema, target, counts, earlier: &mut earlier }
-        .find_in(&owner.or(root)?)
-        .then_some(earlier)
+    let owner = owner.or(root)?;
+    let late = LateImports::around(sema, &owner);
+    let mut count =
+        Count { sema, target, counts, late, seen: 0, earlier: None, waiting: Vec::new() };
+    count.all_in(&owner)?;
+    while let Some(call) = count.waiting.pop() {
+        count.expansion_of(&call)?;
+    }
+    count.earlier
 }
 
-struct Place<'a, 'db> {
+/// The imports of the scope of a definition that rustc has not resolved when it first comes
+/// to the macros used in the definition: those a macro expanded to. It resolves the imports
+/// it has, then expands every macro it can, and only then resolves the imports that those
+/// expanded to.
+#[derive(Default)]
+struct LateImports {
+    names: FxHashSet<String>,
+    glob: bool,
+}
+
+impl LateImports {
+    fn around(sema: &hir::Semantics<'_, RootDatabase>, owner: &SyntaxNode) -> LateImports {
+        let mut late = LateImports::default();
+        let module_expanded = module_is_expanded(sema, owner);
+        for scope in sema.ancestors_with_macros(owner.clone()) {
+            let expanded = module_expanded || sema.hir_file_for(&scope).is_macro();
+            for import in scope.children().filter_map(ast::Use::cast) {
+                if let (true, Some(tree)) = (expanded, import.use_tree()) {
+                    late.add(&tree, None);
+                }
+            }
+            if ast::Module::can_cast(scope.kind()) {
+                break;
+            }
+        }
+        late
+    }
+
+    /// Adds the names the tree brings in, `prefix` being the last name of the path before it.
+    fn add(&mut self, tree: &ast::UseTree, prefix: Option<String>) {
+        let last = tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
+        let own = if last.as_deref() == Some("self") { prefix } else { last };
+        if let Some(list) = tree.use_tree_list() {
+            list.use_trees().for_each(|it| self.add(&it, own.clone()));
+        } else if tree.star_token().is_some() {
+            self.glob = true;
+        } else if let Some(name) = tree.rename().and_then(|it| it.name()) {
+            self.names.insert(name.text().to_owned());
+        } else {
+            self.names.extend(own);
+        }
+    }
+}
+
+/// Whether a macro expanded to the module the node is in, or to one around it.
+fn module_is_expanded(sema: &hir::Semantics<'_, RootDatabase>, node: &SyntaxNode) -> bool {
+    let mut module = sema.scope(node).map(|it| it.module());
+    while let Some(it) = module {
+        if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
+            return true;
+        }
+        module = it.parent(sema.db);
+    }
+    false
+}
+
+/// When rustc expands a macro used in a definition.
+enum Turn {
+    /// As it comes to it.
+    Now,
+    /// After every macro it can expand at first, the last such first.
+    Later,
+}
+
+struct Count<'a, 'db> {
     sema: &'a hir::Semantics<'db, RootDatabase>,
     target: &'a SyntaxNode,
     counts: &'a dyn Fn(&SyntaxNode) -> bool,
-    earlier: &'a mut u32,
+    late: LateImports,
+    seen: u32,
+    earlier: Option<u32>,
+    waiting: Vec<ast::MacroCall>,
 }
 
-impl Place<'_, '_> {
-    /// Counts the nodes before the target in the definition `node` is of. Whether the target
-    /// is there.
+impl Count<'_, '_> {
+    /// Counts the nodes of the definition `node` is of, or none when the order rustc numbers
+    /// them in is not known.
     ///
     /// rustc numbers what is written in the definition before what the macros used in it
     /// expand to, and then goes through the macros in turn, each the same way.
-    fn find_in(&mut self, node: &SyntaxNode) -> bool {
+    fn all_in(&mut self, node: &SyntaxNode) -> Option<()> {
         let mut calls = Vec::new();
-        if self.find_written_in(node, &mut calls) {
-            return true;
+        self.written_in(node, &mut calls);
+        for call in calls {
+            match self.turn(&call) {
+                Some(Turn::Now) => self.expansion_of(&call)?,
+                Some(Turn::Later) => self.waiting.push(call),
+                None => self.nothing_in(&call)?,
+            }
         }
-        calls.iter().any(|call| {
-            self.sema
-                .expand_macro_call(call)
-                .is_some_and(|expansion| self.find_in(&expansion.value))
-        })
+        Some(())
     }
 
-    /// As `find_in`, of what is not in a macro: `calls` gets the macros come across.
-    fn find_written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) -> bool {
+    fn expansion_of(&mut self, call: &ast::MacroCall) -> Option<()> {
+        match self.sema.expand_macro_call(call) {
+            Some(expansion) => self.all_in(&expansion.value),
+            None => Some(()),
+        }
+    }
+
+    /// That the macro expands to nothing that is counted, so that when it is expanded is
+    /// the same to the count.
+    fn nothing_in(&mut self, call: &ast::MacroCall) -> Option<()> {
+        let (seen, waiting) = (self.seen, self.waiting.len());
+        self.expansion_of(call)?;
+        (self.seen == seen && self.waiting.len() == waiting).then_some(())
+    }
+
+    /// As `all_in`, of what is not in a macro: `calls` gets the macros come across.
+    fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) {
         for child in node.children() {
             if let Some(call) = ast::MacroCall::cast(child.clone()) {
                 calls.push(call);
                 continue;
             }
-            if child == *self.target {
-                return true;
+            let target = child == *self.target;
+            if target {
+                self.earlier = Some(self.seen);
             }
-            if (self.counts)(&child) {
-                *self.earlier += 1;
+            if target || (self.counts)(&child) {
+                self.seen += 1;
             }
-            if !is_definition(&child) && self.find_written_in(&child, calls) {
-                return true;
+            if !target && !is_definition(&child) {
+                self.written_in(&child, calls);
             }
         }
-        false
+    }
+
+    /// When rustc expands the macro, or none when that is not known: a macro it finds by a
+    /// late import waits for the import.
+    fn turn(&self, call: &ast::MacroCall) -> Option<Turn> {
+        let Some(path) = call.path() else { return Some(Turn::Now) };
+        let Some(first) = path.first_segment().and_then(|it| it.name_ref()) else {
+            return Some(Turn::Now);
+        };
+        let alone = path.qualifier().is_none();
+        let imported = self.late.names.contains(first.text());
+        if !alone && !imported {
+            return self.reached_by_path(call).then_some(Turn::Now);
+        }
+        if !imported && !self.late.glob {
+            return Some(Turn::Now);
+        }
+        if alone && self.in_textual_scope(call)? {
+            return Some(Turn::Now);
+        }
+        if imported {
+            return Some(Turn::Later);
+        }
+        // A name alone may be found by the glob import: not one of this crate or of the
+        // standard library, which the macros in scope everywhere are.
+        let home = self.sema.resolve_macro_call(call)?.module(self.sema.db).krate(self.sema.db);
+        let here = self.sema.scope(call.syntax())?.krate();
+        (home == here || home.origin(self.sema.db).is_lang()).then_some(Turn::Now)
+    }
+
+    /// Whether a path finds the macro with no import: any but a `macro_rules!` one of this
+    /// crate that is not exported, which is in no module but by an import of it, and
+    /// whether that import is a late one is not known.
+    fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
+        let sema = self.sema;
+        let Some(found) = sema.resolve_macro_call(call) else { return true };
+        let here = sema.scope(call.syntax()).map(|it| it.krate());
+        if Some(found.module(sema.db).krate(sema.db)) != here {
+            return true;
+        }
+        match sema.source(found).and_then(|it| it.value.left()) {
+            Some(ast::Macro::MacroRules(rules)) => ast::HasAttrs::attrs(&rules)
+                .any(|it| it.simple_name().is_some_and(|name| name == "macro_export")),
+            _ => true,
+        }
+    }
+
+    /// Whether the macro is a `macro_rules!` one found by where it is written, which is
+    /// before an import of the name is looked for: one written earlier, beside something
+    /// the use is in. None when one in scope by `#[macro_use]` may be, which is not known.
+    fn in_textual_scope(&self, call: &ast::MacroCall) -> Option<bool> {
+        let sema = self.sema;
+        let Some(source) = sema.resolve_macro_call(call).and_then(|it| sema.source(it)) else {
+            return Some(false);
+        };
+        let Some(ast::Macro::MacroRules(rules)) = source.value.left() else {
+            return Some(false);
+        };
+        let named = rules.name().map(|it| it.text().to_string());
+        let used = call.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
+        if named != used {
+            return Some(false);
+        }
+        let rules = rules.syntax();
+        let beside = sema.ancestors_with_macros(call.syntax().clone()).any(|around| {
+            around.parent() == rules.parent()
+                && sema.hir_file_for(&around) == source.file_id
+                && rules.text_range().end() <= around.text_range().start()
+        });
+        beside.then_some(true)
     }
 }
 
@@ -1370,6 +1529,15 @@ impl Checkouts {
         self.splits[at] = None;
         self.debug[at] = debug;
     }
+}
+
+/// The directory cargo put the executables of the build in: the one its `deps`, where the
+/// libraries of the build are, is in.
+fn executables_of(symbol_files: &[PathBuf]) -> Option<AbsPathBuf> {
+    let deps = symbol_files.iter().filter_map(|file| file.parent());
+    let deps = deps.filter(|deps| deps.file_name().is_some_and(|name| name == "deps"));
+    let built = deps.filter_map(Path::parent).next()?;
+    AbsPathBuf::try_from(built.to_str()?).ok()
 }
 
 /// The parts of a checkout that a build of it is told.
@@ -2459,11 +2627,11 @@ impl WatchedFile {
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
-    /// The files of the VFS that have a text. One that is not UTF-8 has none, and is no
-    /// source of anything.
+    /// The files of the VFS that are text. One that is not UTF-8 can only be named by an
+    /// `include_bytes!`, and is watched as [`Watched::Included`] once it is.
     fn sources(vfs: &Vfs, db: &RootDatabase) -> Vec<WatchedFile> {
         vfs.iter()
-            .filter(|(id, _)| db.has_text(*id))
+            .filter(|&(id, _)| db.has_file_text(id))
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 WatchedFile::new(Watched::Source(id), path, path)
@@ -3185,6 +3353,7 @@ fn main() -> anyhow::Result<()> {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
+        executables: executables_of(&args.symbol_files),
         ..Default::default()
     };
     let selection = plan::Selection {

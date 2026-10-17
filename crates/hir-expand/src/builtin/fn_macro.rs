@@ -147,11 +147,15 @@ fn module_path_expand(
     _tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // Just return a dummy result.
+    let placeholder = MODULE_PATH_PLACEHOLDER;
     ExpandResult::ok(quote! {span =>
-         "module::path"
+         #placeholder
     })
 }
+
+/// What `module_path!()` expands to: the expander doesn't know modules, and whoever lowers a
+/// literal with this in it puts the path of the module there.
+pub const MODULE_PATH_PLACEHOLDER: &str = "\u{0}module_path\u{0}";
 
 fn line_expand(
     _db: &dyn SourceDatabase,
@@ -562,19 +566,16 @@ fn use_panic_2021(db: &dyn SourceDatabase, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
     // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
+    let mut ctx = span.ctx;
     loop {
-        let Some(expn) = span.ctx.outer_expn(db) else {
-            break false;
+        let Some(expn) = ctx.outer_expn(db) else {
+            break ctx.edition(db) >= Edition::Edition2021;
         };
         let expn = crate::MacroCallId::from(expn).loc(db);
-        // FIXME: Record allow_internal_unstable in the macro def (not been done yet because it
-        // would consume quite a bit extra memory for all call locs...)
-        // if let Some(features) = expn.def.allow_internal_unstable {
-        //     if features.iter().any(|&f| f == sym::edition_panic) {
-        //         span = expn.call_site;
-        //         continue;
-        //     }
-        // }
+        if expn.def.edition_panic {
+            ctx = expn.ctxt;
+            continue;
+        }
         break expn.def.edition >= Edition::Edition2021;
     }
 }
@@ -948,7 +949,10 @@ fn included_bytes<'db>(
 ) -> Option<&'db [u8]> {
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
-    if let Some(file) = db.resolve_path(path) {
+    // A file of the VFS that is not UTF-8 is read from disk like one outside it.
+    if let Some(file) = db.resolve_path(path)
+        && db.has_file_text(file)
+    {
         return Some(db.file_text(file).text(db).as_bytes());
     }
     db.included_file(path)?.bytes(db).as_deref()
@@ -1006,14 +1010,14 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
-        // The only variable rust-analyzer ever sets is `OUT_DIR`, so only diagnose that to avoid
-        // unnecessary diagnostics for eg. `CARGO_PKG_NAME`.
-        if key.as_str() == "OUT_DIR" {
-            err = Some(ExpandError::other(
-                span,
-                r#"`OUT_DIR` not set, build scripts may have failed to run"#,
-            ));
-        }
+        err = Some(ExpandError::other(
+            span,
+            if key.as_str() == "OUT_DIR" {
+                r#"`OUT_DIR` not set, build scripts may have failed to run"#.to_owned()
+            } else {
+                format!("environment variable `{}` not defined at compile time", key.as_str())
+            },
+        ));
 
         // If the variable is unset, still return a dummy string to help type inference along.
         // We cannot use an empty string here, because for

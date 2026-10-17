@@ -12,9 +12,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015", "fragment"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = {"raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro"}
+OPEN = {
+    "raw_write_then_match",
+    "future_unwind_flags",
+    "fragment_edition_through_macro",
+    "assert_long_expression",
+}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
 LEFT = {"caller_in_constant", "empty_array_by_impl"}
 # Crates reduced and not fixed, where rustd says so: a function of these is left to rustc.
@@ -22,7 +27,8 @@ LEFT_CRATES = []
 
 
 def main():
-    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2021"], ["-p", "breaker"])
+    crates = ["breakers", "breakers2021", "breakers2015"]
+    fx = Fixture(os.path.join(HERE, "breakers"), crates, ["-p", "breaker"])
     fx.rustc_build()
     fx.rustd_build()
     skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol" not in r[2]]

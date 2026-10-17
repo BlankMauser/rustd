@@ -172,10 +172,10 @@ fn main() {
 macro_rules! env {() => {}}
 
 fn main() {
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
-    "UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
 }
 "##]],
     );
@@ -261,7 +261,7 @@ fn main() {
 fn main() {
      {
         if !(true ) {
-            $crate::panic::panic_2021!("{} {:?}", arg1(a, b, c), arg2);
+            $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
 }

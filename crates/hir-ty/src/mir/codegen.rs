@@ -31,7 +31,10 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
 };
-use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
+use hir_expand::{
+    FileRange, HirFileId, InFile, MacroDefKind,
+    builtin::{BuiltinFnLikeExpander, EagerExpander},
+};
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
@@ -42,7 +45,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 
 use crate::mir::is_by_move_coroutine;
@@ -51,7 +54,7 @@ use crate::{
     consteval::try_const_usize,
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
-    drop::{DropGlue, has_drop_glue},
+    drop::{DropGlue, destructor, has_drop_glue},
     infer::PointerCast,
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -68,7 +71,7 @@ use hir_def::lang_item::LangItems;
 use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
-    Requests, Variable,
+    Requests, TextPart, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -845,6 +848,9 @@ enum InstanceDef {
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
     /// generic argument: calls the closure through the pointer it is handed, then drops it.
     CallOnceShim,
+    /// A method that takes `self` by value, in a vtable: the slot is called with a pointer to
+    /// the value, which the shim hands to the method as the method takes it.
+    VtableShim(FunctionId),
     /// What a closure that captures nothing coerces to as a function pointer: calls the
     /// closure type that is the instance's only generic argument, which borrows a receiver,
     /// with a dangling one.
@@ -1233,6 +1239,12 @@ fn compiled_instance<'db>(
                 _ => fx.call_once_by_pointer(args),
             });
         }
+        InstanceDef::VtableShim(func) => {
+            let args = instance.args.as_ref();
+            return compile(db, env, None, false, instance.checked, |fx| {
+                fx.vtable_shim(func, args)
+            });
+        }
         InstanceDef::FnPointerShim => {
             return compile(db, env, None, false, instance.checked, |fx| fx.fn_pointer_shim(ty()));
         }
@@ -1518,6 +1530,7 @@ fn instance_body<'db>(
             .map(Cow::Borrowed),
         InstanceDef::DropGlue
         | InstanceDef::CallOnceShim
+        | InstanceDef::VtableShim(_)
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
@@ -1904,6 +1917,94 @@ fn location_macros<'db>(
         .collect()
 }
 
+/// The literals of a body that `concat!` made of arguments with `line!()`, `column!()` or
+/// `file!()` among them, each with the expansion it is in.
+#[salsa::tracked(returns(ref))]
+fn located_concats<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+) -> FxHashMap<ExprId, HirFileId> {
+    let (body, source_map) = Body::with_source_map(db, owner);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+        .filter_map(|(id, _)| {
+            let file_id = source_map.expr_syntax(id).ok()?.file_id;
+            let loc = file_id.macro_file()?.loc(db);
+            let concat =
+                matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
+            (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
+        })
+        .collect()
+}
+
+/// The macro of `name` that expands to a place in the source.
+fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
+    match name {
+        "line" => Some(BuiltinFnLikeExpander::Line),
+        "column" => Some(BuiltinFnLikeExpander::Column),
+        "file" => Some(BuiltinFnLikeExpander::File),
+        _ => None,
+    }
+}
+
+/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+fn names_location(call: &SyntaxNode) -> bool {
+    call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && location_expander(token.text()).is_some()
+            && token
+                .next_token()
+                .and_then(|next| syntax::algo::skip_trivia_token(next, syntax::Direction::Next))
+                .is_some_and(|next| next.kind() == SyntaxKind::BANG)
+    })
+}
+
+/// An argument of a `concat!`.
+enum ConcatPart {
+    Text(String),
+    /// A call of `line!`, `column!` or `file!`, and where it is.
+    Location(BuiltinFnLikeExpander, TextRange),
+}
+
+/// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
+/// or `file!`.
+fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
+    let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
+    let mut inside: Vec<SyntaxElement> =
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
+    inside.pop()?;
+    let inside = inside.get(1..)?;
+    inside
+        .split(|it| it.kind() == SyntaxKind::COMMA)
+        .filter(|argument| !argument.is_empty())
+        .map(concat_part)
+        .collect()
+}
+
+fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
+    if let [SyntaxElement::Token(token)] = argument {
+        let text = match token.kind() {
+            SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
+            SyntaxKind::INT_NUMBER => {
+                ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
+            }
+            SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
+            _ => return None,
+        };
+        return Some(ConcatPart::Text(text));
+    }
+    let [.., SyntaxElement::Token(name), bang, SyntaxElement::Node(arguments)] = argument else {
+        return None;
+    };
+    let expander = location_expander(name.text())?;
+    let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
+    (bang.kind() == SyntaxKind::BANG && empty).then(|| {
+        let range = argument[0].text_range().cover(arguments.text_range());
+        ConcatPart::Location(expander, range)
+    })
+}
+
 /// The macro call an expansion comes from that is itself written out, in the source or in
 /// what a macro was passed, and not by another macro.
 fn written_call(db: &dyn HirDatabase, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
@@ -1964,17 +2065,6 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     };
     let name = AttrFlags::link_name(db, func.into())
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.symbol().clone());
-    Some(name.as_str().to_owned())
-}
-
-/// The symbol a static of an `extern` block links to.
-fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
-    let signature = StaticSignature::of(db, id);
-    if !signature.flags.contains(StaticFlags::EXTERN) {
-        return None;
-    }
-    let name =
-        AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone());
     Some(name.as_str().to_owned())
 }
 
@@ -2085,6 +2175,8 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        argument_temps: Default::default(),
+        handed_over: Vec::new(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -2783,6 +2875,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     };
                     CachedData::FilePath(path)
                 }
+                DataRequest::Text(parts) => {
+                    let Some(text) = self.text(parts) else {
+                        return self.kept.unkept("file without a path");
+                    };
+                    CachedData::FilePath(text)
+                }
             });
         }
         Some(cached::Entry {
@@ -3116,10 +3214,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 self.define_file_path(path)
             }
+            DataRequest::Text(parts) => {
+                let Some(text) = self.text(parts) else {
+                    unsupported!("`file!()` in a file without a path");
+                };
+                self.define_file_path(text)
+            }
         }
     }
 
-    /// The `&str` that `file!()` is.
+    /// The text of the parts, with each file's path for the file.
+    fn text(&mut self, parts: &[TextPart]) -> Option<String> {
+        parts
+            .iter()
+            .map(|part| match part {
+                TextPart::Text(text) => Some(text.clone()),
+                TextPart::FilePath(file) => self.source_path(*file),
+            })
+            .collect()
+    }
+
+    /// The `&str` that `file!()` is, or a `concat!` with it.
     fn define_file_path(&mut self, path: String) -> Result<DataId> {
         let len = path.len();
         let path = self.define_const(ConstBlob {
@@ -3145,6 +3260,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// The data object of a static: rustc's when it exports one, else our own copy of its value.
+    /// The name the linker knows a static by: one of an `extern` block, or one that an
+    /// attribute exports and rustc's build defines.
+    fn linked_static(&self, id: StaticId) -> Result<Option<intern::Symbol>> {
+        let db = self.db;
+        let signature = StaticSignature::of(db, id);
+        if !signature.flags.contains(StaticFlags::EXTERN) {
+            let exported = AttrFlags::export_name(db, id.into()).or_else(|| {
+                let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
+                unmangled.then(|| signature.name.symbol().clone())
+            });
+            return Ok(exported.filter(|name| self.symbols.defines(name.as_str())));
+        }
+        let name = AttrFlags::link_name(db, id.into());
+        Ok(Some(name.unwrap_or_else(|| signature.name.symbol().clone())))
+    }
+
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
         let db = self.db;
         let known = [&self.imported_statics, &self.statics, &self.frozen_statics];
@@ -3169,9 +3300,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(data);
         }
-        if let Some(symbol) = static_link_name(db, id) {
+        if let Some(symbol) = self.linked_static(id)? {
             let thread_local = is_thread_local(db, id);
-            let data = self.module.declare_data(&symbol, Linkage::Import, false, thread_local)?;
+            let data =
+                self.module.declare_data(symbol.as_str(), Linkage::Import, false, thread_local)?;
             self.imported_statics.insert(id, data);
             return Ok(data);
         }
@@ -3306,6 +3438,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::CoroutineByMove(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
@@ -3469,6 +3602,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .and_then(|ty| super::type_name::rustc_symbol_type(db, ty))
                 .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
             InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
@@ -3482,6 +3616,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => "{async}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
+            InstanceDef::VtableShim(_) => "{vtable}",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
             InstanceDef::ReifyShim { .. } => "{reify}",
         }
@@ -4032,6 +4167,11 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The temporaries that are written once and are then an argument of a call, whole.
+    argument_temps: rustc_hash::FxHashSet<LocalId>,
+    /// Where the arguments of the call being compiled are that the callee can have as they
+    /// are, those of `argument_temps`.
+    handed_over: Vec<Value>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -4921,8 +5061,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     values.push(self.load_cast(unit, part, left.min(Size::from_bytes(step))));
                 }
             }
+            // The callee owns the memory it is handed: a temporary nothing else reads is that
+            // already.
+            PassMode::Indirect if self.handed_over.contains(&addr) => values.push(addr),
             PassMode::Indirect => {
-                // The callee owns the memory it is handed.
                 let copy = self.stack_slot(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
@@ -5040,15 +5182,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
-    /// Equal constants share an address, as they do for rustc.
+    /// Equal constants share an address, as they do for rustc. A type that is not `plain` is
+    /// promoted when the value is: a `None` of an `Option<Box<T>>` has nothing to drop.
     fn promoted_constant(
         &mut self,
         body: &'db MirBody<'db>,
         expr: ExprId,
-        size: usize,
+        layout: &Layout,
+        plain: bool,
     ) -> Option<Value> {
         let db = self.cg.db;
-        if self.mentions_location(body, expr) {
+        if layout.size.bytes() == 0 || self.mentions_location(body, expr) {
             return None;
         }
         let constant = monomorphized_promoted_mir_body_query(
@@ -5060,11 +5204,73 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
         .ok()?;
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
+        let ty = allocation.ty;
         let blob = self.allocation_blob(allocation, false).ok()?;
-        if blob.bytes.len() != size {
+        if blob.bytes.len() != layout.size.bytes_usize()
+            || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
+        {
             return None;
         }
         self.blob_addr(blob).ok()
+    }
+
+    /// Whether a value of `ty` can be read-only data that is never dropped.
+    fn is_plain(&self, ty: Ty<'db>) -> bool {
+        self.is_freeze(ty) && has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
+    }
+
+    /// Whether the value of `ty` at `offset` in `bytes` has nothing to drop and no cell in
+    /// it, which a value of a type that is not plain can be: an enum by its variant.
+    fn is_plain_value(&self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> bool {
+        if self.is_plain(ty) {
+            return true;
+        }
+        let db = self.cg.db;
+        let Ok(layout) = self.layout(ty) else { return false };
+        match ty.kind() {
+            TyKind::Tuple(fields) => fields.iter().enumerate().all(|(i, field)| {
+                let at = offset + layout.fields.offset(i).bytes_usize();
+                self.is_plain_value(bytes, at, field)
+            }),
+            TyKind::Array(element, len) => {
+                let (Some(len), Ok(element_layout)) =
+                    (try_const_usize(db, len), self.layout(element))
+                else {
+                    return false;
+                };
+                let size = element_layout.size.bytes_usize();
+                (0..len as usize).all(|i| self.is_plain_value(bytes, offset + i * size, element))
+            }
+            TyKind::Adt(def, args) => {
+                let adt = def.def_id();
+                if destructor(db, adt).is_some() {
+                    return false;
+                }
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match adt {
+                    AdtId::StructId(id) if Some(id) == self.interner.lang_items().UnsafeCell => {
+                        return false;
+                    }
+                    AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return false,
+                    AdtId::EnumId(id) => {
+                        let Some(bytes) = bytes.get(offset..offset + layout.size.bytes_usize())
+                        else {
+                            return false;
+                        };
+                        match detect_variant_from_bytes(&layout, db, self.dl(), bytes, id) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => return false,
+                        }
+                    }
+                };
+                db.field_types(variant).iter().enumerate().all(|(i, (_, field))| {
+                    let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    let at = offset + layout.fields.offset(i).bytes_usize();
+                    self.is_plain_value(bytes, at, field)
+                })
+            }
+            _ => false,
+        }
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -5303,9 +5509,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (.., held) = frame.as_ref()?;
             held.locals.binary_search(&local).ok()
         };
-        let forwarded = forwarded_temps(body);
+        let is_dropped = |local: LocalId| {
+            has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
+                != DropGlue::None
+        };
+        let forwarded = forwarded_temps(body, is_dropped);
+        let used = used_locals(body);
+        let renamed = renamed_temps(body, &forwarded, is_dropped);
         for (local, data) in body.locals.iter() {
-            if self.locals.contains_idx(local) || forwarded.contains_key(&local) {
+            if self.locals.contains_idx(local)
+                || forwarded.contains_key(&local)
+                || renamed.contains_key(&local)
+                || !used.contains(&local)
+            {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
@@ -5320,17 +5536,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
-            let addr = if let Some(&(_, expr)) = promoted
-                && self.is_freeze(data.ty.as_ref())
-                && has_drop_glue(&self.infcx, data.ty.as_ref(), self.env.param_env)
-                    == DropGlue::None
-            {
-                match self.promoted_constant(body, expr, layout.size.bytes_usize()) {
-                    Some(addr) if layout.size.bytes() != 0 => {
+            let addr = if let Some(&(_, expr)) = promoted {
+                let plain = self.is_plain(data.ty.as_ref());
+                match self.promoted_constant(body, expr, &layout, plain) {
+                    Some(addr) => {
                         self.constant_locals.push(local);
                         addr
                     }
-                    _ => self.promoted_slot(&layout)?,
+                    None if plain => self.promoted_slot(&layout)?,
+                    None => self.stack_slot(&layout),
                 }
             } else {
                 self.stack_slot(&layout)
@@ -5342,14 +5556,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
         }
-        for (temp, to) in forwarded {
-            self.locals.insert(temp, self.locals[to]);
+        for &temp in forwarded.keys().chain(renamed.keys()) {
+            let of = aliased_local(temp, &forwarded, &renamed);
+            let Some(&slot) = self.locals.get(of) else {
+                unsupported!("a temporary that stands for a local kept nowhere");
+            };
+            self.locals.insert(temp, slot);
         }
         let mut frame_flags = Vec::new();
         let mut kept_flags = Vec::new();
         for (local, data) in body.locals.iter() {
             let ty = data.ty.as_ref();
             if local == returned_local(body)
+                || !self.locals.contains_idx(local)
                 || has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
             {
                 continue;
@@ -5440,6 +5659,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.argument_temps = argument_temps(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -5741,7 +5961,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             path.pop();
                             return dropped;
                         }
-                        this.call_drop_impl(addr, ty)?;
+                        this.call_drop_impl(addr, meta, ty)?;
                         if let AdtId::StructId(id) = adt_def.def_id() {
                             let layout = this.layout(ty)?;
                             this.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
@@ -6301,7 +6521,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             | TyKind::RawPtr(..)
             | TyKind::FnPtr(..)
             | TyKind::FnDef(..) => true,
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.is_freeze(element),
+            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+                self.is_freeze(element)
+            }
             TyKind::Tuple(fields) => fields.iter().all(|field| self.is_freeze(field)),
             TyKind::Adt(def, args) => {
                 let variants: Vec<VariantId> = match def.def_id() {
@@ -6936,8 +7158,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         match rvalue {
             Rvalue::Use(operand) => {
                 let (src, ty) = self.operand(operand)?;
-                let size = self.layout(ty)?.size;
-                self.copy(dst, src, size);
+                if src != dst {
+                    let size = self.layout(ty)?.size;
+                    self.copy(dst, src, size);
+                }
             }
             Rvalue::CopyForDeref(place) => {
                 let (src, ty) = self.place(place)?;
@@ -7452,7 +7676,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
-                let (r, overflow) = self.shift_amount(r, scalar.ty.bits());
+                let (r, beyond_a_word) = self.shift_amount_word(r);
+                let bits = i64::from(scalar.ty.bits());
+                let overflow =
+                    self.builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let overflow = match beyond_a_word {
+                    Some(beyond) => self.builder.ins().bor(overflow, beyond),
+                    None => overflow,
+                };
                 let (shift_op, value) = match (op, signed) {
                     (BinOp::Shl, _) => (OverflowOp::Shl, self.builder.ins().ishl(l, r)),
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
@@ -7465,18 +7696,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
-    /// The amount to shift a value of `bits` bits by, no wider than a register, and whether
-    /// `amount` is out of range: not less than `bits`, read as unsigned.
-    fn shift_amount(&mut self, amount: Value, bits: u32) -> (Value, Value) {
-        let too_far = IntCC::UnsignedGreaterThanOrEqual;
+    /// A shift amount as at most one machine word, and whether the part cut off was not zero.
+    /// A shift takes its amount modulo the width of the value, which the low word decides.
+    fn shift_amount_word(&mut self, amount: Value) -> (Value, Option<Value>) {
         if self.builder.func.dfg.value_type(amount) != types::I128 {
-            let overflow = self.builder.ins().icmp_imm(too_far, amount, i64::from(bits));
-            return (amount, overflow);
+            return (amount, None);
         }
         let (low, high) = self.builder.ins().isplit(amount);
-        let too_far = self.builder.ins().icmp_imm(too_far, low, i64::from(bits));
-        let wide = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
-        (low, self.builder.ins().bor(too_far, wide))
+        let beyond = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
+        (low, Some(beyond))
     }
 
     fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
@@ -7648,7 +7876,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Whether a promoted expression takes its value from where it is in the source.
     fn mentions_location(&self, body: &MirBody<'db>, expr: ExprId) -> bool {
         let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
-        if self.location_macro(body, expr).is_some() {
+        if self.location_macro(body, expr).is_some()
+            || located_concats(self.cg.db, owner).contains_key(&expr)
+        {
             return true;
         }
         let mut found = false;
@@ -7657,11 +7887,52 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         found
     }
 
+    /// The `&str` of a literal that a `concat!` with `line!()`, `column!()` or `file!()`
+    /// among its arguments expanded to: the expansion has their placeholders in it.
+    fn located_concat(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let db = self.cg.db;
+        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
+            return Ok(None);
+        };
+        let Some(call) = located_concats(db, owner)
+            .get(&expr)
+            .and_then(|file_id| file_id.macro_file())
+            .map(|it| it.loc(db).to_node(db))
+        else {
+            return Ok(None);
+        };
+        let Some(parts) = concat_parts(&call.value) else {
+            unsupported!("`concat!` of a place in the source and what is not a literal");
+        };
+        let mut text = Vec::new();
+        for part in parts {
+            text.push(match part {
+                ConcatPart::Text(text) => TextPart::Text(text),
+                ConcatPart::Location(expander, range) => {
+                    let Some((file, line, col)) = location_of(db, call.file_id, range) else {
+                        unsupported!("`concat!` of a place that is not in a file");
+                    };
+                    match expander {
+                        BuiltinFnLikeExpander::Line => TextPart::Text(line.to_string()),
+                        BuiltinFnLikeExpander::Column => TextPart::Text(col.to_string()),
+                        _ => TextPart::FilePath(file),
+                    }
+                }
+            });
+        }
+        let text = self.cg.text(text);
+        let text = self.cg.declare_data_in_func(text, self.builder.func);
+        Ok(Some(self.builder.ins().symbol_value(ptr(), text)))
+    }
+
     /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
     /// rust-analyzer expands them to placeholders, since a real value would make every body
     /// below an edit change.
     fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
         let db = self.cg.db;
+        if let Some(text) = self.located_concat(expr)? {
+            return Ok(Some(text));
+        }
         let Some((expander, file_id)) = self.body.and_then(|it| self.location_macro(it, expr))
         else {
             return Ok(None);
@@ -7786,7 +8057,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.deferred_drops.push((block, place.clone(), *target, self.span, from));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
-                self.call(func, args, destination, *target)?
+                self.handed_over = args
+                    .iter()
+                    .filter_map(|it| match &it.kind {
+                        OperandKind::Copy(place) | OperandKind::Move(place) => Some(place),
+                        _ => None,
+                    })
+                    .filter(|it| self.argument_temps.contains(&it.local))
+                    .map(|it| self.locals[it.local].addr)
+                    .collect();
+                let called = self.call(func, args, destination, *target);
+                self.handed_over.clear();
+                called?
             }
             _ => unsupported!("terminator {terminator:?}"),
         }
@@ -8440,14 +8722,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
-        // A by-value `self` reaches the method through a pointer and needs a shim.
-        let receiver = self.layout(receiver.as_ref())?;
-        let thin = match receiver.backend_repr {
-            BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Primitive::Pointer(_)),
-            _ => false,
-        };
-        if !thin {
-            unsupported!("vtable method taking `self` by value");
+        // A by-value `self` reaches the method through a pointer and needs a shim, unless the
+        // method takes it through a pointer too.
+        if receiver.as_ref() == self_ty {
+            let layout = self.layout(self_ty)?;
+            let mode = self.pass_mode(&layout, false)?;
+            if !matches!(mode, PassMode::Indirect) {
+                if track_caller(db, callee) {
+                    unsupported!("vtable method taking `self` by value that tracks its caller");
+                }
+                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                return self.cg.callee(
+                    InstanceDef::VtableShim(callee),
+                    callee_args,
+                    self.env,
+                    &sig,
+                );
+            }
         }
         // A method declared `#[track_caller]` in the trait is given a location by the call. One
         // that is so only in the impl is called without, and the shim supplies it.
@@ -8743,19 +9034,45 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn call_once_by_pointer(&mut self, args: GenericArgs<'db>) -> Result<()> {
         let (callee, callee_args, sig, mode) = self.call_once_impl(args)?;
         let layout = self.layout(args.type_at(0))?;
-        self.builder.func.signature = Self::by_pointer(&sig, mode);
+        self.call_by_pointer(callee, callee_args, &sig, mode, &layout)
+    }
+
+    /// The body of a `VtableShim`: calls the method with the value the shim is handed a
+    /// pointer to.
+    fn vtable_shim(&mut self, func: FunctionId, args: GenericArgs<'db>) -> Result<()> {
+        let body = self.body_types(InstanceDef::Fn(func), args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
+            unsupported!("vtable method without a receiver");
+        };
+        let layout = self.layout(receiver.as_ref())?;
+        let mode = self.pass_mode(&layout, false)?;
+        self.call_by_pointer(func, args, &sig, mode, &layout)
+    }
+
+    /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
+    /// it by value as `mode` says.
+    fn call_by_pointer(
+        &mut self,
+        callee: FunctionId,
+        callee_args: GenericArgs<'db>,
+        sig: &Signature,
+        mode: PassMode,
+        layout: &Layout,
+    ) -> Result<()> {
+        self.builder.func.signature = Self::by_pointer(sig, mode);
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
         let mut params = self.builder.block_params(entry).to_vec();
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let Some(&receiver) = params.get(sret as usize) else {
-            unsupported!("call_once shim for a receiver that is not passed");
+            unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
-        self.pass(mode, receiver, &layout, &mut values);
+        self.pass(mode, receiver, layout, &mut values);
         params.splice(sret as usize..sret as usize + 1, values);
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
@@ -9192,6 +9509,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (l, scalar) = self.load_scalar(lhs)?;
                 let (r, r_scalar) = self.load_scalar(rhs)?;
                 let signed = scalar.signed;
+                let r = match name {
+                    "unchecked_shl" | "unchecked_shr" => self.shift_amount_word(r).0,
+                    _ => r,
+                };
                 let value = match name {
                     "wrapping_add" | "unchecked_add" => self.builder.ins().iadd(l, r),
                     "wrapping_sub" | "unchecked_sub" => self.builder.ins().isub(l, r),
@@ -10817,7 +11138,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ty: Ty<'db>,
     ) -> Result<()> {
         self.guarded(
-            |this| this.call_drop_impl(addr, ty),
+            |this| this.call_drop_impl(addr, meta, ty),
             |this| this.drop_adt_fields(addr, meta, ty),
         )
     }
@@ -11051,6 +11372,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         switch.emit(&mut self.builder, l_discr, done);
                         for (block, variant) in arms {
                             self.builder.switch_to_block(block);
+                            // A constant of a pattern is never in such a variant, and here
+                            // the two are in the same one.
+                            if !self.fields_compare_in_parts(variant.into(), subst, &mut vec![ty]) {
+                                self.builder.ins().jump(differ, &[]);
+                                continue;
+                            }
                             let index = RustcEnumVariantIdx(variant.index(db));
                             let layout = &Layout::for_variant(&layout, index);
                             self.branch_unless_fields_equal(
@@ -11093,6 +11420,46 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether [`Self::branch_unless_equal`] can compare two values of `ty`. `seen` are the
+    /// types that hold this one.
+    fn compares_in_parts(&self, ty: Ty<'db>, seen: &mut Vec<Ty<'db>>) -> bool {
+        let ty = self.normalize(ty);
+        if seen.contains(&ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Str => true,
+            TyKind::Ref(_, inner, _) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+                self.compares_in_parts(inner, seen)
+            }
+            TyKind::Tuple(tys) => tys.iter().all(|ty| self.compares_in_parts(ty, seen)),
+            TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
+                AdtId::UnionId(_) => false,
+                // Each variant is looked at once the two are known to be in it.
+                AdtId::EnumId(_) => true,
+                AdtId::StructId(id) => {
+                    seen.push(ty);
+                    let compares = self.fields_compare_in_parts(id.into(), subst, seen);
+                    seen.pop();
+                    compares
+                }
+            },
+            _ => self.scalar_of(ty).is_ok(),
+        }
+    }
+
+    fn fields_compare_in_parts(
+        &self,
+        variant: VariantId,
+        subst: GenericArgs<'db>,
+        seen: &mut Vec<Ty<'db>>,
+    ) -> bool {
+        self.cg.db.field_types(variant).iter().all(|(_, ty)| {
+            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+            self.compares_in_parts(ty, seen)
+        })
     }
 
     fn branch_unless_fields_equal(
@@ -11199,7 +11566,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.guarded(
                         |this| this.drop_value(pointer, pointee_meta, pointee),
                         |this| {
-                            this.call_drop_impl(addr, ty)?;
+                            this.call_drop_impl(addr, meta, ty)?;
                             this.drop_adt_fields(addr, meta, ty)
                         },
                     )?;
@@ -11425,15 +11792,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(index)
     }
 
-    /// Calls `<ty as Drop>::drop` on the value at `addr`.
-    fn call_drop_impl(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
+    /// Calls `<ty as Drop>::drop` on the value at `addr`, whose metadata is `meta` when the
+    /// type is unsized.
+    fn call_drop_impl(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let Some(drop_fn) = self.interner.lang_items().Drop_drop else {
             unsupported!("no `Drop::drop` lang item");
         };
         let reference =
             Ty::new_ref(self.interner, Region::new_erased(self.interner), ty, Mutability::Mut);
-        let slot = self.scratch();
+        let slot = self.scratch_pair();
         self.builder.ins().store(MEM, addr, slot, 0);
+        if let Some(meta) = meta {
+            self.builder.ins().store(MEM, meta, slot, meta_at());
+        }
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         let unit = Ty::new_unit(self.interner);
         self.call_direct(drop_fn, args, &[(slot, reference)], slot, unit)
@@ -11529,20 +11900,204 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     temps
 }
 
+/// The locals a body reads, writes or returns. A closure has a local for every binding of the
+/// function it is written in, and takes no room for the ones it leaves alone.
+fn used_locals(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let mut used: rustc_hash::FxHashSet<LocalId> = body
+        .param_locals
+        .iter()
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    body.clone().walk_places(|place| {
+        used.insert(place.local);
+        for elem in place.projection.as_slice() {
+            if let ProjectionElem::Index(index) = elem {
+                used.insert(*index);
+            }
+        }
+    });
+    used
+}
+
+/// The temporaries that are written once and read once, as a whole argument of the call their
+/// block ends in: what the call is given is a value nothing else reads afterwards.
+fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    body.clone().walk_places(|place| *mentions.entry(place.local).or_default() += 1);
+    // Dropping what was passed drops nothing, and a fake read reads nothing.
+    for (_, block) in body.basic_blocks.iter() {
+        let fake = block.statements.iter().filter_map(|it| match &it.kind {
+            StatementKind::FakeRead(place) => Some(place),
+            _ => None,
+        });
+        let dropped = match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Drop { place, .. }) => Some(place),
+            _ => None,
+        };
+        for place in fake.chain(dropped) {
+            *mentions.entry(place.local).or_default() -= 1;
+        }
+    }
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    let mut temps = rustc_hash::FxHashSet::default();
+    for (_, block) in body.basic_blocks.iter() {
+        let Some(TerminatorKind::Call { args, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+        else {
+            continue;
+        };
+        // Written in the block that ends in the call, so once for every time it is passed.
+        let written = |local: LocalId| {
+            block.statements.iter().any(|it| {
+                matches!(&it.kind, StatementKind::Assign(to, _)
+                    if to.local == local && to.projection.as_slice().is_empty())
+            })
+        };
+        for arg in args.iter() {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &arg.kind
+                && place.projection.as_slice().is_empty()
+                && mentions.get(&place.local) == Some(&2)
+                && !bound.contains(&place.local)
+                && written(place.local)
+            {
+                temps.insert(place.local);
+            }
+        }
+    }
+    temps
+}
+
+/// The temporaries that are a local under another name, each with that local: `wrap(node)`
+/// moves `node` to a temporary and passes the temporary. A value that is dropped is not copied,
+/// so the local holds nothing once it is moved, and it holds nothing else later when the move
+/// is all that is written to the temporary and the local is written once as well.
+fn renamed_temps(
+    body: &MirBody<'_>,
+    forwarded: &FxHashMap<LocalId, LocalId>,
+    is_dropped: impl Fn(LocalId) -> bool,
+) -> FxHashMap<LocalId, LocalId> {
+    let mut renamed = FxHashMap::default();
+    if body.coroutine.is_some() {
+        return renamed;
+    }
+    let mut writes: FxHashMap<LocalId, usize> =
+        body.param_locals.iter().map(|&it| (it, 1)).collect();
+    let mut moves = Vec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Assign(to, rvalue) => {
+                    *writes.entry(to.local).or_default() += 1;
+                    if let Rvalue::Use(Operand {
+                        kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                        ..
+                    }) = rvalue
+                        && to.projection.as_slice().is_empty()
+                        && from.projection.as_slice().is_empty()
+                    {
+                        moves.push((to.local, from.local));
+                    }
+                }
+                StatementKind::InlineAsm(_) => return renamed,
+                _ => (),
+            }
+        }
+        if let Some(
+            TerminatorKind::Call { destination: place, .. }
+            | TerminatorKind::DropAndReplace { place, .. },
+        ) = block.terminator.as_ref().map(|it| &it.kind)
+        {
+            *writes.entry(place.local).or_default() += 1;
+        }
+    }
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    let once = |local: LocalId| writes.get(&local) == Some(&1);
+    for (temp, of) in moves {
+        if once(temp)
+            && once(of)
+            && !bound.contains(&temp)
+            && !forwarded.contains_key(&temp)
+            && !forwarded.contains_key(&of)
+            && !body.promoted_locals.iter().any(|it| it.0 == of)
+            && is_dropped(temp)
+        {
+            renamed.insert(temp, of);
+        }
+    }
+    // The local may be the temporary of another move itself.
+    let named = |mut local: LocalId| {
+        while let Some(&of) = renamed.get(&local) {
+            local = of;
+        }
+        local
+    };
+    renamed.iter().map(|(&temp, &of)| (temp, named(of))).collect()
+}
+
+/// The local whose slot a forwarded or renamed temporary shares: the one it stands for may be
+/// a temporary that stands for another.
+fn aliased_local(
+    temp: LocalId,
+    forwarded: &FxHashMap<LocalId, LocalId>,
+    renamed: &FxHashMap<LocalId, LocalId>,
+) -> LocalId {
+    let next = |local: &LocalId| forwarded.get(local).or_else(|| renamed.get(local)).copied();
+    // No chain is longer than the temporaries there are, unless it is a cycle.
+    let longest = forwarded.len() + renamed.len();
+    std::iter::successors(Some(temp), next).take(longest + 1).last().unwrap_or(temp)
+}
+
+/// The local a call returns into, for each block that only that call leads to.
+fn returned_into(body: &MirBody<'_>) -> FxHashMap<BasicBlockId, LocalId> {
+    let mut entries: FxHashMap<BasicBlockId, usize> = FxHashMap::default();
+    let mut returned = FxHashMap::default();
+    for (id, block) in body.basic_blocks.iter() {
+        for successor in body.accesses(id, &mut |_, _| ()) {
+            *entries.entry(successor).or_default() += 1;
+        }
+        if let Some(TerminatorKind::Call { destination, target: Some(target), .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
+            && destination.projection.as_slice().is_empty()
+        {
+            returned.insert(*target, destination.local);
+        }
+    }
+    returned.retain(|block, _| entries[block] == 1 && *block != body.start_block);
+    returned
+}
+
 /// The temporaries a `let` is initialized through, each with the binding it is copied to right
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
+fn forwarded_temps(
+    body: &MirBody<'_>,
+    is_dropped: impl Fn(LocalId) -> bool,
+) -> FxHashMap<LocalId, LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let mut forwarded = FxHashMap::default();
     if body.coroutine.is_some() {
         return forwarded;
     }
-    for (_, block) in body.basic_blocks.iter() {
+    let returned_into = returned_into(body);
+    for (id, block) in body.basic_blocks.iter() {
         // The temporary written last, by a statement of this block or by the call that led
         // here, and whether the binding's storage has started since.
-        let mut written = None;
+        let mut written = returned_into.get(&id).map(|&temp| (temp, None));
         for statement in &block.statements {
             match &statement.kind {
                 StatementKind::StorageLive(local) => {
@@ -11569,7 +12124,6 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
                 _ => written = None,
             }
         }
-        // FIXME: a temporary a call returns into is copied in the block the call leads to.
     }
     if forwarded.is_empty() {
         return forwarded;
@@ -11584,6 +12138,19 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
             .filter(|it| matches!(&it.kind, StatementKind::FakeRead(place) if place.local == local))
             .count()
     };
+    // The drop of a temporary whose type has nothing to drop is no use of it either.
+    let empty_drops = |local: LocalId| {
+        if is_dropped(local) {
+            return 0;
+        }
+        body.basic_blocks
+            .iter()
+            .filter_map(|(_, block)| block.terminator.as_ref())
+            .filter(
+                |it| matches!(&it.kind, TerminatorKind::Drop { place, .. } if place.local == local),
+            )
+            .count()
+    };
     let bound: rustc_hash::FxHashSet<LocalId> = body
         .binding_locals
         .values()
@@ -11594,7 +12161,7 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
         .collect();
     forwarded.retain(|&temp, to| {
         !bound.contains(&temp)
-            && mentions[&temp] - fake_reads(temp) == 2
+            && mentions[&temp] - fake_reads(temp) - empty_drops(temp) == 2
             && body.locals[temp].ty == body.locals[*to].ty
             && !body.promoted_locals.iter().any(|it| it.0 == *to)
             && *to != returned_local(body)

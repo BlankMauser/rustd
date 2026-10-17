@@ -8,7 +8,7 @@ Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects f
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
 import argparse, json, os, re, subprocess, sys
-from difftest import Fixture, compare, discard, RUNNER
+from difftest import Fixture, bucket, compare, discard, RUNNER
 
 
 UNIT = "(unit tests)"
@@ -44,17 +44,32 @@ class TestFixture(Fixture):
             print(f"{self.crates[0]} is not linked into this test")
             self.crates = self.crates[1:]
 
+    def binary_path(self):
+        # Beside cargo's: a test may look for the crate's other artifacts from where it runs
+        # (autocfg probes the rlibs in the directory of `current_exe`).
+        return self.reference + "-rustd"
+
     def rustd_build(self, deny=()):
         # The crate's objects are the same whichever test binary they are linked into.
         # rustd links to what the rlibs already hold, so that only goes for the same rlibs.
         key = tuple(self.rlibs)
         if deny or key not in self.shared:
             super().rustd_build(deny)
+            if self.leaves_to_rustc():
+                # rustc lays a future out its own way, so what the test leaves to rustc decides
+                # what of the crate can be rustd's: one run has to see both.
+                self.crates = [",".join(self.crates)]
+                super().rustd_build(deny)
             if not deny:
                 self.shared[key] = (self.objects, self.reports)
         else:
             objects, self.reports = self.shared[key]
             self.link(objects)
+
+    def leaves_to_rustc(self):
+        """Whether the test, compiled apart from the crate, left a function of its own to rustc."""
+        rows = self.reports[self.crates[-1]] if len(self.crates) == 2 else []
+        return any(r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function" for r in rows)
 
     def normalize(self, stdout):
         stdout = re.sub(rb"' \(\d+\) panicked", b"' panicked", stdout)
@@ -97,7 +112,11 @@ def main():
     # The test targets as cargo sees them: one may be named otherwise than its file, or be a
     # directory.
     tests = sorted((t["name"], t["src_path"]) for t in package["targets"] if "test" in t["kind"])
-    lib = next((t["src_path"] for t in package["targets"] if "lib" in t["kind"]), None)
+    lib_target = next((t for t in package["targets"] if "lib" in t["kind"]), None)
+    lib = lib_target and lib_target["src_path"]
+    if lib_target and not a.crate:
+        # A package may name its library otherwise (`md-5` has `md5`, `redox_syscall` `syscall`).
+        crate = lib_target["name"].replace("-", "_")
     if lib:
         tests.append((UNIT, lib))
     tests = [(t, path) for t, path in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]

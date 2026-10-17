@@ -101,12 +101,12 @@ impl <A: $crate::clone::Clone, B: $crate::clone::Clone, > $crate::clone::Clone f
     fn clone(&self ) -> Self {
         match self {
             Command::Move {
-                x: x, y: y,
+                x: x_self, y: y_self,
             }
             =>Command::Move {
-                x: $crate::clone::Clone::clone(x), y: $crate::clone::Clone::clone(y),
+                x: $crate::clone::Clone::clone(x_self), y: $crate::clone::Clone::clone(y_self),
             }
-            , Command::Do(f0, )=>Command::Do($crate::clone::Clone::clone(f0), ), Command::Jump=>Command::Jump,
+            , Command::Do(f0_self, )=>Command::Do($crate::clone::Clone::clone(f0_self), ), Command::Jump=>Command::Jump,
         }
     }
 }"#]],
@@ -161,10 +161,10 @@ impl <T: $crate::clone::Clone, > $crate::clone::Clone for Foo<T, > where <T as T
     fn clone(&self ) -> Self {
         match self {
             Foo {
-                qualified: qualified, shorthand: shorthand, generic: generic,
+                qualified: qualified_self, shorthand: shorthand_self, generic: generic_self,
             }
             =>Foo {
-                qualified: $crate::clone::Clone::clone(qualified), shorthand: $crate::clone::Clone::clone(shorthand), generic: $crate::clone::Clone::clone(generic),
+                qualified: $crate::clone::Clone::clone(qualified_self), shorthand: $crate::clone::Clone::clone(shorthand_self), generic: $crate::clone::Clone::clone(generic_self),
             }
             ,
         }
@@ -188,7 +188,7 @@ struct Foo<const X: usize, T>(u32);
 impl <const X: usize, T: $crate::clone::Clone, > $crate::clone::Clone for Foo<X, T, > where {
     fn clone(&self ) -> Self {
         match self {
-            Foo(f0, )=>Foo($crate::clone::Clone::clone(f0), ),
+            Foo(f0_self, )=>Foo($crate::clone::Clone::clone(f0_self), ),
         }
     }
 }"#]],
@@ -436,12 +436,12 @@ impl <> $crate::hash::Hash for Foo< > where {
     fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
         match self {
             Foo {
-                x: x, y: y, z: z,
+                x: x_self, y: y_self, z: z_self,
             }
             => {
-                x.hash(ra_expand_state);
-                y.hash(ra_expand_state);
-                z.hash(ra_expand_state);
+                x_self.hash(ra_expand_state);
+                y_self.hash(ra_expand_state);
+                z_self.hash(ra_expand_state);
             }
             ,
         }
@@ -475,14 +475,14 @@ impl <> $crate::hash::Hash for Command< > where {
         $crate::mem::discriminant(self ).hash(ra_expand_state);
         match self {
             Command::Move {
-                x: x, y: y,
+                x: x_self, y: y_self,
             }
             => {
-                x.hash(ra_expand_state);
-                y.hash(ra_expand_state);
+                x_self.hash(ra_expand_state);
+                y_self.hash(ra_expand_state);
             }
-            , Command::Do(f0, )=> {
-                f0.hash(ra_expand_state);
+            , Command::Do(f0_self, )=> {
+                f0_self.hash(ra_expand_state);
             }
             , Command::Jump=> {}
             ,
@@ -520,17 +520,17 @@ impl <> $crate::fmt::Debug for Command< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             Command::Move {
-                x: x, y: y,
+                x: x_self, y: y_self,
             }
             => {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "Move");
-                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "x", &x);
-                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "y", &y);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "x", &x_self);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "y", &y_self);
                 $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
             }
-            , Command::Do(f0, )=> {
+            , Command::Do(f0_self, )=> {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_tuple(f, "Do");
-                $crate::fmt::DebugTuple::field(&mut ra_expand_builder, &f0);
+                $crate::fmt::DebugTuple::field(&mut ra_expand_builder, &f0_self);
                 $crate::fmt::DebugTuple::finish(&mut ra_expand_builder)
             }
             , Command::Jump=>$crate::fmt::Formatter::write_str(f, "Jump"),
@@ -593,11 +593,11 @@ impl <> $crate::fmt::Debug for HideAndShow< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             HideAndShow {
-                always_show: always_show,
+                always_show: always_show_self,
             }
             => {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "HideAndShow");
-                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show_self);
                 $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
             }
         }
@@ -607,11 +607,11 @@ impl <> $crate::fmt::Debug for HideAndShowEnum< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             HideAndShowEnum::AlwaysShow {
-                always_show: always_show,
+                always_show: always_show_self,
             }
             => {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "AlwaysShow");
-                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show_self);
                 $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
             }
             ,

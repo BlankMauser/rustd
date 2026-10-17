@@ -54,7 +54,7 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
             TyKind::Alias(..) => {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
-                let ty = self.impl_opaque(ty);
+                let ty = self.outside_binders(self.impl_opaque(ty))?;
 
                 let mut ocx = ObligationCtxt::new(&self.infcx);
                 let ty = ocx
@@ -110,6 +110,23 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
 }
 
 impl<'db> Filler<'db> {
+    /// An alias as it is normalized: the lifetimes of a `for<'a>` around it are erased, as
+    /// every other lifetime is. Which lifetime it is makes no difference to the code.
+    fn outside_binders(&self, ty: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
+        if !ty.has_escaping_bound_vars() {
+            return Ok(ty);
+        }
+        let interner = self.infcx.interner;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
+            RegionKind::ReBound(..) => Region::new_erased(interner),
+            _ => region,
+        });
+        if ty.has_escaping_bound_vars() {
+            return Err(MirLowerError::NotSupported("an alias of a bound type".to_owned()));
+        }
+        Ok(ty)
+    }
+
     fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);

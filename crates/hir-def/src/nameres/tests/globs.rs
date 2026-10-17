@@ -35,6 +35,35 @@ pub struct Baz;
 }
 
 #[test]
+fn glob_of_crate_root_2015() {
+    check(
+        r#"
+//- /lib.rs edition:2015
+mod foo;
+mod bar;
+
+//- /foo.rs
+use ::*;
+
+//- /bar.rs
+pub struct Baz;
+"#,
+        expect![[r#"
+            crate
+            - bar : type
+            - foo : type
+
+            crate::bar
+            - Baz : type value
+
+            crate::foo
+            - bar : type (glob)
+            - foo : type (glob)
+        "#]],
+    );
+}
+
+#[test]
 fn glob_2() {
     check(
         r#"

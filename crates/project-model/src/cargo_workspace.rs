@@ -45,6 +45,8 @@ pub struct CargoWorkspace {
     /// configuration option.
     env: Env,
     requires_rustc_private: bool,
+    /// The directory the build put the executables of the workspace in.
+    executables: Option<AbsPathBuf>,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -150,6 +152,9 @@ pub struct CargoConfig {
     /// Run the build scripts as a build of the manifest's package has them, not as a build of
     /// every member of its workspace does: the features of the two differ.
     pub only_manifest_package: bool,
+    /// The directory a build put the executables of the workspace in, which the tests of a
+    /// package are told as `CARGO_BIN_EXE_<name>`.
+    pub executables: Option<AbsPathBuf>,
 }
 
 pub type Package = Idx<PackageData>;
@@ -536,6 +541,7 @@ impl CargoWorkspace {
             manifest_path: ws_manifest_path,
             is_virtual_workspace,
             requires_rustc_private,
+            executables: None,
             is_sysroot,
             env: cargo_env,
         }
@@ -686,6 +692,14 @@ impl CargoWorkspace {
 
     pub fn env(&self) -> &Env {
         &self.env
+    }
+
+    pub fn executables(&self) -> Option<&AbsPath> {
+        self.executables.as_deref()
+    }
+
+    pub fn set_executables(&mut self, directory: Option<AbsPathBuf>) {
+        self.executables = directory;
     }
 
     pub fn is_sysroot(&self) -> bool {

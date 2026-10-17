@@ -110,9 +110,18 @@ fn tuple_field_iterator(span: Span, n: usize) -> impl Iterator<Item = tt::Ident>
     (0..n).map(move |it| tt::Ident::new(&format!("f{it}"), span))
 }
 
+/// What a pattern over `self` binds a field to. The name of the field may be that of a tuple
+/// struct or a constant in scope, which a binding can't have.
+fn bound_of_self(field: &tt::Ident) -> tt::Ident {
+    tt::Ident::new(&format!("{}_self", field.sym), field.span)
+}
+
 impl VariantShape {
     fn as_pattern(&self, path: tt::TopSubtree, span: Span) -> tt::TopSubtree {
-        self.as_pattern_map(path, span, |it| quote!(span => #it))
+        self.as_pattern_map(path, span, |it| {
+            let bound = bound_of_self(it);
+            quote!(span => #bound)
+        })
     }
 
     fn field_names(&self, span: Span) -> Vec<tt::Ident> {
@@ -182,7 +191,14 @@ enum AdtShape {
 
 impl AdtShape {
     fn as_pattern(&self, span: Span, name: &tt::Ident) -> Vec<tt::TopSubtree> {
-        self.as_pattern_map(name, |it| quote!(span =>#it), span)
+        self.as_pattern_map(
+            name,
+            |it| {
+                let bound = bound_of_self(it);
+                quote!(span =>#bound)
+            },
+            span,
+        )
     }
 
     fn field_names(&self, span: Span) -> Vec<Vec<tt::Ident>> {
@@ -770,7 +786,10 @@ fn clone_expand_with(
         let patterns = adt.shape.as_pattern(span, name);
         let exprs = adt.shape.as_pattern_map(
             name,
-            |it| quote! {span => #krate::clone::Clone::clone(#it) },
+            |it| {
+                let bound = bound_of_self(it);
+                quote! {span => #krate::clone::Clone::clone(#bound) }
+            },
             span,
         );
         let arms = patterns.into_iter().zip(exprs).map(|(pat, expr)| {
@@ -881,8 +900,9 @@ fn debug_expand(
                 // trait must not be picked up.
                 let for_fields = fields.iter().map(|it| {
                     let x_string = it.sym.as_str().to_owned();
+                    let bound = bound_of_self(it);
                     quote! {span =>
-                        #krate::fmt::DebugStruct::field(&mut ra_expand_builder, #x_string, & #it);
+                        #krate::fmt::DebugStruct::field(&mut ra_expand_builder, #x_string, & #bound);
                     }
                 });
                 quote! {span => {
@@ -893,8 +913,9 @@ fn debug_expand(
             }
             VariantShape::Tuple(n) => {
                 let for_fields = tuple_field_iterator(span, *n).map(|it| {
+                    let bound = bound_of_self(&it);
                     quote! {span =>
-                        #krate::fmt::DebugTuple::field(&mut ra_expand_builder, & #it);
+                        #krate::fmt::DebugTuple::field(&mut ra_expand_builder, & #bound);
                     }
                 });
                 quote! {span => {
@@ -967,8 +988,10 @@ fn hash_expand(
             adt.shape.as_pattern(span, &adt.name).into_iter().zip(adt.shape.field_names(span)).map(
                 |(pat, names)| {
                     let expr = {
-                        let it =
-                            names.iter().map(|it| quote! {span => #it . hash(ra_expand_state); });
+                        let it = names.iter().map(|it| {
+                            let bound = bound_of_self(it);
+                            quote! {span => #bound . hash(ra_expand_state); }
+                        });
                         quote! {span => {
                             # #it
                         } }
@@ -1078,7 +1101,7 @@ fn self_and_other_patterns(
     let self_patterns = adt.shape.as_pattern_map(
         name,
         |it| {
-            let t = tt::Ident::new(&format!("{}_self", it.sym), it.span);
+            let t = bound_of_self(it);
             quote!(span =>#t)
         },
         span,
