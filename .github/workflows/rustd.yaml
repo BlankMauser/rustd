@@ -91,6 +91,8 @@ jobs:
           # The targets it builds for are another architecture and another libc of an
           # x86-64 host, and it is one producer's.
           if [ "$(uname -m)" = x86_64 ] && [ "$RUSTD_BACKEND" = cranelift ]; then run buildmodel.py; fi
+          # TEMPORARY: what its rows say on AArch64, which is not held to them yet.
+          if [ "$(uname -m)" = aarch64 ] && [ "$RUSTD_BACKEND" = cranelift ]; then python3 buildmodel.py || true; fi
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py

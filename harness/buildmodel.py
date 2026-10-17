@@ -87,7 +87,8 @@ class Case:
         self.source = os.path.join(CASES, name)
         self.spec = json.load(open(os.path.join(self.source, "case.json")))
         self.target = self.spec.get("target")
-        cross = CROSS.get(self.target, {})
+        # A target that is the host's own is linked and run as the host's programs are.
+        cross = CROSS.get(self.target, {}) if self.target != host() else {}
         self.runner = cross.get("runner", [])
         self.env = {**os.environ, **self.spec.get("env", {})}
         if "linker" in cross:
