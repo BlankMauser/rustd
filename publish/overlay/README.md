@@ -1,8 +1,8 @@
 # rustd
 
 rustd is a Rust compiler daemon. One process per user stays running, keeps rust-analyzer's
-analysis of your workspaces in memory and compiled functions in a store on disk, and answers
-builds from that state. After an edit it compiles the functions that changed, with Cranelift
+analysis of your workspaces in memory and, when given a directory, compiled functions in a
+store on disk, and answers builds from that state. After an edit it compiles the functions that changed, with Cranelift
 or LLVM, and either links them in front of what rustc built or splices them into the
 executable that is already there.
 
@@ -23,7 +23,11 @@ Read this section before relying on it.
 
 - rustc is still required and still does the first build. rustd replaces the code of
   workspace crates in a program cargo and rustc linked; it does not produce `.rlib` or
-  `.rmeta` files and it has no diagnostics. Errors and warnings are rustc's.
+  `.rmeta` files.
+- It has no diagnostics and no borrow checker. Source with an error rust-analyzer finds is
+  handed to cargo, so the message is rustc's. A borrow or move error is not found: the
+  daemon builds and runs such a program, and you only hear of it from `cargo rustd check`
+  or the next build cargo does.
 - It is pinned to one toolchain, Rust 1.99.0. It links against rustc's output, so it has to
   agree with that rustc on symbol names, type layout and the unstable Rust ABI.
 - `cargo rustd` serves dev and test builds on Linux (ELF). Release builds, other profiles,
@@ -32,9 +36,9 @@ Read this section before relying on it.
 - The code rustd generates is for the edit loop. Each function is compiled alone and nothing
   is inlined across functions, under either backend.
 - When rustd cannot build something it says so in one line and cargo or rustc builds it. It
-  is not supposed to guess. Where that rule has been broken is listed in
-  [docs/results.md](docs/results.md): the fuzzer found sixteen problems, eleven of them
-  miscompiles, and two are still open.
+  is not supposed to guess. It has still been wrong: a fuzzer found sixteen problems,
+  eleven of them miscompiles. Five known differences from rustc are open and listed in
+  [docs/support.md](docs/support.md).
 
 ## Build from source
 
@@ -81,6 +85,9 @@ shows what the daemon holds and how many builds it served or handed to cargo, by
 `cargo rustd stop` ends it; it also exits by itself after 30 minutes without a request.
 `cargo rustd check` is `cargo check`.
 
+Nothing is kept on disk between daemons unless `RUSTD_CACHE` names a directory when the
+daemon starts. See [docs/cache.md](docs/cache.md) for the store and the S3 remote.
+
 ### Plain `cargo`, switched on globally
 
 <!-- GLOBAL-MODE: to be filled from the cargo session's report. Not present at the commit
@@ -122,14 +129,15 @@ were left out, for reasons listed in the results.
 |---|---|---|---|---|---|
 | Cranelift | yes | yes | yes | yes | no (own lowering) |
 | LLVM | yes | yes | yes | yes | no |
-| Full link | yes | yes | yes | yes | yes |
-| Splice | yes | yes | yes | yes, not with chained fixups | yes |
-| Debug info | yes | yes | no | not checked | no |
+| Full link | yes | yes | yes | yes | older branch only |
+| Splice | yes | yes | yes | yes, not with chained fixups | older branch only |
+| Debug info | yes | yes | no | unverified | no |
 | `cargo rustd` | yes | unverified | not run | not run | no |
-| Disk store | yes | unverified | unverified | unverified | unverified |
-| S3 remote | yes | unverified | unverified | unverified | unverified |
+| Disk store | yes | yes | yes | yes | unverified |
+| S3 remote | yes, not real AWS | unverified | unverified | unverified | unverified |
 
-"yes" means a harness passes there and the report says where it ran.
+"yes" means a harness passes there and a report says where it ran. The wasm32 column was
+measured on an earlier branch with a nightly toolchain and has not been run since.
 [docs/support.md](docs/support.md) has the source of every cell and the same for language and
 build-model features.
 
