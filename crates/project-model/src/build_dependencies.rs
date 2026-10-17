@@ -175,6 +175,11 @@ impl WorkspaceBuildScripts {
         self.error.as_deref()
     }
 
+    /// Where the build script of `package` wrote, when it ran.
+    pub fn out_dir(&self, package: Package) -> Option<&AbsPath> {
+        self.outputs.get(package)?.out_dir.as_deref()
+    }
+
     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
         self.outputs.get(idx)
     }

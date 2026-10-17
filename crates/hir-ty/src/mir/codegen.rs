@@ -2028,10 +2028,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         })
     }
 
-    fn finish(self) -> Result<Vec<u8>> {
+    fn finish(mut self) -> Result<Vec<u8>> {
         if Target::current().writes_wasm_objects() {
             return self.finish_wasm();
         }
+        self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))

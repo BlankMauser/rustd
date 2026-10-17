@@ -3,6 +3,7 @@
 
 mod content;
 mod deps;
+mod inputs;
 mod memory;
 mod outline;
 mod plan;
@@ -107,6 +108,10 @@ struct Args {
     features: Vec<String>,
     /// Build without the default features of the package, as `--no-default-features` does.
     no_default_features: bool,
+    /// The packages cargo is asked for with `-p`: none is what `cargo build` builds there.
+    packages: Vec<String>,
+    /// Whether every member is built, as `--workspace` has it.
+    workspace: bool,
     /// Build with every feature of the package, as `--all-features` does.
     all_features: bool,
     /// The cargo profile the program is built with: `dev` unless told otherwise.
@@ -173,6 +178,7 @@ impl Args {
         let mut dev_deps = false;
         let mut features = Vec::new();
         let mut no_default_features = false;
+        let (mut packages, mut workspace) = (Vec::new(), false);
         let mut all_features = false;
         let mut profile = None;
         let mut also = Vec::new();
@@ -198,6 +204,8 @@ impl Args {
                 "--target" => target = Some(value()?),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 "--no-default-features" => no_default_features = true,
+                "--package" | "-p" => packages.push(value()?),
+                "--workspace" => workspace = true,
                 "--all-features" => all_features = true,
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
@@ -226,6 +234,8 @@ impl Args {
             dev_deps,
             features,
             no_default_features,
+            packages,
+            workspace,
             all_features,
             profile: profile.unwrap_or_else(|| "dev".to_owned()),
             also,
@@ -867,6 +877,7 @@ fn load(
         cargo_config: cargo_config.clone(),
         load_config,
         selection,
+        inputs: inputs::Inputs::default(),
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
@@ -889,6 +900,8 @@ struct Checkouts {
     loaded: load_cargo::Loaded,
     cargo_config: CargoConfig,
     load_config: LoadCargoConfig,
+    /// What the checkouts loaded in full were loaded from besides their source.
+    inputs: inputs::Inputs,
     /// Which build of each project is loaded.
     selection: plan::Selection,
 }
@@ -1124,6 +1137,7 @@ impl Checkouts {
                     TargetDirectoryConfig::Directory(target.to_owned());
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
+            self.inputs.watch(&root, &workspace, &self.cargo_config);
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
@@ -1273,12 +1287,20 @@ fn workspace_at(
         }
         // `cargo metadata` unifies features over every member of the workspace and knows no
         // profile. The build of this one package has both.
-        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection)?;
+        let dir = manifest.manifest_path().parent();
+        let triple = project_model::toolchain_info::target_tuple::get(
+            project_model::toolchain_info::QueryConfig::Rustc(&workspace.sysroot, dir.as_ref()),
+            selection.target.as_deref(),
+            &cargo_config.extra_env,
+        )?;
+        let triple = triple.first().context("no target to build for")?;
+        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, triple)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
             cargo.set_active_features(package, built.features.iter().cloned().collect());
             cargo.set_profile_cfg(package, built.profile.cfg());
+            cargo.set_primary(package, built.primary);
         }
     }
     if load_config.load_out_dirs_from_check {
@@ -1365,10 +1387,22 @@ struct ListedCrate {
     main: Option<FunctionId>,
 }
 
+/// Whether the root of `krate` says `#![no_main]`.
+fn has_no_main(db: &RootDatabase, krate: Crate) -> bool {
+    let root = ide_db::base_db::EditionedFileId::new(db, krate.root_file(db), krate.edition(db));
+    let attrs = syntax::ast::HasAttrs::attrs(&root.parse(db).tree());
+    attrs.filter_map(|it| it.as_simple_atom()).any(|it| it == "no_main")
+}
+
 impl ListedCrate {
     fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
         let functions = functions_of(db, krate);
-        let main = functions.iter().copied().find(|&it| hir::Function::from(it).is_main(db));
+        // A crate with `#![no_main]` has no `main` of Rust's: one it exports is the runtime's.
+        let main = functions
+            .iter()
+            .copied()
+            .find(|&it| hir::Function::from(it).is_main(db))
+            .filter(|_| !has_no_main(db, krate));
         let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
         ListedCrate { functions, exported, main }
     }
@@ -1518,15 +1552,8 @@ fn build(
     let start = Instant::now();
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
-    let resolver = Resolver {
-        db,
-        table,
-        root,
-        base,
-        rustc_commit: Default::default(),
-        contents,
-        listed,
-    };
+    let resolver =
+        Resolver { db, table, root, base, rustc_commit: Default::default(), contents, listed };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
@@ -1963,6 +1990,18 @@ fn place(
     moved
 }
 
+/// The arguments to cargo that have it run the build scripts of the build `args` asks for.
+fn selected(args: &Args) -> Vec<String> {
+    let mut selected = vec!["--profile".to_owned(), args.profile.clone()];
+    for package in &args.packages {
+        selected.extend(["--package".to_owned(), package.clone()]);
+    }
+    if args.workspace {
+        selected.push("--workspace".to_owned());
+    }
+    selected
+}
+
 /// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
 /// it open or under another name: the object of a program can be that of another one too.
 fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -2103,14 +2142,17 @@ struct WatchedFile {
 }
 
 impl WatchedFile {
-    /// `path` is what the file is known as, `on_disk` where it is read from.
     /// Whether the file is never written again: everything is watched but the sysroot, the
-    /// registry and what a build made, as path dependencies live outside the project.
+    /// registry and what a build made, as path dependencies live outside the project. What a
+    /// build script wrote is written again when it runs again.
     fn immutable(path: &Path) -> bool {
-        path.components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")))
+        let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
+        let of_script = names.windows(3).any(|it| it[0] == "build" && it[2] == "out");
+        names.iter().any(|&it| matches!(it, "rustlib" | "registry"))
+            || names.contains(&"target") && !of_script
     }
 
+    /// `path` is what the file is known as, `on_disk` where it is read from.
     fn new(file: Watched, path: &Path, on_disk: &Path) -> Option<WatchedFile> {
         if WatchedFile::immutable(path) {
             return None;
@@ -2213,6 +2255,8 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             dev_deps: args.dev_deps,
             features: args.features.clone(),
             no_default_features: args.no_default_features,
+            packages: args.packages.clone(),
+            workspace: args.workspace,
             all_features: args.all_features,
             profile: args.profile.clone(),
             also: Vec::new(),
@@ -2723,7 +2767,7 @@ fn main() -> anyhow::Result<()> {
         },
         // The build scripts say what the build asked for says, not what `cargo check` of the
         // workspace does.
-        extra_args: vec!["--profile".to_owned(), args.profile.clone()],
+        extra_args: selected(&args),
         only_manifest_package: true,
         ..Default::default()
     };
@@ -2732,6 +2776,8 @@ fn main() -> anyhow::Result<()> {
         features: args.features.clone(),
         no_default_features: args.no_default_features,
         all_features: args.all_features,
+        packages: args.packages.clone(),
+        workspace: args.workspace,
         target: args.target.clone(),
         dev_deps: args.cfg_test || args.dev_deps,
     };
@@ -2937,6 +2983,10 @@ fn main() -> anyhow::Result<()> {
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    if let Some(why) = checkouts.inputs.changed(&stream.env) {
+                        let _ = writeln!(&stream, "error: {why}");
+                        continue;
+                    }
                     let asked = target.clone();
                     let mut target = target;
                     // One build is for one process: its variables are what `env!` reads.
