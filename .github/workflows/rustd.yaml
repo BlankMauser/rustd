@@ -282,7 +282,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p rustd --release --features llvm
       # ripgrep, fd and hyperfine at pinned commits, the flags, and the daemon's life,
-      # the second user among it.
+      # the second user among it. Incremental compilation is left to the profile, as on a
+      # developer's machine: with it off the tests of every project are cargo's (the
+      # harness has that case among the flags).
       - name: cargo rustd against cargo
         working-directory: harness
-        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" python3 cargo_rustd.py --small
+        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small

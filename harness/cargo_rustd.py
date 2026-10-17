@@ -125,6 +125,9 @@ PROJECTS = {
     "wasmtime": dict(
         repo="bytecodealliance/wasmtime", tag="v49.0.3", rev="f96eabaa11a06086e4fb779ed1c1688481067ab9",
         run=["wast", "tests/misc_testsuite/add.wast"], test=["-p", "wasmtime-environ"],
+        # With debug info one target directory of it is 8.5 GB and the wrapper's copies as
+        # much again; the two builds side by side are more than the 20 GB this was run on.
+        env={"CARGO_PROFILE_DEV_DEBUG": "0"},
         edits=[("src/bin/wasmtime.rs", "fn main() -> Result<()> {", 'fn main() -> Result<()> {\n    eprintln!("edited main");')],
     ),
 }
