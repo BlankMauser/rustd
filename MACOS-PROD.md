@@ -190,7 +190,20 @@ What is missing, in the order it would have to be done:
 The macOS job of `.github/workflows/rustd.yaml` now also runs `debuginfo.py` (after
 `DevToolsSecurity -enable`, with lldb as root), `buildmodel.py` on the Cranelift leg as the
 Linux job does, and the four store harnesses. `keys.py` was there. `deps.py` is still left
-out for the reason given last round. What the jobs said on the head of the branch is in the message this report came with.
+out for the reason given last round. The workflow now prints the
+last lines of each harness that failed again at the end of the step, and `debuginfo.py`
+repeats its wrong lines before its verdict, because the log I could read keeps only the end.
+
+On 68b1d8713b (everything but this paragraph): both macOS jobs are green, and so is fmt and
+tests. Both Linux harness jobs are red on `debuginfo.py` alone, with four lines
+`gdb at <file:line>  NOT STOPPED  [Inferior 1 killed]` (corpus, stress, rung2 and the
+spliced binary) and everything else passing, `buildmodel.py` at 180 of 180. On the base,
+0151c01218, the Linux LLVM job fails `debuginfo.py` with the same `wrong: 4`, and the
+Cranelift job fails `buildmodel.py` at 179 of 180; I could not read which four lines or
+whether Cranelift's `debuginfo.py` failed there too, since that log is cut. The gdb path of
+the harness is the code that was there, so I take the four to be the runner's gdb and not
+this branch, but that is an inference from the count, not something I compared line by
+line. `coverage` is red on both, as before.
 
 ## Shared code to check on Linux
 
