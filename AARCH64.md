@@ -175,3 +175,66 @@ linker and CPU speeds. The run column does not carry over at all.
 8. Inline assembly: symbols in templates, more register classes and modifiers.
 9. `Target` for other systems: `parse` accepts Linux only, and object format and unwind
    format have one variant each.
+
+## Round on 530ce12b8f: variadics, asm labels, LLVM
+
+Everything below ran on an x86-64 host with the AArch64 programs under `qemu-aarch64` user
+mode, stable 1.99.0. Nothing ran on AArch64 hardware.
+
+Before any change, the Cranelift matrix on 530ce12b8f passed in full. The corpus was
+788/791 from rustd; the three left to rustc were `sum_all`, `forward` and `weigh` in
+`stabilized.rs`, each with "a function that takes `...` for this target".
+
+**C variadic definitions.** `VariadicRegisters` now covers AAPCS64 as Linux has it as well
+as x86-64 System V. The function is declared with all eight integer and eight vector
+argument registers, saves the ones its named parameters left, and fills the five fields
+of `VaListInner` (stack, end of the saved integer registers, end of the saved vector
+registers, and the two negative offsets). `va_arg` counts the offset up to zero and then
+reads the stack. Cranelift has no parameter that stands for the caller's stack on AArch64,
+so the function takes the address from its frame pointer (the arguments start 16 bytes
+above it). Cranelift only answers `get_frame_pointer` when the code generator keeps frame
+pointers, so `emit` compiles a function that asks for it in its entry block with a third
+code generator that does; other functions are compiled as before. Still refused, as on
+x86-64: a named parameter on the stack, a named parameter that is not an integer or float
+of at most 8 bytes, and `va_arg` of anything wider than 8 bytes.
+
+**Asm labels and naked functions.** `stabilized.rs` has a module `arm` with the AArch64
+equivalents of the x86 cases (`naked_functions`, `asm_goto`, `asm_cfg`,
+`target_feature_11`, `naked_more`, `asm_goto_more`). They passed without a change to
+`asm/aarch64.rs`. There was no `rustd-macos-variadic` branch to take cases from when I
+looked.
+
+**LLVM.** The read-back of an AArch64 ELF object now goes the way the Mach-O one does:
+the function's section alone is the code, and every section it refers to becomes a data
+object, since ADRP pairs are resolved by the linker. The ELF relocations read are CALL26,
+JUMP26, ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, ADR_GOT_PAGE, LD64_GOT_LO12_NC and the four
+TLSDESC ones. On the corpus LLVM -O2 compiles 11307 of 11761 functions (96.1%). Left to
+Cranelift: 448 because LLVM folds the low 12 bits of an address into a load
+(`R_AARCH64_LDST8/64/128_ABS_LO12_NC`, 434 + 1 + 13), which Cranelift's relocation kinds
+cannot say on ELF; 3 with more than two return values; 3 that take `...` and ask for the
+frame pointer. The LLVM lowering used to treat `get_frame_pointer` as the SEH arrival slot
+on every target; it now does that only where exceptions arrive in the frame.
+
+Results after the changes:
+
+| Harness | Cranelift | LLVM -O2 fast emit |
+|---|---|---|
+| corpus `--layouts` | MATCH, 802/802, 0 of 903 layouts differ | MATCH, 802/802, 0 of 903 |
+| corpus `--mixed 6` | 6 splits match | not run |
+| programs | 22/22 | 22/22 |
+| stress | 99/99 | 99/99 |
+| breakers | 25/25 | 25/25 |
+| unwinds | 8/8 | 8/8 |
+| splices | 71/71 (61 spliced) | 71/71 (61 spliced) |
+| farsplices | 6/6 | 6/6 |
+| asmedits | 10/10 | 10/10 |
+| deps, includes | 10/10, 9/9 | not run |
+| worktrees plain, `--join --together`, `--overlay`, with splice | 52/52, 52/52, 61/61, 52/52 | not run |
+
+The Cranelift column was run one commit-worth of edits before the end: the only change
+after it is the `get_frame_pointer` refusal in the LLVM lowering, which Cranelift does not
+reach.
+
+What is left from this round: the `LDST*_ABS_LO12_NC` relocations. Closing it needs
+either those kinds in Cranelift's `Reloc` (and `cranelift-object`), or having LLVM reach
+data in the program through the GOT on this target, which costs a load on every reference.

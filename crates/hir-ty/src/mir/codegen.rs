@@ -1005,7 +1005,7 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| Target::selected()?.isa("backtracking"))
+        .get_or_init(|| Target::selected()?.isa("backtracking", false))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -1017,7 +1017,19 @@ fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
     static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
         std::sync::OnceLock::new();
     TARGET
-        .get_or_init(|| Target::selected()?.isa("single_pass"))
+        .get_or_init(|| Target::selected()?.isa("single_pass", false))
+        .as_ref()
+        .map_err(|e| CodegenError::Backend(e.clone()))
+}
+
+/// The same target for a function that asks for its frame pointer at its start, as one
+/// that takes `...` does to find the arguments on the stack: Cranelift answers only where
+/// every function keeps a frame pointer, which the others have no use for.
+fn target_with_frame_pointer() -> Result<&'static isa::OwnedTargetIsa> {
+    static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
+        std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| Target::selected()?.isa("backtracking", true))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -1150,25 +1162,33 @@ fn compiled_instance<'db>(
     })
 }
 
-/// How many of the registers of x86-64's System V convention the named parameters of a
-/// variadic function take. What is left of them holds the first of the variable arguments.
+/// How many of the argument registers of a C convention the named parameters of a variadic
+/// function take. What is left of them holds the first of the variable arguments. The
+/// conventions a function that takes `...` is compiled for are x86-64's System V and
+/// AAPCS64 as Linux has it.
 #[derive(Clone, Copy)]
 struct VariadicRegisters {
+    arch: Arch,
     ints: u32,
     floats: u32,
 }
 
 impl VariadicRegisters {
-    const INTS: u32 = 6;
     const FLOATS: u32 = 8;
-    /// The size of where `va_arg` expects the registers saved: the integer ones, then 16
-    /// bytes for each vector one.
-    const SAVED: u32 = Self::INTS * 8 + Self::FLOATS * 16;
+    /// What `va_arg` expects a saved vector register to take.
+    const FLOAT_BYTES: u32 = 16;
 
-    fn named(sig: &Signature) -> Result<Self> {
-        let mut named = VariadicRegisters { ints: 0, floats: 0 };
+    /// How many integer registers hold arguments.
+    fn int_count(arch: Arch) -> u32 {
+        if arch == Arch::Aarch64 { 8 } else { 6 }
+    }
+
+    fn named(sig: &Signature, arch: Arch) -> Result<Self> {
+        let mut named = VariadicRegisters { arch, ints: 0, floats: 0 };
         for param in &sig.params {
             match param.value_type {
+                // AAPCS64 has a register of its own for where the result goes.
+                _ if param.purpose == ArgumentPurpose::StructReturn && arch == Arch::Aarch64 => {}
                 _ if param.purpose != ArgumentPurpose::Normal
                     && param.purpose != ArgumentPurpose::StructReturn =>
                 {
@@ -1179,7 +1199,7 @@ impl VariadicRegisters {
                 ty => unsupported!("a variadic function with a named {ty}"),
             }
         }
-        if named.ints > Self::INTS || named.floats > Self::FLOATS {
+        if named.ints > Self::int_count(arch) || named.floats > Self::FLOATS {
             unsupported!("a variadic function with a named parameter on the stack");
         }
         Ok(named)
@@ -1207,12 +1227,16 @@ impl VariadicRegisters {
         Ok(())
     }
 
-    /// Adds the registers the named parameters left, and the stack past them, to `sig`, so
-    /// that the function is given all of them whatever it was called with.
+    /// Adds the registers the named parameters left to `sig`, so that the function is given
+    /// all of them whatever it was called with, and on x86-64 the stack past them. Cranelift
+    /// has no such parameter for AArch64, where the frame pointer finds the stack.
     fn rest(self, sig: &mut Signature) {
-        sig.params.extend((self.ints..Self::INTS).map(|_| AbiParam::new(types::I64)));
+        let ints = Self::int_count(self.arch);
+        sig.params.extend((self.ints..ints).map(|_| AbiParam::new(types::I64)));
         sig.params.extend((self.floats..Self::FLOATS).map(|_| AbiParam::new(types::F64)));
-        sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+        if self.arch == Arch::X86_64 {
+            sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+        }
     }
 }
 
@@ -1272,7 +1296,7 @@ impl Variadic {
     fn of(target: &Target, sig: &Signature) -> Result<Option<Self>> {
         Ok(match target.variable_arguments() {
             Some(VariableArguments::Registers) => {
-                Some(Variadic::SystemV(VariadicRegisters::named(sig)?))
+                Some(Variadic::SystemV(VariadicRegisters::named(sig, target.arch)?))
             }
             Some(VariableArguments::Homed) => Some(Variadic::Windows(HomedRegisters::named(sig)?)),
             Some(VariableArguments::Stack) => {
@@ -1818,7 +1842,17 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
         return emit_wasm(&ctx.func, Target::current().calls());
     }
     let large = ctx.func.dfg.num_insts() > LARGE;
-    let isa = &**if large { target_for_large()? } else { target()? };
+    let mut isa = &**if large { target_for_large()? } else { target()? };
+    let func = &ctx.func;
+    if !isa.flags().preserve_frame_pointers()
+        && func.layout.entry_block().is_some_and(|entry| {
+            func.layout
+                .block_insts(entry)
+                .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetFramePointer)
+        })
+    {
+        isa = &**target_with_frame_pointer()?;
+    }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store::Store::global() {
             Some(store) => ctx
@@ -4558,7 +4592,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             true => {
                 let native = match self.cg.target.variable_arguments() {
                     Some(VariableArguments::Registers) => {
-                        matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. })
+                        matches!(self.abi, ExternAbi::C { .. })
+                            || matches!(self.abi, ExternAbi::SysV64 { .. })
+                                && self.cg.target.arch == Arch::X86_64
                     }
                     Some(VariableArguments::Homed) => {
                         matches!(self.abi, ExternAbi::C { .. } | ExternAbi::Win64 { .. })
@@ -4622,31 +4658,59 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(Variadic::SystemV(named)) = variadic {
             let list = *body.param_locals.last().expect("the list of a variadic function");
             let layout = self.layout(body.locals[list].ty.as_ref())?;
-            if layout.size.bytes() != 24 {
+            let (int_count, floats_bytes) = (
+                VariadicRegisters::int_count(named.arch),
+                VariadicRegisters::FLOATS * VariadicRegisters::FLOAT_BYTES,
+            );
+            if layout.size.bytes() != if named.arch == Arch::Aarch64 { 32 } else { 24 } {
                 unsupported!("a `VaList` that is not the one of this target");
             }
             let addr = self.stack_slot(&layout);
+            // Where `va_arg` expects the registers saved: the integer ones, then the vector
+            // ones, each kind at the place it has among all of its kind.
             let saved = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                VariadicRegisters::SAVED,
+                int_count * 8 + floats_bytes,
                 4,
             ));
             let saved = self.builder.ins().stack_addr(ptr(), saved, 0);
-            for offset in (named.ints..VariadicRegisters::INTS).map(|at| at * 8).chain(
+            for offset in (named.ints..int_count).map(|at| at * 8).chain(
                 (named.floats..VariadicRegisters::FLOATS)
-                    .map(|at| VariadicRegisters::INTS * 8 + at * 16),
+                    .map(|at| int_count * 8 + at * VariadicRegisters::FLOAT_BYTES),
             ) {
                 let value = incoming.next().expect("a register of the variable arguments");
                 self.builder.ins().store(MEM, value, saved, offset as i32);
             }
-            let stack = incoming.next().expect("the variable arguments on the stack");
-            let ints = self.builder.ins().iconst(types::I32, i64::from(named.ints * 8));
-            let floats = i64::from(VariadicRegisters::INTS * 8 + named.floats * 16);
-            let floats = self.builder.ins().iconst(types::I32, floats);
-            self.builder.ins().store(MEM, ints, addr, 0);
-            self.builder.ins().store(MEM, floats, addr, 4);
-            self.builder.ins().store(MEM, stack, addr, 8);
-            self.builder.ins().store(MEM, saved, addr, 16);
+            let floats_at = int_count * 8 + named.floats * VariadicRegisters::FLOAT_BYTES;
+            if named.arch == Arch::Aarch64 {
+                // The list has where each kind of saved register ends, and how far before
+                // that the next one is. The arguments on the stack are above the frame
+                // pointer and the return address: no named parameter is among them. Asking
+                // for the frame pointer here is what has `emit` keep one.
+                let frame = self.builder.ins().get_frame_pointer(ptr());
+                let stack = self.builder.ins().iadd_imm(frame, 16);
+                let ints_end = self.builder.ins().iadd_imm(saved, i64::from(int_count * 8));
+                let floats_end =
+                    self.builder.ins().iadd_imm(saved, i64::from(int_count * 8 + floats_bytes));
+                let ints = i64::from(named.ints * 8) - i64::from(int_count * 8);
+                let ints = self.builder.ins().iconst(types::I32, ints);
+                let floats = i64::from(floats_at) - i64::from(int_count * 8 + floats_bytes);
+                let floats = self.builder.ins().iconst(types::I32, floats);
+                self.builder.ins().store(MEM, stack, addr, 0);
+                self.builder.ins().store(MEM, ints_end, addr, 8);
+                self.builder.ins().store(MEM, floats_end, addr, 16);
+                self.builder.ins().store(MEM, ints, addr, 24);
+                self.builder.ins().store(MEM, floats, addr, 28);
+            } else {
+                // The list has how far into what was saved the next of each kind is.
+                let stack = incoming.next().expect("the variable arguments on the stack");
+                let ints = self.builder.ins().iconst(types::I32, i64::from(named.ints * 8));
+                let floats = self.builder.ins().iconst(types::I32, i64::from(floats_at));
+                self.builder.ins().store(MEM, ints, addr, 0);
+                self.builder.ins().store(MEM, floats, addr, 4);
+                self.builder.ins().store(MEM, stack, addr, 8);
+                self.builder.ins().store(MEM, saved, addr, 16);
+            }
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
         if let Some(Variadic::Apple) = variadic {
@@ -8522,39 +8586,67 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if self.cg.target.variable_arguments() != Some(VariableArguments::Registers) {
                     unsupported!("intrinsic `va_arg` for this target");
                 }
+                let arch = self.cg.target.arch;
                 let scalar = self.scalar_of(dst_ty)?;
                 if scalar.ty.bytes() > 8 {
                     unsupported!("`va_arg` of {dst_ty:?}");
                 }
-                // An argument is in the registers the function saved while its kind of
-                // register lasts, and on the stack after that.
-                let (at, step, end) = match scalar.ty.is_float() {
-                    false => (0, 8, VariadicRegisters::INTS * 8),
-                    true => (4, 16, VariadicRegisters::SAVED),
-                };
+                let float = scalar.ty.is_float();
+                let step = if float { VariadicRegisters::FLOAT_BYTES } else { 8 };
                 let (list, _) = self.load_scalar(list)?;
-                let offset = self.builder.ins().load(types::I32, MEM, list, at);
                 let [saved, stack, done] = [(); 3].map(|()| self.builder.create_block());
                 self.builder.append_block_param(done, ptr());
-                let fits = self.builder.ins().icmp_imm(
-                    IntCC::UnsignedLessThanOrEqual,
-                    offset,
-                    i64::from(end - step),
-                );
-                self.builder.ins().brif(fits, saved, &[], stack, &[]);
+                // An argument is in the registers the function saved while its kind of
+                // register lasts, and on the stack after that.
+                let stack_at = if arch == Arch::Aarch64 {
+                    // The list counts up to zero, from the end of what was saved.
+                    let (at, end) = if float { (28, 16) } else { (24, 8) };
+                    let offset = self.builder.ins().load(types::I32, MEM, list, at);
+                    let fits = self.builder.ins().icmp_imm(
+                        IntCC::SignedLessThanOrEqual,
+                        offset,
+                        -i64::from(step),
+                    );
+                    self.builder.ins().brif(fits, saved, &[], stack, &[]);
 
-                self.builder.switch_to_block(saved);
-                let area = self.builder.ins().load(ptr(), MEM, list, 16);
-                let wide = self.builder.ins().uextend(ptr(), offset);
-                let from = self.builder.ins().iadd(area, wide);
-                let next = self.builder.ins().iadd_imm(offset, i64::from(step));
-                self.builder.ins().store(MEM, next, list, at);
-                self.builder.ins().jump(done, &[from.into()]);
+                    self.builder.switch_to_block(saved);
+                    let area = self.builder.ins().load(ptr(), MEM, list, end);
+                    let wide = self.builder.ins().sextend(ptr(), offset);
+                    let from = self.builder.ins().iadd(area, wide);
+                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
+                    self.builder.ins().store(MEM, next, list, at);
+                    self.builder.ins().jump(done, &[from.into()]);
+                    0
+                } else {
+                    let ints = VariadicRegisters::int_count(arch) * 8;
+                    let (at, end) = match float {
+                        false => (0, ints),
+                        true => {
+                            (4, ints + VariadicRegisters::FLOATS * VariadicRegisters::FLOAT_BYTES)
+                        }
+                    };
+                    let offset = self.builder.ins().load(types::I32, MEM, list, at);
+                    let fits = self.builder.ins().icmp_imm(
+                        IntCC::UnsignedLessThanOrEqual,
+                        offset,
+                        i64::from(end - step),
+                    );
+                    self.builder.ins().brif(fits, saved, &[], stack, &[]);
+
+                    self.builder.switch_to_block(saved);
+                    let area = self.builder.ins().load(ptr(), MEM, list, 16);
+                    let wide = self.builder.ins().uextend(ptr(), offset);
+                    let from = self.builder.ins().iadd(area, wide);
+                    let next = self.builder.ins().iadd_imm(offset, i64::from(step));
+                    self.builder.ins().store(MEM, next, list, at);
+                    self.builder.ins().jump(done, &[from.into()]);
+                    8
+                };
 
                 self.builder.switch_to_block(stack);
-                let from = self.builder.ins().load(ptr(), MEM, list, 8);
+                let from = self.builder.ins().load(ptr(), MEM, list, stack_at);
                 let next = self.builder.ins().iadd_imm(from, 8);
-                self.builder.ins().store(MEM, next, list, 8);
+                self.builder.ins().store(MEM, next, list, stack_at);
                 self.builder.ins().jump(done, &[from.into()]);
 
                 self.builder.switch_to_block(done);

@@ -15,8 +15,8 @@ use cranelift_codegen::{
 };
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
 use object::{
-    BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
-    SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
+    Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
+    RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
 use rustc_hash::FxHashMap;
 
@@ -76,13 +76,18 @@ impl<'data> Emitted<'data> {
             align: 1,
             relocs: Vec::new(),
         };
-        let unwind = match emitted.file.format() {
-            BinaryFormat::MachO => {
-                emitted.place_macho(text, recorder)?;
-                emitted.relocate_macho(recorder)?;
+        let unwind = match (emitted.file.format(), emitted.file.architecture()) {
+            (BinaryFormat::MachO, _) => {
+                emitted.place_paged(text, recorder)?;
+                emitted.relocate_paged(recorder)?;
                 emitted.unwind_macho()?
             }
-            BinaryFormat::Coff => {
+            (BinaryFormat::Elf, Architecture::Aarch64) => {
+                emitted.place_paged(text, recorder)?;
+                emitted.relocate_paged(recorder)?;
+                emitted.unwind()?
+            }
+            (BinaryFormat::Coff, _) => {
                 emitted.place(text, recorder)?;
                 emitted.relocate(recorder)?;
                 emitted.unwind_coff()?
@@ -203,7 +208,7 @@ impl<'data> Emitted<'data> {
     fn is_address(relocation: &object::Relocation) -> bool {
         matches!(
             relocation.flags(),
-            RelocationFlags::Elf { r_type: elf::R_X86_64_64 }
+            RelocationFlags::Elf { r_type: elf::R_X86_64_64 | elf::R_AARCH64_ABS64 }
                 | RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 }
         )
     }
@@ -313,7 +318,7 @@ impl<'data> Emitted<'data> {
     /// Lays out the function's section. Every other section its relocations lead to is a
     /// data object of its own: AArch64 code finds what is near it by the page it is on,
     /// which only the linker knows.
-    fn place_macho(
+    fn place_paged(
         &mut self,
         text: SectionIndex,
         recorder: &mut Recorder<'_>,
@@ -332,13 +337,33 @@ impl<'data> Emitted<'data> {
             if self.placed.contains_key(&index) {
                 continue;
             }
-            let blob = self.blob_macho(&self.file.section_by_index(index)?)?;
+            let section = self.file.section_by_index(index)?;
+            let blob = match self.file.format() {
+                BinaryFormat::MachO => self.blob_macho(&section)?,
+                _ => self.blob_elf(&section)?,
+            };
             let id = recorder
                 .define_const(blob)
                 .map_err(|_| Unhandled::Shape("constants that cannot be defined"))?;
             self.placed.insert(index, Placement::Blob(id));
         }
         Ok(())
+    }
+
+    /// A section of constants, which may hold addresses of what the function asked for.
+    fn blob_elf(&self, section: &object::Section<'data, '_>) -> Result<ConstBlob, Unhandled> {
+        if section.relocations().next().is_some() {
+            return self.blob(section);
+        }
+        match section.kind() {
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => Ok(ConstBlob {
+                bytes: section.data()?.to_vec(),
+                relocs: Vec::new(),
+                fn_relocs: Vec::new(),
+                align: section.align().max(1),
+            }),
+            _ => Err(Unhandled::Shape("code that refers to a writable section")),
+        }
     }
 
     /// A section of constants, which may hold addresses of what the function asked for.
@@ -386,21 +411,34 @@ impl<'data> Emitted<'data> {
 
     /// Turns the relocations of the function into relocations against requests and against
     /// the data objects its constants became.
-    fn relocate_macho(&mut self, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
+    fn relocate_paged(&mut self, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
         let section = self.file.section_by_index(self.inline[0])?;
         for (offset, relocation) in section.relocations() {
-            let RelocationFlags::MachO { r_type, .. } = relocation.flags() else {
-                return Err(Unhandled::Shape("an object that is not Mach-O"));
-            };
-            let kind = match r_type {
-                macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
-                macho::ARM64_RELOC_PAGE21 => Reloc::Aarch64AdrPrelPgHi21,
-                macho::ARM64_RELOC_PAGEOFF12 => Reloc::Aarch64AddAbsLo12Nc,
-                macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Reloc::Aarch64AdrGotPage21,
-                macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
-                macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Reloc::MachOAarch64TlsAdrPage21,
-                macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
-                other => return Err(Unhandled::Relocation(other.into())),
+            let kind = match relocation.flags() {
+                RelocationFlags::MachO { r_type, .. } => match r_type {
+                    macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
+                    macho::ARM64_RELOC_PAGE21 => Reloc::Aarch64AdrPrelPgHi21,
+                    macho::ARM64_RELOC_PAGEOFF12 => Reloc::Aarch64AddAbsLo12Nc,
+                    macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Reloc::Aarch64AdrGotPage21,
+                    macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
+                    macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Reloc::MachOAarch64TlsAdrPage21,
+                    macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
+                    other => return Err(Unhandled::Relocation(other.into())),
+                },
+                RelocationFlags::Elf { r_type } => match r_type {
+                    // A jump out of the function is a call that does not come back.
+                    elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => Reloc::Arm64Call,
+                    elf::R_AARCH64_ADR_PREL_PG_HI21 => Reloc::Aarch64AdrPrelPgHi21,
+                    elf::R_AARCH64_ADD_ABS_LO12_NC => Reloc::Aarch64AddAbsLo12Nc,
+                    elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
+                    elf::R_AARCH64_LD64_GOT_LO12_NC => Reloc::Aarch64Ld64GotLo12Nc,
+                    elf::R_AARCH64_TLSDESC_ADR_PAGE21 => Reloc::Aarch64TlsDescAdrPage21,
+                    elf::R_AARCH64_TLSDESC_LD64_LO12 => Reloc::Aarch64TlsDescLd64Lo12,
+                    elf::R_AARCH64_TLSDESC_ADD_LO12 => Reloc::Aarch64TlsDescAddLo12,
+                    elf::R_AARCH64_TLSDESC_CALL => Reloc::Aarch64TlsDescCall,
+                    other => return Err(Unhandled::Relocation(other)),
+                },
+                _ => return Err(Unhandled::Shape("an object of a format that is not read")),
             };
             let symbol = Self::symbol(&self.file, &relocation)?;
             let (name, addend) = match symbol.section() {
@@ -472,7 +510,7 @@ impl<'data> Emitted<'data> {
             let cie = fde.cie();
             let entry_rules = Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
             let arch = match self.file.architecture() {
-                object::Architecture::Aarch64 => crate::mir::codegen::Arch::Aarch64,
+                Architecture::Aarch64 => crate::mir::codegen::Arch::Aarch64,
                 _ => crate::mir::codegen::Arch::X86_64,
             };
             if !entry_rules

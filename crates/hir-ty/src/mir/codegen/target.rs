@@ -51,7 +51,8 @@ impl Arch {
 /// Where the variable arguments of a C function are when it is entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariableArguments {
-    /// In the registers the named parameters left, then on the stack: x86-64's System V.
+    /// In the registers the named parameters left, then on the stack: System V for x86-64
+    /// and AArch64.
     Registers,
     /// In the integer registers the named parameters left, which the function writes to the
     /// room the caller keeps below the ones on the stack: Windows x64.
@@ -215,7 +216,7 @@ impl Target {
     /// definition of one is compiled for.
     pub fn variable_arguments(&self) -> Option<VariableArguments> {
         match (self.call_conv, self.arch) {
-            (CallConv::SystemV, Arch::X86_64) => Some(VariableArguments::Registers),
+            (CallConv::SystemV, Arch::X86_64 | Arch::Aarch64) => Some(VariableArguments::Registers),
             (CallConv::WindowsFastcall, Arch::X86_64) => Some(VariableArguments::Homed),
             (CallConv::AppleAarch64, Arch::Aarch64) => Some(VariableArguments::Stack),
             _ => None,
@@ -248,7 +249,13 @@ impl Target {
     }
 
     /// The code generator for the target. `regalloc` names Cranelift's register allocator.
-    pub(super) fn isa(&self, regalloc: &str) -> Result<OwnedTargetIsa, String> {
+    /// With `frame_pointers` every function it compiles keeps one, which a function that
+    /// asks for its frame pointer needs.
+    pub(super) fn isa(
+        &self,
+        regalloc: &str,
+        frame_pointers: bool,
+    ) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
         // An image of PE reaches all of itself relative to the instruction, and what it
         // imports through the stubs the linker adds: there is no table of addresses to go
@@ -267,7 +274,8 @@ impl Target {
             flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
             flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
         }
-        if self.reads_frame_pointer() {
+        if frame_pointers || self.reads_frame_pointer() {
+            // Cranelift gives a function its frame pointer only when all of them keep one.
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;
