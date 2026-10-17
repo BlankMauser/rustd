@@ -468,13 +468,20 @@ def transfers(top, remote):
     check("the store is whole, and counts what was kept aside as a temporary file",
           whole_store and counted.get("packs") == 0 and counted.get("temporary files") == 1 and counted.get("temporary bytes") == size)
     proxy.rate = None
+    # Old enough for a collection to take any other temporary file, an hour after its last byte.
+    aside = os.path.join(b.store, left[0]) if left else None
+    if aside:
+        os.utime(aside, (time.time() - 3600,) * 2)
+    b.cache("gc")
+    check("a collection an hour later leaves what was kept aside", b.partials() == left and aside
+          and os.path.getsize(aside) == size)
     out = b.rustd("cache", "pull", address)
     check("the next one fetches the rest only", out.returncode == 0 and whole(b, name)
           and said_number(out.stderr, "bytes received") < BIG - size + MIB, out.stderr.strip().split("\n")[0][-60:])
 
     a, b, address, bucket, name = pushed("spoiled partial")
     b.add_pack(filler(f"{remote.name} there already", 4096))
-    open(os.path.join(b.store, name + ".fetch.tmp"), "wb").write(b"what a stopped process left of something else" * 1000)
+    open(os.path.join(b.store, name + ".zst.tmp"), "wb").write(b"what a stopped process left of something else" * 1000)
     out = b.rustd("cache", "pull", address)
     check("a part kept aside that is of something else: fetched from the start",
           out.returncode == 0 and b.packs().get(name) is True and not b.partials()
@@ -560,7 +567,7 @@ def transfers(top, remote):
     out = a.rustd("cache", "push", address)
     check("back: the push goes through and no upload is left unfinished",
           out.returncode == 0 and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads(),
-          out.stdout.strip())
+          out.stdout.strip() or out.stderr.strip()[-200:])
 
 
 def stored(top, remote):
@@ -876,9 +883,12 @@ def over_tls(top, remote):
               sent.returncode == 0 and out.returncode == 0 and b.packs() == {name: True}
               and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5], out.stdout.strip())
         b.empty()
+        start = time.time()
         out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_TIMEOUT": "2"})
+        took = time.time() - start
         check("a certificate nobody vouches for: refused, said, nothing fetched",
               out.returncode != 0 and not b.packs() and not b.partials() and "ertificate" in out.stderr, out.stderr.strip()[-90:])
+        check("and it is said at once, not after the waits of a remote that is down", took < 3, f"{took:.2f}s")
     finally:
         server.kill()
 

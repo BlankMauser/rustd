@@ -394,14 +394,12 @@ where
 
 /// Whether the error is the other end's certificate being turned down.
 fn is_distrust(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cause = Some(error);
-    while let Some(error) = cause {
-        if matches!(error.downcast_ref(), Some(rustls::Error::InvalidCertificate(_))) {
-            return true;
-        }
-        cause = error.source();
+    if matches!(error.downcast_ref(), Some(rustls::Error::InvalidCertificate(_))) {
+        return true;
     }
-    false
+    // An error of the transport carries what it is about inside it, not as its source.
+    let inside = error.downcast_ref::<std::io::Error>().and_then(|it| it.get_ref());
+    inside.is_some_and(|it| is_distrust(it)) || error.source().is_some_and(is_distrust)
 }
 
 /// An error and what it was caused by, each as it describes itself.
