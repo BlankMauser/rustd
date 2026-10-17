@@ -1754,7 +1754,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn finish(self) -> Result<Vec<u8>> {
-        if Target::current().is_wasm() {
+        if Target::current().writes_wasm_objects() {
             return self.finish_wasm();
         }
         let mut product = self.module.finish();

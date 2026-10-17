@@ -155,6 +155,12 @@ impl Target {
         self.arch == Arch::Wasm32
     }
 
+    /// Whether an object is written as a relocatable wasm object, for a linker. A page links
+    /// what the compiler emits itself, and reads the object Cranelift's writer made.
+    pub fn writes_wasm_objects(&self) -> bool {
+        self.is_wasm() && self.calls() == Calls::Direct
+    }
+
     /// How wasm code calls: through the table where functions are replaced in a page.
     pub fn calls(&self) -> Calls {
         if cfg!(feature = "wasm") { Calls::Table } else { Calls::Direct }
