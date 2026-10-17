@@ -529,19 +529,16 @@ fn use_panic_2021(db: &dyn SourceDatabase, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
     // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
+    let mut ctx = span.ctx;
     loop {
-        let Some(expn) = span.ctx.outer_expn(db) else {
-            break false;
+        let Some(expn) = ctx.outer_expn(db) else {
+            break ctx.edition(db) >= Edition::Edition2021;
         };
         let expn = crate::MacroCallId::from(expn).loc(db);
-        // FIXME: Record allow_internal_unstable in the macro def (not been done yet because it
-        // would consume quite a bit extra memory for all call locs...)
-        // if let Some(features) = expn.def.allow_internal_unstable {
-        //     if features.iter().any(|&f| f == sym::edition_panic) {
-        //         span = expn.call_site;
-        //         continue;
-        //     }
-        // }
+        if expn.def.edition_panic {
+            ctx = expn.ctxt;
+            continue;
+        }
         break expn.def.edition >= Edition::Edition2021;
     }
 }

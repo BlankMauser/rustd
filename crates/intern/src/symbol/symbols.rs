@@ -302,6 +302,7 @@ define_symbols! {
     dyn_metadata,
     efiapi,
     eh_catch_typeinfo,
+    edition_panic,
     eh_personality,
     env,
     eq,

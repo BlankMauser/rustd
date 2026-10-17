@@ -26,3 +26,26 @@ pub mod dots_range_pattern {
         (mangle("has-atomic 64!"), [class(0), class(9), class(10), class(200)])
     }
 }
+
+/// version-sync 0.8 panics with a `String` that is not a format string, which editions
+/// before 2021 take as the panic's payload.
+pub mod panic_with_string {
+    fn check(path: &str) -> Result<(), String> {
+        Err(format!("could not read {}", path))
+    }
+
+    fn checked() {
+        if let Err(err) = check("no/such/file.md") {
+            panic!(err);
+        }
+    }
+
+    pub fn run() -> (String, i32) {
+        let text = ::std::panic::catch_unwind(checked).unwrap_err();
+        let number = ::std::panic::catch_unwind(|| panic!(7)).unwrap_err();
+        (
+            text.downcast_ref::<String>().cloned().unwrap_or_default(),
+            number.downcast_ref::<i32>().cloned().unwrap_or_default(),
+        )
+    }
+}

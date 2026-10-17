@@ -255,6 +255,9 @@ pub struct MacroDefId {
     pub kind: MacroDefKind,
     pub local_inner: bool,
     pub allow_internal_unsafe: bool,
+    /// Whether the macro has `#[allow_internal_unstable(edition_panic)]`: a `panic!` in it is
+    /// of the edition of whoever calls the macro.
+    pub edition_panic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
