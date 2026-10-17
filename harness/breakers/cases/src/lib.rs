@@ -70,4 +70,5 @@ cases![
     late_import_macro,
     line_continuation,
     static_in_static,
+    type_id_of_fn,
 ];
