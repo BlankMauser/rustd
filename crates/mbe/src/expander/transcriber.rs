@@ -400,11 +400,8 @@ fn expand_var(
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
                 // Basically, a metavariable can never be joined with whatever after it.
                 Fragment::Tokens { tree, origin } => {
-                    let view = match origin {
-                        TokensOrigin::Raw => tree.strip_invisible(),
-                        TokensOrigin::Ast => tree,
-                    };
-                    builder.extend_with_tt_alone(view);
+                    let _ = origin;
+                    builder.extend_with_tt_alone(tree);
                 }
                 Fragment::TokensOwned(tt) => {
                     builder.extend_with_tt_alone(tt.view().strip_invisible())
@@ -428,22 +425,21 @@ fn expand_var(
                     // it is one token: the `0` of an expression is not the `0` of a rule.
                     let is_leaf =
                         matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
-                    let delimiter = if is_leaf {
-                        Some(tt::DelimiterKind::Invisible)
-                    } else if is_negative_literal
-                        || sub.try_into_subtree().is_some_and(|it| {
-                            it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
-                        })
-                    {
-                        None
-                    } else {
-                        Some(tt::DelimiterKind::Parenthesis)
-                    };
-                    if let Some(delimiter) = delimiter {
-                        builder.open(delimiter, span);
+                    let is_group = sub.try_into_subtree().is_some();
+                    // To rustc a fragment is a group without delimiters; the parentheses in
+                    // it keep the expression together where it is parsed again.
+                    let parentheses = !is_leaf && !is_group;
+                    if !is_negative_literal {
+                        builder.open(tt::DelimiterKind::Invisible, span);
+                    }
+                    if parentheses && !is_negative_literal {
+                        builder.open(tt::DelimiterKind::Parenthesis, span);
                     }
                     builder.extend_with_tt_alone(sub);
-                    if delimiter.is_some() {
+                    if parentheses && !is_negative_literal {
+                        builder.close(span);
+                    }
+                    if !is_negative_literal {
                         builder.close(span);
                     }
                 }

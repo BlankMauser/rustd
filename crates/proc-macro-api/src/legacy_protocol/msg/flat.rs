@@ -581,10 +581,30 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
         let close = self.token_id_of(subtree.delimiter.close);
         let delimiter_kind = subtree.delimiter.kind;
         self.subtree.push(SubtreeRepr { open, close, kind: delimiter_kind, tt: [!0, !0] });
+        let contents = fragment_contents(subtree, contents.clone()).unwrap_or(contents);
         // FIXME: `count()` walks over the entire iterator.
         self.work.push_back((idx, contents.clone().count(), contents));
         idx as u32
     }
+}
+
+/// What is in the parentheses of an expression a macro was passed and passed on: a group
+/// without delimiters around parentheses of the same span. The parentheses are there for our
+/// parser and a proc macro is not to see them.
+fn fragment_contents<'a>(
+    subtree: &tt::Subtree,
+    mut contents: tt::iter::TtIter<'a>,
+) -> Option<tt::iter::TtIter<'a>> {
+    if subtree.delimiter.kind != tt::DelimiterKind::Invisible {
+        return None;
+    }
+    let Some(tt::iter::TtElement::Subtree(inner, inner_contents)) = contents.next() else {
+        return None;
+    };
+    let wrapper = inner.delimiter.kind == tt::DelimiterKind::Parenthesis
+        && inner.delimiter.open == subtree.delimiter.open
+        && inner.delimiter.close == subtree.delimiter.open;
+    (wrapper && contents.next().is_none()).then_some(inner_contents)
 }
 
 impl<'a, T: SpanTransformer, U> Writer<'a, '_, T, U> {
