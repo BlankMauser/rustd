@@ -116,6 +116,9 @@ enum Guard {
     /// A directory with nothing in it written since cargo built.
     Tree { what: String, dir: PathBuf },
     Env { name: String, value: Option<String> },
+    /// A file cargo writes itself while it builds, `Cargo.lock`: as cargo left it, by when
+    /// it was last written, or not there.
+    AsLeft { file: PathBuf, written: Option<u128> },
     /// A build script that cargo runs again when one of `reruns_for` does not hold, and
     /// that the daemon then runs itself: the build is cargo's when the script prints or
     /// writes something else than it did.
@@ -151,6 +154,8 @@ impl Guard {
                 let changed = newer_in(dir, built_at)?;
                 Some(format!("{what} and {} changed", changed.display()))
             }
+            Guard::AsLeft { file, written } => (written_at(file) != *written)
+                .then(|| format!("{} changed", file.display())),
             Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
                 .then(|| format!("the environment variable {name} changed")),
         }
@@ -163,6 +168,11 @@ impl Guard {
         });
         Guard::Files { what: what.to_owned(), files: files.collect() }
     }
+}
+
+/// When the file was last written, as a stamp. `None` when it is not there.
+fn written_at(file: &Path) -> Option<u128> {
+    std::fs::metadata(file).and_then(|it| it.modified()).ok().map(stamp_of)
 }
 
 /// A file below `dir` that was written after `since`. What cargo and git keep there is not
@@ -241,7 +251,10 @@ impl State {
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
         std::fs::write(&new, serde_json::to_vec(self)?)?;
-        Ok(std::fs::rename(&new, &path)?)
+        std::fs::rename(&new, &path)?;
+        let kept: Vec<(&Path, &Path)> =
+            self.programs.iter().map(|it| (&*it.executable, &*it.cargos)).collect();
+        Ok(std::fs::write(State::kept_path(&self.key)?, serde_json::to_vec(&kept)?)?)
     }
 
     /// Every state this rustd wrote for the user.
@@ -249,7 +262,9 @@ impl State {
         let dir = daemon::home().map(|it| it.join("states"));
         let entries = dir.ok().and_then(|it| std::fs::read_dir(it).ok()).into_iter().flatten();
         let keys = entries.flatten().filter_map(|it| {
-            Some(it.file_name().to_str()?.strip_suffix(".json")?.to_owned())
+            let name = it.file_name();
+            let key = name.to_str()?.strip_suffix(".json")?;
+            (!key.contains('.')).then(|| key.to_owned())
         });
         keys.filter_map(|it| State::read(&it)).collect()
     }
@@ -264,15 +279,26 @@ impl State {
         *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
     }
 
+    /// The executables of the build `key` and the hard link kept to what rustc linked of
+    /// each. A file of its own, in a shape that stays: it is read when the state can't be.
+    fn kept_path(key: &str) -> anyhow::Result<PathBuf> {
+        Ok(daemon::home()?.join("states").join(format!("{key}.kept.json")))
+    }
+
     /// Puts the executables rustc linked back where cargo has them, for cargo to find what
-    /// it built.
-    pub(crate) fn give_back(&self) {
-        for program in &self.programs {
-            let same = same_file::is_same_file(&program.cargos, &program.executable);
-            if !same.unwrap_or(true) {
-                // Cargo links the program again when the file is not there or not its own.
-                let _ = place(&program.cargos, &program.executable);
-            }
+    /// it built. One whose link is gone is deleted, and cargo links it again.
+    pub(crate) fn give_back(key: &str) {
+        let kept = State::kept_path(key).ok().and_then(|it| std::fs::read(it).ok());
+        let kept: Vec<(PathBuf, PathBuf)> =
+            kept.and_then(|it| serde_json::from_slice(&it).ok()).unwrap_or_default();
+        for (executable, cargos) in kept {
+            // Whatever goes wrong here, cargo finds a file that is not its own or none,
+            // and builds the program again.
+            let _ = match same_file::is_same_file(&cargos, &executable) {
+                Ok(true) => Ok(()),
+                Ok(false) => place(&cargos, &executable),
+                Err(_) => std::fs::remove_file(&executable),
+            };
         }
     }
 
@@ -350,7 +376,7 @@ impl State {
         };
         let mut checkouts = [checkout(false), checkout(true)];
         let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
-        for (at, artifact) in executables.enumerate() {
+        for artifact in executables {
             let Some(executable) = &artifact.executable else { continue };
             let package = metadata.packages.iter().find(|it| it.id == artifact.package_id);
             let package = package.context("cargo built a package it does not list")?;
@@ -358,13 +384,19 @@ impl State {
             let test = artifact.profile.test;
             let unit_test = test && !matches!(kind, Kind::Test | Kind::Bench);
             let name = artifact.target.name.clone();
-            let files = dir.join("programs").join(format!("{at}-{name}"));
+            let unit = Record::of_artifact(&used, executable.as_std_path());
+            // Named as cargo names the unit, the same in every build of it.
+            let files = dir.join("programs").join(unit.map_or(&name, |it| &it.id));
             std::fs::create_dir_all(&files)?;
             let cargos = files.join("cargo");
             place(executable.as_std_path(), &cargos)?;
-            let plan = match Record::of_artifact(&used, executable.as_std_path()) {
+            let plan = match unit {
                 Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
-                None => Err(format!("cargo built `{name}` before rustd recorded what it is linked from; `cargo clean -p {}` has it built again", package.name)),
+                None => Err(format!(
+                    "cargo built `{name}` before rustd recorded what it is linked from; \
+                     `cargo clean -p {}` has it built again",
+                    package.name
+                )),
             };
             let asked_as = match plan {
                 Ok(plan) => {
@@ -401,7 +433,12 @@ impl State {
             checkout.sources = sources.into_iter().collect();
         }
         state.checkouts = checkouts.into_iter().collect();
-        state.doc_tests = artifacts.iter().any(|it| it.target.is_lib() && it.target.doctest);
+        // Cargo runs the doc tests of the packages it runs the tests of.
+        let tested: FxHashSet<_> =
+            artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
+        let documented = |it: &&Package| it.targets.iter().any(|it| it.is_lib() && it.doctest);
+        state.doc_tests =
+            metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
         state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
         let kept: Vec<PathBuf> = State::all()
             .iter()
@@ -571,7 +608,8 @@ fn guards(
     let root = metadata.workspace_root.as_std_path();
     let manifests = metadata.workspace_packages().into_iter().map(|it| it.manifest_path.clone().into_std_path_buf());
     let mut guards = vec![
-        Guard::files("the manifest", manifests.chain([root.join("Cargo.toml"), root.join("Cargo.lock")])),
+        Guard::files("the manifest", manifests.chain([root.join("Cargo.toml")])),
+        Guard::AsLeft { written: written_at(&root.join("Cargo.lock")), file: root.join("Cargo.lock") },
         Guard::files("cargo's configuration", named_above(cwd, &CONFIGS).chain(cargo_home_configs())),
         Guard::files("the toolchain file", named_above(cwd, &TOOLCHAIN_FILES)),
     ];

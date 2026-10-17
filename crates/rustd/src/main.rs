@@ -1550,7 +1550,9 @@ fn build(
         for krate in named {
             local.push(krate);
             let listed = listed.of(db, krate);
-            if at == 0 {
+            // With `cfg(test)` the program starts in the harness rustc wrote, which calls
+            // every test: the crate's own `main` is one function among the others.
+            if at == 0 && !args.cfg_test {
                 main = main.or(listed.main);
             }
             functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
@@ -2355,22 +2357,27 @@ impl Target {
         })
     }
 
-    /// The program's crate and the others in it, from `a` or `a,b,c`.
+    /// The program's crate and the others in it, from `a,b,c`. A name with no comma says
+    /// nothing of the others, and `a,` says there are none.
     fn crates(named: &str) -> (String, Option<Vec<String>>) {
         match named.split_once(',') {
             Some((krate, batch)) => {
-                (krate.to_owned(), Some(batch.split(',').map(str::to_owned).collect()))
+                let batch = batch.split(',').filter(|it| !it.is_empty()).map(str::to_owned);
+                (krate.to_owned(), Some(batch.collect()))
             }
             None => (named.to_owned(), None),
         }
     }
 
     fn fields(&self) -> String {
-        let crates = std::iter::once(&self.krate).chain(self.batch.iter().flatten());
+        let crates = match &self.batch {
+            Some(batch) => format!("{},{}", self.krate, batch.join(",")),
+            None => self.krate.clone(),
+        };
         let mut fields = format!(
             "\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            crates.cloned().collect::<Vec<_>>().join(","),
+            crates,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.link_cmd.as_deref().unwrap_or_default(),
@@ -2399,6 +2406,60 @@ struct Program {
     interrupted: u32,
     /// Whether its crates are others than the last build was of, which is then no patch.
     moved: bool,
+    /// The tests of its crate when it was first built, which is how rustc built it.
+    tests: Option<Tests>,
+}
+
+/// The functions of a program's own crate that a test harness runs, each with its
+/// attributes. The harness of a test executable is rustc's: it lists the tests by name and
+/// by what `#[ignore]` and `#[should_panic]` say of them, so a build after the list changed
+/// would run the tests of before.
+#[derive(PartialEq)]
+struct Tests(Vec<(String, String)>);
+
+impl Tests {
+    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Tests {
+        use hir::HasSource as _;
+        use syntax::ast::HasAttrs as _;
+        let crates = crates_named(db, &args.krate, args).unwrap_or_default();
+        let mut tests = Vec::new();
+        for krate in crates {
+            for &id in &listed.of(db, krate).functions {
+                let function = hir::Function::from(id);
+                if !function.is_test(db) && !function.is_bench(db) {
+                    continue;
+                }
+                let module = function.module(db);
+                let mut path: Vec<String> = module
+                    .path_to_root(db)
+                    .into_iter()
+                    .rev()
+                    .filter_map(|it| Some(it.name(db)?.as_str().to_owned()))
+                    .collect();
+                path.push(function.name(db).as_str().to_owned());
+                let attrs = function.source(db).map(|it| {
+                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+                    attrs.collect::<Vec<_>>().join(" ")
+                });
+                tests.push((path.join("::"), attrs.unwrap_or_default()));
+            }
+        }
+        tests.sort();
+        Tests(tests)
+    }
+
+    /// Why the program can't be built by the daemon, when its tests are not these.
+    fn changed(&self, now: &Tests) -> Option<String> {
+        if self == now {
+            return None;
+        }
+        let differs = |a: &Tests, b: &Tests| a.0.iter().find(|it| !b.0.contains(it)).map(|it| it.0.clone());
+        let which = differs(now, self).or_else(|| differs(self, now)).unwrap_or_default();
+        Some(format!(
+            "the test `{which}` was added, removed or given other attributes, and the list of \
+             tests is rustc's to write"
+        ))
+    }
 }
 
 /// A request, the program it is for, and who waits for the answer.
@@ -2854,7 +2915,9 @@ fn main() -> anyhow::Result<()> {
     }
     // The first is the program asked for when a request names none.
     let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
+    let tests = Some(hir::attach_db(&db, || Tests::of(&db, &listed, &args)));
     let mut programs = vec![Program {
+        tests,
         args,
         table: Arc::new(table),
         known,
@@ -3078,6 +3141,7 @@ fn main() -> anyhow::Result<()> {
                                 unlinked: false,
                             };
                             let mut program = Program {
+                                tests: None,
                                 args,
                                 table,
                                 known,
@@ -3364,6 +3428,7 @@ fn main() -> anyhow::Result<()> {
                     whole: None,
                     interrupted: program.interrupted,
                     moved: program.moved,
+                    tests: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept });
@@ -3682,7 +3747,7 @@ impl Program {
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
-        let Program { args, table, known, unbuilt, wrote, whole, .. } = self;
+        let Program { args, table, known, unbuilt, wrote, whole, tests, .. } = self;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
@@ -3723,6 +3788,13 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
+        match tests {
+            Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
+            // The first build of the program is of the source rustc built it from.
+            None if failed.is_none() => *tests = Some(tests_now),
+            None => {}
+        }
         if failed.is_none() || known.stats.patched.is_none() {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());

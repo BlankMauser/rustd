@@ -248,9 +248,13 @@ impl SymbolTable {
         }
     }
 
+    /// The symbol of the one item at `path`. A symbol that is alone at its path and is not
+    /// the first of its name there is of another item than the one the path was read from:
+    /// rustc wrote that item itself, as it does the `main` of a test executable, and built
+    /// nothing of the one in the source.
     pub(crate) fn get(&self, path: &str) -> Option<&str> {
         match &**self.by_path.get(path)? {
-            [only] => Some(&only.name),
+            [only] if only.place.is_none_or(|it| it == 0) => Some(&only.name),
             _ => None,
         }
     }

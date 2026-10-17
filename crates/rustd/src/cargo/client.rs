@@ -37,7 +37,10 @@ pub(crate) enum Start {
 pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
     let home = home()?;
     let socket = socket_in(&home);
-    let envelope = serde_json::to_string(&Envelope { version: version(), request })?;
+    // A daemon of another version exits for a client that starts its own, and for one that
+    // tells it to stop.
+    let replaces = start == Start::IfMissing || matches!(request, Request::Stop);
+    let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
     let mut stream = match (UnixStream::connect(&socket), start) {
         (Ok(stream), _) => stream,
         (Err(_), Start::Never) => return Ok(None),

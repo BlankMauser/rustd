@@ -40,6 +40,8 @@ pub(crate) const ENDS_WITH_INPUT: &str = "RUSTD_ENDS_WITH_INPUT";
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Envelope {
     pub(crate) version: String,
+    /// Whether the client starts a daemon of its own version when this one is of another.
+    pub(crate) replaces: bool,
     pub(crate) request: Request,
 }
 
@@ -56,7 +58,7 @@ pub(crate) enum Request {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) enum Reply {
-    /// The daemon is of another version and is exiting: start one and ask again.
+    /// The daemon is of another version. It exits when the client said it replaces it.
     Restart { version: String },
     /// The daemon has no part in this build, and why. Cargo builds.
     Cold { reason: String },
@@ -144,11 +146,12 @@ impl Checkout {
         let named = |path: &PathBuf| {
             path.strip_prefix(&self.root).unwrap_or(path).display().to_string()
         };
-        let crates: Vec<String> = plan.crates.iter().map(named).collect();
+        // Each with a comma after it: the program is of these crates and no others.
+        let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
             "sync\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
-            crates.join(","),
+            crates,
             plan.object.display(),
             plan.patch.display(),
             plan.link_cmd,
@@ -451,15 +454,18 @@ impl Daemon {
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line)?;
-        let reply = match serde_json::from_str::<Envelope>(&line) {
+        let envelope = serde_json::from_str::<Envelope>(&line);
+        // A request that can't be read is one of another version too, and of a client
+        // that waits for an answer it can read: it gets none, and the daemon stays.
+        let replaced = envelope.as_ref().is_ok_and(|it| it.replaces && it.version != self.version);
+        let reply = match envelope {
             Ok(envelope) if envelope.version == self.version => self.handle(envelope.request),
-            // Whatever it asks, it is not of this version.
             _ => Reply::Restart { version: self.version.clone() },
         };
         let mut text = serde_json::to_string(&reply)?;
         text.push('\n');
         let sent = (&stream).write_all(text.as_bytes());
-        if matches!(reply, Reply::Restart { .. } | Reply::Stopping) {
+        if replaced || matches!(reply, Reply::Stopping) {
             self.end();
         }
         Ok(sent?)

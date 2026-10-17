@@ -66,7 +66,6 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
         }
         Some(Err((state, reason))) => {
             say::fallback(&reason, "building with cargo");
-            state.give_back();
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
             match by_cargo(asked, &cwd, &key, counts)? {
@@ -127,6 +126,7 @@ fn warmed(checkout: &Checkout) -> Result<(), String> {
 /// Builds with cargo, and has the daemon load what cargo built for the builds to come.
 /// `Err` is cargo's exit status when it failed.
 fn by_cargo(asked: &Invocation, cwd: &Path, key: &str, counts: Counts) -> anyhow::Result<Result<State, i32>> {
+    State::give_back(key);
     let built = match Built::by_cargo(asked)? {
         Ok(built) => built,
         Err(code) => return Ok(Err(code)),
