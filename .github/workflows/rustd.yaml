@@ -63,4 +63,8 @@ jobs:
           run asmedits.py
           run includes.py
           run worktrees.py
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storefull.py
+          run storeshared.py
           exit $failed

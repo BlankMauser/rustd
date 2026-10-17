@@ -261,17 +261,11 @@ impl StoredCode {
 }
 
 impl Entry {
-    /// The key of the entry for `name`, or `None` when this build of the compiler cannot be
-    /// told from another, whose entries would then be taken for its own.
+    /// The key of the entry for `name`. The store tells the entries of this build of the
+    /// compiler from another's.
     pub(super) fn key(name: &str) -> Option<[u8; KEY]> {
-        static COMPILER: OnceLock<Option<[u8; KEY]>> = OnceLock::new();
-        let compiler = COMPILER.get_or_init(|| {
-            let program = std::fs::read(std::env::current_exe().ok()?).ok()?;
-            Some(Sha256::digest(program).into())
-        });
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 3");
-        hasher.update((*compiler)?);
+        hasher.update(b"rustd entry 4");
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
@@ -367,7 +361,7 @@ impl Entries {
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let entry = (!banned)
-            .then(|| Entry::decode(self.store.get(&Entry::key(name)?)?))
+            .then(|| Entry::decode(&self.store.get(&Entry::key(name)?)?))
             .flatten()
             .map(Arc::new);
         self.known().entries.insert(Arc::from(name), entry.clone());
