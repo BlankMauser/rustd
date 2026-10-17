@@ -356,6 +356,22 @@ fn main() {
     let five = foreign::five(foreign::Five { at: [1.0, 2.0, 3.0, 4.0, 5.0] }, 1.5);
     case!(foreign::quads(quad(1.0), quad(2.0), quad(3.0), 0.25).at, five.at);
     case!(foreign::wides(1, 1 << 70, 2, -5, 3, 1 << 90, 4, 1 << 100));
+    {
+        let aligned = |a, b| foreign::Aligned { a, b };
+        case!(foreign::aligned(
+            1,
+            aligned(2, 3),
+            4,
+            5,
+            6,
+            aligned(7, 8),
+            9,
+            aligned(10, 11),
+            1 << 80,
+            12
+        ));
+    }
+    case!(foreign::wide_last([1, 2, 3, 4, 5, 6, 7], -(1 << 70), 8, 9, 1 << 100, 10));
     let map = shapes::byte_map();
     case!(map.map[b'a' as usize], map.map[10], map.map[0]);
     let (a, b) = (shapes::state(b"abc"), shapes::state(b"abd"));
@@ -435,22 +451,42 @@ fn main() {
     println!("stabilized c_variadic {:?}", cases::stabilized::c_variadic());
     #[cfg(not(target_family = "wasm"))]
     println!("stabilized c_variadic_stack {:?}", cases::stabilized::c_variadic_stack());
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
+    println!(
+        "stabilized c_variadic_named_wide {:?}",
+        cases::stabilized::c_variadic_named_wide()
+    );
+    #[cfg(target_vendor = "apple")]
+    println!(
+        "stabilized c_variadic_named_stack {:?}",
+        cases::stabilized::c_variadic_named_stack()
+    );
+    #[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+    println!("stabilized c_variadic_wide {:?}", cases::stabilized::c_variadic_wide());
+    #[cfg(not(target_family = "wasm"))]
+    println!("stabilized c_variadic_named {:?}", cases::stabilized::c_variadic_named());
+    #[cfg(windows)]
+    println!("stabilized by_reference {:?}", cases::stabilized::by_reference::run());
+    #[cfg(any(unix, windows))]
     println!("stabilized variadic_floats {:?}", cases::stabilized::variadic_floats());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized naked_functions {:?}", cases::stabilized::x86::naked_functions());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_goto {:?}", cases::stabilized::x86::asm_goto());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_cfg {:?}", cases::stabilized::x86::asm_cfg());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized target_feature_11 {:?}", cases::stabilized::x86::target_feature_11());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized varargs_abi {:?}", cases::stabilized::x86::varargs_abi());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    println!("stabilized naked_sym {:?}", cases::stabilized::x86::naked_sym());
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    println!("stabilized arm naked_sym {:?}", cases::stabilized::arm::naked_sym());
     #[cfg(target_arch = "aarch64")]
     println!("stabilized arm naked_functions {:?}", cases::stabilized::arm::naked_functions());
     #[cfg(target_arch = "aarch64")]
@@ -463,6 +499,46 @@ fn main() {
     println!("stabilized arm naked_more {:?}", cases::stabilized::arm::naked_more());
     #[cfg(target_arch = "aarch64")]
     println!("stabilized arm asm_goto_more {:?}", cases::stabilized::arm::asm_goto_more());
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        use cases::stabilized::arm::symbols;
+        let (jumped, loaded) = (symbols::naked_sym(6), symbols::naked_sym_data(8));
+        println!("stabilized arm naked_sym {:?} {jumped} {loaded}", symbols::naked_sym_operands());
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        use cases::stabilized::x86::symbols;
+        let (jumped, loaded) = (symbols::naked_sym(6), symbols::naked_sym_data(8));
+        println!("stabilized naked_sym {:?} {jumped} {loaded}", symbols::naked_sym_operands());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use cases::stabilized::arm::{self, Aligned};
+        let (x, y) = (Aligned { a: 30, b: 40 }, Aligned { a: 50, b: 60 });
+        println!(
+            "stabilized arm wide_stack {:?} {} {} {}",
+            arm::wide_stack(),
+            arm::wide_late(9, 8, 7, 6, 5, 4, 3, 1 << 77 | 5, 2, -1 << 100),
+            arm::aligned_late(9, 8, 7, 6, 5, 4, 3, x, 2, y),
+            arm::wide_fits(9, 8, 7, 6, 5, 1 << 99, 4),
+        );
+        println!("stabilized arm va_named {:?} {}", arm::va_named_args(), unsafe {
+            arm::va_named(
+                9, 8, 7, 6, 5, 4, 3, 2, 1, 8.5, 7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5,
+                7u128 << 64 | 3, 4, 100i64, 0.125f64, 80u32, -7i64,
+            )
+        });
+        #[cfg(feature = "nightly")]
+        println!("stabilized arm va_wide {:?}", arm::va_wide_args());
+        #[cfg(feature = "nightly")]
+        println!("stabilized arm va_wide runner {:?}", unsafe {
+            (
+                arm::va_wide(5, 3u128 << 90, 77u64, 1.25f64, -9i128, 1u128),
+                arm::va_wide(9, 1u128, 2u64, 3.0f64, 4i128, 5u128, 6u64, 7.0f64, 8i128, 9u128),
+                arm::va_named_wide(7, 6, 5, 4, 3, 2, 1, 1i128 << 100, -2i64, -3i128 << 70, 4.0f64),
+            )
+        });
+    }
     #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());

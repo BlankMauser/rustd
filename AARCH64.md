@@ -238,3 +238,143 @@ reach.
 What is left from this round: the `LDST*_ABS_LO12_NC` relocations. Closing it needs
 either those kinds in Cranelift's `Reloc` (and `cranelift-object`), or having LLVM reach
 data in the program through the GOT on this target, which costs a load on every reference.
+
+## Round on 6d12f21c86: LLVM at 100%, the rest of the ABI, `sym`, and a native run
+
+Branch `rustd-aarch64-abi2`. Two kinds of run are reported here and they are kept apart:
+the local ones are on an x86-64 host with `qemu-aarch64` user mode, as before, and the CI
+ones are on GitHub's `ubuntu-24.04-arm` runner, where rustd, rustc, the linker and the
+programs are all AArch64 processes on an AArch64 kernel. That is the first native run.
+
+### What changed
+
+**Relocations Cranelift has no kind for.** `Code` has a new list, `elf_types`: for a
+relocation at a given place, the type ELF has for it. Cranelift is given the others, and
+when the object is finished the ones in the list are added to it by type, against the same
+symbols. LLVM's read-back uses it for `R_AARCH64_LDST8/16/32/64/128_ABS_LO12_NC`. The
+splice already knew these five (they were in `splice.rs` with a unit test since the first
+round), so nothing changed there; the LLVM column of `splices.py` is what exercises them.
+A function compiled without any such relocation goes the way it did.
+
+**More than two return values under LLVM.** The other three functions LLVM left were
+ones that return three or four values in registers (homogeneous float aggregates). On
+AArch64 the lowering now returns a struct of up to eight fields, which LLVM gives the next
+register of each kind in order, as Cranelift does. Other architectures still refuse.
+
+With those two, LLVM -O2 compiles 11775 of 11775 corpus functions and leaves none to
+Cranelift (`backends.py`). In the daemon logs of `programs.py`, `stress.py`, `splices.py`,
+`asmedits.py` and `unwinds.py` under LLVM there is no function left to Cranelift either.
+
+**The caller's stack under LLVM.** A variadic definition finds the arguments on the stack
+from its frame pointer plus 16, which is right for Cranelift's frames. LLVM on ELF saves
+other registers above the frame record, so the same sum points into the function's own
+frame. On AArch64 ELF the LLVM lowering now answers the request for the frame pointer
+with `llvm.sponentry` minus 16. Without it the corpus under LLVM crashes in
+`c_variadic_stack` (I put the old lowering back to see). Mach-O keeps `llvm.frameaddress`:
+LLVM has the frame record on top there, and I cannot run it.
+
+**A 128-bit argument that the registers left do not hold.** New `PassMode::Stacked`: the
+integer registers that were left are taken up by unused parameters, and the value goes to
+the stack whole as an `i128`, which Cranelift aligns to 16. This is what LLVM does for
+both AAPCS64 and Apple's variant (the half that would fit in `x7` is not put there, and
+`x7` stays unused), so the two share the code and the refusal Apple had is gone. I ran
+only Linux. An aggregate aligned to 16 that does not fit used to be refused. rustc 1.99
+passes it on the stack in 8-byte units at the next multiple of 8, not of 16 (seen in the
+caller rustc compiled), so it now takes the same path as any other small aggregate.
+
+**`va_arg` and named parameters.** `va_arg` of a 128-bit integer reads two registers
+starting at an even one, or 16 bytes of the stack at a multiple of 16, and a value that
+does not fit in the registers left takes them out of use, as the AAPCS64 procedure says.
+Named parameters may now be on the stack: the definition works out where Cranelift put
+them and starts the variable ones after. `va_arg` of a struct cannot be written: the trait
+that bounds `VaList::next_arg` is sealed and has only integers, pointers and `f64`.
+The 128-bit integers are behind the unstable `c_variadic_int128`, so those cases are in
+the corpus under its `nightly` feature and are not part of a default run.
+
+**`sym` in `naked_asm!`.** The front end now lowers a `sym` operand to the function or
+static it names. The assembly is given a placeholder name, the assembler's relocations
+against it are read back, and they go into the object by ELF type against the real
+symbol. It works for any ELF target; x86-64 has a case too.
+
+### Results
+
+Local, under qemu for AArch64, on the commit before the last (the last change only skips
+a copy when a function has no such relocation):
+
+| Harness | AArch64 Cranelift | AArch64 LLVM -O2 | x86-64 Cranelift | x86-64 LLVM -O2 |
+|---|---|---|---|---|
+| corpus `--layouts` | MATCH, 817/817, 0 of 903 | MATCH, 817/817, 0 of 903 | MATCH, 808/808, 0 of 892 | MATCH, 808/808, 0 of 892 |
+| programs | 22/22 | 22/22 | 22/22 | 22/22 |
+| stress | 99/99 | 99/99 | 99/99 | 99/99 |
+| breakers | 25/25 | 25/25 | 25/25 | 25/25 |
+| unwinds | 8/8 | 8/8 | 8/8 | 8/8 |
+| splices | 71/71 (62 spliced) | 71/71 (61) | 71/71 (60) | 71/71 (60) |
+| farsplices | 6/6 | 6/6 | 6/6 | 6/6 |
+| asmedits | 10/10 | 10/10 | 10/10 | 10/10 |
+| deps | 10/10 | 10/10 | 10/10 | 10/10 |
+| includes | 9/9 | 9/9 | 9/9 | 9/9 |
+| worktrees | 58/58 | 58/58 | 58/58 | 58/58 |
+| worktrees `--join --together` | 58/58 | 58/58 | 58/58 | 58/58 |
+| worktrees `--overlay` | 67/67 | 67/67 | 67/67 | 67/67 |
+| worktrees with splice | 58/58 | 58/58 | 58/58 | 58/58 |
+| keys | 26/26, 4 open | 26/26, 4 open | 26/26, 4 open | 26/26, 4 open |
+
+After the last change I reran the corpus on all four (same counts), `--mixed 6` on
+AArch64 and `--mixed 3` on x86-64 with Cranelift (all splits match), and programs, stress,
+splices, asmedits and unwinds on AArch64 under LLVM (same counts). With the `nightly`
+feature and `RUSTC_BOOTSTRAP=1` the AArch64 corpus is 827/827 and matches under both
+producers, and `--mixed 6` matches with Cranelift. The 4 open cases of `keys.py` are the
+ones the harness lists as open on every platform.
+
+Native, on `ubuntu-24.04-arm` (the `rustd` workflow on this branch):
+
+| Job | Result |
+|---|---|
+| fmt and tests (aarch64) | passed |
+| harness (cranelift, aarch64) | corpus MATCH 817/817, 0 of 903 layouts; programs 22/22; stress 99/99; breakers 25/25; unwinds 8/8; splices 71/71 (60 spliced); farsplices 6/6; asmedits 10/10; includes 9/9; worktrees 58/58; keys 26/26, 4 open |
+| harness (llvm, aarch64) | the same counts |
+
+The workflow runs the list the x86-64 jobs run, plus `farsplices.py` on AArch64. It does
+not run `deps.py` or the other worktrees modes, so those are qemu only.
+
+### Native against qemu
+
+Every count is the same. What differs:
+
+- The edit made while the binary runs is linked in full natively ("Text file busy"), as
+  on x86-64. Under qemu the write succeeds and the harness skips that assertion. This was
+  the one behaviour I had only inferred.
+- A real kernel loads the spliced executables. The program header layout I changed in the
+  first round for qemu's loader had not been seen under one.
+- rustd itself as an AArch64 process, with either producer, had never been built or run.
+- "a static of bytes" in `splices.py` is declined natively ("may be aligned to 8") and
+  spliced under qemu with Cranelift. I do not think this is the machine: the same step
+  goes one way or the other on x86-64 between the two producers in CI, and under qemu
+  with LLVM it is declined too. It depends on the address the linker happened to give
+  the static. The full link runs and the output is right either way.
+- Times are not comparable between the two machines, but for scale: a spliced edit in
+  `splices.py` takes 34 to 35 ms natively and 41 to 43 ms under qemu here; the AArch64
+  harness jobs took 18 and 19 minutes, the x86-64 ones 14 and 21.
+
+### Still refused, and why
+
+- `sym` with a generic function: inference does not look at the path of a `sym` operand,
+  so its generic arguments are not known when the body is lowered.
+- `sym` in `asm!` (not naked): the block's function is shared by its text and has no way
+  yet to carry what its symbols name.
+- `sym` on Mach-O and COFF: their relocations are not read back from the assembler.
+- A variadic definition with a named vector parameter.
+- `va_arg` wider than 8 bytes on x86-64, as before.
+
+### For whoever merges this
+
+- `codegen.rs`, `fragment.rs`, `cached.rs`: `Code` has a new field. The key of cached
+  LLVM code and of assembled text changed, so stores made before are not read.
+- `mir.rs`, `mir/lower.rs`, `monomorphization.rs`: `AsmOperand::Sym`. A body with a `sym`
+  operand used to be refused in lowering on every target; it now reaches the back end,
+  which refuses it where it cannot do it.
+- `aapcs64_abi` is shared with Apple: `PassMode::Stacked` and the 16-aligned aggregate
+  on the stack apply there too and were not run there.
+- `stabilized::arm` has new cases that also build for macOS (`wide_stack`, `va_named`);
+  the `symbols` modules are Linux only.
+- The workflow's job names for x86-64 are unchanged.

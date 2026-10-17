@@ -3283,9 +3283,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
-    let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
-    if let Some(sending) = sending.filter(|_| args.socket.is_none() && !args.watch) {
-        _ = sending.join();
+    match shared {
+        Some(shared) if args.socket.is_none() && !args.watch => shared.push(),
+        Some(shared) => shared.keep(),
+        None => {}
     }
     hir::attach_db(&db, || known.out_of_date(&db));
     // What rustc compiled, by where in the checkout it is: the files as this build read them.
