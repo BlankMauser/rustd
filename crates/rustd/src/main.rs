@@ -541,7 +541,15 @@ impl SymbolResolver for Resolver<'_> {
             return None;
         }
         let path = self.path(func)?;
-        if let Some(symbol) = self.table.get(&path) {
+        // A test is the second of its name where it is written: rustc puts the constant
+        // that describes it to the harness before it, under the same name.
+        let function = hir::Function::from(func);
+        let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
+            self.table.get_at(&path, 1)
+        } else {
+            self.table.get(&path)
+        };
+        if let Some(symbol) = symbol {
             return Some(symbol.to_owned());
         }
         // rustc has built nothing of the crate: the function is ours to name.
