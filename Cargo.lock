@@ -3063,6 +3063,7 @@ name = "rustd"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cargo_metadata",
  "cfg",
  "dunce",
  "hir",
@@ -3070,6 +3071,7 @@ dependencies = [
  "hir-ty",
  "ide-db",
  "intern",
+ "libc",
  "load-cargo",
  "memchr",
  "memmap2",
@@ -3086,6 +3088,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "syntax",
  "tar",
  "tikv-jemalloc-ctl",
