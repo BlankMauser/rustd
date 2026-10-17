@@ -1855,6 +1855,7 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        index_spans: Default::default(),
         in_cleanup: false,
         guarded: false,
         deferred_clears: Vec::new(),
@@ -3631,6 +3632,8 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The index expression each local that holds an index was made for.
+    index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
@@ -4945,6 +4948,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.index_spans = index_spans(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -5493,7 +5497,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
                     let index = self.builder.ins().load(ptr(), MEM, self.locals[*local].addr, 0);
+                    // An index out of bounds is reported at the index expression, which may be
+                    // an operand of the statement that reads it.
+                    let statement = self.span;
+                    self.span = self.index_spans.get(local).copied().unwrap_or(statement);
                     addr = self.element(addr, meta, prev.ty, index)?;
+                    self.span = statement;
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -10433,6 +10442,18 @@ fn dump_mir(body: &MirBody<'_>) {
             eprintln!("    -> {}", compact(format!("{:?}", terminator.kind)));
         }
     }
+}
+
+/// Where each local of a body starts to live. A local that holds the index of `base[index]`
+/// starts at that expression.
+fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+    statements
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => Some((local, statement.span)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The locals a body drops whole, in the order of the blocks that drop them when each block
