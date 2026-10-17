@@ -6829,8 +6829,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
-                let bits = self.builder.ins().iconst(r_scalar.ty, i64::from(scalar.ty.bits()));
-                let overflow = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let (r, overflow) = self.shift_amount(r, scalar.ty.bits());
                 let (shift_op, value) = match (op, signed) {
                     (BinOp::Shl, _) => (OverflowOp::Shl, self.builder.ins().ishl(l, r)),
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
@@ -6841,6 +6840,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             BinOp::Offset => unsupported!("pointer offset"),
         })
+    }
+
+    /// The amount to shift a value of `bits` bits by, no wider than a register, and whether
+    /// `amount` is out of range: not less than `bits`, read as unsigned.
+    fn shift_amount(&mut self, amount: Value, bits: u32) -> (Value, Value) {
+        let too_far = IntCC::UnsignedGreaterThanOrEqual;
+        if self.builder.func.dfg.value_type(amount) != types::I128 {
+            let overflow = self.builder.ins().icmp_imm(too_far, amount, i64::from(bits));
+            return (amount, overflow);
+        }
+        let (low, high) = self.builder.ins().isplit(amount);
+        let too_far = self.builder.ins().icmp_imm(too_far, low, i64::from(bits));
+        let wide = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
+        (low, self.builder.ins().bor(too_far, wide))
     }
 
     fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
