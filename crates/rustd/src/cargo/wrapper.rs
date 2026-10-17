@@ -135,6 +135,10 @@ impl Unit {
                 .with_context(|| format!("copying {}", original.display()))?;
             copies.push(Copied { original, copy });
         }
+        // The daemon tells which crate a file of rustc's is by the dep-info next to it, of
+        // which it reads the first source: the root of the crate.
+        let stem = format!("{}{}", self.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        std::fs::write(to.join(format!("{stem}.d")), format!("{stem}: {}\n", self.source.display()))?;
         if self.script
             && let Some(linked) = record.outputs().first()
         {

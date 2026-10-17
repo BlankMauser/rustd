@@ -39,9 +39,9 @@ WARMUP_SECS = 1800
 PROJECTS = {
     "ripgrep": dict(
         repo="BurntSushi/ripgrep", tag="15.1.0",
-        run=["-n", "--no-heading", "fn main", "crates/core/main.rs", "build.rs"],
+        run=["-n", "--no-heading", "--sort", "path", "fn main", "crates/core/main.rs", "build.rs"],
         edits=[("crates/core/main.rs", "fn main() -> ExitCode {", 'fn main() -> ExitCode {\n    eprintln!("edited main");'),
-               ("crates/printer/src/util.rs", "pub(crate) fn trim_ascii_prefix(", 'pub(crate) fn trim_ascii_prefix_unused() -> u32 {\n    7\n}\n\npub(crate) fn trim_ascii_prefix(')],
+               ("crates/printer/src/standard.rs", "pub fn new() -> StandardBuilder {", 'pub fn new() -> StandardBuilder {\n        eprintln!("edited printer");')],
     ),
     "fd": dict(
         repo="sharkdp/fd", tag="v10.3.0",
@@ -121,7 +121,11 @@ def program_output(ran):
     """What the program said, without what cargo said, and with the two target directories
     named alike."""
     def clean(text):
-        lines = [l for l in text.splitlines() if not STATUS.match(l)]
+        # What rustc warned of, which cargo shows again with every build, comes before
+        # cargo says what it runs.
+        lines = text.splitlines()
+        running = [at for at, l in enumerate(lines) if re.match(r"^\s*Running `", l)]
+        lines = [l for l in lines[running[-1] + 1 if running else 0:] if not STATUS.match(l)]
         text = "\n".join(lines).replace("target-ref", "target")
         # A panic message has the id of the thread, and a logger the time.
         text = re.sub(r"' \(\d+\) panicked", "' panicked", text)
