@@ -70,8 +70,8 @@ const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 /// A function's `UNWIND_INFO` without a handler, and how long its code is.
 #[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct Frame {
-    len: u32,
-    info: Vec<u8>,
+    pub(super) len: u32,
+    pub(super) info: Vec<u8>,
 }
 
 /// The frame of compiled code and the calls in it that have a landing pad, each as the
