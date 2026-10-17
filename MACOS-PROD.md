@@ -1,7 +1,8 @@
 # macOS arm64: debug info, the build model and the store
 
-Branch `rustd-macos-prod`, cut from `rustd-macos-abi2` with `rustd-collate` at 0151c01218
-merged in. Everything under "Measured" ran natively on an Apple Silicon Mac (`uname -m` is
+Branch `rustd-macos-prod`, cut from `rustd-macos-abi2`, with `rustd-collate` merged in three
+times: 0151c01218, 526f2963ba and last ce52276cf5. Everything under "Measured" ran
+natively on an Apple Silicon Mac (`uname -m` is
 `arm64`, macOS 26.5.2, stable 1.99.0-aarch64-apple-darwin, LLVM 20.1.8 from Homebrew). The
 x86_64-apple-darwin attempt ran under Rosetta 2 and is described separately. Nothing here
 ran on Linux locally.
@@ -110,41 +111,96 @@ numbers say little about a real drive, where `F_FULLFSYNC` is known to cost far 
 
 ## The gate, measured
 
-Native arm64, the binary built from the head of the branch with `--features llvm`.
+Native arm64, on the merge of `rustd-collate` ce52276cf5 into this branch, the binary built
+with `--features llvm`. Each column is one whole run, one harness after another, nothing
+else running beside it.
 
 | harness | Cranelift | LLVM `-O2` fast emit |
 |---|---|---|
-| `difftest.py corpus --layouts` | MATCH, 816 of 816 from rustd; layouts 0 of 913 differ | MATCH, 816 of 816; 0 of 913 |
+| `difftest.py corpus --layouts` | MATCH, 828 of 828 from rustd; layouts 0 of 914 differ | MATCH, 828 of 828; 0 of 914 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 25 of 25, 0 open | 25 of 25, 0 open |
+| `breakers.py` | 43 of 43, 5 open, 0 skipped | 43 of 43, 5 open, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` / `includes.py` | 10 of 10, 9 of 9 | 10 of 10, 9 of 9 |
-| `worktrees.py` plain / `--join --together` / `--overlay` | 58 of 58, 58 of 58, 67 of 67 | 58 of 58, 58 of 58, 67 of 67 |
-| `keys.py` | 36 of 36, 0 open | 36 of 36, 0 open |
+| `worktrees.py` plain / `--join --together` / `--overlay` | 62 of 62, 62 of 62, 71 of 71 | 62 of 62, 62 of 62, 71 of 71 |
+| `keys.py` | 46 of 46, 0 open | 46 of 46, 0 open |
+| `backends.py corpus --levels 2f` | not run | LLVM compiled 11879 of 11879 functions, none left to Cranelift; prints the same as cargo |
 | `debuginfo.py` | all right | all right |
-| `buildmodel.py` | 174 of 174 as expected, 0 wrong, 6 skipped for the host | the same run, 174 of 174 |
-| `storekills.py --kills 100` | 100 kills, pass | 100 kills, pass |
-| `storecorrupts.py --rounds 4` | 4 damaged stores rebuilt | 4 damaged stores rebuilt |
-| `storefull.py` | 6 full disks, pass | 6 full disks, pass |
-| `storeshared.py` | 180 builds, pass | 180 builds, pass |
+| `buildmodel.py` | 188 of 188 as expected, 0 wrong | 188 of 188, 0 wrong |
+| `storekills.py --kills 100` | pass | pass |
+| `storecorrupts.py --rounds 4` | pass | pass |
+| `storefull.py` | pass | pass |
+| `storeshared.py` | pass | pass |
+| `remote.py` | 178 of 178 | 178 of 178 |
+| `cargo_rustd.py` | PASS | PASS |
 
-`buildmodel.py` runs its cases under both backends itself, so its row is one run. The six
-it skips are the Linux cross cases and `rustflags_target_cpu`, each under both backends
-where the case has both.
+`buildmodel.py` runs its cases under both backends itself, so each column ran all of it.
+It does not run `cross_musl` and `rustflags_target_cpu` (cases of x86-64 hosts) and skips
+`cross_aarch64` (needs a Linux cross toolchain), each under both backends.
 
-How it was run, since it matters for what the table proves: the Cranelift column is one
-whole run on the commit before the last two small changes (a `HashMap::entry` in
-`splice/macho.rs` for clippy and a comment in `store.rs`), and after them I ran the corpus,
-`splices.py`, `worktrees.py`, `debuginfo.py` and `storekills.py` again, with the same
-results. The LLVM column ran on the final binary. By mistake two LLVM runs were going at
-the same time and wrote the same log files; every harness in both exited 0 and the counts
-are from their last lines, but for LLVM I cannot show a clean log per harness.
+`remote.py` runs against MinIO and SeaweedFS from Homebrew. `harness/s3fake.py` hands out
+each port once: it gave the same port to two services before, and SeaweedFS failed to
+start on it.
 
-Not run this round: `deps.py`, `scoreboard.py`, `backends.py`, `linkbench.py`. `cargo
-clippy` stops on `crates/rustd/src/remote.rs:31` (a large enum variant), which came with
-the merge and is not mine; I left it.
+`breakers.py` counts five cases as open, known wrong and not counted against the run. They
+came with the merges; I did not check whether the same five are open on Linux.
+
+### `cargo rustd` on Mach-O
+
+What it needed, all behind the object format:
+
+- `cargo/plan.rs` reads the link line of Apple's linker: it is Mach-O when it has `-arch`,
+  the `env -u` in front of it is kept, and the line gets `-Wl,-headerpad,0x200` for the
+  splice. The copies of rustc's objects with weak definitions are made when the link
+  command is built, not before, so that cargo's executable is still recognised as the one
+  the unit wrote.
+- cargo copies an executable out of `deps/` on macOS where it hard-links it on Linux.
+  `Record::wrote` takes an artifact for a unit's when it is the same file or has the same
+  bytes. It reads both files whole to compare them, after comparing lengths; I did not
+  measure what that costs on a large binary.
+- `socket.rs`: macOS refuses `set_read_timeout` on a socket whose peer has gone with
+  `EINVAL`, which is now taken for the peer having gone.
+- `cargo_rustd.py` makes its projects under `/tmp` on macOS: the path of the daemon's
+  socket under `/var/folders/...` is longer than a socket path may be.
+
+### The stack of `just`
+
+On the first run after the merge `cargo_rustd.py` failed under Cranelift on one test of
+`just` 1.43.0, `recursion_limit::bugfix`: the binary from rustd overflowed its stack where
+cargo's reported the recursion limit. rustd's frames were larger: `parse_expression` took
+4912 bytes against 3024 from rustc. Every call that passes an argument by a copy in memory
+made a stack slot of its own for the copy. Now the calls of a function take turns with
+those slots (`ArgumentCopies` in `codegen.rs`): a copy is free again once its call is
+made, since the callee owns it and nothing of it is read afterwards. `parse_expression` is
+4064 bytes with that, and the test passes.
+
+The margin is thin, and this is measured: with `ulimit -s`, that input needs between 6 and
+7 MiB of stack in rustd's binary and between 4 and 5 MiB in rustc's, and the main thread
+has 8. The frames are still about a third larger than rustc's. I did not find what the
+rest is; my guess is temporaries that rustc's MIR does not have, which is not measured.
+This is shared code and changes what Cranelift emits on every target.
+
+### Debug settings
+
+They come from the unit graph (`Plan::debug()`), and nothing reads `profile.rs`, which is
+gone. One thing was wrong on Mach-O: a patch built without debug info still got a debug
+map in the spliced binary. `splice/macho.rs` now writes no map for a patch object without
+`__debug_info`. Checked by hand: with debug on the spliced binary has one `N_OSO` for the
+patch, and with `[profile.dev] debug = false` it has none.
+
+### Variables and types
+
+Under Cranelift the Mach-O objects describe parameters, locals and their types with the
+same code as ELF, from x29. Measured by `debuginfo.py`: 13087 parameters and locals in
+11786 functions of the corpus, and lldb prints 9 of 9 values of its `locals` program
+(integers, a float, a `&str`, a struct, a tuple struct, an array, a tuple, a reference).
+Under LLVM no variable is described, on Mach-O as on ELF: the harness says "LLVM's frames
+are not read back yet" on both. So Mach-O has what ELF has; what neither has is variables
+under LLVM, and enums, which `DebugType` does not have a case for.
+
+Not run this round: `deps.py`, `scoreboard.py`, `linkbench.py`.
 
 ## x86_64-apple-darwin
 
@@ -171,7 +227,10 @@ How far it got, measured:
 
 What is missing, in the order it would have to be done:
 
-1. The cause of that crash, and whatever else the remaining 200 lines of the corpus show.
+1. The cause of that crash, and whatever else the remaining lines of the corpus show. A
+   second look got no further: lldb never attached to the binary under Rosetta, and after
+   the attempts every x86-64 process on this machine hangs at start, a hello world
+   included, and cannot be killed. Restarting `oahd` did not help; it needs a reboot.
 2. The five variadic definitions the corpus has with named parameters on the stack, which
    are refused on x86-64 everywhere (`rustd-plat-abi2` has that code now).
 3. Unwinding through rustd's frames was not reached. The panics before the crash did
@@ -187,23 +246,13 @@ What is missing, in the order it would have to be done:
 
 ## CI
 
-The macOS job of `.github/workflows/rustd.yaml` now also runs `debuginfo.py` (after
-`DevToolsSecurity -enable`, with lldb as root), `buildmodel.py` on the Cranelift leg as the
-Linux job does, and the four store harnesses. `keys.py` was there. `deps.py` is still left
-out for the reason given last round. The workflow now prints the
-last lines of each harness that failed again at the end of the step, and `debuginfo.py`
-repeats its wrong lines before its verdict, because the log I could read keeps only the end.
-
-On 68b1d8713b (everything but this paragraph): both macOS jobs are green, and so is fmt and
-tests. Both Linux harness jobs are red on `debuginfo.py` alone, with four lines
-`gdb at <file:line>  NOT STOPPED  [Inferior 1 killed]` (corpus, stress, rung2 and the
-spliced binary) and everything else passing, `buildmodel.py` at 180 of 180. On the base,
-0151c01218, the Linux LLVM job fails `debuginfo.py` with the same `wrong: 4`, and the
-Cranelift job fails `buildmodel.py` at 179 of 180; I could not read which four lines or
-whether Cranelift's `debuginfo.py` failed there too, since that log is cut. The gdb path of
-the harness is the code that was there, so I take the four to be the runner's gdb and not
-this branch, but that is an inference from the count, not something I compared line by
-line. `coverage` is red on both, as before.
+The workflow is the one of `rustd-collate` ce52276cf5, which has a macOS job of its own
+now. On this branch that job also runs `debuginfo.py` (after `DevToolsSecurity -enable`,
+with lldb as root), `buildmodel.py` on the Cranelift leg as the Linux job does, and
+`storefull.py`; the collated one left those out as not written for Mach-O. `remote.py`
+and `cargo_rustd.py` are not in the macOS job: the first needs MinIO on the runner and the
+second downloads and builds seven projects, and I did not try either there. What CI says
+of the head is in the final message of the round, not here.
 
 ## Shared code to check on Linux
 
@@ -218,7 +267,17 @@ line. `coverage` is red on both, as before.
   next one on the thread is made. This came from looking at a timeout in `buildmodel.py`
   under LLVM that I could not reproduce afterwards; it is harmless but I cannot say it
   fixed anything.
-- `buildmodel.py`: the `hosts` key and the short socket paths.
+- `buildmodel.py`: the `hosts` key and the short socket paths. `hosts` stays beside the
+  `on` key of the collated branch: `on` is the architecture, `hosts` the system.
+- `codegen.rs`: `ArgumentCopies`, described above. Every target's Cranelift code changes.
+- `cargo/units.rs`, `cargo/state.rs`: an artifact is a unit's when it is the same file,
+  as before, or a copy of it.
+- `cargo/plan.rs`: the ELF link line goes through the parser that now also reads Mach-O.
+- `socket.rs`: an `EINVAL` from `set_read_timeout` is not an error.
+- `harness/s3fake.py`: a port is handed out once.
+- In the merge of ce52276cf5 I took the collated side for every conflict in `codegen.rs`,
+  `fragment.rs`, `debuginfo.rs` and `llvm.rs` (`sym` operands, the frame register for
+  variables, the LLVM context kept per thread), so the `llvm.rs` item above is gone.
 
 ## What is left, in order
 
@@ -228,4 +287,7 @@ line. `coverage` is red on both, as before.
 2. x86_64-apple-darwin, from the list above.
 3. Debug info of a stripped binary and of a binary linked with `-dead_strip`: not looked at.
 4. A test of the store under a real loss of power, on a real drive.
-5. The clippy error in `remote.rs`.
+5. Why rustd's Cranelift frames are a third larger than rustc's: `just` passes with about
+   1 MiB of stack to spare.
+6. Variables under LLVM and enums in debug info, on every format.
+7. The clippy error in `remote.rs`.
