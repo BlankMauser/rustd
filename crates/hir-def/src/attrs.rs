@@ -514,6 +514,23 @@ fn collect_attrs<BreakValue>(
     )
 }
 
+/// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
+/// rustc expands the expression of a key-value attribute before it reads it
+/// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
+fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    let (source, _, _, krate) = attrs_source(db, owner);
+    let value = collect_attrs(db, owner, |attr| match attr {
+        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name) => match attr.expr() {
+            Some(value) => ControlFlow::Break(value),
+            None => ControlFlow::Continue(()),
+        },
+        _ => ControlFlow::Continue(()),
+    })?;
+    let resolver = resolver_for_attr_def_id(db, owner);
+    let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
+    Some(Symbol::intern(&value))
+}
+
 fn collect_field_attrs<T>(
     db: &dyn SourceDatabase,
     variant: VariantId,
@@ -750,31 +767,13 @@ impl AttrFlags {
     /// The symbol a foreign item is declared to link against, if it is not its own name.
     #[salsa::tracked(returns(clone))]
     pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        collect_attrs(db, owner, |attr| {
-            if let ast::Meta::KeyValueMeta(attr) = attr
-                && attr.path().is1("link_name")
-                && let Some(value) = attr.value_string()
-            {
-                ControlFlow::Break(Symbol::intern(&value))
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
+        symbol_attr(db, owner, "link_name")
     }
 
     /// The symbol `#[export_name]` gives an item.
     #[salsa::tracked(returns(clone))]
     pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
-        collect_attrs(db, owner, |attr| {
-            if let ast::Meta::KeyValueMeta(attr) = attr
-                && attr.path().is1("export_name")
-                && let Some(value) = attr.value_string()
-            {
-                ControlFlow::Break(Symbol::intern(&value))
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
+        symbol_attr(db, owner, "export_name")
     }
 
     #[inline]

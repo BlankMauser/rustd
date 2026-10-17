@@ -10251,6 +10251,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                 }
             }
+            // `NonNull` holds its pointer as a pattern type.
+            TyKind::Pat(base, _) => self.branch_unless_equal(l, r, metas, base, differ),
+            // A pointer to something unsized is equal in its address and its metadata.
+            TyKind::RawPtr(pointee, _) if self.is_unsized(pointee) => {
+                for offset in [0, meta_at()] {
+                    let l = self.builder.ins().load(ptr(), MEM, l, offset);
+                    let r = self.builder.ins().load(ptr(), MEM, r, offset);
+                    let same = self.builder.ins().icmp(IntCC::Equal, l, r);
+                    self.branch_unless(same, differ);
+                }
+                Ok(())
+            }
             _ => {
                 let scalar = self.scalar_of(ty)?;
                 let l = self.builder.ins().load(scalar.ty, MEM, l, 0);

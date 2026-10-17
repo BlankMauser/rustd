@@ -30,6 +30,8 @@ cases![
     simd_lanes,
     simd_packs,
     sha_ni,
+    link_name_macro,
+    const_pattern,
     simd_sums,
     variant_alias,
     two_bitflags,
