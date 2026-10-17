@@ -164,6 +164,7 @@ impl Loaded {
         db: &mut RootDatabase,
     ) -> anyhow::Result<()> {
         self.workspaces.extend(workspaces);
+        let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
         if self.proc_macro_server.is_none() {
             self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
@@ -260,9 +261,11 @@ impl Loaded {
             let is_local = self.file_sets.get(idx).is_none_or(|it| it.1);
             let root_id = SourceRootId(idx as u32);
             if is_local { &mut local_roots } else { &mut library_roots }.insert(root_id);
-            // The roots there were have the files they had. The one of the files no root had
-            // was where the first new one is now.
+            // The roots there were have the files they had, and those of them that are new
+            // to the database: what a workspace loaded again names that was not source
+            // before. The one of the files no root had was where the first new one is now.
             if was != 0 && idx < was {
+                join_root(db, root_id, file_set, &known);
                 continue;
             }
             let (root, durability) = match is_local {
@@ -292,6 +295,37 @@ impl Loaded {
         self.crates = members.into_iter().map(|it| it.iter().map(|id| ids[id]).collect()).collect();
         Ok(())
     }
+}
+
+/// Puts the files of `files` that are not among `known`, and so in no source root yet, in
+/// the root `root_id`.
+fn join_root(
+    db: &mut RootDatabase,
+    root_id: SourceRootId,
+    files: vfs::file_set::FileSet,
+    known: &FxHashSet<vfs::FileId>,
+) {
+    let was = db.source_root(root_id).source_root(db);
+    let new: Vec<_> = files.iter().filter(|it| !known.contains(it)).collect();
+    if new.is_empty() {
+        return;
+    }
+    let mut joined = vfs::file_set::FileSet::default();
+    let of_both = was.iter().map(|it| (it, was.path_for_file(&it)));
+    let of_both = of_both.chain(new.iter().map(|&it| (it, files.path_for_file(&it))));
+    for (file, path) in of_both {
+        if let Some(path) = path {
+            joined.insert(file, path.clone());
+        }
+    }
+    let (root, durability) = match was.is_library {
+        true => (SourceRoot::new_library(joined), Durability::MEDIUM),
+        false => (SourceRoot::new_local(joined), Durability::LOW),
+    };
+    for file in new {
+        db.set_file_source_root_with_durability(file, root_id, durability);
+    }
+    db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
 }
 
 fn spawn_proc_macro_server(

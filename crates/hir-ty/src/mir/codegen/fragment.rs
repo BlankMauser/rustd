@@ -85,6 +85,12 @@ pub(super) struct Code {
     pub(super) bytes: Vec<u8>,
     pub(super) align: u64,
     pub(super) relocs: Vec<ModuleReloc>,
+    /// The relocations of `relocs`, by where they are, that Cranelift has no kind for, with
+    /// the type ELF has for each: the low bits of an address in an AArch64 load or store,
+    /// which go in in units of what it moves, and whatever the assembly of a function
+    /// names a symbol with. The kind in `relocs` stands in for it, and the object is given
+    /// the relocation when it is finished.
+    pub(super) elf_types: Vec<(u32, u32)>,
     pub(super) unwind: Option<FunctionUnwind>,
     /// Which statement the code is of, from each offset where that changes.
     pub(super) lines: Vec<LineRow>,
@@ -110,6 +116,7 @@ impl PartialEq for Code {
             && self.signature == other.signature
             && self.unwind == other.unwind
             && self.lines == other.lines
+            && self.elf_types == other.elf_types
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
                 a.offset == b.offset
@@ -168,6 +175,8 @@ pub(super) struct Recorder<'db> {
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
     pub(super) target: &'static Target,
+    /// Whether the crate compiling the function has `-C overflow-checks`.
+    pub(super) checked: bool,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -175,8 +184,9 @@ pub(super) struct Recorder<'db> {
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
-    /// The assembly of the function, when it is a `#[naked]` one.
-    pub(super) naked: Option<String>,
+    /// The assembly of the function, when it is a `#[naked]` one, and what each operand of
+    /// it that is a `sym` names.
+    pub(super) naked: Option<(String, Vec<Option<ModuleRelocTarget>>)>,
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
     span_ids: FxHashMap<MirSpan, u32>,
@@ -190,11 +200,13 @@ impl<'db> Recorder<'db> {
         db: &'db dyn HirDatabase,
         isa: &'static dyn TargetIsa,
         target: &'static Target,
+        checked: bool,
     ) -> Self {
         Recorder {
             db,
             isa,
             target,
+            checked,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -281,7 +293,8 @@ impl<'db> Recorder<'db> {
             rustc_type_ir::RegionKind::ReBound(..) => region,
             _ => Region::new_erased(interner),
         });
-        let instance = Instance { def, args: args.store() };
+        let checked = super::compiled_checked(self.db, def, args, self.checked);
+        let instance = Instance { def, args: args.store(), checked };
         Ok(self.func(FuncTarget::Instance(instance, env.store()), sig))
     }
 

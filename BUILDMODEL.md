@@ -1,7 +1,7 @@
 # Cargo's build model in rustd
 
-Branch `rustd-build-model`, from `rustd-collate` at 6d12f21c86. Linux x86-64, Rust 1.99.0,
-LLVM 20.
+Branch `rustd-build-model`. The second round starts from `rustd-collate` at 0151c01218
+merged in. Linux x86-64, Rust 1.99.0, LLVM 20.
 
 This is a survey of which parts of cargo's build model rustd follows, with a small project
 for each part under `harness/buildmodel/` and a script, `harness/buildmodel.py`, that builds
@@ -14,13 +14,19 @@ under the same daemon and each step is compared with cargo again.
 Measured with
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm
-    cd harness && RUSTD_BIN=$PWD/../target/release/rustd python3 buildmodel.py --jobs 6 --table table.md
+    cd harness
+    RUSTD_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
+    RUSTD_BIN=... RUSTD_OPT=2 RUSTD_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
 
-Result: 180 of 180 runs as expected, 0 WRONG. That is 90 cases under each of Cranelift and
-LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`), and the two backends agree on every row: 82 supported
-and 8 refused. Of the 8, 2 are projects cargo itself turns down. The cases have 16
-invalidation steps between them, run under each backend: 9 come out the same as cargo's
-rebuild and 7 are refused with "start it again".
+Result: 97 of 97 as expected under Cranelift and 97 of 97 under LLVM, 0 WRONG. The two
+tables are the same but for the backend column: 92 supported and 5 refused. Of the 5, 2 are
+projects cargo itself turns down, 2 are `lto` and 1 is doctests. The cases have 31
+invalidation steps between them: 29 come out the same as cargo's rebuild and 2 are refused
+with a reason (an edit to a crate the daemon was not asked to build, see below). None is
+"start it again" any more.
+
+The first round ended at 90 cases per backend, 82 supported and 8 refused, with 16 steps of
+which 7 were refused.
 
 A row is one of three things. "supported": the two programs print and return the same, and
 every function of the crates the case names was compiled by rustd. "refused": rustd said why
@@ -29,10 +35,139 @@ rustc with a reason. "WRONG": a different output, a crash, or a refusal without 
 script fails on a WRONG row and on any row that is not what its `case.json` expects, so a
 feature that stops working, or a refusal that starts to pass, is seen.
 
-## What was wrong and what was done
+## Second round
 
-The first run of the suite, before any fix, had 19 WRONG rows of 87 under Cranelift. They fell
-into the groups below; each says whether it was fixed or turned into a refusal.
+### 1. A checkout is loaded again in place
+
+Before, a change under a running daemon to `Cargo.toml`, `Cargo.lock`,
+`.cargo/config.toml`, `RUSTFLAGS`, or a build-script input that changes what the script
+says was answered with "start it again". Now the daemon loads that checkout's workspace
+again and goes on.
+
+How it works. `inputs.rs` keeps, for each checkout, the files cargo reads of it (manifests,
+lock file, configuration files), the flag variables of the client that asked, and what the
+build scripts said. Before a request is served, the checkouts it is about are asked whether
+any of that is stale. For a stale one, cargo is asked again for the workspace of that
+checkout only (`Checkouts::reload`), and the new crate graph is put in place of the old
+with `load-cargo`'s `Loaded::replace`. Other checkouts are not looked at. Each crate is
+then compared with what it was before (its data, cfg and environment): a crate that is the
+same keeps its salsa state, and since the disk store is keyed on a crate's content, its
+stored code is still found. Crates that differ are compiled again. When the graph itself
+changed, the programs of that checkout start over: their functions are compiled again or
+taken from the store, and the client's link line, sent with the request, is the new one.
+
+A request and a reload never interleave. The daemon serves builds one at a time; a request
+that arrives while a build runs waits, and staleness is checked and the reload done before
+that request's build starts. So a build sees the model from before the reload or the one
+after it, whole.
+
+Two things had to be fixed on the way. Files that are new to a checkout after a reload (a
+new `build.rs`, a new member) had no source root and the daemon panicked; `load-cargo` now
+puts them in the root of the directory they are in. And variables that were only meant for
+running cargo were also given to crates as if `env!` could read them; `project-model` now
+keeps the two apart (`extra_env_for_commands_only`).
+
+Measured. The 7 steps that were refused are "same" now (`config_env`, the `RUSTFLAGS` and
+configuration rustflags cases, the manifest and build-script cases in the table). New
+cases, all "same" under both backends:
+
+- `reload_dep_added`: a dependency is added, then removed again.
+- `reload_lock_version`: the version of a dependency in `Cargo.lock` goes up, then down.
+- `reload_feature_toggled`: a feature of a dependency and a default feature of the package
+  are turned on in the manifest, then both off, with 6
+  clients asking at once after each change.
+- `reload_member_added`: a new workspace member is added and depended on.
+- `reload_build_script_added`: a `build.rs` appears that sets a cfg and an env variable,
+  then says something else.
+- `reload_git_checkout`: `git checkout` between two commits that differ in all of the
+  above, there, back and there again, with 6 clients asking at once each time.
+
+`worktrees.py` has a new step where the manifest of one of several checkouts changes in a
+way no crate reads; it passes 62 of 62 (plain, `--join`, `--together`) and 71 of 71
+(`--overlay`), which includes its counts of what each checkout compiles.
+
+Inferred, not measured: that "6 clients at once" exercises every interleaving. It shows
+that six requests arriving together after a change all get the new program; the argument
+that none can see a mix is the one above, from how the daemon orders builds, not a test
+that tries to catch one mid-reload. How long a reload takes was not measured either; it is
+one `cargo metadata` and the build scripts of that checkout.
+
+One thing this turned up, which was silently wrong before and is a refusal now. A daemon
+asked to build only `app` (`--crate app`) took an edit to a path dependency of `app`,
+answered "ok", and the program still ran rustc's old copy of the dependency. That is now
+refused: "... is of `dep`, which the program uses and the daemon was not asked to build:
+rustc's copy of it is from before the edit, name the crate with `--crate`". Cases
+`dep_not_named` and the second step of `reload_member_added` (an edit inside a member that
+did not exist when the daemon was told what to build). After a reload the refusal is not
+given, because the client has just sent a link line from a fresh cargo build.
+
+### 2. Debug info from the unit graph
+
+`crates/rustd/src/profile.rs`, which read `Cargo.toml` itself, is deleted, and the `toml`
+dependency of `rustd` with it. `Plan::debug()` in `plan.rs` says whether the packages the
+build was asked for have debug info, from the profile of their units in cargo's unit graph,
+with `-g` and `-C debuginfo=` of the rustflags over it. That sees `.cargo/config.toml`
+profiles and per-package overrides because cargo has already applied them. It is kept per
+checkout and read again on a reload. `RUSTD_DEBUGINFO` still overrides it. `debuginfo.py`
+passes under both backends.
+
+### 3. Overflow checks and debug assertions per package
+
+Both rows that were refused (`overflow_checks_package`, `release_package_checks`) are
+supported.
+
+`debug-assertions` was already per crate, since it is a cfg. For overflow checks, an
+instance of a function now carries whether it is compiled with checks (`Instance::checked`
+in `codegen.rs`). A function that is neither generic nor `#[inline]` takes the setting of
+the crate that defines it. A generic or `#[inline]` function takes the setting of the code
+that asks for it, so the same generic function can exist twice in one program, once
+checked and once not. The stable name of a checked instance ends in " checked", and that
+name is what the store is keyed on, so the two never share an entry; the single
+whole-build overflow setting is gone from `Entry::key`.
+
+`keys.py` has 10 more cases (46 of 46 right, 0 open, both backends): overflow checks
+changed for a dependency only, for the program crate only, for a generic function used
+from two crates with different settings, the same in release, and debug assertions for one
+package. Each builds with an empty store, changes the setting, builds with the warm store
+in place and in a copy elsewhere, and compares with cargo.
+
+Known differences that are not covered by a case:
+
+- With `-Z share-generics`, which is on by default at `opt-level` 0, rustc may reuse an
+  instantiation that an upstream crate already made, with the upstream crate's setting.
+  rustd always uses the setting of the crate that asks. The fixtures do not show a
+  difference; a program built so that it depends on which copy rustc reuses could.
+- In release rustc can decide by itself that a small non-generic function is inlinable
+  across crates and compile it in the caller, with the caller's setting. rustd goes by
+  `#[inline]` only. The fixture's function for "defined in the dependency" is
+  `#[inline(never)]` for that reason.
+- The `ub_checks` intrinsic is a constant false, as before.
+
+### 4. Doctests
+
+Refused, with what is missing named. `rustd build --doc` and the `doctest` case (which now
+has a plain doctest, a `should_panic`, a `no_run` and a `compile_fail`) say: rustdoc takes
+each example out of the documentation, compiles it as a crate of its own and runs it, and
+a stable rustdoc tells nobody where that crate and its link line are (`--persist-doctests`
+and `--test-builder` are unstable). rustd lacks the two things that would stand in for it:
+taking the examples out itself (hidden `#` lines, the `main` put around an example, the
+`should_panic`, `no_run`, `compile_fail`, `ignore` and edition marks), and linking a
+program of its own for each, where today it only replaces functions of a program cargo
+linked.
+
+### 5. `[target.'cfg(..)'] rustflags`
+
+Supported (`config_rustflags_cfg`). The keys of `[target]` tables are matched with
+`cargo-platform` against the triple and the cfg of the target as rustc prints it, and the
+flags of every table that matches are joined the way cargo does. The refusal is gone.
+
+### `lto`
+
+Still refused, same reason as before.
+
+## First round: what was wrong and what was done
+
+The first run of the suite, before any fix, had 19 WRONG rows of 87 under Cranelift.
 
 Fixed at the root:
 
@@ -74,29 +209,9 @@ Fixed at the root:
 - Files a build script writes into `OUT_DIR` were taken for files that never change, so
   generated code was stale after the script ran again. They are watched now.
 
-Turned into a refusal, with the reason rustd gives:
-
-- `lto = true` / `"thin"` (also `-C lto` in the flags): the link failed with undefined
-  symbols. Now: "`lto` is on: rustc compiles the whole program again as it links it and
-  leaves no library on the link line for rustd's functions to be linked against".
-- Overflow checks that differ between packages of one program (`[profile.dev.package.x]
-  overflow-checks`): a generic function instantiated in one package and defined in another
-  takes the setting of the one that instantiates it, and rustd's code for it is shared.
-  Functions that reach across such a border are left to rustc with that reason. Doing it
-  properly means keying shared instantiations on the setting, which is a larger change.
-- `[target.'cfg(..)'] rustflags`: rustd does not evaluate the cfg against the target, and
-  says to name the triple.
-- A change, under a running daemon, of `.cargo/config.toml`, of `RUSTFLAGS`, of a
-  `Cargo.toml`, or of something a build script reads (`rerun-if-changed`,
-  `rerun-if-env-changed`, the script's own source) when the script then says something
-  else (another cfg, another `rustc-env`, another `OUT_DIR`). Before, the daemon went on
-  with what it had loaded and the program differed from cargo's. `inputs.rs` now watches
-  these: when a watched thing changes it runs the build scripts again, and if what they say
-  is what was loaded the build goes on (and generated files are read again); otherwise the
-  request is answered with "... is not what the daemon loaded, start it again". Loading the
-  checkout again in place is the real fix and is not done; the daemon already refused a
-  changed `Cargo.toml` the same way.
-- Doctests: rustdoc compiles them itself and never asks rustd. The row says so.
+Turned into a refusal in the first round: `lto`; and four that the second round has since
+dealt with (per-package overflow checks, `[target.'cfg(..)'] rustflags`, changes that
+needed a restart, doctests).
 
 Two rows are refusals by cargo itself (`env!` of an unset variable, a `rust-version` newer
 than the toolchain); the case checks that rustd turns the project down too.
@@ -114,26 +229,26 @@ Inferred, not measured:
   the program's output agree with rustc. Whether rustd's backends emit the wider
   instructions was not looked at.
 - The cross rows run under qemu (aarch64) and natively (musl). Other targets were not run.
-- Two clients with different environments asking one daemon at the same moment is covered
-  by a unit test of the protocol and by the single-client steps here, not by a test with
-  two clients racing.
+- The points marked as inferred under "A checkout is loaded again in place" and the known
+  differences under "Overflow checks and debug assertions per package".
 
 ## Still open
 
-- Reloading a checkout in place when its manifest, cargo configuration or build-script
-  output changes, in place of asking for a restart.
-- Per-package overflow checks across generic instantiations.
-- LTO.
-- `[target.'cfg(..)']` tables of cargo's configuration.
-- Doctests.
+- Doctests (refused).
+- LTO (refused).
+- An edit to a crate the daemon was not asked to build is refused, not built. A member or
+  dependency that appears on a reload cannot be added to what a running daemon builds; the
+  client has to name it when it starts one.
+- Overflow checks under rustc's shared generics and its automatic cross-crate inlining, as
+  described above.
 - `Flags::of` in `plan.rs` asks `cargo config get` for the configuration, which is how
   project-model already reads it; it is an unstable cargo command.
 
 ## Regression gate
 
-Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`,
-once with `RUSTD_BACKEND=cranelift` and once with `RUSTD_BACKEND=llvm RUSTD_OPT=2
-RUSTD_EMIT=fast`. The numbers were the same under both.
+Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`
+from the head of the branch, once with `RUSTD_BACKEND=cranelift` and once with
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`. The numbers were the same under both.
 
 | command | result |
 |---|---|
@@ -145,15 +260,24 @@ RUSTD_EMIT=fast`. The numbers were the same under both.
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
 | `python3 includes.py` | 9 of 9 right |
-| `python3 worktrees.py` | 58 of 58 right |
-| `python3 keys.py` | 36 of 36 right, 0 open (was 26 with 2 open) |
+| `python3 worktrees.py` | 62 of 62 right |
+| `python3 keys.py` | 46 of 46 right, 0 open |
+| `python3 debuginfo.py` | all right |
+| `python3 buildmodel.py --backend <backend> --jobs 6` | 97 of 97 as expected, 0 WRONG |
+| `python3 storecorrupts.py` | PASS, 40 damaged stores detected, discarded and rebuilt |
+| `python3 storefull.py` | PASS, 6 full disks |
+| `python3 storekills.py` | PASS, 300 kills |
+| `python3 storeshared.py` | PASS, 180 builds on a shared store |
 | `cargo fmt --all -- --check` | clean |
-| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | passes, 0 failed |
-| `cargo test --release -p project-model -p base-db` | passes, 0 failed |
+| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 929 passed, 0 failed |
 
-The gate ran on the tree as committed except for two later edits that change no behaviour: a
-doc comment moved in `base-db`, and how `buildmodel.py` prints reasons in its table. The
-binary was built again and `buildmodel.py` run again after them.
+The two backends were run side by side. The Cranelift `difftest.py` of that run failed with
+"no linker line": both runs build the same `corpus` directory, and cargo had nothing left
+to link for the second. Run again by itself it gave the line in the table. Everything else
+is from the side-by-side run.
+
+`cargo clippy --all-targets -- --cap-lints warn` on the crates touched gives warnings and no
+errors; they were not sorted into old and new.
 
 ## The table
 
@@ -164,11 +288,11 @@ One row per case. "invalidation" is what each step of the case came to under one
 | benches (`harness = false`, the `bench` profile) | `bench` | both | supported |  |  |
 | `codegen-units = 1` | `codegen_units` | both | supported |  |  |
 | `codegen-units = 1` in dev | `codegen_units_dev` | both | supported |  |  |
-| `.cargo/config.toml`: `[env]` | `config_env` | both | supported |  | the value in the configuration changes: refused (.cargo/config.toml is not what the daemon loaded, start it again) |
+| `.cargo/config.toml`: `[env]` | `config_env` | both | supported |  | the value in the configuration changes: same |
 | `.cargo/config.toml`: `[env]` under a variable of the process, and `force` | `config_env_overridden` | both | supported |  |  |
 | `.cargo/config.toml`: `[target.*] linker` and `runner` | `config_linker_runner` | both | supported |  |  |
 | `.cargo/config.toml`: `[build] rustflags` | `config_rustflags` | both | supported |  |  |
-| `.cargo/config.toml` `[target.'cfg(..)'] rustflags` | `config_rustflags_cfg` | both | refused | rustflags of `[target.'cfg(unix)']` in cargo's configuration: rustd does not tell which targets a cfg there is of, name the triple |  |
+| `.cargo/config.toml` `[target.'cfg(..)'] rustflags` | `config_rustflags_cfg` | both | supported |  |  |
 | `.cargo/config.toml` `[target.<triple>] rustflags` | `config_rustflags_target` | both | supported |  |  |
 | crate types `bin` and `lib` | `crate_bin_lib` | both | supported |  |  |
 | crate type `cdylib` | `crate_cdylib` | both | supported |  |  |
@@ -183,15 +307,16 @@ One row per case. "invalidation" is what each step of the case came to under one
 | `debug-assertions = true` in release | `debug_assertions_on` | both | supported |  |  |
 | per-package `debug-assertions` | `debug_assertions_package` | both | supported |  |  |
 | git dependency | `dep_git` | both | supported |  |  |
+| edit to a dependency the daemon was not asked to build | `dep_not_named` | both | supported |  | the dependency's source changes: refused (outside/dep/src/lib.rs is of `dep`, which the program uses and the daemon was not asked to build: rustc's copy of it is from before the edit, name the crate with `--crate`) |
 | `[patch]` | `dep_patch` | both | supported |  | the patched source changes: same |
 | path dependency outside the workspace | `dep_path` | both | supported |  | the dependency's source changes: same |
 | a workspace member that is also a registry dependency at the same version | `dep_registry_member` | both | supported |  |  |
 | renamed dependency (`package = ...`) | `dep_renamed` | both | supported |  |  |
 | `[replace]` | `dep_replace` | both | supported |  |  |
 | vendored dependency (`[source] directory`) | `dep_vendored` | both | supported |  |  |
-| doctests | `doctest` | both | refused | rustdoc compiles and runs doctests itself, a crate for each: nothing asks rustd for them, and it has no way to be asked |  |
+| doctests | `doctest` | both | refused | rustdoc takes each example out of the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc tells nobody where that crate and its link line are (`--persist-doctests`, `--test-builder` are unstable); rustd neithe |  |
 | editions 2015, 2018, 2021 and 2024 in one graph | `editions_mixed` | both | supported |  |  |
-| `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_CRATE_NAME`, `CARGO_BIN_NAME` | `env_cargo_pkg` | both | supported |  | the version in the manifest changes: refused (what a build script reads has changed and it says something else than when the daemon loaded it, start it again) |
+| `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_CRATE_NAME`, `CARGO_BIN_NAME` | `env_cargo_pkg` | both | supported |  | the version in the manifest changes: same |
 | `env!` of a variable of the process | `env_env` | both | supported |  | the variable changes: same |
 | `env!` of a variable that is not set | `env_env_unset` | both | refused | cargo turns it down too |  |
 | `option_env!` of a variable of the process | `env_option_env` | both | supported |  | the variable changes: same; another variable, which nothing reads, changes: same |
@@ -219,18 +344,24 @@ One row per case. "invalidation" is what each step of the case came to under one
 | per-package `opt-level` (`[profile.dev.package.dep]`) | `opt_level_package` | both | supported |  |  |
 | `overflow-checks = false` in dev | `overflow_checks_off` | both | supported |  |  |
 | `overflow-checks = true` in release | `overflow_checks_on` | both | supported |  |  |
-| per-package `overflow-checks` | `overflow_checks_package` | both | refused | 1 functions left to rustc: app::main: unsupported: callee `tried`: callee `catch_unwind`: callee `catch_unwind`: callee `do_call`: callee `{closure}`: unsupported: overflow checks differ between the |  |
+| per-package `overflow-checks` | `overflow_checks_package` | both | supported |  |  |
 | `panic = "abort"` | `panic_abort` | both | supported |  |  |
 | `panic = "abort"` in release | `panic_abort_release` | both | supported |  |  |
 | `panic = "unwind"` (the default) | `panic_unwind` | both | supported |  |  |
 | profile: custom (`--profile fast`, inherits release) | `profile_custom` | both | supported |  |  |
 | profile: dev | `profile_dev` | both | supported |  |  |
 | profile: release | `profile_release` | both | supported |  |  |
-| per-package checks turned on in release | `release_package_checks` | both | refused | 2 functions left to rustc: app::main: unsupported: callee `tried`: callee `catch_unwind`: callee `catch_unwind`: callee `do_call`: callee `{closure}`: callee `add_generic`: callee `add`: unsupported |  |
+| per-package checks turned on in release | `release_package_checks` | both | supported |  |  |
+| reload: a new `build.rs` | `reload_build_script_added` | both | supported |  | the package gets a build script: same; the script says something else: same |
+| reload: a dependency is added to the manifest and removed again | `reload_dep_added` | both | supported |  | a dependency is added: same; and removed: same |
+| reload: a feature is toggled in the manifest | `reload_feature_toggled` | both | supported |  | a feature of a dependency is turned on: same; a default feature of the package is turned on: same; and both off: same |
+| reload: `git checkout` between commits that differ in dependencies, lock file, features, members and build script | `reload_git_checkout` | both | supported |  | the other commit is checked out: same; and the first again: same; and the other once more: same |
+| reload: a dependency's version is bumped in `Cargo.lock` | `reload_lock_version` | both | supported |  | the lock file has the newer version: same; and the older again: same |
+| reload: a new workspace member | `reload_member_added` | both | supported |  | a member is added and depended on: same; the new member's source changes: refused (tool/src/lib.rs is of `tool`, which the program uses and the daemon was not asked to build: rustc's copy of it is from before the edit, name the crate with `--crate`) |
 | `rust-version` the toolchain meets | `rust_version_met` | both | supported |  |  |
 | `rust-version` newer than the toolchain | `rust_version_unmet` | both | refused | cargo turns it down too |  |
 | `RUSTFLAGS` with `--cfg` | `rustflags_cfg` | both | supported |  |  |
-| `RUSTFLAGS=-C debug-assertions=off` over the profile | `rustflags_debug_assertions` | both | supported |  | `RUSTFLAGS` of the client is another: refused (`RUSTFLAGS` is not what the daemon loaded, start it again) |
+| `RUSTFLAGS=-C debug-assertions=off` over the profile | `rustflags_debug_assertions` | both | supported |  | `RUSTFLAGS` of the client is another: same |
 | `RUSTFLAGS=-C opt-level=3` in dev: the checks cargo left to rustc go off | `rustflags_opt_level` | both | supported |  |  |
 | `RUSTFLAGS=-C overflow-checks=off` over the profile | `rustflags_overflow_checks` | both | supported |  |  |
 | `RUSTFLAGS=-C panic=abort` over the profile | `rustflags_panic_abort` | both | supported |  |  |
@@ -239,9 +370,9 @@ One row per case. "invalidation" is what each step of the case came to under one
 | build script: `cargo:rustc-link-lib` and `rustc-link-search` | `script_link_lib` | both | supported |  |  |
 | build script: generated code through `OUT_DIR` | `script_out_dir` | both | supported |  | `rerun-if-changed` input gains a row: same |
 | build script: `cargo:rerun-if-changed` | `script_rerun_if_changed` | both | supported |  | the named file changes: same; the build script itself changes: same |
-| build script: `cargo:rerun-if-env-changed` | `script_rerun_if_env_changed` | both | supported |  | the variable is set: refused (what a build script reads has changed and it says something else than when the daemon loaded it, start it again); the variable changes: refused (what a build script reads has changed and it says something else than when the daemon loaded it, start it again) |
-| build script: `cargo:rustc-cfg` | `script_rustc_cfg` | both | supported |  | the file the script reads turns the cfg off: refused (what a build script reads has changed and it says something else than when the daemon loaded it, start it again); and on again: same |
-| build script: `cargo:rustc-env` | `script_rustc_env` | both | supported |  | the file the script reads has another value: refused (what a build script reads has changed and it says something else than when the daemon loaded it, start it again) |
+| build script: `cargo:rerun-if-env-changed` | `script_rerun_if_env_changed` | both | supported |  | the variable is set: same; the variable changes: same |
+| build script: `cargo:rustc-cfg` | `script_rustc_cfg` | both | supported |  | the file the script reads turns the cfg off: same; and on again: same |
+| build script: `cargo:rustc-env` | `script_rustc_env` | both | supported |  | the file the script reads has another value: same |
 | `strip = "debuginfo"` with `debug = true` | `strip_debuginfo` | both | supported |  |  |
 | `strip = true` | `strip_symbols` | both | supported |  |  |
 | target-specific dependencies and `cfg(target_*)` on the host | `target_specific_deps` | both | supported |  |  |

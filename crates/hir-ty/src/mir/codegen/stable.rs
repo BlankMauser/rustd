@@ -31,6 +31,9 @@ use crate::{
 /// Before the content of a crate of the checkout, where a crate of rustc's alone has its id.
 const OF_CHECKOUT: char = '~';
 
+/// After the name of an instance compiled with `-C overflow-checks`.
+const CHECKED: &str = " checked";
+
 /// Before what stands for a crate from outside the checkout that rustc has no id for.
 const OF_LIBRARY: char = '^';
 
@@ -107,6 +110,9 @@ impl<'a, 'db> StableNames<'a, 'db> {
             InstanceDef::ReifyShim { receiver } => write!(out, "reify {receiver}").ok()?,
         }
         self.args(&mut out, instance.args.as_ref())?;
+        if instance.checked {
+            out.push_str(CHECKED);
+        }
         Some(out)
     }
 
@@ -139,6 +145,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
     /// The functions an instance without arguments can be of: one for each crate that the
     /// one build of its crate is here.
     pub(super) fn functions_named(&self, name: &str) -> Vec<FunctionId> {
+        let name = name.strip_suffix(CHECKED).unwrap_or(name);
         self.listed(name, |it| it.functions.get(name).cloned()).unwrap_or_default()
     }
 

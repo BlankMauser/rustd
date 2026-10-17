@@ -5,6 +5,8 @@
 
 use std::ffi::{c_char, c_int, CStr, VaList};
 
+// The C runtime of MSVC has `vsnprintf` inline in its headers, and out of line in this library.
+#[cfg_attr(target_env = "msvc", link(name = "legacy_stdio_definitions"))]
 unsafe extern "C" {
     fn vsnprintf(buf: *mut c_char, len: usize, format: *const c_char, args: VaList<'_>) -> c_int;
 }

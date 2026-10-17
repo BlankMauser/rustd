@@ -296,3 +296,107 @@ declines are the same every time (4 whole-object rewrites, 3 executables written
 else, 1 `abs` not in the executable, 1 running executable). The rest are "the static has
 another value that is larger", and which steps get it, and the sizes it names, differ from
 run to run under both backends. I did not find out why.
+
+## The ABI round after that
+
+Measured on `rustd-windows-abi2` (on `rustd-collate` `6d12f21c86`), on the same machine, with
+stable 1.99.0 and LLVM 20.1.8. Where this section disagrees with the ones above, this one
+is current.
+
+### The splice count
+
+The count of spliced steps in `splices.py` used to move between 59 and 61 from run to run.
+A COFF symbol does not say how large its object is, so the splice took a static to be as
+large as the next symbol of its section is far. Every static of a patch was in `.data` or
+`.rdata`, the order they were written in was not the same in each run, and the distance to
+the next one includes that one's alignment padding. An 8-byte static that had not changed
+could measure 12 or 16 bytes and be turned down as "larger".
+
+On COFF a static with a name now has a section of its own, `.data$static` or
+`.rdata$static` (`Target::section_of_static`); the linker merges them into `.data` and
+`.rdata`, and the size of the static is the size of its section. ELF, Mach-O and wasm are
+as they were. Three runs under each backend gave 61 spliced and 10 full links, and so did
+the two runs of the final matrix. `splices.py` fails on `x86_64-pc-windows-msvc` when the
+count is not 61. The ten full links are 4 whole-object rewrites, 3 executables written by
+someone else, 1 static that grew from 8 bytes to 1048576, 1 `abs` not in the executable
+and 1 running executable.
+
+### `va_arg` of wide values, and named parameters on the stack
+
+Windows x64 passes what is not 1, 2, 4 or 8 bytes behind an address: the slot holds a
+pointer to the caller's copy. `va_arg` of such a type (`u128`, `i128`, a struct of 12, 16 or
+24 bytes) reads the slot, steps over it, and copies from where it points. A struct of 1, 2,
+4 or 8 bytes is in the slot itself. The other conventions still turn down `va_arg` of more
+than 8 bytes.
+
+A variadic function may have more named parameters than the four that come in registers,
+and named parameters passed by reference; the variable arguments start at the slot after
+the last named one, wherever that is. The corpus has `by_reference` for these (Windows
+only) next to `c_variadic_named`, which the collation had dropped and is back.
+
+Still left to rustc: a variadic function with no named parameter, and one of an ABI other
+than `C` and `win64`. None is in the corpus.
+
+### `naked_asm!` with `sym` and `const`
+
+A `sym` operand goes through MIR as `AsmOperand::Sym`. The assembly names it
+`rustd_sym_N`, the relocations of the assembled object against those names are read back
+(COFF and ELF; a `rel32` call or jump, a `rip`-relative reference, an absolute 64-bit
+address), and become relocations of the function against the function or static meant.
+`const` was already put into the text. The corpus case `naked_sym` jumps to and calls a
+function, loads a static, takes the address of one and adds to it in place.
+
+Turned down, with the reason logged: `sym` in `asm!` that is not naked, a `sym` that names
+a generic function or a thread-local static, and a relocation of another kind. The case is
+in the corpus on x86-64 Unix too and the Linux harness jobs pass with it in CI, but I did
+not check there that rustd compiled it rather than leaving it to rustc. Mach-O relocations
+are not read.
+
+### CI
+
+`.github/workflows/rustd.yaml` has two Windows jobs on `windows-latest` with MSVC:
+`fmt and tests (windows)`, and `harness (windows, cranelift|llvm)`, which builds rustd with
+`--features llvm` against the LLVM 20.1.8 release and runs the matrix. Two things it needed:
+Git's `/usr/bin/link.exe` is ahead of MSVC's linker in bash and is removed, and a stub
+`libxml2s.lib` is made with `llvm-ar`. All four Windows and Linux harness jobs and both
+`fmt and tests` jobs pass on `3c0a37993e`.
+
+The test `open_pack_of_a_daemon_that_ended_is_sealed_up_to_its_last_whole_record` failed
+on Windows: the store locked the pack and then read it by path, and Windows keeps a locked
+file from every other handle, those of the same process too. It reads through the handle
+that holds the lock now. This is shared code.
+
+The `coverage` workflow fails on this branch as it does on `6d12f21c86`: it is
+rust-analyzer's own, and 18 tests of `hir-ide` (type display, incremental queries) fail in
+it. I left it alone.
+
+### Harness results (measured, `3c0a37993e`)
+
+One binary built with `--features llvm`; the Cranelift column is that binary with the
+default backend.
+
+| Harness | LLVM | LLVM compiled / left | Cranelift |
+|---|---|---|---|
+| `difftest.py corpus --layouts` | MATCH, 827/827, 0 of 898 layouts differ | 11779 / 0 | MATCH, 827/827, 0 of 898 |
+| `scoreboard.py` | 6 targets match | 18622 / 0 | 6 targets match |
+| `programs.py` | 22 of 22 | 1289 / 0 | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts | 5435 / 0 | 99 of 99, 0 restarts |
+| `breakers.py` | 25 of 25, 0 open | 3065 / 0 | 25 of 25, 0 open |
+| `unwinds.py` | 8 of 8 | 102 / 0 | 8 of 8 |
+| `RUSTD_SPLICE=1 splices.py` | 71 of 71, 61 spliced | 2340 / 0 | 71 of 71, 61 spliced |
+| `asmedits.py` | 10 of 10 | 20 / 0 | 10 of 10 |
+| `deps.py` | 10 of 10 | 0 / 0 | 10 of 10 |
+| `includes.py` | 9 of 9 | 76 / 0 | 9 of 9 |
+| `RUSTD_SPLICE=1 worktrees.py` | 58 of 58 | 2396 / 0 | 58 of 58 |
+| `worktrees.py --join --together` | 58 of 58 | 2439 / 0 | 58 of 58 |
+| `worktrees.py --overlay` | 67 of 67 | 1998 / 0 | 67 of 67 |
+| `keys.py` | 26 of 26, 4 open | 7973 / 0 | 26 of 26, 4 open |
+
+The four open cases of `keys.py` are the ones the harness lists as open: a variable of the
+process read by `option_env!`, and the release profile, each "again" and "elsewhere".
+
+### What is left
+
+1. `sym` in `asm!` that is not naked, and `sym` of a generic function.
+2. A variadic function with no named parameter.
+3. `naked_asm!` with `sym` on Mach-O, and a check on Linux that rustd compiles the ELF case.
