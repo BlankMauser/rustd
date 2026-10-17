@@ -26,7 +26,7 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::Body,
-    hir::ExprId,
+    hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
@@ -42,7 +42,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 
 use crate::mir::is_by_move_coroutine;
@@ -65,9 +65,10 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
-    Requests,
+    Requests, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -82,6 +83,7 @@ mod asm;
 mod backend;
 pub use backend::Backend;
 mod cached;
+mod debuginfo;
 mod float_pair;
 mod fragment;
 mod home;
@@ -95,7 +97,10 @@ mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 
 pub use patch::{Stale, StaleSteps};
-pub use store::{pack_name, seal_left_open};
+pub use store::{
+    Collected, FORMAT as STORE_FORMAT, Stats, StoreDir, Verified, compiles_against, is_pack,
+    limit_from_env, pack_name, parse_size, write_file_whole,
+};
 mod type_id;
 mod unwind;
 mod vtable;
@@ -143,6 +148,11 @@ pub trait SymbolResolver {
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    /// The directory the names of [`Self::source_path`] are relative to, when the build is
+    /// to tell a debugger where its code comes from.
+    fn debug_directory(&self) -> Option<String> {
+        None
+    }
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
         false
@@ -842,6 +852,8 @@ struct ObjectCodegen<'a, 'db> {
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     unwind: UnwindContext,
+    /// What a debugger is told about the functions, when the build tells one anything.
+    debug: Option<DebugContext>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1087,6 +1099,25 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
         fx.args = Some(args);
         fx.codegen()
     })
+}
+
+/// Whether the crate is built with `-C overflow-checks`, when cargo builds it. The standard
+/// library is built already, without.
+fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
+    if krate.data(db).origin.is_lang() {
+        return None;
+    }
+    let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
+    Some(krate.cfg_options(db).check_atom(&flag))
+}
+
+/// Whether the crates cargo builds have `-C overflow-checks`, when they all agree.
+#[salsa::tracked(returns(copy))]
+fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
+    let crates = base_db::all_crates(db);
+    let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
+    let first = settings.next()?;
+    settings.all(|it| it == first).then_some(first)
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -1606,6 +1637,38 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
+/// What a debugger is told of `variables`, which are of the body of `owner`. A name the body
+/// gives to more than one local is left out: nothing says yet from where to where each of
+/// them is the one meant. So is a variable of a type that is not told of.
+fn described_variables(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    env: &StoredParamEnvAndCrate,
+    variables: &[Variable],
+) -> Vec<VariableDebug> {
+    let body = Body::of(db, owner);
+    let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
+    for (_, binding) in body.bindings() {
+        *uses.entry(&binding.name).or_default() += 1;
+    }
+    let types = debuginfo::Types::new(db, env.as_ref(db));
+    variables
+        .iter()
+        .filter_map(|variable| {
+            let name = &body[variable.binding].name;
+            if uses.get(name) != Some(&1) {
+                return None;
+            }
+            Some(VariableDebug {
+                name: name.as_str().to_owned(),
+                param: variable.param,
+                ty: types.describe(variable.ty.as_ref())?,
+                offset: variable.offset,
+            })
+        })
+        .collect()
+}
+
 /// File, line and column of a place in a body, as rustc reports them.
 #[salsa::tracked]
 fn source_location<'db>(
@@ -1616,10 +1679,26 @@ fn source_location<'db>(
     let source_map = &Body::with_source_map(db, owner).1;
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => {
+            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+                (Ok(written), _) => written,
+                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
+                    source_map.expr_syntax(*tail).ok()?
+                }
+                (Err(_), _) => return None,
+            }
+        }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
     let mut range = source.value.syntax_node_ptr().text_range();
+    if let MirSpan::ExprEnd(_) = span {
+        // The brace that closes a block, which is where rustc has a scope left.
+        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+        return location_of(db, source.file_id, TextRange::new(last?, range.end()));
+    }
     if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
         // A method call is reported from the method's name on.
         let root = source.file_id.parse_or_expand(db);
@@ -1783,13 +1862,39 @@ fn compile<'db>(
                 align: 16,
                 relocs,
                 unwind: None,
+                lines: Vec::new(),
             }
         }
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
+    let source = match body.map(|body| body.owner) {
+        Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
+        _ => None,
+    };
+    let variables = variables(&ctx, std::mem::take(&mut cg.named));
+    let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, layouts })
+    Ok(CompiledFunction { requests, code, source, variables, layouts })
+}
+
+/// Where the slots of named locals ended up in the frame Cranelift laid out. None of them
+/// is known when the code is another backend's, which keeps locals where it likes.
+fn variables(
+    ctx: &cranelift_codegen::Context,
+    named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
+) -> Vec<Variable> {
+    let Some(frame) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) else {
+        return Vec::new();
+    };
+    let to_fp = i64::from(frame.frame_to_fp_offset);
+    named
+        .into_iter()
+        .filter_map(|(binding, param, ty, slot)| {
+            let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
+            Some(Variable { binding, param, ty, offset })
+        })
+        .collect()
 }
 
 fn build<'db>(
@@ -1802,6 +1907,9 @@ fn build<'db>(
     let interner = DbInterner::new_with(cg.db, env.krate);
     let mut ctx = cranelift_codegen::Context::new();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
+    // Source locations are kept as distances from the first one set, and the distance of
+    // the one just below it is taken for none at all.
+    ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut fx = FunctionCx {
         cg,
@@ -1834,6 +1942,7 @@ fn build<'db>(
         suspended_drop: None,
     };
     fill(&mut fx)?;
+    fx.note_variables();
     fx.builder.seal_all_blocks();
     let config = fx.cg.target_config();
     let guarded = fx.guarded;
@@ -1891,6 +2000,9 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
                 .collect(),
             unwind: FunctionUnwind::of(isa, ctx)?,
+            lines: LineRow::of_ranges(
+                compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+            ),
         })
     }));
     match outcome {
@@ -1915,7 +2027,14 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
     for reloc in &mut relocs {
         reloc.offset += body;
     }
-    Ok(Code { signature: func.signature.clone(), bytes, align: 1, relocs, unwind: None })
+    Ok(Code {
+        signature: func.signature.clone(),
+        bytes,
+        align: 1,
+        relocs,
+        unwind: None,
+        lines: Vec::new(),
+    })
 }
 
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
@@ -1960,11 +2079,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
+        let debug = symbols
+            .debug_directory()
+            .and_then(|directory| DebugContext::new(module.isa(), &directory));
+        let debugged = debug.is_some();
         Ok(ObjectCodegen {
             db,
             symbols,
             module,
             unwind,
+            debug,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -2008,7 +2132,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store))),
+                .map(|store| {
+                    let checked = build_checks_overflow(db);
+                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked))
+                }),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2020,12 +2147,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         })
     }
 
-    fn finish(self) -> Result<Vec<u8>> {
+    fn finish(mut self) -> Result<Vec<u8>> {
         if Target::current().writes_wasm_objects() {
             return self.finish_wasm();
         }
+        self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
+        if let Some(debug) = self.debug {
+            debug.emit(&mut product).map_err(CodegenError::Backend)?;
+        }
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
@@ -2103,6 +2234,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
+        let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), Some(func));
         Ok(symbol)
     }
 
@@ -2273,8 +2406,48 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             );
         }
         let ids = self.stitch(id, compiled)?;
-        self.keep(instance, compiled, &ids);
+        let name = self.backtrace_name(instance);
+        let declared = match instance.def {
+            InstanceDef::Fn(func) => Some(func),
+            _ => None,
+        };
+        let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
+        self.keep(instance, compiled, &ids, debug);
         Ok(())
+    }
+
+    /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
+    /// has it, and which line each of its instructions is of. `None` when no debugger is
+    /// told anything.
+    fn describe(
+        &mut self,
+        id: FuncId,
+        compiled: &CompiledFunction,
+        mut debug: FunctionDebug,
+        declared: Option<FunctionId>,
+    ) -> Option<FunctionDebug> {
+        self.debug.as_ref()?;
+        if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
+            debug.declared = Some(debug.place(file, line, column));
+        }
+        if let Some((owner, spans)) = &compiled.source {
+            for row in &compiled.code.lines {
+                let Some(&span) = spans.get(row.span as usize) else { continue };
+                let Some((file, line, column)) = self.location_at(Some((*owner, span))) else {
+                    continue;
+                };
+                let place = debug.place(file, line, column);
+                debug.row(row.offset, place);
+            }
+        }
+        if let Some((owner, _)) = &compiled.source
+            && let Some((env, variables)) = &compiled.variables
+        {
+            debug.variables = described_variables(self.db, *owner, env, variables);
+        }
+        let len = compiled.code.bytes.len() as u32;
+        self.debug.as_mut()?.add_function(id, len, &debug);
+        Some(debug)
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
@@ -2288,20 +2461,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Adds a stitched instance to the store, when everything it is and refers to has a name
     /// that another run of the daemon can find it by.
-    fn keep(&mut self, instance: &Instance, compiled: &CompiledFunction, ids: &Resolved) {
+    fn keep(
+        &mut self,
+        instance: &Instance,
+        compiled: &CompiledFunction,
+        ids: &Resolved,
+        debug: Option<FunctionDebug>,
+    ) {
         // What a patch refers to is in its base under names of that one object.
         let Some(store) = store::Store::global().filter(|_| self.base.is_none()) else { return };
         let Some(name) = self.stable_name(instance) else {
             self.kept.unnamed += 1;
             return;
         };
-        let Some(key) = cached::Entry::key(&name) else { return };
-        let stored = store.get(&key);
-        let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
-        if stored.is_some() && !check {
+        let checked = build_checks_overflow(self.db);
+        let Some(key) = cached::Entry::key(&name, debug.is_some(), checked) else { return };
+        let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
+        if !check && store.has(&key) {
             return;
         }
-        let Some(entry) = self.entry(instance, compiled, ids) else {
+        let stored = store.get(&key).filter(|_| check);
+        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
@@ -2317,7 +2497,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 eprintln!("entry of `{name}` is not what was compiled");
                 if let Some(path) = std::env::var_os("RUSTD_CACHE_CHECK").filter(|it| it != "1") {
                     let at = std::path::Path::new(&path).join(self.kept.differing.to_string());
-                    let was = cached::Entry::decode(stored);
+                    let was = cached::Entry::decode(&stored);
                     _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
                 }
             }
@@ -2335,6 +2515,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         instance: &Instance,
         compiled: &CompiledFunction,
         ids: &Resolved,
+        debug: Option<FunctionDebug>,
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let mut funcs = Vec::with_capacity(ids.funcs.len());
@@ -2438,6 +2619,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             funcs,
             datas,
             code: cached::CachedCode::from(&compiled.code),
+            debug,
         })
     }
 
@@ -2537,6 +2719,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let code = entry.code.code();
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
+        if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
+            debug.add_function(id, code.bytes.len() as u32, of);
+        }
         self.bodies += 1;
         self.kept.found += 1;
         Ok(())
@@ -3061,6 +3246,40 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.named.insert(name, id);
         }
         Ok(id)
+    }
+
+    /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
+    /// the last name of it otherwise.
+    fn backtrace_name(&self, instance: &Instance) -> String {
+        let db = self.db;
+        let args = instance.args.as_ref();
+        let ty = || args.as_slice().first().and_then(|arg| arg.ty());
+        let of_closure = |owner: InferBodyId<'db>, expr| match owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                super::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
+            }
+            _ => None,
+        };
+        let name = match instance.def {
+            InstanceDef::Fn(func) => {
+                super::type_name::rustc_function_name(db, func, args.as_slice())
+            }
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::DropGlue => ty()
+                .and_then(|ty| super::type_name::rustc_symbol_type(db, ty))
+                .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
+            InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        };
+        name.unwrap_or_else(|| self.callee_name(instance.def).to_owned())
     }
 
     fn callee_name(&self, def: InstanceDef) -> &'db str {
@@ -3593,8 +3812,9 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
+    /// The block to generate each `Drop` terminator in, with its place and target, and the
+    /// statement the drop is of.
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, MirSpan)>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -4923,7 +5143,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.builder.switch_to_block(self.blocks[id]);
             for statement in &block.statements {
-                self.span = statement.span;
+                self.at(statement.span);
                 match &statement.kind {
                     // A promoted constant already holds its value.
                     StatementKind::Assign(place, _)
@@ -4943,7 +5163,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let Some(terminator) = &block.terminator else {
                 unsupported!("block without terminator");
             };
-            self.span = terminator.span;
+            self.at(terminator.span);
             let target = match &terminator.kind {
                 // A promoted call already holds its value, and that value is read-only.
                 TerminatorKind::Call { destination, target: Some(target), .. }
@@ -4966,8 +5186,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+        for (block, place, target, span) in std::mem::take(&mut self.deferred_drops) {
             self.builder.switch_to_block(block);
+            self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
             let replace =
@@ -5004,7 +5225,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
             self.builder.switch_to_block(suspended);
-            self.drop_live_locals()?;
+            self.at(Self::returns_at(body));
+            self.drop_live_locals(Some(&Self::scope_ends(body)))?;
             self.builder.ins().jump(done, &[]);
         }
         self.emit_cleanup()
@@ -6412,7 +6634,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             _ => self.builder.ins().ireduce(ty, zero),
                         };
                         let (value, overflow) = self.builder.ins().ssub_overflow(zero, value);
-                        self.panic_if(overflow, OverflowOp::Neg)?;
+                        self.panic_if_overflow(overflow, OverflowOp::Neg)?;
                         value
                     }
                 };
@@ -6786,7 +7008,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && self.builder.func.dfg.value_type(l) == types::I128
         {
             let (value, overflow) = self.wide_mul_overflow(l, r, signed)?;
-            self.panic_if(overflow, OverflowOp::Mul)?;
+            self.panic_if_overflow(overflow, OverflowOp::Mul)?;
             return Ok(value);
         }
         let ins = self.builder.ins();
@@ -6811,7 +7033,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     BinOp::Sub => OverflowOp::Sub,
                     _ => OverflowOp::Mul,
                 };
-                self.panic_if(overflow, op)?;
+                self.panic_if_overflow(overflow, op)?;
                 value
             }
             BinOp::Div | BinOp::Rem => {
@@ -6845,7 +7067,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
                     (_, false) => (OverflowOp::Shr, self.builder.ins().ushr(l, r)),
                 };
-                self.panic_if(overflow, shift_op)?;
+                self.panic_if_overflow(overflow, shift_op)?;
                 value
             }
             BinOp::Offset => unsupported!("pointer offset"),
@@ -6949,6 +7171,35 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
+    /// Whether arithmetic of the body being compiled panics when it overflows. rustc decides
+    /// it twice: the crate the body is written in leaves the check out of what it keeps of the
+    /// body unless it has `-C overflow-checks` or the function takes the setting of its
+    /// callers, and the crate that compiles the body drops the check unless it has the flag.
+    fn checks_overflow(&self) -> Result<bool> {
+        let db = self.cg.db;
+        let Some(body) = self.body else { return Ok(false) };
+        let inherits = match body.owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+            }
+            _ => false,
+        };
+        let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
+        if written_with == Some(false) || (written_with.is_none() && !inherits) {
+            return Ok(false);
+        }
+        match build_checks_overflow(db) {
+            Some(checked) => Ok(checked),
+            // The body is compiled by whichever crate uses it, and that is not known here.
+            None => unsupported!("overflow checks differ between the packages of the build"),
+        }
+    }
+
+    /// Branches to a panic when `overflow` is set, if the body is one that checks.
+    fn panic_if_overflow(&mut self, overflow: Value, op: OverflowOp) -> Result<()> {
+        if self.checks_overflow()? { self.panic_if(overflow, op) } else { Ok(()) }
+    }
+
     /// Branches to a call of rustc's `panic_const_*` when `cond` is set.
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
         let name = match op {
@@ -7039,6 +7290,38 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Some(addr))
     }
 
+    /// Notes the locals a debugger can be told of: the ones written with a name whose value
+    /// is in a stack slot of its own. A closure's are left out, where a name may be of what
+    /// the closure captured.
+    fn note_variables(&mut self) {
+        let Some(body) = self.body else { return };
+        if !matches!(body.owner, InferBodyId::DefWithBodyId(_)) || !body.upvar_locals.is_empty() {
+            return;
+        }
+        for (binding, &local) in body.binding_locals.iter() {
+            let Some(&LocalSlot { addr, borrowed: false }) = self.locals.get(local) else {
+                continue;
+            };
+            let dfg = &self.builder.func.dfg;
+            let ir::ValueDef::Result(inst, 0) = dfg.value_def(addr) else { continue };
+            let ir::InstructionData::StackAddr { stack_slot, offset, .. } = dfg.insts[inst] else {
+                continue;
+            };
+            if i32::from(offset) == 0 {
+                let param = body.param_locals.contains(&local);
+                let ty = body.locals[local].ty.clone();
+                self.cg.named.push((binding, param, ty, stack_slot));
+            }
+        }
+    }
+
+    /// Has what is built from here on be of the statement at `span`.
+    fn at(&mut self, span: MirSpan) {
+        self.span = span;
+        let loc = self.cg.source_loc(span);
+        self.builder.set_srcloc(loc);
+    }
+
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
     fn caller_location(&mut self) -> Result<Value> {
         if let Some(location) = self.location {
@@ -7098,7 +7381,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target));
+                self.deferred_drops.push((block, place.clone(), *target, self.span));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -8599,7 +8882,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("overflow_checks", []) => {
-                let value = self.builder.ins().iconst(types::I8, 1);
+                let Some(checked) = build_checks_overflow(self.cg.db) else {
+                    unsupported!("overflow checks differ between the packages of the build");
+                };
+                let value = self.builder.ins().iconst(types::I8, i64::from(checked));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])
@@ -9552,9 +9838,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
     ) -> Vec<Value> {
         self.guarded = true;
-        self.builder.set_srcloc(unwind::seh::guarded());
+        let loc = self.cg.source_loc(self.span);
+        self.builder.set_srcloc(unwind::seh::guarded(loc));
         let call = call(&mut self.builder);
-        self.builder.set_srcloc(ir::SourceLoc::default());
+        self.at(self.span);
         let results = self.builder.inst_results(call).to_vec();
         let frame = self.builder.ins().get_frame_pointer(ptr());
         let exception = self.builder.ins().load(ptr(), MEM, frame, unwind::seh::ARRIVAL);
@@ -9576,7 +9863,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
-        self.drop_live_locals()?;
+        self.drop_live_locals(None)?;
         if let Some(state) = &self.suspended {
             let (addr, ty) = (state.addr, state.ty);
             self.store_state(addr, ty, PANICKED);
@@ -9584,8 +9871,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.resume_unwinding(exception)
     }
 
-    /// Drops every local that holds a value.
-    fn drop_live_locals(&mut self) -> Result<()> {
+    /// Drops every local that holds a value. Each is dropped at where `ends` has it, if that is
+    /// given, and where the code being generated is otherwise.
+    fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
         // Locals the body never drops come first, last declared first, and of those the
         // operands of the expression that unwound before the temporaries it borrowed, which
         // live to the end of the statement. The rest go in the order the body drops them when
@@ -9601,10 +9889,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
+            if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
+                self.at(end);
+            }
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
+    }
+
+    /// Where the scope of each local the body drops ends.
+    fn scope_ends(body: &MirBody<'db>) -> FxHashMap<LocalId, MirSpan> {
+        let mut ends = FxHashMap::default();
+        for (_, block) in body.basic_blocks.iter() {
+            if let Some(crate::mir::Terminator {
+                kind: TerminatorKind::Drop { place, .. },
+                span: span @ MirSpan::ExprEnd(_),
+            }) = &block.terminator
+            {
+                ends.entry(place.local).or_insert(*span);
+            }
+        }
+        ends
     }
 
     fn store_state(&mut self, state: Value, ty: Type, value: i64) {
@@ -9708,6 +10014,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().brif(is_suspended, suspended, &[], done, &[]);
         self.in_cleanup = true;
         self.builder.switch_to_block(unresumed);
+        self.at(Self::returns_at(body));
         let TyKind::Coroutine(_, args) = ty.kind() else {
             unsupported!("async body of {ty:?}");
         };
@@ -9721,6 +10028,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.suspended_drop = Some((suspended, done));
         self.builder.switch_to_block(done);
         self.return_()
+    }
+
+    /// Where the body is written to end, which is where rustc has an `async` block dropped.
+    fn returns_at(body: &MirBody<'db>) -> MirSpan {
+        let returns = body.basic_blocks.iter().find_map(|(_, block)| match &block.terminator {
+            Some(crate::mir::Terminator { kind: TerminatorKind::Return, span }) => Some(*span),
+            _ => None,
+        });
+        returns.unwrap_or(MirSpan::Unknown)
     }
 
     /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
