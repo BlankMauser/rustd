@@ -125,8 +125,8 @@ def sysroot_rlibs():
 
 
 def label(crate):
-    """A crate may be given as its root file."""
-    return os.path.basename(crate).removesuffix(".rs")
+    """A crate may be given as its root file, and several that one run compiles with commas."""
+    return "+".join(os.path.basename(c).removesuffix(".rs") for c in crate.split(","))
 
 
 class Fixture:

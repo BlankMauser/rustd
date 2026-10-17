@@ -7,7 +7,7 @@ Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects f
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
 import argparse, json, os, re, subprocess, sys
-from difftest import Fixture, compare, discard, RUNNER
+from difftest import Fixture, bucket, compare, discard, RUNNER
 
 
 UNIT = "(unit tests)"
@@ -53,11 +53,21 @@ class TestFixture(Fixture):
         key = tuple(self.rlibs)
         if deny or key not in self.shared:
             super().rustd_build(deny)
+            if self.leaves_to_rustc():
+                # rustc lays a future out its own way, so what the test leaves to rustc decides
+                # what of the crate can be rustd's: one run has to see both.
+                self.crates = [",".join(self.crates)]
+                super().rustd_build(deny)
             if not deny:
                 self.shared[key] = (self.objects, self.reports)
         else:
             objects, self.reports = self.shared[key]
             self.link(objects)
+
+    def leaves_to_rustc(self):
+        """Whether the test, compiled apart from the crate, left a function of its own to rustc."""
+        rows = self.reports[self.crates[-1]] if len(self.crates) == 2 else []
+        return any(r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function" for r in rows)
 
     def normalize(self, stdout):
         stdout = re.sub(rb"' \(\d+\) panicked", b"' panicked", stdout)
