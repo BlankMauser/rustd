@@ -26,7 +26,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use ide_db::base_db::SourceDatabase as _;
+use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _};
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
@@ -47,7 +47,7 @@ use hir_def::{
 };
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_symbol,
+    exported_symbol, link_name,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -625,9 +625,13 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = self.table.get(&path) {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name.
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            return Some(symbol);
+        }
         Some(format!("rustd.{id:x}.{path}"))
     }
 
@@ -1481,9 +1485,24 @@ impl ListedCrate {
             .copied()
             .find(|&it| hir::Function::from(it).is_main(db))
             .filter(|_| !has_no_main(db, krate));
-        let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
+        let exported = functions
+            .iter()
+            .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
+            .collect();
         ListedCrate { functions, exported, main }
     }
+}
+
+/// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
+/// through symbols rustc writes for the `#[global_allocator]`, so no call in the source names
+/// these methods, and they run all the same.
+fn serves_allocator(db: &RootDatabase, func: FunctionId) -> bool {
+    let Some(item) = hir::Function::from(func).as_assoc_item(db) else { return false };
+    let AssocItemContainer::Impl(implementation) = item.container(db) else { return false };
+    implementation.trait_(db).is_some_and(|it| {
+        let core = CrateOrigin::Lang(LangCrateOrigin::Core);
+        it.name(db).as_str() == "GlobalAlloc" && it.module(db).krate(db).origin(db) == core
+    })
 }
 
 impl Listed {
