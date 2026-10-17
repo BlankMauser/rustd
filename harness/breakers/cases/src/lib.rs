@@ -51,6 +51,7 @@ cases![
     crlf_literal,
     dyn_lifetime_upcast,
     format_of_macro,
+    static_fn_table,
     const_none_niche,
     late_import_macro,
     line_continuation,

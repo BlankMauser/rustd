@@ -2058,6 +2058,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A shared borrow borrowed again where it is used is the same borrow.
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment {
+                    kind: Adjust::Borrow(AutoBorrow::Ref(crate::infer::AutoBorrowMutability::Not)),
+                    ..
+                },
+            ] => {
+                matches!(self.store[expr], Expr::Ref { .. }) && self.is_promotable_unadjusted(expr)
+            }
             _ => false,
         }
     }
