@@ -57,6 +57,7 @@ cases![
     concat_module_path,
     fragment_parens,
     vtable_self_by_value,
+    const_format_args,
     static_enum_slice,
     const_none_niche,
     late_import_macro,

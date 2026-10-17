@@ -100,6 +100,8 @@ struct MirLowerCtx<'a, 'db> {
     extended_temporaries: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
+    /// How many `const { .. }` blocks deep the expression being lowered is.
+    inline_consts: u32,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -255,6 +257,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             super_let: None,
+            inline_consts: 0,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -1195,7 +1198,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.result.binding_locals.insert(binding, local);
                     }
                 }
-                self.lower_expr_to_place(id, place, current)
+                self.inline_consts += 1;
+                let lowered = self.lower_expr_to_place(id, place, current);
+                self.inline_consts -= 1;
+                lowered
             }
             Expr::Cast { expr, type_ref: _ } => {
                 // Since we don't have THIR, this is the "zipped" version of [rustc's HIR lowering](https://github.com/rust-lang/rust/blob/e71f9529121ca8f687e4b725e3c9adc3f1ebab4d/compiler/rustc_mir_build/src/thir/cx/expr.rs#L165-L178)
@@ -1295,7 +1301,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     // Behind a deref the local is a pointer, an overloaded index's result say,
                     // and not the value.
                     && !p.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
-                    && self.is_promotable(*expr)
+                    // What a `const { .. }` block borrows is a constant whatever it is made of.
+                    && (self.inline_consts > 0 || self.is_promotable(*expr))
                 {
                     // The local holds what the fields and elements are taken out of.
                     let mut constant = *expr;

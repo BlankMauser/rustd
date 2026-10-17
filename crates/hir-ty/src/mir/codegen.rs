@@ -5858,7 +5858,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             | TyKind::RawPtr(..)
             | TyKind::FnPtr(..)
             | TyKind::FnDef(..) => true,
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.is_freeze(element),
+            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+                self.is_freeze(element)
+            }
             TyKind::Tuple(fields) => fields.iter().all(|field| self.is_freeze(field)),
             TyKind::Adt(def, args) => {
                 let variants: Vec<VariantId> = match def.def_id() {
