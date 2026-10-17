@@ -2,9 +2,9 @@
 
 rustd is a Rust compiler daemon. One process per user stays running, keeps rust-analyzer's
 analysis of your workspaces in memory and, when given a directory, compiled functions in a
-store on disk, and answers builds from that state. After an edit it compiles the functions that changed, with Cranelift
-or LLVM, and either links them in front of what rustc built or splices them into the
-executable that is already there.
+store on disk, and answers builds from that state. After an edit it compiles the functions
+that changed, with Cranelift or LLVM, and either links them in front of what rustc built or
+splices them into the executable that is already there.
 
 cargo and rustc start from the file system on every build: they parse, resolve, type-check
 and generate code for a whole crate again when one function in it changed, and a second
@@ -53,8 +53,8 @@ backend.
     cargo +1.99.0 build -p rustd --release
 
 `vendor/rust-analyzer` is rust-analyzer at the commit rustd was forked from, and
-`vendor/apply.py` applies rustd's patches to it. With LLVM 20 installed (on Debian and Ubuntu,
-`llvm-20-dev` from apt.llvm.org):
+`vendor/apply.py` applies rustd's patches to it. With LLVM 20 installed (on Debian and
+Ubuntu, `llvm-20-dev` and `libpolly-20-dev` from apt.llvm.org):
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.0 build -p rustd --release --features llvm
 
@@ -78,7 +78,7 @@ The first build of a workspace is cargo's own, with rustd recording what rustc w
 do. It also starts the daemon, which loads the workspace in the background. Until it has,
 builds go to cargo and a line on stderr says so:
 
-    rustd: the daemon is loading the workspace; building with cargo
+    rustd: the daemon is still loading the workspace (951ms so far); building with cargo
 
 After that an edit is compiled by the daemon and no cargo process runs. `cargo rustd status`
 shows what the daemon holds and how many builds it served or handed to cargo, by reason.

@@ -112,6 +112,12 @@ These flags are handled on the daemon's path: `--target` naming the host, a sing
 `--features`, `--bin`, `--example`, `--test`, `--lib`, `--manifest-path`, `--workspace`,
 `--no-run`, `--no-fail-fast`, `-q`, test filters and the arguments after `--`.
 
+The daemon's state is kept per command line. `cargo rustd build`, `cargo rustd build -q`
+and `cargo rustd build --features x` are three different builds to rustd, told apart by a
+hash of the subcommand (`run` counts as `build`), the build flags, the working directory
+and the environment variables that change what cargo builds. The first use of each is a
+cargo build, usually a quick one because cargo's own output is shared between them.
+
 ## The daemon
 
 There is one daemon per user. It is started by the first `cargo rustd` that needs it, in a
