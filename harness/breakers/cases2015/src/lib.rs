@@ -49,3 +49,42 @@ pub mod panic_with_string {
         )
     }
 }
+
+/// plain's tests import the crate root with `use ::*;` and name its private modules.
+pub mod glob_of_root {
+    use ::*;
+
+    pub fn run() -> u32 {
+        doubling::double(21)
+    }
+}
+
+mod doubling {
+    pub fn double(n: u32) -> u32 {
+        n * 2
+    }
+}
+
+/// fxhash's trait for hashing a word leaves its parameter unnamed.
+pub mod unnamed_parameter {
+    trait HashWord {
+        fn hash_word(&mut self, Self);
+    }
+
+    impl HashWord for u32 {
+        fn hash_word(&mut self, word: Self) {
+            *self = self.rotate_left(5) ^ word;
+        }
+    }
+
+    fn hashed(mut hash: u32, bytes: &[u8]) -> u32 {
+        for byte in bytes {
+            hash.hash_word(*byte as u32);
+        }
+        hash
+    }
+
+    pub fn run() -> u32 {
+        hashed(0, b"plain words")
+    }
+}

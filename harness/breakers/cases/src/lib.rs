@@ -71,4 +71,7 @@ cases![
     line_continuation,
     static_in_static,
     type_id_of_fn,
+    glob_of_root,
+    unnamed_parameter,
+    field_named_as_type,
 ];
