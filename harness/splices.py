@@ -17,7 +17,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir, BINUTILS, toolchain, WINDOWS
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET_ARGS, built, WASM
 
 TOML = """[package]
 name = "sedge"
@@ -225,6 +225,9 @@ def strip(binary):
         tool = os.path.join(sysroot, "lib", "rustlib", host, "bin", "rust-objcopy.exe")
         subprocess.run([tool, "--strip-all", binary], check=True)
         return
+    if WASM:
+        subprocess.run(["wasm-tools", "strip", binary, "-o", binary], check=True)
+        return
     subprocess.run([BINUTILS + "strip", binary], check=True)
 
 
@@ -425,11 +428,30 @@ STEPS = [
     ("everything of one function back as it first was", [("x * 2 + 7\n", "x * 2\n"), ("#[inline(never)]\n#[cold]\n", "")], None),
 ]
 
+# `wasm32-wasip1` has no threads: what the program gives to one runs where it is asked for.
+INLINE = """
+mod inline {
+    pub struct Ran<T>(T);
+    impl<T> Ran<T> {
+        pub fn join(self) -> Result<T, ()> {
+            Ok(self.0)
+        }
+    }
+    pub fn spawn<T>(f: impl FnOnce() -> T) -> Ran<T> {
+        Ran(f())
+    }
+}
+"""
+
+
+def ported(text):
+    return text.replace("std::thread::spawn(", "inline::spawn(") if WASM else text
+
 
 def main():
     ws = tempfile.mkdtemp(prefix="rustd-splices-")
     os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", TOML), (MAIN, MAIN_TEXT)):
+    for path, text in (("Cargo.toml", TOML), (MAIN, ported(MAIN_TEXT) + (INLINE if WASM else ""))):
         open(os.path.join(ws, path), "w").write(text)
     work = tempfile.mkdtemp(prefix="rustd-splices-out-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -445,7 +467,7 @@ def main():
     splice = ["--binary", binary]
     ask = ["--crate", "sedge", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([RUSTD, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -470,6 +492,9 @@ def main():
         """What readelf and a loader that binds everything at once have against the file."""
         if WINDOWS:
             return sound_pe(path)
+        if WASM:
+            read = subprocess.run(["wasm-tools", "validate", path], capture_output=True, text=True)
+            return f"invalid: {read.stderr.strip()[:80]}" if read.returncode else None
         read = subprocess.run(["readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
         said = [l for l in read.stderr.splitlines() if l.strip()]
         if read.returncode or said:
@@ -479,6 +504,7 @@ def main():
     def edit(edits):
         text = open(os.path.join(ws, MAIN)).read()
         for old, new in edits:
+            old, new = ported(old), ported(new)
             assert old in text, old
             text = text.replace(old, new, 1)
         open(os.path.join(ws, MAIN), "w").write(text)
@@ -501,12 +527,12 @@ def main():
         began = time.time()
         reply, how = sync()
         took = (time.time() - began) * 1000
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         assert cargo.returncode == 0, cargo.stderr[-2000:]
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon died at {what!r}: {log_path}")
-        theirs = run(os.path.join(profile_dir(reference), "sedge"))
+        theirs = run(built(reference, "sedge"))
         if not reply.startswith("ok"):
             verdict = "REFUSED: " + reply[:60]
         elif run(binary) != theirs:
@@ -540,9 +566,9 @@ def main():
             if not reply.startswith("ok") or f"soak {value}\n" not in printed or (turn % 50 == 49 and sound(binary)):
                 soak_wrong += 1
                 print(f"soak {turn}: WRONG ({how}): {reply[:60]} {printed[-40:]!r}", flush=True)
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
-        same = run(binary) == run(os.path.join(profile_dir(reference), "sedge"))
+        same = run(binary) == run(built(reference, "sedge"))
         soak_wrong += not same
         times.sort()
         print(f"soak: {soak - soak_wrong} of {soak} right, {spliced} spliced, median {times[len(times) // 2]:.0f} ms per request, "

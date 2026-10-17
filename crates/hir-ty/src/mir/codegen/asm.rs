@@ -201,6 +201,7 @@ pub(super) fn wrapper(
     match arch {
         Arch::X86_64 => wrapper_x86_64(template, options, operands),
         Arch::Aarch64 => aarch64::wrapper(template, options, operands),
+        Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
 

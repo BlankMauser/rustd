@@ -152,7 +152,10 @@ impl SymbolTable {
         for symbol in object.symbols() {
             // A reference is as good as a definition: something in the link defines it.
             // Not `is_definition`, which leaves out thread locals.
-            let defined = symbol.section_index().is_some() || symbol.is_common();
+            // A wasm object's data is in segments, which are not sections.
+            let in_segment = object.format() == object::BinaryFormat::Wasm
+                && symbol.section() == object::SymbolSection::Unknown;
+            let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
             let linkable = symbol.is_undefined() || (defined && symbol.is_global());
             if !linkable {
                 continue;

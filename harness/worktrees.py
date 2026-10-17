@@ -14,7 +14,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -113,7 +113,7 @@ def main():
     first = checkouts[0]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+        [RUSTD, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
@@ -161,7 +161,7 @@ def main():
             began, reply = asking.pop(at, None) or ask(at)
             reply = reply.communicate(timeout=120)[0].strip()
             took = (time.time() - began) * 1000
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=checkout["ws"], capture_output=True,
+            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
             if daemon.poll() is not None:
@@ -171,7 +171,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(os.path.join(profile_dir(checkout["reference"]), "sapp"))
+                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
                 verdict = "same" if same else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()

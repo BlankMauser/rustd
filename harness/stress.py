@@ -14,7 +14,7 @@ import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -310,7 +310,7 @@ def main():
             reply = "no reply in 120 s"
         took = (time.time() - asked) * 1000
         died = daemon.poll() is not None
-        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         if (cargo.returncode != 0) != broken:
             raise SystemExit(f"step {index} {name!r}: cargo {'failed' if cargo.returncode else 'passed'}:\n{cargo.stderr[-2000:]}")
@@ -322,7 +322,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(os.path.join(profile_dir(reference), "sapp"))
+            ours, theirs = run(binary), run(built(reference, "sapp"))
             if ours == theirs:
                 verdict = "same"
             else:

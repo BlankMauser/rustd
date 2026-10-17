@@ -11,9 +11,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use hir_ty::mir::codegen::wasm::{
-    ADDRESS_LEN, STACK_POINTER, TYPE_INDEX_LEN, WasmFunction, WasmSignature, WasmType,
-};
+use hir_ty::mir::codegen::wasm::{INDEX_LEN, WasmFunction, WasmSignature, WasmType};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use wasm_encoder::{
@@ -479,7 +477,7 @@ impl Linker {
                 let at = reloc.offset.checked_sub(start).ok_or("relocation outside")?;
                 // A call is the address and `call_indirect` with its type.
                 // The signature of a function nothing defines is that of a call to it.
-                let type_at = (at + ADDRESS_LEN + 1) as u32;
+                let type_at = (at + INDEX_LEN + 1) as u32;
                 if let Some(Target::Undefined(name)) = symbols.targets.get(&reloc.target)
                     && let Some(&(_, ty)) = function.type_fixups.iter().find(|it| it.0 == type_at)
                     && !symbols.numbered.contains_key(name)
@@ -488,12 +486,12 @@ impl Linker {
                     out.called.insert(name.clone(), function.types[ty as usize].clone());
                 }
                 let value = (self.place(symbols, reloc.target) as i64).wrapping_add(reloc.addend);
-                let place = function.body.get_mut(at..at + ADDRESS_LEN);
+                let place = function.body.get_mut(at..at + INDEX_LEN);
                 write_sleb(place.ok_or("relocation outside")?, value);
             }
             for &(at, ty) in &function.type_fixups {
                 let ty = out.ty(&function.types[ty as usize]);
-                let place = &mut function.body[at as usize..at as usize + TYPE_INDEX_LEN];
+                let place = &mut function.body[at as usize..at as usize + INDEX_LEN];
                 write_uleb(place, ty);
             }
             let ty = out.ty(&function.signature);
@@ -602,7 +600,7 @@ impl Output {
             shared: false,
         };
         imports.import(ENV, "table", EntityType::Table(table));
-        debug_assert_eq!(STACK_POINTER, 0);
+        // The first global: an index a function leaves to be filled in reads as 0 as it is.
         let stack_pointer = GlobalType { val_type: ValType::I32, mutable: true, shared: false };
         imports.import(ENV, "stack_pointer", EntityType::Global(stack_pointer));
         for (_, ty, name) in &self.imported {

@@ -508,7 +508,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         hasher.write_isize(0);
         hasher.write_isize(0);
         hasher.write_u128(value);
-        hasher.write_u8(8);
+        hasher.write_u8(super::Target::current().word() as u8);
         Some(())
     }
 

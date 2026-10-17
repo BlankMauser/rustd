@@ -93,7 +93,7 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
             Arch::X86_64 => format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"),
-            Arch::Aarch64 => format!("{text}\n"),
+            Arch::Aarch64 | Arch::Wasm32 => format!("{text}\n"),
         };
         module.set_inline_assembly(&text);
         let object = machine
@@ -151,6 +151,8 @@ impl Machine {
         match emitted.arch {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
+            // The lowering of `wasm.rs` produces a module's functions.
+            Arch::Wasm32 => return Err(Unhandled::Llvm("no LLVM producer for wasm32".to_owned())),
         }
         let name = emitted.triple();
         let triple = TargetTriple::create(name);

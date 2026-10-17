@@ -141,9 +141,12 @@ fn main() {
     let shuffles = is_x86_feature_detected!("ssse3");
     #[cfg(target_arch = "aarch64")]
     let shuffles = std::arch::is_aarch64_feature_detected!("neon");
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if shuffles {
         case!(unsafe { simd::shuffle(&hay, &other) }, unsafe { simd::shuffle(&other, &hay) });
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (hay, other);
     case!(statics::bump(3), statics::bump(100), statics::once(), statics::once());
     case!(statics::lowest(4), statics::lowest(-9), statics::lowest(-2), statics::local(2), statics::local(77));
     case!(statics::plain(0, 5), statics::plain(2, 7), statics::plain(0, 1));
@@ -198,7 +201,9 @@ fn main() {
     println!("array_move {:?}", cases::array_move::run());
     println!("const_overflow {:?}", cases::const_overflow::run());
     println!("const_overflow more {:?}", cases::const_overflow::more());
+    #[cfg(panic = "unwind")]
     println!("unwind_cleanup {:?}", cases::unwind_cleanup::run());
+    #[cfg(panic = "unwind")]
     println!("failing_drop {:?}", cases::unwind_cleanup::failing_drop());
     println!("capture_enum_field {:?}", cases::capture_enum_field::run());
     println!("autoref_promoted {:?}", cases::autoref_promoted::run());
@@ -214,12 +219,15 @@ fn main() {
     println!("derive_ufcs {:?}", cases::derive_ufcs::run());
     println!("builtin_clone {:?}", cases::builtin_clone::run());
     println!("guard_moves {:?}", cases::guard_moves::run());
+    #[cfg(panic = "unwind")]
     println!("division_panics {:?}", cases::division_panics::run());
+    #[cfg(panic = "unwind")]
     println!("unwind_owned {:?}", cases::unwind_owned::run());
     println!("derive_copy_packed {:?}", cases::derive_copy_packed::run());
     println!("union_pointer {:?}", cases::union_pointer::run());
     println!("async_basic {:?}", cases::async_basic::run());
     println!("async_items {:?}", cases::async_items::run());
+    #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());
     println!("array_map {:?}", cases::array_map::run());
@@ -227,7 +235,9 @@ fn main() {
     println!("box_patterns {:?}", cases::box_patterns::run());
     println!("promoted_call {:?}", cases::promoted_call::run());
     println!("type_ids {:?}", cases::type_ids::run());
+    #[cfg(panic = "unwind")]
     println!("unwind_drops {:?}", cases::unwind_drops::run());
+    #[cfg(panic = "unwind")]
     println!("async_drops {:?}", cases::async_drops::run());
     println!("promoted_assoc_const {:?}", cases::promoted_assoc_const::run());
     println!("offsets {:?}", cases::offsets::run());
@@ -281,8 +291,12 @@ fn main() {
     println!("simd_x86 {}", cases::simd_x86::run());
     #[cfg(target_arch = "aarch64")]
     println!("simd_aarch64 {}", cases::simd_aarch64::run());
+    // Threads.
+    #[cfg(not(target_family = "wasm"))]
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());
     println!("module_paths {}", cases::module_paths::run());
+    // Threads.
+    #[cfg(not(target_family = "wasm"))]
     println!("fn_thread_local {:?}", cases::fn_thread_local::run());
     println!("shadowed_items {}", cases::shadowed_items::run());
     println!("hrtb_type_ids {:?}", cases::hrtb_type_ids::run());

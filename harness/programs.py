@@ -10,7 +10,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -84,7 +84,7 @@ def main():
     first = programs["sapp"]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+        [RUSTD, ws, *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
@@ -114,7 +114,7 @@ def main():
                  "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", name], cwd=ws, capture_output=True, text=True,
+            cargo = subprocess.run(["cargo", "build", "-q", "-p", name, *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                    env={**os.environ, "CARGO_TARGET_DIR": reference})
             assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
             if daemon.poll() is not None:
@@ -124,7 +124,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                verdict = "same" if run(program["bin"]) == run(os.path.join(profile_dir(reference), name)) else "DIFFERENT OUTPUT"
+                verdict = "same" if run(program["bin"]) == run(built(reference, name)) else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)

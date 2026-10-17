@@ -1,5 +1,4 @@
-//! Lowers one function of Cranelift IR to a WebAssembly function body, for a build of the
-//! compiler that runs where native code cannot: in a browser.
+//! Lowers one function of Cranelift IR to a WebAssembly function body.
 //!
 //! Cranelift has no WebAssembly backend, so this takes the IR the rest of codegen builds and
 //! writes wasm from it directly. The target is `wasm32`, so an address is an `i32`.
@@ -7,14 +6,20 @@
 //! What comes out is not a module. A [`WasmFunction`] names the functions and data it uses
 //! through relocations, like machine code does, and a linker gives them places:
 //!
-//! - every function has a slot in one function table, and every call goes through the table,
-//!   so a function is replaced by writing its slot;
+//! - a call names the function ([`Calls::Direct`]) or goes through the function's slot in
+//!   the function table ([`Calls::Table`]), so that a function is replaced by writing its
+//!   slot;
 //! - the address of a function is its slot, the address of data is where the linker put it
 //!   in linear memory;
-//! - stack slots live on a stack in linear memory, whose pointer is global 0.
+//! - stack slots live on the stack in linear memory, whose pointer is the global
+//!   `__stack_pointer`.
 //!
-//! Unwinding is not lowered: the exceptional edges of `try_call` are dropped, so a panic that
-//! would unwind has to abort.
+//! The signatures are the ones LLVM gives the same functions, since the code is linked with
+//! rustc's: a function that returns more than one value, or an `i128`, writes them through
+//! a pointer it takes ahead of its parameters.
+//!
+//! Unwinding is not lowered: the exceptional edges of `try_call` are dropped, which is what
+//! `panic=abort` means, and the wasm targets rustc has are built that way.
 
 use cranelift_codegen::{
     entity::{EntityRef, SecondaryMap},
@@ -29,13 +34,15 @@ use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use serde_derive::{Deserialize, Serialize};
 use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 
-/// The index of the global that holds the stack pointer in every module the linker writes.
-pub const STACK_POINTER: u32 = 0;
+use super::target::Calls;
 
-/// How many bytes a relocated `i32.const` operand takes: a LEB128 padded to full length.
-pub const ADDRESS_LEN: usize = 5;
-/// How many bytes a type index takes: a LEB128 padded to full length.
-pub const TYPE_INDEX_LEN: usize = 5;
+/// How many bytes an operand a linker fills in takes: a LEB128 padded to full length.
+pub const INDEX_LEN: usize = 5;
+
+/// The relocation of a `call` operand: the index of the function. The other relocation
+/// here, `Abs4`, is of an `i32.const` operand: the address of data, or the slot of a function.
+pub(super) const CALL: cranelift_codegen::binemit::Reloc =
+    cranelift_codegen::binemit::Reloc::X86CallPCRel4;
 
 /// A value type, as its byte in the binary format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -66,17 +73,62 @@ pub struct WasmSignature {
 
 impl WasmSignature {
     pub fn of(sig: &Signature) -> Result<WasmSignature, String> {
-        let flatten = |params: &[ir::AbiParam]| {
-            let mut flat = Vec::new();
-            for param in params {
-                match Class::of(param.value_type)? {
-                    Class::Pair => flat.extend([WasmType::I64, WasmType::I64]),
-                    class => flat.push(class.wasm()),
-                }
+        let mut params = Vec::new();
+        let returned = Returned::of(sig)?;
+        if let Returned::Through(_) = returned {
+            params.push(WasmType::I32);
+        }
+        for param in &sig.params {
+            match Class::of(param.value_type)? {
+                Class::Pair => params.extend([WasmType::I64, WasmType::I64]),
+                class => params.push(class.wasm()),
             }
-            Ok::<_, String>(flat)
+        }
+        let results = match returned {
+            Returned::Value(class) => vec![class.wasm()],
+            Returned::Nothing | Returned::Through(_) => Vec::new(),
         };
-        Ok(WasmSignature { params: flatten(&sig.params)?, results: flatten(&sig.returns)? })
+        Ok(WasmSignature { params, results })
+    }
+}
+
+/// How a function hands back what it returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Returned {
+    Nothing,
+    Value(Class),
+    /// Written through a pointer that is the first parameter, each value at its offset: what
+    /// LLVM does with a return of several values or of an `i128` where a wasm function has
+    /// one result of one of four types.
+    Through(Vec<(u64, Class)>),
+}
+
+impl Returned {
+    /// The bytes a caller sets aside for [`Returned::Through`], and their alignment.
+    const SPACE: u64 = 64;
+    const ALIGN: u64 = 16;
+
+    fn of(sig: &Signature) -> Result<Returned, String> {
+        let classes: Vec<Class> =
+            sig.returns.iter().map(|it| Class::of(it.value_type)).collect::<Result<_, _>>()?;
+        match classes[..] {
+            [] => return Ok(Returned::Nothing),
+            [class] if class != Class::Pair => return Ok(Returned::Value(class)),
+            _ => {}
+        }
+        // The fields of the struct the values are to LLVM, each aligned to its size.
+        let mut end = 0u64;
+        let mut places = Vec::new();
+        for class in classes {
+            let size = class.bytes();
+            let at = end.next_multiple_of(size);
+            places.push((at, class));
+            end = at + size;
+        }
+        if end > Returned::SPACE {
+            return Err("wasm: more returned values than there is room for".to_owned());
+        }
+        Ok(Returned::Through(places))
     }
 }
 
@@ -87,8 +139,10 @@ pub struct WasmFunction {
     /// The signatures of the indirect calls in the body.
     pub types: Vec<WasmSignature>,
     /// Where the body has a type index to fill in, and which of `types` it is. Each place is
-    /// [`TYPE_INDEX_LEN`] bytes.
+    /// [`INDEX_LEN`] bytes.
     pub type_fixups: Vec<(u32, u32)>,
+    /// Where the body has the index of the stack pointer's global to fill in.
+    pub stack_pointer_fixups: Vec<u32>,
     /// Local declarations and instructions, as the code section has them after the size.
     pub body: Vec<u8>,
 }
@@ -122,14 +176,18 @@ impl WasmFunction {
             signature: self.signature.clone(),
             types: self.types.clone(),
             type_fixups: self.type_fixups.clone(),
+            stack_pointer_fixups: self.stack_pointer_fixups.clone(),
             body: Vec::new(),
         }
     }
 }
 
 /// Lowers `func`. The relocations are relative to the start of the body.
-pub(super) fn lower(func: &Function) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
-    Lower::new(func)?.run()
+pub(super) fn lower(
+    func: &Function,
+    calls: Calls,
+) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
+    Lower::new(func, calls)?.run()
 }
 
 /// How a Cranelift type is held in wasm locals.
@@ -176,6 +234,16 @@ impl Class {
 
     fn is_long(self) -> bool {
         self == Class::Long
+    }
+
+    /// How many bytes the value is in memory.
+    fn bytes(self) -> u64 {
+        match self {
+            Class::Word(bits) => u64::from(bits / 8),
+            Class::F32 => 4,
+            Class::Long | Class::F64 => 8,
+            Class::Pair => 16,
+        }
     }
 }
 
@@ -313,7 +381,14 @@ impl Op {
 
 struct Lower<'a> {
     func: &'a Function,
+    calls: Calls,
     signature: WasmSignature,
+    returned: Returned,
+    /// Where in the frame the values are written that a called function returns through a
+    /// pointer.
+    returned_at: Option<u64>,
+    /// The blocks a jump reaches. The others are where a call unwinds to.
+    reachable: SecondaryMap<Block, bool>,
     code: Vec<u8>,
     /// The locals after the parameters.
     locals: Vec<ValType>,
@@ -331,6 +406,7 @@ struct Lower<'a> {
     relocs: Vec<ModuleReloc>,
     types: Vec<WasmSignature>,
     type_fixups: Vec<(u32, u32)>,
+    stack_pointer_fixups: Vec<u32>,
 }
 
 const MEMORY: u32 = 0;
@@ -340,8 +416,9 @@ fn mem(offset: u64) -> MemArg {
 }
 
 impl<'a> Lower<'a> {
-    fn new(func: &'a Function) -> Result<Self, String> {
+    fn new(func: &'a Function, calls: Calls) -> Result<Self, String> {
         let signature = WasmSignature::of(&func.signature)?;
+        let returned = Returned::of(&func.signature)?;
         let mut order = SecondaryMap::new();
         let mut block_count = 0;
         for block in func.layout.blocks() {
@@ -359,8 +436,21 @@ impl<'a> Lower<'a> {
         if func.dynamic_stack_slots.iter().next().is_some() {
             return Err("wasm: dynamic stack slot".to_owned());
         }
+        let mut returned_at = None;
+        for (_, called) in func.dfg.signatures.iter() {
+            if let Returned::Through(_) = Returned::of(called)? {
+                size = size.next_multiple_of(Returned::ALIGN);
+                returned_at = Some(size);
+                size += Returned::SPACE;
+                break;
+            }
+        }
         let mut this = Lower {
             func,
+            calls,
+            returned,
+            returned_at,
+            reachable: Self::reachable(func),
             param_count: signature.params.len() as u32,
             signature,
             code: Vec::new(),
@@ -374,8 +464,9 @@ impl<'a> Lower<'a> {
             relocs: Vec::new(),
             types: Vec::new(),
             type_fixups: Vec::new(),
+            stack_pointer_fixups: Vec::new(),
         };
-        if !this.slot_offsets.is_empty() {
+        if size != 0 || !this.slot_offsets.is_empty() {
             let frame = this.temp(ValType::I32);
             this.frame = Some((frame, size.next_multiple_of(16)));
         }
@@ -387,8 +478,9 @@ impl<'a> Lower<'a> {
         let Some(entry) = func.layout.entry_block() else {
             return Err("wasm: function without blocks".to_owned());
         };
-        // The parameters of the entry block are the parameters of the function.
-        let mut local = 0;
+        // The parameters of the entry block are the parameters of the function, after the
+        // pointer it returns through.
+        let mut local = if let Returned::Through(_) = self.returned { 1 } else { 0 };
         for &param in func.dfg.block_params(entry) {
             self.values[param] = local + 1;
             let class = self.class(param)?;
@@ -404,11 +496,11 @@ impl<'a> Lower<'a> {
             return Err("wasm: entry block and signature disagree".to_owned());
         }
         if let Some((frame, size)) = self.frame {
-            self.i(I::GlobalGet(STACK_POINTER));
+            self.stack_pointer(false);
             self.i(I::I32Const(size as i32));
             self.i(I::I32Sub);
             self.i(I::LocalTee(frame));
-            self.i(I::GlobalSet(STACK_POINTER));
+            self.stack_pointer(true);
         }
 
         // Blocks are laid out one after the other, each inside a wasm block that ends where
@@ -439,6 +531,10 @@ impl<'a> Lower<'a> {
         }
         for block in func.layout.blocks() {
             self.i(I::End);
+            if !self.reachable[block] {
+                self.i(I::Unreachable);
+                continue;
+            }
             for inst in func.layout.block_insts(block) {
                 self.inst(block, inst)?;
             }
@@ -471,17 +567,59 @@ impl<'a> Lower<'a> {
         for (offset, _) in &mut self.type_fixups {
             *offset += start;
         }
+        for offset in &mut self.stack_pointer_fixups {
+            *offset += start;
+        }
         let function = WasmFunction {
             signature: self.signature,
             types: self.types,
             type_fixups: self.type_fixups,
+            stack_pointer_fixups: self.stack_pointer_fixups,
             body,
         };
         Ok((function, self.relocs))
     }
 
+    /// The blocks reached from the entry without unwinding.
+    fn reachable(func: &Function) -> SecondaryMap<Block, bool> {
+        let mut reachable = SecondaryMap::new();
+        let mut pending: Vec<Block> = func.layout.entry_block().into_iter().collect();
+        while let Some(block) = pending.pop() {
+            if std::mem::replace(&mut reachable[block], true) {
+                continue;
+            }
+            let Some(last) = func.layout.last_inst(block) else { continue };
+            match func.dfg.insts[last] {
+                InstructionData::TryCall { exception, .. }
+                | InstructionData::TryCallIndirect { exception, .. } => {
+                    let returns = func.dfg.exception_tables[exception].normal_return();
+                    pending.push(returns.block(&func.dfg.value_lists));
+                }
+                data => pending.extend(
+                    data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                        .iter()
+                        .map(|call| call.block(&func.dfg.value_lists)),
+                ),
+            }
+        }
+        reachable
+    }
+
     fn i(&mut self, instruction: I<'_>) {
         instruction.encode(&mut self.code);
+    }
+
+    /// Reads the stack pointer, or writes it. Which global that is, a linker says.
+    fn stack_pointer(&mut self, write: bool) {
+        self.code.push(if write { 0x24 } else { 0x23 });
+        self.stack_pointer_fixups.push(self.code.len() as u32);
+        self.index_to_fill();
+    }
+
+    /// Leaves room for an index: a LEB128 of full length, so that any index fits.
+    fn index_to_fill(&mut self) {
+        self.code.extend([0x80; INDEX_LEN - 1]);
+        self.code.push(0);
     }
 
     fn temp(&mut self, ty: ValType) -> u32 {
@@ -640,8 +778,29 @@ impl<'a> Lower<'a> {
             name: ModuleRelocTarget::user(name.namespace, name.index),
             addend,
         });
-        self.code.extend([0x80; ADDRESS_LEN - 1]);
-        self.code.push(0);
+        self.index_to_fill();
+        Ok(())
+    }
+
+    /// Calls the function `name` with the arguments on the stack.
+    fn call_named(&mut self, name: &ExternalName, signature: &Signature) -> Result<(), String> {
+        if self.calls == Calls::Table {
+            self.address(name, 0)?;
+            return self.call_slot(signature);
+        }
+        let ExternalName::User(name) = name else {
+            return Err(format!("wasm: call of {name:?}"));
+        };
+        let name = &self.func.params.user_named_funcs()[*name];
+        // `call`, then the index of the function.
+        self.code.push(0x10);
+        self.relocs.push(ModuleReloc {
+            offset: self.code.len() as u32,
+            kind: CALL,
+            name: ModuleRelocTarget::user(name.namespace, name.index),
+            addend: 0,
+        });
+        self.index_to_fill();
         Ok(())
     }
 
@@ -658,8 +817,7 @@ impl<'a> Lower<'a> {
         // `call_indirect`, the type, the table.
         self.code.push(0x11);
         self.type_fixups.push((self.code.len() as u32, index as u32));
-        self.code.extend([0x80; TYPE_INDEX_LEN - 1]);
-        self.code.push(0);
+        self.index_to_fill();
         self.code.push(0);
         Ok(())
     }
@@ -818,21 +976,139 @@ impl<'a> Lower<'a> {
     }
 
     fn return_(&mut self, values: &[Value]) -> Result<(), String> {
-        for &value in values {
-            self.get(value)?;
+        match self.returned.clone() {
+            Returned::Nothing => {}
+            Returned::Value(_) => {
+                let [value] = values else {
+                    return Err("wasm: return and signature disagree".to_owned());
+                };
+                let signed =
+                    self.func.signature.returns[0].extension == ir::ArgumentExtension::Sext;
+                self.get_for(*value, signed)?;
+            }
+            Returned::Through(places) => {
+                for (&value, (at, class)) in values.iter().zip(places) {
+                    self.i(I::LocalGet(0));
+                    self.get(value)?;
+                    self.store_class(class, at);
+                }
+            }
         }
         if let Some((frame, size)) = self.frame {
             self.i(I::LocalGet(frame));
             self.i(I::I32Const(size as i32));
             self.i(I::I32Add);
-            self.i(I::GlobalSet(STACK_POINTER));
+            self.stack_pointer(true);
         }
         self.i(I::Return);
         Ok(())
     }
 
-    /// Calls a function and gives the first local of each result. `callee` is `None` when
-    /// the slot to call is the first of `args`.
+    /// Stores the value on the stack, held as `class`, at `offset` from the address below it.
+    fn store_class(&mut self, class: Class, offset: u64) {
+        match class {
+            Class::Word(bits) => self.store_int(class, bits, offset),
+            Class::Long => self.i(I::I64Store(mem(offset))),
+            Class::F32 => self.i(I::F32Store(mem(offset))),
+            Class::F64 => self.i(I::F64Store(mem(offset))),
+            Class::Pair => {
+                let high = self.temp(ValType::I64);
+                let low = self.temp(ValType::I64);
+                let address = self.temp(ValType::I32);
+                self.i(I::LocalSet(high));
+                self.i(I::LocalSet(low));
+                self.i(I::LocalTee(address));
+                self.i(I::LocalGet(low));
+                self.i(I::I64Store(mem(offset)));
+                self.i(I::LocalGet(address));
+                self.i(I::LocalGet(high));
+                self.i(I::I64Store(mem(offset + 8)));
+            }
+        }
+    }
+
+    /// Pushes the value held as `class` at `offset` from the address on the stack.
+    fn load_class(&mut self, class: Class, offset: u64) {
+        match class {
+            Class::Word(bits) => self.load_int(class, bits, false, offset),
+            Class::Long => self.i(I::I64Load(mem(offset))),
+            Class::F32 => self.i(I::F32Load(mem(offset))),
+            Class::F64 => self.i(I::F64Load(mem(offset))),
+            Class::Pair => {
+                let address = self.temp(ValType::I32);
+                self.i(I::LocalTee(address));
+                self.i(I::I64Load(mem(offset)));
+                self.i(I::LocalGet(address));
+                self.i(I::I64Load(mem(offset + 8)));
+            }
+        }
+    }
+
+    /// Pushes the arguments of a call: the pointer the function returns through when it does
+    /// that, then each one extended the way the signature asks.
+    fn arguments(&mut self, signature: &Signature, args: &[Value]) -> Result<(), String> {
+        if let Returned::Through(_) = Returned::of(signature)? {
+            let Some(at) = self.returned_at else {
+                return Err("wasm: no room for what a call returns".to_owned());
+            };
+            let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
+            self.i(I::LocalGet(frame));
+            self.i(I::I32Const(at as i32));
+            self.i(I::I32Add);
+        }
+        for (&arg, param) in args.iter().zip(&signature.params) {
+            self.get_for(arg, param.extension == ir::ArgumentExtension::Sext)?;
+        }
+        Ok(())
+    }
+
+    /// Makes the call the arguments are on the stack for and puts what it returns in fresh
+    /// locals, the first of each value given.
+    fn finish_call(
+        &mut self,
+        callee: Option<&ExternalName>,
+        signature: &Signature,
+    ) -> Result<Vec<u32>, String> {
+        match callee {
+            Some(name) => self.call_named(name, signature)?,
+            None => self.call_slot(signature)?,
+        }
+        let mut local_of = |this: &mut Self, class: Class| {
+            let local = this.temp(class.wasm().into());
+            if class == Class::Pair {
+                this.temp(ValType::I64);
+            }
+            local
+        };
+        match Returned::of(signature)? {
+            Returned::Nothing => Ok(Vec::new()),
+            Returned::Value(class) => {
+                let local = local_of(self, class);
+                self.mask_for(class);
+                self.i(I::LocalSet(local));
+                Ok(vec![local])
+            }
+            Returned::Through(places) => {
+                let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
+                let base = self.returned_at.ok_or("wasm: no room for what a call returns")?;
+                let mut locals = Vec::new();
+                for (at, class) in places {
+                    let local = local_of(self, class);
+                    self.i(I::LocalGet(frame));
+                    self.load_class(class, base + at);
+                    if class == Class::Pair {
+                        self.i(I::LocalSet(local + 1));
+                    }
+                    self.mask_for(class);
+                    self.i(I::LocalSet(local));
+                    locals.push(local);
+                }
+                Ok(locals)
+            }
+        }
+    }
+
+    /// Calls a function. `callee` is `None` when the slot to call is the first of `args`.
     fn call(
         &mut self,
         callee: Option<&ExternalName>,
@@ -840,30 +1116,37 @@ impl<'a> Lower<'a> {
         args: &[Value],
         results: &[Value],
     ) -> Result<(), String> {
-        match callee {
-            Some(ExternalName::LibCall(libcall)) => return self.libcall(*libcall, args, results),
-            Some(name) => {
-                for &arg in args {
-                    self.get(arg)?;
-                }
-                self.address(name, 0)?;
+        if let Some(ExternalName::LibCall(libcall)) = callee {
+            return self.libcall(*libcall, args, results);
+        }
+        let returned = self.call_returning(callee, signature, args)?;
+        for (&result, local) in results.iter().zip(returned) {
+            self.i(I::LocalGet(local));
+            if self.class(result)? == Class::Pair {
+                self.i(I::LocalGet(local + 1));
             }
+            self.set(result)?;
+        }
+        Ok(())
+    }
+
+    fn call_returning(
+        &mut self,
+        callee: Option<&ExternalName>,
+        signature: &Signature,
+        args: &[Value],
+    ) -> Result<Vec<u32>, String> {
+        match callee {
+            Some(_) => self.arguments(signature, args)?,
             None => {
                 let [slot, args @ ..] = args else {
                     return Err("wasm: indirect call of nothing".to_owned());
                 };
-                for &arg in args {
-                    self.get(arg)?;
-                }
+                self.arguments(signature, args)?;
                 self.get(*slot)?;
             }
         }
-        self.call_slot(signature)?;
-        for &result in results.iter().rev() {
-            self.mask_for(self.class(result)?);
-            self.set(result)?;
-        }
-        Ok(())
+        self.finish_call(callee, signature)
     }
 
     /// The memory routines Cranelift's frontend calls by name are instructions here.
@@ -890,6 +1173,11 @@ impl<'a> Lower<'a> {
         }
         if let (&[to, ..], &[result]) = (args, results) {
             self.get(to)?;
+            // Cranelift's frontend types what the routine returns as an address of the
+            // machine it has a backend for.
+            if self.func.dfg.value_type(result) == types::I64 {
+                self.i(I::I64ExtendI32U);
+            }
             self.set(result)?;
         }
         Ok(())
@@ -907,41 +1195,7 @@ impl<'a> Lower<'a> {
         let func = self.func;
         let table = &func.dfg.exception_tables[table];
         let signature = &func.dfg.signatures[table.signature()];
-        match callee {
-            Some(name) => {
-                for &arg in args {
-                    self.get(arg)?;
-                }
-                self.address(name, 0)?;
-            }
-            None => {
-                let [slot, args @ ..] = args else {
-                    return Err("wasm: indirect call of nothing".to_owned());
-                };
-                for &arg in args {
-                    self.get(arg)?;
-                }
-                self.get(*slot)?;
-            }
-        }
-        self.call_slot(signature)?;
-        let mut returned = Vec::new();
-        for param in &signature.returns {
-            let class = Class::of(param.value_type)?;
-            let local = self.temp(class.wasm().into());
-            if class == Class::Pair {
-                self.temp(ValType::I64);
-            }
-            returned.push((local, class));
-        }
-        for &(local, class) in returned.iter().rev() {
-            if class == Class::Pair {
-                self.i(I::LocalSet(local + 1));
-            }
-            self.mask_for(class);
-            self.i(I::LocalSet(local));
-        }
-        let returned: Vec<u32> = returned.into_iter().map(|it| it.0).collect();
+        let returned = self.call_returning(callee, signature, args)?;
         self.jump(block, *table.normal_return(), 0, &returned)
     }
 

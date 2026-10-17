@@ -5,6 +5,10 @@ usage: difftest.py <workspace> --bin <package> --crate <name> [--crate <name> ..
 
 Exit code 0 when stdout, stderr and exit status match. With --bisect, each rustd function is
 also linked in on its own to name the ones that change behaviour.
+
+RUSTD_TARGET=wasm32-wasip1 builds both sides for that target and runs them under wasmtime
+(RUSTD_WASM_RUNNER names another runner); the other harnesses take it the same way. See
+WASM32.md.
 """
 import re
 import argparse, glob, json, os, shlex, subprocess, sys, tempfile, time
@@ -79,7 +83,12 @@ def linker_line(output):
             continue
         if "-o" in args:
             # The environment the driver runs in comes first, as assignments.
-            return args[next(i for i, a in enumerate(args) if "=" not in a):]
+            link = args[next(i for i, a in enumerate(args) if "=" not in a):]
+            if link[0] == "rust-lld":
+                # The linker of a wasm target, which rustc finds in what it puts first in `PATH`.
+                path = next(a for a in args if a.startswith("PATH=")).removeprefix("PATH=")
+                link[0] = next(p for d in path.split(os.pathsep) if os.path.exists(p := os.path.join(d, link[0])))
+            return link
         for at, arg in enumerate(args[:8]):
             if os.path.basename(arg).lower().removesuffix(".exe") in ("rust-lld", "lld-link", "link") and "/NOLOGO" in args:
                 if arg == "rust-lld":
@@ -88,6 +97,25 @@ def linker_line(output):
                     arg = os.path.join(sysroot, "lib", "rustlib", triple, "bin", "rust-lld.exe")
                 return [arg, *args[at + 1:]]
     raise SystemExit(f"no linker line:\n{output[-3000:]}")
+
+
+# `wasm32-wasip1` runs under wasmtime.
+WASM = bool(TARGET) and TARGET.startswith("wasm32")
+if WASM and not RUNNER:
+    # What runs a wasm program, which gets the program and its arguments after it.
+    RUNNER = shlex.split(os.environ.get("RUSTD_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608 -S inherit-env"))
+# What a link line gets after rustd's objects, which define again what rustc's do.
+AHEAD = linkline.allowing_duplicates(WASM)
+
+
+def command(binary):
+    """What runs a built program."""
+    return [*RUNNER, binary]
+
+
+def built(target_dir, name):
+    """Where cargo leaves the program `name`."""
+    return os.path.join(profile_dir(target_dir), name + (".wasm" if WASM else ".exe" if WINDOWS else ""))
 
 
 def sysroot_rlibs():
@@ -192,6 +220,11 @@ class Fixture:
                 self.reference_secs = time.monotonic() - start
             # The thread id in a panic message differs from run to run.
             stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
+            if WASM:
+                # After the program's own output the runtime says where in which file it
+                # trapped: only the kind of trap is the program's.
+                program, _, runtime = stderr.partition(b"Error: failed to run main module")
+                stderr = program + b"".join(re.findall(rb"wasm trap: [^\n]*\n?", runtime))
             # Loggers stamp their lines with the time, on either stream.
             stamp = rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?"
             # What prints an address prints another one in every run.

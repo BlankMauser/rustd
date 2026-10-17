@@ -43,6 +43,21 @@ def join(link):
     return subprocess.list2cmdline(link) if WINDOWS else shlex.join(link)
 
 
+def wasm(link):
+    """Whether the line is one of `wasm-ld`, which rustc runs itself rather than through `cc`."""
+    return "wasm" in link[:3]
+
+
+def allowing_duplicates(wasm):
+    """What an ELF or wasm link line gets after rustd's objects. A wasm module that edits are
+    spliced into has to keep its symbol table, as it names nothing but its exports otherwise,
+    and keeps what nothing calls yet, as an edit may. `RUSTD_LINK_ARGS` is what it gets
+    instead of those."""
+    spliced = "--emit-relocs --no-gc-sections" if wasm and os.environ.get("RUSTD_SPLICE") else ""
+    allow = "--allow-multiple-definition" if wasm else "-Wl,--allow-multiple-definition"
+    return [allow, *shlex.split(os.environ.get("RUSTD_LINK_ARGS", spliced))]
+
+
 def ahead(link, objects, rustd):
     """`link` with `objects` before rustc's, and the linker told that the first definition stays."""
     link = list(link)
@@ -50,8 +65,8 @@ def ahead(link, objects, rustd):
     if msvc(link):
         link[first:first] = [*objects, "/FORCE:MULTIPLE", "/IGNORE:4006"]
         return link
-    if not MACHO:
-        link[first:first] = [*objects, "-Wl,--allow-multiple-definition"]
+    if not MACHO or wasm(link):
+        link[first:first] = [*objects, *allowing_duplicates(wasm(link))]
         return link
     # The library of the toolchain defines nothing a workspace crate does.
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()

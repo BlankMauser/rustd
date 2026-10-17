@@ -54,3 +54,8 @@ pub fn run() -> Vec<[i64; 8]> {
         vec![signed.map(Into::into), unsigned.map(Into::into), rest]
     }
 }
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn run() -> Vec<[i64; 8]> {
+    Vec::new()
+}

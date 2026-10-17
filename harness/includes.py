@@ -10,7 +10,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOML = """[package]
 name = "sinc"
@@ -75,7 +75,7 @@ def follow(files, steps):
     splice = ["--binary", binary]
     ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([RUSTD, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -109,7 +109,7 @@ def follow(files, steps):
         reply = subprocess.run([RUSTD, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
         took = (time.time() - began) * 1000
         reply = (reply.stdout + reply.stderr).strip()
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
         if daemon.poll() is not None:
@@ -119,7 +119,7 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(os.path.join(profile_dir(reference), "sinc")) else "DIFFERENT OUTPUT"
+            verdict = "same" if run(binary) == run(built(reference, "sinc")) else "DIFFERENT OUTPUT"
         made = linked(seen)
         if how and not verdict.isupper() and how[0] not in made:
             verdict = f"NOT {how[0]}: {made}"[:60]

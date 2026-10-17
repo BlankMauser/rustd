@@ -4856,7 +4856,7 @@ pub mod variadic {
     pub fn two(a: i32, b: u64) -> String {
         let mut buf = [0u8; 32];
         let len =
-            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%lu".as_ptr().cast(), a, b) };
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%llu".as_ptr().cast(), a, b) };
         String::from_utf8_lossy(&buf[..len as usize]).into_owned()
     }
 

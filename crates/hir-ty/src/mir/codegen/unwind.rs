@@ -97,6 +97,7 @@ impl FrameRule {
     pub(super) fn on_entry(arch: super::Arch) -> &'static [FrameRule] {
         match arch {
             super::Arch::Aarch64 => &[FrameRule::Cfa(31, 0)],
+            super::Arch::Wasm32 => &[],
             super::Arch::X86_64 => &[FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)],
         }
     }
@@ -215,6 +216,10 @@ impl UnwindContext {
         let mut frame_table = FrameTable::default();
         let seh = seh::Tables::default();
         let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
+        // Nothing unwinds on wasm: a panic aborts there.
+        if super::Target::current().is_wasm() {
+            return Ok(UnwindContext { frame_table, cies: None, seh });
+        }
         let Some(mut cie) = module.isa().create_systemv_cie().filter(|_| dwarf) else {
             return Ok(UnwindContext { frame_table, cies: None, seh });
         };

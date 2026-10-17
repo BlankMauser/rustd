@@ -7,6 +7,7 @@
 use std::sync::OnceLock;
 
 use cranelift_codegen::{
+    ir::{Type, types},
     isa::{self, CallConv, OwnedTargetIsa},
     settings::{self, Configurable},
 };
@@ -27,6 +28,8 @@ pub struct Target {
 pub enum Arch {
     X86_64,
     Aarch64,
+    /// WebAssembly with 32-bit addresses.
+    Wasm32,
 }
 
 impl Arch {
@@ -39,6 +42,8 @@ impl Arch {
             Arch::X86_64 => Some((5, 0xcc)),
             // An instruction is as long as `b`.
             Arch::Aarch64 => None,
+            // A function of a module is replaced by its slot in the table, not by a jump.
+            Arch::Wasm32 => None,
         }
     }
 }
@@ -48,6 +53,8 @@ pub enum ObjectFormat {
     Elf,
     MachO,
     Coff,
+    /// Relocatable WebAssembly objects.
+    Wasm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,18 @@ pub enum UnwindFormat {
     EhFrame,
     /// The unwind codes of Windows in `.pdata` and `.xdata`, see `unwind::seh`.
     Seh,
+    /// Nothing unwinds: a panic aborts.
+    None,
+}
+
+/// How wasm code calls a function it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Calls {
+    /// `call`, as rustc's code does.
+    Direct,
+    /// `call_indirect` through the slot the linker gives the function in the function
+    /// table, so that a module loaded later replaces the function by writing its slot.
+    Table,
 }
 
 impl Target {
@@ -83,7 +102,7 @@ impl Target {
         // The wasm backend writes its own code from Cranelift's IR and only borrows the
         // settings of an ISA Cranelift has, whatever the compiler itself runs on.
         if cfg!(feature = "wasm") {
-            return "x86_64-unknown-linux-gnu";
+            return "wasm32-unknown-unknown";
         }
         // FIXME: the triples of the hosts that have no code emitted for them yet are missing,
         // and `parse` turns those down by name.
@@ -103,12 +122,15 @@ impl Target {
         let arch = match parts.next() {
             Some("x86_64") => Arch::X86_64,
             Some("aarch64") => Arch::Aarch64,
+            Some("wasm32") => Arch::Wasm32,
             _ => return Err(format!("rustd emits no code for the architecture of {triple}")),
         };
         let system = parts.find(|part| matches!(*part, "linux" | "darwin" | "windows"));
         // Cranelift's names for the C convention: `SystemV` is the psABI's on x86-64 and
         // AAPCS64 on AArch64, which Apple's differs from in what goes on the stack.
         let (object_format, unwind, call_conv) = match (system, arch) {
+            // The calling convention is the one of the ISA whose settings are borrowed.
+            (_, Arch::Wasm32) => (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV),
             (Some("linux"), _) => (ObjectFormat::Elf, UnwindFormat::EhFrame, CallConv::SystemV),
             (Some("darwin"), Arch::Aarch64) => {
                 (ObjectFormat::MachO, UnwindFormat::EhFrame, CallConv::AppleAarch64)
@@ -121,6 +143,34 @@ impl Target {
             _ => return Err(format!("rustd emits no code for the system of {triple}")),
         };
         Ok(Target { triple: triple.to_owned(), arch, object_format, call_conv, unwind })
+    }
+
+    /// The target of the process, once it is known that there is one: nothing is compiled
+    /// before [`Target::selected`] has said so.
+    pub fn current() -> &'static Target {
+        Target::selected().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn is_wasm(&self) -> bool {
+        self.arch == Arch::Wasm32
+    }
+
+    /// How wasm code calls: through the table where functions are replaced in a page.
+    pub fn calls(&self) -> Calls {
+        if cfg!(feature = "wasm") { Calls::Table } else { Calls::Direct }
+    }
+
+    /// The integer an address is.
+    pub(super) fn pointer(&self) -> Type {
+        match self.arch {
+            Arch::X86_64 | Arch::Aarch64 => types::I64,
+            Arch::Wasm32 => types::I32,
+        }
+    }
+
+    /// How many bytes an address takes.
+    pub(crate) fn word(&self) -> usize {
+        self.pointer().bytes() as usize
     }
 
     pub fn triple(&self) -> &str {
@@ -137,8 +187,9 @@ impl Target {
     pub fn cpu(&self) -> &'static str {
         match (self.arch, self.object_format) {
             (Arch::X86_64, _) => "x86-64",
+            (Arch::Wasm32, _) => "generic",
             (Arch::Aarch64, ObjectFormat::MachO) => "apple-m1",
-            (Arch::Aarch64, ObjectFormat::Elf | ObjectFormat::Coff) => "generic",
+            (Arch::Aarch64, _) => "generic",
         }
     }
 
@@ -152,6 +203,7 @@ impl Target {
             ObjectFormat::Elf => ("true", "elf_gd"),
             ObjectFormat::MachO => ("true", "macho"),
             ObjectFormat::Coff => ("false", "coff"),
+            ObjectFormat::Wasm => ("true", "elf_gd"),
         };
         flags.set("is_pic", pic).map_err(|e| e.to_string())?;
         flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
@@ -169,7 +221,13 @@ impl Target {
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
         flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-        isa::lookup_by_name(&self.triple)
+        // Cranelift has no ISA for WebAssembly: its code is written from the IR, and the
+        // settings of this one are what the IR is made under.
+        let triple = match self.arch {
+            Arch::Wasm32 => "x86_64-unknown-linux-gnu",
+            Arch::X86_64 | Arch::Aarch64 => &self.triple,
+        };
+        isa::lookup_by_name(triple)
             .map_err(|e| e.to_string())?
             .finish(settings::Flags::new(flags))
             .map_err(|e| e.to_string())

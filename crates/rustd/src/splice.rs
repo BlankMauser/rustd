@@ -26,6 +26,11 @@
 //! The patch holds everything that differs from the object the executable was linked from, so
 //! each splice starts from the executable as the linker left it: the last one is undone
 //! first. Anything the splice has no answer for is an error, and the caller links in full.
+//!
+//! That is the splice of an ELF executable. A wasm module is written again instead, with
+//! the patch's functions in place of its own: see [`wasm`].
+
+mod wasm;
 
 use std::{
     fs::{File, OpenOptions},
@@ -81,6 +86,7 @@ enum Executable {
     Elf(Image),
     MachO(macho::Image),
     Pe(pe::Image),
+    Wasm(wasm::Module),
 }
 
 /// What a splice did, for the log.
@@ -97,20 +103,25 @@ impl Baseline {
         // SAFETY: the daemon is the one that has the link write the file, and it does not
         // start another while this reads.
         let bytes = unsafe { memmap2::Mmap::map(&file)? };
-        let image = match object::FileKind::parse(&*bytes)? {
-            object::FileKind::MachO64 => Executable::MachO(macho::Image::read(&bytes)?),
-            object::FileKind::Pe64 => {
-                let object = std::fs::read(object)?;
-                Executable::Pe(pe::Image::read(&bytes, &path, &[patch, &object])?)
-            }
-            _ => Executable::Elf(Image::read(&bytes)?),
+        let (image, baked) = if bytes.starts_with(b"\0asm") {
+            (Executable::Wasm(wasm::Module::read(bytes.to_vec())?), wasm::defined(patch)?)
+        } else {
+            let image = match object::FileKind::parse(&*bytes)? {
+                object::FileKind::MachO64 => Executable::MachO(macho::Image::read(&bytes)?),
+                object::FileKind::Pe64 => {
+                    let object = std::fs::read(object)?;
+                    Executable::Pe(pe::Image::read(&bytes, &path, &[patch, &object])?)
+                }
+                _ => Executable::Elf(Image::read(&bytes)?),
+            };
+            let patch = object::File::parse(patch)?;
+            let baked = patch
+                .symbols()
+                .filter(|it| it.is_definition() && !it.is_local())
+                .filter_map(|it| it.name_bytes().ok().map(Box::from))
+                .collect();
+            (image, baked)
         };
-        let patch = object::File::parse(patch)?;
-        let baked = patch
-            .symbols()
-            .filter(|it| it.is_definition() && !it.is_local())
-            .filter_map(|it| it.name_bytes().ok().map(Box::from))
-            .collect();
         Ok(Baseline { path, image, baked, undo: Vec::new(), stamp })
     }
 
@@ -131,6 +142,12 @@ impl Baseline {
                 let patch = pe::Patch::read(patch, image)?;
                 self.has_baked(patch.defined())?;
                 (patch.place(image)?, image.len)
+            }
+            Executable::Wasm(module) => {
+                let (bytes, spliced) = self.rewrite(module, patch)?;
+                std::fs::write(&self.path, bytes)?;
+                self.stamp = Stamp::of(&File::open(&self.path)?)?;
+                return Ok(spliced);
             }
             Executable::MachO(image) => {
                 let Baseline { path, baked, undo, stamp, .. } = self;
@@ -154,6 +171,20 @@ impl Baseline {
         }
         self.stamp = Stamp::of(&file)?;
         Ok(Spliced { redirected: addition.redirected, appended: addition.appended.len() })
+    }
+
+    /// The splice of a wasm module, which is written anew from the linker's each time.
+    fn rewrite(&self, module: &wasm::Module, patch: &[u8]) -> anyhow::Result<(Vec<u8>, Spliced)> {
+        let defined: FxHashSet<Box<[u8]>> = wasm::defined(patch)?.into_iter().collect();
+        ensure!(
+            self.baked.iter().all(|it| defined.contains(it)),
+            "a function the executable was linked with a patch of is as it first was"
+        );
+        ensure!(
+            Stamp::of(&File::open(&self.path)?)? == self.stamp,
+            "the executable was written by someone else"
+        );
+        module.splice(patch)
     }
 }
 
