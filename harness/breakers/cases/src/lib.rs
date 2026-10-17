@@ -61,6 +61,7 @@ cases![
     assert_long_expression,
     frame_of_array,
     frame_of_results,
+    frame_of_tables,
     link_name_macro,
     backtrace_line,
     static_enum_slice,

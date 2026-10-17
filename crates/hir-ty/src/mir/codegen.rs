@@ -4960,12 +4960,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let (.., held) = frame.as_ref()?;
             held.locals.binary_search(&local).ok()
         };
-        let forwarded = forwarded_temps(body);
-        let used = used_locals(body);
-        let renamed = renamed_temps(body, &forwarded, |local| {
+        let is_dropped = |local: LocalId| {
             has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
                 != DropGlue::None
-        });
+        };
+        let forwarded = forwarded_temps(body, is_dropped);
+        let used = used_locals(body);
+        let renamed = renamed_temps(body, &forwarded, is_dropped);
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local)
                 || forwarded.contains_key(&local)
@@ -10983,7 +10984,10 @@ fn returned_into(body: &MirBody<'_>) -> FxHashMap<BasicBlockId, LocalId> {
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
+fn forwarded_temps(
+    body: &MirBody<'_>,
+    is_dropped: impl Fn(LocalId) -> bool,
+) -> FxHashMap<LocalId, LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let mut forwarded = FxHashMap::default();
     if body.coroutine.is_some() {
@@ -11034,6 +11038,19 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
             .filter(|it| matches!(&it.kind, StatementKind::FakeRead(place) if place.local == local))
             .count()
     };
+    // The drop of a temporary whose type has nothing to drop is no use of it either.
+    let empty_drops = |local: LocalId| {
+        if is_dropped(local) {
+            return 0;
+        }
+        body.basic_blocks
+            .iter()
+            .filter_map(|(_, block)| block.terminator.as_ref())
+            .filter(
+                |it| matches!(&it.kind, TerminatorKind::Drop { place, .. } if place.local == local),
+            )
+            .count()
+    };
     let bound: rustc_hash::FxHashSet<LocalId> = body
         .binding_locals
         .values()
@@ -11044,7 +11061,7 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
         .collect();
     forwarded.retain(|&temp, to| {
         !bound.contains(&temp)
-            && mentions[&temp] - fake_reads(temp) == 2
+            && mentions[&temp] - fake_reads(temp) - empty_drops(temp) == 2
             && body.locals[temp].ty == body.locals[*to].ty
             && !body.promoted_locals.iter().any(|it| it.0 == *to)
             && *to != returned_local(body)
