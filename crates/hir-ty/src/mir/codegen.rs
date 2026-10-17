@@ -1818,6 +1818,9 @@ fn build<'db>(
     let interner = DbInterner::new_with(cg.db, env.krate);
     let mut ctx = cranelift_codegen::Context::new();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
+    // Source locations are kept as distances from the first one set, and the distance of
+    // the one just below it is taken for none at all.
+    ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut fx = FunctionCx {
         cg,
@@ -9647,7 +9650,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
     ) -> Vec<Value> {
         self.guarded = true;
-        self.builder.set_srcloc(unwind::seh::guarded());
+        let loc = self.cg.source_loc(self.span);
+        self.builder.set_srcloc(unwind::seh::guarded(loc));
         let call = call(&mut self.builder);
         self.at(self.span);
         let results = self.builder.inst_results(call).to_vec();

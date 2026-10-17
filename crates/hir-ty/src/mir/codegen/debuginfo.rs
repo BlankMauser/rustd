@@ -43,9 +43,8 @@ pub(super) struct LineRow {
 }
 
 impl LineRow {
-    /// The first source location that stands for a statement. The ones below mark
-    /// instructions for other ends, see `unwind::seh::guarded`.
-    const FIRST: u32 = 2;
+    /// The first source location that stands for a statement: 0 is that of none.
+    const FIRST: u32 = 1;
 
     /// The source location of instructions built for the statement of index `span`.
     pub(super) fn source_loc(span: u32) -> ir::SourceLoc {
@@ -53,7 +52,7 @@ impl LineRow {
     }
 
     fn span_of(loc: ir::SourceLoc) -> Option<u32> {
-        if loc.is_default() { None } else { loc.bits().checked_sub(Self::FIRST) }
+        super::unwind::seh::unguarded(loc).bits().checked_sub(Self::FIRST)
     }
 
     /// The rows of a function from the source location its code has from each offset on, in

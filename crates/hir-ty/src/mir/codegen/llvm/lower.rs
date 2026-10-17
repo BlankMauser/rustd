@@ -205,8 +205,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     fn mark(&self, inst: Inst) {
         let Some(marks) = &self.marks else { return };
         let scope = marks.function.as_debug_info_scope();
-        let line = self.func.srcloc(inst).bits();
-        let line = if self.func.srcloc(inst).is_default() { 0 } else { line };
+        let line = unwind::seh::unguarded(self.func.srcloc(inst)).bits();
         let location = marks.builder.create_debug_location(self.context, line, 0, scope, None);
         self.builder.set_current_debug_location(location);
     }
@@ -623,7 +622,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             InstructionData::Call { func_ref, .. } => {
                 let callee = self.callee(func_ref)?;
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
-                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                if unwind::seh::is_guarded(self.func.srcloc(inst)) {
                     let (returned, pad) = self.guard();
                     let args = self.invoke_arguments(sig, dfg.inst_args(inst))?;
                     let call =
@@ -641,7 +640,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     return Err(Unhandled::Shape("indirect call without a callee"));
                 };
                 let callee = self.pointer(*callee)?;
-                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                if unwind::seh::is_guarded(self.func.srcloc(inst)) {
                     let (returned, pad) = self.guard();
                     let args = self.invoke_arguments(sig, args)?;
                     let call =
