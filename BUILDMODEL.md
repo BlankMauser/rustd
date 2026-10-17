@@ -1,7 +1,7 @@
 # Cargo's build model in rustd
 
-Branch `rustd-build-model`. The second round starts from `rustd-collate` at 0151c01218
-merged in. Linux x86-64, Rust 1.99.0, LLVM 20.
+Branch `rustd-build-model`. The third round starts from `rustd-collate` at 1547078a30
+merged in (the second from 0151c01218). Linux x86-64, Rust 1.99.0, LLVM 20.
 
 This is a survey of which parts of cargo's build model rustd follows, with a small project
 for each part under `harness/buildmodel/` and a script, `harness/buildmodel.py`, that builds
@@ -18,15 +18,15 @@ Measured with
     RUSTD_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
     RUSTD_BIN=... RUSTD_OPT=2 RUSTD_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
 
-Result: 97 of 97 as expected under Cranelift and 97 of 97 under LLVM, 0 WRONG. The two
-tables are the same but for the backend column: 92 supported and 5 refused. Of the 5, 2 are
-projects cargo itself turns down, 2 are `lto` and 1 is doctests. The cases have 31
-invalidation steps between them: 29 come out the same as cargo's rebuild and 2 are refused
-with a reason (an edit to a crate the daemon was not asked to build, see below). None is
-"start it again" any more.
+Result: 100 of 100 as expected under Cranelift and 100 of 100 under LLVM, 0 WRONG. The two
+tables are the same but for the backend column: 96 supported and 4 refused. Of the 4, 2 are
+projects cargo itself turns down and 2 are `lto` with rustc's own LTO link line. The cases
+have 36 invalidation steps between them and all 36 come out the same as cargo's rebuild;
+none is refused.
 
-The first round ended at 90 cases per backend, 82 supported and 8 refused, with 16 steps of
-which 7 were refused.
+The second round ended at 97 cases per backend, 92 supported and 5 refused, with 31 steps of
+which 2 were refused. The first ended at 90 cases, 82 supported and 8 refused, with 16 steps
+of which 7 were refused.
 
 A row is one of three things. "supported": the two programs print and return the same, and
 every function of the crates the case names was compiled by rustd. "refused": rustd said why
@@ -34,6 +34,183 @@ it does not build this and nothing ran differently; that includes a function it 
 rustc with a reason. "WRONG": a different output, a crash, or a refusal without a reason. The
 script fails on a WRONG row and on any row that is not what its `case.json` expects, so a
 feature that stops working, or a refusal that starts to pass, is seen.
+
+## Third round
+
+Starts from `rustd-collate` at 1547078a30 merged in (c41ee3294c).
+
+### 1. Overflow checks where rustc picks the copy
+
+Fixtures first. `harness/keys/kdep` got a small plain function, `klib` and `kapp` both use
+the same instantiation of a generic function of `kdep`, and three cases were added to
+`keys.py`: overflow checks of the program alone in release, of all but the package a small
+function is written in in release, and of all but the package whose copy of generic code the
+program uses in dev. Before the fix one of the three came out different from rustc (the
+small function in release); the dev case was right by luck.
+
+What rustc does, measured on a four-crate workspace by reading which crate's object holds
+each instance:
+
+- A check is kept when the crate the function is written in has overflow checks on and the
+  crate that compiles the copy has them on too.
+- In dev (`opt-level` 0, shared generics) a generic instance is compiled by the most
+  upstream crate that uses it, and crates further down use that copy. `#[inline]` functions
+  get one copy per crate that uses them.
+- In release nothing is shared: generic and `#[inline]` code is compiled by the crate that
+  uses it, and so is a small plain leaf function, which rustc decides by itself to make
+  inlinable across crates.
+
+What rustd does now. rustd keeps one copy per instance and setting, rustc one per crate, so
+rustd has to know which crate's copy a call would have reached. The v0 symbol of a copy ends
+with the crate that instantiated it, and rustd reads that from rustc's objects
+(`symbols.rs`, `codegen/settled.rs`):
+
+- When the instance has a name rustd can spell and rustc's objects hold a copy of it, the
+  call takes the setting of the crate whose object holds the copy the asking crate links to.
+- A plain function with no symbol exported from the crate it is written in was compiled into
+  its users, so it takes the asking crate's setting. That is the release case.
+- When rustd cannot tell, the function that makes the call is refused and left to rustc,
+  with the reason in the report. That happens when the instance has no name rustd can spell
+  and a crate with a different setting made a copy of a function of that name (for a
+  closure, of the function it is written in), or when two crates with the same setting
+  would reach copies that check differently.
+
+I chose "observe, else refuse" over "refuse every program with mixed settings" because the
+first is right for everything it builds and still builds most of it: in the `keys.py`
+fixture 8 functions over the mixed cases are refused and the rest are rustd's.
+
+A program whose crates differ in overflow checks has its settings in every store key
+(`Entry::key`, namespace "rustd entry 7"), since what a call resolves to is no longer a
+function of the caller's name alone.
+
+Not closed: the evidence is rustc's last build. An edit that adds a new instantiation, or
+moves a function across rustc's inlining threshold, in a program with mixed settings is
+judged by the old objects until cargo builds again. And generic code of std that std ships
+a copy of was not examined, in programs with one setting either.
+
+### 2. A request in the middle of a reload
+
+`RUSTD_RELOAD_PAUSE_MS` makes the daemon stop inside `Checkouts::reload` at the point
+where the checkouts already have their new workspaces and the crates are still the old
+ones, and log `reload: paused`. The case `reload_paused` changes the manifest, has one
+client ask (which sets the reload off), waits for that line, and sends 8 more clients while
+the daemon is paused; it does that twice. Each answer has to be exactly the old program's
+output or
+exactly the new one's; anything else is WRONG. Measured: all 18 answers (9 each time, under
+each backend) were the new program. They
+cannot get a mix because a request is not looked at until the reload it arrived during is
+done; the test now shows that instead of the argument.
+
+### 3. The daemon widens what it builds
+
+The two refused steps are gone. When a crate the program uses, inside the workspace, has
+source that is not what rustc compiled and the daemon was not asked to build it, the daemon
+adds it to what it builds and starts that program over (`Program::widen`, `Args.widened`).
+The same happens for a member that first appears on a reload. `dep_not_named` now has a
+crate in the middle (app uses mid uses dep) and four steps; `reload_member_added` edits the
+new member. All steps match cargo.
+
+### 4. Doctests
+
+Implemented (`crates/rustd/src/doctest.rs`, `doctest/extract.rs`, `doctest/program.rs`).
+rustd stands in for rustdoc: cargo runs `$RUSTDOC --test`, and `cargo rustd test` and
+`cargo rustd test --doc` set that to rustd. Anything that is not `--test` goes to the real
+rustdoc.
+
+- Extraction walks the crate in hir and reads each item's docs through rust-analyzer's
+  `Docs` (so `#[doc = include_str!(..)]` is read as it reads it), finds code blocks with pulldown-cmark, and decides which are Rust
+  with `ide_db::rust_doc::is_rust_fence`. Honoured: `no_run`, `ignore` and `ignore-<target>`,
+  `should_panic`, `compile_fail` with error codes, `edition20xx`, hidden `#` lines, `##`,
+  the `fn main` put around an example, the `Result` form that ends in `(())`, the injected
+  `extern crate`, and crate-level attributes written in the example.
+- Each example is a program of its own. rustc compiles the example's text; rustd builds the
+  library once and its object is linked ahead of rustc's library in every example. So the
+  example's own `main` is rustc's code and the library under it is rustd's.
+- The output is libtest's: the same test names, suffixes, failure block and exit status.
+
+Measured against `cargo test --doc`:
+
+- the `doctest` case (21 examples, including one that fails): same under both backends;
+- `harness/doctests.py` on three crates from crates.io, comparing every test line and the
+  exit status: semver 1.0.28 (4 doctests), either 1.19.0 (61), smallvec 1.16.3 (14), same
+  under both backends. Of the library's functions rustd compiled 43 of 107 in semver, 2 of
+  172 in either and 2 of 170 in smallvec. In either the other 170 are reported as "no rustc
+  symbol for function": they are generic, and their copies are made by rustc in the
+  example's crate, which is rustc's code. So for either and smallvec this shows the extraction and the
+  programs are right, and says little about rustd's code.
+
+`either` found a crash in rust-analyzer's docs source map on an item whose docs have no
+written line (`hir-def/src/attrs/docs.rs`, an unchecked `- 1`); fixed.
+
+Not compared: the text of compiler errors of a `compile_fail` example, and timing lines.
+When rustd cannot build the library it says `rustd: the doctests are left to rustdoc:` with
+the reason and runs rustdoc.
+
+### 5. `lto`
+
+What it would mean: with `lto = "thin"` or `"fat"` rustc keeps bitcode in every library and
+compiles the program again from that bitcode as it links, so it can inline and specialise
+across crates. rustd compiles each function alone and has no step at which it sees the whole
+program, so there is nothing for it to do with the setting.
+
+Is taking it and doing nothing observably different from rustc, other than in speed and
+size? For a program without undefined behaviour, no: LTO is an optimisation and keeps what
+the program does. Two things do differ and neither is the program's behaviour:
+
+- The link. rustc's LTO link line has no libraries on it, only the object it made from
+  bitcode, so rustd's functions have nothing to be linked against by name. rustd therefore
+  needs a link line from a build with `lto = "off"`. Given one, it accepts the profile and
+  prints `lto: accepted, no cross-function optimization`. Given rustc's LTO link line it
+  refuses and says so.
+- `-C lto` in `RUSTFLAGS` rather than in a profile is still refused: cargo does not know
+  about it and builds libraries that cannot be linked the ordinary way.
+
+So the rows are: `lto_fat` and `lto_thin` supported (the reference is cargo with LTO, rustd
+links against the same project built with `--config profile.release.lto="off"`, the outputs
+are the same and the sentence is checked), and `lto_fat_linked` and `lto_thin_linked`
+refused. `cargo rustd` runs cargo itself, so with `lto` in the profile there is no ordinary
+link line and the program is left to cargo with "`x` is built with LTO".
+
+Open: when the program is a single crate there is no library of the workspace whose absence
+shows the link was an LTO one, and a client that hands rustd an LTO link line gets the
+linker's undefined-symbol error instead of rustd's sentence. The harness has no row for it.
+
+### 6. One plan
+
+There is one reader of cargo's unit graph, `crates/rustd/src/plan.rs`, and one description
+of which build is meant, `plan::Selection` (profile, features, `--no-default-features`,
+`--all-features`, packages, `--workspace`, target, dev dependencies). The daemon's arguments
+hold a `Selection`, `cargo rustd` makes one from its command line and hands it to its worker
+(`WorkerConfig.selection`), and `Selection::flags` is the only place that turns it into
+cargo arguments. Rustflags come from one place too (`Flags::of`), read from the client's
+environment and configuration.
+
+Because `cargo rustd` now uses the daemon's plan, it no longer sends these to cargo: other
+profiles than dev, `--all-features`, `--no-default-features`, `RUSTFLAGS`, `opt-level`,
+`panic = "abort"`, `-C target-cpu` and `-C target-feature`. `cargo_rustd.py`'s workspace
+was changed so these can be told apart in the output (it prints `cfg!(debug_assertions)`, a
+cfg from `RUSTFLAGS`, a target feature and the result of an overflow; release is
+`panic = "abort"`) and has six new commands.
+
+What is still separate, on purpose: `cargo/units.rs` does not read the unit graph. It keeps
+the records of what rustc was actually run with, written by the wrapper, and `cargo/plan.rs`
+plans the link from them. Its `unsupported` still reads `-C` flags from those records to
+leave a program to cargo (LTO, coverage, PGO, `-Z`).
+
+### 7. Clippy and style
+
+`cargo clippy -p rustd -p hir-ty -p hir-def --all-targets -- --cap-lints warn` gave 305
+warnings. A warning is "new" when a line it points at was written on this branch (by `git
+blame` against the commits of the three rounds, or not committed yet): 12 new, 293 old. The
+12 are fixed: one unused `mut`; four `Command::new` (now one function, `doctest::as_asked`,
+that says why `toolchain::command` is wrong there: it adds a variable to the environment an
+example can read); seven `eprintln!`, by allowing `clippy::print_stderr` for the `rustd`
+binary, whose output that is. That also silences 60 or so old ones of the same kind; 234
+remain, all old.
+
+Style pass over this round's Rust: no `unwrap` or `expect` outside tests, no dead code or
+`allow(dead_code)`, doc comments say what a thing is. I did not restructure code from
+earlier rounds.
 
 ## Second round
 
@@ -131,7 +308,7 @@ from two crates with different settings, the same in release, and debug assertio
 package. Each builds with an empty store, changes the setting, builds with the warm store
 in place and in a copy elsewhere, and compares with cargo.
 
-Known differences that are not covered by a case:
+Known differences at the end of this round (the first two are closed in the third round):
 
 - With `-Z share-generics`, which is on by default at `opt-level` 0, rustc may reuse an
   instantiation that an upstream crate already made, with the upstream crate's setting.
@@ -145,15 +322,7 @@ Known differences that are not covered by a case:
 
 ### 4. Doctests
 
-Refused, with what is missing named. `rustd build --doc` and the `doctest` case (which now
-has a plain doctest, a `should_panic`, a `no_run` and a `compile_fail`) say: rustdoc takes
-each example out of the documentation, compiles it as a crate of its own and runs it, and
-a stable rustdoc tells nobody where that crate and its link line are (`--persist-doctests`
-and `--test-builder` are unstable). rustd lacks the two things that would stand in for it:
-taking the examples out itself (hidden `#` lines, the `main` put around an example, the
-`should_panic`, `no_run`, `compile_fail`, `ignore` and edition marks), and linking a
-program of its own for each, where today it only replaces functions of a program cargo
-linked.
+Refused in this round; implemented in the third, see above.
 
 ### 5. `[target.'cfg(..)'] rustflags`
 
@@ -163,7 +332,7 @@ flags of every table that matches are joined the way cargo does. The refusal is 
 
 ### `lto`
 
-Still refused, same reason as before.
+Refused in this round; see the third round for what is accepted now.
 
 ## First round: what was wrong and what was done
 
@@ -234,13 +403,16 @@ Inferred, not measured:
 
 ## Still open
 
-- Doctests (refused).
-- LTO (refused).
-- An edit to a crate the daemon was not asked to build is refused, not built. A member or
-  dependency that appears on a reload cannot be added to what a running daemon builds; the
-  client has to name it when it starts one.
-- Overflow checks under rustc's shared generics and its automatic cross-crate inlining, as
-  described above.
+- Overflow checks in a program whose crates differ in the setting are judged by rustc's
+  last build: an edit that adds an instantiation or moves a function across rustc's
+  inlining threshold is seen with the old objects until cargo builds again. Generic code
+  that std ships a copy of was not examined.
+- `lto` in a single-crate program handed to rustd with rustc's LTO link line ends in the
+  linker's error, not in rustd's sentence. `-C lto` in `RUSTFLAGS` is refused.
+- Doctests: the text of a `compile_fail` example's errors is not compared; where rustd
+  cannot build the library the examples are left to rustdoc with the reason printed.
+- `cargo/units.rs` still keeps its own records of what rustc was run with (it does not read
+  the unit graph), and `cargo/plan.rs` plans the link from them.
 - `Flags::of` in `plan.rs` asks `cargo config get` for the configuration, which is how
   project-model already reads it; it is an unstable cargo command.
 
@@ -248,36 +420,44 @@ Inferred, not measured:
 
 Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`
 from the head of the branch, once with `RUSTD_BACKEND=cranelift` and once with
-`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`. The numbers were the same under both.
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`, one after the other. The numbers were the
+same under both.
 
 | command | result |
 |---|---|
-| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803/803 functions from rustd, 0 of 892 layouts differ |
+| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803/803 functions from rustd, 0 of 893 layouts differ |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
-| `python3 breakers.py` | 25 of 25 right, 0 open, 0 functions skipped |
+| `python3 breakers.py` | 43 of 43 right, 5 open, 0 functions skipped |
 | `python3 unwinds.py` | 8 of 8 right |
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
 | `python3 includes.py` | 9 of 9 right |
 | `python3 worktrees.py` | 62 of 62 right |
-| `python3 keys.py` | 46 of 46 right, 0 open |
+| `python3 keys.py` | 52 of 52 right, 0 open, 8 functions refused |
 | `python3 debuginfo.py` | all right |
-| `python3 buildmodel.py --backend <backend> --jobs 6` | 97 of 97 as expected, 0 WRONG |
+| `python3 buildmodel.py --backend <backend> --jobs 6` | 100 of 100 as expected, 0 WRONG |
+| `python3 doctests.py` | 3 crates the same as `cargo test --doc`, 0 WRONG |
 | `python3 storecorrupts.py` | PASS, 40 damaged stores detected, discarded and rebuilt |
 | `python3 storefull.py` | PASS, 6 full disks |
 | `python3 storekills.py` | PASS, 300 kills |
 | `python3 storeshared.py` | PASS, 180 builds on a shared store |
+| `python3 cargo_rustd.py --only-checks` | PASS: 84 commands and 11 daemon checks the same as cargo |
 | `cargo fmt --all -- --check` | clean |
-| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 929 passed, 0 failed |
+| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 955 passed, 0 failed |
 
-The two backends were run side by side. The Cranelift `difftest.py` of that run failed with
-"no linker line": both runs build the same `corpus` directory, and cargo had nothing left
-to link for the second. Run again by itself it gave the line in the table. Everything else
-is from the side-by-side run.
+The 5 open cases of `breakers.py` came with `rustd-collate` and are not of this work.
+`cargo_rustd.py` was run once (it picks its own backend), without its timings of real
+projects: the timings in `harness/CARGO-RUSTD.md` are the earlier ones, only its table of
+flags is new.
 
-`cargo clippy --all-targets -- --cap-lints warn` on the crates touched gives warnings and no
-errors; they were not sorted into old and new.
+The first pass of this gate found two things. A check for an LTO link line ran for every
+program and turned down ordinary ones (`programs.py`, one case of `breakers.py`); it now
+runs only when the unit graph says the profile has `lto`. And `release_package_checks` was
+refused where it had been supported: a closure of std's `Iterator::count` has no name to
+find copies by, and was treated as if any crate could have compiled it. A closure is now
+looked for under the name of the function it is written in. The gate was run again from the
+start after each.
 
 ## The table
 
@@ -307,14 +487,14 @@ One row per case. "invalidation" is what each step of the case came to under one
 | `debug-assertions = true` in release | `debug_assertions_on` | both | supported |  |  |
 | per-package `debug-assertions` | `debug_assertions_package` | both | supported |  |  |
 | git dependency | `dep_git` | both | supported |  |  |
-| edit to a dependency the daemon was not asked to build | `dep_not_named` | both | supported |  | the dependency's source changes: refused (outside/dep/src/lib.rs is of `dep`, which the program uses and the daemon was not asked to build: rustc's copy of it is from before the edit, name the crate with `--crate`) |
+| edit to a dependency the daemon was not asked to build | `dep_not_named` | both | supported |  | the dependency's source changes: same; a generic function of it that a crate between holds a copy of changes: same; the crate between changes: same; the dependency changes back: same |
 | `[patch]` | `dep_patch` | both | supported |  | the patched source changes: same |
 | path dependency outside the workspace | `dep_path` | both | supported |  | the dependency's source changes: same |
 | a workspace member that is also a registry dependency at the same version | `dep_registry_member` | both | supported |  |  |
 | renamed dependency (`package = ...`) | `dep_renamed` | both | supported |  |  |
 | `[replace]` | `dep_replace` | both | supported |  |  |
 | vendored dependency (`[source] directory`) | `dep_vendored` | both | supported |  |  |
-| doctests | `doctest` | both | refused | rustdoc takes each example out of the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc tells nobody where that crate and its link line are (`--persist-doctests`, `--test-builder` are unstable); rustd neithe |  |
+| doctests | `doctest` | both | supported |  |  |
 | editions 2015, 2018, 2021 and 2024 in one graph | `editions_mixed` | both | supported |  |  |
 | `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_CRATE_NAME`, `CARGO_BIN_NAME` | `env_cargo_pkg` | both | supported |  | the version in the manifest changes: same |
 | `env!` of a variable of the process | `env_env` | both | supported |  | the variable changes: same |
@@ -330,9 +510,11 @@ One row per case. "invalidation" is what each step of the case came to under one
 | weak `opt?/loud` with the optional dependency on | `features_weak_on` | both | supported |  |  |
 | integration tests | `integration_test` | both | supported |  |  |
 | `links` and `DEP_<name>_<key>` metadata | `links` | both | supported |  |  |
-| `lto = true` | `lto_fat` | both | refused | `lto` is on: rustc compiles the whole program again as it links it and leaves no library on the link line for rustd's functions to be linked against |  |
+| `lto = true` | `lto_fat` | both | supported |  |  |
+| `lto = true`, and what rustd links against built with it | `lto_fat_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: rustd links against a build with `lto = "off"` |  |
 | `lto = "off"` | `lto_off` | both | supported |  |  |
-| `lto = "thin"` | `lto_thin` | both | refused | `lto` is on: rustc compiles the whole program again as it links it and leaves no library on the link line for rustd's functions to be linked against |  |
+| `lto = "thin"` | `lto_thin` | both | supported |  |  |
+| `lto = "thin"`, and what rustd links against built with it | `lto_thin_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: rustd links against a build with `lto = "off"` |  |
 | proc macro: attribute | `macro_attribute` | both | supported |  |  |
 | proc macro: derive, with a dependency of its own | `macro_derive` | both | supported |  |  |
 | proc macro: function-like | `macro_function` | both | supported |  |  |
@@ -357,7 +539,8 @@ One row per case. "invalidation" is what each step of the case came to under one
 | reload: a feature is toggled in the manifest | `reload_feature_toggled` | both | supported |  | a feature of a dependency is turned on: same; a default feature of the package is turned on: same; and both off: same |
 | reload: `git checkout` between commits that differ in dependencies, lock file, features, members and build script | `reload_git_checkout` | both | supported |  | the other commit is checked out: same; and the first again: same; and the other once more: same |
 | reload: a dependency's version is bumped in `Cargo.lock` | `reload_lock_version` | both | supported |  | the lock file has the newer version: same; and the older again: same |
-| reload: a new workspace member | `reload_member_added` | both | supported |  | a member is added and depended on: same; the new member's source changes: refused (tool/src/lib.rs is of `tool`, which the program uses and the daemon was not asked to build: rustc's copy of it is from before the edit, name the crate with `--crate`) |
+| reload: a new workspace member | `reload_member_added` | both | supported |  | a member is added and depended on: same; the new member's source changes: same |
+| reload: requests that arrive in the middle of one | `reload_paused` | both | supported |  | 8 clients ask while two features are turned on: same; 8 clients ask while one of them is turned off: same |
 | `rust-version` the toolchain meets | `rust_version_met` | both | supported |  |  |
 | `rust-version` newer than the toolchain | `rust_version_unmet` | both | refused | cargo turns it down too |  |
 | `RUSTFLAGS` with `--cfg` | `rustflags_cfg` | both | supported |  |  |
@@ -382,7 +565,3 @@ One row per case. "invalidation" is what each step of the case came to under one
 | feature unification, resolver 3 (edition 2024) | `unify_resolver3` | both | supported |  |  |
 | feature unification across members, whole workspace built | `unify_workspace` | both | supported |  |  |
 | unit tests | `unit_test` | both | supported |  |  |
-
-`buildmodel.py` is not in `.github/workflows/rustd.yaml`: the cross rows need
-`aarch64-linux-gnu-gcc`, `qemu-aarch64` and `musl-gcc` and the two rustup targets, which the
-workflow does not install.
