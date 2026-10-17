@@ -100,7 +100,7 @@ pub use patch::{Stale, StaleSteps};
 pub use store::{
     Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
     fetch_missing_with, is_pack, limit_from_env, name_file_whole, pack_format, pack_keys,
-    pack_name, parse_size, write_file_whole,
+    pack_name, parse_size, seal_open, write_file_whole,
 };
 mod type_id;
 mod unwind;
