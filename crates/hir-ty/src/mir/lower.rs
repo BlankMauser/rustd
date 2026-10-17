@@ -2489,6 +2489,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
+                        let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                         self.extend_temporaries(*expr_id, *pat);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
@@ -2519,11 +2520,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 self.set_terminator(else_block, TerminatorKind::Unreachable, span);
                             }
                             (Some(else_block), Some(else_branch)) => {
-                                if let Some((_, b)) =
-                                    self.lower_expr_as_place(else_block, *else_branch, true)?
-                                {
-                                    self.set_terminator(b, TerminatorKind::Unreachable, span);
-                                }
+                                self.lower_let_else(else_block, *else_branch, declared, span)?;
                             }
                         }
                         current = temporaries.pop_and_drop(self, current, span);
@@ -2591,6 +2588,40 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.in_statement = outer_statement;
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
+    }
+
+    /// Lowers the `else` of a `let`, which runs when the pattern did not match. The temporaries
+    /// of the initializer are dropped before it runs: the value that was matched, and the ones
+    /// that would have lived on to the end of the block, which are the locals of the block from
+    /// `declared` on.
+    fn lower_let_else(
+        &mut self,
+        mut else_block: BasicBlockId,
+        else_branch: ExprId,
+        declared: usize,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let [.., block, temporaries] = &mut self.drop_scopes[..] else {
+            return Err(MirLowerError::ImplementationError("`let` outside a block".into()));
+        };
+        let extended = block.locals.split_off(declared.min(block.locals.len()));
+        let held = [
+            DropScope { locals: extended, temporaries: true },
+            DropScope { locals: std::mem::take(&mut temporaries.locals), temporaries: true },
+        ];
+        for scope in held.iter().rev() {
+            self.emit_drop_and_storage_dead_for_scope(scope, &mut else_block, span);
+        }
+        let lowered = self.lower_expr_as_place(else_block, else_branch, true);
+        let [extended, statement] = held;
+        if let [.., block, temporaries] = &mut self.drop_scopes[..] {
+            block.locals.extend(extended.locals);
+            temporaries.locals = statement.locals;
+        }
+        if let Some((_, end)) = lowered? {
+            self.set_terminator(end, TerminatorKind::Unreachable, span);
+        }
+        Ok(())
     }
 
     fn lower_params_and_bindings(

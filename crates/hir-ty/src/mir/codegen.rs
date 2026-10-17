@@ -3622,8 +3622,9 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
+    /// The block to generate each `Drop` terminator in, with the block of the body it ends,
+    /// its place and its target.
+    deferred_drops: Vec<(ir::Block, BasicBlockId, StoredPlace, BasicBlockId)>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -4997,7 +4998,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Some(target) => {
                     self.builder.ins().jump(self.blocks[target], &[]);
                 }
-                None => self.terminator(&terminator.kind)?,
+                None => self.terminator(id, &terminator.kind)?,
             }
         }
         // Drops are generated last, when every field that gets moved out of a local is known.
@@ -5006,8 +5007,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+        let mut parted: Vec<LocalId> = Vec::new();
+        for moved in &self.moved_paths {
+            if !parted.contains(&moved.local) {
+                parted.push(moved.local);
+            }
+        }
+        let parted_at_end = body.parted_at_block_ends(&parted, |place| self.moves_part(place));
+        for (block, from, place, target) in std::mem::take(&mut self.deferred_drops) {
             self.builder.switch_to_block(block);
+            // A local that has not lost a part on any way here is dropped as one value.
+            let whole = parted
+                .iter()
+                .position(|&it| it == place.local)
+                .is_none_or(|at| !parted_at_end[from][at]);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
             let replace =
@@ -5025,7 +5038,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let dropped = self.builder.create_block();
                     self.guarded(
                         |this| {
-                            this.drop_place(&place, dropped)?;
+                            this.drop_place(&place, false, dropped)?;
                             this.builder.switch_to_block(dropped);
                             Ok(())
                         },
@@ -5037,7 +5050,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     )?;
                     self.builder.ins().jump(target, &[]);
                 }
-                _ => self.drop_place(&place, target)?,
+                _ => self.drop_place(&place, whole, target)?,
             }
         }
         // So is dropping a suspended future, which drops the same locals as unwinding does.
@@ -5120,6 +5133,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some((path, ty))
     }
 
+    /// Whether using `place` as an operand moves a part out of its local, as far as is known.
+    fn moves_part(&self, place: &StoredPlace) -> bool {
+        let is_moved = |path: &Vec<u32>| {
+            self.moved_paths.iter().any(|it| it.local == place.local && it.path == *path)
+        };
+        self.moved_out_paths(place).is_none_or(|paths| paths.iter().any(is_moved))
+    }
+
     /// Says that the fields of `place` are all there again, after an assignment to it.
     fn clear_moved(&mut self, place: &StoredPlace) {
         if !self.drop_flags.contains_idx(place.local)
@@ -5163,8 +5184,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(bit)
     }
 
-    /// Drops what is left of a place, which is nothing if its local holds no value.
-    fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
+    /// Drops what is left of a place, which is nothing if its local holds no value. `whole`
+    /// says that no part of the local can have been moved out.
+    fn drop_place(&mut self, place: &StoredPlace, whole: bool, target: ir::Block) -> Result<()> {
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -5182,7 +5204,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let local = place.local;
         let place = self.place_ref(place)?;
-        self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        if whole {
+            self.drop_value(place.addr, place.meta, place.ty.ty)?;
+        } else {
+            self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
+        }
         self.builder.ins().jump(target, &[]);
         Ok(())
     }
@@ -7082,7 +7108,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(self.builder.ins().symbol_value(ptr(), location))
     }
 
-    fn terminator(&mut self, terminator: &TerminatorKind) -> Result<()> {
+    fn terminator(&mut self, id: BasicBlockId, terminator: &TerminatorKind) -> Result<()> {
         match terminator {
             TerminatorKind::Goto { target }
             | TerminatorKind::FalseEdge { real_target: target, .. }
@@ -7127,7 +7153,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target));
+                self.deferred_drops.push((block, id, place.clone(), *target));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -9623,7 +9649,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
-            self.drop_place(&place, next)?;
+            self.drop_place(&place, false, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())

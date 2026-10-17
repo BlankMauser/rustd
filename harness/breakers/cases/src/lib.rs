@@ -48,4 +48,5 @@ cases![
     if_branch_temporaries,
     uncaptured_scrutinee,
     unread_index,
+    let_else_temporaries,
 ];
