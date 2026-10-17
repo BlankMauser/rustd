@@ -2818,13 +2818,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         } else {
             self.declare_local_data(compiled.writable)?
         };
+        // One the build after this may replace where it is has to say how large it is.
+        let named = (again.is_some() || self.patching) && !thread_local;
+        let section =
+            named.then(|| Target::current().section_of_static(compiled.writable)).flatten();
         let known = if compiled.writable { &mut self.statics } else { &mut self.frozen_statics };
         known.insert(id, data);
         let begun = self.own_static_order.len();
         self.own_static_order.push(id);
         match self.resolve(&compiled.requests) {
             Ok(ids) => {
-                self.fill_data(data, ids.blob(&compiled.blob))?;
+                self.fill_data(data, ids.blob(&compiled.blob), section)?;
                 Ok(data)
             }
             Err(e) => {
@@ -2839,7 +2843,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     fn_relocs: Vec::new(),
                     align: 1,
                 };
-                self.fill_data(data, nothing)?;
+                self.fill_data(data, nothing, section)?;
                 Err(e)
             }
         }
@@ -3377,7 +3381,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         let id = self.declare_local_data(writable)?;
-        self.fill_data(id, blob)?;
+        self.fill_data(id, blob, None)?;
         if let Some(blob) = shared {
             self.consts.insert(blob, id);
         }
@@ -3392,8 +3396,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
-    fn fill_data(&mut self, id: DataId, blob: ConstBlob) -> Result<()> {
+    /// Defines `id` as `blob`, in a section of its own named `section` when there is one.
+    fn fill_data(&mut self, id: DataId, blob: ConstBlob, section: Option<&str>) -> Result<()> {
         let mut data = DataDescription::new();
+        if let Some(section) = section {
+            data.set_custom_section(section);
+        }
         data.define(blob.bytes.into_boxed_slice());
         data.set_align(blob.align);
         for (offset, target, addend) in blob.relocs {
