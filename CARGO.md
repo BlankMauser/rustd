@@ -292,7 +292,32 @@ a client built from another source replaces the daemon and the old workers exit;
 `RUSTD_IDLE_SECS` set low the daemon and workers exit; workers exit when the daemon is
 killed; the next build starts a new daemon.
 
-Regression gate: see section 5.
+### The regression gate
+
+Run on the head of this branch, from `harness/`, with `RUSTD_BIN=target/release/rustd`, once
+with `RUSTD_BACKEND=cranelift` (binary from `cargo build -p rustd --release`) and once with
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast` (binary from
+`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm`; the
+daemon log says `backend: llvm -O2 fast emit`). Every script exited 0 under both, and the
+counts were the same under both:
+
+| Script | Result |
+|---|---|
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803 of 803 functions from rustd, 0 of 892 layouts differ |
+| `programs.py` | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts |
+| `breakers.py` | 25 of 25, 0 open, 0 functions skipped |
+| `unwinds.py` | 8 of 8 |
+| `splices.py` | 71 of 71 |
+| `asmedits.py` | 10 of 10 |
+| `includes.py` | 9 of 9 |
+| `worktrees.py` | 58 of 58 |
+| `keys.py` | 26 of 26; 4 cases the script marks open (`option_env!` and the release profile, twice each) |
+
+`cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
+-p syntax -p rustd` passed: 928 tests, 0 failed, 1 ignored, of which 27 are rustd's.
+`cargo clippy -p rustd` reports no errors; the new code has warnings of the kinds the rest
+of the crate has (`eprintln!`, `Command::new`), which I left.
 
 ## 4. What is open
 
