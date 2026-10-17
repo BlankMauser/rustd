@@ -57,7 +57,10 @@ pub(super) fn emit(
     Machine::with(optimization, |machine| {
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
-        tally.time(Phase::Lower, || lower::Lowering::lower(&context, &module, func, &named))?;
+        let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
+        tally.time(Phase::Lower, || {
+            lower::Lowering::lower(&context, &module, func, &named, &constants)
+        })?;
         if std::env::var_os("RUSTD_DUMP_LLVM").is_some() {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }

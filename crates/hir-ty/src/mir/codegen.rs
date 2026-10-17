@@ -25,8 +25,11 @@ use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, TraitId,
     VariantId,
     attrs::AttrFlags,
-    expr_store::Body,
-    hir::ExprId,
+    expr_store::{
+        Body,
+        scope::{ExprScopes, ScopeId},
+    },
+    hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
@@ -1663,29 +1666,22 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
 }
 
 /// What a debugger is told of `variables`, which are of the body of `owner` and are where
-/// `debug` has the places of. A name the body gives to more than one local is left out:
-/// nothing says yet from where to where each of them is the one meant. So is a variable of
-/// a type that is not told of.
+/// `debug` has the places of, each in the scope `scopes` has for its binding. A variable of
+/// a type that is not told of is left out.
 fn describe_variables<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
     types: &mut debuginfo::Types<'db>,
     variables: &[Variable],
     places: &SlotPlaces,
+    scopes: &FxHashMap<BindingId, u32>,
     debug: &mut FunctionDebug,
 ) {
     let body = Body::of(db, owner);
-    let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
-    for (_, binding) in body.bindings() {
-        *uses.entry(&binding.name).or_default() += 1;
-    }
     // Where the type of each variable told of is among the types of the function.
     let mut firsts = FxHashMap::default();
     for variable in variables {
         let name = &body[variable.binding].name;
-        if uses.get(name) != Some(&1) {
-            continue;
-        }
         let Some(place) = places.of(variable.slot) else { continue };
         let place = match variable.pointer {
             true => place.pointee(),
@@ -1706,10 +1702,80 @@ fn describe_variables<'db>(
             param: variable.param,
             ty,
             place,
-            scope: None,
+            scope: scopes.get(&variable.binding).copied(),
         });
     }
     debug.frame_base = places.frame_base.clone();
+}
+
+/// The scopes of the body of `owner` that `variables` are bound in, added to `debug`, and
+/// which of them each binding is of. The code of a scope is the code of the expressions
+/// that names are looked up from it or from a scope inside it for: `rows` has, in the order
+/// of the code, where the code of each expression starts, and `len` is where the last ends.
+/// A binding of the outermost scope, which a parameter is, is known in all of the function
+/// and is not among what is returned.
+fn describe_scopes(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    variables: &[Variable],
+    rows: &[(u32, MirSpan)],
+    len: u32,
+    debug: &mut FunctionDebug,
+) -> FxHashMap<BindingId, u32> {
+    let scopes = ExprScopes::of(db, owner);
+    let body = Body::of(db, owner);
+    let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
+    // The scope each binding is an entry of.
+    let mut bound = FxHashMap::default();
+    let mut seen = FxHashSet::default();
+    for (_, &scope) in scopes.scope_by_expr().iter() {
+        for scope in scopes.scope_chain(Some(scope)).take_while(|&it| seen.insert(it)) {
+            bound.extend(scopes.entries(scope).iter().map(|entry| (entry.binding(), scope)));
+        }
+    }
+    // The scopes told of, outer ones first, and where each is among them.
+    let mut told: FxHashMap<ScopeId, u32> = FxHashMap::default();
+    let mut of_binding = FxHashMap::default();
+    for variable in variables {
+        let Some(&scope) = bound.get(&variable.binding).filter(|&&it| Some(it) != outermost) else {
+            continue;
+        };
+        let mut chain: Vec<ScopeId> = scopes
+            .scope_chain(Some(scope))
+            .take_while(|it| Some(*it) != outermost && !told.contains_key(it))
+            .filter(|&it| it == scope || !scopes.entries(it).is_empty())
+            .collect();
+        chain.reverse();
+        for scope in chain {
+            let parent =
+                scopes.scope_chain(Some(scope)).skip(1).find_map(|it| told.get(&it).copied());
+            told.insert(scope, debug.scopes.len() as u32);
+            debug.scopes.push(debuginfo::Scope { parent, ranges: Vec::new() });
+        }
+        of_binding.insert(variable.binding, told[&scope]);
+    }
+    if told.is_empty() {
+        return of_binding;
+    }
+    // Code that is of no expression is of the scope of the code before it.
+    let mut scope = None;
+    let ends = rows.iter().skip(1).map(|row| row.0).chain([len]);
+    for (&(from, span), to) in rows.iter().zip(ends) {
+        if let MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) = span {
+            scope = scopes.scope_for(expr);
+        }
+        if from >= to {
+            continue;
+        }
+        for index in scopes.scope_chain(scope).filter_map(|it| told.get(&it)) {
+            let ranges = &mut debug.scopes[*index as usize].ranges;
+            match ranges.last_mut() {
+                Some(last) if last.1 == from => last.1 = to,
+                _ => ranges.push((from, to)),
+            }
+        }
+    }
+    of_binding
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
@@ -2493,11 +2559,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             let places = &compiled.code.slots;
             let db = self.db;
+            let len = compiled.code.bytes.len() as u32;
+            let mut rows: Vec<(u32, MirSpan)> = match &compiled.source {
+                Some((_, spans)) => (compiled.code.lines.iter())
+                    .filter_map(|row| Some((row.offset, *spans.get(row.span as usize)?)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            rows.sort_by_key(|row| row.0);
+            let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
             let types = self
                 .types
                 .entry(env.clone())
                 .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
-            describe_variables(db, *owner, types, variables, places, &mut debug);
+            describe_variables(db, *owner, types, variables, places, &scopes, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
@@ -3764,6 +3839,17 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Whether the bytes are all there is to it, with no address among them.
+    #[cfg(feature = "llvm")]
+    fn points_nowhere(&self) -> bool {
+        self.relocs.is_empty() && self.fn_relocs.is_empty()
+    }
+
+    #[cfg(feature = "llvm")]
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
     fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
         self.bytes[offset..offset + word()].fill(0);
