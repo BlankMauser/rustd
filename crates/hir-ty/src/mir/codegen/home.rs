@@ -40,7 +40,7 @@ impl<'db> Mentions<'db> {
         let mut mentions =
             Mentions { db, crates: FxHashSet::default(), bodies: Vec::new(), opaque: false };
         match instance.def {
-            InstanceDef::Fn(func) => {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
                 mentions.crates.insert(func.krate(db));
                 mentions.bodies.push(func.into());
             }

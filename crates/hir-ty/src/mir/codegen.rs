@@ -818,6 +818,9 @@ enum InstanceDef {
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
     /// generic argument: calls the closure through the pointer it is handed, then drops it.
     CallOnceShim,
+    /// A method that takes `self` by value, in a vtable: the slot is called with a pointer to
+    /// the value, which the shim hands to the method as the method takes it.
+    VtableShim(FunctionId),
     /// What a closure that captures nothing coerces to as a function pointer: calls the
     /// closure type that is the instance's only generic argument, which borrows a receiver,
     /// with a dangling one.
@@ -1128,6 +1131,10 @@ fn compiled_instance<'db>(
                 _ => fx.call_once_by_pointer(args),
             });
         }
+        InstanceDef::VtableShim(func) => {
+            let args = instance.args.as_ref();
+            return compile(db, env, None, false, |fx| fx.vtable_shim(func, args));
+        }
         InstanceDef::FnPointerShim => {
             return compile(db, env, None, false, |fx| fx.fn_pointer_shim(ty()));
         }
@@ -1361,6 +1368,7 @@ fn instance_body<'db>(
             .map(Cow::Borrowed),
         InstanceDef::DropGlue
         | InstanceDef::CallOnceShim
+        | InstanceDef::VtableShim(_)
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
@@ -3024,6 +3032,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::CoroutineByMove(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
@@ -3166,6 +3175,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => "{async}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
+            InstanceDef::VtableShim(_) => "{vtable}",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
             InstanceDef::ReifyShim { .. } => "{reify}",
         }
@@ -7950,14 +7960,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
-        // A by-value `self` reaches the method through a pointer and needs a shim.
-        let receiver = self.layout(receiver.as_ref())?;
-        let thin = match receiver.backend_repr {
-            BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Primitive::Pointer(_)),
-            _ => false,
-        };
-        if !thin {
-            unsupported!("vtable method taking `self` by value");
+        // A by-value `self` reaches the method through a pointer and needs a shim, unless the
+        // method takes it through a pointer too.
+        if receiver.as_ref() == self_ty {
+            let layout = self.layout(self_ty)?;
+            let mode = self.pass_mode(&layout, false)?;
+            if !matches!(mode, PassMode::Indirect) {
+                if track_caller(db, callee) {
+                    unsupported!("vtable method taking `self` by value that tracks its caller");
+                }
+                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                return self.cg.callee(
+                    InstanceDef::VtableShim(callee),
+                    callee_args,
+                    self.env,
+                    &sig,
+                );
+            }
         }
         // A method declared `#[track_caller]` in the trait is given a location by the call. One
         // that is so only in the impl is called without, and the shim supplies it.
@@ -8250,19 +8269,45 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn call_once_by_pointer(&mut self, args: GenericArgs<'db>) -> Result<()> {
         let (callee, callee_args, sig, mode) = self.call_once_impl(args)?;
         let layout = self.layout(args.type_at(0))?;
-        self.builder.func.signature = Self::by_pointer(&sig, mode);
+        self.call_by_pointer(callee, callee_args, &sig, mode, &layout)
+    }
+
+    /// The body of a `VtableShim`: calls the method with the value the shim is handed a
+    /// pointer to.
+    fn vtable_shim(&mut self, func: FunctionId, args: GenericArgs<'db>) -> Result<()> {
+        let body = self.body_types(InstanceDef::Fn(func), args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
+            unsupported!("vtable method without a receiver");
+        };
+        let layout = self.layout(receiver.as_ref())?;
+        let mode = self.pass_mode(&layout, false)?;
+        self.call_by_pointer(func, args, &sig, mode, &layout)
+    }
+
+    /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
+    /// it by value as `mode` says.
+    fn call_by_pointer(
+        &mut self,
+        callee: FunctionId,
+        callee_args: GenericArgs<'db>,
+        sig: &Signature,
+        mode: PassMode,
+        layout: &Layout,
+    ) -> Result<()> {
+        self.builder.func.signature = Self::by_pointer(sig, mode);
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
         let mut params = self.builder.block_params(entry).to_vec();
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let Some(&receiver) = params.get(sret as usize) else {
-            unsupported!("call_once shim for a receiver that is not passed");
+            unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
-        self.pass(mode, receiver, &layout, &mut values);
+        self.pass(mode, receiver, layout, &mut values);
         params.splice(sret as usize..sret as usize + 1, values);
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);

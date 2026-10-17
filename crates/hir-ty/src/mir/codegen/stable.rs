@@ -103,6 +103,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             }
             InstanceDef::DropGlue => out.push_str("drop"),
             InstanceDef::CallOnceShim => out.push_str("call_once"),
+            InstanceDef::VtableShim(func) => {
+                out.push_str("vtable shim ");
+                self.function(&mut out, func)?;
+            }
             InstanceDef::FnPointerShim => out.push_str("fn_pointer"),
             InstanceDef::ReifyShim { receiver } => write!(out, "reify {receiver}").ok()?,
         }

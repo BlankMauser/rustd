@@ -56,6 +56,7 @@ cases![
     stringify_lifetime,
     concat_module_path,
     fragment_parens,
+    vtable_self_by_value,
     static_enum_slice,
     const_none_niche,
     late_import_macro,
