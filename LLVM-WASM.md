@@ -26,7 +26,7 @@ medians of 5 runs, details below):
 - A rebuild after a one-line edit: codegen 12 ms to 16-18 ms, which nobody will notice.
 - Memory: the compiler's linear memory grows by 6 to 9 MiB (208 to 214 MiB on balls).
 - The compiler has to be built for `wasm32-wasip1`, not `wasm32-unknown-unknown`, with a
-  75-line WASI shim in the page, and LLVM needs a 428-line patch to its Support library.
+  74-line WASI shim in the page, and LLVM needs a 428-line patch to its Support library.
 
 What it buys: the emitted module is 53% to 59% smaller and the demos' frames run 1.75x to
 4.75x faster.
@@ -129,7 +129,7 @@ The problems, in the order they came up:
 
 What the page must supply: the module imports 24 functions of `wasi_snapshot_preview1`
 (environment, clock, random, the `fd_*` and `path_*` file calls, `proc_exit`, `sched_yield`).
-`web/wasi.js` (75 lines) implements the environment, the clock, random bytes and `fd_write` to
+`web/wasi.js` (74 lines) implements the environment, the clock, random bytes and `fd_write` to
 the console, and answers everything else with `ENOSYS`. No file is ever opened. The environment
 is how the page passes `RUSTD_BACKEND` and `RUSTD_OPT`.
 
@@ -148,8 +148,8 @@ compiled by the hand-written lowering, as Cranelift takes over natively.
 - `RUSTD_OPT=1-fast` is new (`Optimization::Quick`): the `default<O1>` pipeline, and the
   target machine at `OptimizationLevel::None`. It exists natively too.
 - `llvm/emitted_wasm.rs` (427 lines) reads the wasm object with `wasmparser` (already in the
-  lock file through other crates; `object` reads wasm too but does not give relocations in
-  a form that was less work). It takes the one function body, turns direct calls into the
+  lock file through other crates, so no new crate is downloaded; reading it with `object`
+  was not tried). It takes the one function body, turns direct calls into the
   table calls the page's linker expects, turns relocations into rustd's, and data segments
   into constants. One trap: the buffer inkwell hands back has a trailing NUL that is not part
   of the object.
