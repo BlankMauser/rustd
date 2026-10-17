@@ -163,19 +163,40 @@ fn check_peer(_: &UnixStream) -> io::Result<()> {
 /// Reads the one line a client sends, without its end: of the user, within the time and
 /// the length a request may take.
 pub(crate) fn read_request(stream: &UnixStream) -> io::Result<String> {
-    read_request_within(stream, LONGEST_REQUEST, REQUEST_TIMEOUT)
+    let [request] = read_lines_within(stream, LONGEST_REQUEST, REQUEST_TIMEOUT)?;
+    Ok(request)
 }
 
-fn read_request_within(stream: &UnixStream, longest: u64, timeout: Duration) -> io::Result<String> {
+/// Reads the two lines a client of a worker sends, as [`read_request`] does one: the
+/// request, and the variables of the client's process.
+pub(crate) fn read_request_and_env(stream: &UnixStream) -> io::Result<[String; 2]> {
+    read_lines_within(stream, LONGEST_REQUEST, REQUEST_TIMEOUT)
+}
+
+fn read_lines_within<const LINES: usize>(
+    stream: &UnixStream,
+    longest: u64,
+    timeout: Duration,
+) -> io::Result<[String; LINES]> {
     check_peer(stream)?;
     stream.set_read_timeout(Some(timeout))?;
-    let mut line = String::new();
-    BufReader::new(stream.take(longest)).read_line(&mut line)?;
+    let mut lines = BufReader::new(stream.take(longest));
+    let mut read = [const { String::new() }; LINES];
+    for line in &mut read {
+        *line = read_line(&mut lines)?;
+    }
     // What a build takes is not the client's to be timed for.
     stream.set_read_timeout(None)?;
+    Ok(read)
+}
+
+/// The next line of `lines` without its end, when it has one before `lines` is at its limit.
+fn read_line(lines: &mut BufReader<io::Take<&UnixStream>>) -> io::Result<String> {
+    let mut line = String::new();
+    lines.read_line(&mut line)?;
     match line.strip_suffix('\n') {
-        Some(request) => Ok(request.to_owned()),
-        None if line.len() as u64 >= longest => {
+        Some(line) => Ok(line.to_owned()),
+        None if lines.get_ref().limit() == 0 => {
             Err(io::Error::new(io::ErrorKind::InvalidData, "the request is too long"))
         }
         None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the request has no end")),
@@ -232,25 +253,26 @@ mod tests {
 
         let (_silent, stream) = connect();
         let began = Instant::now();
-        let timed_out = read_request_within(&stream, 64, short).unwrap_err();
+        let timed_out = read_lines_within::<1>(&stream, 64, short).unwrap_err();
         assert!(matches!(timed_out.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
         assert!(began.elapsed() < Duration::from_secs(5));
 
         let (mut endless, stream) = connect();
         endless.write_all(&[b'a'; 200]).unwrap();
-        let too_long = read_request_within(&stream, 64, short).unwrap_err();
+        let too_long = read_lines_within::<1>(&stream, 64, short).unwrap_err();
         assert_eq!(too_long.kind(), io::ErrorKind::InvalidData);
 
         let (mut cut_short, stream) = connect();
         cut_short.write_all(b"sync").unwrap();
         drop(cut_short);
-        let no_end = read_request_within(&stream, 64, short).unwrap_err();
+        let no_end = read_lines_within::<1>(&stream, 64, short).unwrap_err();
         assert_eq!(no_end.kind(), io::ErrorKind::UnexpectedEof);
 
         // The others did not keep this one from being heard.
         let (mut good, stream) = connect();
-        good.write_all(b"sync\n").unwrap();
-        assert_eq!(read_request_within(&stream, 64, short).unwrap(), "sync");
+        good.write_all(b"sync\nA=b\n").unwrap();
+        let heard: [String; 2] = read_lines_within(&stream, 64, short).unwrap();
+        assert_eq!(heard, ["sync", "A=b"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

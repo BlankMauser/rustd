@@ -12,6 +12,11 @@ rust-version.workspace = true
 [dependencies]
 memchr = "2"
 anyhow.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+cfg.workspace = true
+intern.workspace = true
 memmap2 = "0.9"
 wasmparser = { version = "0.236", default-features = false, features = ["std"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
@@ -23,8 +28,6 @@ same-file = "1"
 dunce = "1"
 pdb = "0.8"
 sha2 = "0.10"
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 cargo_metadata.workspace = true
 shlex = "2"
 toml.workspace = true

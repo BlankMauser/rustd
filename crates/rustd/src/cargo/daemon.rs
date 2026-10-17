@@ -202,6 +202,9 @@ struct Worker {
     project: PathBuf,
     socket: PathBuf,
     log: PathBuf,
+    /// The variables the process runs with, as a request says them: the daemon asks for
+    /// builds for the process the worker was loaded for.
+    env: String,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
@@ -239,6 +242,11 @@ impl Worker {
         }
         let output = File::create(&log)?;
         command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+        let mut env = crate::process::own();
+        for (name, value) in &config.env {
+            env.set(name, value);
+        }
+        env.set(ENDS_WITH_INPUT, "1");
         command.current_dir(&checkout.root);
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         let child = command.spawn().context("starting a worker")?;
@@ -251,6 +259,7 @@ impl Worker {
             project: checkout.project(),
             socket,
             log,
+            env: crate::process::encode(&env),
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
@@ -328,6 +337,7 @@ impl Worker {
         };
         let mut stream = UnixStream::connect(&self.socket).with_context(failed)?;
         stream.write_all(line.as_bytes()).with_context(failed)?;
+        stream.write_all(format!("{}\n", self.env).as_bytes()).with_context(failed)?;
         let mut reply = String::new();
         BufReader::new(stream).read_line(&mut reply).with_context(failed)?;
         let reply = reply.trim_end();

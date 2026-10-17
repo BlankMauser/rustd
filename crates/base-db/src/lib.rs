@@ -322,6 +322,32 @@ pub struct LocalRoots {
     pub roots: FxHashSet<SourceRootId>,
 }
 
+/// The variables of the process a build is for, which `env!` and `option_env!` read where
+/// the crate's own have nothing: those of whoever asked for the build.
+#[salsa::input(singleton, debug)]
+pub struct ProcessEnv {
+    #[returns(ref)]
+    pub vars: Env,
+}
+
+/// The variable `key` of the process the build is for.
+pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+    ProcessEnv::try_get(db)?.vars(db).get(key)
+}
+
+/// Has builds from here on be for a process with the variables `vars`.
+pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
+    use salsa::Setter as _;
+    match ProcessEnv::try_get(db) {
+        Some(env) => {
+            env.set_vars(db).to(vars);
+        }
+        None => {
+            ProcessEnv::new(db, vars);
+        }
+    }
+}
+
 #[salsa::input(debug)]
 pub struct FileText {
     #[returns(ref)]
