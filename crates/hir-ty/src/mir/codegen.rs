@@ -9310,6 +9310,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// Calls a function of one instruction on two vectors, with where it reads a third
+    /// operand and writes its result.
+    fn vector_assembly(
+        &mut self,
+        text: String,
+        a: &Operand,
+        b: &Operand,
+        dst: Value,
+    ) -> Result<()> {
+        let (a, _) = self.operand(a)?;
+        let (b, _) = self.operand(b)?;
+        let mut sig = self.cg.make_signature();
+        sig.params.extend([AbiParam::new(ptr()); 3]);
+        let callee = self.cg.assembly(text, &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &[a, b, dst]);
+        Ok(())
+    }
+
     /// A function `core::arch` declares as `llvm.{name}`: something LLVM implements, with no
     /// body anywhere.
     fn llvm_intrinsic(
@@ -9414,6 +9433,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("x86.sse41.packusdw" | "x86.avx2.packusdw" | "x86.avx512.packusdw.512", [a, b]) => {
                 self.pack_lanes(a, b, dst, types::I32, false)?
+            }
+            (
+                "x86.sha1msg1" | "x86.sha1msg2" | "x86.sha1nexte" | "x86.sha256msg1"
+                | "x86.sha256msg2",
+                [a, b],
+            ) => {
+                let instruction = format!("{} xmm0, xmm1", name.trim_start_matches("x86."));
+                self.vector_assembly(asm::vector_instruction(&instruction, "xmm0"), a, b, dst)?;
+            }
+            ("x86.sha256rnds2", [a, b, k]) => {
+                let (k, ty) = self.operand(k)?;
+                let size = self.layout(ty)?.size;
+                self.copy(dst, k, size);
+                // The instruction takes its third vector in `xmm0`.
+                let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
+                self.vector_assembly(asm::vector_instruction(rounds, "xmm3"), a, b, dst)?;
+            }
+            ("x86.sha1rnds4", [a, b, function]) => {
+                let (function, _) = self.load_scalar(function)?;
+                self.builder.ins().store(MEM, function, dst, 0);
+                self.vector_assembly(asm::sha1rnds4(), a, b, dst)?;
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;

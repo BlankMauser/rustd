@@ -29,6 +29,7 @@ cases![
     simd_reduce,
     simd_lanes,
     simd_packs,
+    sha_ni,
     simd_sums,
     variant_alias,
     two_bitflags,

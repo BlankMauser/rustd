@@ -65,6 +65,34 @@ pub(super) fn vcvtps2ph(register: &str) -> String {
     text
 }
 
+/// A function of one instruction over 128-bit vectors that Cranelift does not have. `xmm0`
+/// and `xmm1` are loaded from where the first two arguments point and `xmm2` from where the
+/// third does, which is where `result` is written once `instruction` ran.
+pub(super) fn vector_instruction(instruction: &str, result: &str) -> String {
+    let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+    format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
+         movdqu xmm2, [{c}]\n{instruction}\nmovdqu [{c}], {result}\nret\n"
+    )
+}
+
+/// `sha1rnds4` does four rounds of SHA-1 on the vectors at its first two arguments. Which
+/// function the rounds use is part of the instruction, so there is one for each of the four:
+/// the byte at the third argument says which runs, and the result is written over it.
+pub(super) fn sha1rnds4() -> String {
+    let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+    let mut text = format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
+         movzx eax, byte ptr [{c}]\nand eax, 3\nshl eax, 4\nlea r11, [rip + .Lrounds]\n\
+         add r11, rax\njmp r11\n.p2align 4\n.Lrounds:\n"
+    );
+    for function in 0..4 {
+        _ = write!(text, ".p2align 4\nsha1rnds4 xmm0, xmm1, {function}\njmp .Lround\n");
+    }
+    _ = write!(text, ".Lround:\nmovdqu [{c}], xmm0\nret\n");
+    text
+}
+
 /// Calls the variadic function whose address is the last argument with the arguments before
 /// it, and says that up to eight vector registers hold arguments. `ints` of those are in
 /// integer registers and `stack` of them on the stack, which says where the address is.
