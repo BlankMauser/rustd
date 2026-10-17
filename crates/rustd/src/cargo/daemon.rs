@@ -307,6 +307,13 @@ impl Worker {
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
         self.set(&checkout.key, warmth);
+        // Nobody could ask it for a build until now.
+        *lock(&self.asked) = Instant::now();
+    }
+
+    /// Whether a checkout is still being loaded.
+    fn loads(&self) -> bool {
+        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
     }
 
     fn warmed(&self, checkout: &Checkout, started_on: bool) -> anyhow::Result<()> {
@@ -583,7 +590,8 @@ impl Daemon {
                 self.end();
             }
             lock(&self.workers).retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle;
+                // Loading can take longer than the idle time, and is what was asked for.
+                let keep = worker.loads() || lock(&worker.asked).elapsed() < idle;
                 if !keep {
                     worker.stop();
                 }
