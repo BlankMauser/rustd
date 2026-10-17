@@ -1977,6 +1977,7 @@ fn build<'db>(
         location: None,
         span: MirSpan::Unknown,
         constant_locals: Vec::new(),
+        copies: ArgumentCopies::default(),
         args: None,
         suspended: None,
         suspended_drop: None,
@@ -3853,6 +3854,39 @@ struct LocalSlot {
     borrowed: bool,
 }
 
+/// The stack a function has for the copies of arguments it passes by pointer. A callee owns
+/// its copy only until it returns, so the calls of a function take turns with the same stack.
+#[derive(Default)]
+struct ArgumentCopies {
+    /// The copies of calls not made yet, by the address each is passed as.
+    lent: Vec<(Value, ArgumentCopy)>,
+    spare: Vec<ArgumentCopy>,
+}
+
+#[derive(Clone, Copy)]
+struct ArgumentCopy {
+    slot: ir::StackSlot,
+    size: u32,
+    align_shift: u8,
+}
+
+impl ArgumentCopies {
+    /// The smallest spare copy that holds `size` bytes at that alignment.
+    fn spare(&mut self, size: u32, align_shift: u8) -> Option<ArgumentCopy> {
+        let fits = |it: &&ArgumentCopy| it.size >= size && it.align_shift >= align_shift;
+        let smallest = self.spare.iter().filter(fits).map(|it| it.size).min()?;
+        let at = self.spare.iter().position(|it| fits(&it) && it.size == smallest)?;
+        Some(self.spare.swap_remove(at))
+    }
+
+    /// The call with `args` is made: what it was lent is spare again.
+    fn returned(&mut self, args: &[Value]) {
+        let (back, lent) = self.lent.drain(..).partition(|(addr, _)| args.contains(addr));
+        self.lent = lent;
+        self.spare.extend(back.into_iter().map(|(_, copy): (Value, ArgumentCopy)| copy));
+    }
+}
+
 struct FunctionCx<'cx, 'db> {
     cg: &'cx mut Recorder<'db>,
     /// `None` while generating a shim that has no MIR.
@@ -3902,6 +3936,7 @@ struct FunctionCx<'cx, 'db> {
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
+    copies: ArgumentCopies,
     /// What the body's generic parameters stand for, when it is the body of an instance.
     args: Option<StoredGenericArgs>,
     /// While compiling an `async` body: where it says where it left off.
@@ -4734,7 +4769,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
-                let copy = self.stack_slot(layout);
+                let copy = self.argument_copy(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
             }
@@ -4871,6 +4906,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         }
         self.blob_addr(blob).ok()
+    }
+
+    /// Stack for the copy of an argument of `layout` that the next call is passed.
+    fn argument_copy(&mut self, layout: &Layout) -> Value {
+        let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
+        if align > 16 {
+            return self.stack_slot(layout);
+        }
+        let align_shift = align.trailing_zeros() as u8;
+        let copy = self.copies.spare(size, align_shift).unwrap_or_else(|| ArgumentCopy {
+            slot: self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size,
+                align_shift,
+            )),
+            size,
+            align_shift,
+        });
+        let addr = self.builder.ins().stack_addr(ptr(), copy.slot, 0);
+        self.copies.lent.push((addr, copy));
+        addr
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -9942,6 +9998,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Calls a function that may unwind. When this function has values to drop, the call gets a
     /// landing pad that drops them and resumes unwinding.
     fn invoke(&mut self, callee: ir::FuncRef, args: &[Value]) -> Vec<Value> {
+        self.copies.returned(args);
         let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call(callee, args);
             return self.builder.inst_results(call).to_vec();
@@ -9957,6 +10014,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn invoke_indirect(&mut self, sig: ir::SigRef, pointer: Value, args: &[Value]) -> Vec<Value> {
+        self.copies.returned(args);
         let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call_indirect(sig, pointer, args);
             return self.builder.inst_results(call).to_vec();

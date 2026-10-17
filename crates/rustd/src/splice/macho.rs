@@ -1331,6 +1331,10 @@ impl<'a> Patch<'a> {
                 size: next.map_or(end, |next| end.min(*next)) - symbol.address(),
             });
         }
+        // A patch built without debug info describes nothing, as the profile asked.
+        if self.file.section_by_name("__debug_info").is_none() {
+            functions.clear();
+        }
         let map = DebugMap { object, functions };
 
         let mut rebases: Vec<u64> = image.rebases.clone();
@@ -1504,6 +1508,7 @@ impl Layout<'_> {
         let strings_len = u32_at(&commands, symbols + 20)?;
         let (entries, names) = match locals {
             0 => (Vec::new(), Vec::new()),
+            _ if self.map.functions.is_empty() => (Vec::new(), Vec::new()),
             _ => self.map.written(strings_len, code_section)?,
         };
         let mapped = u64::from(u32_at(&commands, symbols + 8)?) + u64::from(locals) * NLIST as u64;
