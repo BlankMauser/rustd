@@ -1,0 +1,20 @@
+{
+  "row": "edit to a dependency the daemon was not asked to build",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "steps": [
+    {
+      "what": "the dependency's source changes",
+      "edit": [
+        [
+          "outside/dep/src/lib.rs",
+          "n * 3",
+          "n * 4"
+        ]
+      ],
+      "expect": "refused"
+    }
+  ]
+}

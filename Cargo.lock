@@ -3062,6 +3062,7 @@ name = "rustd"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cargo-platform",
  "cargo_metadata",
  "cfg",
  "dunce",
@@ -3092,7 +3093,7 @@ dependencies = [
  "tar",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
- "toml",
+ "toolchain",
  "triomphe",
  "uds_windows",
  "ureq",
