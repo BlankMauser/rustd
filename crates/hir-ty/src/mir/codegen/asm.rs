@@ -738,23 +738,22 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
             RelocationTarget::Symbol(index) => file.symbol_by_index(index).ok(),
             _ => None,
         };
+        // The name is as the text has it: an assembler adds nothing to one, on Mach-O either.
         let operand = operand
-            .and_then(|it| {
-                let name = it.name().ok()?;
-                // Mach-O has an underscore before every name of C.
-                let name = match format {
-                    BinaryFormat::MachO => name.strip_prefix('_')?,
-                    _ => name,
-                };
-                name.strip_prefix(SYM)?.parse().ok()
-            })
+            .and_then(|it| it.name().ok()?.strip_prefix(SYM)?.parse().ok())
             .ok_or("inline assembly that names a symbol")?;
         let (kind, elf_type) = Named::kind(format, file.architecture(), relocation.flags())
             .ok_or("inline assembly that names a symbol in a way that is not read")?;
         let offset = offset.checked_sub(start).ok_or("inline assembly before its function")?;
         let mut addend = relocation.addend();
-        if relocation.has_implicit_addend() {
-            // COFF keeps what is added in the field, which whoever applies this is given apart.
+        // COFF keeps what is added in the field, and Mach-O does for an address that is data,
+        // which whoever applies this is given apart. `object` says as much of every Mach-O
+        // relocation that nothing is added to, where the field is an instruction.
+        let in_field = match format {
+            BinaryFormat::MachO => kind == Reloc::Abs8,
+            _ => true,
+        };
+        if in_field && relocation.has_implicit_addend() {
             let len = if kind == Reloc::Abs8 { 8 } else { 4 };
             let field = code
                 .get_mut(offset as usize..)
