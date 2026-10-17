@@ -97,7 +97,10 @@ mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 
 pub use patch::{Stale, StaleSteps};
-pub use store::{pack_name, seal_left_open};
+pub use store::{
+    Collected, FORMAT as STORE_FORMAT, Stats, StoreDir, Verified, compiles_against, is_pack,
+    limit_from_env, pack_name, parse_size, write_file_whole,
+};
 mod type_id;
 mod unwind;
 mod vtable;
@@ -2459,11 +2462,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let checked = build_checks_overflow(self.db);
         let Some(key) = cached::Entry::key(&name, debug.is_some(), checked) else { return };
-        let stored = store.get(&key);
-        let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
-        if stored.is_some() && !check {
+        let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
+        if !check && store.has(&key) {
             return;
         }
+        let stored = store.get(&key).filter(|_| check);
         let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
@@ -2480,7 +2483,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 eprintln!("entry of `{name}` is not what was compiled");
                 if let Some(path) = std::env::var_os("RUSTD_CACHE_CHECK").filter(|it| it != "1") {
                     let at = std::path::Path::new(&path).join(self.kept.differing.to_string());
-                    let was = cached::Entry::decode(stored);
+                    let was = cached::Entry::decode(&stored);
                     _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
                 }
             }

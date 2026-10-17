@@ -524,6 +524,32 @@ fn rustc_commit(toolchain: &str) -> Option<String> {
     Some(commit.split_once('"')?.0.to_owned())
 }
 
+/// What tells the toolchain whose library was loaded from any other: the name of the built
+/// library the program links, its commit, and the name of its compiler, each of which has
+/// a hash of the toolchain in it. `None` when it has none of them.
+fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String> {
+    let mut identity: Vec<String> = symbol_files
+        .iter()
+        .filter_map(|it| it.file_name()?.to_str())
+        .filter(|it| it.starts_with("libstd-"))
+        .map(str::to_owned)
+        .collect();
+    let toolchain = vfs.iter().find_map(|(_, path)| {
+        let (toolchain, _) = path.as_path()?.as_str().split_once("lib/rustlib/src/rust/")?;
+        Some(toolchain.to_owned())
+    });
+    if let Some(toolchain) = &toolchain {
+        identity.extend(rustc_commit(toolchain));
+        for dir in ["lib", "bin"] {
+            let Ok(entries) = std::fs::read_dir(format!("{toolchain}{dir}")) else { continue };
+            let names = entries.filter_map(|it| it.ok()?.file_name().into_string().ok());
+            identity.extend(names.filter(|it| it.contains("rustc_driver-")));
+        }
+    }
+    identity.sort_unstable();
+    (!identity.is_empty()).then(|| identity.join(" "))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -2821,6 +2847,10 @@ fn main() -> anyhow::Result<()> {
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
     let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;
     ide_db::base_db::set_process_env(&mut db, process::own());
+    match toolchain_identity(&vfs, &args.symbol_files) {
+        Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
+        None => eprintln!("store: the toolchain of the library cannot be told from another"),
+    }
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     args.debug = profile::debug(&args.checkout, &args.profile);

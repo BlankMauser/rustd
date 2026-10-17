@@ -65,4 +65,8 @@ jobs:
           run keys.py
           run debuginfo.py
           if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storefull.py
+          run storeshared.py
           exit $failed

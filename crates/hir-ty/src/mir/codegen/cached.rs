@@ -273,8 +273,8 @@ impl StoredCode {
 }
 
 impl Entry {
-    /// The key of the entry for `name`, or `None` when this build of the compiler cannot be
-    /// told from another, whose entries would then be taken for its own.
+    /// The key of the entry for `name`. The store tells the entries of this build of the
+    /// compiler from another's.
     ///
     /// An entry kept with what a debugger is told is not the one kept without.
     ///
@@ -282,14 +282,8 @@ impl Entry {
     /// they agree: code of the standard library that takes the setting of its callers has the
     /// same name in a build with the checks and in one without.
     pub(super) fn key(name: &str, debug: bool, checks_overflow: Option<bool>) -> Option<[u8; KEY]> {
-        static COMPILER: OnceLock<Option<[u8; KEY]>> = OnceLock::new();
-        let compiler = COMPILER.get_or_init(|| {
-            let program = std::fs::read(std::env::current_exe().ok()?).ok()?;
-            Some(Sha256::digest(program).into())
-        });
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 4");
-        hasher.update((*compiler)?);
+        hasher.update(b"rustd entry 5");
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.
@@ -395,7 +389,7 @@ impl Entries {
         let entry = (!banned)
             .then(|| {
                 let key = Entry::key(name, self.debug, self.checks_overflow)?;
-                Entry::decode(self.store.get(&key)?)
+                Entry::decode(&self.store.get(&key)?)
             })
             .flatten()
             .map(Arc::new);
