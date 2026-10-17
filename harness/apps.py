@@ -147,8 +147,9 @@ class App(Fixture):
         except subprocess.TimeoutExpired:
             return "timeout", b"", b""
         # A program that prints where it is prints a different place for each build.
-        where = os.fsencode(binary)
-        return run.returncode, *(self.scrub(out.replace(where, b"<program>")) for out in (run.stdout, run.stderr))
+        where, directory = os.fsencode(binary), os.fsencode(os.path.dirname(binary))
+        return run.returncode, *(self.scrub(out.replace(where, b"<program>").replace(directory, b"<directory>"))
+                                 for out in (run.stdout, run.stderr))
 
     def scrub(self, output):
         """What a program measures (elapsed times) differs from run to run."""
