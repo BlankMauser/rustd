@@ -1,6 +1,7 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod cargo;
 mod content;
 mod deps;
 mod memory;
@@ -2254,6 +2255,9 @@ struct Target {
     /// The checkout it is a program of. `None` is the one the daemon was started in.
     project: Option<PathBuf>,
     krate: String,
+    /// The other crates of the workspace that are in it, when the client says: the names
+    /// after the first in `--crate a,b,c`. Otherwise the ones the daemon was started with.
+    batch: Option<Vec<String>>,
     out: PathBuf,
     patch: Option<PathBuf>,
     link_cmd: Option<String>,
@@ -2271,16 +2275,15 @@ impl Target {
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, out, patch, link_cmd, splice, symbol_files } = self;
+        let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
-        let batch = std::iter::once(&daemon.krate)
-            .chain(&daemon.batch)
-            .filter(|&it| *it != krate)
-            .cloned()
-            .collect();
+        let batch = batch.unwrap_or_else(|| {
+            let started_with = std::iter::once(&daemon.krate).chain(&daemon.batch);
+            started_with.filter(|&it| *it != krate).cloned().collect()
+        });
         Ok(Args {
             project,
             checkout,
@@ -2317,7 +2320,8 @@ impl Target {
         }
         match (krate, out) {
             (Some(krate), Some(out)) => {
-                Ok(Some(Target { project, krate, out, patch, link_cmd, splice, symbol_files }))
+                let (krate, batch) = Target::crates(&krate);
+                Ok(Some(Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files }))
             }
             (None, None)
                 if patch.is_none()
@@ -2338,9 +2342,11 @@ impl Target {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
+        let (krate, batch) = Target::crates(krate);
         Some(Target {
             project: given(project).map(PathBuf::from),
-            krate: krate.to_owned(),
+            krate,
+            batch,
             out: PathBuf::from(out),
             patch: given(patch).map(PathBuf::from),
             link_cmd: given(link_cmd),
@@ -2349,11 +2355,22 @@ impl Target {
         })
     }
 
+    /// The program's crate and the others in it, from `a` or `a,b,c`.
+    fn crates(named: &str) -> (String, Option<Vec<String>>) {
+        match named.split_once(',') {
+            Some((krate, batch)) => {
+                (krate.to_owned(), Some(batch.split(',').map(str::to_owned).collect()))
+            }
+            None => (named.to_owned(), None),
+        }
+    }
+
     fn fields(&self) -> String {
+        let crates = std::iter::once(&self.krate).chain(self.batch.iter().flatten());
         let mut fields = format!(
             "\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            self.krate,
+            crates.cloned().collect::<Vec<_>>().join(","),
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.link_cmd.as_deref().unwrap_or_default(),
@@ -2600,9 +2617,32 @@ fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>
     }
 }
 
+/// Ends the process when its standard input ends: the daemon that started this worker holds
+/// the other end for as long as it lives, however it dies.
+fn end_with_input() {
+    let mut held = [0u8; 64];
+    while std::io::Read::read(&mut std::io::stdin(), &mut held).is_ok_and(|read| read > 0) {}
+    std::process::exit(0);
+}
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    // A build script runs with the variables of the cargo that runs it, the wrapper's too.
+    if std::env::args().nth(1).as_deref() == Some("build-script") {
+        return cargo::script::command(std::env::args_os().skip(2));
+    }
+    if std::env::var_os(cargo::wrapper::ENABLED).is_some() {
+        return cargo::wrapper::command(std::env::args_os().skip(1));
+    }
+    match std::env::args().nth(1).as_deref() {
+        Some("cargo") => return cargo::command(std::env::args().skip(2)),
+        Some("daemon") => return cargo::daemon::serve(),
+        _ => {}
+    }
+    if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
+        std::thread::spawn(end_with_input);
     }
     if std::env::var_os("RUSTD_WRAPS_RUSTC").is_some() {
         return stub::command(std::env::args_os().skip(1));

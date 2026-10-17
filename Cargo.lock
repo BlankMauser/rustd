@@ -3061,6 +3061,7 @@ name = "rustd"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cargo_metadata",
  "dunce",
  "hir",
  "hir-def",
@@ -3078,7 +3079,10 @@ dependencies = [
  "rustc-hash 2.1.2",
  "rusty-s3",
  "same-file",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "syntax",
  "tar",
  "tikv-jemalloc-ctl",

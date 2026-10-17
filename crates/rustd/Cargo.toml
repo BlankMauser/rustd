@@ -23,6 +23,10 @@ same-file = "1"
 dunce = "1"
 pdb = "0.8"
 sha2 = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+cargo_metadata.workspace = true
+shlex = "2"
 
 hir.workspace = true
 hir-def.workspace = true
