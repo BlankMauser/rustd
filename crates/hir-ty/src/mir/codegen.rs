@@ -31,7 +31,10 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
 };
-use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
+use hir_expand::{
+    FileRange, HirFileId, InFile, MacroDefKind,
+    builtin::{BuiltinFnLikeExpander, EagerExpander},
+};
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, Size};
 use rustc_ast_ir::Mutability;
@@ -42,7 +45,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast};
 use triomphe::Arc;
 
 use crate::mir::is_by_move_coroutine;
@@ -67,7 +70,7 @@ use hir_def::lang_item::LangItems;
 
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
-    Requests,
+    Requests, TextPart,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -1686,6 +1689,94 @@ fn location_macros<'db>(
         .collect()
 }
 
+/// The literals of a body that `concat!` made of arguments with `line!()`, `column!()` or
+/// `file!()` among them, each with the expansion it is in.
+#[salsa::tracked(returns(ref))]
+fn located_concats<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+) -> FxHashMap<ExprId, HirFileId> {
+    let (body, source_map) = Body::with_source_map(db, owner);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+        .filter_map(|(id, _)| {
+            let file_id = source_map.expr_syntax(id).ok()?.file_id;
+            let loc = file_id.macro_file()?.loc(db);
+            let concat =
+                matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
+            (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
+        })
+        .collect()
+}
+
+/// The macro of `name` that expands to a place in the source.
+fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
+    match name {
+        "line" => Some(BuiltinFnLikeExpander::Line),
+        "column" => Some(BuiltinFnLikeExpander::Column),
+        "file" => Some(BuiltinFnLikeExpander::File),
+        _ => None,
+    }
+}
+
+/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+fn names_location(call: &SyntaxNode) -> bool {
+    call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && location_expander(token.text()).is_some()
+            && token
+                .next_token()
+                .and_then(|next| syntax::algo::skip_trivia_token(next, syntax::Direction::Next))
+                .is_some_and(|next| next.kind() == SyntaxKind::BANG)
+    })
+}
+
+/// An argument of a `concat!`.
+enum ConcatPart {
+    Text(String),
+    /// A call of `line!`, `column!` or `file!`, and where it is.
+    Location(BuiltinFnLikeExpander, TextRange),
+}
+
+/// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
+/// or `file!`.
+fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
+    let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
+    let mut inside: Vec<SyntaxElement> =
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
+    inside.pop()?;
+    let inside = inside.get(1..)?;
+    inside
+        .split(|it| it.kind() == SyntaxKind::COMMA)
+        .filter(|argument| !argument.is_empty())
+        .map(concat_part)
+        .collect()
+}
+
+fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
+    if let [SyntaxElement::Token(token)] = argument {
+        let text = match token.kind() {
+            SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
+            SyntaxKind::INT_NUMBER => {
+                ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
+            }
+            SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
+            _ => return None,
+        };
+        return Some(ConcatPart::Text(text));
+    }
+    let [.., SyntaxElement::Token(name), bang, SyntaxElement::Node(arguments)] = argument else {
+        return None;
+    };
+    let expander = location_expander(name.text())?;
+    let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
+    (bang.kind() == SyntaxKind::BANG && empty).then(|| {
+        let range = argument[0].text_range().cover(arguments.text_range());
+        ConcatPart::Location(expander, range)
+    })
+}
+
 /// The macro call an expansion comes from that is itself written out, in the source or in
 /// what a macro was passed, and not by another macro.
 fn written_call(db: &dyn HirDatabase, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
@@ -2417,6 +2508,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     };
                     CachedData::FilePath(path)
                 }
+                DataRequest::Text(parts) => {
+                    let Some(text) = self.text(parts) else {
+                        return self.kept.unkept("file without a path");
+                    };
+                    CachedData::FilePath(text)
+                }
             });
         }
         Some(cached::Entry {
@@ -2731,10 +2828,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 self.define_file_path(path)
             }
+            DataRequest::Text(parts) => {
+                let Some(text) = self.text(parts) else {
+                    unsupported!("`file!()` in a file without a path");
+                };
+                self.define_file_path(text)
+            }
         }
     }
 
-    /// The `&str` that `file!()` is.
+    /// The text of the parts, with each file's path for the file.
+    fn text(&mut self, parts: &[TextPart]) -> Option<String> {
+        parts
+            .iter()
+            .map(|part| match part {
+                TextPart::Text(text) => Some(text.clone()),
+                TextPart::FilePath(file) => self.source_path(*file),
+            })
+            .collect()
+    }
+
+    /// The `&str` that `file!()` is, or a `concat!` with it.
     fn define_file_path(&mut self, path: String) -> Result<DataId> {
         let len = path.len();
         let path = self.define_const(ConstBlob {
@@ -6975,7 +7089,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Whether a promoted expression takes its value from where it is in the source.
     fn mentions_location(&self, body: &MirBody<'db>, expr: ExprId) -> bool {
         let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
-        if self.location_macro(body, expr).is_some() {
+        if self.location_macro(body, expr).is_some()
+            || located_concats(self.cg.db, owner).contains_key(&expr)
+        {
             return true;
         }
         let mut found = false;
@@ -6984,11 +7100,52 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         found
     }
 
+    /// The `&str` of a literal that a `concat!` with `line!()`, `column!()` or `file!()`
+    /// among its arguments expanded to: the expansion has their placeholders in it.
+    fn located_concat(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let db = self.cg.db;
+        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
+            return Ok(None);
+        };
+        let Some(call) = located_concats(db, owner)
+            .get(&expr)
+            .and_then(|file_id| file_id.macro_file())
+            .map(|it| it.loc(db).to_node(db))
+        else {
+            return Ok(None);
+        };
+        let Some(parts) = concat_parts(&call.value) else {
+            unsupported!("`concat!` of a place in the source and what is not a literal");
+        };
+        let mut text = Vec::new();
+        for part in parts {
+            text.push(match part {
+                ConcatPart::Text(text) => TextPart::Text(text),
+                ConcatPart::Location(expander, range) => {
+                    let Some((file, line, col)) = location_of(db, call.file_id, range) else {
+                        unsupported!("`concat!` of a place that is not in a file");
+                    };
+                    match expander {
+                        BuiltinFnLikeExpander::Line => TextPart::Text(line.to_string()),
+                        BuiltinFnLikeExpander::Column => TextPart::Text(col.to_string()),
+                        _ => TextPart::FilePath(file),
+                    }
+                }
+            });
+        }
+        let text = self.cg.text(text);
+        let text = self.cg.declare_data_in_func(text, self.builder.func);
+        Ok(Some(self.builder.ins().symbol_value(ptr(), text)))
+    }
+
     /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
     /// rust-analyzer expands them to placeholders, since a real value would make every body
     /// below an edit change.
     fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
         let db = self.cg.db;
+        if let Some(text) = self.located_concat(expr)? {
+            return Ok(Some(text));
+        }
         let Some((expander, file_id)) = self.body.and_then(|it| self.location_macro(it, expr))
         else {
             return Ok(None);

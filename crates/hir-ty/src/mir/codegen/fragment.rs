@@ -70,6 +70,16 @@ pub(super) enum DataRequest {
     Declaration(FunctionId),
     /// The path of a file as rustc reports it, without a terminator.
     FilePath(FileId),
+    /// A `&str` with the paths of files in it.
+    Text(Vec<TextPart>),
+}
+
+/// A part of a [`DataRequest::Text`].
+#[derive(PartialEq, Eq)]
+pub(super) enum TextPart {
+    Text(String),
+    /// The path of a file as rustc reports it.
+    FilePath(FileId),
 }
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
@@ -309,6 +319,10 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn file_path(&mut self, file: FileId) -> DataId {
         self.data(DataRequest::FilePath(file))
+    }
+
+    pub(super) fn text(&mut self, parts: Vec<TextPart>) -> DataId {
+        self.data(DataRequest::Text(parts))
     }
 
     pub(super) fn make_signature(&self) -> Signature {
