@@ -126,7 +126,8 @@ impl<'db> Filler<'db> {
         let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else {
             return ty;
         };
-        if alias.args.has_type_flags(TypeFlags::HAS_PARAM | TypeFlags::HAS_ERROR) {
+        // A lifetime nothing settled is an error one, and no code depends on it.
+        if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
             return ty;
         }
         let (either::Either::Left(implemented), args) =

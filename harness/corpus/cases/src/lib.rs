@@ -3776,6 +3776,17 @@ pub mod type_id_hashes {
             id::<dyn FnMut(&str) -> &str>(),
             id::<Box<dyn Fn(&dyn Fn(&u8) -> &u8) -> Box<dyn Iterator<Item = &'static str>>>>(),
             id::<std::iter::Map<std::slice::Iter<'static, u8>, fn(&u8) -> u8>>(),
+            id::<fn(&u8, &u16)>(),
+            id::<fn(&u16, &u8)>(),
+            id::<fn(Borrowed) -> Borrowed>(),
+            id::<fn(Borrowed<'_>, &u8)>(),
+            id::<fn(&'static u8) -> &u8>(),
+            id::<for<'a> fn(&'a u8, &u8) -> &'a u8>(),
+            id::<fn(&dyn Any) -> &dyn Any>(),
+            id::<fn(&mut dyn FnMut(&str) -> &str, Box<dyn Any>) -> &str>(),
+            id::<dyn Fn(&dyn Any, fn(&u8) -> &u8)>(),
+            id::<fn(fn(&u8)) -> fn(&u8) -> &u8>(),
+            id::<&'static dyn Fn(&u8) -> std::slice::Iter<u8>>(),
         ]
     }
 

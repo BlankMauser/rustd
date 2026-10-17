@@ -302,6 +302,15 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 });
             }
             TyKind::Adt(adt, args) => {
+                // `Ref<'a, dyn Trait>` is `Ref<'a, dyn Trait + 'a>` to rustc and `+ 'static`
+                // here, which only matters where a signature binds the `'a`.
+                let lifetimes = args.iter().any(|arg| arg.region().is_some());
+                let object = args
+                    .iter()
+                    .any(|arg| matches!(arg.ty().map(|ty| ty.kind()), Some(TyKind::Dynamic(..))));
+                if self.signatures > 0 && lifetimes && object {
+                    return None;
+                }
                 hasher.write_isize(5);
                 self.adt_def(adt.def_id())?.hash(hasher);
                 self.args(args)?.hash(hasher);
@@ -487,7 +496,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// A lifetime, which is erased unless a binder in the type binds it.
     fn region(&mut self, hasher: &mut StableSipHasher128, region: Region<'db>) -> Option<()> {
         let RegionKind::ReBound(index, bound) = region.kind() else {
-            if self.signatures > 0 {
+            // An error in a signature is a lifetime nothing settled, which rustc may have bound.
+            if self.signatures > 0 && region.is_error() {
                 return None;
             }
             // `ReErased`.
