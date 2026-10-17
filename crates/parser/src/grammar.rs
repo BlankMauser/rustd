@@ -81,7 +81,7 @@ pub(crate) mod entry {
         }
         pub(crate) fn item(p: &mut Parser<'_>) {
             // We can set `is_in_extern=true`, because it only allows `safe fn`, and there is no ambiguity here.
-            items::item_or_macro(p, true, true);
+            items::item_or_macro(p, true, true, false);
         }
         // Parse a meta item , which excluded [], e.g : #[ MetaItem ]
         pub(crate) fn meta_item(p: &mut Parser<'_>) {
@@ -194,7 +194,8 @@ pub(crate) fn reparser(
         EXTERN_ITEM_LIST => items::extern_item_list,
         TOKEN_TREE if first_child? == T!['{'] => items::token_tree,
         ASSOC_ITEM_LIST => match parent? {
-            IMPL | TRAIT => items::assoc_item_list,
+            IMPL => items::assoc_item_list,
+            TRAIT => items::trait_item_list,
             _ => return None,
         },
         ITEM_LIST => items::item_list,
