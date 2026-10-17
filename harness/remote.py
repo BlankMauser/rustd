@@ -219,7 +219,7 @@ class Machine:
         link = linkline.with_output(linkline.ahead(list(self.link_args), [obj], RUSTD), self.program)
         start = time.time()
         out = self.rustd(self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj,
-                         "--link-cmd", shlex.join(link), *symbols, env=env, timeout=3600)
+                         "--link-cmd", linkline.join(link), *symbols, env=env, timeout=3600)
         if out.returncode != 0:
             raise SystemExit(f"rustd failed:\n{out.stderr[-3000:]}")
         return out.stderr, time.time() - start
@@ -309,7 +309,10 @@ def configuration(top, remote, a, address, bucket):
     c.empty()
     out = c.rustd("cache", "pull", address + "&region=eu-west-1&path-style=true")
     check("another region and addressing by path asked for", out.returncode == 0 and c.packs(), out.stderr.strip()[-80:])
-    if remote.server.kind == "minio":
+    if remote.server.kind == "minio" and os.name == "nt":
+        # glibc and macOS answer for every name under `localhost`; Windows asks the network.
+        print("  the bucket in the name of the host: left out, Windows resolves no name under `localhost`", flush=True)
+    elif remote.server.kind == "minio":
         c.empty()
         remote.proxy.clear()
         by_host = address.replace("127.0.0.1", "localhost") + "&path-style=false"
@@ -430,7 +433,7 @@ def transfers(top, remote):
     proxy.rate = 4 * MIB
     process = subprocess.Popen([RUSTD, "cache", "pull", address], env=b.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
-    process.send_signal(signal.SIGKILL)
+    process.kill()
     process.wait()
     left = b.partials()
     size = os.path.getsize(os.path.join(b.store, left[0])) if left else 0
@@ -636,6 +639,8 @@ def over_tls(top, remote):
     open(at("leaf.ext"), "w").write("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n")
     certificate = at("authority.crt")
     for command in (["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=rustd harness",
+                     # Python from 3.13 takes no authority that does not say it may sign.
+                     "-addext", "keyUsage=critical,keyCertSign,cRLSign",
                      "-keyout", at("authority.key"), "-out", certificate],
                     ["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", at("private.key"),
                      "-out", at("leaf.csr")],

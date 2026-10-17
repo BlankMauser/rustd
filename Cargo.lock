@@ -3773,6 +3773,7 @@ dependencies = [
  "vfs",
  "wasm-encoder",
  "wasmparser 0.236.1",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

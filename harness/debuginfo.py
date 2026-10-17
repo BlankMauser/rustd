@@ -613,7 +613,7 @@ def edits(tally):
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
-            raise SystemExit(f"the daemon did not start: {log_path}")
+            raise SystemExit(f"the daemon did not start: {open(log_path).read()[-2000:]}")
         time.sleep(0.05)
     spliced = 0
     for what, changes in EDITS:
