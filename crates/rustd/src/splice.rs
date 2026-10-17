@@ -658,6 +658,27 @@ impl Image {
         self.segments_of(elf::PT_LOAD).map(|it| it.p_vaddr(e) + it.p_memsz(e)).max().unwrap_or(0)
     }
 
+    /// Where a splice adds to the file and to memory, at `offset` and `address` or past
+    /// them: as far from each other as the linker's frames are in the two. A profiler that
+    /// unwinds by the file finds the frames from the unwind table by how far they are from
+    /// it in memory, so the table a splice writes has to be that far from them in the file.
+    fn behind(&self, offset: u64, address: u64) -> (u64, u64) {
+        let e = Endianness::Little;
+        let frames = self.unwind.frames;
+        let holds = |it: &&elf::ProgramHeader64<Endianness>| {
+            (it.p_vaddr(e)..it.p_vaddr(e) + it.p_filesz(e)).contains(&frames)
+        };
+        let ahead = (self.segments_of(elf::PT_LOAD).find(holds))
+            .and_then(|it| it.p_vaddr(e).checked_sub(it.p_offset(e)));
+        match ahead {
+            Some(ahead) => {
+                let address = address.max(offset + ahead);
+                (address - ahead, address)
+            }
+            None => (offset, address),
+        }
+    }
+
     fn page(&self) -> u64 {
         let e = Endianness::Little;
         self.segments_of(elf::PT_LOAD).map(|it| it.p_align(e)).max().unwrap_or(1).max(1)
@@ -1197,8 +1218,8 @@ impl<'a> Patch<'a> {
         let page = image.page();
         let machine = image.machine;
         let (stub_len, stub_align) = machine.stub();
-        let offset = image.len.next_multiple_of(page);
-        let base = image.end().next_multiple_of(page);
+        let (offset, base) = image
+            .behind(image.len.next_multiple_of(page), image.end().next_multiple_of(page));
         let relocations = image.relocations.as_ref().filter(|_| image.pie);
         ensure!(!image.pie || relocations.is_some(), "an executable the loader fixes nothing in");
         let fixed_up = if image.pie { self.stored + self.slots.len() } else { 0 };

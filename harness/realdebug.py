@@ -12,11 +12,11 @@ added, so that the program looked at is the one the daemon linked. Then, in the 
             build names there are named, with the same values where they are plain ones
   panic     the frames of the workspace's files are those of the cargo build, by file:line
   perf      `perf record --call-graph dwarf`, then `perf report` names the symbols and
-            `perf script` the lines of the frames in the workspace's crates
+            `perf script` the lines of the frames in rustd's functions
   addr2line every function of rustd's has a name and a line at its first address
   dwarfdump `llvm-dwarfdump --verify` has nothing to say of rustd's units
 """
-import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, http.client
 
 import cargo_rustd
 from cargo_rustd import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
@@ -27,8 +27,8 @@ PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for");
 # Where to stop is the line of a piece of text, so that it is a line of the tag's source.
 CHECKS = {
     "ripgrep": dict(
-        binary="rg", crates=["rg", "grep", "ignore", "globset"],
-        run=["-n", "--no-heading", "-j1", "fn main", "crates"],
+        binary="rg",
+        run=["-n", "--no-heading", "-j1", "fn.\\w+", "."],
         panic=("crates/core/search.rs", "        use self::PatternMatcher::*;\n\n        let (searcher, printer)",
                "        use self::PatternMatcher::*;\n        " + PANIC + "\n        let (searcher, printer)"),
         places=[("crates/core/main.rs", "let mut searched = false;"),
@@ -39,7 +39,7 @@ CHECKS = {
                 ("crates/ignore/src/walk.rs", "let follow_links = self.follow_links;")],
     ),
     "axum": dict(
-        binary="example-hello-world", crates=["example_hello_world", "axum", "axum_core"],
+        binary="example-hello-world",
         build=["-p", "example-hello-world"], serves="http://127.0.0.1:3000/",
         panic=("examples/hello-world/src/main.rs", '    Html("<h1>Hello, World!</h1>")',
                "    " + PANIC + '\n    Html("<h1>Hello, World!</h1>")'),
@@ -65,7 +65,8 @@ def asked(url, times=1):
         try:
             urllib.request.urlopen(url, timeout=5).read()
             answered += 1
-        except urllib.error.HTTPError:
+        except (urllib.error.HTTPError, http.client.RemoteDisconnected):
+            # A handler that panicked has answered too: its connection is closed.
             answered += 1
         except OSError:
             time.sleep(0.1)
@@ -78,18 +79,21 @@ def driven(argv, cwd, env, serves, times=1):
     """Runs the program to its end, or a server until it has answered. The result is what it wrote to stderr."""
     if not serves:
         return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=900).stderr
-    server = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                              errors="replace", start_new_session=True)
-    try:
-        asked(serves, times)
-    finally:
-        # perf writes what it recorded when it is interrupted, and takes the server with it.
-        os.killpg(server.pid, signal.SIGINT)
+    # To a file: a pipe nobody reads fills, and the server stops at its next panic.
+    with tempfile.TemporaryFile(mode="w+", errors="replace") as said:
+        server = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=said, start_new_session=True)
         try:
-            return server.communicate(timeout=60)[1]
-        except subprocess.TimeoutExpired:
-            os.killpg(server.pid, signal.SIGKILL)
-            return server.communicate()[1]
+            asked(serves, times)
+        finally:
+            # perf writes what it recorded when it is interrupted, and takes the server with it.
+            os.killpg(server.pid, signal.SIGINT)
+            try:
+                server.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(server.pid, signal.SIGKILL)
+                server.wait()
+        said.seek(0)
+        return said.read()
 
 
 def stopped(binary, ws, place, run, serves):
@@ -102,7 +106,7 @@ def stopped(binary, ws, place, run, serves):
                  "info proc mappings", "echo <args>\\n", "info args", "echo <locals>\\n", "info locals", "echo <end>\\n", "kill"]
     try:
         out = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
-                             capture_output=True, text=True, errors="replace", cwd=ws, timeout=600).stdout
+                             capture_output=True, text=True, errors="replace", cwd=ws, timeout=90).stdout
     except subprocess.TimeoutExpired:
         return None
     line = place.rsplit(":", 1)[1]
@@ -143,7 +147,8 @@ def debugger(tally, what, reference, binary, ws, spec):
         if not producer.startswith("rustd"):
             tally.say(said, "NOT RUSTD'S", f"the code is of {producer}")
             continue
-        names = list(theirs["values"])
+        # What rustc has an `async` body resumed with is of no name the source has.
+        names = [name for name in theirs["values"] if name != "_task_context"]
         unnamed = [name for name in names if name not in ours["values"]]
         gone = [name for name in names if name in ours["values"] and OPTIMIZED_OUT in ours["values"][name]]
         both = [name for name in names if name not in unnamed and name not in gone]
@@ -169,24 +174,27 @@ def profiler(tally, what, binary, ws, spec):
     perf = shutil.which("perf")
     data = os.path.join(tempfile.mkdtemp(prefix="rustd-realdebug-perf-"), "perf.data")
     if perf:
-        driven([perf, "record", "-o", data, "-F", "2000", "--call-graph", "dwarf", binary, *spec.get("run", [])],
+        driven([perf, "record", "-o", data, "-F", "2000", "--call-graph", "dwarf,32768", binary, *spec.get("run", [])],
                ws, dict(os.environ), spec.get("serves"), times=300)
     if not perf or not os.path.exists(data):
         return tally.say(f"{what}: perf", "not run", "no perf here, or it may not sample: see kernel.perf_event_paranoid")
-    crates = spec["crates"]
-    mine = lambda name: any(f"{len(c)}{c}" in name or re.search(rf"\b{c}::", name) for c in crates)
-    script = subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True, errors="replace").stdout
-    frames = [(name, line) for name, line in re.findall(r"^\s+[0-9a-f]+ (\S.*)\n\s+(\S+)$", script, re.M) if mine(name)]
-    lost = [name for name, line in frames if not re.search(r"\.rs:\d+$", line)]
-    report = subprocess.run([perf, "report", "-i", data, "--stdio", "--no-children", "--sort", "dso,symbol", "-g", "none"],
+    # A function is rustd's when a unit of rustd's has its first address.
+    starts = {start for start, _ in own_ranges(binary)}
+    table = subprocess.run(["nm", "--defined-only", binary], capture_output=True, text=True, errors="replace").stdout
+    mine = {name for at, name in re.findall(r"^([0-9a-f]+) \w (\S+)$", table, re.M) if int(at, 16) in starts}
+    script = subprocess.run([perf, "script", "--no-demangle", "-i", data, "-F", "ip,sym,srcline"],
                             capture_output=True, text=True, errors="replace").stdout
-    rows = [row.split("[.]")[1].strip() for row in report.splitlines() if os.path.basename(binary)[:15] in row and "[.]" in row]
+    frames = [(name, line) for name, line in re.findall(r"^[ \t]+[0-9a-f]+ (\S+)\n[ \t]+(\S+)(?: \(inlined\))?$", script, re.M) if name in mine]
+    lost = [name for name, line in frames if not re.search(r"\.rs:\d+$", line)]
+    report = subprocess.run([perf, "report", "--no-demangle", "-i", data, "--stdio", "--no-children", "--sort", "dso,symbol", "-g", "none"],
+                            capture_output=True, text=True, errors="replace").stdout
+    rows = [row.split("[.]")[1].split()[0] for row in report.splitlines() if os.path.basename(binary)[:15] in row and "[.]" in row]
     unnamed = [row for row in rows if re.fullmatch(r"0x[0-9a-f]+", row)]
-    ours = [row for row in rows if mine(row)]
+    ours = [row for row in rows if row in mine]
     verdict = "NO SAMPLES" if not frames or not ours else "NO LINE" if lost else "NO SYMBOL" if unnamed else "named"
     tally.say(f"{what}: perf record, report and script", verdict,
-              f"report: {len(rows)} symbols of the program, {len(ours)} of the workspace's crates, {len(unnamed)} without a name; "
-              f"script: {len(frames)} frames of theirs, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
+              f"report: {len(rows)} symbols of the program, {len(ours)} of rustd's functions, {len(unnamed)} without a name; "
+              f"script: {len(frames)} frames in rustd's functions, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
 
 
 def addr2line(tally, what, binary):
@@ -214,7 +222,7 @@ def verify(tally, what, binary):
     for unit in re.finditer(r"^(0x[0-9a-f]+): Compile Unit: length = (0x[0-9a-f]+).*?(?=^0x[0-9a-f]+: Compile Unit|\Z)", listed, re.S | re.M):
         if re.search(r'DW_AT_producer\s+\("rustd ', unit.group(0)):
             spans.append((int(unit.group(1), 16), int(unit.group(1), 16) + int(unit.group(2), 16)))
-    errors = [it for it in re.split(r"^error: ", said, flags=re.M)[1:] if "occurred" not in it.splitlines()[0]]
+    errors = [it for it in re.split(r"^error: ", said, flags=re.M)[1:] if "occurred" not in it.splitlines()[0] and not it.startswith("Aggregated")]
     ours = [it for it in errors
             if any(low <= int(at, 16) < high for at in re.findall(r"^(0x[0-9a-f]+): DW_TAG", it, re.M)[:2] for low, high in spans)
             or not re.search(r"^0x[0-9a-f]+: DW_TAG", it, re.M)]

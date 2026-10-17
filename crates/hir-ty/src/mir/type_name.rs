@@ -53,7 +53,19 @@ pub(crate) fn rustc_closure_name<'db>(
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
-    write_closure(db, &mut out, func, args, expr)?;
+    write_closure(db, &mut out, func, args, expr, Named::Code)?;
+    Some(out.text)
+}
+
+/// The path rustc tells a debugger the code of that closure or `async` block by.
+pub(crate) fn rustc_debug_closure<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+    expr: ExprId,
+) -> Option<String> {
+    let mut out = Spelled::new(Spelling::Debug);
+    write_closure(db, &mut out, func, args, expr, Named::Code)?;
     Some(out.text)
 }
 
@@ -71,6 +83,52 @@ pub(crate) fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Op
     let mut out = Spelled::new(Spelling::Debug);
     write_ty(db, &mut out, ty)?;
     Some(out.text)
+}
+
+/// The path rustc tells a debugger a function by: the modules it is written in, then the
+/// type an `impl` of its own is of, `{impl#0}` for any other `impl` by its place in the
+/// module, or the trait, and last the name with what the function and the `impl` are
+/// generic over.
+pub(crate) fn rustc_debug_function<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<String> {
+    let mut out = Spelled::new(Spelling::Debug);
+    write_container(db, &mut out, func, args)?;
+    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+    write_args(db, &mut out, args)?;
+    Some(out.text)
+}
+
+/// What a function is written in, as a debugger is told of it.
+fn write_container<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut Spelled,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<()> {
+    match func.lookup(db).container {
+        ItemContainerId::ModuleId(module) => write_module(db, out, module),
+        ItemContainerId::ImplId(impl_) => {
+            let parent_args = args.get(..generics(db, func.into()).len_parent())?;
+            let interner = DbInterner::new_no_crate(db);
+            let self_ty = db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
+            if db.impl_trait(impl_).is_none() && matches!(self_ty.kind(), TyKind::Adt(..)) {
+                return write_ty(db, out, self_ty);
+            }
+            let module = impl_.lookup(db).container;
+            let scope = module.def_map(db).module(db, module).scope(db);
+            let place = scope.impls().position(|it| it == impl_)?;
+            write_module(db, out, module)?;
+            write!(out, "::{{impl#{place}}}").ok()
+        }
+        ItemContainerId::TraitId(trait_) => {
+            write_module(db, out, trait_.module(db))?;
+            write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()
+        }
+        ItemContainerId::ExternBlockId(_) => None,
+    }
 }
 
 /// Which of rustc's ways to write a name is wanted.
@@ -275,7 +333,10 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
         }
         TyKind::Dynamic(bounds, _) => {
             let principal = bounds.principal()?.skip_binder();
-            if bounds.projection_bounds().into_iter().count() != 0 {
+            // The order rustc has more than one in is not one that is known here.
+            let mut projections = bounds.projection_bounds().into_iter();
+            let (projection, more) = (projections.next(), projections.next());
+            if more.is_some() || (projection.is_some() && out.spelling == Spelling::TypeName) {
                 return None;
             }
             if !principal.args.is_empty() && out.spelling == Spelling::TypeName {
@@ -285,7 +346,25 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             let trait_ = principal.def_id.0;
             write_module(db, out, trait_.module(db))?;
             write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
-            write_args(db, out, principal.args.as_slice())?;
+            let mut written = Spelled::new(out.spelling);
+            write_args(db, &mut written, principal.args.as_slice())?;
+            match projection {
+                Some(bound) => {
+                    let bound = bound.skip_binder();
+                    let crate::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
+                        return None;
+                    };
+                    let given = written.text.strip_prefix('<').and_then(|it| it.strip_suffix('>'));
+                    out.push('<');
+                    if let Some(given) = given {
+                        write!(out, "{given}, ").ok()?;
+                    }
+                    write!(out, "{} = ", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
+                    write_ty(db, out, bound.term.as_type()?)?;
+                    out.push('>');
+                }
+                None => out.push_str(&written.text),
+            }
             for auto in bounds.auto_traits() {
                 out.push_str(" + ");
                 write_module(db, out, auto.0.module(db))?;
@@ -298,15 +377,22 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
         }
         TyKind::Closure(id, args) => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_closure().parent_args(), func.1)?;
+            write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
         }
         TyKind::Coroutine(id, args) if out.spelling != Spelling::TypeName => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1)?;
+            write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1, Named::Kept)?;
         }
         TyKind::CoroutineClosure(id, args) if out.spelling != Spelling::TypeName => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_coroutine_closure().parent_args(), func.1)?;
+            write_closure(
+                db,
+                out,
+                func.0,
+                args.as_coroutine_closure().parent_args(),
+                func.1,
+                Named::Kept,
+            )?;
         }
         TyKind::FnPtr(sig, header) if out.spelling != Spelling::TypeName => {
             let sig = sig.skip_binder();
@@ -371,6 +457,7 @@ fn write_closure<'db>(
     func: FunctionId,
     args: &[GenericArg<'db>],
     expr: ExprId,
+    named: Named,
 ) -> Option<()> {
     let around = closures_around(db, func.into(), expr)?;
     if out.spelling != Spelling::Debug {
@@ -396,8 +483,20 @@ fn write_closure<'db>(
         ItemContainerId::ExternBlockId(_) => return None,
     }
     write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
-    out.closure_env(&around)?;
+    match named {
+        Named::Code => out.closures(&around),
+        Named::Kept => out.closure_env(&around)?,
+    }
     write_args(db, out, args)
+}
+
+/// Which of the two things a closure is to a debugger is being named.
+#[derive(Clone, Copy)]
+enum Named {
+    /// The function its body is.
+    Code,
+    /// The type of what it keeps.
+    Kept,
 }
 
 /// `dyn Trait<A, Item=B> + Auto` as a debugger is told of it, in brackets after `dyn` when

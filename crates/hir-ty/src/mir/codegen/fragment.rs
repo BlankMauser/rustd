@@ -11,7 +11,10 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId, hir::BindingId};
+use hir_def::{
+    DefWithBodyId, FunctionId, StaticId, TraitId,
+    hir::{BindingId, ExprId},
+};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -140,6 +143,8 @@ pub struct CompiledFunction {
     /// The body the function was compiled from and the statements of it that
     /// [`Code::lines`] index. Looked up when stitching, like a [`DataRequest::Location`].
     pub(super) source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    /// The closure or `async` block of that body the code is of, when it is of one.
+    pub(super) closure: Option<ExprId>,
     /// The named locals of the body a debugger can be told of, whose types are of `.0`.
     pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
@@ -155,8 +160,8 @@ pub(super) struct Variable {
     pub(super) ty: StoredTy,
     /// The number of the stack slot it is kept in.
     pub(super) slot: u32,
-    /// The slot holds where the local is rather than the local.
-    pub(super) pointer: bool,
+    /// The slot holds an address rather than the local, which is this far from it.
+    pub(super) pointer: Option<u32>,
 }
 
 /// A local written with a name, as the function that is being built keeps it.
@@ -165,8 +170,8 @@ pub(super) struct Named {
     pub(super) param: bool,
     pub(super) ty: StoredTy,
     pub(super) slot: ir::StackSlot,
-    /// The slot holds where the local is rather than the local.
-    pub(super) pointer: bool,
+    /// The slot holds an address rather than the local, which is this far from it.
+    pub(super) pointer: Option<u32>,
 }
 
 /// The value of a static rustc exports no symbol for.

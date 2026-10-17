@@ -253,9 +253,9 @@ impl SlotPlaces {
 }
 
 impl VariablePlace {
-    /// Where the value is that this place holds the address of. Code a debugger cannot
-    /// read the address in has no place for the value.
-    pub(super) fn pointee(&self) -> VariablePlace {
+    /// Where the value is that is `offset` bytes from the address this place holds. Code a
+    /// debugger cannot read the address in has no place for the value.
+    pub(super) fn pointee(&self, offset: u32) -> VariablePlace {
         let ranges = match self {
             VariablePlace::Frame(offset) => {
                 let mut held = vec![gimli::DW_OP_fbreg.0];
@@ -267,27 +267,36 @@ impl VariablePlace {
         };
         let ranges = ranges
             .into_iter()
-            .filter_map(|(from, to, held)| Some((from, to, pointee_expression(&held)?)))
+            .filter_map(|(from, to, held)| Some((from, to, pointee_expression(&held, offset)?)))
             .collect();
         VariablePlace::Ranges(ranges)
     }
 }
 
-/// The expression of the memory an address is of, from the one of where the address is
-/// held: in a register, or in memory a single operation finds.
-fn pointee_expression(held: &[u8]) -> Option<Vec<u8>> {
+/// The expression of the memory `offset` bytes from an address, from the one of where the
+/// address is held: in a register, or in memory a single operation finds.
+fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
     let (&operation, operands) = held.split_first()?;
     let register = gimli::DW_OP_reg0.0..=gimli::DW_OP_reg31.0;
     let based = gimli::DW_OP_breg0.0..=gimli::DW_OP_breg31.0;
-    if register.contains(&operation) && operands.is_empty() {
-        return Some(vec![operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]);
-    }
-    if operation != gimli::DW_OP_fbreg.0 && !based.contains(&operation) {
+    let mut pointee = if register.contains(&operation) && operands.is_empty() {
+        vec![operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]
+    } else if operation == gimli::DW_OP_fbreg.0 || based.contains(&operation) {
+        // The one operand is a LEB128 number, which ends at the first byte without the high
+        // bit.
+        let end = operands.iter().position(|byte| byte & 0x80 == 0)?;
+        if end + 1 != operands.len() {
+            return None;
+        }
+        [held, &[gimli::DW_OP_deref.0]].concat()
+    } else {
         return None;
+    };
+    if offset != 0 {
+        pointee.push(gimli::DW_OP_plus_uconst.0);
+        gimli::leb128::write::unsigned(&mut pointee, u64::from(offset)).ok()?;
     }
-    // The one operand is a LEB128 number, which ends at the first byte without the high bit.
-    let end = operands.iter().position(|byte| byte & 0x80 == 0)?;
-    (end + 1 == operands.len()).then(|| [held, &[gimli::DW_OP_deref.0]].concat())
+    Some(pointee)
 }
 
 impl SlotPlaces {
@@ -321,7 +330,7 @@ pub(super) struct VariableDebug {
 /// function ends up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct FunctionDebug {
-    /// The name as it is written.
+    /// The path a debugger knows the function by, as in `a::B<c::D>::e<F>`.
     pub(super) name: String,
     /// What a backtrace calls the function: its symbol when that is one rustc mangled, and
     /// otherwise its path the way such a symbol demangles.
@@ -590,10 +599,7 @@ impl DebugContext {
         if let Some(&entry) = self.namespaces.get(path) {
             return entry;
         }
-        let (outer, name) = match path.rsplit_once("::") {
-            Some((outer, name)) => (Some(outer), name),
-            None => (None, path),
-        };
+        let (outer, name) = last_of(path);
         let parent = self.namespace(outer);
         let entry = self.named(parent, DW_TAG_namespace, name);
         self.namespaces.insert(path.to_owned(), entry);
@@ -881,10 +887,12 @@ impl DebugContext {
         for (offset, place) in &debug.rows {
             (offset, place.line, place.column).hash(&mut self.id);
         }
-        let name = self.text(debug.name.as_bytes());
+        let (outer, name) = last_of(&debug.name);
+        let outer = self.namespace(outer);
+        let name = self.text(name.as_bytes());
         let linkage_name = self.text(debug.linkage_name.as_bytes());
         let unit = &mut self.dwarf.unit;
-        let function = unit.add(unit.root(), DW_TAG_subprogram);
+        let function = unit.add(outer, DW_TAG_subprogram);
         let entry = unit.get_mut(function);
         entry.set(DW_AT_name, name);
         entry.set(DW_AT_linkage_name, linkage_name);
@@ -1035,6 +1043,28 @@ fn within(name: &str) -> (Option<&str>, &str) {
         return (None, name);
     }
     (Some(path), &name[path.len() + 2..])
+}
+
+/// What a path is in and its last name, as in `a::B<c::D>` and `e<F>`: the last `::` that is
+/// in no brackets parts them. A name that is no path is in nothing.
+fn last_of(path: &str) -> (Option<&str>, &str) {
+    let mut depth = 0u32;
+    let mut parted = None;
+    let bytes = path.as_bytes();
+    for (at, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            // The arrow of a function's result closes nothing.
+            b'>' if at > 0 && bytes[at - 1] == b'-' => {}
+            b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(at + 1) == Some(&b':') => parted = Some(at),
+            _ => {}
+        }
+    }
+    match parted {
+        Some(at) if at > 0 && at + 2 < path.len() => (Some(&path[..at]), &path[at + 2..]),
+        _ => (None, path),
+    }
 }
 
 /// The address `by` bytes past `start`.
