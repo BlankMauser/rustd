@@ -174,7 +174,13 @@
     "new": "{bytes_printed} bytes printed ({matches} matches)\n",
     "what": "a format argument used twice"
    }
-  ]
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "integration"
+   ]
+  }
  },
  "fd": {
   "repo": "https://github.com/sharkdp/fd",
@@ -272,7 +278,13 @@
    "1",
    "--base-directory",
    "../fd-vendor"
-  ]
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "tests"
+   ]
+  }
  },
  "bat": {
   "repo": "https://github.com/sharkdp/bat",
@@ -347,7 +359,13 @@
    "src/printer.rs",
    "src/controller.rs",
    "Cargo.lock"
-  ]
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "integration_tests"
+   ]
+  }
  },
  "eza": {
   "repo": "https://github.com/eza-community/eza",
@@ -422,7 +440,13 @@
   "cargo_args": [
    "--bin",
    "eza"
-  ]
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "cli_tests"
+   ]
+  }
  },
  "tokei": {
   "repo": "https://github.com/XAMPPRocky/tokei",
@@ -480,7 +504,13 @@
   ],
   "bench": [
    "../tokei-vendor"
-  ]
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "accuracy"
+   ]
+  }
  },
  "delta": {
   "repo": "https://github.com/dandavison/delta",
