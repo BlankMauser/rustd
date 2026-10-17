@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use aws_sdk_s3::primitives::ByteStream;
+use hir_ty::mir::codegen::name_file_whole;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     fs::File,
@@ -152,6 +153,38 @@ impl Body {
     }
 }
 
+/// A failure that waiting does not cure: the service said no, a list names what is not
+/// there, or a file of this machine could not be written.
+pub(super) fn is_final(error: &anyhow::Error) -> bool {
+    error.is::<Refused>() || error.is::<Missing>() || error.is::<std::io::Error>()
+}
+
+impl super::Remote {
+    /// Makes a request of the remote until it is answered, with the waits a broken transfer
+    /// is taken up after, for as long as waiting may cure what went wrong.
+    pub(super) async fn patiently<T, F>(&self, mut request: impl FnMut() -> F) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        let mut again = 0;
+        loop {
+            match request().await {
+                Ok(answer) => return Ok(answer),
+                Err(e) if is_final(&e) => return Err(e),
+                Err(e) if again == RESUMES => {
+                    self.traffic.down.store(true, Ordering::Relaxed);
+                    return Err(e.context(format!("after asking {again} times more")));
+                }
+                Err(_) => {
+                    tokio::time::sleep(FIRST_WAIT * 2u32.pow(again)).await;
+                    again += 1;
+                    self.traffic.resumed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// How a fetch ended, when it did not fail.
 pub(crate) enum Fetched {
     /// The file is there, and this many bytes came over the line for it.
@@ -160,20 +193,25 @@ pub(crate) enum Fetched {
     Elsewhere,
 }
 
-/// The file an object is fetched into before it has its name: `NAME.partial`, locked by the
-/// process that writes it. One left by a process that was stopped is taken up where it ends.
+/// How many of the first bytes of an object are kept to tell what it is.
+const START: usize = 8;
+
+/// The file an object is fetched into before it has its name: `NAME.fetch.tmp`, which in a
+/// store is a temporary file of the store's, locked by the process that writes it. One left
+/// by a process that was stopped is taken up where it ends.
 struct Partial {
     path: PathBuf,
     file: File,
     hash: Sha256,
     len: u64,
+    start: Vec<u8>,
 }
 
 impl Partial {
     /// `None` when another process holds it.
     async fn open(to: &Path) -> anyhow::Result<Option<Partial>> {
         let mut path = to.as_os_str().to_owned();
-        path.push(".partial");
+        path.push(".fetch.tmp");
         let path = PathBuf::from(path);
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -186,23 +224,29 @@ impl Partial {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
-        let mut partial = Partial { path, file: File::from_std(file), hash: Sha256::new(), len: 0 };
+        let file = File::from_std(file);
+        let mut partial = Partial { path, file, hash: Sha256::new(), len: 0, start: Vec::new() };
         let mut chunk = vec![0; CHUNK];
         loop {
             let read = partial.file.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
-            partial.hash.update(&chunk[..read]);
-            partial.len += read as u64;
+            partial.count(&chunk[..read]);
         }
         Ok(Some(partial))
     }
 
-    async fn append(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
-        self.file.write_all(chunk).await?;
+    fn count(&mut self, chunk: &[u8]) {
+        let wanted = START.saturating_sub(self.start.len()).min(chunk.len());
+        self.start.extend_from_slice(&chunk[..wanted]);
         self.hash.update(chunk);
         self.len += chunk.len() as u64;
+    }
+
+    async fn append(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(chunk).await?;
+        self.count(chunk);
         Ok(())
     }
 
@@ -210,6 +254,7 @@ impl Partial {
         self.file.set_len(0).await?;
         self.file.seek(SeekFrom::Start(0)).await?;
         (self.hash, self.len) = (Sha256::new(), 0);
+        self.start.clear();
         Ok(())
     }
 
@@ -220,8 +265,8 @@ impl Partial {
     /// Gives the file its name, which is when anything else starts to read it.
     async fn seal(mut self, to: &Path) -> anyhow::Result<()> {
         self.file.flush().await?;
-        self.file.sync_all().await?;
-        tokio::fs::rename(&self.path, to).await?;
+        let (file, from, to) = (self.file.into_std().await, self.path, to.to_owned());
+        tokio::task::spawn_blocking(move || name_file_whole(&file, &from, &to)).await??;
         Ok(())
     }
 
@@ -231,16 +276,19 @@ impl Partial {
 }
 
 impl super::Remote {
-    /// Fetches the object `name` into the file `to` if its bytes hash to `want`.
+    /// Fetches the object `name` into the file `to` if its bytes hash to `want` and start as
+    /// `is_wanted` says the file has to.
     ///
     /// A transfer that breaks off is taken up from the byte it stopped at, a few times with
     /// a growing wait in between, and by the next process after this one is stopped. Bytes
-    /// that do not hash to `want` are thrown away and the object is counted as rejected.
+    /// that are not what was asked for are thrown away and the object is counted as
+    /// rejected. A failure that waiting does not cure leaves nothing behind.
     pub(crate) async fn fetch_file(
         &self,
         name: &str,
         want: &Digest,
         to: &Path,
+        is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<Fetched> {
         let _permit = self.traffic.permit().await?;
         let Some(mut partial) = Partial::open(to).await? else {
@@ -258,9 +306,9 @@ impl super::Remote {
             }
             match appended {
                 Ok(()) => {}
-                Err(e) if e.is::<Missing>() => {
+                Err(e) if is_final(&e) => {
                     partial.discard().await;
-                    return Err(e);
+                    return Err(e.context(format!("fetching {name}")));
                 }
                 Err(e) if resumes == RESUMES => {
                     self.traffic.down.store(true, Ordering::Relaxed);
@@ -274,8 +322,8 @@ impl super::Remote {
                 }
             }
             let got = partial.digest();
-            if got == *want {
-                partial.seal(to).await?;
+            if got == *want && is_wanted(&partial.start) {
+                partial.seal(to).await.with_context(|| format!("fetching {name}"))?;
                 return Ok(Fetched::Whole(received));
             }
             // What a stopped process left may be the start of something else.
@@ -286,6 +334,9 @@ impl super::Remote {
             let len = partial.len;
             partial.discard().await;
             self.traffic.rejected.fetch_add(1, Ordering::Relaxed);
+            if got == *want {
+                bail!("rejected {name}: it is not what it is listed as");
+            }
             bail!("rejected {name}: its {len} bytes hash to {got}, not to {want}");
         }
     }
@@ -313,7 +364,7 @@ impl super::Remote {
 
 /// An object that a list names and the remote does not have.
 #[derive(Debug)]
-pub(crate) struct Missing(String);
+pub(crate) struct Missing(pub(super) String);
 
 impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -322,3 +373,15 @@ impl fmt::Display for Missing {
 }
 
 impl std::error::Error for Missing {}
+
+/// A request the service answered with a no that asking again does not change.
+#[derive(Debug)]
+pub(super) struct Refused(pub(super) String);
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}

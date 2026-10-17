@@ -27,7 +27,7 @@ use aws_sdk_s3::{
 use futures_util::{StreamExt, TryStreamExt, stream};
 use url::Url;
 
-use super::transfer::{Traffic, Version};
+use super::transfer::{Refused, Traffic, Version};
 
 /// A file of at least this many bytes is sent in parts.
 const MULTIPART_AT: u64 = 16 << 20;
@@ -164,7 +164,7 @@ impl S3 {
     pub(crate) async fn write_small(
         &self,
         name: &str,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         read_at: Option<&Version>,
     ) -> anyhow::Result<Written> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
@@ -174,7 +174,7 @@ impl S3 {
             Some(tag) => request.if_match(tag),
             None => request.if_none_match("*"),
         };
-        match request.body(ByteStream::from(bytes)).send().await {
+        match request.body(ByteStream::from(bytes.to_vec())).send().await {
             Ok(_) => {
                 self.traffic.sent.fetch_add(len, Ordering::Relaxed);
                 Ok(Written::Done)
@@ -339,7 +339,11 @@ where
         (None, Some(status)) => format!("the service answered {status}"),
         (None, None) => causes(&error),
     };
-    anyhow::Error::msg(said)
+    // The service understood and said no. It says 408 and 429 to be asked again.
+    match status(&error) {
+        Some(400..=499) if !matches!(status(&error), Some(408 | 429)) => Refused(said).into(),
+        _ => anyhow::Error::msg(said),
+    }
 }
 
 /// An error and what it was caused by, each as it describes itself.

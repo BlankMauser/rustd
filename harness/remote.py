@@ -24,7 +24,8 @@ import linkline
 from difftest import RUSTD, RUNNER, TARGET_ARGS, linker_line, sysroot_rlibs
 from s3fake import ACCESS, SECRET, Bucket, Proxy, Server, find
 
-MAGIC = b"rustdpk\x01"
+FORMAT = 2
+MAGIC = b"rustdpk" + bytes([FORMAT])
 MIB = 1 << 20
 # Enough for three parts of a multipart upload.
 BIG = 20 * MIB
@@ -50,7 +51,8 @@ def pack_of(records):
     """A pack with these `(key, value)` records, as store.rs lays one out."""
     out = bytearray(MAGIC)
     for key, value in records:
-        out += key + len(value).to_bytes(4, "little") + zlib.crc32(value).to_bytes(4, "little") + value
+        size = len(value).to_bytes(4, "little")
+        out += key + size + zlib.crc32(key + size + value).to_bytes(4, "little") + value
     return bytes(out)
 
 
@@ -169,7 +171,25 @@ class Machine:
                 for name in os.listdir(self.store) if name.endswith(".pack")}
 
     def partials(self):
-        return [name for name in os.listdir(self.store) if name.endswith(".partial")] if os.path.isdir(self.store) else []
+        return [name for name in os.listdir(self.store) if name.endswith(".tmp")] if os.path.isdir(self.store) else []
+
+    def add_pack(self, data):
+        """Puts a sealed pack in the store, as a daemon of this format would have. Returns its name."""
+        os.makedirs(self.store, exist_ok=True)
+        open(os.path.join(self.store, "version"), "w").write(f"rustd store {FORMAT}\n")
+        name = digest(data) + ".pack"
+        open(os.path.join(self.store, name), "wb").write(data)
+        return name
+
+    def cache(self, verb, *args, env=None):
+        """`rustd cache stats|verify|gc`: (whether it ended well, its `name: number` lines, what it printed)."""
+        out = self.rustd("cache", verb, *args, env=env)
+        numbers = {}
+        for line in out.stdout.splitlines():
+            name, _, value = line.partition(":")
+            if value.split() and value.split()[0].isdigit():
+                numbers[name.strip()] = int(value.split()[0])
+        return out.returncode == 0, numbers, out.stdout + out.stderr
 
     def empty(self):
         shutil.rmtree(self.store, ignore_errors=True)
@@ -248,6 +268,9 @@ def round_trip(top, remote, name, crates, target, workspace):
     check("B fetches and compiles nothing", compiled(log) == 0 and all(b.packs().values()) and set(a.packs()) <= set(b.packs()),
           f"{said_number(log, 'functions found')} found, {compiled(log)} compiled")
     check("B's program prints what A's and cargo's do", b.run() == expected == b.run(b.reference))
+    whole, numbers, said = b.cache("verify")
+    check("B's store is whole after the pull and the build", whole and numbers.get("packs") == len(b.packs())
+          and numbers.get("corrupt packs") == 0 and not b.partials(), f"{numbers.get('records')} records")
     return a, b, address, bucket, expected
 
 
@@ -306,11 +329,7 @@ def configuration(top, remote, a, address, bucket):
 
 def big_store(machine, seed):
     """A store with one pack big enough to go up in parts. Returns its name."""
-    os.makedirs(machine.store, exist_ok=True)
-    data = filler(seed, BIG)
-    name = digest(data) + ".pack"
-    open(os.path.join(machine.store, name), "wb").write(data)
-    return name
+    return machine.add_pack(filler(seed, BIG))
 
 
 def transfers(top, remote):
@@ -416,17 +435,22 @@ def transfers(top, remote):
     left = b.partials()
     size = os.path.getsize(os.path.join(b.store, left[0])) if left else 0
     check("rustd killed in a fetch leaves no pack", not b.packs() and len(left) == 1 and 0 < size < BIG, f"{size} bytes kept aside")
+    whole_store, _, _ = b.cache("verify")
+    counted = b.cache("stats")[1]
+    check("the store is whole, and counts what was kept aside as a temporary file",
+          whole_store and counted.get("packs") == 0 and counted.get("temporary files") == 1 and counted.get("temporary bytes") == size)
     proxy.rate = None
     out = b.rustd("cache", "pull", address)
     check("the next one fetches the rest only", out.returncode == 0 and whole(b, name)
           and said_number(out.stderr, "bytes received") < BIG - size + MIB, out.stderr.strip().split("\n")[0][-60:])
 
     a, b, address, bucket, name = pushed("spoiled partial")
-    os.makedirs(b.store)
-    open(os.path.join(b.store, name + ".partial"), "wb").write(b"what a stopped process left of something else" * 1000)
+    b.add_pack(filler(f"{remote.name} there already", 4096))
+    open(os.path.join(b.store, name + ".fetch.tmp"), "wb").write(b"what a stopped process left of something else" * 1000)
     out = b.rustd("cache", "pull", address)
     check("a part kept aside that is of something else: fetched from the start",
-          out.returncode == 0 and whole(b, name) and said_number(out.stderr, "objects rejected") == 0)
+          out.returncode == 0 and b.packs().get(name) is True and not b.partials()
+          and said_number(out.stderr, "objects rejected") == 0)
 
     a, b, address, bucket, name = pushed("two at once")
     proxy.rate = 8 * MIB
@@ -440,10 +464,8 @@ def transfers(top, remote):
     counter[0] += 1
     address, bucket = remote.fresh()
     a, b = (Machine(top, f"t{counter[0]}-{remote.name}-{it}", remote) for it in "ab")
-    os.makedirs(a.store)
     for at in range(12):
-        data = filler(f"{remote.name} small {at}", 64 << 10)
-        open(os.path.join(a.store, digest(data) + ".pack"), "wb").write(data)
+        a.add_pack(filler(f"{remote.name} small {at}", 64 << 10))
     proxy.clear()
     proxy.hold = 0.05
     out = a.rustd("cache", "push", address, env={"RUSTD_REMOTE_JOBS": "3"})
@@ -513,6 +535,79 @@ def transfers(top, remote):
           out.stdout.strip())
 
 
+def stored(top, remote):
+    """What is fetched is the store's: counted, kept under the limit, evicted, fetched again."""
+    print(f"{remote.name}: the store a pull fills", flush=True)
+    address, bucket = remote.fresh()
+    a, b, c = (Machine(top, f"k-{remote.name}-{it}", remote) for it in "abc")
+    sent = [a.add_pack(filler(f"{remote.name} kept {at}", MIB)) for at in range(6)]
+    if a.rustd("cache", "push", address).returncode != 0:
+        raise SystemExit("the push failed")
+
+    out = b.rustd("cache", "pull", address)
+    whole, verified, _ = b.cache("verify")
+    _, counted, _ = b.cache("stats")
+    check("after a pull verify and stats count what was fetched", out.returncode == 0 and whole
+          and verified.get("packs") == 6 and verified.get("records") == 6 and verified.get("bytes") == 6 * MIB
+          and counted.get("packs") == 6 and counted.get("pack bytes") == 6 * MIB and counted.get("temporary files") == 0,
+          f"{counted.get('pack bytes')} bytes")
+
+    ok, collected, _ = b.cache("gc", "--max", "0")
+    out = b.rustd("cache", "pull", address)
+    whole, verified, _ = b.cache("verify")
+    check("packs that were evicted are fetched again", ok and collected.get("evicted packs") == 6 and out.returncode == 0
+          and whole and sorted(b.packs()) == sorted(sent) and said_number(out.stderr, "bytes received") > 6 * MIB)
+
+    limit = {"RUSTD_CACHE_MAX": str(3 * MIB + 4096)}
+    packs_fetched(remote)
+    out = c.rustd("cache", "pull", address, env=limit)
+    _, counted, _ = c.cache("stats", env=limit)
+    whole, _, _ = c.cache("verify")
+    check("a pull into a store with a limit fetches what fits and says what does not",
+          out.returncode == 0 and "3 left that do not fit under RUSTD_CACHE_MAX" in out.stdout and whole
+          and counted.get("packs") == 3 and counted.get("pack bytes") <= 3 * MIB + 4096
+          and packs_fetched(remote) in (3, None), out.stdout.strip()[:90])
+
+    # What was there before is the oldest, and makes room for what is fetched.
+    d = Machine(top, f"k-{remote.name}-d", remote)
+    old = [d.add_pack(filler(f"{remote.name} old {at}", MIB)) for at in range(2)]
+    for name in old:
+        os.utime(os.path.join(d.store, name), (time.time() - 3600, time.time() - 3600))
+    out = d.rustd("cache", "pull", address, env=limit)
+    _, counted, _ = d.cache("stats", env=limit)
+    whole, _, _ = d.cache("verify")
+    check("what is fetched counts toward the limit: the packs unused the longest go",
+          out.returncode == 0 and "2 packs unused the longest evicted" in out.stdout and whole and counted.get("packs") == 3
+          and not set(old) & set(d.packs()) and set(d.packs()) <= set(sent), out.stdout.strip()[-80:])
+
+    # A pack of the format before this one, listed as what it is and listed as what it is not.
+    address, bucket = remote.fresh()
+    other = b"rustdpk" + bytes([FORMAT - 1]) + b" what the format before wrote"
+    keys = b"\0" * 32
+    bucket.put("packs/" + digest(other) + ".pack", other)
+    bucket.put("keys/" + digest(keys), keys)
+    e = Machine(top, f"k-{remote.name}-e", remote)
+    packs_fetched(remote)
+    for said_format, what in ((FORMAT - 1, "left"), (FORMAT, "rejected")):
+        bucket.put("manifests/default", f"{digest(other)} {len(other)} {digest(keys)} {said_format}\n".encode())
+        out = e.rustd("cache", "pull", address)
+        whole, verified, _ = e.cache("verify")
+        left = out.returncode == 0 and "1 of another format left" in out.stdout and packs_fetched(remote) in (0, None)
+        rejected = out.returncode != 0 and "is not what it is listed as" in out.stderr and said_number(out.stderr, "objects rejected") == 1
+        check(f"a pack of another format, listed as format {said_format}: {what}",
+              (left if what == "left" else rejected) and whole and not e.packs() and not e.partials(),
+              (out.stdout + out.stderr).strip()[-70:])
+
+
+def packs_fetched(remote):
+    """How many fetches of packs the proxy saw since it was last asked, or `None` without a proxy."""
+    if not remote.proxy:
+        return None
+    seen = len(remote.proxy.seen("GET", "/packs/"))
+    remote.proxy.clear()
+    return seen
+
+
 def spoiled(top, remote):
     """Objects that are not what their name says."""
     print(f"{remote.name}: objects that are not what was sent", flush=True)
@@ -522,10 +617,8 @@ def spoiled(top, remote):
                         ("made empty", lambda data: b"")):
         address, bucket = remote.fresh()
         a, b = (Machine(top, f"s-{remote.name}-{what.replace(' ', '-')}-{it}", remote) for it in "ab")
-        os.makedirs(a.store)
         data = filler(f"{remote.name} {what}", MIB)
-        name = digest(data) + ".pack"
-        open(os.path.join(a.store, name), "wb").write(data)
+        name = a.add_pack(data)
         other = big_store(a, f"{remote.name} {what} whole") if what == "one byte changed" else None
         if a.rustd("cache", "push", address).returncode != 0:
             raise SystemExit("the push failed")
@@ -589,7 +682,7 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
 
     forged_name = digest(changed)
     keys = b"".join(key for key, _ in records)
-    forged = "".join(f"{forged_name} {len(changed)} {digest(keys)}\n" if fields[0] == listed[0][0] else " ".join(fields) + "\n"
+    forged = "".join(f"{forged_name} {len(changed)} {digest(keys)} {FORMAT}\n" if fields[0] == listed[0][0] else " ".join(fields) + "\n"
                      for fields in listed)
     def forge(to, last_line=""):
         to.put("packs/" + forged_name + ".pack", changed)
@@ -670,6 +763,7 @@ def checks():
             remote.start()
             a, b, address, bucket, expected = round_trip(top, remote, remote.name, crates, target, workspace)
             configuration(top, remote, a, address, bucket)
+            stored(top, remote)
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)

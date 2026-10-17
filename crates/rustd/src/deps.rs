@@ -218,7 +218,8 @@ async fn pull(
         let (unit, hash) = (unit.clone(), *hash);
         async move {
             let archive = dir.join(format!("{hash}.unit"));
-            let fetched = remote.fetch_file(&format!("units/{hash}"), &hash, &archive).await?;
+            let fetched =
+                remote.fetch_file(&format!("units/{hash}"), &hash, &archive, |_| true).await?;
             if let Fetched::Whole(_) = fetched {
                 let (dir, from) = (dir.to_owned(), archive.clone());
                 let unpacked = tokio::task::spawn_blocking(move || unpack(&dir, &unit, &from));
