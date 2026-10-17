@@ -15,6 +15,13 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 /// The same for `link.exe`, which warns of every name it does so for unless told not to.
 const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
 
+/// The target feature that is no feature of the processor.
+const CRT_STATIC: &str = "crt-static";
+
+/// What a build script says to have `link.exe` fail on a warning. It warns of every image
+/// it writes with `/FORCE` and can't be told not to, so the daemon's link leaves this out.
+const WARNINGS_FAIL: &str = "/WX";
+
 /// How `link.exe` is told where to write.
 const OUT: &str = "/OUT:";
 
@@ -136,12 +143,17 @@ fn unsupported(unit: &Record) -> Option<String> {
     if unit.codegen("panic") == Some("abort") {
         return Some(format!("`{name}` is built with panic=abort"));
     }
-    for flag in
-        ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"]
-    {
+    for flag in ["instrument-coverage", "target-cpu", "profile-generate", "profile-use"] {
         if unit.codegen(flag).is_some() {
             return Some(format!("`{name}` is built with -C {flag}"));
         }
+    }
+    // `crt-static` is how the C runtime is linked: the link line is rustc's, and the cfg the
+    // workspace is loaded with is cargo's for these flags. Any other feature changes the code.
+    let features = unit.codegen_each("target-feature").flat_map(|it| it.split(','));
+    let of_code = |feature: &str| feature.trim_start_matches(['+', '-']) != CRT_STATIC;
+    if let Some(feature) = features.filter(|it| !it.is_empty()).find(|it| of_code(it)) {
+        return Some(format!("`{name}` is built with -C target-feature={feature}"));
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
@@ -221,7 +233,10 @@ impl LinkLine {
 
     /// The command that links the plan's executable, with its arguments in the file at
     /// `response`: a line with all of them is longer than a process may be given.
-    fn command(self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
+    fn command(mut self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
+        if self.flavor == Flavor::Msvc {
+            self.args.retain(|it| !it.eq_ignore_ascii_case(WARNINGS_FAIL));
+        }
         let first = self
             .args
             .iter()
@@ -363,7 +378,7 @@ mod tests {
 
     #[test]
     fn ours_go_ahead_of_rustcs_for_link_exe() {
-        const LINE: &str = r#""C:\\v c\\link.exe" "/NOLOGO" "C:\\t\\rustc1\\symbols.o" "C:\\t\\a.1.rcgu.o" "C:\\t\\libb-2.rlib" "kernel32.lib" "/LIBPATH:C:\\l\\" "/OUT:C:\\t\\a.exe" "/DEBUG" "/PDBALTPATH:%_PDB%""#;
+        const LINE: &str = r#""C:\\v c\\link.exe" "/NOLOGO" "C:\\t\\rustc1\\symbols.o" "C:\\t\\a.1.rcgu.o" "C:\\t\\libb-2.rlib" "kernel32.lib" "/WX" "/LIBPATH:C:\\l\\" "/OUT:C:\\t\\a.exe" "/DEBUG" "/PDBALTPATH:%_PDB%""#;
         let dir = std::env::temp_dir().join(format!("rustd-plan-msvc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let plan = Plan {

@@ -103,11 +103,17 @@ impl Record {
 
     /// The value of `-C name=value`, however cargo spelled it.
     pub(crate) fn codegen(&self, name: &str) -> Option<&str> {
+        self.codegen_each(name).next()
+    }
+
+    /// The value of every `-C name=value`, for a flag that adds to what was said before.
+    pub(crate) fn codegen_each(&self, name: &str) -> impl Iterator<Item = &str> + use<'_> {
+        let name = name.to_owned();
         let joined = self.args.iter().filter_map(|it| it.strip_prefix("-C"));
         let split = self.values("-C");
-        joined.chain(split).filter(|it| !it.is_empty()).find_map(|it| {
+        joined.chain(split).filter(|it| !it.is_empty()).filter_map(move |it| {
             let (key, value) = it.split_once('=').unwrap_or((it, ""));
-            (key == name).then_some(value)
+            (key == name.as_str()).then_some(value)
         })
     }
 
@@ -318,6 +324,13 @@ mod tests {
         assert_eq!(unit.codegen("extra-filename"), Some("-1"));
         assert_eq!(unit.codegen("debug-assertions"), Some(""));
         assert_eq!(unit.codegen("lto"), None);
+    }
+
+    #[test]
+    fn a_codegen_flag_given_twice() {
+        let unit = record(&["-Ctarget-feature=+crt-static", "-C", "target-feature=+avx"]);
+        let features: Vec<&str> = unit.codegen_each("target-feature").collect();
+        assert_eq!(features, ["+crt-static", "+avx"]);
     }
 
     #[test]
