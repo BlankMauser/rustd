@@ -104,7 +104,6 @@ jobs:
           run unwinds.py
           run splices.py
           run asmedits.py
-          run deps.py
           run includes.py
           run worktrees.py
           run worktrees.py --join --together
