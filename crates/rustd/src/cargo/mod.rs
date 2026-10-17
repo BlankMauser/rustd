@@ -172,28 +172,36 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
 
 /// `cargo rustd status`: the daemon, its workers, and how the builds of each checkout went.
 fn status() -> anyhow::Result<i32> {
+    use std::fmt::Write as _;
+    let mut said = String::new();
     match client::ask(Request::Status, Start::Never)? {
         Some(Reply::Status(daemon)) => {
             let idle =
                 daemon.idle_secs.map_or("never".to_owned(), |it| format!("after {it}s idle"));
-            println!("daemon: pid {}, version {}, exits {idle}", daemon.pid, daemon.version);
+            let _ = writeln!(
+                said,
+                "daemon: pid {}, version {}, exits {idle}",
+                daemon.pid, daemon.version
+            );
             for worker in daemon.workers {
-                println!(
+                let _ = writeln!(
+                    said,
                     "  worker: pid {}, {}, log {}",
                     worker.pid,
                     worker.project.display(),
                     worker.log.display()
                 );
                 for (root, warmth) in worker.checkouts {
-                    println!("    {}: {warmth}", root.display());
+                    let _ = writeln!(said, "    {}: {warmth}", root.display());
                 }
             }
         }
-        _ => println!("daemon: not running"),
+        _ => said.push_str("daemon: not running\n"),
     }
     for state in State::all() {
         let to_cargo: u64 = state.counts.cargo.values().sum();
-        println!(
+        let _ = writeln!(
+            said,
             "{} ({}, {}): {} builds by the daemon, {to_cargo} by cargo",
             state.root.display(),
             state.profile,
@@ -201,12 +209,14 @@ fn status() -> anyhow::Result<i32> {
             state.counts.served
         );
         for (reason, count) in &state.counts.cargo {
-            println!("  {count} x {reason}");
+            let _ = writeln!(said, "  {count} x {reason}");
         }
         if let Some(refusal) = &state.refusal {
-            println!("  every build is cargo's: {refusal}");
+            let _ = writeln!(said, "  every build is cargo's: {refusal}");
         }
     }
+    // Whoever reads this may stop reading before its end.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), said.as_bytes());
     Ok(0)
 }
 
