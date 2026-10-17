@@ -96,7 +96,11 @@ def main():
         ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=a.crate_dir))
     package = next(p for p in meta["packages"] if p["name"].replace("-", "_") == crate
                    or any(t["name"].replace("-", "_") == crate for t in p["targets"]))
-    lib = next((t["src_path"] for t in package["targets"] if "lib" in t["kind"]), None)
+    lib_target = next((t for t in package["targets"] if "lib" in t["kind"]), None)
+    lib = lib_target and lib_target["src_path"]
+    if lib_target and not a.crate:
+        # A package may name its library otherwise (`md-5` has `md5`, `redox_syscall` `syscall`).
+        crate = lib_target["name"].replace("-", "_")
     if lib:
         tests.append(UNIT)
     tests = [t for t in tests if not a.test or t in a.test or (t == UNIT and "unit" in a.test)]
