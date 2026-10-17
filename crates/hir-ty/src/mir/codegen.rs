@@ -1730,13 +1730,29 @@ fn source_location<'db>(
         let call = ast::MethodCallExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
         range = TextRange::new(call.name_ref()?.syntax().text_range().start(), range.end());
     }
-    if source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
-        // An index is reported from its bracket on.
+    let called = !matches!(span, MirSpan::ExprId(expr) if indexes_in_place(db, owner, expr));
+    if called && source.value.syntax_node_ptr().kind() == SyntaxKind::INDEX_EXPR {
+        // A call of `Index::index` is reported from the bracket on.
         let root = source.file_id.parse_or_expand(db);
         let index = ast::IndexExpr::cast(source.value.syntax_node_ptr().to_node(&root))?;
         range = TextRange::new(index.l_brack_token()?.text_range().start(), range.end());
     }
     location_of(db, source.file_id, range)
+}
+
+/// Whether an expression indexes an array or a slice by a `usize`, which is a place of the
+/// language's own and is reported from where the expression starts.
+fn indexes_in_place(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> bool {
+    let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr] else {
+        return false;
+    };
+    let infer = InferenceResult::of(db, owner);
+    let adjusted = |expr| match infer.expr_adjustment(expr).and_then(|it| it.last()) {
+        Some(last) => last.target.as_ref(),
+        None => infer.expr_ty(expr),
+    };
+    matches!(adjusted(index).kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize))
+        && matches!(adjusted(base).strip_reference().kind(), TyKind::Array(..) | TyKind::Slice(..))
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -1948,6 +1964,7 @@ fn build<'db>(
         abi: ExternAbi::Rust,
         location: None,
         span: MirSpan::Unknown,
+        lives: None,
         constant_locals: Vec::new(),
         args: None,
         suspended: None,
@@ -3867,6 +3884,8 @@ struct FunctionCx<'cx, 'db> {
     location: Option<Value>,
     /// Where the statement being compiled comes from.
     span: MirSpan,
+    /// Where each local of the body starts to live, once something asked.
+    lives: Option<FxHashMap<LocalId, MirSpan>>,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
     /// What the body's generic parameters stand for, when it is the body of an instance.
@@ -5840,7 +5859,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
                     let index = self.builder.ins().load(ptr(), MEM, self.locals[*local].addr, 0);
-                    addr = self.element(addr, meta, prev.ty, index)?;
+                    // An index out of bounds is reported at the index expression, which is
+                    // where its local starts to live, not at the statement that uses the place.
+                    let statement = self.span;
+                    self.span = self.indexed_at(*local).unwrap_or(statement);
+                    let element = self.element(addr, meta, prev.ty, index);
+                    self.span = statement;
+                    addr = element?;
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -7481,6 +7506,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().store(MEM, addr, kept, 0);
         let ty = body.locals[local].ty.clone();
         self.cg.named.push(Named { binding, param: true, ty, slot, pointer: true });
+    }
+
+    /// The expression a local that indexes a place was made for.
+    fn indexed_at(&mut self, local: LocalId) -> Option<MirSpan> {
+        let body = self.body?;
+        let lives = self.lives.get_or_insert_with(|| {
+            let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+            statements
+                .filter_map(|it| match it.kind {
+                    StatementKind::StorageLive(local) => Some((local, it.span)),
+                    _ => None,
+                })
+                .collect()
+        });
+        lives.get(&local).copied()
     }
 
     /// Has what is built from here on be of the statement at `span`.

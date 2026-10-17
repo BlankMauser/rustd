@@ -14,7 +14,7 @@ whether rustd leaves it out when the profile says `debug = false`.
 
 RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
                      jumps, so a frame the cargo build prints may be missing: those are counted.
---only NAME          one of: corpus stress rung2 edits cost
+--only NAME          one of: corpus stress rung2 edits callers locals types profile cost
 """
 import os, re, shutil, struct, subprocess, sys, tempfile, time
 
@@ -97,7 +97,6 @@ fn main() {
 LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline::Point {x: 3, y: -4}"),
           ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
           ("*borrowed", "sline::Point {x: 3, y: -4}")]
-# (what the step is, [(old, new)])
 OPTIMIZED_OUT = "<optimized out>"
 
 TYPES_MAIN = """#[derive(Clone, Copy)]
@@ -141,6 +140,82 @@ fn main() {
 TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
          "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
 
+# Panics behind functions rustc inlines even in a dev build, and behind `#[track_caller]` ones.
+CALLERS_MAIN = """use std::panic::{catch_unwind, Location};
+
+#[inline(always)]
+fn always(items: &[u32], at: usize) -> u32 {
+    items[at]
+}
+
+#[inline]
+fn hinted(items: &[u32], at: usize) -> u32 {
+    always(items, at) + 1
+}
+
+fn indexes() -> u32 {
+    hinted(&[1, 2, 3], std::env::args().count() + 8)
+}
+
+#[track_caller]
+fn inner(value: Option<u32>) -> u32 {
+    value.expect("inner")
+}
+
+#[track_caller]
+fn outer(value: Option<u32>) -> u32 {
+    inner(value) + 1
+}
+
+fn tracked() -> u32 {
+    outer(None) + 1
+}
+
+#[track_caller]
+fn here() -> u32 {
+    panic!("called from line {}", Location::caller().line())
+}
+
+fn located() -> u32 {
+    here() + 1
+}
+
+trait Named {
+    #[track_caller]
+    fn must(&self) -> u32;
+}
+
+impl Named for u8 {
+    fn must(&self) -> u32 {
+        panic!("through a trait")
+    }
+}
+
+fn dynamic() -> u32 {
+    let it: &dyn Named = &3u8;
+    it.must() + 1
+}
+
+fn closure() -> u32 {
+    let take = |value: Option<u32>| value.unwrap() + 1;
+    take(None) + 1
+}
+
+fn bound() -> u32 {
+    let items = [1u32, 2, 3];
+    let item = items[std::env::args().count() + 8];
+    item + 1
+}
+
+fn main() {
+    let cases: [fn() -> u32; 6] = [indexes, tracked, located, dynamic, closure, bound];
+    for case in cases {
+        let _ = catch_unwind(case);
+    }
+}
+"""
+
+# (what the step is, [(old, new)])
 EDITS = [
     ("nothing edited", []),
     ("a line added above everything", [("use std::fmt::Display;", "// One line further down.\nuse std::fmt::Display;")]),
@@ -155,11 +230,13 @@ EDITS = [
 
 
 def panics(stderr):
-    """The panics a run printed: where each says it was, and its frames as [name, place]."""
-    found = []
-    for line in stderr.splitlines():
+    """The panics a run printed: where each says it was and what it said, and its frames as
+    [name, place]."""
+    found, lines = [], stderr.splitlines()
+    for at, line in enumerate(lines):
         if "panicked at" in line:
-            found.append((line.split("panicked at")[1].strip(), []))
+            said = lines[at + 1].strip() if at + 1 < len(lines) else ""
+            found.append((line.split("panicked at")[1].strip() + " " + said, []))
         elif found and (frame := re.match(r"\s+\d+: (.*)", line)):
             found[-1][1].append([frame.group(1).strip(), None])
         elif found and found[-1][1] and (place := re.match(r"\s+at (.*)", line)):
@@ -198,9 +275,36 @@ class Tally:
         print(f"{what:58} {verdict:14} {more}", flush=True)
 
 
-def compare(tally, what, theirs, ours):
+def jumps_away(binary, name):
+    """Whether the function rustd compiled under that name leaves by jumping to another one
+    rather than calling it, so that it has no frame while the other runs. Its range is what the
+    debug info says, and the jump is read from the disassembly; None where that cannot be read."""
+    said = subprocess.run([DWARFDUMP, f"--name={name}", binary], capture_output=True, text=True).stdout
+    entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it]
+    if not entries and re.fullmatch(r"\w+(::\w+)*", name):
+        # A function with a symbol of its own is named by its last part and its mangled path.
+        parts = name.split("::")
+        said = subprocess.run([DWARFDUMP, f"--name={parts[-1]}", binary], capture_output=True, text=True).stdout
+        mangled = "".join(f"{len(part)}{part}" for part in parts)
+        entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it
+                   and re.search(rf'DW_AT_linkage_name\s+\("_R\w*?{mangled}"\)', it)]
+    ranges = [(low.group(1), high.group(1)) for it in entries
+              if (low := re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", it))
+              and (high := re.search(r"DW_AT_high_pc\s+\((0x[0-9a-f]+)\)", it))]
+    if not ranges or not shutil.which("objdump"):
+        return None
+    for low, high in ((int(low, 16), int(high, 16)) for low, high in ranges):
+        listed = subprocess.run(["objdump", "-d", "--no-show-raw-insn", f"--start-address={low:#x}",
+                                 f"--stop-address={high:#x}", binary], capture_output=True, text=True).stdout
+        targets = [int(it, 16) for it in re.findall(r"^\s*[0-9a-f]+:\s+(?:jmp|b)\s+([0-9a-f]+)\b", listed, re.M)]
+        if any(not low <= target < high for target in targets):
+            return True
+    return False
+
+
+def compare(tally, what, theirs, ours, binary=None):
     """Holds the frames of each panic of rustd's binary against the cargo build's."""
-    differ, fewer, frames, shown = 0, 0, 0, ""
+    differ, fewer, frames, shown, absent = 0, 0, 0, "", set()
     for (their_at, their_frames), (our_at, our_frames) in zip(theirs, ours):
         want, got = own(their_frames), own(our_frames)
         frames += len(got)
@@ -208,6 +312,7 @@ def compare(tally, what, theirs, ours):
             continue
         if LLVM and their_at == our_at and got and within(got, want):
             fewer += 1
+            absent.update(frame[0] for frame in want if frame not in got)
             continue
         differ += 1
         shown = shown or f"at {our_at}: {[g for g in got if g not in want][:2]} for {[w for w in want if w not in got][:2]}"
@@ -215,7 +320,17 @@ def compare(tally, what, theirs, ours):
         return tally.say(what, "NOT THE PANICS", f"{len(ours)} for {len(theirs)}")
     if not frames:
         return tally.say(what, "NO FRAMES")
-    more = f"{len(theirs)} panics, {frames} frames" + (f", {fewer} with frames the optimizer left out" if fewer else "")
+    more = f"{len(theirs)} panics, {frames} frames"
+    if fewer:
+        # A frame may only be missing because its function left by a jump: anything else is a
+        # frame the debug info lost.
+        left = {name: jumps_away(binary, name) if binary else None for name in sorted(absent)}
+        kept = [name for name, jumps in left.items() if jumps is False]
+        if kept:
+            return tally.say(what, "FRAMES LOST", f"{more}; {kept[0]} calls and has no frame")
+        seen = sum(1 for jumps in left.values() if jumps)
+        more += (f", {fewer} with frames the optimizer left out: {seen} of {len(left)} functions seen to leave"
+                 f" by a jump, first {next(iter(left))[:60]}")
     tally.say(what, "DIFFERENT" if differ else "same", more + (f"; {differ} differ, first {shown}" if differ else ""))
 
 
@@ -401,7 +516,7 @@ def program(tally, what, workspace, crates, package, inject=None):
     fx.rustc_build()
     fx.rustd_build()
     theirs, ours = backtraces(fx.reference, fx.ws, env), backtraces(fx.binary, fx.ws, env)
-    compare(tally, f"{what}: frames of each panic", theirs, ours)
+    compare(tally, f"{what}: frames of each panic", theirs, ours, fx.binary)
     verify(tally, what, fx.binary)
     unwinding(tally, what, fx.binary)
     if place := call_site(ours):
@@ -505,6 +620,20 @@ def variables(tally):
     tally.say("locals: gdb prints them", "printed" if not wrong else "NOT AS THEY ARE",
               f"{len(right)} of {len(LOCALS)}, {len(gone)} optimized out, {count} described in {functions} functions"
               + (f", but {wrong[0][:50]}" if wrong else ""))
+
+
+def callers(tally):
+    """Whether panics behind inlined and `#[track_caller]` functions say where they were, and
+    have the frames a cargo build's have."""
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-callers-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, CALLERS_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+    fx.rustd_build()
+    compare(tally, "callers: frames of each panic", backtraces(fx.reference, ws), backtraces(fx.binary, ws), fx.binary)
+    verify(tally, "callers", fx.binary)
 
 
 def printed_by(debugger, binary, cwd, place, names):
@@ -632,6 +761,7 @@ def main():
         "rung2": lambda: program(tally, "rung2", os.path.join(HERE, "rung2"), ["rung2"], "rung2",
                                  ("src/main.rs", ".map_ok(|it| it + 1)", ".map_ok(|it| {\n        " + PANIC + "\n        it + 1\n    })")),
         "edits": lambda: edits(tally),
+        "callers": lambda: callers(tally),
         "locals": lambda: variables(tally),
         "types": lambda: shapes(tally),
         "profile": lambda: settings(tally),
