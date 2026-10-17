@@ -311,7 +311,8 @@ def debugger(tally, what, binary, cwd, place, env=None):
     out = ran.stdout
     file, line = place.rsplit(":", 1)
     said = f"{what}: gdb at {os.path.basename(file)}:{line}"
-    stop = re.search(r"Breakpoint 1, .*? at (\S+):(\d+)", out, re.S)
+    # A newer gdb numbers which of a breakpoint's places it stopped at: "Breakpoint 1.1,".
+    stop = re.search(r"Breakpoint 1(?:\.\d+)?, .*? at (\S+):(\d+)", out, re.S)
     if not stop or stop.group(2) != line or not file.endswith(os.path.basename(stop.group(1))):
         # What gdb said up to where it would have stopped is what tells why it did not.
         print("\n".join("    gdb: " + it[:200] for it in (out.split("<where>")[0] + ran.stderr).strip().splitlines()[-12:]))
