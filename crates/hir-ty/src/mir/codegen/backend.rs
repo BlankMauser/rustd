@@ -24,6 +24,10 @@ const BACKEND: &str = "RUSTD_BACKEND";
 /// How hard LLVM optimizes each function, `0` to `3`. Functions are compiled alone at any
 /// level: nothing is inlined across them.
 const OPTIMIZATION: &str = "RUSTD_OPT";
+/// How LLVM turns the optimized function into machine code: `optimized` (the default) or
+/// `fast`, its quick instruction selection and register allocation. Most of LLVM's time on a
+/// function is here, not in the passes before it.
+const SELECTION: &str = "RUSTD_EMIT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -31,12 +35,32 @@ pub enum Backend {
     Llvm(Optimization),
 }
 
+/// What LLVM does to a function: the passes over its IR, and how code is selected for what
+/// they leave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Optimization {
+pub struct Optimization {
+    pub passes: Passes,
+    pub selection: Selection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Passes {
     None,
     Less,
     Default,
     Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Selection {
+    Fast,
+    Optimized,
+}
+
+impl Optimization {
+    /// No passes and the quick selection: what a function too large for more is given.
+    pub const NONE: Optimization =
+        Optimization { passes: Passes::None, selection: Selection::Fast };
 }
 
 impl Backend {
@@ -47,13 +71,22 @@ impl Backend {
     }
 
     fn read_env() -> std::result::Result<Backend, String> {
-        let optimization = match std::env::var(OPTIMIZATION).as_deref() {
-            Ok("0") => Optimization::None,
-            Ok("1") => Optimization::Less,
-            Ok("2") | Err(_) => Optimization::Default,
-            Ok("3") => Optimization::Aggressive,
+        let passes = match std::env::var(OPTIMIZATION).as_deref() {
+            Ok("0") => Passes::None,
+            Ok("1") => Passes::Less,
+            Ok("2") | Err(_) => Passes::Default,
+            Ok("3") => Passes::Aggressive,
             Ok(other) => return Err(format!("{OPTIMIZATION}={other}: expected 0, 1, 2 or 3")),
         };
+        let selection = match std::env::var(SELECTION).as_deref() {
+            Ok("fast") => Selection::Fast,
+            Ok("optimized") | Err(_) if passes != Passes::None => Selection::Optimized,
+            Ok("optimized") | Err(_) => Selection::Fast,
+            Ok(other) => {
+                return Err(format!("{SELECTION}={other}: expected `fast` or `optimized`"));
+            }
+        };
+        let optimization = Optimization { passes, selection };
         match std::env::var(BACKEND).as_deref() {
             Ok("cranelift") | Err(_) => Ok(Backend::Cranelift),
             Ok("llvm") if cfg!(feature = "llvm") => Ok(Backend::Llvm(optimization)),
@@ -65,6 +98,22 @@ impl Backend {
     /// Compiles the function `context` holds. `recorder` is where a producer asks for a
     /// function its own code calls that the IR did not name.
     pub(super) fn emit(
+        recorder: &mut Recorder<'_>,
+        context: &mut cranelift_codegen::Context,
+    ) -> Result<Code> {
+        let mut code = Self::produce(recorder, context)?;
+        // A function is replaced in a linked program by a jump written over its entry, so
+        // none is shorter than that jump. Nothing runs the bytes that make up the length.
+        let target = super::Target::selected().map_err(CodegenError::Backend)?;
+        if let Some((shortest, filler)) = target.arch.shortest_function()
+            && code.bytes.len() < shortest
+        {
+            code.bytes.resize(shortest, filler);
+        }
+        Ok(code)
+    }
+
+    fn produce(
         recorder: &mut Recorder<'_>,
         context: &mut cranelift_codegen::Context,
     ) -> Result<Code> {
@@ -125,10 +174,19 @@ impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Backend::Cranelift => f.write_str("cranelift"),
-            Backend::Llvm(Optimization::None) => f.write_str("llvm -O0"),
-            Backend::Llvm(Optimization::Less) => f.write_str("llvm -O1"),
-            Backend::Llvm(Optimization::Default) => f.write_str("llvm -O2"),
-            Backend::Llvm(Optimization::Aggressive) => f.write_str("llvm -O3"),
+            Backend::Llvm(Optimization { passes, selection }) => {
+                let level = match passes {
+                    Passes::None => 0,
+                    Passes::Less => 1,
+                    Passes::Default => 2,
+                    Passes::Aggressive => 3,
+                };
+                write!(f, "llvm -O{level}")?;
+                match selection {
+                    Selection::Fast if *passes != Passes::None => f.write_str(" fast emit"),
+                    _ => Ok(()),
+                }
+            }
         }
     }
 }

@@ -33,7 +33,9 @@ class Compiled:
                                  env={**os.environ, "RUSTD_STATS": "1", **env})
         self.stderr = child.stderr.read()
         _, status, usage = os.wait4(child.pid, 0)
-        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // 1024
+        # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
+        unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
+        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // unit
         if status != 0:
             raise SystemExit(f"rustd failed with {name}:\n{self.stderr[-3000:]}")
         open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w").write(self.stderr)
@@ -99,7 +101,11 @@ def main():
     expected = run(fx.reference, run_args)
     project = os.path.join(workspace, opt("--project", ""))
     producers = [("cranelift", {"RUSTD_BACKEND": "cranelift"})]
-    producers += [(f"llvm -O{level}", {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": level}) for level in levels]
+    # A level with an `f` after it is that level's passes with LLVM's fast code selection.
+    for level in levels:
+        fast = level.endswith("f")
+        env = {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": level.rstrip("f"), "RUSTD_EMIT": "fast" if fast else "optimized"}
+        producers.append((f"llvm -O{level.rstrip('f')}" + (" fast emit" if fast else ""), env))
     built = []
     for name, env in producers:
         compiled = Compiled(fx, name, env, project)

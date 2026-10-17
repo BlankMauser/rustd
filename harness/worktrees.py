@@ -13,6 +13,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 COUNT = 3
@@ -85,7 +86,8 @@ def splice(program):
 
 
 def main():
-    work = tempfile.mkdtemp(prefix="rustd-worktrees-")
+    # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-worktrees-"))
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
     crates = ["sapp", "sbase", "smid"]
     checkouts = []
@@ -104,8 +106,7 @@ def main():
             fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, obj], RUSTD)
         link[link.index("-o") + 1] = binary
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link),

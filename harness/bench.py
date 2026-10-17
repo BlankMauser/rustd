@@ -12,6 +12,7 @@ import json, os, re, shlex, statistics, subprocess, sys, time
 # rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
 # has to come from the rustc that copy was taken from.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,8 +43,7 @@ class Edit:
 def rustd_loop(fx, crate, edit, n):
     obj = os.path.join(fx.work, "rustd.o")
     args = list(fx.link_args)
-    first = next(i for i, a in enumerate(args) if a.endswith(".rlib"))
-    args[first:first] = [obj, "-Wl,--allow-multiple-definition"]
+    args = linkline.ahead(args, [obj], RUSTD)
     args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     log = open(os.path.join(fx.work, "daemon.log"), "w+")

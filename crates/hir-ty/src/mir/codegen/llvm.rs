@@ -23,7 +23,8 @@ use inkwell::{
 use rustc_hash::FxHashMap;
 
 use super::{
-    backend::{Optimization, Phase, Tally},
+    Arch,
+    backend::{Optimization, Passes, Phase, Selection, Tally},
     fragment::{Code, Recorder},
 };
 
@@ -33,7 +34,6 @@ mod lower;
 /// The name of the function being compiled, in the module and in the object.
 const OWN: &str = "rustd.own";
 const PERSONALITY: &str = "rust_eh_personality";
-const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 
 pub(super) fn emit(
     recorder: &mut Recorder<'_>,
@@ -44,10 +44,10 @@ pub(super) fn emit(
     // LLVM's optimizing register allocator takes more than linear time, as Cranelift's does:
     // one function of dx kept it busy for minutes. Such a function is compiled without
     // optimization, and counted.
-    let optimization = if func.dfg.num_insts() > super::LARGE && optimization != Optimization::None
+    let optimization = if func.dfg.num_insts() > super::LARGE && optimization != Optimization::NONE
     {
         tally.large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Optimization::None
+        Optimization::NONE
     } else {
         optimization
     };
@@ -88,10 +88,14 @@ pub(super) fn emit(
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
     let context = Context::create();
     let module = context.create_module("rustd_asm");
-    Machine::with(Optimization::None, |machine| {
+    Machine::with(Optimization::NONE, |machine| {
         module.set_triple(&machine.get_triple());
-        // What rustc wraps `global_asm!` in.
-        module.set_inline_assembly(&format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"));
+        // What rustc wraps `global_asm!` in, where there are two syntaxes.
+        let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
+            Arch::X86_64 => format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"),
+            Arch::Aarch64 => format!("{text}\n"),
+        };
+        module.set_inline_assembly(&text);
         let object = machine
             .write_to_memory_buffer(&module, FileType::Object)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
@@ -102,20 +106,21 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
 
 impl Optimization {
     fn pipeline(self) -> Option<&'static str> {
-        match self {
-            Optimization::None => None,
-            Optimization::Less => Some("default<O1>"),
-            Optimization::Default => Some("default<O2>"),
-            Optimization::Aggressive => Some("default<O3>"),
+        match self.passes {
+            Passes::None => None,
+            Passes::Less => Some("default<O1>"),
+            Passes::Default => Some("default<O2>"),
+            Passes::Aggressive => Some("default<O3>"),
         }
     }
 
+    /// The level of the code generator, which is not that of the passes.
     fn level(self) -> OptimizationLevel {
-        match self {
-            Optimization::None => OptimizationLevel::None,
-            Optimization::Less => OptimizationLevel::Less,
-            Optimization::Default => OptimizationLevel::Default,
-            Optimization::Aggressive => OptimizationLevel::Aggressive,
+        match (self.selection, self.passes) {
+            (Selection::Fast, _) | (_, Passes::None) => OptimizationLevel::None,
+            (Selection::Optimized, Passes::Less) => OptimizationLevel::Less,
+            (Selection::Optimized, Passes::Default) => OptimizationLevel::Default,
+            (Selection::Optimized, Passes::Aggressive) => OptimizationLevel::Aggressive,
         }
     }
 }
@@ -143,14 +148,12 @@ impl Machine {
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
-        if emitted.triple() != TRIPLE {
-            return Err(Unhandled::Llvm(format!(
-                "the LLVM backend emits for {TRIPLE} only, not {}",
-                emitted.triple()
-            )));
+        match emitted.arch {
+            Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
+            Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
         }
-        Target::initialize_x86(&InitializationConfig::default());
-        let triple = TargetTriple::create(TRIPLE);
+        let name = emitted.triple();
+        let triple = TargetTriple::create(name);
         let target = Target::from_triple(&triple)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
@@ -158,13 +161,13 @@ impl Machine {
         target
             .create_target_machine(
                 &triple,
-                "x86-64",
+                emitted.cpu(),
                 "",
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,
             )
-            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {TRIPLE}")))
+            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {name}")))
     }
 }
 
@@ -210,7 +213,7 @@ pub(super) enum Unhandled {
     Type(Type),
     /// IR or an object of a kind there is no answer for yet.
     Shape(&'static str),
-    /// An ELF relocation type, by its number.
+    /// A relocation type of the object format, by its number.
     Relocation(u32),
     Llvm(String),
 }

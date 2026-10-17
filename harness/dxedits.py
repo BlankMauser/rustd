@@ -7,6 +7,7 @@ Starts the daemon on the crates, waits for the first build, applies each edit an
 time the daemon took to rebuild and how many functions it compiled again.
 """
 import json, os, re, shlex, subprocess, sys, tempfile, time
+import linkline
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
@@ -69,9 +70,8 @@ def main():
     binary = os.path.join(work, "dx-rustd-bin")
     if os.environ.get("DXEDITS_PATCH"):
         link = list(json.load(open(os.path.join(work, "fixture.json")))["link_args"])
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
         patch = os.path.join(work, "dx.patch.o")
-        link[first:first] = [patch, os.path.join(work, "dx.o"), "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, os.path.join(work, "dx.o")], RUSTD)
         link[link.index("-o") + 1] = binary
         # DXEDITS_LD: a directory holding the `ld` to link with, instead of rustc's lld.
         if ld := os.environ.get("DXEDITS_LD"):

@@ -3586,7 +3586,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// How a call with these types passes its values. Mirrors rustc: `adjust_for_rust_abi`
-    /// for Rust's own conventions, and `callconv/x86_64.rs` for C's.
+    /// for Rust's own conventions, and `callconv/x86_64.rs` or `callconv/aarch64.rs` for C's.
     fn fn_abi(
         &self,
         abi: ExternAbi,
@@ -7659,9 +7659,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if variadic {
                     // Each call of a variadic function has a signature of its own, and the
                     // function is declared with only one of them.
-                    // FIXME: the callee is told how many vector registers hold arguments,
-                    // which Cranelift has no way to say.
-                    if sig.params.iter().any(|param| param.value_type.is_float()) {
+                    if let isa::CallConv::AppleAarch64 = self.cg.target.call_conv {
+                        let InstanceDef::Fn(func) = def else { unreachable!() };
+                        let named = FunctionSignature::of(self.cg.db, func).params.len();
+                        let named = arg_modes[..named]
+                            .iter()
+                            .map(|&mode| {
+                                let mut params = Vec::new();
+                                self.push_abi_params(mode, &mut params);
+                                params.len()
+                            })
+                            .sum::<usize>()
+                            + usize::from(matches!(ret_mode, PassMode::Indirect));
+                        self.apple_variadic(&mut sig, &mut values, named);
+                    } else if sig.params.iter().any(|param| param.value_type.is_float()) {
+                        // FIXME: the callee is told how many vector registers hold arguments,
+                        // which Cranelift has no way to say.
                         unsupported!("float passed to a variadic function");
                     }
                     let sig = self.builder.import_signature(sig);
@@ -7678,6 +7691,41 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         self.receive(ret_mode, &mut results.into_iter(), dst, &ret_layout);
         Ok(())
+    }
+
+    /// Makes a call pass what follows its first `named` parameters the way Apple passes the
+    /// variable arguments of a C function on AArch64: each in eight bytes of stack, whatever
+    /// registers are free. Cranelift knows no such thing, so arguments that carry nothing
+    /// take the registers that are left.
+    fn apple_variadic(&mut self, sig: &mut Signature, values: &mut Vec<Value>, named: usize) {
+        let (mut ints, mut floats) = (8usize, 8usize);
+        for param in &sig.params[..named] {
+            match param.purpose {
+                ArgumentPurpose::StructReturn => (),
+                _ if param.value_type.is_float() => floats = floats.saturating_sub(1),
+                _ => ints = ints.saturating_sub(param.value_type.bytes().div_ceil(8) as usize),
+            }
+        }
+        for (param, value) in sig.params[named..].iter_mut().zip(&mut values[named..]) {
+            if param.value_type.is_int() && param.value_type.bits() < 64 {
+                *value = match param.extension {
+                    ir::ArgumentExtension::Sext => self.builder.ins().sextend(types::I64, *value),
+                    _ => self.builder.ins().uextend(types::I64, *value),
+                };
+                *param = AbiParam::new(types::I64);
+            }
+        }
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let zero_float = self.builder.ins().f64const(0.0);
+        sig.params.splice(
+            named..named,
+            std::iter::repeat_n(AbiParam::new(types::I64), ints)
+                .chain(std::iter::repeat_n(AbiParam::new(types::F64), floats)),
+        );
+        values.splice(
+            named..named,
+            std::iter::repeat_n(zero, ints).chain(std::iter::repeat_n(zero_float, floats)),
+        );
     }
 
     fn intrinsic(

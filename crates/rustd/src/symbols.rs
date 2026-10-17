@@ -158,6 +158,12 @@ impl SymbolTable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
+            // Mach-O spells every name of C and Rust with an underscore in front, which the
+            // writer of an object adds back.
+            let name = match object.format() {
+                object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
+                _ => name,
+            };
             self.add_name(name, symbols);
         }
     }

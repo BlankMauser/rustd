@@ -9,6 +9,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 TOOL_TOML = """[package]
@@ -77,8 +78,7 @@ def main():
         fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, obj], RUSTD)
         link[link.index("-o") + 1] = binary
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link), "symbols": symbols}

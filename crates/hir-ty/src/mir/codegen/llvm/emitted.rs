@@ -9,12 +9,11 @@ use cranelift_codegen::{
     binemit::Reloc,
     gimli::{self, BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection},
     ir::{LibCall, Signature},
-    isa::CallConv,
 };
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
 use object::{
-    Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex,
-    SectionKind, SymbolSection, elf,
+    BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
+    SectionIndex, SectionKind, SymbolSection, elf, macho,
 };
 use rustc_hash::FxHashMap;
 
@@ -53,7 +52,9 @@ impl<'data> Emitted<'data> {
         let file = object::File::parse(object)?;
         let own = file
             .symbols()
-            .find(|symbol| symbol.name() == Ok(OWN) && symbol.is_definition())
+            .find(|symbol| {
+                symbol.is_definition() && symbol.name().is_ok_and(|name| plain(&file, name) == OWN)
+            })
             .ok_or(Unhandled::Shape("an object without the function"))?;
         let SymbolSection::Section(text) = own.section() else {
             return Err(Unhandled::Shape("an object without the function"));
@@ -69,9 +70,18 @@ impl<'data> Emitted<'data> {
             align: 1,
             relocs: Vec::new(),
         };
-        emitted.place(text, recorder)?;
-        emitted.relocate(recorder)?;
-        let unwind = emitted.unwind()?;
+        let unwind = match emitted.file.format() {
+            BinaryFormat::MachO => {
+                emitted.place_macho(text, recorder)?;
+                emitted.relocate_macho(recorder)?;
+                emitted.unwind_macho()?
+            }
+            _ => {
+                emitted.place(text, recorder)?;
+                emitted.relocate(recorder)?;
+                emitted.unwind()?
+            }
+        };
         let Emitted { bytes, align, relocs, .. } = emitted;
         Ok(Code { signature, bytes, align, relocs, unwind })
     }
@@ -213,6 +223,121 @@ impl<'data> Emitted<'data> {
         Ok(())
     }
 
+    /// Lays out the function's section. Every other section its relocations lead to is a
+    /// data object of its own: AArch64 code finds what is near it by the page it is on,
+    /// which only the linker knows.
+    fn place_macho(
+        &mut self,
+        text: SectionIndex,
+        recorder: &mut Recorder<'_>,
+    ) -> Result<(), Unhandled> {
+        let section = self.file.section_by_index(text)?;
+        self.align = section.align().max(1);
+        self.bytes.extend_from_slice(section.data()?);
+        self.placed.insert(text, Placement::Inline(0));
+        self.inline.push(text);
+        for (_, relocation) in section.relocations() {
+            let SymbolSection::Section(index) = self.symbol(&relocation)?.section() else {
+                continue;
+            };
+            if self.placed.contains_key(&index) {
+                continue;
+            }
+            let blob = self.blob_macho(&self.file.section_by_index(index)?)?;
+            let id = recorder
+                .define_const(blob)
+                .map_err(|_| Unhandled::Shape("constants that cannot be defined"))?;
+            self.placed.insert(index, Placement::Blob(id));
+        }
+        Ok(())
+    }
+
+    /// A section of constants, which may hold addresses of what the function asked for.
+    fn blob_macho(&self, section: &object::Section<'data, '_>) -> Result<ConstBlob, Unhandled> {
+        match section.kind() {
+            SectionKind::ReadOnlyData
+            | SectionKind::ReadOnlyString
+            | SectionKind::ReadOnlyDataWithRel => {}
+            // `__DATA,__const`: written to only by the loader, which fills in the addresses.
+            SectionKind::Data if section.name()? == "__const" => {}
+            _ => return Err(Unhandled::Shape("code that refers to a writable section")),
+        }
+        let mut blob = ConstBlob {
+            bytes: section.data()?.to_vec(),
+            relocs: Vec::new(),
+            fn_relocs: Vec::new(),
+            align: section.align().max(1),
+        };
+        const HELD: Unhandled = Unhandled::Shape("constants that hold an address of the code");
+        for (offset, relocation) in section.relocations() {
+            let RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_length: 3, .. } =
+                relocation.flags()
+            else {
+                return Err(HELD);
+            };
+            let symbol = self.symbol(&relocation)?;
+            let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
+            // The addend is where the address will be.
+            let at = offset as usize;
+            let field = blob.bytes.get_mut(at..at + 8).ok_or(HELD)?;
+            let addend = i64::from_le_bytes((&*field).try_into().map_err(|_| HELD)?);
+            field.fill(0);
+            match (named.and_then(|name| Symbol::parse(plain(&self.file, name))), addend) {
+                (Some(Symbol::Data(index)), addend) => {
+                    blob.relocs.push((at as u32, DataId::from_u32(index), addend));
+                }
+                (Some(Symbol::Func(index)), 0) => {
+                    blob.fn_relocs.push((at as u32, FuncId::from_u32(index)));
+                }
+                _ => return Err(HELD),
+            }
+        }
+        Ok(blob)
+    }
+
+    /// Turns the relocations of the function into relocations against requests and against
+    /// the data objects its constants became.
+    fn relocate_macho(&mut self, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
+        let section = self.file.section_by_index(self.inline[0])?;
+        for (offset, relocation) in section.relocations() {
+            let RelocationFlags::MachO { r_type, .. } = relocation.flags() else {
+                return Err(Unhandled::Shape("an object that is not Mach-O"));
+            };
+            let kind = match r_type {
+                macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
+                macho::ARM64_RELOC_PAGE21 => Reloc::Aarch64AdrPrelPgHi21,
+                macho::ARM64_RELOC_PAGEOFF12 => Reloc::Aarch64AddAbsLo12Nc,
+                macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Reloc::Aarch64AdrGotPage21,
+                macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
+                macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Reloc::MachOAarch64TlsAdrPage21,
+                macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
+                other => return Err(Unhandled::Relocation(other.into())),
+            };
+            let symbol = self.symbol(&relocation)?;
+            let (name, addend) = match symbol.section() {
+                SymbolSection::Section(target) => match self.placed[&target] {
+                    Placement::Blob(id) => {
+                        let within =
+                            symbol.address() - self.file.section_by_index(target)?.address();
+                        (
+                            ModuleRelocTarget::user(1, id.as_u32()),
+                            relocation.addend() + within as i64,
+                        )
+                    }
+                    Placement::Inline(_) => {
+                        return Err(Unhandled::Shape("code that holds an address of itself"));
+                    }
+                },
+                _ => (
+                    Self::target(plain(&self.file, symbol.name()?), recorder)?,
+                    relocation.addend(),
+                ),
+            };
+            self.relocs.push(ModuleReloc { offset: offset as u32, kind, name, addend });
+        }
+        Ok(())
+    }
+
     /// What an undefined symbol of the object stands for.
     fn target(name: &str, recorder: &mut Recorder<'_>) -> Result<ModuleRelocTarget, Unhandled> {
         if let Some(symbol) = Symbol::parse(name) {
@@ -229,7 +354,7 @@ impl<'data> Emitted<'data> {
         // rounding function, wide division. Nothing is checked against the signature of an
         // import.
         let id: FuncId = recorder
-            .import(name, &Signature::new(CallConv::SystemV))
+            .import(name, &recorder.make_signature())
             .map_err(|_| Unhandled::Shape("a library call that cannot be imported"))?;
         Ok(ModuleRelocTarget::user(0, id.as_u32()))
     }
@@ -237,7 +362,11 @@ impl<'data> Emitted<'data> {
     /// The function's entry of `.eh_frame` as rules, and its entry of `.gcc_except_table`
     /// as it is: the offsets in it are from the start of the function.
     fn unwind(&self) -> Result<Option<FunctionUnwind>, Unhandled> {
-        let Some(section) = self.file.section_by_name(".eh_frame") else { return Ok(None) };
+        let name = match self.file.format() {
+            BinaryFormat::MachO => "__eh_frame",
+            _ => ".eh_frame",
+        };
+        let Some(section) = self.file.section_by_name(name) else { return Ok(None) };
         let eh_frame = EhFrame::new(section.data()?, LittleEndian);
         let bases = BaseAddresses::default().set_eh_frame(0).set_text(0);
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
@@ -253,7 +382,15 @@ impl<'data> Emitted<'data> {
             }
             let cie = fde.cie();
             let entry_rules = Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
-            if entry_rules != FrameRule::ON_ENTRY.map(|rule| (0, rule)) {
+            let arch = match self.file.architecture() {
+                object::Architecture::Aarch64 => crate::mir::codegen::Arch::Aarch64,
+                _ => crate::mir::codegen::Arch::X86_64,
+            };
+            if !entry_rules
+                .iter()
+                .copied()
+                .eq(FrameRule::on_entry(arch).iter().map(|&rule| (0, rule)))
+            {
                 return Err(Unhandled::Shape("an unwind table that starts from other rules"));
             }
             rows = Some(FrameRows {
@@ -262,14 +399,88 @@ impl<'data> Emitted<'data> {
             });
         }
         let Some(rows) = rows else { return Ok(None) };
-        let landing_pads = match self.file.section_by_name(".gcc_except_table") {
-            Some(table) if table.relocations().next().is_some() => {
-                return Err(Unhandled::Shape("landing pads that name a type"));
-            }
-            Some(table) => Some(table.data()?.to_vec()),
-            None => None,
+        Ok(Some(FunctionUnwind::from_rows(rows, self.landing_pads()?)))
+    }
+
+    /// The function's table of landing pads as it is: the offsets in it are from the start
+    /// of the function.
+    fn landing_pads(&self) -> Result<Option<Vec<u8>>, Unhandled> {
+        let name = match self.file.format() {
+            BinaryFormat::MachO => "__gcc_except_tab",
+            _ => ".gcc_except_table",
         };
-        Ok(Some(FunctionUnwind::from_rows(rows, landing_pads)))
+        match self.file.section_by_name(name) {
+            Some(table) if table.relocations().next().is_some() => {
+                Err(Unhandled::Shape("landing pads that name a type"))
+            }
+            Some(table) => Ok(Some(table.data()?.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// The function's entry of `__compact_unwind` as the rules it stands for, and its entry
+    /// of `__gcc_except_tab` as it is. The compact entry says how the frame is once it is
+    /// set up and not where in the function that is, so the rules are given from the first
+    /// instruction on: right wherever the function calls, which is where a panic unwinds.
+    fn unwind_macho(&self) -> Result<Option<FunctionUnwind>, Unhandled> {
+        const MODE: u32 = 0x0f00_0000;
+        const FRAMELESS: u32 = 0x0200_0000;
+        const FRAME: u32 = 0x0400_0000;
+        const STACK: u32 = 0x00ff_f000;
+        /// The pairs of registers a function saves at the top of its frame, in the order
+        /// they are there, by their DWARF numbers.
+        const PAIRS: [(u32, u16); 9] = [
+            (0x001, 19),
+            (0x002, 21),
+            (0x004, 23),
+            (0x008, 25),
+            (0x010, 27),
+            (0x100, 72),
+            (0x200, 74),
+            (0x400, 76),
+            (0x800, 78),
+        ];
+        let Some(section) = self.file.section_by_name("__compact_unwind") else {
+            return Ok(None);
+        };
+        let data = section.data()?;
+        let &[_, _, _, _, _, _, _, _, l0, l1, l2, l3, e0, e1, e2, e3, ..] = data else {
+            return Ok(None);
+        };
+        if data.len() != 32 {
+            return Err(Unhandled::Shape("more than one unwind table entry"));
+        }
+        let (len, encoding) =
+            (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
+        let mut rows = Vec::new();
+        // How far below the frame the saved pairs start.
+        let mut at = match encoding & MODE {
+            FRAMELESS => {
+                let size = ((encoding & STACK) >> 12) * 16;
+                if size != 0 {
+                    rows.push((0, FrameRule::CfaOffset(size as i32)));
+                }
+                0
+            }
+            FRAME => {
+                rows.extend([
+                    (0, FrameRule::Cfa(29, 16)),
+                    (0, FrameRule::Offset(30, -8)),
+                    (0, FrameRule::Offset(29, -16)),
+                ]);
+                -16
+            }
+            // The frame was beyond the compact form, and has an entry of `__eh_frame`.
+            _ => return self.unwind(),
+        };
+        for (pair, register) in PAIRS {
+            if encoding & pair != 0 {
+                rows.push((0, FrameRule::Offset(register, at - 8)));
+                rows.push((0, FrameRule::Offset(register + 1, at - 16)));
+                at -= 16;
+            }
+        }
+        Ok(Some(FunctionUnwind::from_rows(FrameRows { len, rows }, self.landing_pads()?)))
     }
 
     const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");
@@ -319,6 +530,14 @@ impl<'data> Emitted<'data> {
             rules.push((at, rule));
         }
         Ok(rules)
+    }
+}
+
+/// The name of a symbol as the module had it: Mach-O puts an underscore before it.
+fn plain<'n>(file: &object::File<'_>, name: &'n str) -> &'n str {
+    match file.format() {
+        BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
+        _ => name,
     }
 }
 

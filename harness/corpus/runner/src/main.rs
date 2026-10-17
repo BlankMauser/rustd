@@ -134,6 +134,7 @@ fn main() {
     case!(simd::ascii_bytes(long.as_bytes()), simd::ascii_bytes(&[b'a', 200, b'c']));
     let hay = *b"hello, simd lane";
     let other = [3, 250, 17, 128, 127, 0, 255, 1, 90, 200, 44, 129, 5, 6, 7, 8];
+    #[cfg(target_arch = "x86_64")]
     case!(simd::find(&hay, b'l'), simd::find(&hay, b'z'), simd::mix(&hay, &other), simd::mix(&other, &hay));
 
     #[cfg(target_arch = "x86_64")]

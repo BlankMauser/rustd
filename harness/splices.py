@@ -4,7 +4,8 @@
 The program has thread-locals, statics of every kind, vtables, tables of function pointers,
 closures, generics, recursion, panics and foreign calls, and the steps edit each. Some steps
 first do something to the linked binary (strip it, touch it, run it). After every step the
-binary is run as it is and with LD_BIND_NOW, read by readelf, and compared with what
+binary is run as it is and with everything bound at once (LD_BIND_NOW, or DYLD_BIND_AT_LAUNCH
+on macOS), read by readelf (there: its signature verified and its fixups read by dyld_info), and compared with what
 `cargo build` of the same source prints. How each step got linked is counted, not judged.
 
 RUSTD_SPLICE=0   link each edit in full (the same test of the full link)
@@ -15,6 +16,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir, BINUTILS
 
 TOML = """[package]
@@ -206,6 +208,16 @@ fn main() {
 """
 
 
+# What reads an executable and says so when it is malformed, and what has the loader bind
+# everything at once.
+if linkline.MACHO:
+    READERS = [["codesign", "--verify", "--strict"], ["dyld_info", "-fixups", "-segments", "-exports"]]
+    BIND_NOW = "DYLD_BIND_AT_LAUNCH"
+else:
+    READERS = [[BINUTILS + "readelf", "-lSdrW", "--dyn-syms"]]
+    BIND_NOW = "LD_BIND_NOW"
+
+
 def strip(binary):
     subprocess.run([BINUTILS + "strip", binary], check=True)
 
@@ -364,8 +376,7 @@ def main():
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sedge.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link = linkline.ahead(link, [patch, obj], RUSTD)
     link[link.index("-o") + 1] = binary
     if os.environ.get("SPLICES_NO_PIE"):
         link = [a for a in link if a != "-pie"] + ["-no-pie"]
@@ -395,11 +406,12 @@ def main():
         return (reply.stdout + reply.stderr).strip(), how
 
     def sound(path):
-        """What readelf and a loader that binds everything at once have against the file."""
-        read = subprocess.run([BINUTILS + "readelf", "-lSdrW", "--dyn-syms", path], capture_output=True, text=True)
-        said = [l for l in read.stderr.splitlines() if l.strip()]
-        if read.returncode or said:
-            return f"readelf: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
+        """What the tools that read an executable have against the file."""
+        for tool in READERS:
+            read = subprocess.run([*tool, path], capture_output=True, text=True)
+            said = [l for l in read.stderr.splitlines() if l.strip()]
+            if read.returncode or said:
+                return f"{tool[0]}: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
         return None
 
     def edit(edits):
@@ -437,7 +449,7 @@ def main():
             verdict = "REFUSED: " + reply[:60]
         elif run(binary) != theirs:
             verdict = "DIFFERENT OUTPUT"
-        elif run(binary, {"LD_BIND_NOW": "1"}) != theirs:
+        elif run(binary, {BIND_NOW: "1"}) != theirs:
             verdict = "DIFFERENT OUTPUT BOUND AT ONCE"
         elif held and held.communicate(timeout=30)[0] != expected:
             verdict = "THE RUNNING ONE CHANGED"

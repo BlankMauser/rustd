@@ -28,6 +28,7 @@ import os, random, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
@@ -322,8 +323,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, obj], RUSTD)
         link[link.index("-o") + 1] = binary
         for path in (socket, binary):
             if os.path.exists(path):

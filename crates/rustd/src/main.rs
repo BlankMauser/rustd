@@ -10,6 +10,7 @@ mod splice;
 mod stub;
 mod symbols;
 mod tree;
+mod weaken;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at.
@@ -1596,7 +1597,7 @@ fn build(
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
-    let unit =
+    let mut unit =
         hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
             .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
@@ -1609,7 +1610,10 @@ fn build(
         );
     }
     let start = Instant::now();
-    if let Some(object) = &unit.object {
+    if let Some(object) = &mut unit.object {
+        // A patch defines again what the object does, and the linker of Mach-O takes two
+        // definitions of a name only when one of them gives way.
+        weaken::definitions(object);
         replace(&args.out, object)?;
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
@@ -2521,6 +2525,9 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("deps") {
         return deps::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("weaken") {
+        return weaken::command(std::env::args().skip(2));
     }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
