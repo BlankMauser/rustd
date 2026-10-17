@@ -15,7 +15,12 @@ found in the run is counted and not reduced a second time.
 
 RUSTD_BIN names the rustd under test. The exit status is 1 when there is a finding.
 """
-import argparse, collections, contextlib, json, os, re, resource, shutil, subprocess, sys, tempfile, time
+import argparse, collections, contextlib, json, os, re, shutil, subprocess, sys, tempfile, time
+
+try:
+    import resource
+except ImportError:  # Windows: a generated program is held to its time alone.
+    resource = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -62,7 +67,7 @@ class Project:
         if edition != self.edition:
             open(os.path.join(self.dir, "Cargo.toml"), "w").write(MANIFEST.format(edition=edition))
             self.edition = edition
-        open(self.main, "w").write(gen.render(modules))
+        open(self.main, "w", encoding="utf-8").write(gen.render(modules))
         if self.fx is None:
             self.fx = Fixture(self.dir, ["fz"], ["-p", "fz"], touch=self.main)
             self.fx.rustd_timeout = 600
@@ -97,7 +102,7 @@ class Project:
 
 def run(binary):
     """What a program prints and how it ends, within the limits a generated program has."""
-    limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (RUN_BYTES, RUN_BYTES))
+    limit = (lambda: resource.setrlimit(resource.RLIMIT_AS, (RUN_BYTES, RUN_BYTES))) if resource else None
     try:
         done = subprocess.run([*RUNNER, binary], capture_output=True, timeout=RUN_SECONDS, preexec_fn=limit)
     except subprocess.TimeoutExpired:
@@ -265,13 +270,13 @@ def write_found(seed, edition, backend, finding, modules, tests):
     head = [f"// Found by fuzz.py: seed {seed}, case {finding.case}, edition {edition}, backend {backend}.",
             f"// {finding.kind}: {finding.key}", f"// Reduced in {tests} builds. Again: fuzz.py check {os.path.basename(path)}"]
     head += ["// " + line for line in finding.detail.splitlines()[:12]]
-    open(path, "w").write("\n".join(head) + "\n" + "\n\n".join(gen.module(name, lines) for name, lines in modules) + "\n")
+    open(path, "w", encoding="utf-8").write("\n".join(head) + "\n" + "\n\n".join(gen.module(name, lines) for name, lines in modules) + "\n")
     return path
 
 
 def read_found(path):
     """The modules of a file under found/ and the edition it was found with."""
-    text = open(path).read()
+    text = open(path, encoding="utf-8").read()
     edition = re.search(r"edition (\d+)", text).group(1)
     modules = []
     for name, body in re.findall(r"^mod (c\d+) \{\n    use super::\*;\n(.*?)^\}$", text, re.M | re.S):

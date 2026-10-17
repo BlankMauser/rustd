@@ -2546,7 +2546,7 @@ def module(name, lines):
 def render(modules):
     """A whole program from `(name, lines)` per case."""
     table = "const CASES: &[(&str, fn())] = &[" + ", ".join(f'("{name}", {name}::run)' for name, _ in modules) + "];"
-    return "\n\n".join([open(os.path.join(HERE, "prelude.rs")).read(), table, *(module(name, lines) for name, lines in modules)]) + "\n"
+    return "\n\n".join([open(os.path.join(HERE, "prelude.rs"), encoding="utf-8").read(), table, *(module(name, lines) for name, lines in modules)]) + "\n"
 
 
 def program(seed, cases):
