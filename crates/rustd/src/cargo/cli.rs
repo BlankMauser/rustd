@@ -120,6 +120,8 @@ pub(crate) enum Asked {
     Cargo(Vec<String>),
     Status,
     Stop,
+    Enable,
+    Disable,
 }
 
 /// A build command and its arguments, split into what is cargo's to read and what is the
@@ -173,9 +175,35 @@ impl Asked {
             (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
+            ("enable", _) => Asked::Enable,
+            ("disable", _) => Asked::Disable,
             _ => Asked::Cargo(args),
         }
     }
+}
+
+/// The build command a cargo was run for, from its arguments. Cargo takes its own flags
+/// ahead of the subcommand as well as after it, and they are read as if they were after.
+/// `None` when the command is not one that builds programs rustd has a part in, or is one
+/// with a directory to change to first.
+pub(crate) fn of_cargo(args: &[String]) -> Option<Invocation> {
+    let mut ahead = Vec::new();
+    let mut words = args.iter();
+    let subcommand = loop {
+        let word = words.next()?;
+        if !word.starts_with('-') {
+            break Subcommand::named(word)?;
+        }
+        if word == "-C" {
+            return None;
+        }
+        ahead.push(word.clone());
+        if VALUED.contains(&word.as_str()) {
+            ahead.push(words.next()?.clone());
+        }
+    };
+    let typed: Vec<String> = ahead.into_iter().chain(words.cloned()).collect();
+    Some(Invocation::parse(subcommand, &typed))
 }
 
 impl Invocation {
@@ -246,16 +274,13 @@ impl Invocation {
     /// Why this command is cargo's alone, when it is clear before anything is built.
     pub(crate) fn only_cargo(&self) -> Option<String> {
         let flags = &self.flags;
-        let set = |name: &str| std::env::var_os(name).is_some_and(|it| !it.is_empty());
         let reason = match () {
             _ if flags.doc => "doc tests are built by rustdoc",
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
             _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if set("RUSTC_WORKSPACE_WRAPPER") && !set(super::wrapper::ENABLED) => {
-                "RUSTC_WORKSPACE_WRAPPER is set already"
-            }
+            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -303,6 +328,14 @@ impl Flags {
             _ => {}
         }
     }
+}
+
+/// Whether the environment names a wrapper for the crates of the workspace that is not
+/// rustd's.
+fn another_wrapper() -> bool {
+    let ours = super::switch::wrapper_path().ok();
+    std::env::var_os(super::switch::VARIABLE)
+        .is_some_and(|it| !it.is_empty() && Some(Path::new(&it)) != ours.as_deref())
 }
 
 /// Why rustd does not build for `triple`, when it does not.

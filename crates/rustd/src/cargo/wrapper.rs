@@ -1,55 +1,177 @@
-//! rustd as cargo's `RUSTC_WORKSPACE_WRAPPER` under `cargo rustd`: rustc runs as cargo asked,
-//! and what it built of a crate of the workspace is recorded for the daemon. A crate that is
-//! linked is also asked for its link line and for the objects it was linked from.
+//! rustd as the wrapper cargo runs rustc through for the crates of a workspace, under
+//! `cargo rustd` and, once `rustd enable` named it in cargo's configuration, under plain
+//! cargo. What rustc built of a crate is recorded for the daemon; a crate that is linked is
+//! also asked for its link line and for the objects it was linked from. Under plain cargo
+//! a program the daemon has loaded is the daemon's to build when cargo asks for it again,
+//! and one it has not is rustc's, after which the daemon loads the build.
 
 use std::{
     ffi::OsString,
+    fs::OpenOptions,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    thread::JoinHandle,
 };
 
 use anyhow::Context as _;
 
 use super::{
-    script,
+    ancestor::Cargo,
+    cli, daemon, say, script,
+    state::{State, place},
+    switch::Enabled,
     units::{Copied, Record, stamp_now},
 };
-use crate::stub::VALUED;
+use crate::{
+    socket::{private_dir, private_file},
+    stub::VALUED,
+};
 
-/// The variable that makes `rustd` this wrapper.
-pub(crate) const ENABLED: &str = "RUSTD_CARGO_WRAPS";
+/// The variable `cargo rustd` sets for the cargo it runs: the wrapper records what rustc
+/// builds and leaves the rest to the command that drives cargo.
+pub(crate) const DRIVEN: &str = "RUSTD_CARGO_DRIVES";
 
 /// What the variables that name the programs of a build start with.
 const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
 /// The variable that names the directory cargo gives the integration tests of a build.
 const SCRATCH: &str = "CARGO_TARGET_TMPDIR";
 
-/// Runs rustc, records the unit when rustc succeeded, and ends as rustc did.
+/// The file in the daemon's directory that has a line for every program plain cargo asked
+/// for: who linked it, and why when it was rustc.
+const TALLY: &str = "plain-cargo.log";
+/// The directory there with a file for every cargo whose build is being loaded.
+const SETTLING: &str = "settling";
+
+/// Builds what cargo asked rustc for and ends as rustc would have.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
     let args: Vec<OsString> = args.collect();
-    let Some(unit) = Unit::of(&args) else {
-        let status = Command::new(&rustc).args(&args).status()?;
-        std::process::exit(status.code().unwrap_or(1));
+    // The wrapper the user had for the workspace's crates still runs rustc.
+    let mut compiler = match Enabled::read().and_then(|it| it.chained) {
+        Some(chained) => {
+            let mut command = Command::new(chained);
+            command.arg(&rustc);
+            command
+        }
+        None => Command::new(&rustc),
     };
+    compiler.args(&args);
+    let Some(unit) = Unit::of(&args) else {
+        std::process::exit(compiler.status()?.code().unwrap_or(1));
+    };
+    let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
+    if plain {
+        let dir = unit.records.join(&unit.id);
+        let known = State::of_unit(&dir);
+        if !known.is_empty() {
+            match unit.by_daemon(&dir, &known, &rustc) {
+                Ok(()) => {
+                    tally("daemon", &unit.crate_name);
+                    std::process::exit(0);
+                }
+                Err(why) => unit.left_to_rustc(&why),
+            }
+            State::forget(&known);
+            let _ = std::fs::remove_file(dir.join(State::STATES));
+        }
+    }
     let stamp = stamp_now();
     let copies = unit.records.join(&unit.id).join(stamp.to_string());
     let line = copies.join("link.line");
-    let mut command = Command::new(&rustc);
-    command.args(&args);
     if unit.linked {
         std::fs::create_dir_all(&copies)?;
-        command.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
+        compiler.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
     }
     let status =
-        command.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
+        compiler.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
     if status.success()
         && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line))
     {
         // The build is good; the daemon has no part in this crate until it is built again.
         eprintln!("warning: rustd did not record `{}`: {error:#}", unit.id);
     }
+    if plain
+        && status.success()
+        && let Err(why) = loaded_later()
+    {
+        unit.left_to_rustc(&why);
+    }
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Starts a process that has the daemon load the build of the cargo above this one, when
+/// none was started for that cargo yet. `Err` is why the build is not one the daemon loads.
+fn loaded_later() -> Result<(), String> {
+    let cargo = Cargo::above()?;
+    let typed = cargo.args.join(" ");
+    let asked =
+        cli::of_cargo(&cargo.args).ok_or(format!("`cargo {typed}` is not a build rustd loads"))?;
+    if let Some(why) = asked.only_cargo() {
+        return Err(why);
+    }
+    let said = |it: &dyn std::fmt::Display| format!("the build is not loaded: {it:#}");
+    let home = daemon::home().map_err(|it| said(&it))?;
+    let settling = home.join(SETTLING);
+    private_dir(&settling).map_err(|it| said(&it))?;
+    let ours = settling.join(cargo.pid.to_string());
+    match private_file(OpenOptions::new().write(true).create_new(true), &ours) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(said(&error)),
+    }
+    let log = private_file(OpenOptions::new().create(true).append(true), &home.join("settle.log"))
+        .map_err(|it| said(&it))?;
+    let mut settle = Command::new(std::env::current_exe().map_err(|it| said(&it))?);
+    settle.args(["cargo", super::SETTLE]).arg(cargo.pid.to_string()).args(&cargo.args);
+    settle.env_clear().envs(cargo.env).env("CARGO", &cargo.executable).current_dir(&cargo.cwd);
+    settle.stdin(Stdio::null()).stdout(log.try_clone().map_err(|it| said(&it))?).stderr(log);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut settle, 0);
+    settle.spawn().map(drop).map_err(|it| {
+        settled(cargo.pid);
+        said(&it)
+    })
+}
+
+/// The build of the cargo `cargo` is loaded, or is not going to be.
+pub(crate) fn settled(cargo: u32) {
+    if let Ok(home) = daemon::home() {
+        let _ = std::fs::remove_file(home.join(SETTLING).join(cargo.to_string()));
+    }
+}
+
+/// Writes down that `who` linked a program for plain cargo, and `what` of it: its name
+/// when it was the daemon, why it was not when it was rustc.
+fn tally(who: &str, what: &str) {
+    let log = daemon::home().and_then(|home| {
+        private_dir(&home)?;
+        Ok(private_file(OpenOptions::new().create(true).append(true), &home.join(TALLY))?)
+    });
+    if let Ok(mut log) = log {
+        let _ = writeln!(log, "{who}\t{}", what.replace('\n', " "));
+    }
+}
+
+/// The lines of `rustd status` that count the programs plain cargo asked for.
+pub(crate) fn tallied() -> Vec<String> {
+    let log = daemon::home().ok().and_then(|it| std::fs::read_to_string(it.join(TALLY)).ok());
+    let Some(log) = log else { return Vec::new() };
+    let mut reasons = std::collections::BTreeMap::<&str, u64>::new();
+    let (mut daemon, mut rustc) = (0u64, 0u64);
+    for line in log.lines() {
+        match line.split_once('\t') {
+            Some(("daemon", _)) => daemon += 1,
+            Some((_, why)) => {
+                rustc += 1;
+                *reasons.entry(why).or_default() += 1;
+            }
+            None => {}
+        }
+    }
+    let mut lines = vec![format!("  {daemon} programs linked by the daemon, {rustc} by rustc")];
+    lines.extend(reasons.iter().map(|(why, count)| format!("    {count} x {why}")));
+    lines
 }
 
 /// A run of rustc that compiles a crate, as cargo's arguments describe it.
@@ -100,11 +222,68 @@ impl Unit {
         let emits_link = unit.args.iter().any(|it| {
             it.strip_prefix("--emit=").is_some_and(|kinds| kinds.split(',').any(|it| it == "link"))
         });
-        unit.script = record.is_build_script() && emits_link;
-        unit.linked = record.is_linked() && emits_link && !record.runs_in_build();
+        // A unit that is only checked leaves nothing the daemon reads.
+        if !emits_link {
+            return None;
+        }
+        unit.script = record.is_build_script();
+        unit.linked = record.is_linked() && !record.runs_in_build();
         unit.id =
             format!("{}{}", unit.crate_name, record.codegen("extra-filename").unwrap_or_default());
         Some(unit)
+    }
+
+    /// Has the daemon build the program and puts it where rustc would have, with the
+    /// dep-info rustc would have written. `known` are the builds that have the program, and
+    /// `dir` is where the unit is recorded. `Err` is why the program is rustc's to link.
+    fn by_daemon(&self, dir: &Path, known: &[String], rustc: &OsString) -> Result<(), String> {
+        let mut read = known.iter().map(|key| State::read(key).map_err(|why| (key, why)));
+        let mut state = match read.find_map(Result::ok) {
+            Some(state) => state,
+            None => {
+                let why = known.iter().find_map(|it| State::read(it).err().flatten());
+                return Err(why.unwrap_or("the build is not one the daemon has loaded").to_owned());
+            }
+        };
+        if let Some(why) = state.refusal.clone().or_else(|| state.broken_guard()) {
+            return Err(why);
+        }
+        let (checkout, at) = state.asked_for(dir)?;
+        let dep_info = self.dep_info(rustc);
+        let answer = super::synced(checkout).and_then(|programs| {
+            programs.get(at).cloned().unwrap_or(Err("the daemon said nothing of it".to_owned()))
+        });
+        let read = dep_info.join().map_err(|_| "rustc did not run".to_owned());
+        answer?;
+        let read = read?.map_err(|it| format!("rustc did not run: {it}"))?;
+        if !read.status.success() {
+            return Err("rustc does not read the source the daemon compiled".to_owned());
+        }
+        let binary = &checkout.programs[at].binary;
+        let record = self.as_record(0, Vec::new(), None);
+        let linked = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
+        place(binary, &linked).map_err(|it| format!("installing {}: {it}", linked.display()))?;
+        state.cargo_has(dir, binary).map_err(|it| format!("keeping {}: {it}", linked.display()))?;
+        // Every other build with the program kept the one cargo had before.
+        State::forget(known.iter().filter(|it| **it != state.key));
+        let _ = std::io::stderr().write_all(&read.stderr);
+        Ok(())
+    }
+
+    /// Runs rustc for the dep-info of the unit alone, which cargo reads to know what the
+    /// program was compiled from. What it says is kept until the program is the daemon's.
+    fn dep_info(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
+        let emits = |it: &String| it.starts_with("--emit=");
+        let args = self.args.iter().map(|it| if emits(it) { "--emit=dep-info" } else { it });
+        let mut command = Command::new(rustc);
+        command.args(args).stdin(Stdio::null());
+        std::thread::spawn(move || command.output())
+    }
+
+    /// Says in one line why rustc links the program and not the daemon, and counts it.
+    fn left_to_rustc(&self, why: &str) {
+        say::fallback(why, &format!("rustc links `{}`", self.crate_name));
+        tally("rustc", why);
     }
 
     fn as_record(&self, stamp: u128, copies: Vec<Copied>, link_line: Option<PathBuf>) -> Record {

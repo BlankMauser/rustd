@@ -18,7 +18,7 @@ use uds_windows::UnixStream;
 
 use super::{
     daemon::{Envelope, Reply, Request, home, socket_in, version},
-    wrapper,
+    switch, wrapper,
 };
 use crate::socket::{connect, private_dir, private_file};
 
@@ -95,7 +95,7 @@ fn started(home: &Path) -> anyhow::Result<UnixStream> {
     private_dir(home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let log = private_file(OpenOptions::new().create(true).append(true), &home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
-    daemon.arg("daemon").env_remove(wrapper::ENABLED).env_remove("RUSTC_WORKSPACE_WRAPPER");
+    daemon.arg("daemon").env_remove(wrapper::DRIVEN).env_remove(switch::VARIABLE);
     daemon.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut daemon, 0);

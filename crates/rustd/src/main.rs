@@ -3074,11 +3074,12 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("build-script") {
         return cargo::script::command(std::env::args_os().skip(2));
     }
-    if std::env::var_os(cargo::wrapper::ENABLED).is_some() {
-        return cargo::wrapper::command(std::env::args_os().skip(1));
-    }
     match std::env::args().nth(1).as_deref() {
+        Some("rustc-wrapper") => return cargo::wrapper::command(std::env::args_os().skip(2)),
         Some("cargo") => return cargo::command(std::env::args().skip(2)),
+        Some("enable" | "disable" | "status" | "stop") => {
+            return cargo::command(std::env::args().skip(1));
+        }
         Some("daemon") => return cargo::daemon::serve(),
         _ => {}
     }

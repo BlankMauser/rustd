@@ -4,6 +4,7 @@
 pub(crate) mod daemon;
 pub(crate) mod wrapper;
 
+mod ancestor;
 mod cli;
 mod client;
 mod plan;
@@ -11,6 +12,7 @@ mod run;
 mod say;
 pub(crate) mod script;
 mod state;
+mod switch;
 mod units;
 
 use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
@@ -24,7 +26,13 @@ use state::{Built, Counts, State};
 
 /// `rustd cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
-    let code = match Asked::parse(args.collect()) {
+    let args: Vec<String> = args.collect();
+    if let [word, cargo, rest @ ..] = args.as_slice()
+        && word == SETTLE
+    {
+        return settle(cargo.parse().context("`settle` is told the cargo to wait for")?, rest);
+    }
+    let code = match Asked::parse(args) {
         Asked::Build(asked) => match asked.only_cargo() {
             Some(reason) => {
                 say::fallback(&reason, &format!("this is `cargo {}`", asked.subcommand.name()));
@@ -36,8 +44,33 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Cargo(args) => plain_cargo(args)?,
         Asked::Status => status()?,
         Asked::Stop => stop()?,
+        Asked::Enable => switch::enable()?,
+        Asked::Disable => switch::disable()?,
     };
     std::process::exit(code)
+}
+
+/// What a wrapper runs rustd with once rustc has linked a program under plain cargo.
+pub(super) const SETTLE: &str = "settle";
+
+/// Has the daemon load the build `typed` is the cargo command of, which the cargo `cargo`
+/// is running: the build is asked of cargo again, which waits for that cargo to be done
+/// with the target directory, has nothing left to compile and says what it built. This
+/// process has that cargo's directory and environment. Nobody reads what it says but the
+/// log.
+fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
+    let settled = (|| {
+        let asked = cli::of_cargo(typed).context("`settle` is told a build command")?;
+        let cwd = std::env::current_dir()?;
+        let key = asked.key(&cwd);
+        eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
+        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default())? {
+            state.write()?;
+        }
+        anyhow::Ok(())
+    })();
+    wrapper::settled(cargo);
+    settled
 }
 
 /// Runs cargo with `args` and nothing of rustd's.
@@ -124,7 +157,7 @@ fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
 
 /// Asks the daemon for the programs of `checkout`, and says how each went. `Err` is why it
 /// has no part in any.
-fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
+pub(super) fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
     if checkout.programs.is_empty() {
         return Ok(Vec::new());
     }
@@ -147,7 +180,7 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
 /// `checkout` as a request names it: with the variables of this process, which `env!`
 /// reads where cargo set none. The ones that make rustd the wrapper are cargo's alone.
 fn asking(checkout: &Checkout) -> Checkout {
-    let wraps = |name: &str| name == wrapper::ENABLED || name == "RUSTC_WORKSPACE_WRAPPER";
+    let wraps = |name: &str| name == wrapper::DRIVEN || name == switch::VARIABLE;
     let mut env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| !wraps(name)).collect();
     env.extend(checkout.env.clone());
@@ -222,6 +255,9 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
 fn status() -> anyhow::Result<i32> {
     use std::fmt::Write as _;
     let mut said = String::new();
+    for line in switch::status(&std::env::current_dir()?).into_iter().chain(wrapper::tallied()) {
+        let _ = writeln!(said, "{line}");
+    }
     match client::ask(Request::Status, Start::Never)? {
         Some(Reply::Status(daemon)) => {
             let idle =

@@ -3767,6 +3767,7 @@ dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
+ "toml",
  "toolchain",
  "triomphe",
  "uds_windows",
