@@ -109,12 +109,17 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
 }
 
 impl Optimization {
+    /// The passes to run. What `lower` writes keeps every value in a stack slot, and a slot
+    /// indexed by a number that is itself in a slot is not taken apart until that number is
+    /// known; left to the default pipeline, such a slot is deleted whole and the variable it
+    /// holds is lost to the debugger. So the slots are taken apart twice first, with the
+    /// constants folded in between.
     fn pipeline(self) -> Option<&'static str> {
         match self.passes {
             Passes::None => None,
-            Passes::Less => Some("default<O1>"),
-            Passes::Default => Some("default<O2>"),
-            Passes::Aggressive => Some("default<O3>"),
+            Passes::Less => Some("function(sroa,instsimplify,sroa),default<O1>"),
+            Passes::Default => Some("function(sroa,instsimplify,sroa),default<O2>"),
+            Passes::Aggressive => Some("function(sroa,instsimplify,sroa),default<O3>"),
         }
     }
 
