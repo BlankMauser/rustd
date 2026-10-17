@@ -452,7 +452,10 @@ impl State {
                 let compiled = used.iter().filter(|it| plan.crates.contains(&it.source));
                 compiled.flat_map(|it| it.inputs().files)
             });
-            let sources: FxHashSet<PathBuf> = sources.collect();
+            // What a build script wrote is cargo's, written while it built.
+            let target_dir = metadata.target_directory.as_std_path();
+            let sources: FxHashSet<PathBuf> =
+                sources.filter(|it| !it.starts_with(target_dir)).collect();
             checkout.sources = sources.into_iter().collect();
         }
         state.checkouts = checkouts.into_iter().collect();

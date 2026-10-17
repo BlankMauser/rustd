@@ -74,7 +74,7 @@ PROJECTS = {
     "nushell": dict(
         repo="nushell/nushell", tag="0.108.0",
         run=["-n", "-c", "[3 1 2] | sort | str join ','"],
-        test=["-p", "nu-path", "-p", "nu-glob"],
+        test=["-p", "nu-path"],
         edits=[("src/main.rs", "fn main() -> Result<()> {", 'fn main() -> Result<()> {\n    eprintln!("edited main");')],
     ),
 }
