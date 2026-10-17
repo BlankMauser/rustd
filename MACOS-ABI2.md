@@ -101,7 +101,31 @@ includes, and also deps and keys) passed on the first run; nothing needed fixing
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
 -p syntax -p rustd` passes. `cargo clippy -p rustd -p hir-ty --all-targets` has no errors.
 
-CI_RESULTS
+GitHub Actions, on 8354d5f92f (the commit before this report was filled in; the report is
+the only difference):
+
+| job | result |
+|---|---|
+| macOS arm64 (cranelift), `macos-latest` (image macos-26-arm64) | green: fmt, tests, corpus MATCH 816/816, programs 22/22, stress 99/99, breakers 25/25, unwinds 8/8, splices 71/71, asmedits 10/10, includes 9/9, worktrees 58/58, 58/58, 67/67, keys 26/26 |
+| macOS arm64 (llvm) | green, the same numbers |
+| harness (cranelift), Linux x86-64 | green |
+| harness (llvm), Linux x86-64 | green |
+| fmt and tests, Linux | green |
+| coverage (another workflow) | red, as on 6d12f21c86: the same 18 `hir-ty` tests fail on both |
+
+So Linux x86-64 was run on this branch, by CI, not by me locally.
+
+## A bug this found on Linux x86-64
+
+The first push had the new `foreign::aligned` case on every target, and both Linux harness
+jobs failed the corpus on it: rustd printed 37476700408053505959396591 where rustc prints
+37476700408053504415892978. The function was compiled by rustd (806/806) and no code of
+this branch is on that path, so this is a bug that was there: on x86-64 an aggregate
+aligned to sixteen bytes that goes to the stack is a Cranelift `StructArgument`, which
+Cranelift places at the next multiple of eight. The case has three such arguments; the
+second or third lands eight bytes off. I did not fix it (not my platform, and I cannot run
+Linux here); the case is `#[cfg(target_arch = "aarch64")]` with a FIXME saying so. On
+AArch64 the same situation is what this round fixed.
 
 ## x86_64-apple-darwin
 
@@ -136,6 +160,8 @@ By reading the code, these are also missing: x86-64 Mach-O relocations in
 
 ## What is left
 
+0. The x86-64 stack placement of 16-byte-aligned aggregates above (Linux, and Windows should
+   be checked).
 1. `sym` in an ordinary `asm!` block.
 2. `va_arg` of a struct, if Rust ever allows it.
 3. x86_64-apple-darwin, starting with the unwind table.
