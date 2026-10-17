@@ -34,7 +34,8 @@ pub(crate) enum Start {
     Never,
 }
 
-/// Sends `request` to the daemon. `None` when there is none and none was to be started.
+/// Sends `request` to the daemon. `None` when there is none and none was to be started;
+/// `Reply::Restart` when the one there is is of another version and none was to be started.
 pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
     let home = home()?;
     let socket = socket_in(&home);
@@ -50,7 +51,7 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     let mut reply = exchange(&mut stream, &envelope)?;
     if let Reply::Restart { .. } = reply {
         if start == Start::Never {
-            return Ok(None);
+            return Ok(Some(reply));
         }
         // It exits once it has answered; its socket goes with it.
         let asked = Instant::now();
@@ -77,7 +78,11 @@ pub(crate) fn why_none() -> String {
 fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
     stream.write_all(format!("{envelope}\n").as_bytes())?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    let read = BufReader::new(stream).read_line(&mut line);
+    if !matches!(read, Ok(1..)) {
+        let log = home()?.join("daemon.log");
+        anyhow::bail!("the daemon ended before it answered (killed?), its log is {}", log.display());
+    }
     serde_json::from_str(&line).context("the daemon's answer is not one of this version")
 }
 

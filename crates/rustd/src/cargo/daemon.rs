@@ -488,8 +488,9 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         let Ok(stream) = stream else { continue };
         let daemon = daemon.clone();
         std::thread::spawn(move || {
-            // A client that went away has no use for the answer.
-            let _ = daemon.answer(stream);
+            if let Err(why) = daemon.answer(stream) {
+                eprintln!("a request is not answered: {why:#}");
+            }
         });
     }
     Ok(())

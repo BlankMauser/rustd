@@ -54,13 +54,13 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let key = asked.key(&cwd);
     let known = State::read(&key);
     let state = match known.map(by_daemon) {
-        Some(Ok(state)) => {
+        Ok(Ok(state)) => {
             let took = started.elapsed().as_secs_f64();
             let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
             say::status(asked.flags.quiet, "Finished", &finished);
             state
         }
-        Some(Err((state, reason))) => {
+        Ok(Err((state, reason))) => {
             say::fallback(&reason, "building with cargo");
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
@@ -69,10 +69,15 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                 Err(code) => return Ok(code),
             }
         }
-        None => match by_cargo(asked, &cwd, &key, Counts::default())? {
-            Ok(state) => state,
-            Err(code) => return Ok(code),
-        },
+        Err(unread) => {
+            if let Some(why) = unread {
+                say::fallback(why, "building with cargo");
+            }
+            match by_cargo(asked, &cwd, &key, Counts::default())? {
+                Ok(state) => state,
+                Err(code) => return Ok(code),
+            }
+        }
     };
     state.write()?;
     after_build(asked, &state, &cwd)
@@ -130,6 +135,9 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
         None => Err(client::why_none()),
         Some(Reply::Synced { programs }) => Ok(programs.into_iter().map(|it| it.map(drop)).collect()),
         Some(Reply::Cold { reason }) => Err(reason),
+        Some(Reply::Restart { version }) => {
+            Err(format!("the daemon running is another build of rustd ({version}), it is replaced"))
+        }
         Some(other) => Err(format!("the daemon answered {other:?}")),
     }
 }
@@ -223,6 +231,12 @@ fn status() -> anyhow::Result<i32> {
                     let _ = writeln!(said, "    {}: {warmth}", root.display());
                 }
             }
+        }
+        Some(Reply::Restart { version }) => {
+            let _ = writeln!(
+                said,
+                "daemon: another build of rustd, version {version}; the next build replaces it"
+            );
         }
         _ => said.push_str("daemon: not running\n"),
     }

@@ -441,7 +441,127 @@ def daemon(work):
     _, again = here.cargo("run")
     check("the build after that starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status()[0] not in (None, pid))
     here.cargo("stop")
+    abuse(work, ws, tree, env, check, status, alive)
     return checks
+
+
+def abuse(work, ws, tree, env, check, status, alive):
+    """The daemon under what it is not asked for politely: many clients at once, a client
+    and a daemon killed while a build is asked for, and a client that is another user."""
+    here = Side(ws, env, True)
+    git = lambda *args: subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True)
+    trees = [ws, tree]
+    for n in (2, 3):
+        trees.append(os.path.realpath(os.path.join(work, f"life-worktree{n}")))
+        git("worktree", "add", "-q", trees[-1])
+    sides = [Side(root, env, True) for root in trees]
+    for side in sides:
+        side.cargo("build")
+    for side in sides:
+        wait_warm(side, side.ws)
+    pid, workers, _ = status()
+    for n, root in enumerate(trees):
+        rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("hello {name}")', f'format!("tree{n} {{name}}")')
+    spawn = lambda root, *args: subprocess.Popen(["cargo", "rustd", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    clients = [(n, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees)]
+    ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
+    right = [code == 0 and out[0] == f"tree{n} c{i}\n" for n, i, out, code in ended]
+    by_daemon = sum(how_built(out[1]) == "daemon" for _, _, out, _ in ended)
+    check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker")
+
+    # A worker that is stopped holds the build a client asks for until it is continued.
+    edit = lambda text: open(os.path.join(ws, "app/src/main.rs"), "a").write(f"\n// {text}\n")
+    held = lambda: [os.kill(p, signal.SIGSTOP) for p in workers]
+    freed = lambda: [os.kill(p, signal.SIGCONT) for p in workers if alive(p)]
+    edit("held one")
+    held()
+    client = spawn(ws, "build")
+    time.sleep(1)
+    waits = client.poll() is None
+    os.killpg(client.pid, signal.SIGKILL)
+    client.wait()
+    freed()
+    _, after = here.cargo("run", "again")
+    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and after.stdout == "tree0 again\n" and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
+
+    edit("held two")
+    held()
+    client = spawn(ws, "run", "killed")
+    time.sleep(1)
+    waits = client.poll() is None
+    os.kill(pid, signal.SIGKILL)
+    freed()
+    out, err = client.communicate(timeout=600)
+    said = how_built(err)
+    check("the build whose daemon is killed is cargo's, is right, and says so", waits and client.returncode == 0 and out == "tree0 killed\n" and "the daemon ended before it answered" in said, said)
+    time.sleep(1)
+    check("the workers of the killed daemon are gone", not any(alive(p) for p in workers), f"{workers}")
+    wait_warm(here, ws)
+    edit("after")
+    _, after = here.cargo("run", "after")
+    check("the build after that is a new daemon's", after.returncode == 0 and after.stdout == "tree0 after\n" and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
+
+    other = os.path.join(work, "other-build")
+    older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
+    pid = status()[0]
+    seen = older.cargo("status")[1].stdout.splitlines()[0]
+    check("status by another build says the daemon is another build, and leaves it", "another build of rustd" in seen and status()[0] == pid, seen)
+    edit("skew")
+    _, skewed = older.cargo("run", "skew")
+    said = how_built(skewed.stderr)
+    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and skewed.stdout == "tree0 skew\n" and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    wait_warm(older, ws)
+    edit("back")
+    _, back = here.cargo("run", "back")
+    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and back.stdout == "tree0 back\n" and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    wait_warm(here, ws)
+
+    stranger(env["RUSTD_HOME"], check)
+    here.cargo("stop")
+
+
+CONNECT = "import socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.settimeout(5)\ntry:\n    s.connect(sys.argv[1])\nexcept OSError as e:\n    print('connect:', e.strerror)\n    sys.exit()\ns.sendall(sys.argv[2].encode() + b'\\n')\ntry:\n    print('answer:', s.recv(65536).decode())\nexcept OSError as e:\n    print('answer:', e)\n"
+
+
+def stranger(home, check):
+    """A second user at the daemon's socket: kept out by the directory and the socket's
+    modes, and turned away by the daemon when those are opened to it."""
+    name = "rustd-stranger"
+    sudo = lambda *argv: subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
+    if sudo("true").returncode != 0:
+        check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RUSTD_NO_SUDO") == "1", "not run")
+        return
+    sudo("userdel", name)
+    made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
+    sock = os.path.join(home, "daemon.sock")
+    version = re.search(r"version (\S+),", subprocess.run(["cargo", "rustd", "status"], env=dict(os.environ, RUSTD_HOME=home, PATH=os.path.dirname(RUSTD) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
+    request = json.dumps({"version": version, "replaces": False, "request": "Status"})
+    knock = lambda user: subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/").stdout.strip()
+    try:
+        mine = knock(None)
+        check("the user's own raw request is answered", made.returncode == 0 and '"Status"' in mine, mine[:60])
+        modes = (os.stat(home).st_mode & 0o777, os.stat(sock).st_mode & 0o777)
+        closed = knock(name)
+        check("a second user can't reach the socket", modes == (0o700, 0o600) and closed == "connect: Permission denied", f"modes {modes[0]:o} {modes[1]:o}, {closed}")
+        # Every directory above has to let the second user through for the daemon to be the one that refuses.
+        opened, at = [], home
+        while at != "/" and os.stat(at).st_uid == os.getuid():
+            opened.append((at, os.stat(at).st_mode & 0o7777))
+            os.chmod(at, opened[-1][1] | 0o011)
+            at = os.path.dirname(at)
+        os.chmod(sock, 0o666)
+        try:
+            refused = knock(name)
+        finally:
+            os.chmod(sock, 0o600)
+            for at, mode in opened:
+                os.chmod(at, mode)
+        log = open(os.path.join(home, "daemon.log")).read()
+        check("with the modes opened, the daemon turns the second user away by its uid", refused.startswith("answer:") and "Status" not in refused and "the peer is user" in log, f"{refused!r}")
+        mine = knock(None)
+        check("and still answers its own user", '"Status"' in mine, mine[:60])
+    finally:
+        sudo("userdel", name)
 
 
 def table(rows):

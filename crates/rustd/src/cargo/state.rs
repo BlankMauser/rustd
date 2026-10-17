@@ -264,12 +264,20 @@ impl State {
         Ok(daemon::home()?.join("states").join(format!("{key}.json")))
     }
 
-    /// The state of the build `key`, when this rustd wrote one and its files are there.
-    pub(crate) fn read(key: &str) -> Option<State> {
-        let text = std::fs::read_to_string(State::path(key).ok()?).ok()?;
-        let state: State = serde_json::from_str(&text).ok()?;
-        let whole = state.programs.iter().all(|it| it.cargos.exists());
-        (state.version == daemon::version() && whole).then_some(state)
+    /// The state of the build `key`. `Err` is why what is there is not read, when there
+    /// is something.
+    pub(crate) fn read(key: &str) -> Result<State, Option<&'static str>> {
+        let path = State::path(key).map_err(|_| None)?;
+        let text = std::fs::read_to_string(path).map_err(|_| None)?;
+        let another = "this build's state was written by another build of rustd";
+        let state = serde_json::from_str::<State>(&text).map_err(|_| another)?;
+        if state.version != daemon::version() {
+            return Err(Some(another));
+        }
+        if !state.programs.iter().all(|it| it.cargos.exists()) {
+            return Err(Some("what cargo built is no longer in the target directory"));
+        }
+        Ok(state)
     }
 
     pub(crate) fn write(&self) -> anyhow::Result<()> {
@@ -292,7 +300,7 @@ impl State {
             let key = name.to_str()?.strip_suffix(".json")?;
             (!key.contains('.')).then(|| key.to_owned())
         });
-        keys.filter_map(|it| State::read(&it)).collect()
+        keys.filter_map(|it| State::read(&it).ok()).collect()
     }
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
