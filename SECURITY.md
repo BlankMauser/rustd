@@ -862,7 +862,7 @@ changed:
 
 All of this is on Linux x86-64, with stable 1.99.0, LLVM 20.1.8 and MinIO
 RELEASE.2026-09-22T19-25-18Z, on the head of this branch after the merge of `rustd-collate`
-at 526f2963ba. Nothing else was run.
+at ce52276cf5. Nothing else was run.
 
 Builds and checks:
 
