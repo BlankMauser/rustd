@@ -490,3 +490,37 @@ use reexport_2::*;
         "#]],
     );
 }
+
+#[test]
+fn variant_reexported_through_private_enum_import() {
+    check(
+        r#"
+mod minusplus {
+    pub enum Index { Minus, Plus }
+}
+mod sides {
+    use super::minusplus::Index;
+    pub use Index::Minus as Left;
+}
+mod numbers {
+    use super::sides::Left;
+}
+"#,
+        expect![[r#"
+            crate
+            - minusplus : type
+            - numbers : type
+            - sides : type
+
+            crate::minusplus
+            - Index : type
+
+            crate::numbers
+            - Left : type (import) value (import)
+
+            crate::sides
+            - Index : type (import)
+            - Left : type (import) value (import)
+        "#]],
+    );
+}

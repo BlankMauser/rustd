@@ -263,3 +263,32 @@ jobs:
           run storeshared.py
           echo "failed:${failed:- none}"
           test -z "$failed"
+
+  cargo-rustd:
+    name: cargo rustd (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      # ripgrep, fd and hyperfine at pinned commits, the flags, and the daemon's life,
+      # the second user among it. Incremental compilation is left to the profile, as on a
+      # developer's machine: with it off the tests of every project are cargo's (the
+      # harness has that case among the flags).
+      - name: cargo rustd against cargo
+        working-directory: harness
+        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
