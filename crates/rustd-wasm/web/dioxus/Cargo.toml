@@ -1,7 +1,8 @@
-# The Dioxus demo: `app` is what the page shows and rustd compiles in it; `base` is Dioxus and
-# `std` as rustc builds them, which the page loads first and the compiled `app` calls into.
+# `playground` is the page, a Dioxus app rustc builds. `app` is the Dioxus program the page
+# shows: rustd compiles it in the page and links it into the page itself, whose Dioxus and
+# `std` it calls into.
 [workspace]
-members = ["app", "base"]
+members = ["app", "playground"]
 resolver = "3"
 
 [workspace.dependencies]

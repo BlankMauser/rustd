@@ -4,20 +4,47 @@
 //! This app does not compile anything. The compiler is a worker, and `playground.js` runs it
 //! and the programs it builds: this app tells it of the program to show and of every edit,
 //! through `window.rustd`, and hears how builds went through [`rustd_state`] and [`rustd_line`].
+//!
+//! It is also what a Dioxus program is linked into. This module is linked whole, with
+//! everything exported, and the program rustd compiles calls its Dioxus and its `std`: the
+//! program's `App` is a function in the table they share, which [`rustd_launch`] hands over
+//! and this app renders as a component of its own.
 
 use std::cell::RefCell;
 
-use dioxus::prelude::*;
+use dioxus::{dioxus_core::Runtime, prelude::*};
 use dioxus_code::{CodeTheme, Theme};
 use dioxus_code_editor::{CodeEditor, Language};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use wasm_bindgen::prelude::*;
 
-fn main() {
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(text: &str);
+}
+
+/// Starts the page, called by `playground.js` once the module is loaded.
+#[unsafe(no_mangle)]
+pub extern "C" fn rustd_main() {
+    std::panic::set_hook(Box::new(|info| error(&info.to_string())));
     dioxus::LaunchBuilder::web()
         .with_cfg(dioxus::web::Config::new().rootname("playground"))
         .launch(Playground);
+}
+
+/// The component of a Dioxus program, a function rustd compiled: its slot in the table.
+#[derive(Clone, Copy, PartialEq)]
+struct App(usize);
+
+/// The program rustd compiled, in a scope of its own for its hooks.
+#[component]
+fn Program(app: App) -> Element {
+    // SAFETY: `playground.js` gave `rustd_launch` the slot of the program's `App`, which
+    // rustd compiled as a function of this signature.
+    let app = unsafe { std::mem::transmute::<usize, fn() -> Element>(app.0) };
+    app()
 }
 
 #[component]
@@ -27,6 +54,7 @@ fn Playground() -> Element {
     let mut dark = use_signal(stored_dark);
     let mut state = use_signal(|| "building".to_owned());
     let mut log = use_signal(Vec::<Line>::new);
+    let mut program = use_signal(|| None::<App>);
 
     // The program to show, once what it is shown in is in the page.
     use_effect(move || {
@@ -41,6 +69,9 @@ fn Playground() -> Element {
         while let Some(next) = receiver.next().await {
             match next {
                 Said::State(kind) => state.set(kind),
+                Said::App(app) => program.set(Some(app)),
+                // The functions in the table are others now, which nothing here can tell.
+                Said::Swapped => Runtime::current().force_all_dirty(),
                 Said::Line(line) => {
                     let mut log = log.write();
                     let extra = (log.len() + 1).saturating_sub(LINES);
@@ -121,7 +152,11 @@ fn Playground() -> Element {
                 // The canvas is as large as this is, whatever size it draws at.
                 div { class: "stage",
                     canvas { id: "canvas", hidden: app }
-                    div { id: "main", hidden: !app }
+                    div { id: "main", hidden: !app,
+                        if let Some(app) = program() {
+                            Program { app }
+                        }
+                    }
                 }
             }
             section { class: "pane builds",
@@ -156,7 +191,7 @@ fn Playground() -> Element {
 enum Output {
     /// It draws, with the functions `playground.js` gives it.
     Canvas,
-    /// It is a Dioxus app, linked into the Dioxus rustc built.
+    /// It is a Dioxus app, linked into this one.
     App,
 }
 
@@ -178,7 +213,7 @@ const DEMOS: &[Demo] = &[
         title: "Bouncing balls",
         about: "Click to drop a ball. Change the gravity while they fall.",
         tags: &["structs", "traits", "statics", "f64"],
-        source: include_str!("../../demos/balls.rs"),
+        source: include_str!("../../../demos/balls.rs"),
         output: Output::Canvas,
     },
     Demo {
@@ -186,7 +221,7 @@ const DEMOS: &[Demo] = &[
         title: "Fountain",
         about: "Drops under gravity. Change the speed, the wind, the color.",
         tags: &["closures", "iterators", "consts", "f64"],
-        source: include_str!("../../demos/fountain.rs"),
+        source: include_str!("../../../demos/fountain.rs"),
         output: Output::Canvas,
     },
     Demo {
@@ -194,7 +229,7 @@ const DEMOS: &[Demo] = &[
         title: "Game of life",
         about: "Conway's cells on a grid. Click to bring one to life.",
         tags: &["2D arrays", "iterators", "static mut"],
-        source: include_str!("../../demos/life.rs"),
+        source: include_str!("../../../demos/life.rs"),
         output: Output::Canvas,
     },
     Demo {
@@ -202,7 +237,7 @@ const DEMOS: &[Demo] = &[
         title: "Sorting",
         about: "Three algorithms behind one trait object, a step a frame.",
         tags: &["dyn Trait", "slices", "vtables"],
-        source: include_str!("../../demos/sort.rs"),
+        source: include_str!("../../../demos/sort.rs"),
         output: Output::Canvas,
     },
     Demo {
@@ -210,7 +245,7 @@ const DEMOS: &[Demo] = &[
         title: "Mandelbrot set",
         about: "Complex numbers with operators of their own. Click to zoom.",
         tags: &["operators", "closures", "Option"],
-        source: include_str!("../../demos/mandelbrot.rs"),
+        source: include_str!("../../../demos/mandelbrot.rs"),
         output: Output::Canvas,
     },
     Demo {
@@ -218,7 +253,7 @@ const DEMOS: &[Demo] = &[
         title: "Dioxus counter",
         about: "Linked into the Dioxus and std rustc built. Edits keep its state.",
         tags: &["rsx!", "signals", "#[component]", "std"],
-        source: include_str!("../../dioxus/app/src/main.rs"),
+        source: include_str!("../../app/src/main.rs"),
         output: Output::App,
     },
 ];
@@ -284,6 +319,10 @@ enum Said {
     /// `building`, `running` or `error`.
     State(String),
     Line(Line),
+    /// The Dioxus program was built for the first time.
+    App(App),
+    /// It was built again, and functions of it were swapped.
+    Swapped,
 }
 
 type Channel = (UnboundedSender<Said>, Option<UnboundedReceiver<Said>>);
@@ -318,6 +357,18 @@ pub fn rustd_line(
     say(Said::Line(Line { time, level, head, parts, notes }));
 }
 
+/// Called by `playground.js` with the `App` of the Dioxus program, once it is linked in.
+#[unsafe(no_mangle)]
+pub extern "C" fn rustd_launch(app: usize) {
+    say(Said::App(App(app)));
+}
+
+/// Called by `playground.js` once it has swapped functions of the Dioxus program.
+#[unsafe(no_mangle)]
+pub extern "C" fn rustd_rerender() {
+    say(Said::Swapped);
+}
+
 #[wasm_bindgen]
 extern "C" {
     /// Builds and runs another program, in place of the one shown.
@@ -327,4 +378,14 @@ extern "C" {
     /// Builds the program shown again, from this source.
     #[wasm_bindgen(js_namespace = ["window", "rustd"])]
     fn edit(source: &str);
+}
+
+// Linked whole, the page takes in what the C of the highlighting's parser never calls here
+// but names: two things of libc.
+#[unsafe(no_mangle)]
+static stderr: usize = 0;
+
+#[unsafe(no_mangle)]
+extern "C" fn isprint(character: i32) -> i32 {
+    (0x20..0x7f).contains(&character) as i32
 }

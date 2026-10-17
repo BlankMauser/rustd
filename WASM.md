@@ -25,8 +25,7 @@ Linux VM; where a number comes from a single run it says so.
     rustup component add rust-src
     cargo install wasm-bindgen-cli --version 0.2.122
     crates/rustd-wasm/web/build.sh              # the compiler, and the source of core
-    crates/rustd-wasm/web/build-dioxus.sh       # the Dioxus demo: rustc's module, the packed workspace
-    crates/rustd-wasm/web/build-playground.sh   # the page itself, needs `dx` and clang
+    crates/rustd-wasm/web/build-dioxus.sh       # the page itself and the packed Dioxus workspace, needs clang
     python3 -m http.server -d crates/rustd-wasm/web 8377
 
 Then open `http://localhost:8377/` in Chrome. The line at the bottom shows what the last
@@ -49,7 +48,7 @@ I ran it in the Chrome on this VM and in Node 24. I did not try Firefox or Safar
   the packing of a cargo workspace (`pack.rs`), the proc macros that run in the compiler
   (`macros.rs`, `core-macro/`), a small C ABI for the page, and a CLI that does the packing
   natively.
-- `crates/rustd-wasm/web`: the playground (`playground/`, a Dioxus app), the JavaScript it
+- `crates/rustd-wasm/web`: the playground (`dioxus/playground`, a Dioxus app), the JavaScript it
   leaves the compiler to (`playground.js`, `worker.js`, `compiler.js`), the runtime that
   holds a program's memory and function table (`program.js`), the canvas programs
   (`demos/`), and the workspace of the Dioxus demo (`dioxus/`).
@@ -320,18 +319,21 @@ The Dioxus demo answers section 3 the other way round from what it recommended: 
 the dependencies are not compiled in the page. They come from rustc.
 
 **The host module.** `web/dioxus` is a cargo workspace with two crates: `app`, the counter
-the editor shows, and `base`, a staticlib that depends on Dioxus and exports two functions,
-`rustd_launch(app: fn() -> Element)` and `rustd_rerender()`. `build-dioxus.sh` builds
-`base` with rustc and links it with `rust-lld` itself, with `--whole-archive --export-all
---no-gc-sections --export-table --growable-table` and an exported `__stack_pointer`, then
-runs `wasm-bindgen --keep-lld-exports` over it. This is the same shape as the fat module
-subsecond builds for web hot-patching. Measured: 7.3 MB of wasm, 11,974 functions and
-5,422 data symbols that the program can link against by their rustc v0 symbol names.
+the editor shows, and `playground`, the page itself (section 7), a staticlib that depends
+on Dioxus and exports `rustd_launch(app)`, which takes the table slot of the program's
+`App`, and `rustd_rerender()`. `build-dioxus.sh` builds `playground` with rustc and links
+it with `rust-lld` itself, with `--whole-archive --export-all --no-gc-sections
+--export-table --growable-table` and an exported `__stack_pointer`, then runs
+`wasm-bindgen --keep-lld-exports` over it. This is the same shape as the fat module
+subsecond builds for web hot-patching. Measured: 15.9 MB of wasm, 16,381 functions and
+19,265 data symbols that the program can link against by their rustc v0 symbol names.
+Until the playground became the host, the host was a crate of its own with only Dioxus in
+it, 7.3 MB.
 
 **The workspace.** rustd in the page still has to analyse everything the app's types come
 from. `rustd-wasm pack` loads the cargo workspace natively and writes one file with the
-sources of all 197 crates (3,310 files, `std` included), the crate graph, and every proc
-macro expansion rust-analyzer made while analysing the app (600 of them). Measured: 71 MB
+sources of all 206 crates (3,392 files, `std` included), the crate graph, and every proc
+macro expansion rust-analyzer made while analysing the app (652 of them). Measured: 74 MB
 as JSON, not compressed. In the page, name resolution over it takes 8 to 12 s and type
 inference of the app 3 to 6 s, and the compiler's memory is about 1 GiB.
 
@@ -376,21 +378,36 @@ bridge server, as rust-analyzer's proc-macro server is for dylibs.
 
 ## 7. The playground
 
-The page is one Dioxus app built by rustc and `dx` (`web/playground`, 3.3 MB of wasm): the
-list of programs down the left, the editor (`dioxus-code-editor`, highlighted by `dioxus-code`), the light and
-dark themes, the output pane and, under both, a log with a line for each build. It compiles nothing. It tells
-`playground.js` which program to show and of every edit, and is told how each build went.
-JavaScript keeps the compiler workers, the instantiation of what they emit, the canvas
-functions and the Dioxus host module. There is one worker for the canvas programs and one
-for the Dioxus workspace, each started when first needed and kept, so going from the
-counter to a canvas program and back keeps the counter's state.
+The page is one Dioxus app built by rustc (`web/dioxus/playground`): the list of programs
+down the left, the editor (`dioxus-code-editor`, highlighted by `dioxus-code`), the light
+and dark themes, the output pane and, under both, a log with a line for each build, which
+starts with how long the build took. It compiles nothing. It tells `playground.js` which
+program to show and of every edit, and is told how each build went. JavaScript keeps the
+compiler workers, the instantiation of what they emit and the canvas functions. There is
+one worker for the canvas programs and one for the Dioxus workspace, each started when
+first needed and kept, so going from the counter to a canvas program and back keeps the
+counter's state.
 
-The page therefore runs two Dioxus instances when the counter is shown: the playground,
-and the host module the counter is linked into. Both find the element an event is for by a number on
-it, and a click on the counter's button reached the playground as a click on its theme
-button, so `playground.js` stops events from leaving the counter's pane. Making the
-playground itself the host was not tried. It would need the playground built the way `base` is (everything exported,
-nothing removed), and the counter would share the playground's Dioxus runtime.
+The playground is also the module the counter is linked into, so the page has one Dioxus.
+`rustd_launch` gets the table slot of the `App` rustd compiled, and the playground renders
+it in the output pane as a component of its own VirtualDom; after a swap `rustd_rerender`
+marks every scope dirty. Checked in Chrome, one run: clicks, an edited heading, a new
+`#[component]` with props, an edit that does not compile and its fix, and going to canvas
+programs and back with the count kept.
+
+An earlier state had two Dioxus instances, the playground and a separate host module
+mounted in its output pane. Both find the element an event is for by a number on it, so a
+click on the counter's button reached the playground as a click on its theme button.
+
+What unifying costs:
+
+- The page is 15.9 MB of wasm, since nothing of it can be removed, where the playground
+  alone was 3.3 MB and the separate host 7.3 MB.
+- It cannot be built with `dx`, which does not link this way. The editor's style sheets are
+  `asset!`s that only `dx` resolves, so `build-dioxus.sh` copies them into `web/assets` for
+  `index.html` to load, and puts an empty sheet under the placeholder name the editor asks
+  for instead.
+- A panic in the program is a panic in the page. Not tried: what the page does after one.
 
 ## What does not work
 
@@ -418,14 +435,14 @@ nothing removed), and the counter would share the playground's Dioxus runtime.
   programs. The linker, the Dioxus demo and the playground are only tested by hand, in
   Chrome. With the `wasm` feature on, `hir-ty` has dead-code warnings for the native emit
   path.
-- Startup of the Dioxus demo: 71 MB to fetch and 11 to 18 s of analysis before the first
+- Startup of the Dioxus demo: 74 MB to fetch and 11 to 18 s of analysis before the first
   build.
 
 ## From here to a real hot-reloading compiler in the browser
 
 Sizes are rough guesses at effort, not measurements.
 
-1. **Startup and memory for a real workspace** (weeks). 71 MB of sources, 11 to 18 s of
+1. **Startup and memory for a real workspace** (weeks). 74 MB of sources, 11 to 18 s of
    analysis and 1 GiB for a counter. Most of the analysis is of crates that never change:
    it needs a persisted database or a prebuilt snapshot, and a compressed pack.
 2. **Proc macros in general** (weeks). Macro crates built to wasm at pack time, and the

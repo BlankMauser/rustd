@@ -1,8 +1,8 @@
-// What the playground (`playground/`, a Dioxus app) leaves to JavaScript: running the compiler
+// What the playground (`dioxus/playground`, a Dioxus app) leaves to JavaScript: running the compiler
 // in `worker.js` on every edit, and the programs it builds. The app calls `window.rustd`,
 // and hears how builds go through `rustd_state` and `rustd_line`.
 
-import { rustd_line, rustd_state } from "./assets/playground.js";
+import init, { rustd_line, rustd_state } from "./pkg/dioxus/playground.js";
 import { Program } from "./program.js";
 
 const ms = (value) => `${value.toFixed(1)} ms`;
@@ -203,39 +203,18 @@ class Canvas extends Builds {
 const SLOTS = 1 << 17;
 const BYTES = 64 << 20;
 
-// The Dioxus app. Dioxus and `std` are a module rustc built, `pkg/dioxus/base`, which runs
-// first. The compiler builds the app from the packed workspace, and each build is
-// instantiated in that module's memory and table.
+// The Dioxus app. Its Dioxus and `std` are the page's own, the module rustc built. The
+// compiler builds the app from the packed workspace, and each build is instantiated in that
+// module's memory and table: the page then renders the app's `App` as a component of its.
 class Dioxus extends Builds {
   constructor() {
     super("worker.js?pack=pkg/dioxus.pack", 200);
     this.launched = false;
-    this.base = this.load();
-  }
-
-  async load() {
-    // The module keeps every import wasm-bindgen can ask for, among them the promise
-    // integration some browsers lack. Nothing here calls through it, so the plain function
-    // stands in.
-    WebAssembly.Suspending ??= function (inner) {
-      return inner;
-    };
-    // The app's Dioxus is inside the playground's, and both find what an event is for by
-    // the number of its element: an event of the app is not one for the playground to see.
-    const main = document.getElementById("main");
-    for (const name in window) {
-      if (name.startsWith("on")) {
-        main.addEventListener(name.slice(2), (event) => event.stopPropagation());
-      }
-    }
-    const { default: init } = await import("./pkg/dioxus/base.js");
-    const base = await init();
-    this.program = new Program({}, base);
+    this.program = new Program({}, page);
     this.start = {
       table: this.program.table.grow(SLOTS),
       memory: this.program.memory.grow(BYTES >> 16) << 16,
     };
-    return base;
   }
 
   show(name, text) {
@@ -248,12 +227,6 @@ class Dioxus extends Builds {
     }
   }
 
-  async build() {
-    // The first build says where in the module the program goes.
-    await this.base;
-    super.build();
-  }
-
   options() {
     const start = this.placed ? undefined : this.start;
     this.placed = true;
@@ -264,7 +237,6 @@ class Dioxus extends Builds {
     return [`compiler ${mib(wasm_bytes)}`, `workspace ${mib(core_bytes)}`, `fetched in ${ms(fetch_ms)}`, `loaded in ${ms(start_ms)}`, analysis];
   }
 
-  // Not awaited: `build` was, before the build this is of.
   apply({ report, module }) {
     const { start, program } = this;
     if (report.table_len > start.table + SLOTS || report.memory_len > start.memory + BYTES) {
@@ -307,6 +279,14 @@ new MutationObserver((_, found) => {
   new MutationObserver(() => newest && (list.scrollTop = list.scrollHeight)).observe(list, { childList: true });
 }).observe(document.getElementById("playground"), { childList: true, subtree: true });
 
+// The module keeps every import wasm-bindgen can ask for, among them the promise integration
+// some browsers lack. Nothing here calls through it, so the plain function stands in.
+WebAssembly.Suspending ??= function (inner) {
+  return inner;
+};
+// The page's own module, which a Dioxus program is linked into.
+const page = await init();
+
 const runners = {};
 window.rustd = {
   // Each compiler is loaded when a program of its kind is first shown, and kept.
@@ -327,3 +307,5 @@ document.addEventListener("keydown", (event) => {
     area.dispatchEvent(new InputEvent("input", { bubbles: true }));
   }
 });
+
+page.rustd_main();

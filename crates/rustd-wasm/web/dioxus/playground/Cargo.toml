@@ -1,22 +1,18 @@
-# The page: a Dioxus app rustc builds (`build-playground.sh`).
+# The page: a Dioxus app rustc builds (`build-dioxus.sh`), whole, for `app` to link into.
 [package]
 name = "playground"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
-[workspace]
+[lib]
+crate-type = ["staticlib"]
 
 [dependencies]
-dioxus = { version = "0.7.9", features = ["web"] }
+dioxus.workspace = true
 dioxus-code = { version = "0.1", features = ["runtime"] }
 dioxus-code-editor = "0.1"
 futures-channel = "0.3"
 futures-util = "0.3"
-wasm-bindgen = "0.2"
+wasm-bindgen.workspace = true
 web-sys = { version = "0.3", features = ["Location", "MediaQueryList", "Storage", "Window"] }
-
-[profile.release]
-opt-level = "s"
-lto = true
-panic = "abort"
