@@ -710,13 +710,11 @@ impl DebugContext {
             Some(parent) => self.block(function, start, debug, blocks, *parent)?,
             None => function,
         };
-        let ranges = ranges
+        // One address for the linker to fill in, and the rest counted from it.
+        let within = ranges
             .iter()
-            .map(|&(from, to)| Range::StartLength {
-                begin: past(start, from),
-                length: (to - from).into(),
-            })
-            .collect();
+            .map(|&(from, to)| Range::OffsetPair { begin: from.into(), end: to.into() });
+        let ranges = std::iter::once(Range::BaseAddress { address: start }).chain(within).collect();
         let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
         let block = self.dwarf.unit.add(parent, DW_TAG_lexical_block);
         self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));

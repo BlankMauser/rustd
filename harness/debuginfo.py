@@ -14,7 +14,7 @@ whether rustd leaves it out when the profile says `debug = false`.
 
 RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
                      jumps, so a frame the cargo build prints may be missing: those are counted.
---only NAME          one of: corpus stress rung2 edits callers locals types profile cost
+--only NAME          one of: corpus stress rung2 edits callers locals types scopes profile cost
 """
 import os, re, shutil, struct, subprocess, sys, tempfile, time
 
@@ -137,6 +137,36 @@ fn main() {
 }
 """
 
+# Names bound more than once and names of an inner block. Each `// stop` is a line a debugger
+# stops at, where the names of SCOPED are asked for: the answer depends on the block.
+SCOPES_MAIN = """use std::hint::black_box;
+
+fn scoped(seed: u32) -> u64 {
+    let value = seed + 1;
+    black_box(value); // stop
+    let value = u64::from(value) * 3;
+    let total = {
+        let inner = value + 5;
+        let value = "text";
+        black_box(inner) + black_box(value.len() as u64) // stop
+    };
+    black_box(total); // stop
+    let mut sum = 0;
+    for step in 0..2u64 {
+        let value = [step, total];
+        sum += black_box(value[1]); // stop
+    }
+    match black_box(Some(sum)) {
+        Some(value) if value > 1 => black_box(value + total), // stop
+        _ => 0,
+    }
+}
+
+fn main() {
+    println!("{}", scoped(black_box(4)));
+}
+"""
+SCOPED = ["seed", "value", "inner", "total", "sum", "step"]
 TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
          "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
 
@@ -673,6 +703,41 @@ def shapes(tally):
               + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else ""))
 
 
+def scopes(tally):
+    """Whether a name is known where its block says and means the binding of that block: at
+    several lines the debugger is asked for the same names, and has to answer as it does for a
+    rustc build, also where the answer is that there is no such name."""
+    debugger = shutil.which("rust-gdb")
+    if not debugger:
+        return tally.say("scopes: names by their block", "not looked at", "no rust-gdb to ask")
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-scopes-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, SCOPES_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+    fx.rustd_build()
+    verify(tally, "scopes", fx.binary)
+    stops = [at + 1 for at, line in enumerate(SCOPES_MAIN.split("\n")) if "// stop" in line]
+    asked = right = gone = unknown = 0
+    wrong = []
+    for line in stops:
+        theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, f"{MAIN}:{line}", SCOPED)
+        ours = printed_by(debugger, fx.binary, ws, f"{MAIN}:{line}", SCOPED)
+        for name in SCOPED:
+            asked += 1
+            if ours[name] == theirs[name]:
+                right += 1
+                unknown += theirs[name] is None
+            elif ours[name] and OPTIMIZED_OUT in ours[name]:
+                gone += 1
+            else:
+                wrong.append(f"{name} at line {line} = {ours[name]}, not {theirs[name]}")
+    tally.say("scopes: names by their block", "as rustc's" if not wrong else "NOT AS RUSTC'S",
+              f"{right} of {asked} at {len(stops)} lines ({unknown} of them not a name there), {gone} optimized out"
+              + (f", but {'; '.join(wrong[:3])[:200]}" if wrong else ""))
+
+
 def settings(tally):
     """Whether the profile's settings for what a debugger reads are followed, or refused with the reason."""
     ws = tempfile.mkdtemp(prefix="rustd-debuginfo-profile-")
@@ -764,6 +829,7 @@ def main():
         "callers": lambda: callers(tally),
         "locals": lambda: variables(tally),
         "types": lambda: shapes(tally),
+        "scopes": lambda: scopes(tally),
         "profile": lambda: settings(tally),
         "cost": lambda: cost(tally),
     }
