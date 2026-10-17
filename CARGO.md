@@ -108,13 +108,13 @@ object a line, typed on both sides.
 
 - Start on demand. A client that finds no daemon starts `rustd daemon` in a session of its own
   (no terminal, output to `$RUSTD_HOME/daemon.log`), and waits for the socket. The daemon holds
-  a lock on `$RUSTD_HOME/daemon.lock` for as long as it lives, so two clients that start one at
+  a lock on `$RUSTD_HOME/daemon.sock.lock` for as long as it lives, so two clients that start one at
   the same moment get one.
 - Survives its clients. It is not in the client's process group or session, and a client that
   goes away mid-request costs a failed write.
 - Version. Every request carries the client's version: the crate version and a hash of the
-  executable. A daemon of another version answers `restart`, stops its workers and exits; the
-  client starts its own.
+  executable. A daemon of another version answers `restart` to a client that builds, stops its workers
+  and exits, and the client starts its own; `status` from another version is answered.
 - Idle. With no request for `RUSTD_IDLE_SECS` (1800 by default, read when the daemon starts;
   0 is never) the daemon stops its workers and exits. A worker nobody asked for that long is
   stopped on its own.
@@ -141,12 +141,175 @@ records; a worker of an older generation is restarted on the new one.
 
 ### Layout
 
-    $RUSTD_HOME/daemon.sock, daemon.lock, daemon.log
-    $RUSTD_HOME/workers/<id>/sock, log
-    <target-dir>/rustd/<key>/state.json
-    <target-dir>/rustd/<key>/units/<crate>-<hash>/record.json, <stamp>/<copies>
+    $RUSTD_HOME/daemon.sock, daemon.sock.lock, daemon.log
+    $RUSTD_HOME/workers/<id>/sock, sock.lock, log
+    $RUSTD_HOME/states/<key>.json, <key>.kept.json
+    <target-dir>/<profile>/.rustd-units/<crate>-<hash>/record.json, <stamp>/<copies>
     <target-dir>/rustd/<key>/programs/<name>/rustd.o, patch.o, link.args, bin
 
-Code: `crates/rustd/src/cargo/` (`cli` the command, `wrapper` the rustc wrapper, `units` the
-records, `plan` what a program needs from the daemon, `daemon` the per-user daemon and its
-protocol, `client` the connection, `run` running programs and tests).
+Code: `crates/rustd/src/cargo/` (`cli` the command line, `wrapper` the rustc wrapper, `units`
+the records, `script` build scripts, `state` what a workspace was last built as and when that
+still holds, `plan` what a program needs from the daemon, `daemon` the per-user daemon and
+its protocol, `client` the connection, `run` running programs and tests, `say` the output),
+`crates/rustd/src/socket.rs` (the sockets), `crates/rustd/src/bin/cargo-rustd.rs`.
+
+### The sockets
+
+Both the daemon's socket and each worker's go through `socket.rs`.
+
+- The directory. `$RUSTD_HOME` is made with mode 0700. Before use it is checked: it must be
+  a directory, owned by the user, with no access for group or others. Otherwise the client
+  and the daemon refuse with the reason and nothing is bound. `$XDG_RUNTIME_DIR/rustd` is
+  used when `XDG_RUNTIME_DIR` is set, `~/.cache/rustd` otherwise; the same check applies to
+  both and to a `RUSTD_HOME` the user sets.
+- The socket is set to 0600 after `bind`, whatever the umask is.
+- The peer. Every accepted connection is asked for its user (`SO_PEERCRED` on Linux,
+  `getpeereid` on macOS and the BSDs) and one that is not the daemon's user is refused
+  before its request is read.
+- A request is one line of at most 16 MiB, and the client has 10 seconds to send it. Each
+  connection is read on a thread of its own, so a client that connects and sends nothing, or
+  an endless line, delays nobody else and is dropped with an error.
+- One server per socket. Whoever serves a socket holds an exclusive lock on `<socket>.lock`
+  for as long as it lives, and only removes a stale socket file once it holds the lock. Of
+  two daemons started together one gets the lock; the other exits and its client connects to
+  the winner. A worker that loses is an error to whoever started it.
+
+Windows. The code compiles the same paths there with `uds-windows`, with the directory
+check and the peer check as no-ops, and I have not run it on Windows. The equivalent there
+is: keep the socket under `%LOCALAPPDATA%\rustd`, whose access control list is inherited
+from the user's profile and admits the user, SYSTEM and Administrators; verify the
+directory's owner SID and DACL with `GetNamedSecurityInfoW` in place of the mode check; and
+for the peer, since AF_UNIX on Windows has no `SO_PEERCRED`, either rely on the directory's
+ACL (what the code does today) or move the transport to a named pipe created with a security
+descriptor for the user's SID and check the client with `GetNamedPipeClientProcessId` and the
+token of that process. The lock file works as it is (`File::try_lock` is `LockFileEx`).
+This is open work, not done.
+
+Tests, in `socket.rs`: `the_directory_and_the_socket_are_the_users_alone`,
+`a_silent_or_endless_client_is_given_up_on`, `one_process_serves_a_socket`. The peer check
+is tested for the same user only; refusing another user needs a second account and is not
+tested.
+
+## 2. What was built
+
+`cargo rustd build|run|test|check`, `cargo rustd status` and `cargo rustd stop`, as the
+`cargo-rustd` binary that sits next to `rustd` and runs `rustd cargo ...`.
+
+The first build of a workspace is cargo's, with rustd as `RUSTC_WORKSPACE_WRAPPER`. The
+wrapper runs the real rustc with the same arguments and records, per workspace unit, the
+arguments, the rlibs and objects, and the link line. The daemon loads the workspace in the
+background while that build's program already runs. Later invocations ask the daemon, which
+compiles what changed and splices or links the program; cargo is not started at all on that
+path. `run` and `test` then run the same executables cargo would, with the variables cargo
+sets, and print cargo's `Running` lines.
+
+What goes to plain cargo, each with a one-line `rustd: <reason>; building with cargo` on
+stderr and a count in `cargo rustd status`:
+
+- The whole invocation: `--release` and any profile but dev, `RUSTFLAGS`, `--all-features`
+  and `--no-default-features`, several `-p`, several `--target`, a target that is not ELF,
+  `--message-format`, `-Z` flags, `-q`, a `RUSTC_WORKSPACE_WRAPPER` that is already set.
+  `check` is always `cargo check`.
+- One build: the daemon is still loading; a manifest, lock file, cargo config, toolchain
+  file or a build script's input changed; a `#[test]` was added, removed or given other
+  attributes (the harness's list is rustc's); a library that unit tests link as rustc built
+  it changed; the source has errors (cargo runs so the diagnostics are rustc's own and the
+  exit status is cargo's); the worker refused or failed.
+- Doc tests are always rustdoc's, through `cargo test --doc`.
+
+`--target <host triple>`, `-p`, `--features`, `--bin`, `--example`, `--test`, `--lib`,
+`--manifest-path`, `--workspace`, `--no-run`, `--no-fail-fast`, test filters and arguments
+after `--` are handled by the daemon path.
+
+This is narrower than the task asked for in two ways. The fallback is per invocation or per
+program, not per compilation unit: when one program can't be the daemon's, cargo builds the
+invocation. And `--release`, custom profiles and `RUSTFLAGS` are passed through to cargo
+unchanged rather than served by the daemon; they build and behave as cargo's because they
+are cargo's.
+
+Fixes outside `cargo/` that the real projects needed, all general:
+
+- A `#[test]` function is looked up under the name rustc gives it. rustc writes a constant of
+  the same name before it, so the function is the second of its name; rustd looked for the
+  first, found no symbol, took the tests for dead code and then made its own copy of a
+  thread-local the tests set (fd's `filter::time` test failed for that reason).
+- Under `cfg(test)` the crate's own `main` is not the entry point, and a symbol that is alone
+  at its path but not the first of its name is not taken for the item in the source.
+- A file the VFS lists that is not UTF-8 has no text and is not watched (bat has one; the
+  worker panicked on it).
+- Worktrees of one repository are recognised by the `.git` file of a worktree.
+- The request for a target can name several crates.
+
+## 3. What was measured
+
+Machine: Linux x86-64, 8 CPUs, 31 GB. Toolchain 1.99.0. Cranelift backend, `target/release/rustd`
+built with `cargo build -p rustd --release`.
+
+    cd harness && python3 cargo_rustd.py
+
+clones the projects at fixed tags into `~/rustd-projects` (once), copies each to a scratch
+directory, and for each runs the steps with `cargo rustd` and with plain cargo in a separate
+target directory, comparing the program's output and exit status and every test's result.
+The edit is a line added to a function; `broken` is a type error, `mended` is the error
+removed. It then runs 22 flag combinations on a small generated workspace cold, warm and
+after an edit (66 comparisons), and 11 daemon lifecycle checks. The run exits 0 only when
+nothing differs. The last full run passed: 0 differences on 7 projects, 66 of 66 flag steps
+the same as cargo, 11 of 11 lifecycle checks. Full output: `harness/CARGO-RUSTD.md`.
+
+Seconds, `cargo rustd` / plain cargo, one run each. Bold is a build the daemon did; `(c)` is
+one cargo did in its place.
+
+| Project | cold build | warm-up | warm build | cold test | test warm-up | warm test | edit build | edit test | broken | mended | Differences |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| ripgrep 15.1.0 | 5.63 / 6.64 | 5.77 | **0.05** / 0.44 | 4.03 / 6.32 | 1.98 | **0.99** / 1.43 | **0.29** / 0.88 | 2.17 (c) / 1.65 | 0.32 (c) / 0.21 | **0.10** / 0.47 | 0 |
+| fd v10.3.0 | 21.22 / 24.01 | 0.02 | **0.05** / 0.56 | 5.39 / 5.52 | 2.50 | **0.79** / 1.08 | **0.06** / 0.53 | **0.78** / 1.14 | 0.34 (c) / 0.20 | **0.05** / 0.47 | 0 |
+| bat v0.26.0 | 16.46 / 21.39 | 7.12 | **0.06** / 0.08 | 10.89 / 16.71 | 4.67 | 1.69 (c) / 1.37 | **0.27** / 0.56 | **2.74** / 1.29 | 0.29 (c) / 0.20 | **0.04** / 0.54 | 0 |
+| hyperfine v1.19.0 | 5.70 / 6.90 | 4.66 | **0.04** / 0.34 | 5.41 / 4.84 | 2.24 | **0.50** / 0.74 | **0.05** / 0.39 | **0.38** / 0.75 | 0.30 (c) / 0.18 | **0.04** / 0.33 | 0 |
+| just 1.43.0 | 8.78 / 9.77 | 2.53 | **0.05** / 0.06 | 8.79 / 7.57 | 6.95 | **1.55** / 1.48 | **0.09** / 0.28 | **1.59** / 1.34 | 0.20 (c) / 0.14 | **0.05** / 0.26 | 0 |
+| axum axum-v0.8.6 | 8.47 / 14.84 | 11.22 | **0.03** / 0.11 | 11.49 / 10.73 | 1.66 | **0.05** / 0.11 | **0.05** / 0.43 | **0.12** / 1.30 | 0.83 (c) / 0.24 | **0.05** / 0.34 | 0 |
+| nushell 0.108.0 | 46.42 / 65.83 | 35.96 | **0.27** / 0.30 | 3.20 / 2.87 | 1.93 | **0.57** / 0.71 | **0.65** / 2.29 | **0.68** / 0.64 | 1.39 (c) / 0.46 | **0.51** / 2.08 | 0 |
+
+Reading it: the cold build is cargo's in both columns (the wrapper adds copying of
+artifacts; the differences there are run-to-run noise of a single run and I would not read
+them as rustd being faster). Warm-up is the time until the daemon has loaded the workspace
+after the cold build, during which builds go to cargo. Edit builds by the daemon took 0.05
+to 0.65 s against 0.28 to 2.29 s for cargo. `broken` always goes to cargo, by design, and
+costs 0.1 to 0.9 s more than cargo alone. Three steps went to cargo for other reasons:
+ripgrep's edit test (the edit was in a library its unit tests link), bat's warm test (a
+build script's output is newer than the build) and the cold run of five projects (daemon
+still loading).
+
+Runs that did not pass, before the fixes above: fd failed its warm and edit test step on
+every run (the `#[test]` naming bug), and bat was never served (the UTF-8 panic). One
+difference is not explained: in one of six runs of just, the integration test
+`delimiters::mismatched_delimiter` failed in the daemon-built test executable and passed
+under cargo; the other five runs matched. I do not know the cause.
+
+Lifecycle checks (in the harness, each observed): no daemon before the first build; the
+first build starts one; a later build is served by the same pid; a git worktree is loaded by
+the same daemon and the same worker; a client killed mid-request leaves the daemon serving;
+a client built from another source replaces the daemon and the old workers exit; with
+`RUSTD_IDLE_SECS` set low the daemon and workers exit; workers exit when the daemon is
+killed; the next build starts a new daemon.
+
+Regression gate: see section 5.
+
+## 4. What is open
+
+- Fallback is per invocation or per program, not per unit; `--release`, other profiles and
+  `RUSTFLAGS` are cargo's entirely. Serving them needs the worker keyed by profile and flags
+  and the optimised backend checked against rustc's optimised output.
+- The just difference seen once in six runs is unexplained.
+- Windows and macOS: the entry point is written to compile there (the link plan refuses
+  anything but ELF, so every build would go to cargo) and has not been built or run on
+  either. The Windows socket hardening is described above and not implemented.
+- The peer check is not tested against a second user.
+- Projects were checked with the Cranelift backend only. The LLVM backend was run through
+  the regression gate, not through `cargo_rustd.py`.
+- The first build after anything cargo owns changes (manifest, lock file, build script
+  input) is cargo's, and the daemon reloads afterwards; on nushell that reload is 36 to 45 s
+  during which builds are cargo's.
+- A function rustc emitted no symbol for is assumed dead. The test naming bug was one way
+  for that assumption to be wrong; I know of no other, and have not proved there is none.
+- `cargo rustd` is not in the CI workflow. The harness needs network to clone the projects
+  and about 20 minutes.
