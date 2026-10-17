@@ -486,7 +486,8 @@ def unwinding(tally, what, binary):
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
-    lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
+    # The row a sequence ends with is of the address past its code, where another function may begin.
+    lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9](?!.*end_sequence)", rows, re.M)})
     without = sum(any(a <= row < b for row in lined) for a, b in bare)
     beyond = sum(a in ends and ends[a] > b for a, b in ours)
     filled = sum(a in ends and ends[a] < b for a, b in ours)

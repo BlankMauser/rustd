@@ -158,9 +158,12 @@ impl Backend {
         optimization: Optimization,
     ) -> std::result::Result<Code, super::llvm::Unhandled> {
         use super::{cached::StoredCode, store::Store};
-        let Some((store, key)) =
-            Store::global().zip(StoredCode::key(optimization, func, recorder.named_slots()))
-        else {
+        let Some((store, key)) = Store::global().zip(StoredCode::key(
+            optimization,
+            func,
+            recorder.named_slots(),
+            recorder.constants(),
+        )) else {
             return super::llvm::emit(recorder, func, optimization);
         };
         if let Some(stored) = store.lookup(&key).and_then(|it| StoredCode::decode(&it))

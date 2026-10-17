@@ -267,7 +267,9 @@ impl<'db> Recorder<'db> {
     #[cfg(feature = "llvm")]
     pub(super) fn constants(&self) -> impl Iterator<Item = (u32, &[u8])> + '_ {
         self.requests.datas.iter().enumerate().filter_map(|(index, data)| match data {
-            DataRequest::Blob { blob, .. } if blob.points_nowhere() => {
+            DataRequest::Blob { blob, identity }
+                if blob.points_nowhere() && *identity != DataIdentity::Writable =>
+            {
                 Some((index as u32, blob.bytes()))
             }
             _ => None,

@@ -183,15 +183,16 @@ impl StoredCode {
 
     /// The key for `func` compiled at `optimization`. Cranelift's key of the IR leaves out
     /// which requests the IR's names stand for, which LLVM's code has in it.
-    pub(super) fn key(
+    pub(super) fn key<'a>(
         optimization: super::backend::Optimization,
         func: &cranelift_codegen::ir::Function,
         named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
+        constants: impl Iterator<Item = (u32, &'a [u8])>,
     ) -> Option<[u8; KEY]> {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 3");
+        hasher.update(b"rustd llvm 4");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
         // Nor does it tell which statement an instruction is of, which the code's lines do.
@@ -208,6 +209,14 @@ impl StoredCode {
         for (_, name) in func.params.user_named_funcs().iter() {
             hasher.update(name.namespace.to_le_bytes());
             hasher.update(name.index.to_le_bytes());
+        }
+        hasher.update(u32::MAX.to_le_bytes());
+        // Nor what the data a name stands for holds, which the code has in place of a load
+        // where that is known.
+        for (index, bytes) in constants {
+            hasher.update(index.to_le_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
         }
         Some(hasher.finalize().into())
     }
