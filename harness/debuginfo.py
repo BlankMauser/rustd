@@ -166,8 +166,11 @@ class Tally:
         self.wrong, self.lines = 0, []
 
     def say(self, what, verdict, more=""):
-        self.wrong += verdict.isupper()
-        print(f"{what:58} {verdict:14} {more}", flush=True)
+        line = f"{what:58} {verdict:14} {more}"
+        if verdict.isupper():
+            self.wrong += 1
+            self.lines.append(line)
+        print(line, flush=True)
 
 
 def compare(tally, what, theirs, ours):
@@ -665,6 +668,9 @@ def main():
     for name, part in parts.items():
         if only in (None, name):
             part()
+    # Again at the end, where a log that keeps only its last lines still has them.
+    for line in tally.lines:
+        print(line)
     print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'} ({'llvm' if LLVM else 'cranelift'})")
     sys.exit(1 if tally.wrong else 0)
 
