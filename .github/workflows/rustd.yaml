@@ -87,6 +87,8 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
           # It runs both producers itself. The cases that are of an x86-64 host (another libc
           # of it, one of its processors) say so, and are not run on AArch64.
@@ -180,6 +182,8 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           # Not run here: `debuginfo.py` reads DWARF with gdb, and the debug info of this
           # target is not written; `buildmodel.py` builds for Linux targets; `storefull.py`
           # mounts a tmpfs; `farsplices.py` is about the reach of an AArch64 branch.
@@ -232,6 +236,8 @@ jobs:
           run worktrees.py --join --together
           run worktrees.py --overlay
           run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           # Not run here: `debuginfo.py` reads DWARF with gdb out of an ELF executable;
           # `buildmodel.py` builds for Linux targets; `storefull.py` mounts a tmpfs;
           # `farsplices.py` splices, which is not done for Mach-O.

@@ -32,10 +32,15 @@ class Compiled:
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                                  env={**os.environ, "RUSTD_STATS": "1", **env})
         self.stderr = child.stderr.read()
-        _, status, usage = os.wait4(child.pid, 0)
-        # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
-        unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
-        self.wall, self.rss_mb = time.monotonic() - start, usage.ru_maxrss // unit
+        if hasattr(os, "wait4"):
+            _, status, usage = os.wait4(child.pid, 0)
+            # `ru_maxrss` is in bytes on macOS and in kilobytes on Linux.
+            unit = 1 << 20 if sys.platform == "darwin" else 1 << 10
+            self.rss_mb = usage.ru_maxrss // unit
+        else:
+            # Windows has no `wait4`: the peak is not measured there.
+            status, self.rss_mb = child.wait(), 0
+        self.wall = time.monotonic() - start
         if status != 0:
             raise SystemExit(f"rustd failed with {name}:\n{self.stderr[-3000:]}")
         open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w").write(self.stderr)
