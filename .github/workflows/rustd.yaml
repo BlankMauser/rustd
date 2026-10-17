@@ -62,4 +62,5 @@ jobs:
           run asmedits.py
           run includes.py
           run worktrees.py
+          run keys.py
           exit $failed
