@@ -812,17 +812,7 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
-    let is_file = krate.ends_with(".rs");
-    let mut found: Vec<_> = Crate::all(db)
-        .into_iter()
-        .filter(|it| match is_file {
-            // Named from the checkout, or in full.
-            true => crate_root_file(db, *it).is_some_and(|root| {
-                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
-            }),
-            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
-        })
-        .collect();
+    let mut found = crates_called(db, krate, args);
     // A dependency may be another version of the crate being built, and another checkout
     // has a crate of its name too.
     let of_checkout = |krate: &Crate| args.members.contains(&(*krate).into());
@@ -831,6 +821,40 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
     }
     anyhow::ensure!(!found.is_empty(), "crate {krate} not found in workspace");
     Ok(found)
+}
+
+/// Every crate called `krate`, of the checkout or not.
+fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
+    let is_file = krate.ends_with(".rs");
+    Crate::all(db)
+        .into_iter()
+        .filter(|it| match is_file {
+            // Named from the checkout, or in full.
+            true => crate_root_file(db, *it).is_some_and(|root| {
+                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+            }),
+            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        })
+        .collect()
+}
+
+/// The crates called `krate` to build: the ones rustc built into this program, when it built
+/// any, which may be a crate of the checkout and a dependency of the same name both. Otherwise
+/// what `crates_named` finds.
+fn crates_to_build(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    krate: &str,
+    args: &Args,
+) -> anyhow::Result<Vec<Crate>> {
+    let linked = |krate: &Crate| {
+        let name = krate.display_name(db);
+        let root = crate_root_file(db, *krate);
+        name.zip(root).is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+    };
+    let mut called = crates_called(db, krate, args);
+    called.retain(linked);
+    if called.is_empty() { crates_named(db, krate, args) } else { Ok(called) }
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -1569,18 +1593,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
-        let mut named = crates_named(db, krate, args)?;
-        // Of the crates of the name, the ones rustc built into this program, when it built any.
-        let linked = |krate: &Crate| {
-            let name = krate.display_name(db);
-            let root = crate_root_file(db, *krate);
-            name.zip(root)
-                .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
-        };
-        if named.iter().any(linked) {
-            named.retain(linked);
-        }
-        for krate in named {
+        for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
             let listed = listed.of(db, krate);
             if at == 0 {
