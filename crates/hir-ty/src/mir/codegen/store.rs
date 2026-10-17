@@ -145,6 +145,31 @@ pub fn pack_name(bytes: &[u8]) -> Option<String> {
     bytes.starts_with(MAGIC).then(|| named(&Sha256::digest(bytes)))
 }
 
+/// The keys of the records of the pack `name`, in the order they were added, if its bytes are
+/// what its name says and every record is as it was written. They are the keys as they are
+/// on disk, which only the build of rustd that wrote them can make.
+pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static str> {
+    Ok(Pack::check(name, bytes)?.into_iter().map(|it| it.key).collect())
+}
+
+/// Asked for a key, as it is on disk, that no sealed pack of the store has: brings the pack
+/// that has it into the store's directory, if it knows of one, and says whether it did.
+pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
+
+static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+
+/// Has the store of this process ask `fetch` for the keys it lacks, from now on. A process
+/// has one store, and only the first call counts.
+pub fn fetch_missing_with(fetch: FetchMissing) {
+    _ = FETCH_MISSING.set(fetch);
+}
+
+/// The format of the pack that starts with these bytes, if they start a pack of any.
+pub fn pack_format(start: &[u8]) -> Option<u32> {
+    let (format, name) = start.get(..MAGIC.len())?.split_last()?;
+    (name == &MAGIC[..MAGIC.len() - 1]).then_some(u32::from(*format))
+}
+
 /// Whether `name` is what a sealed pack is called, and so safe to use as a file name.
 pub fn is_pack(name: &str) -> bool {
     name.strip_suffix(".pack")
@@ -448,6 +473,19 @@ impl StoreDir {
         Ok(self.names()?.into_iter().filter(|it| is_pack(it)).collect())
     }
 
+    /// The keys, as they are on disk, of the records of the sealed packs that are as they
+    /// were written. A collection makes one pack of many, so what a store holds is told by
+    /// its keys and not by the names of its packs.
+    pub fn keys(&self) -> io::Result<FxHashSet<[u8; KEY]>> {
+        let mut keys = FxHashSet::default();
+        for name in self.packs()? {
+            // Evicted since it was listed.
+            let Ok(pack) = std::fs::read(self.dir.join(name)) else { continue };
+            keys.extend(records(&pack).0.into_iter().map(|it| it.key));
+        }
+        Ok(keys)
+    }
+
     /// Seals the open packs that daemons that are gone left behind, as far as their records
     /// are whole. Returns how many there were.
     pub fn adopt(&self) -> usize {
@@ -667,13 +705,22 @@ fn write_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
     let written = file
         .lock()
         .and_then(|()| file.write_all(bytes))
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&partial, to));
+        .and_then(|()| name_file_whole(&file, &partial, to));
     if written.is_err() {
         _ = std::fs::remove_file(&partial);
     }
-    written?;
-    sync_dir(dir)
+    written
+}
+
+/// Gives the file at `from`, which the caller wrote and holds, the name `to`: readers see
+/// all of it or none, and it is whole after a loss of power once this returns. This is how
+/// a file that arrives in pieces, as one fetched from a remote does, ends the way
+/// [`write_file_whole`] writes one. In a store `from` is `<to>.<anything>.tmp`, so that what
+/// a stopped process leaves is known for what it is.
+pub fn name_file_whole(file: &File, from: &Path, to: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    std::fs::rename(from, to)?;
+    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)
 }
 
 /// Writes a file outside a store the way [`StoreDir::write_whole`] writes one inside.
@@ -945,16 +992,29 @@ impl Store {
         }
     }
 
+    /// Where the value of a key as it is on disk is. A key no sealed pack has is asked of
+    /// whoever fetches packs for this process, and looked for again in what arrived.
+    fn place(&self, key: &[u8; KEY]) -> Option<Place> {
+        let known = || self.sealed.read().ok()?.index.get(key).cloned();
+        if let Some(place) = known() {
+            return Some(place);
+        }
+        if !FETCH_MISSING.get().is_some_and(|fetch| fetch(key)) {
+            return None;
+        }
+        self.refresh();
+        known()
+    }
+
     /// Whether a sealed pack has a value for the key.
     pub(super) fn has(&self, key: &[u8; KEY]) -> bool {
-        let key = self.identity.key(key);
-        self.sealed.read().is_ok_and(|it| it.index.contains_key(&key))
+        self.place(&self.identity.key(key)).is_some()
     }
 
     /// The value of a key, if a sealed pack has it as it was written.
     pub(super) fn get(&self, key: &[u8; KEY]) -> Option<Vec<u8>> {
         let key = self.identity.key(key);
-        let place = self.sealed.read().ok()?.index.get(&key)?.clone();
+        let place = self.place(&key)?;
         let mut value = vec![0; place.len as usize];
         let read = read_at(&place.pack.file, &mut value, place.at);
         if read.is_err() || checksum(&key, &value) != place.checksum {
@@ -1509,6 +1569,41 @@ mod tests {
         assert!(Kind::of("12-34.open") == Some(Kind::Open));
         assert!(Kind::of("version.12-34.tmp") == Some(Kind::Temporary));
         assert!(Kind::of(&format!("{}.7.partial", named(&[0; KEY]))) == Some(Kind::Temporary));
+    }
+
+    #[test]
+    fn a_pack_says_its_format_and_its_keys_to_those_who_send_it() {
+        let dir = scratch("sent");
+        let pack = sealed(&dir);
+        let name = pack.file_name().unwrap().to_str().unwrap();
+        let mut bytes = std::fs::read(&pack).unwrap();
+        assert_eq!(pack_format(&bytes), Some(FORMAT));
+        assert_eq!(pack_format(b"rustdpk\x01 of the first format"), Some(1));
+        assert_eq!(pack_format(b"rustdpk"), None);
+        assert_eq!(pack_format(b"something else"), None);
+        let keys = [1, 2].map(|key| identity("a toolchain").key(&[key; KEY]));
+        assert_eq!(pack_keys(name, &bytes).unwrap(), keys);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert_eq!(StoreDir::at(&dir).keys().unwrap(), keys.into_iter().collect());
+        assert!(pack_keys(name, &bytes).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_arrived_in_pieces_gets_its_name_whole() {
+        let dir = scratch("pieces");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) =
+            (dir.join(format!("{}.fetch.tmp", named(&[5; KEY]))), dir.join(named(&[5; KEY])));
+        let mut file = File::create(&from).unwrap();
+        file.write_all(b"one piece, ").unwrap();
+        assert!(Kind::of(from.file_name().unwrap().to_str().unwrap()) == Some(Kind::Temporary));
+        file.write_all(b"and another").unwrap();
+        name_file_whole(&file, &from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"one piece, and another");
+        assert!(files(&dir, Kind::Temporary).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

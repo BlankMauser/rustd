@@ -36,7 +36,9 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   expect    "supported" (the default) or "refused"
   fails     cargo itself turns the project down, and so must rustd
   steps     [{"what": .., "edit": [[file, old, new]], "write": {file: text}, "env": {..},
+              "run": [shell commands in the project], "clients": how many ask at once,
               "expect": "same" | "refused"}]
+            After each step cargo builds again and the client names what it linked.
 """
 from concurrent.futures import ThreadPoolExecutor
 import argparse, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
@@ -219,6 +221,8 @@ class Case:
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), "--out", obj, "--report", report,
              *self.rustd_args, *self.symbols(link, env)], capture_output=True, text=True, env=env, timeout=600)
         open(os.path.join(self.work, "rustd.stderr"), "w").write(run.stderr)
+        if run.returncode < 0:
+            raise Wrong(f"rustd died of signal {-run.returncode}: " + run.stderr[-300:])
         if run.returncode != 0:
             raise Refused(reason_of(run.stderr))
         compiled, skipped = self.left_to_rustc(report)
@@ -244,8 +248,8 @@ class Case:
         obj, patch, binary = (os.path.join(self.work, f"daemon.{n}") for n in ("o", "patch.o", "bin"))
         # The path of a socket has a limit that the name of a case can take the copy past.
         socket, log_path = os.path.join(tempfile.mkdtemp(prefix="bm-"), "s"), os.path.join(self.work, "daemon.log")
-        line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
-        ask = ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
+        self.daemon_files = (obj, patch, binary)
+        ask = self.ask(link, env)
         log = open(log_path, "a")
         daemon = subprocess.Popen(
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), *self.rustd_args, "--socket", socket, *ask],
@@ -260,17 +264,47 @@ class Case:
             daemon.kill()
             shutil.rmtree(os.path.dirname(socket), ignore_errors=True)
 
+    def ask(self, link, env):
+        """What a client names the program by, and how it is linked with what cargo built."""
+        obj, patch, binary = self.daemon_files
+        line = linkline.join(linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary))
+        return ["--out", obj, "--patch", patch, "--link-cmd", line, "--binary", binary, *self.symbols(link, env)]
+
+    def asked(self, env):
+        """The program as cargo links it now: what a client sends after cargo has built again.
+        Nothing when cargo does not build it, where the daemon is to say why by itself."""
+        link = self.link_line(env)
+        if link is None:
+            # cargo has built exactly this before and links nothing: without what it linked
+            # then, it does again.
+            for linked in glob.glob(os.path.join(self.ws, "target", "**", "deps", self.artifact_name() + "-*"), recursive=True):
+                if "." not in os.path.basename(linked):
+                    os.remove(linked)
+            link = self.link_line(env)
+        return [] if link is None else ["--crate", self.crates[0], *self.ask(link, env)]
+
     def step(self, step, env, daemon, socket, binary):
         for path, old, new in step.get("edit", []):
             text = open(os.path.join(self.ws, path)).read()
             assert old in text, (self.name, step["what"], old)
             open(os.path.join(self.ws, path), "w").write(text.replace(old, new, 1))
         for path, text in step.get("write", {}).items():
+            os.makedirs(os.path.dirname(os.path.join(self.ws, path)), exist_ok=True)
             open(os.path.join(self.ws, path), "w").write(text)
         env.update(step.get("env", {}))
+        for command in step.get("run", []):
+            subprocess.run(command, shell=True, cwd=self.ws, check=True, capture_output=True, env=env)
         time.sleep(0.02)
-        reply = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=300, env=env)
+        ask = [RUSTD, "sync", socket, *self.asked(env)]
+        # Clients that ask at once race the reload: each is answered from one model.
+        racing = [subprocess.Popen(ask, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                  for _ in range(step.get("clients", 1) - 1)]
+        reply = subprocess.run(ask, capture_output=True, text=True, timeout=300, env=env)
         reply = (reply.stdout + reply.stderr).strip()
+        for other in racing:
+            said = other.communicate(timeout=300)[0].strip()
+            if not said.startswith("ok"):
+                reply = said
         artifact = self.cargo(env)
         expect = step.get("expect", "same")
         if daemon.poll() is not None:

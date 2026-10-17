@@ -3071,7 +3071,12 @@ fn generic_predicates<'db>(
         // prove that the trait applies to the types that were
         // used, and adding the predicate into this list ensures
         // that this is done.
-        if let GenericDefId::TraitId(def_id) = def {
+        //
+        // A trait alias holds of whatever its bounds hold of, so it has no such
+        // predicate: one would make proving the alias wait on itself.
+        if let GenericDefId::TraitId(def_id) = def
+            && !TraitSignature::of(interner.db(), def_id).flags.contains(TraitFlags::ALIAS)
+        {
             Some(TraitRef::identity(interner, def_id.into()).upcast(interner))
         } else {
             None
