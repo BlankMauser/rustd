@@ -51,7 +51,7 @@ pub(super) fn emit(
     } else {
         optimization
     };
-    Machine::with(optimization, |machine, context| {
+    Machine::with(optimization, |context, machine| {
         let module = context.create_module("rustd");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
@@ -85,7 +85,7 @@ pub(super) fn emit(
 /// FIXME: assembly LLVM rejects ends the process: its default diagnostic handler exits on an
 /// error, and inkwell has no way to set another.
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    Machine::with(Optimization::NONE, |machine, context| {
+    Machine::with(Optimization::NONE, |context, machine| {
         let module = context.create_module("rustd_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
@@ -123,37 +123,42 @@ impl Optimization {
     }
 }
 
-/// The target as LLVM knows it. One per thread and level: making one costs more than a
-/// small function does.
+/// The target as LLVM knows it, one per thread and level: making one costs more than a
+/// small function does. The context the modules are made in is kept with them, as a
+/// machine holds on to things of the last context it compiled a module of: the instruction
+/// selector of AArch64 keeps the source location of the last instruction it saw, and lets
+/// go of it at the next function, by when a context of that one module would be gone.
+#[derive(Default)]
 struct Machine {
-    /// Ahead of the context, which it has to be dropped before.
-    target: TargetMachine,
-    /// The context of the module emitted last. The instruction selector of the target keeps
-    /// the source location it saw last, which is metadata of that context, and lets go of
-    /// it when it starts on the next function: the context has to be there until then.
-    emitted: Option<Context>,
+    // Before the context, which has to outlive them.
+    machines: FxHashMap<Optimization, TargetMachine>,
+    context: Option<Context>,
+    /// How many modules were made in the context.
+    modules: usize,
 }
 
 impl Machine {
-    /// Runs `work` with the target and a context of its own for what it emits.
+    /// How many modules a context is kept for. The constants and source locations of all
+    /// of them stay in it.
+    const MODULES: usize = 1024;
+
     fn with<T>(
         optimization: Optimization,
-        work: impl FnOnce(&TargetMachine, &Context) -> Result<T, Unhandled>,
+        work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
-            static MACHINES: RefCell<FxHashMap<Optimization, Machine>> = RefCell::default();
+            static MACHINE: RefCell<Machine> = RefCell::default();
         }
-        MACHINES.with_borrow_mut(|machines| {
-            let machine = match machines.entry(optimization) {
+        MACHINE.with_borrow_mut(|this| {
+            if this.modules == Self::MODULES {
+                *this = Machine::default();
+            }
+            this.modules += 1;
+            let machine = match this.machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),
-                Entry::Vacant(slot) => {
-                    slot.insert(Machine { target: Self::create(optimization)?, emitted: None })
-                }
+                Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
             };
-            let context = Context::create();
-            let done = work(&machine.target, &context);
-            machine.emitted = Some(context);
-            done
+            work(this.context.get_or_insert_with(Context::create), machine)
         })
     }
 

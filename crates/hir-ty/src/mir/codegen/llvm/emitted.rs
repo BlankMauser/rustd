@@ -39,6 +39,8 @@ pub(super) struct Emitted<'data> {
     code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
+    /// See [`Code::elf_types`].
+    elf_types: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +78,7 @@ impl<'data> Emitted<'data> {
             code: 0,
             align: 1,
             relocs: Vec::new(),
+            elf_types: Vec::new(),
         };
         let unwind = match (emitted.file.format(), emitted.file.architecture()) {
             (BinaryFormat::MachO, _) => {
@@ -100,8 +103,8 @@ impl<'data> Emitted<'data> {
             }
         };
         let lines = emitted.lines()?;
-        let Emitted { bytes, align, relocs, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, unwind, lines })
+        let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
+        Ok(Code { signature, bytes, align, relocs, elf_types, unwind, lines })
     }
 
     /// Which source location the code is of from each offset on, from the line table: the
@@ -463,6 +466,16 @@ impl<'data> Emitted<'data> {
                     elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => Reloc::Arm64Call,
                     elf::R_AARCH64_ADR_PREL_PG_HI21 => Reloc::Aarch64AdrPrelPgHi21,
                     elf::R_AARCH64_ADD_ABS_LO12_NC => Reloc::Aarch64AddAbsLo12Nc,
+                    elf::R_AARCH64_LDST8_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST16_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST32_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST64_ABS_LO12_NC
+                    | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
+                        // The low bits go in in units of what the load or store moves,
+                        // which Cranelift has no kind for: it stands in as an `add`.
+                        self.elf_types.push((offset as u32, r_type));
+                        Reloc::Aarch64AddAbsLo12Nc
+                    }
                     elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
                     elf::R_AARCH64_LD64_GOT_LO12_NC => Reloc::Aarch64Ld64GotLo12Nc,
                     elf::R_AARCH64_TLSDESC_ADR_PAGE21 => Reloc::Aarch64TlsDescAdrPage21,

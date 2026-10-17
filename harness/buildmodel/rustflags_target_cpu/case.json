@@ -7,5 +7,5 @@
   "env": {
     "RUSTFLAGS": "-C target-cpu=x86-64-v3"
   },
-  "hosts": "x86_64-"
+  "on": "x86_64"
 }

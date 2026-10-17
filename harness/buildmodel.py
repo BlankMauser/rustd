@@ -31,6 +31,7 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   target    the triple to build for when it is not the host
   hosts     what the triple of the host has to contain for the case to mean anything: "-linux-"
             for one that needs a Linux cross toolchain. Elsewhere the row is `skipped`, and says so
+  on        the architecture of the only hosts the case is of: it is not run on another
   env       the environment of both builds
   run       a script of the case that runs what was built in place of running it directly;
             it is given ARTIFACT, and RUSTD_OBJECTS with rustd's objects for the second build
@@ -92,7 +93,8 @@ class Case:
         self.source = os.path.join(CASES, name)
         self.spec = json.load(open(os.path.join(self.source, "case.json")))
         self.target = self.spec.get("target")
-        cross = CROSS.get(self.target, {})
+        # A target that is the host's own is linked and run as the host's programs are.
+        cross = CROSS.get(self.target, {}) if self.target != host() else {}
         self.runner = cross.get("runner", [])
         self.env = {**os.environ, **self.spec.get("env", {})}
         if "linker" in cross:
@@ -182,7 +184,9 @@ class Case:
         if whole:
             printed = "\n".join(l for l in printed.splitlines() if f"/{self.artifact_name()}-" in l)
         try:
-            line = [a for a in linker_line(printed) if not a.endswith("symbols.o")]
+            # rustc's `symbols.o` asks for what the libraries need of one another, which a linker
+            # that reads archives in order finds no other way: `-C save-temps` keeps the file.
+            line = [a for a in linker_line(printed) if not a.endswith("symbols.o") or os.path.exists(a)]
         except SystemExit:
             return None
         return line
@@ -386,7 +390,12 @@ def main():
     names = a.cases or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
     backends = a.backend or ["cranelift", "llvm"]
     table, bad = [], 0
+    here = host().split("-")[0]
     cases = [Case(name, backend, a.keep) for name in names for backend in backends]
+    for case in cases:
+        if case.spec.get("on", here) != here:
+            print(f"{case.name:34} {case.backend:9} not run   the case is of {case.spec['on']} hosts", flush=True)
+    cases = [case for case in cases if case.spec.get("on", here) == here]
     with ThreadPoolExecutor(a.jobs) as pool:
         rows = pool.map(Case.row, cases)
         for case, (verdict, detail, steps) in zip(cases, rows):

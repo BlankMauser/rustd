@@ -74,6 +74,12 @@ const SMALL_PACKS: usize = 16;
 /// A temporary file nobody holds is only removed when it is older than this: its writer
 /// creates it before it locks it.
 const TEMPORARY_FOR: Duration = Duration::from_secs(60);
+/// What a temporary file that holds the start of a pack being fetched ends in, before
+/// `.tmp`: one that arrives as it is, and one that arrives compressed.
+const FETCHED: [&str; 2] = [".fetch", ".zst"];
+/// The start of a fetched pack that nobody holds is kept this long for a fetch to go on
+/// from: it took a network to get.
+const FETCHED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 
 static TOOLCHAIN: OnceLock<String> = OnceLock::new();
 
@@ -162,6 +168,14 @@ static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
 /// has one store, and only the first call counts.
 pub fn fetch_missing_with(fetch: FetchMissing) {
     _ = FETCH_MISSING.set(fetch);
+}
+
+/// Seals what the store of this process has open, however little it is, so that it can be
+/// sent to other machines now. Between builds a small pack is otherwise left open.
+pub fn seal_open() {
+    if let Some(store) = Store::global() {
+        store.settle(1);
+    }
 }
 
 /// The format of the pack that starts with these bytes, if they start a pack of any.
@@ -262,6 +276,25 @@ fn records(pack: &[u8]) -> (Vec<Record>, usize) {
         at = start + len;
     }
     (found, at)
+}
+
+/// The keys of the records a pack is laid out as, going by their lengths alone.
+fn headed(pack: &[u8]) -> Vec<[u8; KEY]> {
+    let mut keys = Vec::new();
+    let mut at = MAGIC.len();
+    if !pack.starts_with(MAGIC) {
+        return keys;
+    }
+    while let Some(header) = pack.get(at..at + HEADER) {
+        let (key, rest) = header.split_at(KEY);
+        let len = u32::from_le_bytes(rest[..4].try_into().expect("four bytes")) as usize;
+        at += HEADER + len;
+        if at > pack.len() {
+            break;
+        }
+        keys.push(key.try_into().expect("a key"));
+    }
+    keys
 }
 
 fn record(key: &[u8; KEY], value: &[u8], len: u32) -> Vec<u8> {
@@ -453,15 +486,21 @@ impl StoreDir {
         Ok(self.names()?.into_iter().filter(|it| is_pack(it)).collect())
     }
 
-    /// The keys, as they are on disk, of the records of the sealed packs that are as they
-    /// were written. A collection makes one pack of many, so what a store holds is told by
-    /// its keys and not by the names of its packs.
+    /// The keys, as they are on disk, that the sealed packs say they hold. A collection
+    /// makes one pack of many, so what a store holds is told by its keys and not by the
+    /// names of its packs.
+    ///
+    /// Only the headers of the records are read, not what they hold, so this is no check: a
+    /// damaged pack may be said to hold a key that a build will not get from it.
     pub fn keys(&self) -> io::Result<FxHashSet<[u8; KEY]>> {
         let mut keys = FxHashSet::default();
         for name in self.packs()? {
             // Evicted since it was listed.
-            let Ok(pack) = std::fs::read(self.dir.join(name)) else { continue };
-            keys.extend(records(&pack).0.into_iter().map(|it| it.key));
+            let Ok(file) = File::open(self.dir.join(name)) else { continue };
+            // SAFETY: a sealed pack is never written again; one that is removed stays
+            // mapped.
+            let Ok(pack) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+            keys.extend(headed(&pack));
         }
         Ok(keys)
     }
@@ -617,10 +656,14 @@ impl StoreDir {
         for name in self.names()?.iter().filter(|it| Kind::of(it) == Some(Kind::Temporary)) {
             let path = self.dir.join(name);
             let Ok(file) = File::open(&path) else { continue };
+            let fetched = name
+                .strip_suffix(".tmp")
+                .is_some_and(|it| FETCHED.iter().any(|end| it.ends_with(end)));
+            let kept = if fetched { FETCHED_FOR } else { TEMPORARY_FOR };
             let old = file
                 .metadata()
                 .and_then(|it| it.modified())
-                .is_ok_and(|at| at.elapsed().is_ok_and(|it| it > TEMPORARY_FOR));
+                .is_ok_and(|at| at.elapsed().is_ok_and(|it| it > kept));
             if old && file.try_lock().is_ok() && std::fs::remove_file(&path).is_ok() {
                 abandoned += 1;
             }
@@ -911,7 +954,14 @@ impl Store {
     fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Record>)> {
         let path = self.dir.dir.join(name);
         // Evicted since it was listed.
-        let mut file = File::open(&path).ok()?;
+        // To write as well where that is allowed, which is what Windows asks of whoever
+        // sets a file's time of last use. Another user's pack is only read.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .or_else(|_| File::open(&path))
+            .ok()?;
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes).ok()?;
         match Pack::check(name, &bytes) {
@@ -941,8 +991,13 @@ impl Store {
     /// other daemons sealed. What is not written by the time the daemon ends is compiled
     /// again by the next.
     pub(super) fn flush(&self) {
+        self.settle(self.tuning.seal_at);
+    }
+
+    /// As [`Self::flush`], sealing the open pack if it has `seal_at` bytes.
+    fn settle(&self, seal_at: u64) {
         let sealed = match self.writer.lock() {
-            Ok(mut writer) => writer.settle(&self.dir, self.tuning.seal_at),
+            Ok(mut writer) => writer.settle(&self.dir, seal_at),
             Err(_) => false,
         };
         self.mark_used();
@@ -1524,6 +1579,38 @@ mod tests {
         File::options().write(true).open(&left).unwrap().set_modified(old).unwrap();
         assert_eq!(StoreDir::at(&dir).collect(None).unwrap().abandoned, 1);
         assert!(!left.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_start_of_a_fetched_pack_is_kept_for_a_fetch_to_go_on_from() {
+        let dir = scratch("fetched");
+        sealed(&dir);
+        let kept = ["fetch", "zst"].map(|end| dir.join(format!("{}.{end}.tmp", named(&[5; KEY]))));
+        for (left, age) in kept.iter().zip([TEMPORARY_FOR * 2, FETCHED_FOR * 2]) {
+            std::fs::write(left, b"half of a pack").unwrap();
+            let old = SystemTime::now() - age;
+            File::options().write(true).open(left).unwrap().set_modified(old).unwrap();
+        }
+        assert_eq!(StoreDir::at(&dir).collect(None).unwrap().abandoned, 1);
+        assert!(kept[0].exists() && !kept[1].exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_keys_a_store_says_it_holds_are_those_of_its_records() {
+        let dir = scratch("keys");
+        sealed(&dir);
+        let store = StoreDir::at(&dir);
+        let mut held = Vec::new();
+        for name in store.packs().unwrap() {
+            let pack = std::fs::read(dir.join(&name)).unwrap();
+            held.extend(pack_keys(&name, &pack).unwrap());
+            // Cut short in a value, the record it is in is not counted.
+            assert_eq!(headed(&pack[..pack.len() - 1]).len(), headed(&pack).len() - 1);
+        }
+        assert!(!held.is_empty());
+        assert_eq!(store.keys().unwrap(), held.into_iter().collect());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
