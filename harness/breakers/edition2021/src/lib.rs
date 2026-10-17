@@ -1,0 +1,37 @@
+//! What the 2021 edition does differently, for the cases that are about it.
+
+use std::cell::RefCell;
+
+struct Noisy<'a>(u8, &'a RefCell<Vec<u8>>);
+
+impl Drop for Noisy<'_> {
+    fn drop(&mut self) {
+        self.1.borrow_mut().push(self.0);
+    }
+}
+
+fn mark(n: u8, log: &RefCell<Vec<u8>>) {
+    log.borrow_mut().push(n);
+}
+
+/// tests/ui/drop/drop-order-comparisons.rs: before the 2024 edition the temporaries of what
+/// an `if let` matches on live to the end of the statement the `if` is in.
+#[inline(never)]
+pub fn if_let_outlives(log: &RefCell<Vec<u8>>) {
+    _ = (
+        if let Some(_) = Some(&Noisy(4, log)) {
+            mark(1, log);
+        },
+        mark(2, log),
+        Noisy(3, log),
+    );
+    _ = (
+        if let Some(_) = None.or(Some(&Noisy(8, log))).filter(|_| false) {
+            mark(0, log);
+        } else {
+            mark(5, log);
+        },
+        mark(6, log),
+        Noisy(7, log),
+    );
+}

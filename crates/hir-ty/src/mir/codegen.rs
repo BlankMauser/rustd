@@ -1740,7 +1740,7 @@ pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String>
 }
 
 /// The symbol an item of an `extern` block links to.
-fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
         return None;
     };
@@ -6326,7 +6326,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let (src, ty) = self.operand(operand)?;
                 let size = self.layout(ty)?.size;
-                if len <= 16 {
+                if len == 0 {
+                    // No element takes a moved value, so it ends here. A constant was never made.
+                    if matches!(operand.kind, OperandKind::Move(_)) {
+                        self.drop_value(src, None, ty)?;
+                    }
+                } else if len <= 16 {
                     for i in 0..len as u64 {
                         let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
                         self.copy(element, src, size);
@@ -9541,18 +9546,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Drops every local that holds a value.
     fn drop_live_locals(&mut self) -> Result<()> {
-        // Locals the body never drops come first, last declared first, and of those the
-        // operands of the expression that unwound before the temporaries it borrowed, which
-        // live to the end of the statement. The rest go in the order the body drops them when
-        // nothing unwinds, which is innermost scope first.
-        let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
-        locals.reverse();
-        let rank = |local: &LocalId| match self.drop_order.iter().position(|it| it == local) {
-            Some(at) => at + 2,
-            None => !self.operand_temps.contains(local) as usize,
-        };
-        locals.sort_by_key(rank);
-        for local in locals {
+        for local in self.unwinding_order() {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
@@ -9560,6 +9554,37 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.switch_to_block(next);
         }
         Ok(())
+    }
+
+    /// The locals with a drop flag in the order a landing pad drops them.
+    fn unwinding_order(&self) -> Vec<LocalId> {
+        let body = self.body.expect("MIR body");
+        let named: rustc_hash::FxHashSet<LocalId> =
+            body.binding_locals.values().chain(&body.param_locals).copied().collect();
+        let flagged = |local: &LocalId| self.drop_flags.contains_idx(*local);
+        let mut undropped: Vec<LocalId> = self
+            .drop_flags
+            .iter()
+            .map(|(local, _)| local)
+            .filter(|local| !self.drop_order.contains(local))
+            .collect();
+        undropped.reverse();
+        // Temporaries the body never drops are moved by the expression that made them, so one
+        // that still holds a value belongs to the expression that unwound: its operands come
+        // first, before the temporaries it borrowed, which live to the end of the statement.
+        // The rest go in the order the body drops them when nothing unwinds, which is innermost
+        // scope first.
+        let (variables, mut order): (Vec<LocalId>, Vec<LocalId>) =
+            undropped.into_iter().partition(|local| named.contains(local));
+        order.sort_by_key(|local| !self.operand_temps.contains(local));
+        order.extend(self.drop_order.iter().copied().filter(flagged));
+        // A variable the body never drops is in a scope no path leaves by its end. It goes
+        // after what its scope holds and before the variables declared ahead of it.
+        for variable in variables {
+            let outer = order.iter().position(|it| named.contains(it) && *it < variable);
+            order.insert(outer.unwrap_or(order.len()), variable);
+        }
+        order
     }
 
     fn store_state(&mut self, state: Value, ty: Type, value: i64) {

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential test using a crate's own integration tests.
 
-usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--bisect] [--json out.json]
+usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--skip <test>]... [--bisect]
+                    [--json out.json]
 
 Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects for the crate in
 front of rustc's rlib. Both binaries must report the same result for every test.
@@ -14,7 +15,7 @@ UNIT = "(unit tests)"
 
 
 class TestFixture(Fixture):
-    def __init__(self, crate_dir, crate, test, shared, features=None, lib=None):
+    def __init__(self, crate_dir, crate, test, shared, features=None, lib=None, skip=()):
         if test == UNIT:
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
@@ -28,7 +29,9 @@ class TestFixture(Fixture):
         if features:
             self.target_args += ["--features", features]
             self.rustd_args += ["--features", features]
-        self.run_args = ["--test-threads=1"]
+        # A test left out by name: `--exact` keeps a name from leaving out the ones it starts.
+        self.skips = ["--exact", *(x for name in skip for x in ("--skip", name))] if skip else []
+        self.run_args = ["--test-threads=1", *self.skips]
         self.shared = shared
 
     def rustc_build(self):
@@ -65,13 +68,15 @@ def differing_tests(fx):
     names = [l[:-len(": test")] for l in listed.splitlines() if l.endswith(": test")]
     differing = []
     for name in names:
+        if name in fx.skips:
+            continue
         fx.run_args = ["--test-threads=1", "--exact", name]
         want, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
         if want[:2] != got[:2]:
             tail = got[2].decode(errors="replace").strip().splitlines()[-3:]
             differing.append(name)
             print(f"  DIFFERS {name}: rustc status {want[0]}, rustd status {got[0]}: {' | '.join(tail)[:300]}")
-    fx.run_args = ["--test-threads=1"]
+    fx.run_args = ["--test-threads=1", *fx.skips]
     return differing
 
 
@@ -82,6 +87,7 @@ def main():
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--test", action="append", help="only these test binaries; `unit` is the crate's own")
     ap.add_argument("--features", help="cargo features to turn on, comma separated")
+    ap.add_argument("--skip", action="append", default=[], help="a test, by its whole name, to leave out")
     ap.add_argument("--json")
     a = ap.parse_args()
     crate = a.crate or os.path.basename(os.path.abspath(a.crate_dir)).replace("-", "_")
@@ -98,7 +104,7 @@ def main():
     results, shared = [], {}
     for test in tests:
         print(f"--- {test}", flush=True)
-        fx = TestFixture(a.crate_dir, crate, test, shared, a.features, lib)
+        fx = TestFixture(a.crate_dir, crate, test, shared, a.features, lib, a.skip)
         try:
             result = compare(fx, test, a.bisect)
         except SystemExit as e:
