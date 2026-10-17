@@ -333,6 +333,12 @@ finish (in one run it exited without a reason, in another it spun inside LLVM's 
 (run 39031377253), and this branch changes nothing under `crates/hir-ty`, so I take it to
 be the base's and left it.
 
+CI (`.github/workflows/rustd.yaml`) on this branch: green at 810746319b, which has
+`rustd-collate` f66cd13c10. At 13054e50d6, with b43304222b, it fails in `debuginfo.py`
+(gdb does not stop at its breakpoints on the runner, under both backends; it passes on my
+machine) and in `buildmodel.py` (the row above), and passes everything else. Those are the
+same two failures, line for line, as the CI run of `rustd-collate` at b43304222b itself.
+
 Merging b43304222b changed what a worker is asked: a request is now two lines, the second
 the variables of the client's process. The bounded, timed read takes both lines, and the
 daemon sends its worker the variables that worker was started with, so a build through
