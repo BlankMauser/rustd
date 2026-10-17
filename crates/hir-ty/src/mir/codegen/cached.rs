@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConstBlob, DataIdentity,
-    debuginfo::{FunctionDebug, LineRow},
+    debuginfo::{FunctionDebug, LineRow, SlotPlaces},
     fragment::Code,
     store::{KEY, Store},
     unwind::FunctionUnwind,
@@ -102,6 +102,7 @@ pub(super) struct CachedCode {
     relocs: Vec<CachedReloc>,
     unwind: Option<FunctionUnwind>,
     lines: Vec<LineRow>,
+    slots: SlotPlaces,
 }
 
 impl PartialEq for CachedCode {
@@ -129,6 +130,7 @@ impl From<&Code> for CachedCode {
                 .collect(),
             unwind: code.unwind.clone(),
             lines: code.lines.clone(),
+            slots: code.slots.clone(),
         }
     }
 }
@@ -155,6 +157,7 @@ impl CachedCode {
                 .collect(),
             unwind: self.unwind.clone(),
             lines: self.lines.clone(),
+            slots: self.slots.clone(),
         }
     }
 }
@@ -183,11 +186,12 @@ impl StoredCode {
     pub(super) fn key(
         optimization: super::backend::Optimization,
         func: &cranelift_codegen::ir::Function,
+        named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
     ) -> Option<[u8; KEY]> {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 2");
+        hasher.update(b"rustd llvm 3");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
         // Nor does it tell which statement an instruction is of, which the code's lines do.
@@ -196,6 +200,11 @@ impl StoredCode {
                 hasher.update(func.srcloc(inst).bits().to_le_bytes());
             }
         }
+        // Nor which slots hold a local with a name, which the code says the places of.
+        for slot in named {
+            hasher.update(slot.as_u32().to_le_bytes());
+        }
+        hasher.update(u32::MAX.to_le_bytes());
         for (_, name) in func.params.user_named_funcs().iter() {
             hasher.update(name.namespace.to_le_bytes());
             hasher.update(name.index.to_le_bytes());
@@ -283,7 +292,7 @@ impl Entry {
     /// same name in a build with the checks and in one without.
     pub(super) fn key(name: &str, debug: bool, checks_overflow: Option<bool>) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd entry 5");
+        hasher.update(b"rustd entry 6");
         // Code of one producer is not what another would have given.
         hasher.update(super::Backend::from_env().ok()?.to_string());
         // Nor is code for one target what another runs.

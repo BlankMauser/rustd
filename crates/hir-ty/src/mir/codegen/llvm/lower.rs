@@ -24,8 +24,8 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     debug_info::{
-        AsDIScope, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind, DWARFSourceLanguage,
-        DebugInfoBuilder, debug_metadata_version,
+        AsDIScope, DIFile, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind,
+        DWARFSourceLanguage, DebugInfoBuilder, debug_metadata_version,
     },
     intrinsics::Intrinsic,
     module::{FlagBehavior, Linkage, Module},
@@ -105,10 +105,15 @@ pub(super) struct Lowering<'ctx, 'f> {
 }
 
 /// The source locations of the IR as lines of a file that is not there, for LLVM to say
-/// in its line table which instructions became which code. `emitted` reads the table back.
+/// in its line table which instructions became which code, and the stack slots of named
+/// locals as variables, for it to say where it kept them. `emitted` reads both back.
+/// `DW_ATE_unsigned`: the bytes of a slot are told to LLVM as one number.
+const DW_ATE_UNSIGNED: u32 = 0x07;
+
 struct Marks<'ctx> {
     builder: DebugInfoBuilder<'ctx>,
     function: DISubprogram<'ctx>,
+    file: DIFile<'ctx>,
 }
 
 impl<'ctx> Marks<'ctx> {
@@ -116,6 +121,9 @@ impl<'ctx> Marks<'ctx> {
         let context = module.get_context();
         let version = context.i32_type().const_int(debug_metadata_version().into(), false);
         module.add_basic_value_flag("Debug Info Version", FlagBehavior::Warning, version);
+        // The places are written into a unit of this version (see `debuginfo`).
+        let dwarf = context.i32_type().const_int(4, false);
+        module.add_basic_value_flag("Dwarf Version", FlagBehavior::Warning, dwarf);
         let (builder, unit) = module.create_debug_info_builder(
             false,
             DWARFSourceLanguage::Rust,
@@ -126,7 +134,7 @@ impl<'ctx> Marks<'ctx> {
             "",
             0,
             "",
-            DWARFEmissionKind::LineTablesOnly,
+            DWARFEmissionKind::Full,
             0,
             false,
             false,
@@ -149,7 +157,7 @@ impl<'ctx> Marks<'ctx> {
             false,
         );
         function.set_subprogram(subprogram);
-        Marks { builder, function: subprogram }
+        Marks { builder, function: subprogram, file }
     }
 }
 
@@ -159,6 +167,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         context: &'ctx Context,
         module: &'f Module<'ctx>,
         func: &'f ir::Function,
+        named: &[ir::StackSlot],
     ) -> Lowered<()> {
         let ty = Self::function_type(context, &func.signature)?;
         let function = module.add_function(OWN, ty, Some(Linkage::External));
@@ -194,7 +203,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             marks: (target.object_format == ObjectFormat::Elf)
                 .then(|| Marks::new(module, function)),
         };
-        lowering.body()?;
+        lowering.body(named)?;
         if let Some(marks) = &lowering.marks {
             marks.builder.finalize();
         }
@@ -210,10 +219,41 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         self.builder.set_current_debug_location(location);
     }
 
+    /// Tells LLVM that `alloca` is a variable of `size` bytes named by the number of `slot`,
+    /// so that it says where the bytes of the slot are kept once it is done with them.
+    fn declare(
+        &self,
+        slot: ir::StackSlot,
+        alloca: PointerValue<'ctx>,
+        size: u32,
+        block: BasicBlock<'ctx>,
+    ) -> Lowered<()> {
+        let Some(marks) = &self.marks else { return Ok(()) };
+        let name = slot.as_u32().to_string();
+        let ty = marks
+            .builder
+            .create_basic_type(&name, u64::from(size) * 8, DW_ATE_UNSIGNED, DIFlags::ZERO)
+            .map_err(|e| Unhandled::Llvm(e.to_string()))?;
+        let scope = marks.function.as_debug_info_scope();
+        let variable = marks.builder.create_auto_variable(
+            scope,
+            &name,
+            marks.file,
+            0,
+            ty.as_type(),
+            true,
+            DIFlags::ZERO,
+            0,
+        );
+        let location = marks.builder.create_debug_location(self.context, 0, 0, scope, None);
+        marks.builder.insert_declare_at_end(alloca, Some(variable), None, location, block);
+        Ok(())
+    }
+
     /// 1. Allocas for the stack slots, in a block ahead of the entry block.
     /// 2. A block and its phis for every reachable block.
     /// 3. The instructions, in an order that has every value defined before it is used.
-    fn body(&mut self) -> Lowered<()> {
+    fn body(&mut self, named: &[ir::StackSlot]) -> Lowered<()> {
         let Some(entry) = self.func.layout.entry_block() else {
             return Err(Unhandled::Shape("function without blocks"));
         };
@@ -230,6 +270,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 .set_alignment(align)
                 .map_err(|e| Unhandled::Llvm(e.to_string()))?;
             self.slots.insert(slot, alloca);
+            if named.contains(&slot) {
+                self.declare(slot, alloca, data.size, frame)?;
+            }
         }
 
         let order = self.reverse_post_order(entry);

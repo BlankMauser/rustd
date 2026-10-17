@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 use super::{OWN, Symbol, Unhandled};
 use crate::mir::codegen::{
     ConstBlob,
-    debuginfo::LineRow,
+    debuginfo::{LineRow, SlotPlaces, VariablePlace},
     fragment::{Code, Recorder},
     unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
@@ -100,8 +100,114 @@ impl<'data> Emitted<'data> {
             }
         };
         let lines = emitted.lines()?;
+        let slots = emitted.slots().unwrap_or_default();
         let Emitted { bytes, align, relocs, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, unwind, lines })
+        Ok(Code { signature, bytes, align, relocs, unwind, lines, slots })
+    }
+
+    /// Where LLVM kept the stack slots `lower` told it of as variables, which are named by
+    /// the numbers of the slots. `None` where what it wrote is not understood; a slot it
+    /// kept nowhere a debugger can read has no place.
+    fn slots(&self) -> Option<SlotPlaces> {
+        self.file.section_by_name(".debug_info")?;
+        let owned = gimli::Dwarf::load(|id| self.relocated(id.name()).ok_or(())).ok()?;
+        let dwarf = owned.borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
+        let unit = dwarf.unit(dwarf.units().next().ok()??).ok()?;
+        let mut places = SlotPlaces::default();
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().ok()? {
+            match entry.tag() {
+                gimli::DW_TAG_subprogram => {
+                    if let Some(base) = entry.attr_value(gimli::DW_AT_frame_base)
+                        && let Some(base) = base.exprloc_value()
+                    {
+                        places.frame_base = base.0.slice().to_vec();
+                    }
+                }
+                gimli::DW_TAG_variable => {
+                    let name = entry.attr_value(gimli::DW_AT_name)?;
+                    let name = dwarf.attr_string(&unit, name).ok()?;
+                    let slot = name.to_string().ok()?.parse().ok()?;
+                    let mut ranges = Vec::new();
+                    match entry.attr_value(gimli::DW_AT_location) {
+                        None => {}
+                        Some(gimli::AttributeValue::Exprloc(place)) => {
+                            ranges.push((0, self.code, place));
+                        }
+                        Some(list) => {
+                            let mut list = dwarf.attr_locations(&unit, list).ok()??;
+                            while let Some(place) = list.next().ok()? {
+                                let range = place.range;
+                                ranges.push((range.begin as u32, range.end as u32, place.data));
+                            }
+                        }
+                    }
+                    let ranges = ranges
+                        .into_iter()
+                        .filter(|it| Self::is_of_frame(it.2, unit.encoding()))
+                        .map(|(from, to, place)| (from, to, place.0.slice().to_vec()))
+                        .collect();
+                    places.slots.push((slot, VariablePlace::Ranges(ranges)));
+                }
+                _ => {}
+            }
+        }
+        (!places.frame_base.is_empty()).then_some(places)
+    }
+
+    /// Whether `place` says where a value is by registers, the frame and numbers alone, so
+    /// that it means the same wherever the function ends up and in whatever unit it is
+    /// written.
+    fn is_of_frame(
+        place: gimli::Expression<EndianSlice<'_, LittleEndian>>,
+        encoding: gimli::Encoding,
+    ) -> bool {
+        use gimli::Operation;
+        let mut operations = place.operations(encoding);
+        loop {
+            match operations.next() {
+                Ok(None) => return true,
+                Ok(Some(
+                    Operation::Register { .. }
+                    | Operation::FrameOffset { .. }
+                    | Operation::Piece { .. }
+                    | Operation::StackValue
+                    | Operation::UnsignedConstant { .. }
+                    | Operation::SignedConstant { .. }
+                    | Operation::PlusConstant { .. }
+                    | Operation::Plus
+                    | Operation::Minus
+                    | Operation::And
+                    | Operation::Or
+                    | Operation::Shl
+                    | Operation::Shr
+                    | Operation::Shra
+                    | Operation::ImplicitValue { .. },
+                )) => {}
+                Ok(Some(Operation::RegisterOffset { base_type, .. })) if base_type.0 == 0 => {}
+                Ok(Some(Operation::Deref { base_type, space: false, .. })) if base_type.0 == 0 => {}
+                _ => return false,
+            }
+        }
+    }
+
+    /// The bytes of the section `name` with what its relocations say filled in, as far as
+    /// that is known before linking: the function starts its section, and every other
+    /// section is on its own.
+    fn relocated(&self, name: &str) -> Option<Vec<u8>> {
+        let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
+        let mut bytes = section.data().ok()?.to_vec();
+        for (offset, relocation) in section.relocations() {
+            if relocation.kind() != object::RelocationKind::Absolute {
+                return None;
+            }
+            let symbol = Self::symbol(&self.file, &relocation).ok()?;
+            let value = symbol.address().wrapping_add_signed(relocation.addend());
+            let size = usize::from(relocation.size() / 8);
+            let at = bytes.get_mut(offset as usize..)?.get_mut(..size)?;
+            at.copy_from_slice(value.to_le_bytes().get(..size)?);
+        }
+        Some(bytes)
     }
 
     /// Which source location the code is of from each offset on, from the line table: the

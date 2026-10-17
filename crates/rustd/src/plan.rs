@@ -63,6 +63,42 @@ pub(crate) struct Profile {
     pub(crate) debug_assertions: bool,
     pub(crate) overflow_checks: bool,
     pub(crate) panic: PanicStrategy,
+    debuginfo: DebugLevel,
+    split_debuginfo: Option<String>,
+    strip: Strip,
+}
+
+/// A `debug` setting as cargo passes it on: a level by its number or by its name.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum DebugLevel {
+    Number(u8),
+    Named(String),
+}
+
+/// A `strip` setting. One cargo deferred is its own choice for a build without debug info,
+/// which has nothing the setting would take out.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Strip {
+    Resolved(Stripped),
+    Deferred(Stripped),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+enum Stripped {
+    None,
+    Named(String),
+}
+
+/// What a build tells a debugger of its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Described {
+    Nothing,
+    /// Which line each instruction is of, and the functions.
+    Lines,
+    /// The variables and their types as well.
+    Full,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -98,7 +134,53 @@ impl Profile {
             debug_assertions,
             overflow_checks: flags.overflow_checks.or(named_overflow).unwrap_or(debug_assertions),
             panic: flags.panic.unwrap_or(self.panic),
+            debuginfo: flags.debuginfo.clone().unwrap_or_else(|| self.debuginfo.clone()),
+            split_debuginfo: flags.split_debuginfo.clone().or_else(|| self.split_debuginfo.clone()),
+            strip: flags.strip.clone().map_or_else(
+                || self.strip.clone(),
+                |named| Strip::Resolved(Stripped::Named(named)),
+            ),
             ..self.clone()
+        }
+    }
+
+    /// What the profile has a debugger told. Where the profile asks for it to be kept apart
+    /// from the program, which rustd does not do, that is the reason not to build.
+    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+        let described = match &self.debuginfo {
+            DebugLevel::Number(0) => Described::Nothing,
+            DebugLevel::Number(1) => Described::Lines,
+            DebugLevel::Number(2) => Described::Full,
+            DebugLevel::Named(name) => match name.as_str() {
+                "none" => Described::Nothing,
+                "line-directives-only" | "line-tables-only" | "limited" => Described::Lines,
+                "full" => Described::Full,
+                _ => anyhow::bail!("`debug = \"{name}\"`: rustd does not know the level"),
+            },
+            DebugLevel::Number(level) => {
+                anyhow::bail!("`debug = {level}`: rustd does not know the level")
+            }
+        };
+        // Stripping the symbols is the linker's to do; of what rustd writes, what a debugger
+        // reads is all either setting takes out.
+        let stripped = match &self.strip {
+            Strip::Resolved(Stripped::Named(what)) => match what.as_str() {
+                "none" => false,
+                "debuginfo" | "symbols" => true,
+                _ => anyhow::bail!("`strip = \"{what}\"`: rustd does not know the setting"),
+            },
+            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
+        };
+        if stripped || described == Described::Nothing {
+            return Ok(Described::Nothing);
+        }
+        match self.split_debuginfo.as_deref() {
+            None | Some("off") => Ok(described),
+            Some(split) => anyhow::bail!(
+                "`split-debuginfo = \"{split}\"`: rustd writes what a debugger reads into the \
+                 object and the program, and has no `.dwo`, `.dwp` or `.dSYM` to keep it in. \
+                 Build with `split-debuginfo = \"off\"`, or with `debug = false`"
+            ),
         }
     }
 
@@ -135,6 +217,9 @@ struct Flags {
     overflow_checks: Option<bool>,
     panic: Option<PanicStrategy>,
     lto: bool,
+    debuginfo: Option<DebugLevel>,
+    split_debuginfo: Option<String>,
+    strip: Option<String>,
 }
 
 impl Flags {
@@ -183,6 +268,7 @@ impl Flags {
         while let Some(word) = words.next() {
             let option = match word {
                 "-O" => "opt-level=3",
+                "-g" => "debuginfo=2",
                 "-C" => words.next().unwrap_or_default(),
                 _ => match word.strip_prefix("-C") {
                     Some(option) => option,
@@ -203,6 +289,14 @@ impl Flags {
                 "panic" if value == "unwind" => flags.panic = Some(PanicStrategy::Unwind),
                 "lto" => flags.lto = on != Some(false),
                 "linker-plugin-lto" => flags.lto = on != Some(false),
+                "debuginfo" => {
+                    flags.debuginfo = Some(match value.parse() {
+                        Ok(level) => DebugLevel::Number(level),
+                        Err(_) => DebugLevel::Named(value.to_owned()),
+                    });
+                }
+                "split-debuginfo" => flags.split_debuginfo = Some(value.to_owned()),
+                "strip" => flags.strip = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -287,6 +381,16 @@ impl Plan {
         let graph: UnitGraph =
             serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")?;
         graph.plan(&Flags::of(dir, triple)?)
+    }
+
+    /// What the build has a debugger told of the packages cargo was asked to build: the
+    /// most any of them asks for, which is one answer for all the code rustd writes.
+    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+        let mut described = Described::Nothing;
+        for built in self.packages.values().filter(|it| it.primary) {
+            described = described.max(built.profile.described()?);
+        }
+        Ok(described)
     }
 
     /// How the package cargo calls `id` is built, when the build has it.

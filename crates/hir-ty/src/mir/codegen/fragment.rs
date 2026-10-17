@@ -25,7 +25,8 @@ use crate::{
 
 use super::{
     CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
-    debuginfo::LineRow, unwind::FunctionUnwind,
+    debuginfo::{LineRow, SlotPlaces},
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -88,6 +89,8 @@ pub(super) struct Code {
     pub(super) unwind: Option<FunctionUnwind>,
     /// Which statement the code is of, from each offset where that changes.
     pub(super) lines: Vec<LineRow>,
+    /// Where the slots of named locals are, for a debugger.
+    pub(super) slots: SlotPlaces,
 }
 
 impl PartialEq for Code {
@@ -110,6 +113,7 @@ impl PartialEq for Code {
             && self.signature == other.signature
             && self.unwind == other.unwind
             && self.lines == other.lines
+            && self.slots == other.slots
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
                 a.offset == b.offset
@@ -142,8 +146,20 @@ pub(super) struct Variable {
     pub(super) binding: BindingId,
     pub(super) param: bool,
     pub(super) ty: StoredTy,
-    /// Where the slot is from the frame pointer.
-    pub(super) offset: i64,
+    /// The number of the stack slot it is kept in.
+    pub(super) slot: u32,
+    /// The slot holds where the local is rather than the local.
+    pub(super) pointer: bool,
+}
+
+/// A local written with a name, as the function that is being built keeps it.
+pub(super) struct Named {
+    pub(super) binding: BindingId,
+    pub(super) param: bool,
+    pub(super) ty: StoredTy,
+    pub(super) slot: ir::StackSlot,
+    /// The slot holds where the local is rather than the local.
+    pub(super) pointer: bool,
 }
 
 /// The value of a static rustc exports no symbol for.
@@ -180,12 +196,16 @@ pub(super) struct Recorder<'db> {
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
     span_ids: FxHashMap<MirSpan, u32>,
-    /// The locals written with a name that have a stack slot of their own, and whether each
-    /// is a parameter.
-    pub(super) named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
+    /// The locals written with a name that a stack slot of their own tells where they are.
+    pub(super) named: Vec<Named>,
 }
 
 impl<'db> Recorder<'db> {
+    /// The stack slots that hold a local written with a name.
+    pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
+        self.named.iter().map(|it| it.slot)
+    }
+
     pub(super) fn new(
         db: &'db dyn HirDatabase,
         isa: &'static dyn TargetIsa,

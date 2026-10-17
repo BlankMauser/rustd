@@ -124,7 +124,7 @@ struct Args {
     /// cargo builds it for that target, and the objects are of its format and architecture.
     target: Option<String>,
     /// Whether the code is to say which lines it is of: what `profile` asks for.
-    debug: bool,
+    debug: plan::Described,
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
@@ -243,7 +243,7 @@ impl Args {
             profile: profile.unwrap_or_else(|| "dev".to_owned()),
             also,
             target,
-            debug: false,
+            debug: plan::Described::Nothing,
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
@@ -261,7 +261,7 @@ struct Resolver<'a> {
     rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
     /// Whether the code is to say which lines it is of.
-    debug: bool,
+    debug: plan::Described,
     listed: &'a Listed,
 }
 
@@ -604,7 +604,11 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        self.debug.then(|| self.root.to_string_lossy().into_owned())
+        (self.debug != plan::Described::Nothing).then(|| self.root.to_string_lossy().into_owned())
+    }
+
+    fn describes_variables(&self) -> bool {
+        self.debug == plan::Described::Full
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
@@ -918,6 +922,7 @@ fn load(
         compared: Default::default(),
         roots: Vec::new(),
         splits: Vec::new(),
+        described: Vec::new(),
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
         load_config,
@@ -942,6 +947,8 @@ struct Checkouts {
     roots: Vec<(PathBuf, PathBuf)>,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
     splits: Vec<Option<Split>>,
+    /// For each of `roots`, what its build has a debugger told, when cargo plans the build.
+    described: Vec<Option<plan::Described>>,
     loaded: load_cargo::Loaded,
     cargo_config: CargoConfig,
     load_config: LoadCargoConfig,
@@ -964,7 +971,7 @@ impl Checkouts {
         let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
-        Ok(Parts { root, base, members })
+        Ok(Parts { root, base, members, described: self.described[at] })
     }
 
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
@@ -1157,6 +1164,7 @@ impl Checkouts {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let mut splits = Vec::new();
+        let mut described = Vec::new();
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
         let share = std::env::var_os("RUSTD_SPLIT").is_none_or(|it| it != "0");
         for project in projects {
@@ -1165,12 +1173,14 @@ impl Checkouts {
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
                 splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                described.push(self.described[base]);
                 roots.push((dunce::canonicalize(project)?, over));
                 continue;
             }
             splits.push(None);
-            let workspace =
+            let (workspace, told) =
                 workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
+            described.push(told);
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
@@ -1189,6 +1199,7 @@ impl Checkouts {
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.roots.extend(roots);
         self.splits.extend(splits);
+        self.described.extend(described);
         Ok(())
     }
 }
@@ -1198,6 +1209,8 @@ struct Parts {
     root: PathBuf,
     base: Option<PathBuf>,
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    /// What the build has a debugger told, when cargo plans it.
+    described: Option<plan::Described>,
 }
 
 /// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
@@ -1317,15 +1330,34 @@ struct View {
     project: PathBuf,
 }
 
+/// What a build has a debugger told: what cargo's plan of it says, and for a project cargo
+/// does not plan, what its manifest does.
+fn described_by(planned: Option<plan::Described>, root: &Path, profile: &str) -> plan::Described {
+    // An override for measuring one against the other.
+    match std::env::var("RUSTD_DEBUGINFO").ok().as_deref() {
+        Some("0") => return plan::Described::Nothing,
+        Some("lines") => return plan::Described::Lines,
+        Some(_) => return plan::Described::Full,
+        None => {}
+    }
+    planned.unwrap_or_else(|| match profile::debug(root, profile) {
+        true => plan::Described::Full,
+        false => plan::Described::Nothing,
+    })
+}
+
+/// The workspace of `project` as `selection` builds it, and what that build has a debugger
+/// told when cargo plans it.
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
-) -> anyhow::Result<ProjectWorkspace> {
+) -> anyhow::Result<(ProjectWorkspace, Option<plan::Described>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut described = None;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1340,6 +1372,7 @@ fn workspace_at(
         )?;
         let triple = triple.first().context("no target to build for")?;
         let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, triple)?;
+        described = Some(plan.described()?);
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
@@ -1352,7 +1385,7 @@ fn workspace_at(
         let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
         workspace.set_build_scripts(build_scripts);
     }
-    Ok(workspace)
+    Ok((workspace, described))
 }
 
 /// What the checkouts loaded have in common, and what holding them costs.
@@ -2392,7 +2425,7 @@ impl Target {
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
         let Target { project, krate, out, patch, link_cmd, splice, symbol_files } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
-        let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
+        let Parts { root: checkout, base, members, .. } = checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = std::iter::once(&daemon.krate)
@@ -2851,9 +2884,9 @@ fn main() -> anyhow::Result<()> {
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
-    let Parts { root, base, members } = checkouts.parts(&args.project)?;
+    let Parts { root, base, members, described } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
-    args.debug = profile::debug(&args.checkout, &args.profile);
+    args.debug = described_by(described, &args.checkout, &args.profile);
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
 
@@ -2883,7 +2916,7 @@ fn main() -> anyhow::Result<()> {
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
-        let Parts { root: checkout, base, members } = checkouts.parts(also)?;
+        let Parts { root: checkout, base, members, .. } = checkouts.parts(also)?;
         let resolved = resolve_crates(&db, &Args { checkout, base, members, ..args.clone() })?;
         eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
     }

@@ -18,16 +18,20 @@ pub(super) use types::Types;
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
-        self, DW_AT_byte_size, DW_AT_comp_dir, DW_AT_count, DW_AT_data_member_location,
-        DW_AT_decl_file, DW_AT_decl_line, DW_AT_encoding, DW_AT_frame_base, DW_AT_high_pc,
+        self, DW_AT_artificial, DW_AT_byte_size, DW_AT_comp_dir, DW_AT_const_value, DW_AT_count,
+        DW_AT_data_member_location, DW_AT_decl_file, DW_AT_decl_line, DW_AT_discr,
+        DW_AT_discr_value, DW_AT_encoding, DW_AT_enum_class, DW_AT_frame_base, DW_AT_high_pc,
         DW_AT_language, DW_AT_linkage_name, DW_AT_location, DW_AT_low_pc, DW_AT_name,
         DW_AT_producer, DW_AT_ranges, DW_AT_stmt_list, DW_AT_type, DW_TAG_array_type,
-        DW_TAG_base_type, DW_TAG_formal_parameter, DW_TAG_member, DW_TAG_pointer_type,
-        DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_variable, DwAte,
-        Encoding, Format, LineEncoding, Register, RunTimeEndian, SectionId,
+        DW_TAG_base_type, DW_TAG_enumeration_type, DW_TAG_enumerator, DW_TAG_formal_parameter,
+        DW_TAG_lexical_block, DW_TAG_member, DW_TAG_pointer_type, DW_TAG_structure_type,
+        DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_template_type_parameter, DW_TAG_union_type,
+        DW_TAG_variable, DW_TAG_variant, DW_TAG_variant_part, DwAte, Encoding, Format,
+        LineEncoding, RunTimeEndian, SectionId,
         write::{
             Address, AttributeValue, DwarfUnit, EndianVec, Expression, FileId, LineProgram,
-            LineString, Range, RangeList, Result as WriteResult, Sections, UnitEntryId, Writer,
+            LineString, Location, LocationList, Range, RangeList, Result as WriteResult, Sections,
+            UnitEntryId, Writer,
         },
     },
     ir,
@@ -89,9 +93,13 @@ pub(super) struct Place {
     pub(super) column: u32,
 }
 
+/// A type among the types of a [`FunctionDebug`], by its place in them.
+pub(super) type TypeIndex = u32;
+
 /// What a debugger is told of a type: its name, its size, and what it is made of as far as
-/// that is told.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// that is told. A type names the types it is made of by their place in the same list, so
+/// one that points to itself can be told of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum DebugType {
     /// A number, a `bool` or a `char`, whose bytes are read as the `DW_ATE_*` of `encoding`.
     Base {
@@ -102,35 +110,168 @@ pub(super) enum DebugType {
     /// A pointer of one word. `to` is `None` where what it points to is not told.
     Pointer {
         name: String,
-        to: Option<Box<DebugType>>,
+        to: Option<TypeIndex>,
     },
     Array {
-        of: Box<DebugType>,
+        of: TypeIndex,
         len: u64,
     },
-    /// A struct, a tuple, or a pointer of two words. One without fields may have some that
-    /// are not told.
-    Struct {
+    /// A struct, a tuple, a closure or a pointer of two words. One without fields may have
+    /// some that are not told.
+    Struct(Aggregate),
+    Union(Aggregate),
+    /// An enum none of whose variants has a field: a number with a name for each value.
+    Names {
         name: String,
         size: u64,
-        fields: Vec<Field>,
+        names: Vec<(String, u64)>,
+    },
+    /// An enum with fields. `tag` is `None` where there is one variant and nothing says which.
+    Enum {
+        of: Aggregate,
+        tag: Option<Tag>,
+        variants: Vec<Variant>,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A name, a size, the fields and the types the generic parameters stand for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Aggregate {
+    pub(super) name: String,
+    pub(super) size: u64,
+    pub(super) fields: Vec<Field>,
+    pub(super) parameters: Vec<(String, TypeIndex)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Field {
     pub(super) name: String,
     pub(super) offset: u64,
-    pub(super) ty: DebugType,
+    pub(super) ty: TypeIndex,
 }
 
-/// A parameter or a `let` of a function, and where its value is from the frame pointer.
+/// Where an enum keeps which variant a value is of: an unsigned number of `size` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Tag {
+    pub(super) offset: u64,
+    pub(super) size: u64,
+}
+
+/// A variant of an enum. `tag` is the value of the tag that says a value is of this variant;
+/// the variant without one is what every other value of the tag means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Variant {
+    pub(super) name: String,
+    pub(super) tag: Option<u64>,
+    pub(super) fields: Vec<Field>,
+}
+
+/// Where the value of a variable is while the function runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum VariablePlace {
+    /// In the frame, this far from what the frame is found by, from the first instruction
+    /// to the last.
+    Frame(i64),
+    /// What a DWARF expression says, for the code from the first offset up to the second.
+    /// Code of no range has the value nowhere a debugger can read it.
+    Ranges(Vec<(CodeOffset, CodeOffset, Vec<u8>)>),
+}
+
+/// Where the stack slots of a function are while it runs, for the ones that hold a local
+/// written with a name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SlotPlaces {
+    /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
+    pub(super) frame_base: Vec<u8>,
+    /// The number of a slot and where its bytes are.
+    pub(super) slots: Vec<(u32, VariablePlace)>,
+}
+
+impl SlotPlaces {
+    /// The places in a frame Cranelift laid out, which it finds by the frame pointer.
+    pub(super) fn of_frame(
+        isa: &dyn TargetIsa,
+        frame: &cranelift_codegen::MachBufferFrameLayout,
+        slots: impl Iterator<Item = ir::StackSlot>,
+    ) -> SlotPlaces {
+        // FIXME: variables are told of on x86-64 alone, by `rbp`.
+        if isa.triple().architecture != target_lexicon::Architecture::X86_64 {
+            return SlotPlaces::default();
+        }
+        let to_fp = i64::from(frame.frame_to_fp_offset);
+        let slots = slots
+            .filter_map(|slot| {
+                let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
+                Some((slot.as_u32(), VariablePlace::Frame(offset)))
+            })
+            .collect();
+        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + gimli::X86_64::RBP.0 as u8], slots }
+    }
+}
+
+impl VariablePlace {
+    /// Where the value is that this place holds the address of. Code a debugger cannot
+    /// read the address in has no place for the value.
+    pub(super) fn pointee(&self) -> VariablePlace {
+        let ranges = match self {
+            VariablePlace::Frame(offset) => {
+                let mut held = vec![gimli::DW_OP_fbreg.0];
+                // An expression of one operation writes nowhere it can fail.
+                let _ = gimli::leb128::write::signed(&mut held, *offset);
+                vec![(0, CodeOffset::MAX, held)]
+            }
+            VariablePlace::Ranges(ranges) => ranges.clone(),
+        };
+        let ranges = ranges
+            .into_iter()
+            .filter_map(|(from, to, held)| Some((from, to, pointee_expression(&held)?)))
+            .collect();
+        VariablePlace::Ranges(ranges)
+    }
+}
+
+/// The expression of the memory an address is of, from the one of where the address is
+/// held: in a register, or in memory a single operation finds.
+fn pointee_expression(held: &[u8]) -> Option<Vec<u8>> {
+    let (&operation, operands) = held.split_first()?;
+    let register = gimli::DW_OP_reg0.0..=gimli::DW_OP_reg31.0;
+    let based = gimli::DW_OP_breg0.0..=gimli::DW_OP_breg31.0;
+    if register.contains(&operation) && operands.is_empty() {
+        return Some(vec![operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]);
+    }
+    if operation != gimli::DW_OP_fbreg.0 && !based.contains(&operation) {
+        return None;
+    }
+    // The one operand is a LEB128 number, which ends at the first byte without the high bit.
+    let end = operands.iter().position(|byte| byte & 0x80 == 0)?;
+    (end + 1 == operands.len()).then(|| [held, &[gimli::DW_OP_deref.0]].concat())
+}
+
+impl SlotPlaces {
+    pub(super) fn of(&self, slot: u32) -> Option<&VariablePlace> {
+        self.slots.iter().find(|it| it.0 == slot).map(|it| &it.1)
+    }
+}
+
+/// A part of a function its names are looked up in: the body, a block, what follows a `let`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Scope {
+    /// The scope this one is inside of, by its place among the scopes. It comes before.
+    pub(super) parent: Option<u32>,
+    /// The code of the scope and of the scopes inside it, in the order of the offsets.
+    pub(super) ranges: Vec<(CodeOffset, CodeOffset)>,
+}
+
+/// A parameter or a `let` of a function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct VariableDebug {
     pub(super) name: String,
     pub(super) param: bool,
-    pub(super) ty: DebugType,
-    pub(super) offset: i64,
+    pub(super) ty: TypeIndex,
+    pub(super) place: VariablePlace,
+    /// The scope the name is known in, by its place among the scopes: `None` is all of the
+    /// function.
+    pub(super) scope: Option<u32>,
 }
 
 /// What a debugger is told about one function, with nothing in it that depends on where the
@@ -147,7 +288,12 @@ pub(super) struct FunctionDebug {
     pub(super) declared: Option<Place>,
     /// Where the code is from, from each offset on, in the order of the offsets.
     pub(super) rows: Vec<(CodeOffset, Place)>,
+    /// The types of the variables and what those are made of.
+    pub(super) types: Vec<DebugType>,
+    pub(super) scopes: Vec<Scope>,
     pub(super) variables: Vec<VariableDebug>,
+    /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
+    pub(super) frame_base: Vec<u8>,
 }
 
 impl FunctionDebug {
@@ -158,7 +304,10 @@ impl FunctionDebug {
             files: Vec::new(),
             declared: None,
             rows: Vec::new(),
+            types: Vec::new(),
+            scopes: Vec::new(),
             variables: Vec::new(),
+            frame_base: Vec::new(),
         }
     }
 
@@ -180,20 +329,45 @@ impl FunctionDebug {
     }
 }
 
-/// The compilation unit of an object, which every function of the object is described in.
+/// How many functions a compilation unit describes before the next one is begun. What reads
+/// a unit reads all of it to find one function, so a unit of every function of a large
+/// object takes a debugger or `addr2line` a second to answer from.
+const FUNCTIONS_OF_A_UNIT: usize = 256;
+
+/// The compilation units of an object, which every function of the object is described in.
 pub(super) struct DebugContext {
+    /// The unit functions are being added to.
     dwarf: DwarfUnit,
+    /// The units that have all their functions.
+    full: Vec<gimli::write::Unit>,
+    encoding: Encoding,
+    directory: Vec<u8>,
     files: FxHashMap<String, FileId>,
     ranges: Vec<Range>,
-    types: FxHashMap<DebugType, UnitEntryId>,
-    /// The register a frame is found by, where variables are told of.
-    frame: Option<Register>,
+    types: FxHashMap<SharedType, UnitEntryId>,
+    /// Whether the variables of the functions are told of, and not their lines alone.
+    variables: bool,
+}
+
+/// What tells one type of the unit from another: every function with a variable of the
+/// type shares its entry.
+#[derive(PartialEq, Eq, Hash)]
+enum SharedType {
+    Named(gimli::DwTag, String, u64),
+    Array(UnitEntryId, u64),
+}
+
+/// The entries of one function's types, as far as they have been asked for.
+struct FunctionTypes<'a> {
+    types: &'a [DebugType],
+    entries: Vec<Option<UnitEntryId>>,
 }
 
 impl DebugContext {
     /// The unit of an object for `isa` whose files are named from `directory`, or `None`
-    /// where the tables are not written yet: only ELF has them.
-    pub(super) fn new(isa: &dyn TargetIsa, directory: &str) -> Option<Self> {
+    /// where the tables are not written yet: only ELF has them. The variables of the
+    /// functions are left out unless `variables` asks for them.
+    pub(super) fn new(isa: &dyn TargetIsa, directory: &str, variables: bool) -> Option<Self> {
         if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf
             || super::Target::current().is_wasm()
         {
@@ -201,19 +375,34 @@ impl DebugContext {
         }
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
-        let mut dwarf = DwarfUnit::new(encoding);
-        let directory = directory.as_bytes().to_vec();
-        dwarf.unit.line_program = LineProgram::new(
+        let mut context = DebugContext {
+            dwarf: DwarfUnit::new(encoding),
+            full: Vec::new(),
             encoding,
+            directory: directory.as_bytes().to_vec(),
+            files: FxHashMap::default(),
+            ranges: Vec::new(),
+            types: FxHashMap::default(),
+            variables,
+        };
+        context.begin_unit();
+        Some(context)
+    }
+
+    /// Sets up the unit functions are added to, which is a new one.
+    fn begin_unit(&mut self) {
+        let dwarf = &mut self.dwarf;
+        dwarf.unit.line_program = LineProgram::new(
+            self.encoding,
             LineEncoding::default(),
-            LineString::String(directory.clone()),
+            LineString::String(self.directory.clone()),
             None,
             LineString::String(b"<rustd>".to_vec()),
             None,
         );
         let producer = dwarf.strings.add(concat!("rustd ", env!("CARGO_PKG_VERSION")));
         let name = dwarf.strings.add("<rustd>");
-        let directory = dwarf.strings.add(directory);
+        let directory = dwarf.strings.add(self.directory.clone());
         let root = dwarf.unit.get_mut(dwarf.unit.root());
         root.set(DW_AT_producer, AttributeValue::StringRef(producer));
         root.set(DW_AT_language, AttributeValue::Language(gimli::DW_LANG_Rust));
@@ -221,16 +410,24 @@ impl DebugContext {
         root.set(DW_AT_comp_dir, AttributeValue::StringRef(directory));
         root.set(DW_AT_stmt_list, AttributeValue::LineProgramRef);
         root.set(DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
-        // FIXME: variables are told of on x86-64 alone, by `rbp`.
-        let frame = (isa.triple().architecture == target_lexicon::Architecture::X86_64)
-            .then_some(gimli::X86_64::RBP);
-        Some(DebugContext {
-            dwarf,
-            files: FxHashMap::default(),
-            ranges: Vec::new(),
-            types: FxHashMap::default(),
-            frame,
-        })
+    }
+
+    /// Ends the unit functions were added to, which is left out when it has none, and
+    /// begins the next.
+    fn end_unit(&mut self) {
+        let next = gimli::write::Unit::new(self.encoding, LineProgram::none());
+        let mut unit = std::mem::replace(&mut self.dwarf.unit, next);
+        let ranges = std::mem::take(&mut self.ranges);
+        self.files.clear();
+        self.types.clear();
+        self.begin_unit();
+        if ranges.is_empty() {
+            return;
+        }
+        let ranges = unit.ranges.add(RangeList(ranges));
+        let root = unit.root();
+        unit.get_mut(root).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
+        self.full.push(unit);
     }
 
     fn file(&mut self, name: &str) -> FileId {
@@ -244,51 +441,177 @@ impl DebugContext {
         id
     }
 
-    /// The entry of `ty`, which every variable of the type shares.
-    fn ty(&mut self, ty: &DebugType) -> UnitEntryId {
-        if let Some(&entry) = self.types.get(ty) {
-            return entry;
+    /// The entry of the type at `index` of `of`.
+    fn ty(&mut self, of: &mut FunctionTypes<'_>, index: TypeIndex) -> Option<UnitEntryId> {
+        if let Some(entry) = of.entries.get(index as usize).copied()? {
+            return Some(entry);
         }
-        let root = self.dwarf.unit.root();
-        let entry = match ty {
-            DebugType::Base { name, size, encoding } => {
-                let entry = self.named(root, DW_TAG_base_type, name);
-                let unit = self.dwarf.unit.get_mut(entry);
-                unit.set(DW_AT_byte_size, AttributeValue::Udata(*size));
-                unit.set(DW_AT_encoding, AttributeValue::Encoding(DwAte(*encoding)));
-                entry
+        let ty = of.types.get(index as usize)?;
+        let shared = match ty {
+            DebugType::Base { name, size, .. } => {
+                SharedType::Named(DW_TAG_base_type, name.clone(), *size)
             }
-            DebugType::Pointer { name, to } => {
-                let to = to.as_ref().map(|to| self.ty(to));
-                let entry = self.named(root, DW_TAG_pointer_type, name);
-                if let Some(to) = to {
-                    self.dwarf.unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(to));
-                }
-                entry
+            DebugType::Pointer { name, .. } => {
+                SharedType::Named(DW_TAG_pointer_type, name.clone(), 0)
             }
-            DebugType::Array { of, len } => {
-                let of = self.ty(of);
-                let unit = &mut self.dwarf.unit;
-                let entry = unit.add(root, DW_TAG_array_type);
-                unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(of));
-                let range = unit.add(entry, DW_TAG_subrange_type);
-                unit.get_mut(range).set(DW_AT_count, AttributeValue::Udata(*len));
-                entry
+            DebugType::Array { of: element, len } => {
+                SharedType::Array(self.ty(of, *element)?, *len)
             }
-            DebugType::Struct { name, size, fields } => {
-                let entry = self.named(root, DW_TAG_structure_type, name);
-                self.dwarf.unit.get_mut(entry).set(DW_AT_byte_size, AttributeValue::Udata(*size));
-                for field in fields {
-                    let ty = self.ty(&field.ty);
-                    let member = self.named(entry, DW_TAG_member, &field.name);
-                    let member = self.dwarf.unit.get_mut(member);
-                    member.set(DW_AT_type, AttributeValue::UnitRef(ty));
-                    member.set(DW_AT_data_member_location, AttributeValue::Udata(field.offset));
-                }
-                entry
+            DebugType::Struct(it) | DebugType::Enum { of: it, .. } => {
+                SharedType::Named(DW_TAG_structure_type, it.name.clone(), it.size)
+            }
+            DebugType::Union(it) => SharedType::Named(DW_TAG_union_type, it.name.clone(), it.size),
+            DebugType::Names { name, size, .. } => {
+                SharedType::Named(DW_TAG_enumeration_type, name.clone(), *size)
             }
         };
-        self.types.insert(ty.clone(), entry);
+        if let Some(&entry) = self.types.get(&shared) {
+            of.entries[index as usize] = Some(entry);
+            // A function that followed fewer pointers to the type left it without what it
+            // points to.
+            if let DebugType::Pointer { to: Some(to), .. } = ty
+                && self.dwarf.unit.get(entry).get(DW_AT_type).is_none()
+                && let Some(to) = self.ty(of, *to)
+            {
+                self.dwarf.unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(to));
+            }
+            return Some(entry);
+        }
+        let root = self.dwarf.unit.root();
+        let entry = match &shared {
+            SharedType::Named(tag, name, _) => self.named(root, *tag, name),
+            SharedType::Array(..) => self.dwarf.unit.add(root, DW_TAG_array_type),
+        };
+        // A type that points to itself finds its entry here.
+        of.entries[index as usize] = Some(entry);
+        self.types.insert(shared, entry);
+        self.fill(of, entry, ty);
+        Some(entry)
+    }
+
+    /// Writes what `ty` is made of into its `entry`.
+    fn fill(&mut self, of: &mut FunctionTypes<'_>, entry: UnitEntryId, ty: &DebugType) {
+        let size = |unit: &mut gimli::write::Unit, size: u64| {
+            unit.get_mut(entry).set(DW_AT_byte_size, AttributeValue::Udata(size));
+        };
+        match ty {
+            DebugType::Base { size: bytes, encoding, .. } => {
+                size(&mut self.dwarf.unit, *bytes);
+                let encoding = AttributeValue::Encoding(DwAte(*encoding));
+                self.dwarf.unit.get_mut(entry).set(DW_AT_encoding, encoding);
+            }
+            DebugType::Pointer { to, .. } => {
+                if let Some(to) = to.and_then(|to| self.ty(of, to)) {
+                    self.dwarf.unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(to));
+                }
+            }
+            DebugType::Array { of: element, len } => {
+                let Some(element) = self.ty(of, *element) else { return };
+                let unit = &mut self.dwarf.unit;
+                unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(element));
+                let range = unit.add(entry, DW_TAG_subrange_type);
+                unit.get_mut(range).set(DW_AT_count, AttributeValue::Udata(*len));
+            }
+            DebugType::Struct(it) | DebugType::Union(it) => {
+                size(&mut self.dwarf.unit, it.size);
+                self.members(of, entry, &it.fields);
+                self.parameters(of, entry, &it.parameters);
+            }
+            DebugType::Names { size: bytes, names, .. } => {
+                size(&mut self.dwarf.unit, *bytes);
+                let number = self.unsigned(*bytes);
+                let unit = self.dwarf.unit.get_mut(entry);
+                unit.set(DW_AT_type, AttributeValue::UnitRef(number));
+                unit.set(DW_AT_enum_class, AttributeValue::Flag(true));
+                for (name, value) in names {
+                    let name = self.named(entry, DW_TAG_enumerator, name);
+                    let value = AttributeValue::Udata(*value);
+                    self.dwarf.unit.get_mut(name).set(DW_AT_const_value, value);
+                }
+            }
+            DebugType::Enum { of: it, tag, variants } => {
+                size(&mut self.dwarf.unit, it.size);
+                self.variants(of, entry, it.size, *tag, variants);
+                self.parameters(of, entry, &it.parameters);
+            }
+        }
+    }
+
+    /// The variants of the enum at `entry` the way rustc tells of them: a part of the enum
+    /// that is one of several members by the value of another, each member a struct of its
+    /// own with the fields of a variant.
+    fn variants(
+        &mut self,
+        of: &mut FunctionTypes<'_>,
+        entry: UnitEntryId,
+        size: u64,
+        tag: Option<Tag>,
+        variants: &[Variant],
+    ) {
+        let part = self.dwarf.unit.add(entry, DW_TAG_variant_part);
+        if let Some(tag) = tag {
+            let number = self.unsigned(tag.size);
+            let unit = &mut self.dwarf.unit;
+            let member = unit.add(part, DW_TAG_member);
+            let entry = unit.get_mut(member);
+            entry.set(DW_AT_type, AttributeValue::UnitRef(number));
+            entry.set(DW_AT_artificial, AttributeValue::Flag(true));
+            entry.set(DW_AT_data_member_location, AttributeValue::Udata(tag.offset));
+            unit.get_mut(part).set(DW_AT_discr, AttributeValue::UnitRef(member));
+        }
+        for variant in variants {
+            let fields = self.named(entry, DW_TAG_structure_type, &variant.name);
+            self.dwarf.unit.get_mut(fields).set(DW_AT_byte_size, AttributeValue::Udata(size));
+            self.members(of, fields, &variant.fields);
+            let choice = self.dwarf.unit.add(part, DW_TAG_variant);
+            if let Some(value) = variant.tag {
+                let value = AttributeValue::Udata(value);
+                self.dwarf.unit.get_mut(choice).set(DW_AT_discr_value, value);
+            }
+            let member = self.named(choice, DW_TAG_member, &variant.name);
+            let member = self.dwarf.unit.get_mut(member);
+            member.set(DW_AT_type, AttributeValue::UnitRef(fields));
+            member.set(DW_AT_data_member_location, AttributeValue::Udata(0));
+        }
+    }
+
+    fn members(&mut self, of: &mut FunctionTypes<'_>, entry: UnitEntryId, fields: &[Field]) {
+        for field in fields {
+            let Some(ty) = self.ty(of, field.ty) else { continue };
+            let member = self.named(entry, DW_TAG_member, &field.name);
+            let member = self.dwarf.unit.get_mut(member);
+            member.set(DW_AT_type, AttributeValue::UnitRef(ty));
+            member.set(DW_AT_data_member_location, AttributeValue::Udata(field.offset));
+        }
+    }
+
+    /// The types the generic parameters of the type at `entry` stand for, which a
+    /// pretty-printer finds what a `Vec` holds by.
+    fn parameters(
+        &mut self,
+        of: &mut FunctionTypes<'_>,
+        entry: UnitEntryId,
+        parameters: &[(String, TypeIndex)],
+    ) {
+        for (name, ty) in parameters {
+            let Some(ty) = self.ty(of, *ty) else { continue };
+            let parameter = self.named(entry, DW_TAG_template_type_parameter, name);
+            self.dwarf.unit.get_mut(parameter).set(DW_AT_type, AttributeValue::UnitRef(ty));
+        }
+    }
+
+    /// The unsigned number of `size` bytes.
+    fn unsigned(&mut self, size: u64) -> UnitEntryId {
+        let name = format!("u{}", size * 8);
+        let shared = SharedType::Named(DW_TAG_base_type, name.clone(), size);
+        if let Some(&entry) = self.types.get(&shared) {
+            return entry;
+        }
+        let entry = self.named(self.dwarf.unit.root(), DW_TAG_base_type, &name);
+        let unit = self.dwarf.unit.get_mut(entry);
+        unit.set(DW_AT_byte_size, AttributeValue::Udata(size));
+        unit.set(DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
+        self.types.insert(shared, entry);
         entry
     }
 
@@ -299,28 +622,112 @@ impl DebugContext {
         entry
     }
 
-    /// Tells of the variables of the function at `function`.
-    fn variables(&mut self, function: UnitEntryId, variables: &[VariableDebug]) {
-        let Some(frame) = self.frame.filter(|_| !variables.is_empty()) else { return };
-        let mut base = Expression::new();
-        base.op_reg(frame);
-        self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
-        for variable in variables {
-            let ty = self.ty(&variable.ty);
-            let tag = if variable.param { DW_TAG_formal_parameter } else { DW_TAG_variable };
-            let entry = self.named(function, tag, &variable.name);
-            let mut place = Expression::new();
-            place.op_fbreg(variable.offset);
-            let entry = self.dwarf.unit.get_mut(entry);
-            entry.set(DW_AT_type, AttributeValue::UnitRef(ty));
-            entry.set(DW_AT_location, AttributeValue::Exprloc(place));
+    /// Tells of the variables of the function at `function`, which starts at `start` and is
+    /// `len` bytes of code.
+    fn variables(
+        &mut self,
+        function: UnitEntryId,
+        start: Address,
+        len: u32,
+        debug: &FunctionDebug,
+    ) {
+        if !self.variables || debug.variables.is_empty() || debug.frame_base.is_empty() {
+            return;
         }
+        let base = Expression::raw(debug.frame_base.clone());
+        self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
+        let mut types =
+            FunctionTypes { types: &debug.types, entries: vec![None; debug.types.len()] };
+        let mut blocks = vec![None; debug.scopes.len()];
+        for variable in &debug.variables {
+            let Some(ty) = self.ty(&mut types, variable.ty) else { continue };
+            let parent = match variable.scope {
+                None => Some(function),
+                Some(scope) => self.block(function, start, debug, &mut blocks, scope),
+            };
+            // A name of a scope that no code is of is not looked up.
+            let Some(parent) = parent else { continue };
+            let tag = if variable.param { DW_TAG_formal_parameter } else { DW_TAG_variable };
+            let entry = self.named(parent, tag, &variable.name);
+            self.dwarf.unit.get_mut(entry).set(DW_AT_type, AttributeValue::UnitRef(ty));
+            if let Some(place) = self.place(start, len, &variable.place) {
+                self.dwarf.unit.get_mut(entry).set(DW_AT_location, place);
+            }
+        }
+    }
+
+    /// The entry of the scope `scope` of a function, inside the entry of the scope it is in.
+    fn block(
+        &mut self,
+        function: UnitEntryId,
+        start: Address,
+        debug: &FunctionDebug,
+        blocks: &mut [Option<UnitEntryId>],
+        scope: u32,
+    ) -> Option<UnitEntryId> {
+        if let Some(block) = blocks.get(scope as usize).copied()? {
+            return Some(block);
+        }
+        let Scope { parent, ranges } = debug.scopes.get(scope as usize)?;
+        if ranges.is_empty() {
+            return None;
+        }
+        let parent = match parent {
+            Some(parent) => self.block(function, start, debug, blocks, *parent)?,
+            None => function,
+        };
+        let ranges = ranges
+            .iter()
+            .map(|&(from, to)| Range::StartLength {
+                begin: past(start, from),
+                length: (to - from).into(),
+            })
+            .collect();
+        let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
+        let block = self.dwarf.unit.add(parent, DW_TAG_lexical_block);
+        self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
+        blocks[scope as usize] = Some(block);
+        Some(block)
+    }
+
+    /// Where a variable of a function is, or `None` where it is nowhere to be read.
+    fn place(&mut self, start: Address, len: u32, place: &VariablePlace) -> Option<AttributeValue> {
+        let ranges = match place {
+            VariablePlace::Frame(offset) => {
+                let mut place = Expression::new();
+                place.op_fbreg(*offset);
+                return Some(AttributeValue::Exprloc(place));
+            }
+            VariablePlace::Ranges(ranges) => ranges,
+        };
+        if let [(0, to, expression)] = ranges.as_slice()
+            && *to >= len
+        {
+            return Some(AttributeValue::Exprloc(Expression::raw(expression.clone())));
+        }
+        let places: Vec<Location> = ranges
+            .iter()
+            .filter(|(from, to, _)| from < to && *from < len)
+            .map(|(from, to, expression)| Location::StartLength {
+                begin: past(start, *from),
+                length: (to.min(&len) - from).into(),
+                data: Expression::raw(expression.clone()),
+            })
+            .collect();
+        if places.is_empty() {
+            return None;
+        }
+        let places = self.dwarf.unit.locations.add(LocationList(places));
+        Some(AttributeValue::LocationListRef(places))
     }
 
     /// Describes the function `func` of the module, which is `len` bytes of code.
     pub(super) fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
         if len == 0 {
             return;
+        }
+        if self.ranges.len() == FUNCTIONS_OF_A_UNIT {
+            self.end_unit();
         }
         let start = Address::Symbol { symbol: func.as_u32() as usize, addend: 0 };
         let files: Vec<FileId> = debug.files.iter().map(|it| self.file(it)).collect();
@@ -342,7 +749,7 @@ impl DebugContext {
             entry.set(DW_AT_decl_file, AttributeValue::FileIndex(Some(file)));
             entry.set(DW_AT_decl_line, AttributeValue::Udata(declared.line.into()));
         }
-        self.variables(function, &debug.variables);
+        self.variables(function, start, len, debug);
 
         // The code ahead of the first statement sets the frame up, which is of the line the
         // function is declared on, or of the first statement when that line is not known.
@@ -372,14 +779,17 @@ impl DebugContext {
 
     /// Writes the sections into the object, when it has a function to describe.
     pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<(), String> {
-        if self.ranges.is_empty() || product.object.format() != BinaryFormat::Elf {
+        self.end_unit();
+        if self.full.is_empty() || product.object.format() != BinaryFormat::Elf {
             return Ok(());
         }
-        let ranges = self.dwarf.unit.ranges.add(RangeList(self.ranges));
-        let root = self.dwarf.unit.root();
-        self.dwarf.unit.get_mut(root).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
+        let mut dwarf = gimli::write::Dwarf::new();
+        (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
+        for unit in self.full {
+            dwarf.units.add(unit);
+        }
         let mut sections = Sections::new(SectionWriter::default());
-        self.dwarf.write(&mut sections).map_err(|e| e.to_string())?;
+        dwarf.write(&mut sections).map_err(|e| e.to_string())?;
 
         let mut placed = FxHashMap::default();
         sections.for_each(|id, section: &SectionWriter| {
@@ -427,6 +837,16 @@ impl DebugContext {
             }
             Ok(())
         })
+    }
+}
+
+/// The address `by` bytes past `start`.
+fn past(start: Address, by: CodeOffset) -> Address {
+    match start {
+        Address::Constant(start) => Address::Constant(start + u64::from(by)),
+        Address::Symbol { symbol, addend } => {
+            Address::Symbol { symbol, addend: addend + i64::from(by) }
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use std::{
 
 use stdx::time::Instant;
 
-use super::{CodegenError, Result, fragment::Code, fragment::Recorder};
+use super::{CodegenError, Result, debuginfo::SlotPlaces, fragment::Code, fragment::Recorder};
 
 /// Names the producer: `cranelift` (the default) or `llvm`.
 const BACKEND: &str = "RUSTD_BACKEND";
@@ -137,6 +137,9 @@ impl Backend {
         let start = Instant::now();
         let pairs = super::float_pair::lower(recorder, &mut context.func);
         let mut code = super::emit(context)?;
+        if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
+            code.slots = SlotPlaces::of_frame(recorder.isa, frame, recorder.named_slots());
+        }
         if let Some(pairs) = pairs {
             pairs.hold(context, &mut code)?;
         }
@@ -155,7 +158,9 @@ impl Backend {
         optimization: Optimization,
     ) -> std::result::Result<Code, super::llvm::Unhandled> {
         use super::{cached::StoredCode, store::Store};
-        let Some((store, key)) = Store::global().zip(StoredCode::key(optimization, func)) else {
+        let Some((store, key)) =
+            Store::global().zip(StoredCode::key(optimization, func, recorder.named_slots()))
+        else {
             return super::llvm::emit(recorder, func, optimization);
         };
         if let Some(stored) = store.lookup(&key).and_then(|it| StoredCode::decode(&it))

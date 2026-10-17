@@ -53,10 +53,11 @@ pub(super) fn emit(
     };
     let context = Context::create();
     let module = context.create_module("rustd");
+    let named: Vec<ir::StackSlot> = recorder.named_slots().collect();
     Machine::with(optimization, |machine| {
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
-        tally.time(Phase::Lower, || lower::Lowering::lower(&context, &module, func))?;
+        tally.time(Phase::Lower, || lower::Lowering::lower(&context, &module, func, &named))?;
         if std::env::var_os("RUSTD_DUMP_LLVM").is_some() {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }

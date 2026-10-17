@@ -26,7 +26,7 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::Body,
-    hir::{BindingId, ExprId},
+    hir::ExprId,
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
@@ -65,9 +65,9 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
-use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow, SlotPlaces, VariableDebug};
 use self::fragment::{
-    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
+    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Named, Recorder,
     Requests, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
@@ -152,6 +152,11 @@ pub trait SymbolResolver {
     /// to tell a debugger where its code comes from.
     fn debug_directory(&self) -> Option<String> {
         None
+    }
+    /// Whether a debugger is told of the variables of the code too, and not of its lines
+    /// alone.
+    fn describes_variables(&self) -> bool {
+        true
     }
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
@@ -1637,36 +1642,45 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
-/// What a debugger is told of `variables`, which are of the body of `owner`. A name the body
-/// gives to more than one local is left out: nothing says yet from where to where each of
-/// them is the one meant. So is a variable of a type that is not told of.
-fn described_variables(
+/// What a debugger is told of `variables`, which are of the body of `owner` and are where
+/// `debug` has the places of. A name the body gives to more than one local is left out:
+/// nothing says yet from where to where each of them is the one meant. So is a variable of
+/// a type that is not told of.
+fn describe_variables(
     db: &dyn HirDatabase,
     owner: DefWithBodyId,
     env: &StoredParamEnvAndCrate,
     variables: &[Variable],
-) -> Vec<VariableDebug> {
+    places: &SlotPlaces,
+    debug: &mut FunctionDebug,
+) {
     let body = Body::of(db, owner);
     let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
     for (_, binding) in body.bindings() {
         *uses.entry(&binding.name).or_default() += 1;
     }
-    let types = debuginfo::Types::new(db, env.as_ref(db));
-    variables
-        .iter()
-        .filter_map(|variable| {
-            let name = &body[variable.binding].name;
-            if uses.get(name) != Some(&1) {
-                return None;
-            }
-            Some(VariableDebug {
-                name: name.as_str().to_owned(),
-                param: variable.param,
-                ty: types.describe(variable.ty.as_ref())?,
-                offset: variable.offset,
-            })
-        })
-        .collect()
+    let mut types = debuginfo::Types::new(db, env.as_ref(db));
+    for variable in variables {
+        let name = &body[variable.binding].name;
+        if uses.get(name) != Some(&1) {
+            continue;
+        }
+        let Some(place) = places.of(variable.slot) else { continue };
+        let place = match variable.pointer {
+            true => place.pointee(),
+            false => place.clone(),
+        };
+        let Some(ty) = types.describe(variable.ty.as_ref()) else { continue };
+        debug.variables.push(VariableDebug {
+            name: name.as_str().to_owned(),
+            param: variable.param,
+            ty,
+            place,
+            scope: None,
+        });
+    }
+    debug.types = types.finish();
+    debug.frame_base = places.frame_base.clone();
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
@@ -1850,6 +1864,7 @@ fn compile<'db>(
             relocs: Vec::new(),
             unwind: None,
             lines: Vec::new(),
+            slots: SlotPlaces::default(),
         },
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
@@ -1857,30 +1872,20 @@ fn compile<'db>(
         Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
         _ => None,
     };
-    let variables = variables(&ctx, std::mem::take(&mut cg.named));
+    let variables = std::mem::take(&mut cg.named)
+        .into_iter()
+        .map(|Named { binding, param, ty, slot, pointer }| Variable {
+            binding,
+            param,
+            ty,
+            slot: slot.as_u32(),
+            pointer,
+        })
+        .collect::<Vec<_>>();
     let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(CompiledFunction { requests, code, source, variables, layouts })
-}
-
-/// Where the slots of named locals ended up in the frame Cranelift laid out. None of them
-/// is known when the code is another backend's, which keeps locals where it likes.
-fn variables(
-    ctx: &cranelift_codegen::Context,
-    named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
-) -> Vec<Variable> {
-    let Some(frame) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) else {
-        return Vec::new();
-    };
-    let to_fp = i64::from(frame.frame_to_fp_offset);
-    named
-        .into_iter()
-        .filter_map(|(binding, param, ty, slot)| {
-            let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
-            Some(Variable { binding, param, ty, offset })
-        })
-        .collect()
 }
 
 fn build<'db>(
@@ -1989,6 +1994,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
             lines: LineRow::of_ranges(
                 compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
             ),
+            slots: SlotPlaces::default(),
         })
     }));
     match outcome {
@@ -2020,6 +2026,7 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
         relocs,
         unwind: None,
         lines: Vec::new(),
+        slots: SlotPlaces::default(),
     })
 }
 
@@ -2065,9 +2072,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
-        let debug = symbols
-            .debug_directory()
-            .and_then(|directory| DebugContext::new(module.isa(), &directory));
+        let debug = symbols.debug_directory().and_then(|directory| {
+            DebugContext::new(module.isa(), &directory, symbols.describes_variables())
+        });
         let debugged = debug.is_some();
         Ok(ObjectCodegen {
             db,
@@ -2429,7 +2436,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some((owner, _)) = &compiled.source
             && let Some((env, variables)) = &compiled.variables
         {
-            debug.variables = described_variables(self.db, *owner, env, variables);
+            let places = &compiled.code.slots;
+            describe_variables(self.db, *owner, env, variables, places, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
@@ -4852,6 +4860,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             self.receive(mode, &mut incoming, addr, layout);
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
+            if matches!(mode, PassMode::Indirect | PassMode::OnStack(_)) {
+                self.note_passed_in_memory(body, local, addr);
+            }
         }
         if self.tracked {
             self.location = incoming.next();
@@ -7256,10 +7267,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// is in a stack slot of its own. A closure's are left out, where a name may be of what
     /// the closure captured.
     fn note_variables(&mut self) {
-        let Some(body) = self.body else { return };
-        if !matches!(body.owner, InferBodyId::DefWithBodyId(_)) || !body.upvar_locals.is_empty() {
-            return;
-        }
+        let Some(body) = self.body.filter(|body| Self::names_are_written(body)) else { return };
         for (binding, &local) in body.binding_locals.iter() {
             let Some(&LocalSlot { addr, borrowed: false }) = self.locals.get(local) else {
                 continue;
@@ -7272,9 +7280,36 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if i32::from(offset) == 0 {
                 let param = body.param_locals.contains(&local);
                 let ty = body.locals[local].ty.clone();
-                self.cg.named.push((binding, param, ty, stack_slot));
+                self.cg.named.push(Named { binding, param, ty, slot: stack_slot, pointer: false });
             }
         }
+    }
+
+    /// Whether the locals of a body are the ones its source names: those of a closure are
+    /// not all, and are told of nowhere.
+    fn names_are_written(body: &MirBody) -> bool {
+        matches!(body.owner, InferBodyId::DefWithBodyId(_)) && body.upvar_locals.is_empty()
+    }
+
+    /// Keeps where a parameter passed in memory is in a slot of the frame, when it is
+    /// written with a name, for a debugger to find it by: the register it comes in is soon
+    /// used for something else.
+    fn note_passed_in_memory(&mut self, body: &MirBody, local: LocalId, addr: Value) {
+        if !Self::names_are_written(body) {
+            return;
+        }
+        let Some((binding, _)) = body.binding_locals.iter().find(|it| *it.1 == local) else {
+            return;
+        };
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            ptr().bytes(),
+            3,
+        ));
+        let kept = self.builder.ins().stack_addr(ptr(), slot, 0);
+        self.builder.ins().store(MEM, addr, kept, 0);
+        let ty = body.locals[local].ty.clone();
+        self.cg.named.push(Named { binding, param: true, ty, slot, pointer: true });
     }
 
     /// Has what is built from here on be of the statement at `span`.

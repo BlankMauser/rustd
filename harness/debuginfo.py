@@ -98,6 +98,49 @@ LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline
           ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
           ("*borrowed", "sline::Point {x: 3, y: -4}")]
 # (what the step is, [(old, new)])
+OPTIMIZED_OUT = "<optimized out>"
+
+TYPES_MAIN = """#[derive(Clone, Copy)]
+struct Point { x: i32, y: i64 }
+struct Pair(u8, f64);
+#[derive(Clone, Copy)]
+enum Shape { Circle(u32), Rect { w: u16, h: u16 }, Dot }
+#[derive(Clone, Copy)]
+enum Level { Low = 1, Mid = 5, High = 9 }
+union Bits { whole: u32, half: u16 }
+
+fn show(width: u32, name: &str, big: [u64; 5]) -> u32 {
+    let point = Point { x: 3, y: -4 };
+    let pair = Pair(7, 1.5);
+    let tuple = (true, 'c', 9u64);
+    let shape = Shape::Rect { w: 4, h: 5 };
+    let circle = Shape::Circle(11);
+    let dot = Shape::Dot;
+    let level = Level::Mid;
+    let some = Some(42u32);
+    let none: Option<u32> = None;
+    let boxed: Option<&Point> = Some(&point);
+    let missing: Option<&Point> = None;
+    let ok: Result<u8, String> = Ok(3);
+    let list = vec![1i32, 2, 3];
+    let text = String::from("hello");
+    let slice = &list[1..];
+    let bits = Bits { whole: 0x10002 };
+    let borrowed = &point;
+    let sum = width + point.x as u32 + pair.0 as u32 + tuple.2 as u32 + big[4] as u32;
+    println!("{} {} {} {}", sum, name, borrowed.y, slice.len());
+    std::hint::black_box((&shape, &circle, &dot, &level, &some, &none, &boxed, &missing, &ok, &text, &bits, &tuple));
+    sum
+}
+
+fn main() {
+    println!("{}", show(10, "abc", [1, 2, 3, 4, 5]));
+}
+"""
+
+TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
+         "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
+
 EDITS = [
     ("nothing edited", []),
     ("a line added above everything", [("use std::fmt::Display;", "// One line further down.\nuse std::fmt::Display;")]),
@@ -253,7 +296,8 @@ def unwinding(tally, what, binary):
     ours = set()
     for unit in units.split("DW_TAG_compile_unit")[1:]:
         if re.search(r'DW_AT_producer\s+\("rustd ', unit):
-            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
+            # The unit's own entry ends at the first empty line; what follows is of its functions.
+            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit.split("\n\n")[0])}
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
@@ -437,8 +481,7 @@ def described(binary):
 def variables(tally):
     """Whether gdb prints the parameters and locals of a function of rustd's as they are.
 
-    Only the frames Cranelift lays out say where a local is kept, so under LLVM none is to be
-    told of, and one that is would be a guess."""
+    A value the optimizer did away with is to be said to be so, and is not counted as wrong."""
     ws = tempfile.mkdtemp(prefix="rustd-debuginfo-locals-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
@@ -455,12 +498,92 @@ def variables(tally):
     printed = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name, _ in LOCALS}
     right = [name for name, value in LOCALS if printed[name] and printed[name].group(1) == value]
     functions, count = described(fx.binary)
-    if LLVM:
-        return tally.say("locals: gdb prints them", "GUESSED" if count else "not told of",
-                         f"{count} described in {functions} functions: LLVM's frames are not read back yet")
-    wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS if name not in right]
+    gone = [name for name, _ in LOCALS if printed[name] and OPTIMIZED_OUT in printed[name].group(1)]
+    wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS
+             if name not in right and name not in gone]
     tally.say("locals: gdb prints them", "printed" if not wrong else "NOT AS THEY ARE",
-              f"{len(right)} of {len(LOCALS)}" + (f", but {wrong[0][:50]}" if wrong else ""))
+              f"{len(right)} of {len(LOCALS)}, {len(gone)} optimized out, {count} described in {functions} functions"
+              + (f", but {wrong[0][:50]}" if wrong else ""))
+
+
+def printed_by(debugger, binary, cwd, place, names):
+    """What a debugger prints for each of the names when stopped at a place, addresses aside."""
+    commands = ["set pagination off", "set startup-with-shell off", f"break {place}", "run",
+                *[x for name in names for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+    ran = subprocess.run([debugger, "-q", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
+                         capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300)
+    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
+    return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+
+
+def shapes(tally):
+    """Whether the debugger shows values of each kind of type as it shows those of a rustc build.
+
+    The one the toolchain wraps with its pretty-printers is asked, so a `Vec` or a `String` is
+    shown by what it holds only when the description has the shape the printers look for."""
+    debugger = shutil.which("rust-gdb")
+    if not debugger:
+        return tally.say("types: the debugger shows them", "not looked at", "no rust-gdb to ask")
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-types-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, TYPES_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+    fx.rustd_build()
+    verify(tally, "types", fx.binary)
+    place = f"{MAIN}:{TYPES_MAIN[:TYPES_MAIN.index('println!')].count(chr(10)) + 1}"
+    theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, place, TYPES)
+    ours = printed_by(debugger, fx.binary, ws, place, TYPES)
+    unknown = [name for name in TYPES if theirs[name] is None]
+    gone = [name for name in TYPES if ours[name] and OPTIMIZED_OUT in ours[name]]
+    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in TYPES if ours[name] != theirs[name] and name not in gone]
+    tally.say("types: the debugger shows them", "as rustc's" if not wrong and not unknown else "NOT AS RUSTC'S",
+              f"{len(TYPES) - len(wrong) - len(gone)} of {len(TYPES)}, {len(gone)} optimized out"
+              + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else ""))
+
+
+def settings(tally):
+    """Whether the profile's settings for what a debugger reads are followed, or refused with the reason."""
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-profile-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+
+    def built(**profile):
+        """The object rustd writes under the settings: whether it has anything for a debugger, and how many variables."""
+        names = {f"CARGO_PROFILE_DEV_{name.upper()}": value for name, value in profile.items()}
+        os.environ.update(names)
+        try:
+            fx.rustd_build()
+            return sections(fx.objects[0])[1] > 0, described(fx.objects[0])[1], None
+        except SystemExit as refused:
+            return None, None, str(refused)
+        finally:
+            for name in names:
+                del os.environ[name]
+
+    for what, profile, lines, locals_ in (
+            ("debug = true", {}, True, True),
+            ("debug = \"line-tables-only\"", {"debug": "line-tables-only"}, True, False),
+            ("debug = 1", {"debug": "1"}, True, False),
+            ("strip = \"debuginfo\"", {"strip": "debuginfo"}, False, False),
+            ("strip = true", {"strip": "true"}, False, False),
+            ("split-debuginfo = \"off\"", {"split_debuginfo": "off"}, True, True),
+            ("split-debuginfo = \"packed\"", {"split_debuginfo": "packed"}, None, None),
+            ("split-debuginfo = \"unpacked\"", {"split_debuginfo": "unpacked"}, None, None),
+            ("split-debuginfo = \"packed\" with debug = false", {"split_debuginfo": "packed", "debug": "false"}, False, False)):
+        has, count, refused = built(**profile)
+        if lines is None:
+            reason = re.search(r"`split-debuginfo.*", refused or "", re.S)
+            tally.say(f"profile: {what}", "refused" if reason else "NOT REFUSED",
+                      " ".join(reason.group(0).split())[:110] if reason else (refused or "it built")[-110:])
+        else:
+            followed = has == lines and bool(count) == locals_
+            tally.say(f"profile: {what}", "followed" if followed else "NOT FOLLOWED",
+                      refused[-110:] if refused else f"{'lines' if has else 'nothing'}, {count} variables")
 
 
 def sections(path):
@@ -509,6 +632,8 @@ def main():
                                  ("src/main.rs", ".map_ok(|it| it + 1)", ".map_ok(|it| {\n        " + PANIC + "\n        it + 1\n    })")),
         "edits": lambda: edits(tally),
         "locals": lambda: variables(tally),
+        "types": lambda: shapes(tally),
+        "profile": lambda: settings(tally),
         "cost": lambda: cost(tally),
     }
     for name, part in parts.items():
