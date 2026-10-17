@@ -1336,6 +1336,7 @@ dependencies = [
  "tracing-tree",
  "triomphe",
  "wasm-encoder",
+ "wasmparser",
 ]
 
 [[package]]

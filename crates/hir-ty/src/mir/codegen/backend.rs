@@ -21,8 +21,8 @@ use super::{CodegenError, Result, fragment::Code, fragment::Recorder};
 
 /// Names the producer: `cranelift` (the default) or `llvm`.
 const BACKEND: &str = "RUSTD_BACKEND";
-/// How hard LLVM optimizes each function, `0` to `3`. Functions are compiled alone at any
-/// level: nothing is inlined across them.
+/// How hard LLVM optimizes each function, `0` to `3`, or `1-fast`. Functions are compiled
+/// alone at any level: nothing is inlined across them.
 const OPTIMIZATION: &str = "RUSTD_OPT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,9 @@ pub enum Backend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Optimization {
     None,
+    /// The passes of [`Optimization::Less`], and the instruction selection of
+    /// [`Optimization::None`], which is the quicker half of LLVM's back end.
+    Quick,
     Less,
     Default,
     Aggressive,
@@ -49,10 +52,13 @@ impl Backend {
     fn read_env() -> std::result::Result<Backend, String> {
         let optimization = match std::env::var(OPTIMIZATION).as_deref() {
             Ok("0") => Optimization::None,
+            Ok("1-fast") => Optimization::Quick,
             Ok("1") => Optimization::Less,
             Ok("2") | Err(_) => Optimization::Default,
             Ok("3") => Optimization::Aggressive,
-            Ok(other) => return Err(format!("{OPTIMIZATION}={other}: expected 0, 1, 2 or 3")),
+            Ok(other) => {
+                return Err(format!("{OPTIMIZATION}={other}: expected 0, 1-fast, 1, 2 or 3"));
+            }
         };
         match std::env::var(BACKEND).as_deref() {
             Ok("cranelift") | Err(_) => Ok(Backend::Cranelift),
@@ -126,6 +132,7 @@ impl fmt::Display for Backend {
         match self {
             Backend::Cranelift => f.write_str("cranelift"),
             Backend::Llvm(Optimization::None) => f.write_str("llvm -O0"),
+            Backend::Llvm(Optimization::Quick) => f.write_str("llvm -O1 -fast-isel"),
             Backend::Llvm(Optimization::Less) => f.write_str("llvm -O1"),
             Backend::Llvm(Optimization::Default) => f.write_str("llvm -O2"),
             Backend::Llvm(Optimization::Aggressive) => f.write_str("llvm -O3"),

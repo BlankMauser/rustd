@@ -5,6 +5,7 @@
 //! 2. LLVM optimizes the module, if asked to, and writes an object file into memory.
 //! 3. [`emitted`] reads the object back: the code, the constants LLVM put beside it, the
 //!    relocations, with their [`Symbol`]s turned back into requests, and the unwind table.
+//!    With the `wasm` feature the object is WebAssembly, and [`emitted_wasm`] reads it.
 //!
 //! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
 //! compiled by Cranelift instead.
@@ -27,13 +28,22 @@ use super::{
     fragment::{Code, Recorder},
 };
 
+#[cfg(not(feature = "wasm"))]
 mod emitted;
+#[cfg(feature = "wasm")]
+mod emitted_wasm;
 mod lower;
 
 /// The name of the function being compiled, in the module and in the object.
 const OWN: &str = "rustd.own";
 const PERSONALITY: &str = "rust_eh_personality";
+#[cfg(not(feature = "wasm"))]
 const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+#[cfg(feature = "wasm")]
+const TRIPLE: &str = "wasm32-unknown-unknown";
+/// What every browser the page runs in has, and the hand-written lowering uses too.
+#[cfg(feature = "wasm")]
+const FEATURES: &str = "+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint";
 
 pub(super) fn emit(
     recorder: &mut Recorder<'_>,
@@ -75,7 +85,11 @@ pub(super) fn emit(
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
         tally.time(Phase::Read, || {
-            emitted::Emitted::code(object.as_slice(), func.signature.clone(), recorder)
+            #[cfg(not(feature = "wasm"))]
+            let code = emitted::Emitted::code(object.as_slice(), func.signature.clone(), recorder);
+            #[cfg(feature = "wasm")]
+            let code = emitted_wasm::EmittedWasm::code(object.as_slice(), func, recorder);
+            code
         })
     })
 }
@@ -104,7 +118,7 @@ impl Optimization {
     fn pipeline(self) -> Option<&'static str> {
         match self {
             Optimization::None => None,
-            Optimization::Less => Some("default<O1>"),
+            Optimization::Quick | Optimization::Less => Some("default<O1>"),
             Optimization::Default => Some("default<O2>"),
             Optimization::Aggressive => Some("default<O3>"),
         }
@@ -112,7 +126,7 @@ impl Optimization {
 
     fn level(self) -> OptimizationLevel {
         match self {
-            Optimization::None => OptimizationLevel::None,
+            Optimization::None | Optimization::Quick => OptimizationLevel::None,
             Optimization::Less => OptimizationLevel::Less,
             Optimization::Default => OptimizationLevel::Default,
             Optimization::Aggressive => OptimizationLevel::Aggressive,
@@ -141,6 +155,32 @@ impl Machine {
         })
     }
 
+    #[cfg(feature = "wasm")]
+    fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+        let parts = InitializationConfig {
+            asm_parser: false,
+            disassembler: false,
+            ..InitializationConfig::default()
+        };
+        Target::initialize_webassembly(&parts);
+        let triple = TargetTriple::create(TRIPLE);
+        let target = Target::from_triple(&triple)
+            .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
+        // The linker of the page gives everything a fixed place, so nothing is
+        // position-independent.
+        target
+            .create_target_machine(
+                &triple,
+                "mvp",
+                FEATURES,
+                optimization.level(),
+                RelocMode::Static,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {TRIPLE}")))
+    }
+
+    #[cfg(not(feature = "wasm"))]
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
         if emitted.triple() != TRIPLE {

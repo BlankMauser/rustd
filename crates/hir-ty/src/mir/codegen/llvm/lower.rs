@@ -37,6 +37,10 @@ use crate::mir::codegen::unwind;
 
 type Lowered<T> = Result<T, Unhandled>;
 
+/// Whether the code is WebAssembly, where nothing unwinds and memory is copied and filled
+/// by instructions.
+const WASM: bool = cfg!(feature = "wasm");
+
 /// A Cranelift value in LLVM.
 #[derive(Clone, Copy)]
 enum Operand<'ctx> {
@@ -102,13 +106,16 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         Self::mark_signature(context, &func.signature, Side::Callee, |loc, attribute| {
             function.add_attribute(loc, attribute)
         });
-        for (name, value) in [("target-cpu", "x86-64"), ("probe-stack", "inline-asm")] {
-            let attribute = context.create_string_attribute(name, value);
-            function.add_attribute(AttributeLoc::Function, attribute);
+        if !WASM {
+            for (name, value) in [("target-cpu", "x86-64"), ("probe-stack", "inline-asm")] {
+                let attribute = context.create_string_attribute(name, value);
+                function.add_attribute(AttributeLoc::Function, attribute);
+            }
+            // Every function gets an unwind table entry, as a panic may cross any of them.
+            let uwtable = Attribute::get_named_enum_kind_id("uwtable");
+            function
+                .add_attribute(AttributeLoc::Function, context.create_enum_attribute(uwtable, 2));
         }
-        // Every function gets an unwind table entry, as a panic may cross any of them.
-        let uwtable = Attribute::get_named_enum_kind_id("uwtable");
-        function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(uwtable, 2));
 
         let mut lowering = Lowering {
             context,
@@ -332,7 +339,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         match self.operand(value) {
             Operand::Int(it) => Ok(it),
             Operand::Pointer(it) => {
-                Ok(self.builder.build_ptr_to_int(it, self.context.i64_type(), "")?)
+                let ty = self.int_ty(self.func.dfg.value_type(value))?;
+                Ok(self.builder.build_ptr_to_int(it, ty, "")?)
             }
             _ => Err(Unhandled::Type(self.func.dfg.value_type(value))),
         }
@@ -528,6 +536,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let callee = self.callee(func_ref)?;
                 self.set(inst, Operand::Pointer(callee.as_global_value().as_pointer_value()));
             }
+            InstructionData::Call { func_ref, .. }
+                if WASM && matches!(dfg.ext_funcs[func_ref].name, ExternalName::LibCall(_)) =>
+            {
+                self.memory_routine(inst, func_ref)?;
+            }
             InstructionData::Call { func_ref, .. } => {
                 let callee = self.callee(func_ref)?;
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
@@ -545,6 +558,24 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let args = self.arguments(sig, args)?;
                 let call = self.builder.build_indirect_call(ty, callee, &args, "")?;
                 self.finish_call(call, sig, dfg.inst_results(inst))?;
+            }
+            InstructionData::TryCall { func_ref, exception, .. } if WASM => {
+                let callee = self.callee(func_ref)?;
+                let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
+                let args = self.arguments(sig, dfg.inst_args(inst))?;
+                let call = self.builder.build_direct_call(callee, &args, "")?;
+                self.finish_call_that_never_unwinds(call, sig, exception)?;
+            }
+            InstructionData::TryCallIndirect { exception, .. } if WASM => {
+                let sig = &dfg.signatures[dfg.exception_tables[exception].signature()];
+                let ty = Self::function_type(self.context, sig)?;
+                let [callee, args @ ..] = dfg.inst_args(inst) else {
+                    return Err(Unhandled::Shape("indirect call without a callee"));
+                };
+                let callee = self.pointer(*callee)?;
+                let args = self.arguments(sig, args)?;
+                let call = self.builder.build_indirect_call(ty, callee, &args, "")?;
+                self.finish_call_that_never_unwinds(call, sig, exception)?;
             }
             InstructionData::TryCall { func_ref, exception, .. } => {
                 let callee = self.callee(func_ref)?;
@@ -1129,6 +1160,49 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             self.values.insert(result, value.into());
         }
         Ok(())
+    }
+
+    /// The memory routines Cranelift's frontend calls by name, as the intrinsics LLVM has
+    /// for them: WebAssembly has instructions for those, and no library to call.
+    fn memory_routine(&mut self, inst: Inst, func_ref: ir::FuncRef) -> Lowered<()> {
+        let dfg = &self.func.dfg;
+        let ExternalName::LibCall(routine) = dfg.ext_funcs[func_ref].name else {
+            return Err(Unhandled::Shape("a call of no library function"));
+        };
+        let &[to, from_or_byte, len] = dfg.inst_args(inst) else {
+            return Err(Unhandled::Shape("a library call that is not a memory routine"));
+        };
+        let (to, len) = (self.pointer(to)?, self.int(len)?);
+        match routine {
+            ir::LibCall::Memcpy => {
+                self.builder.build_memcpy(to, 1, self.pointer(from_or_byte)?, 1, len)?;
+            }
+            ir::LibCall::Memmove => {
+                self.builder.build_memmove(to, 1, self.pointer(from_or_byte)?, 1, len)?;
+            }
+            ir::LibCall::Memset => {
+                let byte = self.int(from_or_byte)?;
+                let byte = self.builder.build_int_truncate(byte, self.context.i8_type(), "")?;
+                self.builder.build_memset(to, 1, byte, len)?;
+            }
+            _ => return Err(Unhandled::Shape("a library call that is not a memory routine")),
+        }
+        if let &[result] = dfg.inst_results(inst) {
+            self.values.insert(result, Operand::Pointer(to));
+        }
+        Ok(())
+    }
+
+    /// Goes on to where a call returns to. The handlers of its exception table are never
+    /// reached.
+    fn finish_call_that_never_unwinds(
+        &mut self,
+        call: CallSiteValue<'ctx>,
+        sig: &Signature,
+        table: ir::ExceptionTable,
+    ) -> Lowered<()> {
+        let normal = self.builder.get_insert_block().expect("a block being filled");
+        self.finish_invoke(call, sig, table, normal)
     }
 
     /// The blocks an unwinding call continues in: one of its own that hands what it returned
