@@ -7307,17 +7307,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 break;
             }
             by_ref = Some((addr, ty, mutability));
-            if let TyKind::Dynamic(bounds, _) = inner.kind() {
-                // Which method is in the vtable depends on the object's trait, not on the
-                // trait the call was written against.
-                let lang_items = self.interner.lang_items();
-                let principal = bounds.principal_def_id().map(|it| it.0);
-                let method = match principal {
-                    Some(it) if Some(it) == lang_items.Fn => lang_items.Fn_call,
-                    Some(it) if Some(it) == lang_items.FnMut => lang_items.FnMut_call_mut,
-                    _ => None,
-                };
-                let Some(method) = method else {
+            if let TyKind::Dynamic(..) = inner.kind() {
+                let Some(method) = self.fn_method_of_object(inner) else {
                     unsupported!("Fn-trait call on {inner:?}");
                 };
                 return self.call_virtual(method, inner, addr, ty, &values, dst, dst_ty);
@@ -7537,6 +7528,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             values.push((slot, thin_ty));
         }
         self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust, None), &values, dst, dst_ty)
+    }
+
+    /// The method a call through a reference to `dyn_ty` goes to: `Fn::call` where the
+    /// object's trait is `Fn` or has it above it, `FnMut::call_mut` likewise. Which one is in
+    /// the vtable depends on the object's trait, not on the trait the call was written against.
+    fn fn_method_of_object(&self, dyn_ty: Ty<'db>) -> Option<FunctionId> {
+        let lang_items = self.interner.lang_items();
+        let vtable = VtableLayout::of(self.interner, self.principal(dyn_ty, dyn_ty)?);
+        [lang_items.Fn_call, lang_items.FnMut_call_mut]
+            .into_iter()
+            .flatten()
+            .find(|&method| vtable.method(method).is_some())
     }
 
     /// The principal trait of `dyn_ty`, as implemented by `self_ty`.

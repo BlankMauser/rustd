@@ -36,6 +36,7 @@ cases![
     cfg_variant_match,
     powi,
     avx2_permute,
+    dyn_fn_supertrait,
     println_concat,
     wide_bit_set,
     destructure_assign_try,
