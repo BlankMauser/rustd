@@ -214,6 +214,12 @@ impl ItemScope {
         self.values.iter().map(|(n, &i)| (n, i))
     }
 
+    /// The visibility an enum is declared with here, when this is the scope declaring it.
+    pub(crate) fn declared_enum(&self, id: crate::EnumId) -> Option<Visibility> {
+        let def = ModuleDefId::AdtId(crate::AdtId::EnumId(id));
+        self.types.values().find(|it| it.def == def && it.import.is_none()).map(|it| it.vis)
+    }
+
     pub fn types(
         &self,
     ) -> impl Iterator<Item = (&Name, Item<ModuleDefId, ImportOrExternCrate>)> + '_ {
