@@ -16,7 +16,7 @@ proxy or needs to kill the service.
     python3 remote.py --measure WORKSPACE -p PACKAGE --bin NAME --crate A,B,C [--run ARG]
                                                    a fresh machine with and without the remote
 """
-import argparse, hashlib, os, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, zlib
+import argparse, hashlib, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -65,13 +65,20 @@ def records_of(pack):
     return records
 
 
+def packed(data):
+    """`data` compressed the way rustd sends a pack."""
+    return subprocess.run(["zstd", "-3", "-c"], input=data, capture_output=True, check=True).stdout
+
+
+def unpacked(data):
+    """What a compressed object holds, or nothing when it is not one."""
+    return subprocess.run(["zstd", "-dc"], input=data or b"", capture_output=True).stdout
+
+
 def filler(seed, size):
     """A sealed pack of `size` bytes that no build asks anything of."""
-    value = bytearray()
-    block = hashlib.sha256(seed.encode()).digest()
-    while len(value) < size - 48:
-        block = hashlib.sha256(block).digest()
-        value += block * 512
+    # Bytes that do not compress, so that what goes over the line is as large as the pack.
+    value = bytearray(hashlib.shake_256(seed.encode()).digest(size - 48))
     return pack_of([(hashlib.sha256(b"key" + seed.encode()).digest(), bytes(value[:size - 48]))])
 
 
@@ -97,16 +104,6 @@ class Remote:
             self.endpoint = os.environ.get("AWS_ENDPOINT_URL") or f"https://s3.{self.region}.amazonaws.com"
             self.env = {}
             self.secrets = [os.environ[it] for it in ("AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN") if it in os.environ]
-
-    def start(self):
-        if self.server:
-            self.server.start()
-            self.direct().create()
-            self.direct().put(PROBE, PROBE.encode())
-
-    def direct(self, prefix=""):
-        """The bucket as the service has it, past the proxy."""
-        return Bucket(f"http://127.0.0.1:{self.server.port}", self.bucket_name, prefix)
 
     def start(self):
         if self.server:
@@ -224,6 +221,36 @@ class Machine:
             raise SystemExit(f"rustd failed:\n{out.stderr[-3000:]}")
         return out.stderr, time.time() - start
 
+    def daemon(self, crates, env):
+        """Starts a daemon for the program and waits for its first build. Returns it and where it listens."""
+        rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
+        symbols = [x for rlib in rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
+        obj, self.program = os.path.join(self.out, "rustd.o"), os.path.join(self.out, "program")
+        link = linkline.with_output(linkline.ahead(list(self.link_args), [obj], RUSTD), self.program)
+        self.count = getattr(self, "count", 0) + 1
+        socket, self.log = os.path.join(self.out, f"socket{self.count}"), os.path.join(self.out, f"daemon{self.count}.log")
+        daemon = subprocess.Popen(
+            [RUSTD, self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj, "--socket", socket,
+             "--link-cmd", shlex.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
+            env={**self.env, **env})
+        while "watching" not in self.heard():
+            if daemon.poll() is not None:
+                raise SystemExit(f"the daemon did not start: {self.log}")
+            time.sleep(0.05)
+        return daemon, socket
+
+    def heard(self):
+        return open(self.log).read()
+
+    def edit(self, socket, note):
+        """Changes `main` and has the daemon build it. Returns how long the daemon took, if it built."""
+        path = os.path.join(self.ws, "app/src/main.rs")
+        text = open(path).read()
+        open(path, "w").write(text.replace("fn main() {", f'fn main() {{\n    println!("{note}");', 1))
+        start = time.time()
+        asked = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=120, env=self.env)
+        return time.time() - start if asked.returncode == 0 and note in self.run() else None
+
     def run(self, program=None, args=()):
         ran = subprocess.run([*RUNNER, program or self.program, *args], capture_output=True, text=True, timeout=60)
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -256,11 +283,12 @@ def round_trip(top, remote, name, crates, target, workspace):
     objects = bucket.objects()
     packs = [it for it in objects if it.startswith("packs/")]
     check("the bucket has A's packs, their keys and the manifest",
-          out.returncode == 0 and packs and sorted("packs/" + it for it in a.packs()) == sorted(packs)
+          out.returncode == 0 and packs and sorted("packs/" + it + ".zst" for it in a.packs()) == sorted(packs)
           and "manifests/default" in objects and len([it for it in objects if it.startswith("keys/")]) == len(packs),
           f"{len(objects)} objects")
     check("every object in the bucket is what its name says",
-          all(digest(bucket.get(it)) == it.split("/")[1].split(".")[0] for it in objects if not it.startswith("manifests/")))
+          all(digest(unpacked(bucket.get(it)) if it.endswith(".zst") else bucket.get(it)) == it.split("/")[1].split(".")[0]
+              for it in objects if not it.startswith("manifests/")))
     out = a.rustd("cache", "push", address)
     check("a second push sends nothing", out.returncode == 0 and out.stdout.startswith("0 packs added"), out.stdout.strip())
 
@@ -365,7 +393,7 @@ def transfers(top, remote):
     parts = proxy.seen("PUT", "partNumber=")
     check("a big pack goes up in parts, a few at a time",
           out.returncode == 0 and len(parts) == 3 and proxy.seen("POST", r"uploads") and proxy.seen("POST", "uploadId=")
-          and bucket.objects().get("packs/" + name) == BIG and not bucket.uploads(), f"{len(parts)} parts")
+          and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads(), f"{len(parts)} parts")
     check("rustd counts the requests the proxy saw", said_number(out.stderr, "requests") == len(proxy.requests),
           f"{said_number(out.stderr, 'requests')} and {len(proxy.requests)}")
     proxy.clear()
@@ -385,7 +413,7 @@ def transfers(top, remote):
               proxy.fault("PUT", "/manifests/", times=1, status=503)]
     out = a.rustd("cache", "push", address)
     check("5xx on a part, on completing and on the manifest: sent again",
-          out.returncode == 0 and [it.hits for it in faults] == [2, 1, 1] and digest(bucket.get("packs/" + name)) == name[:-5])
+          out.returncode == 0 and [it.hits for it in faults] == [2, 1, 1] and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5])
 
     a, b, address, bucket, name = pushed("always 503")
     proxy.fault("GET", "/packs/", times=1000, status=503)
@@ -411,7 +439,7 @@ def transfers(top, remote):
     fault = proxy.fault("PUT", "partNumber=1", times=1, cut_request=2 * MIB)
     out = a.rustd("cache", "push", address)
     check("the connection dropped in the middle of a part: sent again",
-          out.returncode == 0 and fault.hits == 1 and digest(bucket.get("packs/" + name) or b"") == name[:-5] and not bucket.uploads())
+          out.returncode == 0 and fault.hits == 1 and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads())
 
     a, b, address, bucket, name = pushed("stall")
     fault = proxy.fault("GET", "/packs/", times=1, stall=(3 * MIB, 6))
@@ -443,13 +471,20 @@ def transfers(top, remote):
     check("the store is whole, and counts what was kept aside as a temporary file",
           whole_store and counted.get("packs") == 0 and counted.get("temporary files") == 1 and counted.get("temporary bytes") == size)
     proxy.rate = None
+    # Old enough for a collection to take any other temporary file, an hour after its last byte.
+    aside = os.path.join(b.store, left[0]) if left else None
+    if aside:
+        os.utime(aside, (time.time() - 3600,) * 2)
+    b.cache("gc")
+    check("a collection an hour later leaves what was kept aside", b.partials() == left and aside
+          and os.path.getsize(aside) == size)
     out = b.rustd("cache", "pull", address)
     check("the next one fetches the rest only", out.returncode == 0 and whole(b, name)
           and said_number(out.stderr, "bytes received") < BIG - size + MIB, out.stderr.strip().split("\n")[0][-60:])
 
     a, b, address, bucket, name = pushed("spoiled partial")
     b.add_pack(filler(f"{remote.name} there already", 4096))
-    open(os.path.join(b.store, name + ".fetch.tmp"), "wb").write(b"what a stopped process left of something else" * 1000)
+    open(os.path.join(b.store, name + ".zst.tmp"), "wb").write(b"what a stopped process left of something else" * 1000)
     out = b.rustd("cache", "pull", address)
     check("a part kept aside that is of something else: fetched from the start",
           out.returncode == 0 and b.packs().get(name) is True and not b.partials()
@@ -531,11 +566,11 @@ def transfers(top, remote):
     proxy.rate = None
     objects = bucket.objects()
     check("the service killed in a push: said, no pack and no manifest in the bucket",
-          out.returncode != 0 and "packs/" + name not in objects and "manifests/default" not in objects, out.stderr.strip()[-60:])
+          out.returncode != 0 and "packs/" + name + ".zst" not in objects and "manifests/default" not in objects, out.stderr.strip()[-60:])
     out = a.rustd("cache", "push", address)
     check("back: the push goes through and no upload is left unfinished",
-          out.returncode == 0 and digest(bucket.get("packs/" + name) or b"") == name[:-5] and not bucket.uploads(),
-          out.stdout.strip())
+          out.returncode == 0 and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5] and not bucket.uploads(),
+          out.stdout.strip() or out.stderr.strip()[-200:])
 
 
 def stored(top, remote):
@@ -616,6 +651,194 @@ def stored(top, remote):
               (out.stdout + out.stderr).strip()[-70:])
 
 
+def collected(top, remote):
+    """`rustd cache gc --remote`: what no list names goes when it is old, and nothing else does."""
+    print(f"{remote.name}: the remote collected", flush=True)
+    DAYS = 24 * 3600
+
+    def gc(machine, address, *args, env=None):
+        out = machine.rustd("cache", "gc", "--remote", address, *args, env=env)
+        numbers = {}
+        for line in out.stdout.splitlines():
+            name, _, value = line.partition(":")
+            numbers[name.strip()] = [int(it) for it in re.findall(r"\d+", value)]
+        return out, numbers
+
+    def aged(seconds, one=True):
+        remote.proxy.clear()
+        remote.proxy.age, remote.proxy.age_one = seconds, one
+
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"g-{remote.name}-{it}", remote) for it in "ab")
+    sent = [a.add_pack(filler(f"{remote.name} collected {at}", 256 << 10)) for at in range(3)]
+    if a.rustd("cache", "push", address).returncode != 0:
+        raise SystemExit("the push failed")
+    stray = filler(f"{remote.name} listed nowhere", 256 << 10)
+    strays = {f"packs/{digest(stray)}.pack.zst": packed(stray), f"keys/{digest(b'k' * 32)}": b"k" * 32,
+              f"units/{digest(b'a unit')}": b"a unit"}
+    for name, data in strays.items():
+        bucket.put(name, data)
+    before = bucket.objects()
+
+    out, said = gc(a, address)
+    check("what was just written stays, listed or not", out.returncode == 0 and said.get("objects removed") == [0]
+          and said.get("lines taken out") == [0, 0] and bucket.objects() == before, out.stdout.splitlines()[0] if out.stdout else out.stderr[-80:])
+    out, _ = gc(a, address, "--unlisted-after", "1h")
+    check("an unlisted object cannot be given less than a push takes it as sent for",
+          out.returncode != 0 and "at least 7200 seconds" in out.stderr and bucket.objects() == before)
+    out, _ = gc(a, address, env={"RUSTD_REMOTE_READONLY": "1"})
+    check("a machine that only reads collects nothing", out.returncode != 0 and "RUSTD_REMOTE_READONLY" in out.stderr)
+    if not remote.proxy:
+        print("given: the checks that need old objects are left out: they need the proxy to say they are old")
+        return
+
+    aged(3 * DAYS)
+    out, said = gc(a, address, "--dry-run")
+    check("--dry-run says what would go and removes nothing", out.returncode == 0
+          and said.get("objects that would be removed") == [3] and bucket.objects() == before
+          and not remote.proxy.seen("DELETE"), out.stdout.replace("\n", "; ")[:110])
+    aged(3 * DAYS, one=False)
+    out, said = gc(a, address)
+    check("an object written again since it was listed stays", out.returncode == 0 and said.get("objects removed") == [0]
+          and bucket.objects() == before)
+    aged(3 * DAYS)
+    out, said = gc(a, address)
+    left = bucket.objects()
+    check("old objects that no list names are removed, and only those", out.returncode == 0
+          and said.get("objects removed") == [3] and said.get("bytes") == [sum(len(it) for it in strays.values())]
+          and set(before) - set(left) == set(strays), out.stdout.replace("\n", "; ")[:110])
+    aged(0)
+    out = b.rustd("cache", "pull", address)
+    whole, verified, _ = b.cache("verify")
+    check("what the lists name is all still there to pull", out.returncode == 0 and whole and sorted(b.packs()) == sorted(sent))
+
+    # A list this machine does not trust keeps what it names and all its lines.
+    key_file = os.path.join(remote.keys, "collector")
+    public = a.rustd("cache", "keygen", key_file).stdout.strip()
+    aged(3 * DAYS)
+    out, said = gc(a, address, "--older-than", "1d", env={"RUSTD_REMOTE_SIGN": key_file, "RUSTD_REMOTE_TRUST": public})
+    check("a list of another signer is left with its lines and what they name",
+          out.returncode == 0 and said.get("manifests left that this machine does not trust") == [1]
+          and said.get("objects removed") == [0] and bucket.objects() == left, out.stdout.replace("\n", "; ")[:110])
+
+    # A pack that was there before and is listed nowhere is sent again once it is old, and its age starts anew.
+    bucket.put(f"packs/{digest(stray)}.pack.zst", packed(stray))
+    c = Machine(top, f"g-{remote.name}-c", remote)
+    c.add_pack(stray)
+    aged(3 * DAYS)
+    out = c.rustd("cache", "push", address, "another")
+    check("a push sends again what has been there unlisted for long", out.returncode == 0
+          and len(remote.proxy.seen("PUT", "/packs/")) == 1, out.stdout.strip()[:80])
+
+    out, said = gc(a, address, "--older-than", "1d")
+    aged(0)
+    check("--older-than takes old packs off the lists and out of the remote", out.returncode == 0
+          and said.get("lines taken out") == [4, 0] and said.get("manifests written") == [2]
+          and not [it for it in bucket.objects() if it.startswith(("packs/", "keys/"))], out.stdout.replace("\n", "; ")[:110])
+    out = a.rustd("cache", "push", address)
+    d = Machine(top, f"g-{remote.name}-d", remote)
+    pulled = d.rustd("cache", "pull", address)
+    check("what was taken out is pushed again by a machine that has it", out.returncode == 0 and out.stdout.startswith("3 packs")
+          and pulled.returncode == 0 and sorted(d.packs()) == sorted(sent), out.stdout.strip()[:80])
+
+    # A store that made one pack of its small ones pushes that one too: the remote has them twice.
+    address, bucket = remote.fresh()
+    e, f = (Machine(top, f"g-{remote.name}-{it}", remote) for it in "ef")
+    for at in range(24):
+        e.add_pack(filler(f"{remote.name} small collected {at}", 64 << 10))
+    e.rustd("cache", "push", address)
+    ok, merged, _ = e.cache("gc")
+    out = e.rustd("cache", "push", address)
+    twice = len([it for it in bucket.objects() if it.startswith("packs/")])
+    aged(3 * DAYS)
+    collect, said = gc(e, address)
+    aged(0)
+    once = [it for it in bucket.objects() if it.startswith("packs/")]
+    pulled = f.rustd("cache", "pull", address)
+    whole, verified, _ = f.cache("verify")
+    check("packs whose keys are all in a merged pack are taken out, and the merged one stays",
+          ok and out.returncode == 0 and twice > len(once) and collect.returncode == 0
+          and said.get("lines taken out") == [0, twice - len(once)] and said.get("objects removed") == [2 * (twice - len(once))]
+          and pulled.returncode == 0 and whole and verified.get("records") == 24 and sorted(f.packs()) == sorted(e.packs()),
+          f"{twice} packs, then {len(once)}; " + collect.stdout.splitlines()[0][:70] if collect.stdout else collect.stderr[-80:])
+
+
+def until(holds, seconds=20):
+    """Waits for `holds()` to be true, and says whether it came to be."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if holds():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def kept(top, remote, crates, target, workspace):
+    """A daemon that stays: it pushes on a schedule and when it ends, and pulls when the manifest changed."""
+    print(f"{remote.name}: a daemon that stays", flush=True)
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"d-{remote.name}-{it}", remote) for it in "ab")
+    a.checkout(workspace)
+    a.cargo(target)
+    packs = lambda: [it for it in bucket.objects() if it.startswith("packs/")]
+    listed = lambda: len((bucket.get("manifests/default") or b"").splitlines())
+
+    daemon, socket = a.daemon(crates, {"RUSTD_REMOTE": address, "RUSTD_REMOTE_PUSH_EVERY": "2s"})
+    try:
+        check("what the first build compiled is sent without being asked, small as it is",
+              until(lambda: listed() >= 1) and len(packs()) == listed(), f"{listed()} packs listed")
+        first = listed()
+        took = a.edit(socket, "edited once")
+        check("what an edit compiled is sent on the schedule", took is not None and until(lambda: listed() > first),
+              f"{listed()} packs listed")
+
+        # Another machine adds to the manifest; the daemon has it after its next build lacks something.
+        other = b.add_pack(filler(f"{remote.name} from another machine", 256 << 10))
+        out = b.rustd("cache", "push", address)
+        took = a.edit(socket, "edited twice")
+        check("a build that lacks something has the daemon pull when the manifest changed",
+              out.returncode == 0 and took is not None and until(lambda: other in a.packs())
+              and "the manifest of `default` has changed" in a.heard(), a.heard().count("has changed"))
+        looks = a.heard().count("has changed")
+        took = a.edit(socket, "edited thrice")
+        time.sleep(6)
+        check("and does not pull when it did not", took is not None and a.heard().count("has changed") == looks)
+
+        if remote.proxy:
+            remote.proxy.clear()
+            remote.proxy.hold = 3
+            took = a.edit(socket, "edited while the remote is slow")
+            remote.proxy.hold = 0
+            check("no build waits for the remote", took is not None and took < 3, f"{took and round(took, 2)}s with every request held 3s")
+    finally:
+        daemon.terminate()
+        ended = daemon.wait(timeout=90)
+    ok, counted, _ = a.cache("stats")
+    out = a.rustd("cache", "push", address)
+    check("told to end, the daemon ends as it was told, with nothing left to send", ended == -signal.SIGTERM and ok
+          and counted.get("open packs") == 0 and out.returncode == 0 and out.stdout.startswith("0 packs added"),
+          f"exit {ended}; {out.stdout.strip()[:40]}")
+
+    daemon, socket = a.daemon(crates, {"RUSTD_REMOTE": address, "RUSTD_REMOTE_PUSH_EVERY": "off"})
+    try:
+        time.sleep(1)
+        before = listed()
+        took = a.edit(socket, "edited with no schedule")
+        time.sleep(4)
+        unsent = listed()
+    finally:
+        daemon.terminate()
+        ended = daemon.wait(timeout=90)
+    check("with the schedule off an edit is sent when the daemon ends and not before",
+          took is not None and unsent == before and ended == -signal.SIGTERM and listed() == before + 1,
+          f"{before}, {unsent}, then {listed()} packs listed")
+    c = Machine(top, f"d-{remote.name}-c", remote)
+    c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
+    log, _ = c.build(crates, env={"RUSTD_REMOTE": address})
+    check("another machine builds the edited program and compiles nothing", compiled(log) == 0 and "edited with no schedule" in c.run(),
+          f"{compiled(log)} compiled")
+
+
 def packs_fetched(remote):
     """How many fetches of packs the proxy saw since it was last asked, or `None` without a proxy."""
     if not remote.proxy:
@@ -663,11 +886,14 @@ def over_tls(top, remote):
         out = b.rustd("cache", "pull", address, env=trusting)
         check("a big pack sent and fetched over TLS, the certificate trusted through SSL_CERT_FILE",
               sent.returncode == 0 and out.returncode == 0 and b.packs() == {name: True}
-              and digest(bucket.get("packs/" + name) or b"") == name[:-5], out.stdout.strip())
+              and digest(unpacked(bucket.get("packs/" + name + ".zst"))) == name[:-5], out.stdout.strip())
         b.empty()
+        start = time.time()
         out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_TIMEOUT": "2"})
+        took = time.time() - start
         check("a certificate nobody vouches for: refused, said, nothing fetched",
               out.returncode != 0 and not b.packs() and not b.partials() and "ertificate" in out.stderr, out.stderr.strip()[-90:])
+        check("and it is said at once, not after the waits of a remote that is down", took < 3, f"{took:.2f}s")
     finally:
         server.kill()
 
@@ -686,20 +912,35 @@ def spoiled(top, remote):
         other = big_store(a, f"{remote.name} {what} whole") if what == "one byte changed" else None
         if a.rustd("cache", "push", address).returncode != 0:
             raise SystemExit("the push failed")
-        bucket.put("packs/" + name, spoil(data))
+        sent = bucket.get("packs/" + name + ".zst")
+        bucket.put("packs/" + name + ".zst", spoil(sent))
         out = b.rustd("cache", "pull", address)
         check(f"a pack with {what}: rejected, said, counted, not in the store",
-              out.returncode != 0 and name not in b.packs() and not b.partials() and "rejected packs/" + name in out.stderr
+              out.returncode != 0 and name not in b.packs() and not b.partials() and "rejected packs/" + name + ".zst" in out.stderr
               and said_number(out.stderr, "objects rejected") == 1 and (other is None or b.packs() == {other: True}),
               out.stderr.strip().split("\n")[-1][-60:])
-        bucket.put("packs/" + name, data)
+        bucket.put("packs/" + name + ".zst", sent)
         out = b.rustd("cache", "pull", address)
         check("put back: fetched", out.returncode == 0 and b.packs().get(name) is True)
+    # An object that is what the manifest says and unpacks to something else than the pack.
+    address, bucket = remote.fresh()
+    a, b = (Machine(top, f"s-{remote.name}-inside-{it}", remote) for it in "ab")
+    name = a.add_pack(filler(f"{remote.name} inside", MIB))
+    a.rustd("cache", "push", address)
+    line = bucket.get("manifests/default").decode().split()
+    for what, inside in (("another pack inside", packed(filler(f"{remote.name} other", MIB))), ("not compressed inside", b"x" * 4096)):
+        bucket.put("packs/" + name + ".zst", inside)
+        bucket.put("manifests/default", (" ".join(line[:4] + [digest(inside), str(len(inside))]) + "\n").encode())
+        out = b.rustd("cache", "pull", address)
+        check(f"a compressed object with {what}: rejected after unpacking, nothing left",
+              out.returncode != 0 and not b.packs() and not b.partials() and "rejected packs/" + name + ".zst" in out.stderr
+              and said_number(out.stderr, "objects rejected") == 1 and b.cache("verify")[0],
+              out.stderr.strip().split("\n")[-1][-60:])
     address, bucket = remote.fresh()
     a, b = (Machine(top, f"s-{remote.name}-gone-{it}", remote) for it in "ab")
     name = big_store(a, f"{remote.name} gone")
     a.rustd("cache", "push", address)
-    bucket.delete("packs/" + name)
+    bucket.delete("packs/" + name + ".zst")
     out = b.rustd("cache", "pull", address)
     check("a pack the manifest lists that is not there: said", out.returncode != 0 and "is listed and is not there" in out.stderr
           and not b.packs() and not b.partials())
@@ -719,11 +960,11 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
         return m
 
     # 1. The pack A sent, changed in place: its name no longer fits.
-    pack = "packs/" + listed[0][0] + ".pack"
+    pack = "packs/" + listed[0][0] + ".pack.zst"
     data = bucket.get(pack)
-    records = records_of(data)
+    records = records_of(unpacked(data))
     changed = pack_of([(key, value[:-1] + bytes([value[-1] ^ 0x55]) if value else value) for key, value in records])
-    bucket.put(pack, changed)
+    bucket.put(pack, packed(changed))
     b = machine("changed")
     log, _ = b.build(crates, env={"RUSTD_REMOTE": address})
     check("code changed under A's name: rejected, B compiles its own and prints the same",
@@ -830,6 +1071,8 @@ def checks():
             if remote.server:
                 over_tls(top, remote)
             stored(top, remote)
+            collected(top, remote)
+            kept(top, remote, crates, target, workspace)
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)

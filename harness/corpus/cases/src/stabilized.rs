@@ -414,6 +414,142 @@ pub fn c_variadic_stack() -> (f64, f64, f64) {
     }
 }
 
+/// Named parameters that the registers do not hold: the variable arguments follow them on
+/// the stack. Only where rustd compiles such a function.
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded(
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    h: u64,
+    i: u8,
+    j: u32,
+    k: u128,
+    l: u16,
+    x0: f64,
+    x1: f64,
+    x2: f64,
+    x3: f64,
+    x4: f64,
+    x5: f64,
+    x6: f64,
+    x7: f64,
+    y: f32,
+    z: f64,
+    count: u32,
+    mut args: ...
+) -> f64 {
+    let ints = a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8;
+    let spilled = i as u128 * 9 + j as u128 * 10 + k * 11 + l as u128 * 12;
+    let mut total = ints as f64 + spilled as f64 + [x0, x1, x2, x3, x4, x5, x6, x7].iter().sum::<f64>() + y as f64 + z * 13.0;
+    for at in 0..count {
+        total = total * 2.0
+            + match at % 2 {
+                0 => unsafe { args.next_arg::<u64>() as f64 },
+                _ => unsafe { args.next_arg::<f64>() },
+            };
+    }
+    total
+}
+/// A 128-bit integer and a pair that the registers left do not hold, and what follows them.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Pair {
+    pub a: u64,
+    pub b: u64,
+}
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded_wide(
+    a: [u64; 7],
+    b: u128,
+    c: u8,
+    count: u32,
+    mut args: ...
+) -> u128 {
+    let mut total = a.iter().sum::<u64>() as u128 + b * 3 + c as u128 * 5;
+    for _ in 0..count {
+        total = total * 7 + unsafe { args.next_arg::<u64>() as u128 };
+    }
+    total
+}
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn crowded_pair(
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+    g: u64,
+    p: Pair,
+    h: u16,
+    q: Pair,
+    count: u32,
+    mut args: ...
+) -> u64 {
+    let mut total = a + b + c + d + e + f + g + p.a * 3 + p.b * 5 + h as u64 * 7 + q.a * 11 + q.b;
+    for _ in 0..count {
+        total = total * 13 + unsafe { args.next_arg::<u32>() as u64 };
+    }
+    total
+}
+#[cfg(target_vendor = "apple")]
+pub fn c_variadic_named_wide() -> (u128, u128, u64, u64) {
+    let (p, q) = (Pair { a: 21, b: 22 }, Pair { a: 23, b: 24 });
+    unsafe {
+        (
+            crowded_wide([1, 2, 3, 4, 5, 6, 7], 1 << 90, 9, 0),
+            crowded_wide([1, 2, 3, 4, 5, 6, 7], 1 << 90, 9, 3, 10u64, 11u64, 12u64),
+            crowded_pair(1, 2, 3, 4, 5, 6, 7, p, 8, q, 0),
+            crowded_pair(1, 2, 3, 4, 5, 6, 7, p, 8, q, 2, 31u32, 32u32),
+        )
+    }
+}
+#[cfg(target_vendor = "apple")]
+pub fn c_variadic_named_stack() -> (f64, f64) {
+    unsafe {
+        (
+            crowded(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1 << 66, 12, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 0.25, 0.75, 0),
+            crowded(
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 0.25, 0.75, 5, 13u64, 1.5f64, 14u64, 2.5f64,
+                15u64,
+            ),
+        )
+    }
+}
+
+/// A 128-bit variable argument, which is at a multiple of sixteen bytes where the variable
+/// arguments are on the stack.
+#[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+unsafe extern "C" fn widest(count: u32, mut args: ...) -> u128 {
+    let mut total = 0u128;
+    for at in 0..count {
+        total = total.wrapping_mul(3).wrapping_add(match at % 3 {
+            0 => unsafe { args.next_arg::<u32>() as u128 },
+            1 => unsafe { args.next_arg::<u128>() },
+            _ => unsafe { args.next_arg::<i128>() as u128 },
+        });
+    }
+    total
+}
+#[cfg(all(feature = "nightly", not(target_family = "wasm")))]
+pub fn c_variadic_wide() -> (u128, u128) {
+    unsafe {
+        (
+            widest(3, 1u32, 1u128 << 100, -5i128),
+            widest(7, 1u32, 2u128, -3i128, 4u32, u128::MAX, i128::MIN, 5u32),
+        )
+    }
+}
+
 // Named parameters past the registers of Windows, a result in memory, and a panic that
 // crosses the function.
 #[cfg(not(target_family = "wasm"))]
@@ -724,6 +860,34 @@ pub mod x86 {
         }
         out
     }
+
+    /// A symbol in the assembly of a function that is nothing but assembly, as ELF has
+    /// its relocations.
+    #[cfg(target_os = "linux")]
+    pub mod symbols {
+        use std::arch::naked_asm;
+
+        extern "C" fn sym_target(a: u64) -> u64 {
+            a * 3 + 1
+        }
+        static SYM_DATA: u64 = 1000;
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym(a: u64) -> u64 {
+            naked_asm!("jmp {f}", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_call(a: u64) -> u64 {
+            naked_asm!("push rbp", "call {f}", "add rax, 500", "pop rbp", "ret", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_data(a: u64) -> u64 {
+            naked_asm!("mov rax, [rip + {d}]", "add rax, rdi", "ret", d = sym SYM_DATA)
+        }
+        pub fn naked_sym_operands() -> (u64, u64, u64) {
+            let f: extern "C" fn(u64) -> u64 = naked_sym;
+            (naked_sym(5) + f(1), naked_sym_call(2), naked_sym_data(3))
+        }
+    }
 }
 
 /// What `x86` has, in AArch64 assembly.
@@ -787,6 +951,44 @@ pub mod arm {
     pub extern "C" fn naked_float(a: f64, b: f64) -> f64 {
         naked_asm!("fadd d0, d0, d1", "ret")
     }
+    extern "C" fn tripled(a: u64) -> u64 {
+        a * 3 + 1
+    }
+    static NAKED_TABLE: [u64; 4] = [11, 22, 33, 44];
+    /// A jump to a function the block names.
+    #[cfg(target_vendor = "apple")]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_jump(a: u64) -> u64 {
+        naked_asm!("add x0, x0, #1", "b {f}", f = sym tripled)
+    }
+    /// A call of one, and a static read by its address.
+    #[cfg(target_vendor = "apple")]
+    #[unsafe(naked)]
+    pub extern "C" fn naked_table(a: u64, at: u64) -> u64 {
+        naked_asm!(
+            "stp x29, x30, [sp, #-32]!",
+            "mov x29, sp",
+            "str x1, [sp, #16]",
+            "bl {f}",
+            "ldr x1, [sp, #16]",
+            "adrp x8, {table}@PAGE",
+            "add x8, x8, {table}@PAGEOFF",
+            "ldr x9, [x8, x1, lsl #3]",
+            "add x0, x0, x9",
+            "adrp x8, {table}@PAGE + 24",
+            "ldr x9, [x8, {table}@PAGEOFF + 24]",
+            "add x0, x0, x9",
+            "ldp x29, x30, [sp], #32",
+            "ret",
+            f = sym tripled,
+            table = sym NAKED_TABLE,
+        )
+    }
+    #[cfg(target_vendor = "apple")]
+    pub fn naked_sym() -> (u64, u64, u64) {
+        (naked_jump(4), naked_table(5, 0), naked_table(6, 2))
+    }
+
     const NAKED_K: u64 = 5 + 2;
     pub fn naked_more() -> (u64, f64, u64) {
         let f: extern "C" fn(u64) -> u64 = naked_const;
@@ -819,5 +1021,175 @@ pub mod arm {
             out.push(v);
         }
         out
+    }
+
+    /// A symbol in the assembly of a function that is nothing but assembly, as ELF has
+    /// its relocations.
+    #[cfg(target_os = "linux")]
+    pub mod symbols {
+        use std::arch::naked_asm;
+
+        extern "C" fn sym_target(a: u64) -> u64 {
+            a * 3 + 1
+        }
+        extern "C" fn sym_other(a: u32) -> u64 {
+            a as u64 + 500
+        }
+        static SYM_DATA: u64 = 1000;
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym(a: u64) -> u64 {
+            naked_asm!("b {f}", f = sym sym_target)
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_call(a: u32) -> u64 {
+            naked_asm!(
+                "stp x29, x30, [sp, #-16]!",
+                "bl {f}",
+                "bl {g}",
+                "ldp x29, x30, [sp], #16",
+                "ret",
+                f = sym sym_other,
+                g = sym sym_target,
+            )
+        }
+        #[unsafe(naked)]
+        pub extern "C" fn naked_sym_data(a: u64) -> u64 {
+            naked_asm!(
+                "adrp x1, {d}",
+                "ldr x1, [x1, :lo12:{d}]",
+                "add x0, x0, x1",
+                "ret",
+                d = sym SYM_DATA,
+            )
+        }
+        pub fn naked_sym_operands() -> (u64, u64, u64) {
+            let f: extern "C" fn(u64) -> u64 = naked_sym;
+            (naked_sym(5) + f(1), naked_sym_call(2), naked_sym_data(3))
+        }
+    }
+
+    // Sixteen bytes aligned to sixteen that the integer registers left do not hold: on the
+    // stack whole, and the registers left are out of use for what follows.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub struct Aligned {
+        pub a: u64,
+        pub b: u32,
+    }
+    pub extern "C" fn wide_late(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, x: u128, h: u64, y: i128,
+    ) -> u128 {
+        let small = a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h;
+        x.wrapping_mul(3).wrapping_add(small as u128).wrapping_sub(y as u128)
+    }
+    pub extern "C" fn wide_fits(a: u64, b: u64, c: u64, d: u64, e: u64, x: u128, h: u64) -> u128 {
+        x ^ ((a + b + c + d + e) as u128) << 64 ^ h as u128
+    }
+    pub extern "C" fn aligned_late(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, x: Aligned, h: u64, y: Aligned,
+    ) -> u64 {
+        a + b + c + d + e + f + g + x.a * 10 + x.b as u64 * 100 + h * 1000 + y.a * 7 + y.b as u64
+    }
+    pub fn wide_stack() -> (u128, u128, u64, u128) {
+        let wide: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u128, u64, i128) -> u128 =
+            wide_late;
+        let (x, y) = (Aligned { a: 3, b: 4 }, Aligned { a: 5, b: 6 });
+        (
+            wide_late(1, 2, 3, 4, 5, 6, 7, 1 << 90 | 9, 8, -5),
+            wide(7, 6, 5, 4, 3, 2, 1, u128::MAX - 2, 11, i128::MIN + 3),
+            aligned_late(1, 2, 3, 4, 5, 6, 7, x, 8, y),
+            wide_fits(1, 2, 3, 4, 5, 1 << 100 | 1 << 20, 6),
+        )
+    }
+
+    // Variable arguments of 128 bits, which come in two registers that start at an even one
+    // or in sixteen bytes of the stack at a multiple of sixteen.
+    #[inline(never)]
+    fn stir(total: u128, at: u32) -> u128 {
+        std::hint::black_box(total.rotate_left(at % 7) ^ at as u128)
+    }
+    #[cfg(feature = "nightly")]
+    pub unsafe extern "C" fn va_wide(count: u32, mut args: ...) -> u128 {
+        let mut total = 0u128;
+        for at in 0..count {
+            let next = match at % 4 {
+                0 => unsafe { args.next_arg::<u128>() },
+                1 => unsafe { args.next_arg::<u64>() as u128 },
+                2 => unsafe { args.next_arg::<f64>() as u128 },
+                _ => unsafe { args.next_arg::<i128>() as u128 },
+            };
+            // The call has the function keep registers of its caller's.
+            total = stir(total.wrapping_mul(31).wrapping_add(next), at);
+        }
+        total
+    }
+    /// Named parameters that the registers do not hold: the variable ones follow them on
+    /// the stack.
+    pub unsafe extern "C" fn va_named(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64,
+        p: f64, q: f64, r: f64, s: f64, t: f64, u: f64, v: f64, w: f64, x: f32,
+        wide: u128, count: u32, mut args: ...
+    ) -> f64 {
+        let mut total = (a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h + 9 * i) as f64
+            + p + q * 2.0 + r * 3.0 + s * 4.0 + t * 5.0 + u * 6.0 + v * 7.0 + w * 8.0
+            + x as f64 * 9.0 + (wide >> 64) as f64 + wide as u64 as f64;
+        for at in 0..count {
+            total = stir(at as u128, at) as f64
+                + total * 2.0
+                + match at % 3 {
+                    0 => unsafe { args.next_arg::<i64>() as f64 },
+                    1 => unsafe { args.next_arg::<f64>() },
+                    _ => unsafe { args.next_arg::<u32>() as f64 },
+                };
+        }
+        total
+    }
+    /// A named 128-bit parameter with one register left for it.
+    #[cfg(feature = "nightly")]
+    pub unsafe extern "C" fn va_named_wide(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, wide: i128, mut args: ...
+    ) -> i128 {
+        let first = unsafe { args.next_arg::<i64>() } as i128;
+        let second = unsafe { args.next_arg::<i128>() };
+        let third = unsafe { args.next_arg::<f64>() } as i128;
+        wide + first * 3 + second * 5 + third * 7 + (a + b + c + d + e + f + g) as i128
+    }
+    pub fn va_named_args() -> (f64, f64, f64) {
+        let through: unsafe extern "C" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            f64, f64, f64, f64, f64, f64, f64, f64, f32,
+            u128, u32, ...
+        ) -> f64 = va_named;
+        unsafe {
+            (
+                va_named(
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5,
+                    5u128 << 64 | 6, 0,
+                ),
+                va_named(
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5,
+                    5u128 << 64 | 6, 5, -4i64, 0.25f64, 70u32, 12i64, 8.0f64,
+                ),
+                through(
+                    9, 8, 7, 6, 5, 4, 3, 2, 1, 8.5, 7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5,
+                    1u128 << 64 | 2, 3, i64::MIN, -0.5f64, u32::MAX,
+                ),
+            )
+        }
+    }
+    #[cfg(feature = "nightly")]
+    pub fn va_wide_args() -> (u128, u128, u128, i128) {
+        let through: unsafe extern "C" fn(u32, ...) -> u128 = va_wide;
+        unsafe {
+            (
+                va_wide(0),
+                va_wide(4, 1u128 << 100, 5u64, 2.5f64, -3i128),
+                through(
+                    10, 7u128, 1u64, 0.5f64, i128::MAX, u128::MAX, 2u64, 9.75f64, -1i128,
+                    3u128 << 64, u64::MAX,
+                ),
+                va_named_wide(1, 2, 3, 4, 5, 6, 7, -1i128 << 80, 11i64, 13i128 << 66, 2.0f64),
+            )
+        }
     }
 }

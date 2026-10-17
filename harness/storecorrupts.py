@@ -89,7 +89,8 @@ def fill(checkout, store):
     if status != 0:
         fail(f"gc: {out}")
     whole, numbers, out = verify(store)
-    if not whole or numbers["packs"] < 2 or numbers["open packs"] != 0:
+    # However many packs: a collection makes one of them once they are many and small.
+    if not whole or numbers["packs"] < 1 or numbers["open packs"] != 0:
         fail(f"the filled store: {out}")
     return numbers["packs"]
 
@@ -223,7 +224,7 @@ def main():
     checkout = Checkout(work)
     counts = {"with no daemon": 0, "under a daemon": 0, "an open pack": 0}
     for round in range(ROUNDS):
-        if round % 8 == 0 or len(files(store, ".pack")) < 2:
+        if round % 8 == 0 or not files(store, ".pack"):
             shutil.rmtree(store, ignore_errors=True)
             fill(checkout, store)
         kind = RNG.choice([while_stopped, while_stopped, while_running, open_pack])

@@ -48,8 +48,11 @@ syntax.workspace = true
 # rustls with ring, which is in the tree already.
 aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-s3 = { version = "1.100", default-features = false, features = ["behavior-version-latest", "rt-tokio", "http-1x"] }
+# The TLS the client above is built on, named to tell a certificate that is refused from a
+# network that is down.
+rustls = { version = "0.23", default-features = false }
 aws-smithy-http-client = { version = "1.1", features = ["rustls-ring"] }
-tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ed25519-dalek = "2.2"
 getrandom = "0.3"

@@ -7,7 +7,9 @@
 //! the packs its builds were served from. A push sends the packs the manifest lacks and
 //! adds them to it; a pull fetches the ones it lists that are not here. With
 //! `RUSTD_REMOTE_LAZY` the daemon fetches the keys only, and a pack when a build first asks
-//! for a key it holds.
+//! for a key it holds. A daemon that stays goes on in `keeper.rs`: it pulls again when a
+//! build lacked something and the manifest has changed, and pushes on a schedule and when
+//! it is told to end.
 //!
 //! What is fetched becomes a pack of the store like any other: it is written the way the
 //! store writes its own, counts toward `RUSTD_CACHE_MAX`, and can be evicted and fetched
@@ -17,6 +19,8 @@
 //! remote can withhold code and cannot change it. What it could change is the list, which
 //! is what `signed.rs` is for. `RUSTD_REMOTE_READONLY` keeps a machine from writing at all.
 
+mod collect;
+mod keeper;
 mod s3;
 mod signed;
 mod transfer;
@@ -41,11 +45,15 @@ use url::Url;
 
 use s3::{S3, Written};
 use signed::Trust;
-use transfer::{Body, Version};
+use transfer::{Body, Object, Version};
 pub(crate) use transfer::{Digest, Fetched, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
 const LIST_WRITES: usize = 8;
+/// An object that is there and that no list names yet is taken as sent for this long after
+/// it was written. Past that it is sent again, so that a collection of the remote, which
+/// goes by when an object was written, does not take it from under a push.
+const REUSE_FOR: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct Remote {
     place: Place,
@@ -136,23 +144,74 @@ impl Remote {
         }
     }
 
-    /// How many bytes the object under `name` has, if there is one.
-    async fn size(&self, name: &str) -> anyhow::Result<Option<u64>> {
+    /// The object under `name`, if there is one.
+    async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         let _permit = self.traffic.permit().await?;
-        self.patiently(|| self.size_once(name)).await
+        self.patiently(|| self.found_once(name)).await
     }
 
-    async fn size_once(&self, name: &str) -> anyhow::Result<Option<u64>> {
+    async fn found_once(&self, name: &str) -> anyhow::Result<Option<Object>> {
         match &self.place {
             Place::Dir(dir) => {
                 self.traffic.operations.fetch_add(1, Ordering::Relaxed);
                 match tokio::fs::metadata(dir.join(name)).await {
-                    Ok(found) => Ok(Some(found.len())),
+                    Ok(found) => Ok(Some(Object {
+                        name: name.to_owned(),
+                        len: found.len(),
+                        written: found.modified()?,
+                    })),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(e).with_context(|| format!("looking for {name}")),
                 }
             }
-            Place::S3(s3) => s3.size(name).await,
+            Place::S3(s3) => s3.found(name).await,
+        }
+    }
+
+    /// Whether the object under `name` is there with `len` bytes and need not be sent. One
+    /// that has been there for longer than [`REUSE_FOR`] is sent again, which tells a
+    /// collection of the remote that it is wanted.
+    async fn holds(&self, name: &str, len: u64) -> anyhow::Result<bool> {
+        let fresh = |it: &Object| it.written.elapsed().is_ok_and(|age| age < REUSE_FOR);
+        Ok(self.found(name).await?.is_some_and(|it| it.len == len && fresh(&it)))
+    }
+
+    /// The objects whose names start with `prefix`, which ends a directory.
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+        let _permit = self.traffic.permit().await?;
+        self.patiently(|| self.list_once(prefix)).await
+    }
+
+    async fn list_once(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+        match &self.place {
+            Place::Dir(dir) => {
+                self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+                let (dir, prefix) = (dir.join(prefix), prefix.to_owned());
+                tokio::task::spawn_blocking(move || list_dir(&dir, &prefix)).await?
+            }
+            Place::S3(s3) => s3.list(prefix).await,
+        }
+    }
+
+    /// Removes the object under `name`.
+    async fn delete(&self, name: &str) -> anyhow::Result<()> {
+        self.may_write()?;
+        let _permit = self.traffic.permit().await?;
+        self.patiently(|| self.delete_once(name)).await
+    }
+
+    async fn delete_once(&self, name: &str) -> anyhow::Result<()> {
+        match &self.place {
+            Place::Dir(dir) => {
+                self.traffic.operations.fetch_add(1, Ordering::Relaxed);
+                match tokio::fs::remove_file(dir.join(name)).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(e).with_context(|| format!("removing {name}"))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Place::S3(s3) => s3.delete(name).await,
         }
     }
 
@@ -221,6 +280,21 @@ impl Remote {
         name: &str,
         extend: impl Fn(&str) -> String,
     ) -> anyhow::Result<()> {
+        self.rewrite_list(name, extend, true).await
+    }
+
+    /// As [`Self::extend_list`], for lines being taken out: a list this machine would not
+    /// add to is left as it is, and that is an error.
+    async fn shrink_list(&self, name: &str, shrink: impl Fn(&str) -> String) -> anyhow::Result<()> {
+        self.rewrite_list(name, shrink, false).await
+    }
+
+    async fn rewrite_list(
+        &self,
+        name: &str,
+        rewrite: impl Fn(&str) -> String,
+        anew: bool,
+    ) -> anyhow::Result<()> {
         for _ in 0..LIST_WRITES {
             let read = self.read_small(name).await?;
             let text = match &read {
@@ -234,12 +308,13 @@ impl Remote {
                     ""
                 }
                 // Signing it would be vouching for it.
-                Err(e) => {
+                Err(e) if anew => {
                     eprintln!("remote: {e:#}: it is written anew");
                     ""
                 }
+                Err(e) => return Err(e),
             };
-            let next = self.trust.seal(name, &extend(lines)).into_bytes();
+            let next = self.trust.seal(name, &rewrite(lines)).into_bytes();
             let read_at = read.as_ref().map(|it| &it.1);
             if let Written::Done = self.write_small(name, next, read_at).await? {
                 return Ok(());
@@ -268,7 +343,7 @@ impl Remote {
         name: &str,
         bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
-        if self.size(name).await? != Some(bytes.len() as u64) {
+        if !self.holds(name, bytes.len() as u64).await? {
             // Whoever else writes it writes the same bytes.
             self.write_small(name, bytes, None).await?;
         }
@@ -283,6 +358,28 @@ impl Remote {
     pub(crate) fn traffic(&self) -> &Traffic {
         &self.traffic
     }
+}
+
+/// The files of a directory of a directory remote, named as objects are. No directory is
+/// no files.
+fn list_dir(dir: &Path, prefix: &str) -> anyhow::Result<Vec<Object>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("listing {prefix}")),
+    };
+    let mut objects = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let found = entry.metadata()?;
+        let Some(name) = entry.file_name().to_str().map(|it| format!("{prefix}{it}")) else {
+            continue;
+        };
+        if found.is_file() {
+            objects.push(Object { name, len: found.len(), written: found.modified()? });
+        }
+    }
+    Ok(objects)
 }
 
 /// Copies a file into a directory remote so that it is there whole or not at all.
@@ -373,13 +470,26 @@ impl Tally {
     }
 }
 
-/// A pack as a manifest lists it: `PACK SIZE KEYS FORMAT`, the hash of the pack, how many
-/// bytes it is, the hash of the list of its keys, and the format of the store it is of.
+/// A pack as a manifest lists it: `PACK SIZE KEYS FORMAT PACKED PACKED_SIZE`, the hash of
+/// the pack, how many bytes it is, the hash of the list of its keys, the format of the
+/// store it is of, and the hash and size of the object that holds it compressed. A line
+/// without the last two is a pack that was sent as it is.
 #[derive(Clone, Copy)]
 struct Listed {
     size: u64,
     keys: Digest,
     format: u32,
+    packed: Option<(Digest, u64)>,
+}
+
+impl Listed {
+    /// The object the pack is in, and the hash of that object.
+    fn object(&self, pack: &Digest) -> (String, Digest) {
+        match self.packed {
+            Some((packed, _)) => (format!("packs/{pack}.pack.zst"), packed),
+            None => (pack_object(pack), *pack),
+        }
+    }
 }
 
 /// What a project's builds were served from.
@@ -400,14 +510,21 @@ impl Manifest {
             let size = fields.next()?.parse().ok()?;
             let keys = Digest::parse(fields.next()?)?;
             let format = fields.next()?.parse().ok()?;
-            Some((pack, Listed { size, keys, format }))
+            let packed = match (fields.next(), fields.next()) {
+                (Some(packed), Some(size)) => Some((Digest::parse(packed)?, size.parse().ok()?)),
+                _ => None,
+            };
+            Some((pack, Listed { size, keys, format, packed }))
         });
         Manifest(packs.collect())
     }
 
     fn lines(&self) -> String {
-        let line = |(pack, it): (&Digest, &Listed)| {
-            format!("{pack} {} {} {}\n", it.size, it.keys, it.format)
+        let line = |(pack, it): (&Digest, &Listed)| match it.packed {
+            Some((packed, size)) => {
+                format!("{pack} {} {} {} {packed} {size}\n", it.size, it.keys, it.format)
+            }
+            None => format!("{pack} {} {} {}\n", it.size, it.keys, it.format),
         };
         self.0.iter().map(line).collect()
     }
@@ -469,13 +586,44 @@ fn keys_of(store: &Path, pack: Digest) -> anyhow::Result<(u64, Vec<u8>)> {
 async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Result<(Listed, u64)> {
     let from = store.to_owned();
     let (size, keys) = tokio::task::spawn_blocking(move || keys_of(&from, pack)).await??;
-    let listed = Listed { size, keys: Digest::of(&keys), format: STORE_FORMAT };
-    remote.send_named_by_hash(&keys_object(&listed.keys), keys).await?;
-    if remote.size(&pack_object(&pack)).await? == Some(size) {
-        return Ok((listed, 0));
+    let keys_digest = Digest::of(&keys);
+    remote.send_named_by_hash(&keys_object(&keys_digest), keys).await?;
+    let (from, aside) = (store.join(pack_file(&pack)), store.join(format!("{pack}.pack.send.tmp")));
+    let packing = aside.clone();
+    let packed = tokio::task::spawn_blocking(move || pack_whole(&from, &packing)).await?;
+    let sent = async {
+        let (packed, packed_size) = packed?;
+        let listed = Listed {
+            size,
+            keys: keys_digest,
+            format: STORE_FORMAT,
+            packed: Some((packed, packed_size)),
+        };
+        let (object, _) = listed.object(&pack);
+        if remote.holds(&object, packed_size).await? {
+            return Ok((listed, 0));
+        }
+        remote.send_file(&object, &aside, packed_size).await?;
+        Ok((listed, packed_size))
     }
-    remote.send_file(&pack_object(&pack), &store.join(pack_file(&pack)), size).await?;
-    Ok((listed, size))
+    .await;
+    _ = tokio::fs::remove_file(&aside).await;
+    sent
+}
+
+/// How hard packs are compressed for the remote: zstd's default, which makes a pack a
+/// seventh of its size at a tenth of a second for 50 MB.
+const PACKING: i32 = 3;
+
+/// Compresses the file `from` into `to`, a temporary file of the store's, and says what
+/// hash and size it has.
+fn pack_whole(from: &Path, to: &Path) -> anyhow::Result<(Digest, u64)> {
+    let mut packed = zstd::Encoder::new(File::create(to)?, PACKING)?;
+    std::io::copy(&mut File::open(from)?, &mut packed)?;
+    packed.finish()?.sync_all()?;
+    // SAFETY: nothing else writes a file this process made under its own name.
+    let bytes = unsafe { memmap2::Mmap::map(&File::open(to)?)? };
+    Ok((Digest::of(&bytes), bytes.len() as u64))
 }
 
 /// Makes the directory a store of this build's format, and seals what ended daemons left
@@ -529,9 +677,22 @@ pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow
     Tally { failed, ..Tally::default() }.settle(said, &remote.traffic)
 }
 
+/// Fetches a pack as its line of the manifest says it is held.
+async fn fetch_pack(
+    remote: &Remote,
+    store: &Path,
+    pack: &Digest,
+    listed: &Listed,
+) -> anyhow::Result<Fetched> {
+    let (object, want) = listed.object(pack);
+    let unpacked = listed.packed.map(|_| *pack);
+    let to = store.join(pack_file(pack));
+    remote.fetch_coded(&object, &want, unpacked, &to, is_pack_of_this_format).await
+}
+
 /// The packs of `missing` that fit in a store that may hold `limit` bytes, the first listed
 /// first, and how many do not.
-fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<Digest>, usize) {
+fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<(Digest, Listed)>, usize) {
     let mut room = limit.unwrap_or(u64::MAX);
     let mut fits = |listed: &Listed| {
         let fits = listed.size <= room;
@@ -539,7 +700,7 @@ fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<Digest>, 
         fits
     };
     let (fit, over): (Vec<_>, Vec<_>) = missing.into_iter().partition(|(_, listed)| fits(listed));
-    (fit.into_iter().map(|(pack, _)| pack).collect(), over.len())
+    (fit, over.len())
 }
 
 /// The packs of `missing` that have a key the store lacks, and how many have none. A store
@@ -594,9 +755,8 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
     let (missing, other_format) = manifest.missing(&local);
     let (missing, here_already) = lacking(remote, StoreDir::at(store), missing).await?;
     let (fit, over) = fitting(missing, limit);
-    let fetch = |pack: Digest| {
-        let (from, to) = (pack_object(&pack), store.join(pack_file(&pack)));
-        async move { remote.fetch_file(&from, &pack, &to, is_pack_of_this_format).await }
+    let fetch = |(pack, listed): (Digest, Listed)| async move {
+        fetch_pack(remote, store, &pack, &listed).await
     };
     let tally = Tally::of(fit, remote.traffic.jobs(), fetch).await;
     let mut said = format!(
@@ -622,6 +782,8 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
 const USAGE: &str = "usage: rustd cache push|pull REMOTE [PROJECT]\n       \
                      rustd cache stats\n       \
                      rustd cache gc [--max SIZE]\n       \
+                     rustd cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
+                     [--dry-run]\n       \
                      rustd cache verify\n       \
                      rustd cache keygen FILE";
 
@@ -630,6 +792,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let Some(verb) = args.next() else { bail!(USAGE) };
     if verb == "keygen" {
         return signed::keygen(Path::new(&args.next().context(USAGE)?));
+    }
+    let mut args = args.peekable();
+    if verb == "gc" && args.next_if(|it| it == "--remote").is_some() {
+        return collect_remote(args);
     }
     let store = PathBuf::from(std::env::var_os("RUSTD_CACHE").context("RUSTD_CACHE is not set")?);
     match verb.as_str() {
@@ -659,6 +825,35 @@ fn transfer_command(
         done
     })?;
     println!("{done} in {:.1?}", start.elapsed());
+    Ok(())
+}
+
+/// `rustd cache gc --remote REMOTE`: takes out of the remote what its lists no longer
+/// name, and of its lists what is old or held twice. An age is a count and `s`, `m`, `h`
+/// or `d`.
+fn collect_remote(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(remote) = args.next() else { bail!(USAGE) };
+    let mut ages = collect::Ages { unlisted: collect::Ages::UNLISTED, listed: None, dry: false };
+    while let Some(flag) = args.next() {
+        let mut age = || {
+            let age = args.next().context(USAGE)?;
+            collect::parse_age(&age).with_context(|| format!("`{age}` is not an age"))
+        };
+        match flag.as_str() {
+            "--unlisted-after" => ages.unlisted = age()?,
+            "--older-than" => ages.listed = Some(age()?),
+            "--dry-run" => ages.dry = true,
+            _ => bail!(USAGE),
+        }
+    }
+    let start = Instant::now();
+    let done = runtime()?.block_on(async {
+        let remote = Remote::open(&remote).await?;
+        let done = collect::collect(&remote, &ages).await;
+        eprintln!("remote: {}", remote.traffic);
+        done
+    })?;
+    println!("{done}\nin {:.1?}", start.elapsed());
     Ok(())
 }
 
@@ -766,6 +961,11 @@ pub(crate) struct Shared {
     remote: Arc<Remote>,
     project: String,
     runtime: Arc<Runtime>,
+    /// Whether packs are left on the remote until a build asks for a key of theirs.
+    lazy: bool,
+    /// How often what the daemon compiled is sent while it runs, if on a schedule at all.
+    push_every: Option<Duration>,
+    asked: Arc<keeper::Asked>,
 }
 
 impl Shared {
@@ -776,34 +976,49 @@ impl Shared {
         let remote = std::env::var("RUSTD_REMOTE").ok()?;
         let opened = runtime().and_then(|runtime| {
             let project = project_name(std::env::var("RUSTD_PROJECT").ok())?;
+            let push_every = keeper::push_every_from_env()?;
             let remote = Arc::new(runtime.block_on(Remote::open(&remote))?);
-            Ok(Shared { store, remote, project, runtime: Arc::new(runtime) })
+            let lazy = std::env::var_os("RUSTD_REMOTE_LAZY").is_some_and(|it| it != "0");
+            let (runtime, asked) = (Arc::new(runtime), Arc::default());
+            Ok(Shared { store, remote, project, runtime, lazy, push_every, asked })
         });
         opened.inspect_err(|e| eprintln!("remote: {e:#}")).ok()
     }
 
     /// Fetches what the project's manifest lists, or with `RUSTD_REMOTE_LAZY` only what
     /// tells which pack holds which key, leaving each pack to the first build that asks.
+    /// From here on the store asks this remote for the keys it lacks.
     pub(crate) fn pull(&self) {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
-        let lazy = std::env::var_os("RUSTD_REMOTE_LAZY").is_some_and(|it| it != "0");
         let done = self.runtime.block_on(async {
-            if lazy {
-                let lazy = Lazy::load(self).await?;
-                let said = format!(
-                    "{} keys in {} packs to fetch from",
-                    lazy.holder.len(),
-                    lazy.packs.len()
-                );
-                hir_ty::mir::codegen::fetch_missing_with(Box::new(move |key| lazy.fetch(key)));
-                Ok(said)
-            } else {
-                pull(&self.store, &self.remote, &self.project).await
-            }
+            self.asked.see(self.manifest_now().await);
+            self.pull_as_set().await
         });
+        let asked = self.asked.clone();
+        hir_ty::mir::codegen::fetch_missing_with(Box::new(move |key| asked.fetch(key)));
         self.report(done, start);
+    }
+
+    /// A pull the way the daemon is set to pull: of every pack, or of what says where the
+    /// keys are.
+    async fn pull_as_set(&self) -> anyhow::Result<String> {
+        if !self.lazy {
+            return pull(&self.store, &self.remote, &self.project).await;
+        }
+        let lazy = Lazy::load(self).await?;
+        let said =
+            format!("{} keys in {} packs to fetch from", lazy.holder.len(), lazy.packs.len());
+        self.asked.fetch_from(lazy);
+        Ok(said)
+    }
+
+    /// What the project's manifest hashes to now: `None` when there is none or it cannot
+    /// be read.
+    async fn manifest_now(&self) -> Option<Digest> {
+        let read = self.remote.read_small(&Manifest::at(&self.project)).await;
+        Some(Digest::of(&read.ok()??.0))
     }
 
     pub(crate) fn push(&self) {
@@ -831,7 +1046,7 @@ struct Lazy {
     remote: Arc<Remote>,
     runtime: Arc<Runtime>,
     /// Each pack and whether it arrived, once it was asked for.
-    packs: Vec<(Digest, OnceLock<bool>)>,
+    packs: Vec<(Digest, Listed, OnceLock<bool>)>,
     holder: FxHashMap<[u8; 32], u32>,
 }
 
@@ -844,10 +1059,8 @@ impl Lazy {
         let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
         let (missing, _) = manifest.missing(&local);
         let fetched = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
-            anyhow::Ok((
-                pack,
-                remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await?,
-            ))
+            let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await?;
+            anyhow::Ok((pack, listed, keys))
         }))
         .buffer_unordered(remote.traffic.jobs())
         .collect::<Vec<_>>()
@@ -861,16 +1074,16 @@ impl Lazy {
         };
         for fetched in fetched {
             match fetched {
-                Ok((pack, keys)) => lazy.add(pack, &keys),
+                Ok((pack, listed, keys)) => lazy.add(pack, listed, &keys),
                 Err(e) => eprintln!("remote: {e:#}"),
             }
         }
         Ok(lazy)
     }
 
-    fn add(&mut self, pack: Digest, keys: &[u8]) {
+    fn add(&mut self, pack: Digest, listed: Listed, keys: &[u8]) {
         let at = self.packs.len() as u32;
-        self.packs.push((pack, OnceLock::new()));
+        self.packs.push((pack, listed, OnceLock::new()));
         for key in keys.chunks_exact(32) {
             self.holder.entry(key.try_into().expect("32 bytes")).or_insert(at);
         }
@@ -880,15 +1093,10 @@ impl Lazy {
     /// compile, which wait here for the pack: the first to ask fetches it.
     fn fetch(&self, key: &[u8; 32]) -> bool {
         let Some(&at) = self.holder.get(key) else { return false };
-        let (pack, arrived) = &self.packs[at as usize];
+        let (pack, listed, arrived) = &self.packs[at as usize];
         *arrived.get_or_init(|| {
-            let to = self.store.join(pack_file(pack));
-            let fetched = self.runtime.block_on(self.remote.fetch_file(
-                &pack_object(pack),
-                pack,
-                &to,
-                is_pack_of_this_format,
-            ));
+            let fetched =
+                self.runtime.block_on(fetch_pack(&self.remote, &self.store, pack, listed));
             match fetched {
                 Ok(Fetched::Whole(bytes)) => {
                     eprintln!("remote: {pack}.pack fetched for a build, {bytes} bytes");

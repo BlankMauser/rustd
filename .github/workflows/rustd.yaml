@@ -1,5 +1,7 @@
 # rustd: the daemon's own checks, on its branches. The harnesses compare what rustd builds
-# with what rustc builds, under both producers.
+# with what rustc builds, under both producers, on Linux x86-64, Linux AArch64, Windows
+# x86-64 and macOS arm64: each on a machine of its own kind, so nothing is cross-compiled
+# or emulated but what `buildmodel.py` builds for other targets.
 name: rustd
 on:
   push:
@@ -17,8 +19,16 @@ env:
 
 jobs:
   checks:
-    name: fmt and tests
-    runs-on: ubuntu-24.04
+    name: fmt and tests${{ matrix.suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            suffix: ""
+          - os: ubuntu-24.04-arm
+            suffix: " (aarch64)"
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
@@ -27,28 +37,41 @@ jobs:
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
   harness:
-    name: harness (${{ matrix.backend }})
-    runs-on: ubuntu-24.04
+    name: harness (${{ matrix.backend }}${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-24.04
+            suffix: ""
+          - os: ubuntu-24.04-arm
+            suffix: ", aarch64"
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
     steps:
       - uses: actions/checkout@v6
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0 && rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      # What `buildmodel.py` builds for besides the host.
+      - run: rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
+        if: matrix.os == 'ubuntu-24.04'
       - name: LLVM 20
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb gcc-aarch64-linux-gnu musl-tools qemu-user
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb
+      - name: Cross tools
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
       # MinIO as one program in the home directory, which is where remote.py looks for it and
       # needs it: it kills the service and starts it again. The image is the one that is still
       # published; the runner's docker takes a file out of it without root.
       - name: MinIO
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
           mkdir -p "$HOME/s3tools"
@@ -62,26 +85,33 @@ jobs:
         working-directory: harness
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=0
-          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
           run breakers.py
           run unwinds.py
           run splices.py
+          # A branch reaches 128 MB on AArch64, and the splice has to get past that.
+          if [ "$(uname -m)" = aarch64 ]; then RUSTD_SPLICE=1 run farsplices.py; fi
           run asmedits.py
           run includes.py
           run worktrees.py
           run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # It runs both producers itself. The cases that are of an x86-64 host (another libc
+          # of it, one of its processors) say so, and are not run on AArch64.
+          if [ "$RUSTD_BACKEND" = cranelift ]; then run buildmodel.py; fi
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
-          run remote.py
-          exit $failed
+          if [ -x "$HOME/s3tools/minio" ]; then run remote.py; fi
+          echo "failed:${failed:- none}"
+          test -z "$failed"
 
   windows-checks:
     name: fmt and tests (windows)
@@ -153,8 +183,8 @@ jobs:
         working-directory: harness
         run: |
           export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
-          failed=0
-          run() { echo "::group::$*"; python "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          failed=
+          run() { echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -165,11 +195,69 @@ jobs:
           run includes.py
           run worktrees.py
           run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
           # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
           if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
-          exit $failed
+          echo "failed:${failed:- none}"
+          test -z "$failed"
+
+  macos:
+    name: macOS arm64 (${{ matrix.backend }})
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          brew install llvm@20
+          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+        if: matrix.backend == 'cranelift'
+      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
+        if: matrix.backend == 'cranelift'
+      - run: cargo build -p rustd --release --features llvm
+      - name: Harnesses
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          failed=
+          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run difftest.py corpus --bin runner --crate cases --layouts
+          run programs.py
+          run stress.py
+          run breakers.py
+          run unwinds.py
+          run splices.py
+          run asmedits.py
+          run includes.py
+          run worktrees.py
+          run worktrees.py --join --together
+          run worktrees.py --overlay
+          run keys.py
+          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
+          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
+          # Not run here: `debuginfo.py` reads DWARF with gdb out of an ELF executable;
+          # `buildmodel.py` builds for Linux targets; `storefull.py` mounts a tmpfs;
+          # `farsplices.py` splices, which is not done for Mach-O.
+          run storekills.py --kills 100
+          run storecorrupts.py --rounds 4
+          run storeshared.py
+          echo "failed:${failed:- none}"
+          test -z "$failed"
