@@ -35,6 +35,18 @@ pub(crate) struct Trust {
     unsigned: bool,
 }
 
+/// A signed list that a machine with no key was about to write back.
+#[derive(Debug)]
+pub(crate) struct NotRewritten(String);
+
+impl std::fmt::Display for NotRewritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotRewritten {}
+
 /// A list as a machine took it.
 pub(crate) struct Opened<'a> {
     pub(crate) lines: &'a str,
@@ -67,6 +79,19 @@ impl Trust {
     pub(crate) fn cannot_sign(&self) -> Option<&'static str> {
         (self.checks() && self.signer.is_none())
             .then_some("RUSTD_REMOTE_TRUST is set and RUSTD_REMOTE_SIGN is not")
+    }
+
+    /// Why this machine may not write the list in `text` back, if it may not: the list is
+    /// signed and the machine has no key, so what it wrote would be a list with no
+    /// signature where the machines that trust the signer look for one.
+    pub(crate) fn cannot_rewrite(&self, name: &str, text: &str) -> Result<(), NotRewritten> {
+        if self.signer.is_some() || split(text).1.is_empty() {
+            return Ok(());
+        }
+        Err(NotRewritten(format!(
+            "`{name}` is signed, and this machine has no key in RUSTD_REMOTE_SIGN: it is left \
+             as it is"
+        )))
     }
 
     /// `body` as the object `name` holds it: with the turn and the signature of this

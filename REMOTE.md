@@ -1,8 +1,9 @@
 # Remote hydration over S3
 
 Branch `rustd-s3`, from `rustd-collate` at `27315323cb`, with `rustd-collate-wip` at
-`0151c01218` (debug info, build model, disk cache) merged in. The numbers below are from
-after the merge unless they say otherwise.
+`0151c01218` (debug info, build model, disk cache) and then `rustd-collate` at `1547078a30`
+merged in. The numbers below are from the third round (compressed packs) unless they say
+otherwise.
 
 `rustd cache push REMOTE` and `rustd cache pull REMOTE` had an S3 path that had never been
 run. This is what it took to make it real, what was measured, and what is still open.
@@ -113,9 +114,9 @@ calls `block_on` from inside a task.
 
 ### Layout of a remote
 
-    packs/<sha256 of the pack>.pack
+    packs/<sha256 of the pack>.pack.zst    the pack, compressed with zstd
     keys/<sha256 of the key list>          the 32-byte keys of one pack, back to back
-    manifests/<project>                    one line a pack: PACK SIZE KEYS FORMAT
+    manifests/<project>                    one line a pack: PACK SIZE KEYS FORMAT ZDIGEST ZSIZE
                                            and, when signed, a last line: signed KEY TURN SIGNATURE
     units/<sha256>, deps/<project>         cargo's units, the same way
 
@@ -137,6 +138,7 @@ does for AWS.
 | `RUSTD_REMOTE_TIMEOUT` | seconds a request may go without an answer, or a body without a byte | 30 |
 | `RUSTD_REMOTE_READONLY` | never write to the remote | off |
 | `RUSTD_REMOTE_LAZY` | fetch a pack when a build first asks for a key in it | off |
+| `RUSTD_REMOTE_PUSH_EVERY` | how often a daemon that stays pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
 | `RUSTD_REMOTE_SIGN` | file with the key this machine signs manifests with | none |
 | `RUSTD_REMOTE_TRUST` | public keys this machine takes manifests from | none |
 | `RUSTD_REMOTE_UNSIGNED` | `1`: with no keys named, take lists nobody signed | off: a pull is refused |
@@ -248,7 +250,9 @@ older list is not taken". `rustd cache forget REMOTE` removes what is remembered
 remote. A machine that has never pulled remembers nothing and takes the first list it is
 given. The design, with what it does not cover, is in `SECURITY.md`.
 
-**How much.** A list is read to 16 MiB, a pack to the size its manifest gives it, the keys
+**How much.** A list is read to 16 MiB, a pack to the sizes its manifest gives it (the
+object as sent to ZSIZE, and what it unpacks to to SIZE, so a small object that unpacks to
+a great deal is stopped at SIZE), the keys
 of a pack to no more than the pack, and the archive of a unit to `RUSTD_REMOTE_MAX`; a
 `deps pull` unpacks no more than `RUSTD_DEPS_MAX` (64G, `off` for none). An object that is
 longer is rejected and counted like one with the wrong hash, with nothing of it left on
@@ -280,20 +284,173 @@ Tested by the harness, on both servers:
   fetched; taken by a machine that never pulled; taken after `cache forget`; and a signer
   that pushes over it writes a new list with a later turn.
 
+## Where the slowdown after the merge went
+
+It is debug info. It is not the store's checksums or its syncs.
+
+Measured with the same build of each project run six times in a row from an empty store,
+changing one thing at a time (`~/work/slow.py`, not in the tree: it runs `rustd` on the
+workspace with the environment given and reads the `store:` and `cold:` lines). The first
+run of a series is always slower (2 s for ripgrep, 8 to 9 s for cargo) whatever it is, so
+the series starts with one that is thrown away. The numbers are rustd's seconds only, not
+cargo's.
+
+| cargo 0.92.0 | rustd | of that, code generation | store |
+| --- | --- | --- | --- |
+| before the merge (`7b33ead6c2`) | 81.2 s | 71.0 s | 928,617,374 bytes |
+| after the merge | 101.9 s | 91.6 s | 1,067,053,828 bytes |
+| after, `RUSTD_DEBUGINFO=0` | 87.2 s | 77.0 s | 927,233,654 bytes |
+| after, no sync at all (`LD_PRELOAD=libeatmydata.so`) | 101.9 s | 91.5 s | 1,067,053,828 bytes |
+| after, both | 87.2 s | 77.1 s | 927,233,654 bytes |
+| after, no store (`RUSTD_CACHE` not set) | 73.1 s | 63.3 s | 0 |
+
+| ripgrep 14.1.1 | rustd | store |
+| --- | --- | --- |
+| before the merge | 9.2 s | 41,551,465 bytes |
+| after the merge | 10.1 s | 51,806,179 bytes |
+| after, `RUSTD_DEBUGINFO=0` | 9.1 s | 41,452,707 bytes |
+| after, no sync | 10.4 s | 51,806,179 bytes |
+| after, no store | 7.3 s | 0 |
+
+So for cargo the merge cost 20.7 s of rustd. Turning debug info off gives back 14.7 s of
+it and all of the 140 MB the packs grew by. Turning every sync into nothing gives back
+nothing: the store syncs once a sealed pack, not once a record, and there are 16 packs.
+The other 6 s are still there with debug info off and syncs off, so they are in what the
+merged base does when it compiles, not in the store's policy. I did not look for them
+further. For ripgrep the whole difference is debug info.
+
+The per-record CRC was not measured on its own, since there is no switch for it. It is
+bounded by the row without a store: the store as a whole (serialising, hashing and writing
+927 MB of entries, CRC included) is 14 s of cargo's build after the merge, and the
+format-1 store without CRCs was 22 s on the older binary (81.2 s with, 59.2 s without). So
+the format-2 store is not slower than the one it replaced.
+
+No change to the sync policy is proposed, because the measurement says there is nothing to
+win there. If debug info in a dev build is wanted but its cost is not, the place to look is
+whether line tables have to be in the entry of every instance.
+
+The two totals in the last report (17.3 s and 152.0 s against 15.2 s and 132.7 s) each had
+a first-run effect in them as well; the tables above compare runs that are not the first.
+
+## Compression
+
+Packs travel compressed with zstd at level 3. The `zstd` crate was in rustd already
+(`deps.rs` packs cargo's units with it), so nothing was added.
+
+A pack is `packs/<digest of the pack>.pack.zst`. Its manifest line carries the digest and
+size of the compressed object next to those of the pack. A fetch checks the compressed
+bytes against the first as they arrive, which is what a resumed transfer continues from,
+then unpacks them into a second temporary file and checks what came out against the pack's
+own digest and format before it gets the pack's name. So the name still says what the
+content is, and an object that is a valid zstd stream of something else is rejected (the
+harness has that case). A line with four fields is a plain pack as before and is still
+read. Level 3 was chosen on one ripgrep pack of 51.8 MB: level 1 gave 9.4 MB in 0.09 s,
+level 3 7.5 MB in 0.11 s, level 9 6.5 MB in 0.47 s; unpacking takes 0.05 s and hashing the
+pack 0.14 s.
+
+| | packs, plain | packs, zstd | push | pull |
+| --- | --- | --- | --- | --- |
+| ripgrep | 51,804,616 bytes | 7,354,887 bytes | 418 ms, then 432 ms | 180 ms, then 240 ms |
+| cargo | 1,066,939,839 bytes | 95,041,189 bytes | 3.7 s, then 1.1 s | 3.1 s, then 1.0 s |
+
+That is 7 and 11 times smaller. On loopback the time moves little for ripgrep (the pack is
+compressed and unpacked in the time it took to send it) and is three times shorter for
+cargo. The bucket for cargo, with cargo's units, went from 1,504 MB to 532 MB; the units
+were compressed already. The full tables are under Measurements.
+
 ## Lazy hydration
 
 With `RUSTD_REMOTE_LAZY=1` the daemon fetches only the key lists (32 bytes a function)
 before a build. When the store is asked for a key it lacks and a listed pack holds it, the
-compiling thread fetches that pack, verified as above, and looks again. A pack nobody asks
-of is never fetched; the harness checks that.
+compiling thread fetches that pack, verified as above, and looks again; other threads that
+want the same pack wait for that one fetch. A pack nobody asks of is never fetched; the
+harness checks that. Fetches in flight are bounded by `RUSTD_REMOTE_JOBS` like every other
+request, since they take a place on the same line.
 
-It did not win in what was measured (below): 9.8 s against 9.4 s for ripgrep, 98.2 s
-against 92.0 s for cargo. A fresh machine building the same workspace wants every pack, so
-lazy fetches the same bytes plus the key lists, and fetches packs one after another as
-threads trip over them instead of eight at a time. Where it should win is a manifest that
-holds much more than one build needs, such as one project name shared by many workspaces or
-a long history of pushes. That is an inference; the only evidence is the harness case where
-an unused pack is not fetched.
+The unit that is fetched is a pack, not a record. A remote has no object for one key, and
+making one would be a request per function (224,346 for cargo).
+
+It still does not win on a fresh machine: 10.0 s against 9.6 s for ripgrep and 100.2 s
+against 94.4 s for cargo, for 0.8 MB and 7 MB more (the key lists). A fresh machine
+building the same workspace wants every pack, and here they arrive one after another as
+threads trip over them, each fetch, unpack and check holding up the threads that wait for
+it, instead of eight at a time before the build starts. That reading of where the six
+seconds go is an inference; I did not profile it. So eager stays the default and lazy is
+behind the setting. Where lazy should win is a manifest that holds much more than one
+build needs; the only evidence for that is the harness case where the unused pack is not
+fetched.
+
+## Collecting a remote
+
+    rustd cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] [--dry-run]
+
+An age is a count and `s`, `m`, `h` or `d`. The run does two things, in this order.
+
+It takes lines out of manifests. With `--older-than`, the lines of packs written longer
+ago than that. Always, the lines of packs whose every key is also in other packs of the
+same manifest: that is the "merged code held twice" case, where a store pushed its small
+packs, later merged them and pushed the merged one. The key lists say it, at one small
+request a pack. Packs are looked at smallest first, so the merged pack stays and the ones
+it was made of go. A manifest is rewritten with the same conditional write a push uses, so
+a push that lands in between is not lost; the run reads again and tries again. A manifest
+that cannot be trusted (signed by nobody this machine takes manifests from) is left as it
+is and said.
+
+Then it removes objects under `packs/`, `keys/` and `units/` that no manifest or unit list
+names and that were written longer ago than `--unlisted-after` (a day when not given). The
+time is looked at again right before each removal.
+
+What makes it safe against a push that is under way is the clock. A push sends a pack and
+its keys first and lists them last, so for a while they are there and unlisted. A push
+takes an object that is already there as sent only for an hour after it was written; older
+than that it sends it again, which makes it new. A collection will not take an unlisted
+object younger than two hours, and refuses a smaller `--unlisted-after`. So an object a
+push relies on is either under an hour old, and out of the collection's reach for another
+hour, or was just written again. What this does not cover is a single push that takes
+over an hour between sending a pack and listing it, and machines whose clocks disagree
+with the service's by that much: the ages are the service's times against this machine's
+clock.
+
+A line that was taken out leaves its object to the second rule, so a pack that was old or
+doubly held is gone a day (or the time given) after it was written, in the same run if it
+is that old already.
+
+In the harness: unlisted objects of three ages, a pusher stopped between sending and
+listing (through the proxy), old listed packs, merged packs, a dry run, a manifest that
+is not trusted, and a store on another machine that pulls afterwards and compiles
+nothing. The proxy changes the times the service reports so that nothing has to wait an
+hour. 12 of 12 on MinIO and on SeaweedFS.
+
+## A daemon that stays
+
+A daemon given `--socket` or `--watch` used to pull when it started and push once after
+its first build. Now a thread of its own keeps the two in step
+(`crates/rustd/src/remote/keeper.rs`):
+
+- It pushes right after the first build, then every `RUSTD_REMOTE_PUSH_EVERY` (five
+  minutes), then once more when the daemon gets SIGTERM or SIGINT, after which the daemon
+  ends by that signal as it would have. The last push is given a minute. Before a push
+  the pack the store has open is sealed, however small, so an edit's one function goes.
+- When a build asks the store for a key it lacks, the thread reads the manifest, at most
+  once in five seconds however many keys are lacking. If it is not what it was when the
+  daemon last pulled, it pulls. The build that lacked the key does not wait: it compiles
+  the function. The next build finds what arrived.
+- The daemon's own push changes the manifest too. That is not taken for a change, unless
+  the manifest had already changed before the push.
+
+No build waits for any of this. In the harness the proxy holds every request for three
+seconds while an edit is built, and the build takes 0.11 s. The other checks: the first
+build is pushed without being asked, an edit is pushed on a two-second schedule, a pack
+another machine added is pulled after the next build that lacks something and not pulled
+again, SIGTERM ends the daemon with exit by SIGTERM and nothing left to send, with the
+schedule `off` an edit is sent only at the end, and a third machine then builds the edited
+program and compiles nothing. 8 of 8 on both servers.
+
+A build with no `--socket` and no `--watch` pushes before it exits, as before.
+
+What it does not do: there is no push when the daemon is killed with SIGKILL or the
+machine loses power; what was compiled since the last push is in the local store and goes
+with the next one. On Windows only Ctrl-C is waited for, and that path was not run.
 
 ## Measurements
 
@@ -317,48 +474,51 @@ ripgrep 14.1.1 (9 crates by rustd; 22,340 functions compiled cold):
 
 | Fresh machine B | To a running program | cargo | rustd | Functions compiled | Requests | Bytes down |
 | --- | --- | --- | --- | --- | --- | --- |
-| no remote | 17.3 s | 4.9 s | 12.4 s | 22,340 | 0 | 0 |
-| rustd's packs | 14.5 s | 4.9 s | 9.6 s | 0 | 2 | 51,804,757 |
-| packs and cargo's units | 9.4 s | 2.0 s | 7.2 s | 0 | 44 | 103,610,692 |
-| the same, lazy | 9.8 s | 2.1 s | 7.5 s | 0 | 45 | 104,396,292 |
+| no remote | 16.8 s | 4.6 s | 12.2 s | 22,340 | 0 | 0 |
+| rustd's packs | 14.3 s | 4.8 s | 9.5 s | 0 | 3 | 7,355,315 |
+| packs and cargo's units | 9.6 s | 2.0 s | 7.3 s | 0 | 45 | 59,161,263 |
+| the same, lazy | 10.0 s | 2.1 s | 7.6 s | 0 | 46 | 59,946,863 |
 
-Machine A's push: 1 pack, 51,804,616 bytes in 418 ms, 17 requests (a multipart upload);
-41 cargo units, 51,802,181 bytes in 402 ms, 85 requests. Pulling the pack took 180 ms.
+Machine A's push: 1 pack, 7,354,887 bytes in 432 ms, 9 requests; 41 cargo units,
+51,802,194 bytes in 427 ms, 85 requests. The bucket ends with 45 objects, 59,946,649
+bytes. Pulling the pack took 240 ms.
 
 cargo 0.92.0 (7 crates by rustd; 226,180 functions compiled cold, 3,599 of 3,602 functions
 of the workspace; the other three are refused by rustd and compiled by rustc, as on the base branch):
 
 | Fresh machine B | To a running program | cargo | rustd | Functions compiled | Requests | Bytes down |
 | --- | --- | --- | --- | --- | --- | --- |
-| no remote | 152.0 s | 42.8 s | 109.1 s | 226,180 | 0 | 0 |
-| rustd's packs | 114.1 s | 42.6 s | 71.5 s | 0 | 17 | 1,066,942,095 |
-| packs and cargo's units | 92.0 s | 25.5 s | 64.9 s | 0 | 405 | 1,496,922,653 |
-| the same, lazy | 98.2 s | 25.7 s | 70.9 s | 0 | 421 | 1,504,101,885 |
+| no remote | 152.4 s | 42.0 s | 110.3 s | 226,180 | 0 | 0 |
+| rustd's packs | 117.1 s | 43.4 s | 73.6 s | 0 | 18 | 95,048,041 |
+| packs and cargo's units | 94.4 s | 25.2 s | 67.4 s | 0 | 406 | 525,028,848 |
+| the same, lazy | 100.2 s | 25.5 s | 73.1 s | 0 | 422 | 532,207,920 |
 
-Machine A's push: 16 packs, 1,066,939,839 bytes in 3.7 s, 241 requests; 387 units,
-429,944,713 bytes in 3.2 s, 777 requests. The bucket ends with 421 objects, 1,504,101,885
-bytes. Pulling the 16 packs took 3.1 to 3.2 s.
+Machine A's push: 16 packs, 95,041,189 bytes in 1.1 s, 74 requests; 387 units,
+429,944,962 bytes in 3.2 s, 777 requests. The bucket ends with 421 objects, 532,204,494
+bytes. Pulling the 16 packs took 1.0 s.
 
 In every row the program printed the same as the one built without the remote.
 
-These are from after the merge. Before it, on the format-1 store, the same commands gave
-15.2, 13.1, 8.6 and 8.7 s for ripgrep and 132.7, 105.7, 80.9 and 82.9 s for cargo, with
-929 MB of packs for cargo instead of 1,067 MB. The merged base compiles more slowly with
-no remote at all (10.6 s to 12.4 s of rustd for ripgrep, 89.7 s to 109.1 s for cargo) and
-its packs are larger; the base branch now keeps debug info in an entry. The remote is not
-what changed there.
+The same tables with plain packs, from the round before (same machine, same commands):
 
-What the numbers say: the remote removes all of rustd's code generation (0 functions
-compiled) and that is worth 3 s of 17 for ripgrep and 38 s of 152 for cargo. With cargo's
-units as well it is 17.3 s to 9.4 s and 152.0 s to 92.0 s. What is left is not transfer,
-which is 0.4 s and under 5 s. It is rustd loading the workspace and walking every instance
-to find its key (the "cold:" line still reads 4.0 s for ripgrep and 54 s for cargo with
-nothing to compile), and cargo running build scripts and proc macros. Those are the next
-thing to cut and are not a remote problem.
+| Fresh machine B | ripgrep | bytes down | cargo | bytes down |
+| --- | --- | --- | --- | --- |
+| no remote | 17.3 s | 0 | 152.0 s | 0 |
+| rustd's packs | 14.5 s | 51,804,757 | 114.1 s | 1,066,942,095 |
+| packs and cargo's units | 9.4 s | 103,610,692 | 92.0 s | 1,496,922,653 |
+| the same, lazy | 9.8 s | 104,396,292 | 98.2 s | 1,504,101,885 |
 
-The store is large for what it holds: 1,067 MB of packs for cargo. Packs are not compressed
-on the wire or at rest. On a real network at, say, 50 MB/s that is 21 s of the 60 s saved,
-so compression would matter there. That sentence is arithmetic, not a measurement.
+So compression cut the bytes a fresh machine takes by 43% for ripgrep and 65% for cargo
+(by 86% and 91% with rustd's packs alone) and left the time to a running program where it
+was, within the few percent one run differs from the next. On loopback there was nothing
+to win in time: the pull was 3 s of 92 before. On a real network the bytes are the time;
+that is arithmetic, not something measured here.
+
+What the numbers say otherwise is what they said before: the remote removes all of
+rustd's code generation (0 functions compiled). What is left is rustd loading the
+workspace and walking every instance to find its key (the "cold:" line still reads 4.1 s
+for ripgrep and 57 s for cargo with nothing to compile), and cargo running build scripts
+and proc macros. Those are the next thing to cut and are not a remote problem.
 
 ## The harness
 
@@ -366,7 +526,7 @@ so compression would matter there. That sentence is arithmetic, not a measuremen
 `RUSTD_MINIO`, `RUSTD_WEED`, PATH or `~/s3tools`), each behind a proxy of its own that
 counts requests and bytes and can answer with a status, reset the connection, cut a response
 or a request body at a byte, stall, or throttle. It builds a small generated workspace on
-machine A, and then checks, 131 checks in all across the two servers:
+machine A, and then checks, 178 checks in all across the two servers:
 
 - the round trip: A compiles and pushes, B with another HOME and an empty store pulls,
   compiles 0 functions, and prints what cargo's build prints; a second push sends nothing;
@@ -377,7 +537,7 @@ machine A, and then checks, 131 checks in all across the two servers:
 - TLS (MinIO only): a second MinIO behind a certificate signed by an authority the harness
   makes with `openssl`; a 20 MiB pack goes up and comes down with the authority trusted
   through `SSL_CERT_FILE`, and without it the pull is refused and says "invalid peer
-  certificate";
+  certificate", in under three seconds;
 - the store after a pull: `cache verify` and `cache stats` count exactly what was fetched;
   packs evicted with `cache gc --max 0` are fetched again; with `RUSTD_CACHE_MAX` a pull
   fetches the three packs of six that fit and says so; into a store that already holds two
@@ -390,8 +550,9 @@ machine A, and then checks, 131 checks in all across the two servers:
 - 503 twice, 503 on a part, on completion and on the manifest, 503 forever;
 - connection dropped mid-body twice, closed with no answer twice, dropped mid-part;
 - a stall longer than the timeout, an answer slower than the timeout;
-- rustd killed mid-fetch, the next run fetching only the rest, a stale temporary file of
-  something else;
+- rustd killed mid-fetch, what it kept aside still there after a collection an hour
+  later, the next run fetching only the rest, a stale temporary file of something else;
+- collecting a remote and a daemon that stays, as listed in their sections;
 - two processes fetching into one store; twelve packs with three requests at a time;
 - the server killed mid-fetch and restarted, killed and left dead, killed mid-push, and
   each of those recovered afterwards with no unfinished upload left in the bucket;
@@ -400,12 +561,8 @@ machine A, and then checks, 131 checks in all across the two servers:
 
     cd harness && RUSTD_BIN=../target/release/rustd python3 remote.py
 
-Takes about seven minutes with both servers. With the code and the harness as pushed it
-was run three times in a row under Cranelift and once under LLVM and gave 131/131 each
-time (6m33s, 6m55s, 6m52s; 7m00s). The first run after the merge gave 129: the check for a
-service slower than the timeout allowed 30 s and now takes 32, because the manifest is
-asked for again like a pack. Its bound is 45 s now. Before the merge the harness had 111
-checks and its last three runs gave 111/111.
+Takes about eight minutes with both servers. Results of this round are under Regression
+gate. The rounds before had 111 and then 131 checks.
 
 One check is conditional. MinIO reads again 1.3 s after a kill and a fetch always rides
 that out. SeaweedFS took between 14 and 23 s to read again in these runs, on either side of
@@ -421,16 +578,16 @@ or need to kill the server. **Not run.**
 
 ## Regression gate
 
-Run on Linux x86-64 after the merge, under `RUSTD_BACKEND=cranelift` with the Cranelift-only
-release binary and under `RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast` with the
-`--features llvm` binary (LLVM 20.1). Both gave the same results:
+Run on Linux x86-64 on the code as pushed (`rustd-collate` at `1547078a30` merged in),
+with the `--features llvm` binary (LLVM 20.1) under `RUSTD_BACKEND=cranelift` and under
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`. Both gave the same results:
 
 | Script | Result |
 | --- | --- |
-| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803/803 functions from rustd, 0 of 892 layouts differ |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 0 of 893 layouts differ |
 | `programs.py` | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts |
-| `breakers.py` | 25 of 25, 0 open, 0 functions skipped |
+| `breakers.py` | 43 of 43, 5 open, 0 functions skipped |
 | `unwinds.py` | 8 of 8 |
 | `splices.py` | 71 of 71 |
 | `asmedits.py` | 10 of 10 |
@@ -438,32 +595,28 @@ release binary and under `RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast` with t
 | `worktrees.py` | 58 of 58 |
 | `keys.py` | 36 of 36, 0 open |
 | `debuginfo.py` | all right |
+| `buildmodel.py` | 180 of 180 as expected, 0 WRONG |
 | `storekills.py --kills 100` | PASS, 100 kills |
 | `storecorrupts.py --rounds 4` | PASS, 4 damaged stores |
 | `storefull.py` | PASS, 6 full disks |
 | `storeshared.py` | PASS, 180 builds |
-| `remote.py` | 131/131 |
+| `remote.py` | 178/178 |
 
-The table is from the last run of everything, on the code as pushed. An earlier run of the
-same scripts on the merge, before the last two fixes, gave the same counts except for
-`storefull.py` under LLVM (below).
+`breakers.py` has 5 open on the base branch as merged; the script exits 0 with them.
+`buildmodel.py` does both backends itself and was run once. The `cross_aarch64` row that
+failed last round passes with the fix on `rustd-collate`.
 
-`buildmodel.py` runs with the `--features llvm` binary under `RUSTD_BACKEND=cranelift`, as
-in CI, and does both backends itself: **179 of 180 as expected, 0 WRONG, and the script
-exits 1.** The row is `cross_aarch64` under LLVM: refused, with nothing after "resolve: 22
-crates" in what it printed. It was the same row in both full runs here. Run alone, or with
-two other cases, that row passes. The CI run of `rustd-collate-wip` itself (0151c01218)
-fails `buildmodel.py` on the same row with the same text, so it came in with the merge and
-is not the remote; it looks like something that depends on what else is running. It is not
-fixed here.
-
-`storefull.py` failed once under LLVM before it passed: a pull into a full disk left two
-`.fetch.tmp` files behind. The write of the last bytes had gone through and the sync
-before the rename had not, and that path did not remove the file. It does now, and the
-script passed three times under LLVM and once under Cranelift after the fix.
+`remote.py` was run twice under Cranelift with the Cranelift-only binary (7m38s, 7m45s)
+and once under LLVM (8m17s): 178/178 each time. While the round was being written three
+checks failed once each and were real: the pull on a changed manifest (the daemon's own
+push had taken the other machine's lines for its own), the certificate that was still
+waited out for 26 s (the cause sits inside two transport errors, not in their source
+chain), and one run in which the disk of this machine was full.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p rustd`: 511, 22, 330, 15 and 56 passed, 0 failed.
+-p syntax -p rustd`: 512, 24, 330, 33 and 56 passed, 0 failed.
+
+`rustd-collate` has moved to `526f2963ba` since this round started; that is not merged in.
 
 ### CI
 
@@ -473,13 +626,14 @@ statically linked program, and the job takes it out of the `cgr.dev/chainguard/m
 (pinned by digest) with `docker create` and `docker cp`, which the runner's user may do
 without sudo. The old ways to get it are gone: `minio/minio` on Docker Hub and the download
 on dl.min.io both refuse. SeaweedFS is not in CI; the harness says "left out" and runs the
-MinIO leg, which is 67 checks.
+MinIO leg. The harness now packs and unpacks objects with the `zstd` command; the job was
+not changed for it and the run of this push was not waited for.
 
-The CI run of the pushed branch (run 39040145198): the MinIO step passed, and `remote.py`
+The CI run of the round before (run 39040145198): the MinIO step passed, and `remote.py`
 gave 67/67 under both backends on the runner. The two harness jobs are red all the same,
 for two things that are red on `rustd-collate-wip`'s own run (39031491164) too:
 `debuginfo.py` ("wrong: 4" under both backends on the runner; it passes here) and
-`buildmodel.py` (the row above). Everything else in both jobs passed, and `fmt and tests`
+`buildmodel.py` (the `cross_aarch64` row). Everything else in both jobs passed, and `fmt and tests`
 is green.
 
 ## What is still open
@@ -488,38 +642,39 @@ is green.
   virtual-hosted addressing against real DNS, IAM denial messages, and role credentials
   (web identity, ECS, EC2) are untested. Needs credentials.
 - **The machines were directories, not containers,** and the network was loopback. Transfer
-  times are best cases.
-- **Packs are not compressed.** See above; 929 MB for cargo.
-- **Nothing is ever deleted from a remote.** Manifests only grow. There is no garbage
-  collection and no expiry, and lazy hydration is the only thing that keeps a long manifest
-  from costing every fresh machine its whole history.
-- **Lazy fetches block a compiling thread each** and are not batched; it did not win here.
+  times are best cases, and what compression is worth in time was not measured.
+- **Six seconds of the slowdown on cargo are not explained.** They are not debug info and
+  not the store; see above.
+- **Lazy hydration fetches whole packs and does not win on a fresh machine.** It is behind
+  `RUSTD_REMOTE_LAZY`. Fetching a pack ahead of the thread that will want it, or packs
+  cut by crate so that a build wants fewer of them, were not tried.
 - **A machine with an empty store can be given any list that was ever signed.** The turn
   keeps out a list older than one a machine has taken, and a machine that has taken none
   has nothing to compare with. See `SECURITY.md`.
 - **The lazy hook is one per process** (`fetch_missing_with` in `store.rs`, first call
-  wins). That fits a daemon with one remote; it would have to become part of the store if a
-  daemon ever serves two.
-- **A remote holds the same code twice once a store has merged packs.** A machine pushes
-  its small packs, later makes one pack of them and pushes that too. A pull passes over
-  what it already has by key, but a fresh machine fetches both. It is bounded by the 64 MB
-  a merged pack may be, per merge. The fix is on the push side (do not send a pack whose
-  keys are all listed already) and costs a key-list request per listed pack, or a remote
-  collection, which does not exist.
-- **Telling a merged pack by its keys reads the store.** When a listed pack is missing by
-  name and the store is not empty, the pull reads every local pack once to collect its
-  keys and makes one small request per missing pack. For a store that has merged its own
-  history that happens at every start. Not measured on a large store.
-- **A TLS failure waits out the whole backoff** (about 16 s) before it is reported, since
-  it is not told apart from a network failure.
-- **A partial fetch is resumed only if a collection has not removed it**, which the store
-  does a minute after its last byte when nobody holds it.
+  wins). The daemon's pull on a miss hangs on the same hook. That fits a daemon with one
+  remote; it would have to become part of the store if a daemon ever serves two.
+- **A remote collection is safe by the clock.** A push that takes over an hour between
+  sending a pack and listing it, or a clock that is hours off, is outside what it
+  promises. A lock on the remote would close that; S3 has none that every compatible
+  service implements, which is why it is the clock.
+- **Merged code is held twice until someone collects.** A push still sends a merged pack
+  whose keys are all listed already. `cache gc --remote` takes the smaller packs off the
+  list; nothing runs it on its own.
+- **The keys of a store are read from the pack headers, not from an index file.** Telling
+  a merged pack by its keys used to read and checksum every local pack; it now maps each
+  pack and walks the record headers only, with no value read and no CRC. A file of keys
+  beside each pack would make it one read, but the store's directory holds only what the
+  store knows, and adding a kind of file to it is the disk-cache branch's to decide. The
+  walk was tested for giving the same keys as the full read; it was not timed on a store
+  the size of cargo's.
+- **A part of a fetch kept aside lasts a day.** A collection used to remove it a minute
+  after its last byte. Now `*.fetch.tmp` and `*.zst.tmp` are kept for a day and counted by
+  `cache stats` as temporary bytes meanwhile; they do not count against `RUSTD_CACHE_MAX`.
 - **One failed pack stops the rest.** When a fetch runs out of resumes the remote is taken
   to be down and the other transfers of that process stop rather than each waiting out its
-  own 16 s. The next run resumes them, and the daemon's push after a build tries afresh.
-- **The daemon talks to the remote twice:** a pull when it starts and a push after its
-  first build. A daemon that stays up for a day does not see what others push meanwhile
-  and does not push what later edits made it compile. `rustd cache push|pull` can be run
-  beside it.
+  own 16 s. The next run resumes them, and the daemon's next push or look tries afresh.
+- **A daemon killed with SIGKILL pushes nothing on its way out.** The next push sends it.
 - **Windows and macOS were not run.** The partial-file lock and the rename are std calls
-  that exist there; the harness is Linux only.
+  that exist there; the harness is Linux only, and the daemon's signal path on Windows is
+  untested.

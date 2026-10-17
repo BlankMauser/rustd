@@ -7,7 +7,7 @@ use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, bail};
@@ -257,10 +257,11 @@ struct Partial {
 }
 
 impl Partial {
-    /// `None` when another process holds it.
-    async fn open(to: &Path) -> anyhow::Result<Option<Partial>> {
+    /// `None` when another process holds it. A file that arrives compressed is kept aside
+    /// under another name than one that arrives as it is, so neither is taken for the other.
+    async fn open(to: &Path, packed: bool) -> anyhow::Result<Option<Partial>> {
         let mut path = to.as_os_str().to_owned();
-        path.push(".fetch.tmp");
+        path.push(if packed { ".zst.tmp" } else { ".fetch.tmp" });
         let path = PathBuf::from(path);
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -329,6 +330,81 @@ impl Partial {
     async fn discard(self) {
         _ = tokio::fs::remove_file(&self.path).await;
     }
+
+    /// Unpacks the file, which is all there, into `to` if what comes out hashes to `want`
+    /// and starts as `is_wanted` says, and removes it. `false` is what came out being
+    /// something else.
+    async fn unpack(
+        self,
+        to: &Path,
+        (want, most): (Digest, u64),
+        is_wanted: fn(&[u8]) -> bool,
+    ) -> anyhow::Result<bool> {
+        let (from, to) = (self.path, to.to_owned());
+        drop(self.file);
+        let unpacked = tokio::task::spawn_blocking(move || {
+            let unpacked = unpack_whole(&from, &to, (want, most), is_wanted);
+            _ = std::fs::remove_file(&from);
+            unpacked
+        });
+        Ok(unpacked.await??)
+    }
+}
+
+/// Writes what the zstd file `from` holds to `to`, whole or not at all, when it is at most
+/// `most` bytes: a file is small for what it unpacks to, and no more than that many bytes
+/// of what comes out are ever on the disk.
+fn unpack_whole(
+    from: &Path,
+    to: &Path,
+    (want, most): (Digest, u64),
+    is_wanted: fn(&[u8]) -> bool,
+) -> std::io::Result<bool> {
+    use std::io::{Read, Write};
+    let mut aside = to.as_os_str().to_owned();
+    aside.push(format!(".{}.tmp", std::process::id()));
+    let aside = PathBuf::from(aside);
+    let unpack = || {
+        let mut packed = zstd::Decoder::new(std::fs::File::open(from)?)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // What is fetched into a store is the store's, which no other user reads.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&aside)?;
+        let (mut hash, mut start, mut chunk) = (Sha256::new(), Vec::new(), vec![0; CHUNK]);
+        let mut left = most;
+        loop {
+            let read = packed.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let Some(rest) = left.checked_sub(read as u64) else { return Ok(false) };
+            left = rest;
+            let wanted = START.saturating_sub(start.len()).min(read);
+            start.extend_from_slice(&chunk[..wanted]);
+            hash.update(&chunk[..read]);
+            file.write_all(&chunk[..read])?;
+        }
+        if Digest(hash.finalize().into()) != want || !is_wanted(&start) {
+            return Ok(false);
+        }
+        name_file_whole(&file, &aside, to).map(|()| true)
+    };
+    let unpacked = unpack();
+    if !matches!(unpacked, Ok(true)) {
+        _ = std::fs::remove_file(&aside);
+    }
+    // Bytes that are not zstd are a remote that lies, as bytes of another hash are.
+    match unpacked {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::Other
+                || e.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            Ok(false)
+        }
+        other => other,
+    }
 }
 
 impl super::Remote {
@@ -348,8 +424,25 @@ impl super::Remote {
         most: u64,
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<Fetched> {
+        self.fetch_coded(name, want, None, to, most, is_wanted).await
+    }
+
+    /// As [`Self::fetch_file`], for an object that may be the file compressed with zstd:
+    /// `unpacked` is then the hash of the file and the most it may unpack to, and `want`
+    /// and `most` are those of the object. The object is checked before it is unpacked and
+    /// the file after, so the name of a file vouches for it however it travelled, and
+    /// neither is longer than it was listed as.
+    pub(crate) async fn fetch_coded(
+        &self,
+        name: &str,
+        want: &Digest,
+        unpacked: Option<(Digest, u64)>,
+        to: &Path,
+        most: u64,
+        is_wanted: fn(&[u8]) -> bool,
+    ) -> anyhow::Result<Fetched> {
         let _permit = self.traffic.permit().await?;
-        let Some(mut partial) = Partial::open(to).await? else {
+        let Some(mut partial) = Partial::open(to, unpacked.is_some()).await? else {
             return Ok(Fetched::Elsewhere);
         };
         // What a stopped process left is not the start of this object.
@@ -387,9 +480,20 @@ impl super::Remote {
                 }
             }
             let got = partial.digest();
-            if got == *want && is_wanted(&partial.start) {
-                partial.seal(to).await.with_context(|| format!("fetching {name}"))?;
-                return Ok(Fetched::Whole(received));
+            if got == *want {
+                let whole = match unpacked {
+                    Some(file) => partial.unpack(to, file, is_wanted).await,
+                    None if is_wanted(&partial.start) => partial.seal(to).await.map(|()| true),
+                    None => {
+                        partial.discard().await;
+                        Ok(false)
+                    }
+                };
+                if whole.with_context(|| format!("fetching {name}"))? {
+                    return Ok(Fetched::Whole(received));
+                }
+                self.traffic.rejected.fetch_add(1, Ordering::Relaxed);
+                bail!("rejected {name}: it is not what it is listed as");
             }
             // What a stopped process left may be the start of something else.
             if std::mem::take(&mut left_by_another) {
@@ -399,9 +503,6 @@ impl super::Remote {
             let len = partial.len;
             partial.discard().await;
             self.traffic.rejected.fetch_add(1, Ordering::Relaxed);
-            if got == *want {
-                bail!("rejected {name}: it is not what it is listed as");
-            }
             bail!("rejected {name}: its {len} bytes hash to {got}, not to {want}");
         }
     }
@@ -434,6 +535,14 @@ impl super::Remote {
 /// An object that a list names and the remote does not have.
 #[derive(Debug)]
 pub(crate) struct Missing(pub(super) String);
+
+/// An object of a remote, as a listing has it.
+pub(crate) struct Object {
+    pub(super) name: String,
+    pub(super) len: u64,
+    /// When it was last written, by the clock of whatever holds it.
+    pub(super) written: SystemTime,
+}
 
 impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

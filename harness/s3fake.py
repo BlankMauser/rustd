@@ -195,6 +195,9 @@ class Proxy:
             self.sent = self.received = self.flying = self.most_flying = 0
             # Bytes a second for the bodies, and seconds every request is held before it is passed on.
             self.rate, self.hold = None, 0
+            # How many seconds earlier the service is made to say its objects were written, and
+            # whether in its answers about one object too or only where it lists them.
+            self.age, self.age_one = 0, True
 
     def fault(self, *args, **kwargs):
         fault = Fault(*args, **kwargs)
@@ -292,10 +295,26 @@ class Proxy:
         finally:
             upstream.close()
 
+    def _aged(self, head, rest, upstream):
+        """An answer with the times objects were written moved back: the same number of bytes."""
+        def earlier(found, form):
+            then = datetime.datetime.strptime(found.group(2), form) - datetime.timedelta(seconds=self.age)
+            return found.group(1) + then.strftime(form) + found.group(3)
+
+        while chunk := upstream.recv(1 << 16):
+            rest += chunk
+        if self.age_one:
+            head = re.sub(r"(?i)(last-modified: )([^\r]*)( GMT)", lambda it: earlier(it, "%a, %d %b %Y %H:%M:%S"), head)
+        listed = re.sub(r"(<LastModified>)([^<.Z]*)((?:\.\d+)?Z</LastModified>)", lambda it: earlier(it, "%Y-%m-%dT%H:%M:%S"),
+                        rest.decode("latin-1"))
+        return head, listed.encode("latin-1")
+
     def _relay(self, upstream, client, fault):
         head, rest = self._head(upstream)
         if head is None:
             return
+        if self.age:
+            head, rest = self._aged(head, rest, upstream)
         lines = [line for line in head.split("\r\n") if not line.lower().startswith("connection:")]
         client.sendall(("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1"))
         passed, start, stalled = 0, time.time(), False

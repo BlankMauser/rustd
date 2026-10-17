@@ -45,6 +45,11 @@ fn unpacked_max() -> anyhow::Result<Option<u64>> {
     }
 }
 
+/// The archives the lines of a list of units name.
+pub(crate) fn archives(lines: &str) -> impl Iterator<Item = Digest> {
+    Listed::parse(lines).0.into_values()
+}
+
 /// The units a project's builds used and the archive of each: `unit hash` a line.
 struct Listed(BTreeMap<String, Digest>);
 

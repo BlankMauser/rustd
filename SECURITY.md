@@ -1,7 +1,7 @@
 # Security review of the store, the remote and the daemon's boundaries
 
-Branch `rustd-security`, on top of `rustd-collate` at 526f2963ba, which has the S3 remote
-and its signed lists. Everything below was
+Branch `rustd-security`, on top of `rustd-collate` at 2da3d6a792, which has the S3 remote
+with its signed lists, compressed packs and `cache gc --remote`. Everything below was
 measured on Linux x86-64 with Rust 1.99.0 and LLVM 20. Where something is an argument and
 not a measurement it says so. The Windows code in this round was compiled for Windows and
 never run; that is said again where it matters.
@@ -360,7 +360,8 @@ how much. Now:
 | What | Bound | Set by |
 |---|---|---|
 | A manifest, or a list of units | 16 MiB | fixed (`LIST_MAX`); a line is under 200 bytes |
-| A pack | the size its manifest lists it with | the manifest |
+| A pack as it is sent (zstd) | the compressed size its manifest lists | the manifest |
+| A pack as it unpacks | the size its manifest lists | the manifest |
 | All the packs one pull writes | the store's limit, 8 GiB | `RUSTD_CACHE_MAX`; a pull fetches only what its listed sizes say fits |
 | The keys of one pack | the pack's listed size, and 512 MiB | `RUSTD_REMOTE_MAX` |
 | All the keys a lazy daemon holds in memory | 512 MiB | `RUSTD_REMOTE_MAX` |
@@ -378,6 +379,13 @@ How each is held:
   it. The part file is removed, the object is counted under "objects rejected", and the
   failure is final: it is not asked for again. A part file left by a stopped process
   that is already longer than the bound is emptied first.
+- A pack is sent compressed, and a manifest line gives both sizes. The object is held
+  to the compressed one while it arrives, and `unpack_whole` (`remote/transfer.rs`)
+  counts what comes out of zstd against the unpacked one and stops at the read that
+  passes it, removing what it wrote. So a small object that unpacks to a great deal
+  writes no more than the pack was listed as: in the test 64 MiB of one byte are under
+  64 KiB as sent, and listed as 0, 64 KiB and one byte short they leave nothing in the
+  store.
 - A pack's bound is the size in its manifest line, which with signed lists is a number
   the signer wrote. The existing `fitting` already left out packs whose listed sizes do
   not fit under `RUSTD_CACHE_MAX`; with each pack held to its listed size, that sum is
@@ -394,6 +402,8 @@ Tests, each with the exact bound taken and less refused:
 `an_object_without_an_end_is_given_up_on` (`/dev/zero` as the object),
 `a_pack_longer_than_its_list_says_is_not_written` (listed as 0, 8, 64 KiB and one byte
 short: rejected, the store holds nothing but its own two files; listed exactly: fetched),
+`a_pack_that_unpacks_to_more_than_its_list_says_is_not_written` (the zstd bomb),
+`a_packed_pack_longer_than_its_list_says_is_not_unpacked`,
 `what_a_stopped_fetch_left_does_not_count_against_the_bound_twice`,
 `a_manifest_longer_than_is_read_is_refused` (16 MiB read; one byte more refused for a
 pull and for a push, and the list not overwritten),
@@ -401,15 +411,18 @@ pull and for a push, and the list not overwritten),
 `an_archive_longer_than_is_taken_is_refused`,
 `a_list_of_units_longer_than_is_read_is_refused` and
 `an_archive_that_unpacks_to_more_than_is_taken_is_refused`. Against MinIO, `remote.py`
-does the pack listed as 0, 1 and one byte short and the manifest of 16 MiB and of one
-byte more through `rustd cache pull`.
+does, through `rustd cache pull`: a pack listed as 0, 1 and one byte short unpacked, and
+as 0 and one byte short as sent; 2,115 bytes that `rustd cache push` made of a 64 MiB
+pack, listed as 1 MiB; and the manifest of 16 MiB and of one byte more.
 
 Not covered: with `RUSTD_CACHE_MAX=off` the sum of what a pull writes has no bound, which
 is what the setting says. The lazy path's two bounds have no test of their own.
 
 ## What was applied on top of the S3 remote
 
-`rustd-collate` at 526f2963ba has `rustd-s3`. Merging it replaced `remote.rs` and
+`rustd-collate` has `rustd-s3`, in two merges while this round ran (526f2963ba, then
+2da3d6a792 with compressed packs, `cache gc --remote` and the daemon that stays). The
+first replaced `remote.rs` and
 `deps.rs` wholesale (the remote is now asynchronous, streams packs to files and has
 `remote/s3.rs`, `remote/signed.rs`, `remote/transfer.rs`), so what this branch had done
 to the old remote was done again on the new one, not merged:
@@ -432,9 +445,31 @@ to the old remote was done again on the new one, not merged:
 - **`Kind::of` in `store.rs`** takes `<pack>.fetch.tmp` for a temporary file of the
   store. The stricter names of M5 did not know the name S3 gives a pack on its way, so
   the store neither counted one nor removed it once it was old; `remote.py` found it.
+- **`cache gc --remote` and a signed list.** Collecting rewrites manifests, so it was
+  checked for a way round the signature. What was already right: it reads a manifest
+  through `read_list`, so a machine that does not trust a list leaves its lines alone,
+  and it removes only objects that no list names, reading every list for that whoever
+  signed it. What was wrong, and older than `gc`: a machine with no key and no keys to
+  trust that wrote a list back (a push, or a collection with
+  `RUSTD_REMOTE_UNSIGNED=1`) wrote it without a signature, over a signed one. Every
+  machine that trusts the signer then takes nothing, and the signer's next push starts
+  the list again from what it sends. That is a writer to the remote doing through
+  rustd what it could do with the bucket's own tools, so no new power, but rustd should
+  not do it by accident. Now `rewrite_list` refuses: "is signed, and this machine has no
+  key in RUSTD_REMOTE_SIGN: it is left as it is". A collection counts such a manifest
+  with the ones it does not trust and goes on. A signer that collects signs what is
+  left at a later turn, and does not shrink a list that was put back under it. The
+  bounds hold in `gc` too: lists to 16 MiB, key lists to their pack's size. Tests:
+  `remote::tests::a_machine_without_a_key_does_not_write_a_signed_list_back`; in
+  `remote.py`, `gc --remote --older-than 0s` by a keyless machine with and without the
+  unsigned setting leaves the list and every object as they were, its push is refused,
+  and the signer's collection is signed at a later turn and taken by the reader.
+  `gc --remote` without `RUSTD_CACHE` remembers the signer's turn in the daemon's home.
+- **Temporary names.** `Kind::of` also takes `<pack>.zst.tmp` and `<pack>.send.tmp`,
+  the two names the compressed transfer leaves, for the store's.
 - **`harness/remote.py`** runs its machines with `RUSTD_REMOTE_UNSIGNED=1` where they
   name no keys, and has a new section, "unsigned lists, old lists, long objects",
-  17 checks. `harness/deps.py` expects the new remote's wording for a changed archive
+  25 checks. `harness/deps.py` expects the new remote's wording for a changed archive
   ("rejected units/...").
 
 ## Rollback protection for signed lists
@@ -806,6 +841,9 @@ changed:
 - **The two bounds of the lazy path** (keys held in memory, a pack over the store's
   limit) have no test of their own.
 - **With `RUSTD_CACHE_MAX=off`** a pull writes as much as the lists name.
+- **A writer to the remote can still delete a signed list with the bucket's own tools,**
+  or anything else in it. Signing protects what is taken, not that there is something
+  to take.
 - **A pushed-over list loses lines.** When a signer finds a rolled-back or untrusted
   list it writes a new one with what it just sent, not with everything it ever sent;
   the next pushes add the rest back. That was the behaviour for untrusted lists already.
