@@ -782,6 +782,7 @@ dependencies = [
  "arrayvec",
  "base-db",
  "bitflags",
+ "cfg",
  "cov-mark",
  "cranelift-codegen",
  "cranelift-frontend",

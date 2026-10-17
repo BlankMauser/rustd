@@ -10,8 +10,12 @@ use super::*;
 
 // test_err empty_param_slot
 // fn f(y: i32, ,t: i32) {}
-pub(super) fn param_list_fn_def(p: &mut Parser<'_>) {
-    list_(p, Flavor::FnDef);
+pub(super) fn param_list_fn_def(p: &mut Parser<'_>, is_in_trait: bool) {
+    // Before the 2018 edition a method of a trait may leave its parameters unnamed, as
+    // rustc's `parse_trait_item` passes `|edition| edition >= Edition::Edition2018` for
+    // `req_name`.
+    let unnamed = is_in_trait && !p.current_edition().at_least_2018();
+    list_(p, if unnamed { Flavor::TraitFn2015 } else { Flavor::FnDef });
 }
 
 pub(super) fn param_list_fn_ptr(p: &mut Parser<'_>) {
@@ -24,7 +28,9 @@ pub(super) fn param_list_closure(p: &mut Parser<'_>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flavor {
-    FnDef, // Includes trait fn params; omitted param idents are not supported
+    FnDef,
+    /// A method of a trait before the 2018 edition, whose parameters may be types alone.
+    TraitFn2015,
     FnPointer,
     Closure,
 }
@@ -34,14 +40,14 @@ fn list_(p: &mut Parser<'_>, flavor: Flavor) {
 
     let (bra, ket) = match flavor {
         Closure => (T![|], T![|]),
-        FnDef | FnPointer => (T!['('], T![')']),
+        FnDef | TraitFn2015 | FnPointer => (T!['('], T![')']),
     };
 
     let list_marker = p.start();
     p.bump(bra);
 
     let mut param_marker = None;
-    if let FnDef = flavor {
+    if let FnDef | TraitFn2015 = flavor {
         // test self_param_outer_attr
         // fn f(#[must_use] self) {}
         let m = p.start();
@@ -96,11 +102,15 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
     match flavor {
         // test param_list_vararg
         // extern "C" { fn printf(format: *const i8, ..., _: u8) -> i32; }
-        Flavor::FnDef | Flavor::FnPointer if p.eat(T![...]) => {}
+        Flavor::FnDef | Flavor::TraitFn2015 | Flavor::FnPointer if p.eat(T![...]) => {}
+
+        // test trait_fn_unnamed_params 2015
+        // trait T { fn f(&self, *const u8, Option<&u8>, x: u8, _: &u8, &u8) -> u8; }
+        Flavor::TraitFn2015 if !is_named_param(p) => types::type_(p),
 
         // test fn_def_param
         // fn foo(..., (x, y): (i32, i32)) {}
-        Flavor::FnDef => {
+        Flavor::FnDef | Flavor::TraitFn2015 => {
             patterns::pattern(p);
             if !variadic_param(p) {
                 if p.at(T![:]) {
@@ -144,6 +154,19 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
         }
     }
     m.complete(p, PARAM);
+}
+
+/// Whether a parameter starts with a name and a colon, as rustc's `Parser::is_named_param`
+/// asks of a parameter that may be a type alone.
+fn is_named_param(p: &Parser<'_>) -> bool {
+    let offset = match p.current() {
+        T![&] if p.nth_at(1, T![mut]) => 2,
+        T![&] | T![mut] => 1,
+        _ => 0,
+    };
+    matches!(p.nth(offset), IDENT | T![_])
+        && p.nth_at(offset + 1, T![:])
+        && !p.nth_at(offset + 1, T![::])
 }
 
 fn variadic_param(p: &mut Parser<'_>) -> bool {

@@ -2065,7 +2065,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             return self.is_promotable_unadjusted(base);
         }
         let is_fn = matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
-        match self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it) {
+        let adjustments = self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it);
+        // Unsizing a reference to a constant, `&[1, 2]` to a slice say, leaves it one: rustc's
+        // `promote_consts::Validator::validate_rvalue` lets every cast through that is not of
+        // a pointer to an integer.
+        let adjustments = match adjustments {
+            [rest @ .., Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }] => rest,
+            all => all,
+        };
+        match adjustments {
             [] => self.is_promotable_unadjusted(expr),
             // A function's address is a constant.
             [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }]
@@ -2073,6 +2081,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
+            // rustc's `promote_consts::Validator::validate_rvalue`.
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(mutability)), .. },
+            ] => {
+                let shared = matches!(Mutability::from(*mutability), Mutability::Not);
+                let reference = self.expr_ty_without_adjust(expr).as_reference().is_some();
+                shared && reference && self.is_promotable_unadjusted(expr)
+            }
             _ => false,
         }
     }
@@ -2150,10 +2168,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(*callee).kind() else {
                     return false;
                 };
-                let CallableDefId::FunctionId(func) = def.0 else { return false };
-                hir_def::attrs::AttrFlags::query(self.db, func.into())
-                    .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
-                    && args.clone().iter().all(|&it| self.is_promotable(it))
+                // A tuple struct's or variant's constructor makes an aggregate of its
+                // arguments, which rustc's `promote_consts::Validator::validate_rvalue`
+                // promotes when each operand is.
+                let promoted = match def.0 {
+                    CallableDefId::FunctionId(func) => {
+                        hir_def::attrs::AttrFlags::query(self.db, func.into())
+                            .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
+                    }
+                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
+                };
+                promoted && args.clone().iter().all(|&it| self.is_promotable(it))
             }
             &Expr::Ref { expr, mutability, .. } => {
                 mutability.is_shared() && self.is_promotable(expr)

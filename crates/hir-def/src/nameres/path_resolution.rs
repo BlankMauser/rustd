@@ -20,7 +20,7 @@ use span::Edition;
 use stdx::TupleExt;
 
 use crate::{
-    AdtId, ModuleDefId, ModuleId,
+    AdtId, EnumId, Lookup, ModuleDefId, ModuleId,
     item_scope::{BUILTIN_SCOPE, ImportOrExternCrate},
     nameres::{
         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, assoc::TraitItems,
@@ -445,6 +445,17 @@ impl DefMap {
         }
     }
 
+    /// The visibility an enum is declared with, in the module that declares it.
+    fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
+        let module = e.lookup(db).container;
+        let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
+            &self.module(db, module)
+        } else {
+            &module.def_map(db).module(db, module)
+        };
+        module_data.declared_enum(db, e)
+    }
+
     fn resolve_remaining_segments<'a>(
         &self,
         db: &dyn SourceDatabase,
@@ -516,11 +527,17 @@ impl DefMap {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
 
+                    // A variant is as visible as its enum, whatever the name the enum was
+                    // reached by: `use Enum::Variant` works through a private import of `Enum`.
+                    let vis = match curr.import {
+                        Some(_) => self.declared_enum_visibility(db, e).unwrap_or(curr.vis),
+                        None => curr.vis,
+                    };
                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
-                            PerNs::both(variant.into(), variant.into(), curr.vis, None)
+                            PerNs::both(variant.into(), variant.into(), vis, None)
                         } else {
-                            PerNs::types(variant.into(), curr.vis, None)
+                            PerNs::types(variant.into(), vis, None)
                         }
                     });
                     // FIXME: Need to filter visibility here and below? Not sure.

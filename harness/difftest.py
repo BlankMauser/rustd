@@ -205,7 +205,7 @@ class Fixture:
         args = linkline.with_output(args, self.binary)
         run = subprocess.run(args, capture_output=True, text=True)
         if run.returncode != 0:
-            raise SystemExit(f"link failed:\n{(run.stderr + run.stdout)[-3000:]}")
+            raise SystemExit(f"link failed:\n{(run.stderr + run.stdout)[-20000:]}")
 
     def compiled(self):
         return [r[1] for rows in self.reports.values() for r in rows if r[0] == "compiled"]

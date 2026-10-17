@@ -295,28 +295,61 @@ fn format_args_expand(
 }
 
 fn format_args_nl_expand(
-    _db: &dyn SourceDatabase,
+    db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let pound = mk_pound(span);
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
     let lit = tt.as_token_trees().iter_flat_tokens().nth(1);
     if let Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
         mut lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
     ))) = lit
     {
+        let mut tt = tt.clone();
+        tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
         // A raw string has no escapes: the newline goes in as it is.
         let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
         let (text, suffix) = lit.text_and_suffix();
         lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}{newline}{suffix}"));
         tt.set_token(1, lit.into());
+        return ExpandResult::ok(quote! {span =>
+            builtin #pound format_args #tt
+        });
     }
-    ExpandResult::ok(quote! {span =>
-        builtin #pound format_args #tt
-    })
+    format_args_nl_of_macro(db, tt, span)
+}
+
+/// `format_args_nl!` whose template is not written as a string: a macro that expands to one.
+///
+/// rustc expands the template and then appends the newline to the string it got
+/// (`expand_format_args_impl` with `append_newline` in
+/// `compiler/rustc_builtin_macros/src/format.rs`). Here the template becomes
+/// `concat!(template, "\n")`, which expands to that same string.
+fn format_args_nl_of_macro(
+    db: &dyn SourceDatabase,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let pound = mk_pound(span);
+    let mut iter = tt.iter();
+    let template = expect_fragment(
+        db,
+        &mut iter,
+        parser::PrefixEntryPoint::Expr,
+        tt.top_subtree().delimiter.delim_span(),
+    );
+    let rest = iter.remaining();
+    let arguments = rest.iter();
+    let dollar_crate = dollar_crate(span);
+    let value = template.value;
+    let expanded = quote! {span =>
+        builtin #pound format_args (#dollar_crate::concat!(#value, "\n") # #arguments)
+    };
+    match template.err {
+        Some(err) => ExpandResult::new(expanded, err.into()),
+        None => ExpandResult::ok(expanded),
+    }
 }
 
 fn asm_expand(
