@@ -3133,6 +3133,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // FIXME: this passes arguments the way Rust functions take them, which is only
             // what a foreign function expects for scalars and pointers.
             if let InstanceDef::Fn(func) = def
+                && *AttrFlags::link_name_from_macro(self.db, func.into())
+            {
+                unsupported!("call to `{name}`, whose `link_name` a macro writes");
+            }
+            if let InstanceDef::Fn(func) = def
                 && let Some(symbol) = link_name(self.db, func)
                 && !symbol.starts_with("llvm.")
             {

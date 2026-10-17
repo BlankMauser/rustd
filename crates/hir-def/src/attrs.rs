@@ -762,6 +762,23 @@ impl AttrFlags {
         })
     }
 
+    /// Whether an item has a `#[link_name]` that is not a string literal: a macro call, which
+    /// names a symbol only once it is expanded.
+    #[salsa::tracked]
+    pub fn link_name_from_macro(db: &dyn SourceDatabase, owner: AttrDefId) -> bool {
+        collect_attrs(db, owner, |attr| {
+            if let ast::Meta::KeyValueMeta(attr) = attr
+                && attr.path().is1("link_name")
+                && attr.value_string().is_none()
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_some()
+    }
+
     /// The symbol `#[export_name]` gives an item.
     #[salsa::tracked(returns(clone))]
     pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
