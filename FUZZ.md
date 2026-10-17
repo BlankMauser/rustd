@@ -14,8 +14,8 @@ macOS, Windows, aarch64 and wasm were not run.
 
 ## Result
 
-The fuzzer found sixteen distinct problems. Thirteen are fixed in rustd, one is worked around (it is a
-bug in LLVM, not in rustd), and two are open. Each has a reduced case in `harness/breakers/`.
+The fuzzer found sixteen distinct problems. Fourteen are fixed in rustd, one is worked around (it is a
+bug in LLVM, not in rustd), and one is open. Each has a reduced case in `harness/breakers/`.
 
 | # | What | Backends | Status | Breaker case |
 |---|---|---|---|---|
@@ -33,7 +33,7 @@ bug in LLVM, not in rustd), and two are open. Each has a reduced case in `harnes
 | 12 | Before the 2024 edition, when a `for` loop was the tail of a block, the temporaries of what it iterates over were dropped after the block's locals instead of where the loop ends | both | fixed, 876f964f06 | `for_tail_temporaries` |
 | 13 | Before the 2024 edition, the temporaries of what an `if let` matches on were dropped at the end of the branch instead of with those of the expression the `if` is in | both | fixed, 302a786299 | `if_let_temporaries` |
 | 14 | When an arm bound part of an array by value (`[_, middle @ .., _] if guard`) and its guard was false, the elements put back into the array were never dropped | both | fixed, 49c4fddd1f | `guard_subslice_restored` |
-| 15 | An array matched by an arm that would move elements out, where rustc can tell from the arms before it that no value reaches that arm, is dropped from the back instead of front to back | both | open | `unreachable_arm_move` |
+| 15 | An array matched by an arm that would move elements out, where rustc can tell from the arms before it that no value reaches that arm, is dropped from the back instead of front to back | both | fixed, 20d97d4d73 | `unreachable_arm_move` |
 | 16 | When an operand of an aggregate or call panicked and the expression was the tail of a block, the operands already made were dropped in the wrong order relative to the temporaries (finding 4 again, outside a statement) | both | fixed, 27a94f2770 | `unwind_operand_tail`, `unwind_operand_order` |
 
 Numbers 4, 6, 7 and 9 to 16 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
@@ -364,24 +364,41 @@ each of its elements, the same set a move out of the subslice sets. Both edition
 backends. `L7` hit it in one program (round 174). Reduction:
 `differs-checksum-L7-174-c9.rs`.
 
-**15. An arm that moves and that nothing reaches.** Open. In
+**15. An arm that moves and that rustc's tree does not lead to.** In
 
     match items { [.., Loud::Char(_)] => 1, [Loud::Char(..), middle @ .., Loud::Char('Z')] => 2, _ => 3 }
 
 the second arm can never be taken: the first takes every array that ends in a `Char`. rustc
-warns of an unreachable pattern, and because it builds one tree of tests for all the arms, the
-second arm's bindings end up in no block that can be reached. Its drop analysis then sees an
-array nothing is ever moved out of, and drops it front to back. rustd tries the arms one after
-the other, so its MIR has a path through the second arm's move, the analysis of finding 11
-takes the array for one that may have lost elements, and it is dropped from the back. The
-values are right and every destructor runs once; only the order differs, and only in code
-rustc warns about. I did not fix it. Skipping arms that pattern analysis calls unreachable
-would be wrong the other way: I measured with rustc alone that an arm hidden behind an
-overlapping range (`[.., Char('a'..='z')]` before `[m @ .., Char('a'..='c')]`) still counts as
-a way through, and the array is dropped from the back. What rustc does follows from the shape
-of its test tree, and matching it means building the match the way rustc does. The breaker
-case is in `breakers.py`'s `OPEN` set. `L7` hit it in one program (round 230). Reduction:
-`differs-checksum-L7-230-c24.rs`.
+builds one tree of tests for all the arms, the second arm's bindings end up in a block no
+edge leads to, and its drop analysis sees an array nothing is moved out of and drops it front
+to back. rustd tries the arms one after the other, so its MIR has a path through the second
+arm's move, and the array was dropped as one that may have lost elements: from the back.
+
+What decides is not whether a value can reach the arm but whether rustc's tree has an edge
+to it, and those differ. I measured with rustc alone (`RUSTC_BOOTSTRAP=1 rustc
+-Zdump-mir=FN -Zdump-mir-dir=DIR` writes the MIR as built, which is the ground truth here):
+an arm behind an overlapping range, an arm behind a wildcard arm with a guard, and an arm
+after arms for every variant are all unreachable for any value and all still have an edge,
+so the array is dropped from the back; an arm covered through an or-pattern, through a
+nested pattern or through an integer literal has none.
+
+So the fix follows rustc's construction. `mir/lower/match_tree.rs` (about 450 lines) turns
+each arm into what rustc calls a candidate, the list of places its pattern tests, and sorts
+the candidates the way `rustc_mir_build`'s match builder does: take the first test of the
+first candidate, sort the candidates the outcome says something about into its branches,
+leave the rest for after, expand or-patterns where rustc does, and stop at a candidate that
+matches without a guard. It builds nothing; it only says which arms are reached. That is
+the part of rustc's roughly 4,000 lines of match lowering that decides reachability, and
+it was contained. rustd still lowers the arms one after the other; the bindings of an arm
+the tree does not reach go into a block listed in `MirBody::unreached`, and the analysis of
+what may be moved out where a drop is does not enter those blocks. If the simulation is
+wrong about an arm, the cost is the order of a drop: every part is still dropped once, by
+its flag. A pattern with something the simulation does not follow (a constant named by a
+path, a deref pattern) makes every arm of that `match` count as reached, as before.
+
+The breaker case has nine functions, the six that rustc drops front to back and three it
+does not, and matches rustc under both backends. `L7` hit this in one program (round 230).
+Reduction: `differs-checksum-L7-230-c24.rs`.
 
 **16. Operands of a tail when a later one panics.** The fix of finding 4 moved the operands
 of an aggregate or call in front of the statement's temporaries on the way out of a panic,
@@ -397,10 +414,9 @@ braces and, from the 2024 edition, the tail of a block; there everything is in o
 (`3, 50, 30, 20, 1`). rustd now keeps the set of those expressions and applies the fix of
 finding 4 to every other aggregate or call. Reduction: `differs-checksum-L8-231-c11.rs`.
 
-`fuzz.py check fuzz/found/*.rs` with the final binary (27a94f2770): of the 30 files, 29 give
-the same output as rustc under both backends with no function left to rustc, and
-`differs-checksum-L7-230-c24.rs`, the reduction of the open finding 15, differs under both
-(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`).
+`fuzz.py check fuzz/found/*.rs` with the binary of 20d97d4d73: all 30 files give the same
+output as rustc under both backends, with no function left to rustc
+(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`, 60 lines of `same`).
 
 ## The merge
 
@@ -418,9 +434,9 @@ pattern gave its elements back. What I kept:
 - From `rustd-collate`, in `mir/codegen.rs`: the analysis of which fields may be moved out
   where a drop is (`moved_where_blocks_end`), the stack argument modes (which include the fix
   of finding 5), and scope ends as the place of drops. This branch's
-  `MirBody::parted_at_block_ends` is still there beside it and decides first whether a local
-  is dropped as one value. The two answer nearly the same question and one of them should
-  go; I did not take either out, because that needs a long run of its own to check.
+  `MirBody::parted_at_block_ends` answered nearly the same question and was still there
+  beside it after the merge. It is gone since 20d97d4d73: the other analysis alone passes
+  every breaker case, including the ones written for this one.
 - The edition 2021 breakers are one crate, `breakers2021`, with both sides' cases.
 - `OPEN` in `breakers.py` is both sides' open cases.
 
@@ -443,14 +459,16 @@ results were the same under both:
 | `python3 difftest.py corpus --bin runner --crate cases --layouts` | exit 0, 0 of 893 layouts differ |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
-| `python3 breakers.py` | 58 of 58 right, 7 open, 0 functions skipped |
+| `python3 breakers.py` | 59 of 59 right, 6 open, 0 functions skipped |
 | `python3 unwinds.py` | 8 of 8 right |
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
 | `python3 includes.py` | 9 of 9 right |
 | `python3 worktrees.py` | 62 of 62 right |
 
-The 7 open of `breakers.py` are the two of this report (findings 3 and 15), three that
+The table is as of 20d97d4d73 (finding 15 fixed), run again under both backends; on the
+merge commit itself the breakers were 58 of 58 right with 7 open, the rest the same. The 6
+open of `breakers.py` are finding 3 of this report, three that
 `rustd-collate` lists as open and two it lists as left to rustc. Before the merge, on
 27a94f2770, the same nine passed under both backends with 40 of 40 breakers right and 2 open.
 
@@ -465,8 +483,6 @@ not run them on the merged head.
 ## Open, and not done
 
 - Finding 3, the `assert!` message, is open for the reason above.
-- Finding 15, the drop order of an array behind an unreachable arm that moves, is open for
-  the reason above.
 - Finding 6 is a workaround. The honest fix is in LLVM; the cost of running without the SLP
   vectorizer was not measured.
 - The fuzzer only tests a whole build. It does not edit a program and splice the change in, so
@@ -475,6 +491,4 @@ not run them on the merged head.
 - The generator's programs are single-crate and use only `std`.
 - A reduction is bounded by time (`--reduce`, 600 s in the long runs), so a reduced file is
   small but not always minimal. The breaker cases were written by hand from them.
-- After the merge there are two analyses of what may be moved out where a drop is (see "The
-  merge"). One should go.
 - The CI jobs for Windows, macOS and AArch64 that came with the merge do not run the fuzzer.
