@@ -102,3 +102,49 @@ What these say, before any profile:
   functions, and still writes the whole object again.
 
 The sections below take these one at a time.
+
+## What the daemon says about its own time
+
+With `RUSTD_STATS=1` the daemon already printed, for every build, `timeline-us:` (the steps
+of an edit one after another: settle, read, apply, roots, check, reach, resolve, define,
+object, write, link, and what is left between them), `phases:`, `backend:` (the producer's
+time summed over threads; LLVM's split into lower, verify, optimize, emit, read), `store:`,
+`link:` (spliced or not and why) and `edit-to-binary:`; and for the first build `load
+workspace:`, `resolve:` and `cold:`. Two things could not be told from those and were added,
+on the same switch and as lines of the same kind:
+
+- `steps: infer …, mir …, monomorphize …, translate …, describe …, store read …, store write …`:
+  what the compiling threads spent, summed over the threads, on the types of a body, its MIR,
+  putting an instance's types into a generic body, turning MIR into the producer's IR, debug
+  info (lines and variables of each function, and writing the sections), and reading and
+  writing entries of the store. `infer` is only what had not been asked for before codegen got
+  to it; after an edit the types are computed in the `check` step of the timeline, so `infer`
+  is then near zero.
+- `round N: TIME, started over: WHY` for every pass over the program whose object was thrown
+  away, and `discarded=` in `timeline-us` for their sum. `phases:` only ever described the last
+  round, so a build of four rounds showed three quarters of its time as "compile-rest".
+
+`bench.py` puts these in the JSON as `steps_ms` (the timeline), `threads_s` (the `steps:` and
+`backend:` lines) and `started_over` (the reasons).
+
+On ripgrep's cold build under Cranelift (7.1 s of compiling on 8 threads, 23,387 functions)
+the threads spent: MIR 2.9 s, translation 3.8 s, Cranelift 6.2 s, store writes 2.1 s, debug
+info 1.2 s, monomorphization 0.5 s, types 0.3 s, store reads 0.07 s. The same for cargo and
+nushell, and the profiles, are not in this file yet.
+
+## Open at this head
+
+Not done yet from the list this file is for:
+
+- Profiles (perf) of cargo's cold build, of debug info, and of the slowest edit of each kind.
+- The 6 s that REMOTE.md calls unexplained. One thing is already clear from its own table:
+  the "store costs 14 s" there subtracts a run with debug info from a run without. With debug
+  info on in both, the store costs 28.8 s on cargo (101.9 s against 73.1 s). The run that
+  tells whether the 6 s are in the store or in compiling (no store and no debug info) has not
+  been made.
+- No fix has been made. The candidates, from the measurements above, none of them small:
+  a refusal costing a whole reload; the first edit after a start with a full store compiling
+  half the program; cargo's generic edit starting over several times.
+- The frontend errors behind the refused edits (`publish` in cargo after a signature edit is
+  taken back, `MatchPattern::eq` in nushell from the start) have not been reduced to cases.
+- The CI job has not run, and its baseline is from another machine than the runner.
