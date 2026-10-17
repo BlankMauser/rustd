@@ -262,6 +262,13 @@ class Case:
         """The program as cargo links it now: what a client sends after cargo has built again.
         Nothing when cargo does not build it, where the daemon is to say why by itself."""
         link = self.link_line(env)
+        if link is None:
+            # cargo has built exactly this before and links nothing: without what it linked
+            # then, it does again.
+            for linked in glob.glob(os.path.join(self.ws, "target", "**", "deps", self.artifact_name() + "-*"), recursive=True):
+                if "." not in os.path.basename(linked):
+                    os.remove(linked)
+            link = self.link_line(env)
         return [] if link is None else ["--crate", self.crates[0], *self.ask(link, env)]
 
     def step(self, step, env, daemon, socket, binary):
@@ -270,6 +277,7 @@ class Case:
             assert old in text, (self.name, step["what"], old)
             open(os.path.join(self.ws, path), "w").write(text.replace(old, new, 1))
         for path, text in step.get("write", {}).items():
+            os.makedirs(os.path.dirname(os.path.join(self.ws, path)), exist_ok=True)
             open(os.path.join(self.ws, path), "w").write(text)
         env.update(step.get("env", {}))
         for command in step.get("run", []):

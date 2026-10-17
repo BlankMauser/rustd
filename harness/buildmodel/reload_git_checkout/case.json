@@ -1,0 +1,27 @@
+{
+  "row": "reload: `git checkout` between commits that differ in dependencies, lock file, features, members and build script",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "steps": [
+    {
+      "what": "the other commit is checked out",
+      "run": [
+        "git checkout -q two"
+      ]
+    },
+    {
+      "what": "and the first again",
+      "run": [
+        "git checkout -q one"
+      ]
+    },
+    {
+      "what": "and the other once more",
+      "run": [
+        "git checkout -q two"
+      ]
+    }
+  ]
+}
