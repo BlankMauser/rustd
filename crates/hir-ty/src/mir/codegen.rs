@@ -9383,6 +9383,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, i as i32);
                 }
             }
+            ("x86.avx2.permd" | "x86.avx2.permps", [table, indices]) => {
+                let (table, _) = self.operand(table)?;
+                let (indices, _) = self.operand(indices)?;
+                // Each of the eight lanes is the lane its index names, by its low three bits.
+                let lanes: Vec<Value> = (0..8)
+                    .map(|lane| {
+                        let index = self.builder.ins().load(types::I32, MEM, indices, lane * 4);
+                        let slot = self.builder.ins().band_imm(index, 7);
+                        let slot = self.builder.ins().uextend(ptr(), slot);
+                        let offset = self.builder.ins().ishl_imm(slot, 2);
+                        let addr = self.builder.ins().iadd(table, offset);
+                        self.builder.ins().load(types::I32, MEM, addr, 0)
+                    })
+                    .collect();
+                for (lane, value) in lanes.into_iter().enumerate() {
+                    self.builder.ins().store(MEM, value, dst, lane as i32 * 4);
+                }
+            }
             ("x86.sse2.psad.bw" | "x86.avx2.psad.bw" | "x86.avx512.psad.bw.512", [a, b]) => {
                 let (a, ty) = self.operand(a)?;
                 let (b, _) = self.operand(b)?;
