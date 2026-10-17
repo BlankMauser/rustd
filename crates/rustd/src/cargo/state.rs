@@ -83,6 +83,11 @@ pub(crate) struct Program {
     cargos: PathBuf,
     /// Where it is among the programs of its checkout in `checkouts`.
     pub(crate) asked_as: Option<(usize, usize)>,
+    /// Why the daemon is never asked for it, when it is not.
+    left_to_cargo: Option<String>,
+    /// The source files of the workspace it is compiled from, its libraries' too. While
+    /// none is written, the executable cargo built is the program.
+    inputs: Vec<PathBuf>,
     /// What cargo sets for the program when it runs it.
     pub(crate) env: Vec<(String, String)>,
 }
@@ -323,17 +328,47 @@ impl State {
         }
     }
 
-    /// Puts the executable the daemon built of each program where cargo has the program.
-    pub(crate) fn install(&self) -> anyhow::Result<()> {
+    /// Has every program be where cargo has it: the daemon's executable of one it built,
+    /// and cargo's own of one it did not, which is the program while none of its source is
+    /// written. `answers` is what the daemon said of each program of each checkout. `Ok`
+    /// are the programs that stay cargo's and why; `Err` is why cargo builds, when a
+    /// program the daemon did not build has new source.
+    pub(crate) fn settle(
+        &self,
+        answers: &[Vec<Result<(), String>>],
+    ) -> Result<Vec<(&Program, String)>, String> {
+        let mut cargos = Vec::new();
         for program in &self.programs {
-            let Some((checkout, at)) = program.asked_as else { continue };
-            let built = &self.checkouts[checkout].programs[at].binary;
-            if !same_file::is_same_file(built, &program.executable).unwrap_or(false) {
-                place(built, &program.executable)
-                    .with_context(|| format!("installing {}", program.executable.display()))?;
+            let answer = match program.asked_as {
+                Some((checkout, at)) => answers
+                    .get(checkout)
+                    .and_then(|it| it.get(at))
+                    .cloned()
+                    .unwrap_or_else(|| Err("the daemon said nothing of it".to_owned())),
+                None => Err(program.left_to_cargo.clone().unwrap_or_default()),
+            };
+            let from = match (&answer, program.asked_as) {
+                (Ok(()), Some((checkout, at))) => &self.checkouts[checkout].programs[at].binary,
+                _ => &program.cargos,
+            };
+            if let Err(why) = answer {
+                if let Some(file) = program.newer_input(self.built_at) {
+                    let name = &program.name;
+                    return Err(format!("`{name}`: {why}, and {} changed", file.display()));
+                }
+                cargos.push((program, why));
+            }
+            if !same_file::is_same_file(from, &program.executable).unwrap_or(false) {
+                place(from, &program.executable)
+                    .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
             }
         }
-        Ok(())
+        Ok(cargos)
+    }
+
+    /// The programs cargo built that the daemon is never asked for, and why.
+    pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
+        self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }
 
     /// The state after cargo built `asked` in `cwd`: what it built, what the daemon can
@@ -359,7 +394,7 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
-            profile: if asked.subcommand == Subcommand::Test { "test" } else { "dev" }.to_owned(),
+            profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),
             checkouts: Vec::new(),
@@ -383,6 +418,11 @@ impl State {
             cfg_test: unit_test,
             dev_deps: asked.subcommand == Subcommand::Test,
             features: asked.flags.features.clone(),
+            no_default_features: asked.flags.no_default_features,
+            all_features: asked.flags.all_features,
+            packages: asked.flags.packages.clone(),
+            workspace: asked.flags.workspace,
+            profile: asked.flags.profile.clone(),
             target: asked.target(),
             env: worker_env(),
         };
@@ -419,18 +459,21 @@ impl State {
                     package.name
                 )),
             };
-            let asked_as = match plan {
+            let (asked_as, left_to_cargo) = match plan {
                 Ok(plan) => {
                     let checkout = &mut checkouts[usize::from(unit_test)];
                     checkout.generation = checkout.generation.max(plan.stamp);
                     checkout.programs.push(plan);
-                    Some((usize::from(unit_test), checkout.programs.len() - 1))
+                    (Some((usize::from(unit_test), checkout.programs.len() - 1)), None)
                 }
-                Err(why) => {
-                    state.refusal.get_or_insert(why);
-                    None
-                }
+                Err(why) => (None, Some(why)),
             };
+            let compiled = reached_from(unit.into_iter().collect(), &used);
+            let inputs: FxHashSet<PathBuf> = compiled
+                .iter()
+                .flat_map(|it| it.inputs().files)
+                .filter(|it| !it.starts_with(metadata.target_directory.as_std_path()))
+                .collect();
             state.programs.push(Program {
                 name,
                 kind,
@@ -441,6 +484,8 @@ impl State {
                 executable: executable.clone().into_std_path_buf(),
                 cargos,
                 asked_as,
+                left_to_cargo,
+                inputs: inputs.into_iter().collect(),
                 env: run_env(package, &built.scripts),
             });
         }
@@ -476,6 +521,14 @@ impl State {
             units::collect_garbage(&dir, &kept)?;
         }
         Ok(state)
+    }
+}
+
+impl Program {
+    /// The first of its source files that was written after cargo started.
+    fn newer_input(&self, built_at: u128) -> Option<&Path> {
+        let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
+        self.inputs.iter().find(newer).map(PathBuf::as_path)
     }
 }
 
@@ -546,11 +599,7 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
             .ok_or(format!("`-p {named}` is not a package of the workspace"));
     }
     if asked.flags.workspace {
-        let virtual_root = metadata.root_package().is_none();
-        return match virtual_root || metadata.workspace_members.len() == 1 {
-            true => Ok(root.to_owned()),
-            false => Err("--workspace of a workspace whose root is a package".to_owned()),
-        };
+        return Ok(root.to_owned());
     }
     let start = match &asked.flags.manifest_path {
         Some(manifest) => cwd.join(manifest).parent().map(Path::to_owned).unwrap_or_default(),
@@ -702,7 +751,11 @@ fn cargo_home_configs() -> Vec<PathBuf> {
 /// The units that run during the build, and the libraries of the workspace they are built
 /// against, and the ones those are.
 fn runs_in_build(used: &[Record]) -> Vec<&Record> {
-    let mut found: Vec<&Record> = used.iter().filter(|it| it.runs_in_build()).collect();
+    reached_from(used.iter().filter(|it| it.runs_in_build()).collect(), used)
+}
+
+/// `found` and the units among `used` they are built against, and the ones those are.
+fn reached_from<'a>(mut found: Vec<&'a Record>, used: &'a [Record]) -> Vec<&'a Record> {
     let mut at = 0;
     while let Some(unit) = found.get(at).copied() {
         at += 1;

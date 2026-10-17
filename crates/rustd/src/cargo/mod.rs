@@ -79,31 +79,56 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
 }
 
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
-/// them. `Err` is the state and why the build is cargo's.
+/// them. A program the daemon does not build stays as cargo built it while its source is
+/// what cargo compiled. `Err` is the state and why the build is cargo's.
 fn by_daemon(mut state: State) -> Result<State, (State, String)> {
-    let refused = state.refusal.clone().or_else(|| state.broken_guard());
-    let refused = refused.or_else(|| {
-        let mut asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
-        asked.find_map(|checkout| synced(checkout).err())
-    });
-    let refused = refused.or_else(|| state.install().err().map(|it| format!("{it:#}")));
-    match refused {
-        Some(reason) => Err((state, reason)),
-        None => {
-            state.counts.served += 1;
-            Ok(state)
+    if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
+        return Err((state, reason));
+    }
+    let asked: Vec<Result<Vec<Result<(), String>>, String>> =
+        state.checkouts.iter().map(synced).collect();
+    let answers: Vec<Vec<Result<(), String>>> = std::iter::zip(&asked, &state.checkouts)
+        .map(|(answer, checkout)| match answer {
+            Ok(programs) => programs.clone(),
+            Err(cold) => vec![Err(cold.clone()); checkout.programs.len()],
+        })
+        .collect();
+    let cargos = match state.settle(&answers) {
+        Ok(cargos) => cargos,
+        Err(reason) => return Err((state, reason)),
+    };
+    let unchanged = "it is as cargo built it, and its source has not changed";
+    for (answer, checkout) in std::iter::zip(&asked, &state.checkouts) {
+        let (Err(cold), false) = (answer, checkout.programs.is_empty()) else { continue };
+        // Loaded now, the daemon builds what changes next.
+        match warmed(checkout) {
+            Ok(()) => say::fallback(cold, "nothing has changed since cargo built"),
+            Err(why) => say::fallback(&why, "nothing has changed since cargo built"),
         }
     }
+    for (program, why) in &cargos {
+        let asked_of_worker = program.asked_as.is_some_and(|(checkout, _)| asked[checkout].is_ok());
+        if asked_of_worker {
+            say::fallback(&format!("`{}`: {why}", program.name), unchanged);
+        }
+    }
+    let served = cargos.len() < state.programs.len() || state.programs.is_empty();
+    state.counts.served += u64::from(served);
+    Ok(state)
 }
 
-/// Asks the daemon for the programs of `checkout`. `Err` is why it built none or not all.
-fn synced(checkout: &Checkout) -> Result<(), String> {
+/// Asks the daemon for the programs of `checkout`, and says how each went. `Err` is why it
+/// has no part in any.
+fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
+    if checkout.programs.is_empty() {
+        return Ok(Vec::new());
+    }
     // The daemon knows the source files from when it was told to load them.
     let asked = Checkout { sources: Vec::new(), ..checkout.clone() };
     let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
     match reply {
-        None => Err("no daemon is running".to_owned()),
-        Some(Reply::Synced { programs }) => programs.into_iter().try_for_each(|it| it.map(drop)),
+        None => Err(client::why_none()),
+        Some(Reply::Synced { programs }) => Ok(programs.into_iter().map(|it| it.map(drop)).collect()),
         Some(Reply::Cold { reason }) => Err(reason),
         Some(other) => Err(format!("the daemon answered {other:?}")),
     }
@@ -139,6 +164,9 @@ fn by_cargo(
         for why in cold {
             say::fallback(&why, "the daemon has no part in the next build");
             state.count_cargo(&why);
+        }
+        for (program, why) in state.left_to_cargo() {
+            say::fallback(why, &format!("`{}` is cargo's to build", program.name));
         }
     }
     Ok(Ok(state))

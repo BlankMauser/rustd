@@ -106,25 +106,15 @@ impl Plan {
 }
 
 /// Why rustd has no part in a crate that was compiled with these flags, when it has none.
+/// What a profile sets (the level, the checks, the panic strategy) the daemon reads from
+/// cargo itself, and refuses there what it does not build.
 fn unsupported(unit: &Record) -> Option<String> {
     let name = &unit.crate_name;
-    let off = |value: Option<&str>| matches!(value, None | Some("off" | "no" | "n" | "false"));
-    if !matches!(unit.codegen("opt-level"), None | Some("0")) {
-        let level = unit.codegen("opt-level").unwrap_or_default();
-        return Some(format!("`{name}` is built with opt-level={level}"));
-    }
-    if !off(unit.codegen("lto")) || unit.codegen("linker-plugin-lto").is_some() {
-        return Some(format!("`{name}` is built with LTO"));
-    }
-    if unit.codegen("panic") == Some("abort") {
-        return Some(format!("`{name}` is built with panic=abort"));
-    }
-    for flag in
-        ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"]
-    {
-        if unit.codegen(flag).is_some() {
-            return Some(format!("`{name}` is built with -C {flag}"));
-        }
+    let flag = ["instrument-coverage", "profile-generate", "profile-use"]
+        .into_iter()
+        .find(|it| unit.codegen(it).is_some());
+    if let Some(flag) = flag {
+        return Some(format!("`{name}` is built with -C {flag}"));
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));

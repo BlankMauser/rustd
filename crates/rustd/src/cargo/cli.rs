@@ -72,6 +72,10 @@ const BUILD_ENV: &[&str] = &[
 
 /// The variables a worker is started with: the ones that pick its toolchain and its backend.
 const WORKER_ENV: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_",
+    "CARGO_PROFILE_",
     "RUSTUP_TOOLCHAIN",
     "RUSTUP_HOME",
     "CARGO_HOME",
@@ -245,29 +249,20 @@ impl Invocation {
         let set = |name: &str| std::env::var_os(name).is_some_and(|it| !it.is_empty());
         let reason = match () {
             _ if flags.doc => "doc tests are built by rustdoc",
-            _ if flags.profile.as_deref().is_some_and(|it| it != "dev" && it != "test") => {
-                "rustd builds the dev profile only"
-            }
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
-            _ if flags.all_features => "--all-features is not loaded by the daemon yet",
-            _ if flags.no_default_features => {
-                "--no-default-features is not loaded by the daemon yet"
-            }
-            _ if flags.packages.len() > 1 || flags.excludes => {
-                "a selection of several packages is not loaded by the daemon yet"
-            }
+            _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"]
-                .iter()
-                .any(|it| set(it)) =>
-            {
-                "RUSTFLAGS is set, and the daemon loads the workspace without it"
-            }
             _ if set("RUSTC_WORKSPACE_WRAPPER") => "RUSTC_WORKSPACE_WRAPPER is set already",
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
+    }
+
+    /// The profile, as cargo's `Finished` line names it.
+    pub(crate) fn profile(&self) -> &str {
+        let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
+        self.flags.profile.as_deref().unwrap_or(of_command)
     }
 
     /// The triple cargo builds for, when it is told one.
@@ -385,16 +380,14 @@ mod tests {
     fn what_is_cargos_alone() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Cargo(vec!["help".to_owned()]));
-        for args in [
-            "--release",
-            "--profile bench",
-            "--message-format json",
-            "-p a -p b",
-            "--all-features",
-            "--target mips-unknown-none",
-        ] {
+        for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
             assert!(build("build", args).only_cargo().is_some(), "{args}");
         }
+        for args in ["--release", "--profile bench", "-p a -p b", "--all-features"] {
+            assert_eq!(build("build", args).only_cargo(), None, "{args}");
+        }
+        assert_eq!(build("test", "--release").profile(), "release");
+        assert_eq!(build("test", "").profile(), "test");
     }
 
     #[test]

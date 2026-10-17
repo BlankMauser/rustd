@@ -104,6 +104,13 @@ pub(crate) struct WorkerConfig {
     pub(crate) cfg_test: bool,
     pub(crate) dev_deps: bool,
     pub(crate) features: Vec<String>,
+    pub(crate) no_default_features: bool,
+    pub(crate) all_features: bool,
+    /// The packages named with `-p`.
+    pub(crate) packages: Vec<String>,
+    pub(crate) workspace: bool,
+    /// The profile, when it is not the one cargo has for the command.
+    pub(crate) profile: Option<String>,
     pub(crate) target: Option<String>,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
@@ -230,6 +237,21 @@ impl Worker {
         }
         if !config.features.is_empty() {
             command.args(["--features", &config.features.join(",")]);
+        }
+        if config.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if config.all_features {
+            command.arg("--all-features");
+        }
+        for package in &config.packages {
+            command.args(["--package", package]);
+        }
+        if config.workspace {
+            command.arg("--workspace");
+        }
+        if let Some(profile) = &config.profile {
+            command.args(["--profile", profile]);
         }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));
@@ -363,10 +385,11 @@ impl Worker {
         });
         match asked.into_iter().collect::<anyhow::Result<Vec<_>>>() {
             Ok(programs) => Reply::Synced { programs },
+            // The worker is gone or stuck, which says nothing of the checkout: the next
+            // build that has nothing to compile has it loaded again.
             Err(why) => {
-                let reason = format!("{why:#}");
-                self.set(&checkout.key, Warmth::Failed(reason.clone()));
-                Reply::Cold { reason }
+                lock(&self.checkouts).remove(&checkout.key);
+                Reply::Cold { reason: format!("{why:#}") }
             }
         }
     }
@@ -538,6 +561,18 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
+        // What a worker could not load once it can't load again, until cargo builds anew.
+        let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
+            Some(Loaded { generation, warmth: Warmth::Failed(why), .. })
+                if *generation == checkout.generation =>
+            {
+                Some(why.clone())
+            }
+            _ => None,
+        });
+        if let Some(why) = failed {
+            anyhow::bail!(why);
+        }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
             let mut checkouts = lock(&worker.checkouts);

@@ -114,6 +114,9 @@ def how_built(stderr):
     reason = re.search(r"^rustd: (.*); (building with cargo|this is `cargo \w+`)$", stderr, re.M)
     if reason:
         return "cargo: " + reason[1]
+    kept = re.search(r"^rustd: (.*); nothing has changed since cargo built$", stderr, re.M)
+    if kept:
+        return "unchanged: " + kept[1]
     return "daemon" if "[rustd]" in stderr else "cargo"
 
 

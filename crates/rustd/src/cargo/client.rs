@@ -62,6 +62,18 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     Ok(Some(reply))
 }
 
+/// Why no daemon answered: there is none, or one ended without taking its socket with it.
+pub(crate) fn why_none() -> String {
+    let left = home().map(|it| (socket_in(&it), it.join("daemon.log")));
+    match left {
+        Ok((socket, log)) if socket.exists() => format!(
+            "the daemon is gone without having shut down (killed?), its log is {}",
+            log.display()
+        ),
+        _ => "no daemon is running".to_owned(),
+    }
+}
+
 fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
     stream.write_all(format!("{envelope}\n").as_bytes())?;
     let mut line = String::new();
