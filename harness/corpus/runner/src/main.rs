@@ -452,6 +452,15 @@ fn main() {
     println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
     #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
+    #[cfg(all(target_arch = "aarch64", unix))]
+    {
+        use cases::stabilized::arm;
+        println!("stabilized naked_functions {:?}", arm::naked_functions());
+        println!("stabilized asm_goto {:?}", arm::asm_goto());
+        println!("stabilized asm_cfg {:?}", arm::asm_cfg());
+        println!("stabilized naked_more {:?}", arm::naked_more());
+        println!("stabilized asm_goto_more {:?}", arm::asm_goto_more());
+    }
     #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());

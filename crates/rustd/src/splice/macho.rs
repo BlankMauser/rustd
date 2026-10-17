@@ -1404,6 +1404,16 @@ impl Layout {
         for (entry, address) in &self.renamed {
             put64(&mut linkedit, (moved(*entry) - offset) as usize + 8, *address);
         }
+        // The signature is looked for right behind the strings, which end the rest, at the
+        // next multiple of sixteen: what filled up to the old one is not kept.
+        let strings = moved(u64::from(u32_at(&commands, image.at.symbols + 16)?))
+            + u64::from(u32_at(&commands, image.at.symbols + 20)?);
+        let filled = linkedit.get((strings - offset) as usize..).context("strings past the end")?;
+        ensure!(
+            filled.len() < 16 && filled.iter().all(|&it| it == 0),
+            "strings that are not the last of `__LINKEDIT`"
+        );
+        linkedit.truncate((strings - offset) as usize);
         linkedit.resize(linkedit.len().next_multiple_of(16), 0);
         let signed = offset + linkedit.len() as u64;
         let signature = image.signature.len(signed) as u64;

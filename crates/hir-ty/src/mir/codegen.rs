@@ -92,7 +92,7 @@ mod patch;
 mod stable;
 mod store;
 mod target;
-pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat};
+pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 
 pub use patch::{Stale, StaleSteps};
 pub use store::{pack_name, seal_left_open};
@@ -1185,6 +1185,28 @@ impl VariadicRegisters {
         Ok(named)
     }
 
+    /// Turns down named parameters that Apple's AArch64 convention has on the stack, where
+    /// the variable arguments then do not start.
+    fn all_in_registers(sig: &Signature) -> Result<()> {
+        const EACH: u32 = 8;
+        let (mut ints, mut floats) = (0, 0);
+        for param in &sig.params {
+            match param.value_type {
+                // The address of what is returned has a register of its own.
+                _ if param.purpose == ArgumentPurpose::StructReturn => (),
+                ty if param.purpose == ArgumentPurpose::Normal && ty.is_int() => {
+                    ints += ty.bytes().div_ceil(8)
+                }
+                types::F32 | types::F64 if param.purpose == ArgumentPurpose::Normal => floats += 1,
+                ty => unsupported!("a variadic function with a named {ty}"),
+            }
+        }
+        if ints > EACH || floats > EACH {
+            unsupported!("a variadic function with a named parameter on the stack");
+        }
+        Ok(())
+    }
+
     /// Adds the registers the named parameters left, and the stack past them, to `sig`, so
     /// that the function is given all of them whatever it was called with.
     fn rest(self, sig: &mut Signature) {
@@ -1240,20 +1262,24 @@ impl HomedRegisters {
 enum Variadic {
     SystemV(VariadicRegisters),
     Windows(HomedRegisters),
+    /// All of them on the stack, right above the frame record.
+    Apple,
 }
 
 impl Variadic {
     /// For a function whose named parameters are `sig`. `None` on a target a function that
     /// takes `...` is not compiled for.
     fn of(target: &Target, sig: &Signature) -> Result<Option<Self>> {
-        Ok(match (target.call_conv, target.arch) {
-            (isa::CallConv::SystemV, Arch::X86_64) => {
+        Ok(match target.variable_arguments() {
+            Some(VariableArguments::Registers) => {
                 Some(Variadic::SystemV(VariadicRegisters::named(sig)?))
             }
-            (isa::CallConv::WindowsFastcall, Arch::X86_64) => {
-                Some(Variadic::Windows(HomedRegisters::named(sig)?))
+            Some(VariableArguments::Homed) => Some(Variadic::Windows(HomedRegisters::named(sig)?)),
+            Some(VariableArguments::Stack) => {
+                VariadicRegisters::all_in_registers(sig)?;
+                Some(Variadic::Apple)
             }
-            _ => None,
+            None => None,
         })
     }
 
@@ -1261,6 +1287,7 @@ impl Variadic {
         match self {
             Variadic::SystemV(named) => named.rest(sig),
             Variadic::Windows(named) => named.rest(sig),
+            Variadic::Apple => (),
         }
     }
 }
@@ -4529,11 +4556,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let variadic = match self.variadic {
             true => {
-                let native = match self.cg.target.call_conv {
-                    isa::CallConv::WindowsFastcall => {
+                let native = match self.cg.target.variable_arguments() {
+                    Some(VariableArguments::Registers) => {
+                        matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. })
+                    }
+                    Some(VariableArguments::Homed) => {
                         matches!(self.abi, ExternAbi::C { .. } | ExternAbi::Win64 { .. })
                     }
-                    _ => matches!(self.abi, ExternAbi::C { .. } | ExternAbi::SysV64 { .. }),
+                    Some(VariableArguments::Stack) => matches!(self.abi, ExternAbi::C { .. }),
+                    None => false,
                 };
                 let Some(variadic) = Variadic::of(self.cg.target, &sig)?.filter(|_| native) else {
                     unsupported!("a function that takes `...` for this target");
@@ -4616,6 +4647,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().store(MEM, floats, addr, 4);
             self.builder.ins().store(MEM, stack, addr, 8);
             self.builder.ins().store(MEM, saved, addr, 16);
+            self.locals.insert(list, LocalSlot { addr, borrowed: false });
+        }
+        if let Some(Variadic::Apple) = variadic {
+            let list = *body.param_locals.last().expect("the list of a variadic function");
+            let layout = self.layout(body.locals[list].ty.as_ref())?;
+            if layout.size.bytes() != 8 {
+                unsupported!("a `VaList` that is not the one of this target");
+            }
+            let addr = self.stack_slot(&layout);
+            // The named parameters are all in registers, so the first of the variable ones
+            // is the first thing the caller left on the stack: what is right above the
+            // frame record, which is the frame pointer and the return address.
+            let frame = self.builder.ins().get_frame_pointer(ptr());
+            let stack = self.builder.ins().iadd_imm(frame, 16);
+            self.builder.ins().store(MEM, stack, addr, 0);
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
         }
         // An `async` body keeps its locals in the future, where they survive a return.
@@ -6063,7 +6109,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.cg.naked = Some(text);
             return Ok(());
         }
-        let wrapper = asm::wrapper(arch, &block.template, block.options, &operands)
+        let wrapper = asm::wrapper(&self.cg.target, &block.template, block.options, &operands)
             .map_err(CodegenError::Unsupported)?;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -8454,12 +8500,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.builder.ins().iconst(types::I8, 1);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            ("va_arg", [list]) if self.cg.target.call_conv == isa::CallConv::WindowsFastcall => {
+            ("va_arg", [list])
+                if matches!(
+                    self.cg.target.variable_arguments(),
+                    Some(VariableArguments::Homed | VariableArguments::Stack)
+                ) =>
+            {
                 let scalar = self.scalar_of(dst_ty)?;
                 if scalar.ty.bytes() > 8 {
                     unsupported!("`va_arg` of {dst_ty:?}");
                 }
-                // The list is where the next argument is, and each takes eight bytes.
+                // The list is the address of the next argument, each of them in eight bytes.
                 let (list, _) = self.load_scalar(list)?;
                 let from = self.builder.ins().load(ptr(), MEM, list, 0);
                 let next = self.builder.ins().iadd_imm(from, 8);
@@ -8468,9 +8519,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list]) => {
-                if (self.cg.target.call_conv, self.cg.target.arch)
-                    != (isa::CallConv::SystemV, Arch::X86_64)
-                {
+                if self.cg.target.variable_arguments() != Some(VariableArguments::Registers) {
                     unsupported!("intrinsic `va_arg` for this target");
                 }
                 let scalar = self.scalar_of(dst_ty)?;
