@@ -16,7 +16,7 @@ CRATES = ["devdep", "blanket", "procmacro"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = {"assert_long_expression", "backtrace_line"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
-LEFT = set()
+LEFT = {"link_name_macro"}
 
 
 def main():
