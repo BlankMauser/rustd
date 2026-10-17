@@ -10,8 +10,8 @@ use hir_def::{
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
-        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat,
-        PatId, RecordLitField, RecordSpread,
+        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, LoopSource,
+        MatchArm, Pat, PatId, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -927,9 +927,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 )
             }
             Expr::Match { expr, arms } => {
+                // The temporaries of what a `for` iterates over are dropped where the loop
+                // ends, wherever the loop is written.
+                let temporaries = self.is_for_loop(arms).then(|| self.push_drop_scope());
                 let Some((cond_place, mut current)) =
                     self.lower_expr_as_place(current, *expr, true)?
                 else {
+                    if let Some(temporaries) = temporaries {
+                        temporaries.pop_assume_dropped(self);
+                    }
                     return Ok(None);
                 };
                 self.push_fake_read(current, cond_place, expr_id.into());
@@ -1040,7 +1046,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 if self.is_unterminated(current) {
                     self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
                 }
-                Ok(end)
+                match (temporaries, end) {
+                    (Some(temporaries), Some(end)) => {
+                        Ok(Some(temporaries.pop_and_drop(self, end, expr_id.into())))
+                    }
+                    (Some(temporaries), None) => {
+                        temporaries.pop_assume_dropped(self);
+                        Ok(None)
+                    }
+                    (None, end) => Ok(end),
+                }
             }
             Expr::Continue { label } => {
                 let loop_data = match label {
@@ -2020,6 +2035,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
         self.resolver.reset_to_guard(resolver_guard);
         Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
+    }
+
+    /// Whether these are the arms of the `match` that a `for` loop is written as.
+    fn is_for_loop(&self, arms: &[MatchArm]) -> bool {
+        matches!(arms, [arm] if matches!(
+            self.store[arm.expr],
+            Expr::Loop { source: LoopSource::ForLoop, .. }
+        ))
     }
 
     /// Lowers a branch of an `if`. Its temporaries are dropped where the branch ends, also

@@ -2098,6 +2098,8 @@ class Gen:
         i, j = self.small(n), self.small(n)
         integer = t.ints[r.choice(["u16", "u32", "u64", "u128", "i32", "i64"])]
         size = INTS[integer.name][0] // 8
+        # `offset_from` panics for a zero-sized element.
+        distance = "(start.add(x).offset_from(start.add(y)) as i64).mix(); " if self.scalars(elem) else ""
         self.emit(f"let mut {a}: {array.name} = {self.expr(array)};")
         self.choose([
             (2, "raw.read", lambda: self.emit(f"(unsafe {{ *{a}.as_ptr().add({i}) }}).mix();")),
@@ -2105,7 +2107,7 @@ class Gen:
             (1.5, "raw.swap", lambda: self.emit(f"{{ let (x, y) = ({i}, {j}); let start = {a}.as_mut_ptr(); unsafe {{ std::ptr::swap(start.add(x), start.add(y)) }}; }}")),
             (1.5, "raw.copy", lambda: self.emit(f"{{ let {b}: {array.name} = {self.expr(array)}; unsafe {{ std::ptr::copy_nonoverlapping({b}.as_ptr(), {a}.as_mut_ptr(), {n}) }}; }}")),
             (1.5, "raw.helper_call", lambda: self.emit(f"{{ let at = {i}; let value = {self.expr(elem, 2)}; unsafe {{ raw_set({a}.as_mut_ptr(), at, value); raw_get({a}.as_ptr(), at).mix(); }} }}")),
-            (1.5, "raw.offset", lambda: self.emit(f"{{ let (x, y) = ({i}, {j}); let start = {a}.as_ptr(); unsafe {{ (start.add(x).offset_from(start.add(y)) as i64).mix(); (start.add(x) < start.add(y)).mix(); }} }}")),
+            (1.5, "raw.offset", lambda: self.emit(f"{{ let (x, y) = ({i}, {j}); let start = {a}.as_ptr(); unsafe {{ {distance}(start.add(x) < start.add(y)).mix(); }} }}")),
             (1.5, "raw.from_raw_parts", lambda: self.emit(f"(unsafe {{ std::slice::from_raw_parts({a}.as_ptr().add({n - 1}), 1) }}).mix();")),
             (1.5, "raw.mut_reference", lambda: self.emit(f"{{ let value = {self.expr(elem, 2)}; let slot = &mut {a}[{r.randrange(n)}] as *mut {elem.name}; unsafe {{ *slot = value; (*slot).mix(); }} }}")),
             (1.5, "raw.bytes", lambda: self.emit(f"{{ let words: [{integer.name}; 3] = {self.expr(t.array(integer, 3))}; (unsafe {{ std::slice::from_raw_parts(words.as_ptr() as *const u8, {3 * size}) }}).mix(); }}")),
