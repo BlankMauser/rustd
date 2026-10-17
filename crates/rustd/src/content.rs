@@ -126,6 +126,10 @@ impl Contents {
             } else {
                 continue;
             };
+            // Not UTF-8, or gone since the directory was listed: no source of the crate.
+            if !db.has_text(file) {
+                continue;
+            }
             let hash = FileHashes::of(db, file);
             files.push((by, relative.to_string_lossy().into_owned(), hash));
         }

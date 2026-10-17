@@ -1651,18 +1651,18 @@ fn serves_allocator(db: &RootDatabase, func: FunctionId) -> bool {
 impl Listed {
     /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
     fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
-        self.built.lock().unwrap().insert(krate);
-        if let Some(listed) = self.functions.lock().unwrap().get(&krate) {
+        lock(&self.built).insert(krate);
+        if let Some(listed) = lock(&self.functions).get(&krate) {
             return listed.clone();
         }
         let listed = std::sync::Arc::new(ListedCrate::new(db, krate));
-        self.functions.lock().unwrap().entry(krate).or_insert(listed).clone()
+        lock(&self.functions).entry(krate).or_insert(listed).clone()
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     fn touch(&self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
         let Some(crates) = crates else {
-            self.functions.lock().unwrap().clear();
+            lock(&self.functions).clear();
             return;
         };
         // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
@@ -1670,7 +1670,7 @@ impl Listed {
             .iter()
             .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
             .collect();
-        let mut functions = self.functions.lock().unwrap();
+        let mut functions = lock(&self.functions);
         for krate in seeing {
             functions.remove(&krate);
         }
@@ -2001,6 +2001,13 @@ fn report(build: &Build) {
     }
 }
 
+/// The lock, also after a thread panicked with it: a build that is interrupted or that
+/// panics unwinds, and what a lock here guards is whole between any two statements, so the
+/// requests after it go on with what is there.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The executables that edits are spliced into, by where each is. One program has as many as
 /// there are checkouts read as its own, and a link may run after the build that asked for it.
 static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executable>>> =
@@ -2023,7 +2030,7 @@ fn link(
     // An executable linked with the object as it was is not one to add to, also when the
     // object was written for a request that does not link.
     let rewritten = match splice {
-        Some(binary) if !patched => LINKED.lock().unwrap().remove(binary).is_some(),
+        Some(binary) if !patched => lock(&LINKED).remove(binary).is_some(),
         _ => false,
     };
     let Some(cmd) = cmd else { return Ok(()) };
@@ -2031,7 +2038,7 @@ fn link(
     let mut declined = String::new();
     let running = splice.map_or(Ok(false), set_aside)?;
     if let (Some(binary), Some(patch)) = (splice, patch) {
-        let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
+        let known = lock(&LINKED).remove(binary).map(Executable::baseline);
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
             _ if running => Err(anyhow::anyhow!("the executable is running")),
@@ -2048,7 +2055,7 @@ fn link(
         match spliced {
             Ok((baseline, Spliced { redirected, appended })) => {
                 let read = Executable::Read(Box::new(baseline));
-                LINKED.lock().unwrap().insert(binary.to_owned(), read);
+                lock(&LINKED).insert(binary.to_owned(), read);
                 eprintln!(
                     "link: {:.1?} (spliced: {redirected} functions redirected, {appended} bytes)",
                     start.elapsed()
@@ -2063,7 +2070,7 @@ fn link(
     anyhow::ensure!(status.success(), "the link failed ({status})");
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
-        LINKED.lock().unwrap().insert(binary.to_owned(), linked);
+        lock(&LINKED).insert(binary.to_owned(), linked);
     }
     Ok(())
 }
@@ -3459,7 +3466,7 @@ fn main() -> anyhow::Result<()> {
                                 started = started.and(again);
                             }
                             listed.touch(&db, Some(&new));
-                            as_built.lock().unwrap().clear();
+                            lock(&as_built).clear();
                             if let Err(error) = reloaded.and(started) {
                                 let _ = writeln!(&stream, "error: {error:#}");
                                 continue;
@@ -3484,7 +3491,7 @@ fn main() -> anyhow::Result<()> {
                                 program.unbuilt.stale = true;
                             }
                             listed.touch(&db, Some(&reading));
-                            as_built.lock().unwrap().clear();
+                            lock(&as_built).clear();
                         }
                     }
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
@@ -3513,9 +3520,7 @@ fn main() -> anyhow::Result<()> {
                     // A checkout read as another that is as it was built takes no turn.
                     if let (Some(view), Some(target)) = (&view, &target) {
                         let unchanged = links.get(&target.out).is_none_or(|it| it.is_finished())
-                            && as_built
-                                .lock()
-                                .unwrap()
+                            && lock(&as_built)
                                 .get(&target.out)
                                 .is_some_and(|it| it.still(&files, &db, view, target, request));
                         if unchanged {
@@ -3732,7 +3737,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(link) = links.remove(&wanted.out) {
                 _ = link.join();
             }
-            as_built.lock().unwrap().remove(&wanted.out);
+            lock(&as_built).remove(&wanted.out);
         }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -4065,7 +4070,7 @@ fn main() -> anyhow::Result<()> {
                 )
                 .err();
                 if failed.is_none() {
-                    as_built.lock().unwrap().insert(object, from);
+                    lock(&as_built).insert(object, from);
                 }
                 for (_, _, client) in clients {
                     let _ = match &failed {
@@ -4442,5 +4447,19 @@ mod tests {
         assert_eq!(commit_of_sources(built.as_bytes()).as_deref(), Some(commit));
         assert_eq!(commit_of_sources(b"/rustc/"), None);
         assert_eq!(commit_of_sources(format!("/rustc/{commit}").as_bytes()), None);
+    }
+
+    #[test]
+    fn a_lock_a_thread_panicked_with_is_still_taken() {
+        let held = std::sync::Arc::new(std::sync::Mutex::new(1));
+        let theirs = held.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = lock(&theirs);
+            panic!("unwinds as an interrupted build does");
+        });
+        assert!(panicked.join().is_err());
+        assert!(held.is_poisoned());
+        *lock(&held) += 1;
+        assert_eq!(*lock(&held), 2);
     }
 }

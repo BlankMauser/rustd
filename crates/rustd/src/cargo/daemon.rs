@@ -9,7 +9,7 @@ use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -24,7 +24,10 @@ use std::os::unix::net::UnixStream;
 use uds_windows::UnixStream;
 
 use super::{plan::Plan, units::stamp_of};
-use crate::socket::{NotServed, Served, private_dir, read_request};
+use crate::{
+    lock,
+    socket::{NotServed, Served, private_dir, read_request},
+};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
@@ -601,10 +604,4 @@ impl Daemon {
         eprintln!("daemon of pid {} ends at {:?}", std::process::id(), SystemTime::now());
         std::process::exit(0)
     }
-}
-
-/// The lock, also after a thread panicked with it: what it guards is whole between any two
-/// statements here.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

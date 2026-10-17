@@ -250,7 +250,7 @@ impl Listed {
     /// Any file may be one before a crate is listed.
     pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
         // Copied out: a query that is cancelled unwinds, and would poison the lock.
-        let built = self.built.lock().unwrap().clone();
+        let built = crate::lock(&self.built).clone();
         // Before the first build there is no telling.
         built.is_empty()
             || relevant_crates(db, file).iter().any(|&krate| {
@@ -273,7 +273,7 @@ impl Listed {
         file: FileId,
     ) -> Option<ide_db::base_db::Crate> {
         let built: Vec<_> =
-            self.built.lock().unwrap().iter().map(|&it| ide_db::base_db::Crate::from(it)).collect();
+            crate::lock(&self.built).iter().map(|&it| ide_db::base_db::Crate::from(it)).collect();
         let crates = relevant_crates(db, file);
         if built.is_empty() || crates.iter().any(|it| built.contains(it)) {
             return None;
@@ -291,7 +291,7 @@ impl Listed {
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
-        let listed = self.functions.lock().unwrap().clone();
+        let listed = crate::lock(&self.functions).clone();
         for &krate in relevant_crates(db, file).iter() {
             match listed.get(&krate.into()) {
                 Some(listed) => functions.extend(
