@@ -61,6 +61,11 @@ macro_rules! make_matcher {
     };
 }
 
+pub mod for_tail_temporaries;
+pub mod if_branch_temporaries;
+pub mod if_let_temporaries;
+pub mod unwind_operand_tail;
+
 /// A macro that panics over how its input is spelled, here so that the function left to
 /// rustc for it is alone in its crate.
 pub mod macro_reads_its_spelling {
