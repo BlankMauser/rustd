@@ -24,8 +24,9 @@ sys.path.insert(0, HERE)
 from storelib import Checkout, Daemon, cache, files, scratch, stats, verify
 
 SIZE = 8 << 20
-# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB.
-ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 1 << 20]
+# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB
+# with Cranelift and 0.9 MB with LLVM.
+ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 768 << 10]
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
 NO_ROOM = "No space left on device"
 

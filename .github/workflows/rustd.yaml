@@ -69,4 +69,5 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          run storeguards.py
           exit $failed

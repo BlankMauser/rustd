@@ -202,9 +202,9 @@ fn pull(
                 "build" | ".fingerprint" => name == unit,
                 _ => false,
             };
-            // Nor a link, which is to wherever it says.
+            // Nor a link, which is to wherever it says. A file with holes is a file.
             let kind = entry.header().entry_type();
-            if !of_unit || !(kind.is_file() || kind.is_dir()) {
+            if !of_unit || !(kind.is_file() || kind.is_dir() || kind.is_gnu_sparse()) {
                 bail!("{unit} holds {}", path.display());
             }
             if !entry.unpack_in(dir)? {
