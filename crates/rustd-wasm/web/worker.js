@@ -3,7 +3,17 @@
 import { Compiler } from "./compiler.js";
 
 // `?pack=<url>` names a packed cargo workspace to compile instead of one file over `core`.
-const pack = new URL(location.href).searchParams.get("pack");
+const parameters = new URL(location.href).searchParams;
+const pack = parameters.get("pack");
+// `?compiler=pkg-llvm&backend=llvm&opt=1-fast` loads the compiler with LLVM in it, of
+// `build-llvm.sh`, and has LLVM produce the program's code.
+const pkg = parameters.get("compiler") ?? "pkg";
+const env = {};
+for (const [parameter, variable] of [["backend", "RUSTD_BACKEND"], ["opt", "RUSTD_OPT"]]) {
+  if (parameters.has(parameter)) {
+    env[variable] = parameters.get(parameter);
+  }
+}
 let compiler;
 let compiled;
 let core;
@@ -11,7 +21,7 @@ try {
   const started = performance.now();
   let wasm;
   [wasm, core] = await Promise.all(
-    ["pkg/rustd_wasm.wasm", pack ?? "pkg/core.bundle"].map(async (url) => {
+    [`${pkg}/rustd_wasm.wasm`, pack ?? `${pkg}/core.bundle`].map(async (url) => {
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`${url}: ${response.status}`);
@@ -21,7 +31,7 @@ try {
   );
   const fetched = performance.now();
   compiled = await WebAssembly.compile(wasm);
-  compiler = await Compiler.load(compiled, pack ? null : core);
+  compiler = await Compiler.load(compiled, pack ? null : core, env);
   let analysis;
   if (pack) {
     compiler.setPack(core);
@@ -48,7 +58,7 @@ onmessage = async ({ data: { id, text, fresh, start } }) => {
   const began = performance.now();
   try {
     if (fresh && !pack) {
-      compiler = await Compiler.load(compiled, core);
+      compiler = await Compiler.load(compiled, core, env);
     }
     if (start) {
       compiler.setStart(start.table, start.memory);

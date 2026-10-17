@@ -1,8 +1,12 @@
 // The compiler: `rustd_wasm.wasm` with its exports as methods.
 
+import { wasi } from "./wasi.js";
+
 export class Compiler {
-  // `wasm` is the compiler's module, `core` the bundle of `core`'s source.
-  static async load(wasm, core) {
+  // `wasm` is the compiler's module, `core` the bundle of `core`'s source. `env` is the
+  // environment of a compiler built for WASI, the one with LLVM in it: `RUSTD_BACKEND` and
+  // `RUSTD_OPT` choose what produces the program's code there.
+  static async load(wasm, core, env = {}) {
     if (!(wasm instanceof WebAssembly.Module)) {
       wasm = await WebAssembly.compile(wasm);
     }
@@ -14,8 +18,11 @@ export class Compiler {
       now: () => performance.now(),
       log: (pointer, length) => console.error(text(pointer, length)),
     };
-    const instance = await WebAssembly.instantiate(wasm, { rustd });
+    const wasi_snapshot_preview1 = wasi(wasm, env, () => memory);
+    const instance = await WebAssembly.instantiate(wasm, { rustd, wasi_snapshot_preview1 });
     memory = instance.exports.memory;
+    // What a module built for WASI runs its constructors in.
+    instance.exports._initialize?.();
     const compiler = new Compiler(instance.exports);
     if (core && !compiler.rustd.rustd_add_bundle(...compiler.argument(core))) {
       throw new Error(compiler.report());

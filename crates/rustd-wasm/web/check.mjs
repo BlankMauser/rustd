@@ -1,5 +1,9 @@
 // The page without a browser: `node check.mjs`, after `build.sh`. Builds the demo, edits it
 // twice, and checks that what it draws follows the edits while its balls stay.
+//
+// With LLVM producing the code, after `build-llvm.sh`:
+//
+//     RUSTD_PKG=pkg-llvm RUSTD_BACKEND=llvm RUSTD_OPT=1-fast node check.mjs
 
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
@@ -7,7 +11,10 @@ import { Compiler } from "./compiler.js";
 import { Program } from "./program.js";
 
 const read = (name) => readFileSync(new URL(name, import.meta.url));
-const compiler = await Compiler.load(read("pkg/rustd_wasm.wasm"), read("pkg/core.bundle"));
+const pkg = process.env.RUSTD_PKG ?? "pkg";
+const load = () =>
+  Compiler.load(read(`${pkg}/rustd_wasm.wasm`), read(`${pkg}/core.bundle`), process.env);
+const compiler = await load();
 let calls = [];
 const program = new Program({
   fill: (...color) => calls.push(["fill", ...color]),
@@ -55,7 +62,7 @@ for (let frame = 0; frame < 3000; frame++) program.call("frame", 400, 300, 0.016
 
 // The other demos build whole and run, clicks and all.
 for (const name of ["fountain", "life", "sort", "mandelbrot"]) {
-  const compiler = await Compiler.load(read("pkg/rustd_wasm.wasm"), read("pkg/core.bundle"));
+  const compiler = await load();
   let drawn = 0;
   const draw = () => (drawn += 1);
   const program = new Program({ fill: draw, rect: draw, circle: draw, text: draw });

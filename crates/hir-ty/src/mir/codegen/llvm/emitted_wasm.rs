@@ -93,8 +93,11 @@ impl<'data> EmittedWasm<'data> {
         let object = object.strip_suffix(&[0]).unwrap_or(object);
         let emitted = Self::parse(object)?;
         let (own, body) = emitted.own()?;
-        if own != WasmSignature::of(&func.signature).map_err(Unhandled::Llvm)? {
-            return Err(Unhandled::Shape("a signature LLVM passes differently"));
+        let expected = WasmSignature::of(&func.signature).map_err(Unhandled::Llvm)?;
+        if own != expected {
+            return Err(Unhandled::Llvm(format!(
+                "a function LLVM passes {own:?} where {expected:?} is taken"
+            )));
         }
         let callees = Self::callees(func)?;
         let blobs = emitted.blobs(recorder)?;
@@ -124,8 +127,10 @@ impl<'data> EmittedWasm<'data> {
                     };
                     let (index, ty) = emitted.imported(symbol())?;
                     let signature = &emitted.types[ty as usize];
-                    if callees.get(&index).is_some_and(|expected| expected != signature) {
-                        return Err(Unhandled::Shape("a signature LLVM passes differently"));
+                    if let Some(expected) = callees.get(&index).filter(|it| *it != signature) {
+                        return Err(Unhandled::Llvm(format!(
+                            "a callee LLVM passes {signature:?} where {expected:?} is taken"
+                        )));
                     }
                     function.body.extend_from_slice(&source[copied..opcode]);
                     function.body.push(I32_CONST);
@@ -335,9 +340,10 @@ impl<'data> EmittedWasm<'data> {
             .ok_or(Unhandled::Shape("code that refers to itself"))?;
         // A function LLVM calls of its own accord, such as wide multiplication, which
         // nothing in the page defines.
-        match Symbol::parse(name.unwrap_or(import)) {
+        let name = name.unwrap_or(import);
+        match Symbol::parse(name) {
             Some(Symbol::Func(index)) => Ok((index, ty)),
-            _ => Err(Unhandled::Shape("a library call")),
+            _ => Err(Unhandled::Llvm(format!("a call of `{name}`, which nothing defines"))),
         }
     }
 
