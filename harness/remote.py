@@ -65,6 +65,16 @@ def records_of(pack):
     return records
 
 
+def packed(data):
+    """`data` compressed the way rustd sends a pack."""
+    return subprocess.run(["zstd", "-3", "-c"], input=data, capture_output=True, check=True).stdout
+
+
+def unpacked(data):
+    """What a compressed object holds, or nothing when it is not one."""
+    return subprocess.run(["zstd", "-dc"], input=data or b"", capture_output=True).stdout
+
+
 def filler(seed, size):
     """A sealed pack of `size` bytes that no build asks anything of."""
     # Bytes that do not compress, so that what goes over the line is as large as the pack.
