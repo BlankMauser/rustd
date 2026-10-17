@@ -782,6 +782,22 @@ impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
                         let repr = &self.literal[idx];
                         let text = self.text[repr.text as usize].as_str();
                         let span = read_span(repr.id);
+                        let suffix = if repr.suffix != !0 {
+                            self.text[repr.suffix as usize].as_str()
+                        } else {
+                            ""
+                        };
+                        // A proc macro can make a negative number one literal. To the compiler
+                        // it is a minus and a number.
+                        if matches!(u16::to_le_bytes(repr.kind), [3 | 4, _])
+                            && let Some(number) = text.strip_prefix('-')
+                        {
+                            let minus = tt::Punct { char: '-', spacing: tt::Spacing::Alone, span };
+                            s.push(tt::Leaf::Punct(minus).into());
+                            let number = format!("{number}{suffix}");
+                            s.push(tt::Leaf::Literal(tt::token_to_literal(&number, span)).into());
+                            continue;
+                        }
                         s.push(
                             tt::Leaf::Literal(if self.version >= EXTENDED_LEAF_DATA {
                                 tt::Literal::new(
@@ -801,11 +817,7 @@ impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
                                         [10, r] => CStrRaw(r),
                                         _ => unreachable!(),
                                     },
-                                    if repr.suffix != !0 {
-                                        self.text[repr.suffix as usize].as_str()
-                                    } else {
-                                        ""
-                                    },
+                                    suffix,
                                 )
                             } else {
                                 tt::token_to_literal(text, span)

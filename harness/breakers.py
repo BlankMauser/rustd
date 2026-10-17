@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket"]
+CRATES = ["devdep", "blanket", "procmacro"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = set()
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.

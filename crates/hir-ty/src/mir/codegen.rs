@@ -54,7 +54,7 @@ use crate::{
     consteval::try_const_usize,
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
-    drop::{DropGlue, has_drop_glue},
+    drop::{DropGlue, destructor, has_drop_glue},
     infer::PointerCast,
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -4613,15 +4613,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
-    /// Equal constants share an address, as they do for rustc.
+    /// Equal constants share an address, as they do for rustc. A type that is not `plain` is
+    /// promoted when the value is: a `None` of an `Option<Box<T>>` has nothing to drop.
     fn promoted_constant(
         &mut self,
         body: &'db MirBody<'db>,
         expr: ExprId,
-        size: usize,
+        layout: &Layout,
+        plain: bool,
     ) -> Option<Value> {
         let db = self.cg.db;
-        if self.mentions_location(body, expr) {
+        if layout.size.bytes() == 0 || self.mentions_location(body, expr) {
             return None;
         }
         let constant = monomorphized_promoted_mir_body_query(
@@ -4633,11 +4635,73 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
         .ok()?;
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
+        let ty = allocation.ty;
         let blob = self.allocation_blob(allocation, false).ok()?;
-        if blob.bytes.len() != size {
+        if blob.bytes.len() != layout.size.bytes_usize()
+            || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
+        {
             return None;
         }
         self.blob_addr(blob).ok()
+    }
+
+    /// Whether a value of `ty` can be read-only data that is never dropped.
+    fn is_plain(&self, ty: Ty<'db>) -> bool {
+        self.is_freeze(ty) && has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
+    }
+
+    /// Whether the value of `ty` at `offset` in `bytes` has nothing to drop and no cell in
+    /// it, which a value of a type that is not plain can be: an enum by its variant.
+    fn is_plain_value(&self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> bool {
+        if self.is_plain(ty) {
+            return true;
+        }
+        let db = self.cg.db;
+        let Ok(layout) = self.layout(ty) else { return false };
+        match ty.kind() {
+            TyKind::Tuple(fields) => fields.iter().enumerate().all(|(i, field)| {
+                let at = offset + layout.fields.offset(i).bytes_usize();
+                self.is_plain_value(bytes, at, field)
+            }),
+            TyKind::Array(element, len) => {
+                let (Some(len), Ok(element_layout)) =
+                    (try_const_usize(db, len), self.layout(element))
+                else {
+                    return false;
+                };
+                let size = element_layout.size.bytes_usize();
+                (0..len as usize).all(|i| self.is_plain_value(bytes, offset + i * size, element))
+            }
+            TyKind::Adt(def, args) => {
+                let adt = def.def_id();
+                if destructor(db, adt).is_some() {
+                    return false;
+                }
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match adt {
+                    AdtId::StructId(id) if Some(id) == self.interner.lang_items().UnsafeCell => {
+                        return false;
+                    }
+                    AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return false,
+                    AdtId::EnumId(id) => {
+                        let Some(bytes) = bytes.get(offset..offset + layout.size.bytes_usize())
+                        else {
+                            return false;
+                        };
+                        match detect_variant_from_bytes(&layout, db, self.dl(), bytes, id) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => return false,
+                        }
+                    }
+                };
+                db.field_types(variant).iter().enumerate().all(|(i, (_, field))| {
+                    let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    let at = offset + layout.fields.offset(i).bytes_usize();
+                    self.is_plain_value(bytes, at, field)
+                })
+            }
+            _ => false,
+        }
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -4889,17 +4953,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
-            let addr = if let Some(&(_, expr)) = promoted
-                && self.is_freeze(data.ty.as_ref())
-                && has_drop_glue(&self.infcx, data.ty.as_ref(), self.env.param_env)
-                    == DropGlue::None
-            {
-                match self.promoted_constant(body, expr, layout.size.bytes_usize()) {
-                    Some(addr) if layout.size.bytes() != 0 => {
+            let addr = if let Some(&(_, expr)) = promoted {
+                let plain = self.is_plain(data.ty.as_ref());
+                match self.promoted_constant(body, expr, &layout, plain) {
+                    Some(addr) => {
                         self.constant_locals.push(local);
                         addr
                     }
-                    _ => self.promoted_slot(&layout)?,
+                    None if plain => self.promoted_slot(&layout)?,
+                    None => self.stack_slot(&layout),
                 }
             } else {
                 self.stack_slot(&layout)
