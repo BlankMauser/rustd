@@ -52,7 +52,16 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run() {
+            echo "::group::$*"
+            python3 "$@" 2>&1 | tee "$RUNNER_TEMP/said.log"
+            if [ "${PIPESTATUS[0]}" != 0 ]; then
+              failed="$failed [$*]"
+              { echo "== $*"; tail -n 40 "$RUNNER_TEMP/said.log"; } >> "$RUNNER_TEMP/failed.log"
+              echo "::error::$* failed"
+            fi
+            echo "::endgroup::"
+          }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -69,6 +78,7 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          test -z "$failed" || cat "$RUNNER_TEMP/failed.log"
           echo "failed:${failed:- none}"
           test -z "$failed"
 
@@ -102,7 +112,16 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run() {
+            echo "::group::$*"
+            python3 "$@" 2>&1 | tee "$RUNNER_TEMP/said.log"
+            if [ "${PIPESTATUS[0]}" != 0 ]; then
+              failed="$failed [$*]"
+              { echo "== $*"; tail -n 40 "$RUNNER_TEMP/said.log"; } >> "$RUNNER_TEMP/failed.log"
+              echo "::error::$* failed"
+            fi
+            echo "::endgroup::"
+          }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -122,5 +141,6 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          test -z "$failed" || cat "$RUNNER_TEMP/failed.log"
           echo "failed:${failed:- none}"
           test -z "$failed"
