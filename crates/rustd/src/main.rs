@@ -2835,6 +2835,9 @@ struct Unbuilt {
     /// Whether the last build was for a request that does not link, which leaves the
     /// executable to the next that does.
     unlinked: bool,
+    /// Whether a client has named what rustc built of the checkout since the edits, as one
+    /// does when the checkout is loaded again: the crates left to rustc are then as edited.
+    named_anew: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
@@ -3443,6 +3446,7 @@ fn main() -> anyhow::Result<()> {
                                 edited: programs[0].unbuilt.edited.clone(),
                                 stale: true,
                                 unlinked: false,
+                                named_anew: true,
                             };
                             let mut program = Program {
                                 args,
@@ -4044,6 +4048,7 @@ impl Program {
                 self.table =
                     Arc::new(SymbolTable::load(&self.args.symbol_files, &self.args.root()?)?);
                 self.distrust_rustc(db, files, None);
+                self.unbuilt.named_anew = true;
             }
             None => self.known.distrust(db, new),
         }
@@ -4095,6 +4100,7 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
+        let named_anew = std::mem::take(&mut unbuilt.named_anew);
         let mut edited = unbuilt.edited.clone();
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // Neither is what no crate that is built reads: an example, or a test.
@@ -4119,9 +4125,8 @@ impl Program {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let mut failed = left_to_rustc(db, listed, &edited, paths)
-            .or_else(|| refusal(db, &edited, paths, out_of_date))
-            .or(broken);
+        let stale = if named_anew { None } else { left_to_rustc(db, listed, &edited, paths) };
+        let mut failed = stale.or_else(|| refusal(db, &edited, paths, out_of_date)).or(broken);
         if failed.is_none() || known.stats.patched.is_none() {
             let patched = known.stats.patched.is_some();
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
