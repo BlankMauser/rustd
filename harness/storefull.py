@@ -26,8 +26,9 @@ from storelib import Checkout, Daemon, cache, files, scratch, stats, verify
 WINDOWS = os.name == "nt"
 # NTFS keeps a log and a file table of its own, which do not fit in the 8 MB a tmpfs can be.
 SIZE = (64 if WINDOWS else 8) << 20
-# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB.
-ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 1 << 20]
+# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB
+# with Cranelift on Linux and under 1 MB with LLVM on Windows, so the last room is measured.
+ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10]
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
 NO_ROOM = "There is not enough space on the disk" if WINDOWS else "No space left on device"
 
@@ -80,6 +81,18 @@ class Disk:
         if WINDOWS:
             return self.diskpart(f'select vdisk file="{self.image}"', "detach vdisk")
         subprocess.run(["sudo", "-n", "umount", self.at], capture_output=True)
+
+
+def cold(checkout, disk):
+    """How many bytes a cold build of the workspace writes to a store with room."""
+    shutil.rmtree(disk.store, ignore_errors=True)
+    os.mkdir(disk.store)
+    if os.path.exists(disk.ballast):
+        os.remove(disk.ballast)
+    daemon = Daemon(checkout, disk.store, name="cold", env=SEALS)
+    checkout.check(daemon, "with room, to measure")
+    daemon.kill()
+    return sum(os.path.getsize(os.path.join(disk.store, name)) for name in os.listdir(disk.store))
 
 
 def built_without(checkout, disk, room):
@@ -176,13 +189,14 @@ def main():
     checkout = Checkout(work)
     disk = Disk(work)
     try:
-        not_used = sum(built_without(checkout, disk, room) for room in ROOMS)
+        rooms = [*ROOMS, cold(checkout, disk) * 2 // 3]
+        not_used = sum(built_without(checkout, disk, room) for room in rooms)
         kept_again(checkout, disk)
         commands(checkout, disk, work)
     finally:
         disk.unmount()
     shutil.rmtree(work, ignore_errors=True)
-    print(f"PASS: {len(ROOMS)} full disks built without a store or without the rest of it "
+    print(f"PASS: {len(rooms)} full disks built without a store or without the rest of it "
           f"({not_used} could not open it at all), in {time.time() - start:.0f}s")
 
 

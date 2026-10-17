@@ -181,10 +181,12 @@ class Case:
         if whole:
             printed = "\n".join(l for l in printed.splitlines() if re.search(rf"[/\\]{re.escape(self.artifact_name())}-", l))
         try:
-            line = [a for a in linker_line(printed) if not a.endswith("symbols.o")]
+            line = linker_line(printed)
         except SystemExit:
             return None
-        return line
+        # A DLL of MSVC exports what the directives of `symbols.o` name: its `.def` is empty.
+        exports = linkline.msvc(line) and any(a.upper() == "/DLL" for a in line)
+        return [a for a in line if exports or not a.endswith("symbols.o")]
 
     def archive(self, env):
         """cargo's archive of the package with every symbol kept, in place of a link line."""
