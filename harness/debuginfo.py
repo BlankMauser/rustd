@@ -16,7 +16,7 @@ RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail 
                      jumps, so a frame the cargo build prints may be missing: those are counted.
 --only NAME          one of: corpus stress rung2 edits callers locals types scopes profile cost
 """
-import os, re, shutil, struct, subprocess, sys, tempfile, time
+import bisect, os, re, shutil, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -429,6 +429,51 @@ def frames_of(binary):
     return ends
 
 
+def own_ranges(binary):
+    """Where the code of each function of rustd's is, as its units say."""
+    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
+    ours = set()
+    for unit in units.split("DW_TAG_compile_unit")[1:]:
+        if re.search(r'DW_AT_producer\s+\("rustd ', unit):
+            # The unit's own entry ends at the first empty line; what follows is of its functions.
+            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit.split("\n\n")[0])}
+    return ours
+
+
+def unlined(binary):
+    """The runs of code in rustd's functions that no row of the line table gives a line.
+
+    A row is of the code from its address to the next row's in its sequence, and a row of line 0
+    gives none. A function is looked at as far as the unwinder has it: past that it is filled, and
+    nothing runs there. One the unwinder does not have and with no row at all is assembly alone,
+    which `unwinding` counts."""
+    rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout
+    lined, last = [], None
+    for address, line, flags in re.findall(r"^0x([0-9a-f]{16}) +(\d+)(?: +\d+)+(.*)$", rows, re.M):
+        address = int(address, 16)
+        if last and last[1] and address > last[0]:
+            lined.append((last[0], address))
+        last = None if "end_sequence" in flags else (address, int(line))
+    lined.sort()
+    starts, ends, gaps = [a for a, _ in lined], frames_of(binary), []
+    for a, b in sorted(own_ranges(binary)):
+        b, at = min(b, ends.get(a, b)), a
+        i, any_row, holes = max(bisect.bisect_right(starts, a) - 1, 0), False, []
+        while i < len(lined) and lined[i][0] < b:
+            x, y = lined[i]
+            if y > at:
+                any_row = True
+                if x > at:
+                    holes.append((at, x))
+                at = y
+            i += 1
+        if at < b:
+            holes.append((at, b))
+        if any_row or a in ends:
+            gaps += holes
+    return gaps
+
+
 def unwinding(tally, what, binary):
     """Whether the functions a debugger is told of are the ones an unwinder is told of.
 
@@ -437,12 +482,7 @@ def unwinding(tally, what, binary):
     filled up to the length of one, for an edit to put that jump there, and the fill is not code
     to unwind from. A `#[naked]` function is its assembly, which says nothing of unwinding and has
     no lines either: one with no entry and no line is that."""
-    units = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", binary], capture_output=True, text=True).stdout
-    ours = set()
-    for unit in units.split("DW_TAG_compile_unit")[1:]:
-        if re.search(r'DW_AT_producer\s+\("rustd ', unit):
-            # The unit's own entry ends at the first empty line; what follows is of its functions.
-            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit.split("\n\n")[0])}
+    ours = own_ranges(binary)
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
@@ -453,6 +493,10 @@ def unwinding(tally, what, binary):
     verdict = "NO FUNCTIONS" if not ours else "DISAGREE" if without or beyond else "agree"
     tally.say(f"{what}: .eh_frame and the ranges", verdict,
               f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone")
+    gaps = unlined(binary)
+    worst = ", ".join(f"{a:#x}+{b - a}" for a, b in sorted(gaps, key=lambda gap: gap[0] - gap[1])[:3])
+    tally.say(f"{what}: a line for every instruction", "NO LINE" if gaps or not ours else "all",
+              f"{len(gaps)} runs of {sum(b - a for a, b in gaps)} bytes without one in {len(ours)} functions" + (f": {worst}" if gaps else ""))
 
 
 def profiler(tally, what, binary, cwd, crates):

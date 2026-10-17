@@ -1851,6 +1851,26 @@ fn declaration_location<'db>(
     location_of(db, source.file_id, written_range(source.value.syntax()))
 }
 
+/// File, line and column of where the struct or the variant `def` constructs is written,
+/// which is where rustc has the code of a constructor from. `None` for a function.
+fn constructor_location(
+    db: &dyn HirDatabase,
+    def: CallableDefId,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file, node) = match def {
+        CallableDefId::FunctionId(_) => return None,
+        CallableDefId::StructId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+        CallableDefId::EnumVariantId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+    };
+    location_of(db, file, written_range(&node))
+}
+
 /// The range of an item or a macro call without the attributes and comments on top of it,
 /// which rustc's span of it leaves out.
 fn written_range(node: &SyntaxNode) -> TextRange {
@@ -2350,7 +2370,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
         let name = FunctionSignature::of(db, func).name.as_str().to_owned();
-        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), Some(func));
+        let declared = self.declaration_at(func);
+        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), declared);
         Ok(symbol)
     }
 
@@ -2522,13 +2543,57 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let ids = self.stitch(id, compiled)?;
         let name = self.backtrace_name(instance);
-        let declared = match instance.def {
-            InstanceDef::Fn(func) => Some(func),
-            _ => None,
-        };
+        let declared = self.written_at(instance, env.krate);
         let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
         self.keep(instance, compiled, &ids, debug);
         Ok(())
+    }
+
+    /// Where what `instance` is the code of is written, which is the line of whatever of its
+    /// code is of no statement: a function where it is declared, a closure or an `async`
+    /// block where it stands, and a shim where the function it stands in for is declared, as
+    /// rustc has it.
+    fn written_at(&mut self, instance: &Instance, krate: Crate) -> Option<(String, u32, u32)> {
+        self.debug.as_ref()?;
+        let db = self.db;
+        let lang_items = DbInterner::new_with(db, krate).lang_items();
+        let ty = || instance.args.as_ref().as_slice().first().and_then(|arg| arg.ty());
+        let of_expr = |owner: InferBodyId<'db>, expr| match owner {
+            InferBodyId::DefWithBodyId(owner) => Some((owner, MirSpan::ExprId(expr))),
+            _ => None,
+        };
+        let func = match instance.def {
+            InstanceDef::Fn(func) => Some(func),
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(db);
+                return self.location_at(of_expr(at.owner, at.expr));
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(db);
+                return self.location_at(of_expr(at.owner, at.expr));
+            }
+            InstanceDef::DropGlue => lang_items.DropInPlace.or(lang_items.DropGlue),
+            InstanceDef::CallOnceShim => lang_items.FnOnce_call_once,
+            InstanceDef::FnPointerShim => match ty()?.kind() {
+                TyKind::Closure(id, _) => {
+                    let at = id.0.loc(db);
+                    return self.location_at(of_expr(at.owner, at.expr));
+                }
+                _ => None,
+            },
+            InstanceDef::ReifyShim { .. } => match ty()?.kind() {
+                TyKind::FnDef(def, _) => match def.0 {
+                    CallableDefId::FunctionId(func) => Some(func),
+                    constructor => {
+                        return constructor_location(db, constructor).and_then(
+                            |(file, line, col)| Some((self.source_path(file)?, line, col)),
+                        );
+                    }
+                },
+                _ => lang_items.FnOnce_call_once,
+            },
+        };
+        self.declaration_at(func?)
     }
 
     /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
@@ -2539,10 +2604,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         id: FuncId,
         compiled: &CompiledFunction,
         mut debug: FunctionDebug,
-        declared: Option<FunctionId>,
+        declared: Option<(String, u32, u32)>,
     ) -> Option<FunctionDebug> {
         self.debug.as_ref()?;
-        if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
+        if let Some((file, line, column)) = declared {
             debug.declared = Some(debug.place(file, line, column));
         }
         if let Some((owner, spans)) = &compiled.source {
@@ -2554,6 +2619,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let place = debug.place(file, line, column);
                 debug.row(row.offset, place);
             }
+        }
+        // Compiled code of no statement with a place is of where the function is written
+        // throughout. A function that is its assembly has no lines, as rustc gives it none.
+        if let Some(declared) = debug.declared
+            && debug.rows.is_empty()
+            && compiled.code.unwind.is_some()
+        {
+            debug.row(0, declared);
         }
         if let Some((owner, _)) = &compiled.source
             && let Some((env, variables)) = &compiled.variables
