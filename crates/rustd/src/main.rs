@@ -922,6 +922,11 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
 /// rustc then compiled the whole program from bitcode as it linked it, and the functions
 /// rustd leaves to rustc are not there to be linked against by name.
 fn linked_from_libraries(db: &RootDatabase, args: &Args) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.link_cmd.as_deref().is_none_or(links_core),
+        "the link command has no library of `core`, as rustc's has not with `lto`: rustd \
+         links against a build with `lto = \"off\"`"
+    );
     if args.symbol_files.is_empty() {
         return Ok(());
     }
@@ -949,6 +954,16 @@ fn linked_from_libraries(db: &RootDatabase, args: &Args) -> anyhow::Result<()> {
         libraries[0].trim_start_matches("lib")
     );
     Ok(())
+}
+
+/// Whether a link command names `core` as a library, by itself or in the shared library of
+/// std. One that reads its files from elsewhere is taken to.
+fn links_core(command: &str) -> bool {
+    let mut files = command.split_whitespace().map(|it| it.trim_matches(['"', '\'']));
+    files.any(|it| {
+        let name = it.rsplit(['/', '\\']).next().unwrap_or(it);
+        it.starts_with('@') || name.starts_with("libcore-") || name.starts_with("libstd-")
+    })
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -4482,4 +4497,19 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
         "phases: compile {:.1?}, resolve {:.1?}, define {:.1?}, fallback {:.1?}, object {:.1?}, {} rounds",
         phases.compile, phases.resolve, phases.define, phases.fallback, phases.object, stats.rounds
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::links_core;
+
+    #[test]
+    fn a_link_command_of_lto_has_no_core() {
+        let ordinary = r#"cc "/t/deps/app-1.app.0.rcgu.o" "/sysroot/lib/libcore-667b96598095cbda.rlib" -o /t/app"#;
+        let lto = r#"cc "/t/deps/app-1.app.0.rcgu.o" "/sysroot/lib/libcompiler_builtins-2ae2.rlib" -o /t/app"#;
+        assert!(links_core(ordinary));
+        assert!(links_core("cc @/t/link.args"));
+        assert!(links_core("cc /sysroot/lib/libstd-44675f186029a4cd.so"));
+        assert!(!links_core(lto));
+    }
 }

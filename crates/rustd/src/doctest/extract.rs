@@ -76,7 +76,8 @@ fn is_error_code(token: &str) -> bool {
 
 /// The examples of the crate, in the order of a walk of its modules.
 pub(crate) fn examples(db: &RootDatabase, krate: hir::Crate) -> Vec<Example> {
-    let mut found = Found { db, examples: Vec::new(), seen: Default::default() };
+    let whole_files = krate.edition(db).at_least_2024();
+    let mut found = Found { db, examples: Vec::new(), seen: Default::default(), whole_files };
     found.module(krate.root_module(db), "");
     found.examples
 }
@@ -86,6 +87,9 @@ struct Found<'db> {
     examples: Vec<Example>,
     /// Where the blocks found are: a macro that is exported is in two modules.
     seen: rustc_hash::FxHashSet<(PathBuf, usize, String)>,
+    /// Whether the crate is of an edition from which rustdoc has the text of a file that
+    /// `include_str!` reads be in that file.
+    whole_files: bool,
 }
 
 fn join(path: &str, name: impl std::fmt::Display) -> String {
@@ -206,58 +210,65 @@ impl Found<'_> {
     /// The file the documentation is written in and the line its first comment or attribute
     /// starts on.
     fn start(&self, docs: &hir::Docs) -> Option<(PathBuf, usize)> {
-        let db = self.db;
         // The first character and not the place before it: with nothing written at `mod name;`
         // that place is in neither file.
-        let first = TextRange::at(TextSize::new(0), TextSize::new(1));
-        let (file, start) = match docs.find_ast_range(first) {
-            Some((range, _)) => {
-                let tree = range.file_id.parse_or_expand(db);
-                let token = tree.token_at_offset(range.value.start()).right_biased()?;
-                // What a macro wrote of its own is where the macro is used, as rustdoc has it.
-                let written =
-                    hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
-                let attr = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::ATTR);
-                let attr = attr.filter(|_| !range.file_id.is_macro());
-                (written.file_id, attr.map_or(written.range, |it| it.text_range()).start())
+        let at = |offset: usize| TextRange::at(TextSize::new(offset as u32), TextSize::new(1));
+        if let Some(written) = self.written(docs, at(0)) {
+            return Some(written);
+        }
+        // The text starts with what a macro wrote, like `include_str!`.
+        let (call, _) = docs.macro_calls().next()?;
+        let call = call.to_in_file_node(self.db);
+        let included = self.whole_files.then(|| included(&call.value)).flatten();
+        let call = call.syntax().original_file_range_rooted(self.db);
+        if let Some(included) = included {
+            // From edition 2024 the text of a file that is included is in that file, and the
+            // lines are its lines. With a comment beside it rustdoc counts from the comment.
+            let text = docs.docs();
+            let lines = text.match_indices('\n').map(|(it, _)| it + 1);
+            let lines = lines.filter(|&it| it < text.len() && !text[it..].starts_with('\n'));
+            if let Some(written) = lines.into_iter().find_map(|it| self.written(docs, at(it))) {
+                return Some(written);
             }
-            // The text starts with what a macro wrote, like `include_str!`.
-            None => {
-                let (call, _) = docs.macro_calls().next()?;
-                let call = call.to_in_file_node(db).syntax().original_file_range_rooted(db);
-                let tree = call.file_id.parse(db).syntax_node();
-                let attr = tree.covering_element(call.range).ancestors();
-                let attr = attr.into_iter().find(|it| it.kind() == SyntaxKind::ATTR);
-                if let Some(included) = attr.as_ref().and_then(included) {
-                    let path = self.path(call.file_id.file_id(db))?;
-                    return Some((path.parent()?.join(included), 1));
-                }
-                (call.file_id, attr.map_or(call.range, |it| it.text_range()).start())
-            }
-        };
-        let file = file.file_id(db);
-        let path = self.path(file)?;
-        let line = ide_db::line_index(db, file).line_col(start).line;
-        Some((path, line as usize + 1))
+            let path = self.path(call.file_id.file_id(self.db))?;
+            return Some((path.parent()?.join(included), 1));
+        }
+        let tree = call.file_id.parse(self.db).syntax_node();
+        let attr = tree.covering_element(call.range).ancestors();
+        let attr = attr.into_iter().find(|it| it.kind() == SyntaxKind::ATTR);
+        let start = attr.map_or(call.range, |it| it.text_range()).start();
+        self.line_of(call.file_id, start)
+    }
+
+    /// The file and the line of the comment or attribute that the text at `range` of the
+    /// documentation is written in, when it is written and not what a macro made.
+    fn written(&self, docs: &hir::Docs, range: TextRange) -> Option<(PathBuf, usize)> {
+        let db = self.db;
+        let (range, _) = docs.find_ast_range(range)?;
+        let tree = range.file_id.parse_or_expand(db);
+        let token = tree.token_at_offset(range.value.start()).right_biased()?;
+        // What a macro wrote of its own is where the macro is used, as rustdoc has it.
+        let written = hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
+        let attr = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::ATTR);
+        let attr = attr.filter(|_| !range.file_id.is_macro());
+        let start = attr.map_or(written.range, |it| it.text_range()).start();
+        self.line_of(written.file_id, start)
+    }
+
+    fn line_of(&self, file: hir::EditionedFileId, at: TextSize) -> Option<(PathBuf, usize)> {
+        let file = file.file_id(self.db);
+        let line = ide_db::line_index(self.db, file).line_col(at).line;
+        Some((self.path(file)?, line as usize + 1))
     }
 }
 
-/// The file a `#[doc = include_str!("file")]` names, as it is written. rustdoc has the
-/// examples of such documentation be in that file, by its lines; not so when the attribute
-/// is in a `cfg_attr` or is what a macro wrote, which are not asked here.
-fn included(attr: &syntax::SyntaxNode) -> Option<String> {
-    let attr = syntax::ast::Attr::cast(attr.clone())?;
-    let syntax::ast::Meta::KeyValueMeta(meta) = attr.meta()? else { return None };
-    let syntax::ast::Expr::MacroExpr(call) = meta.expr()? else { return None };
-    let call = call.macro_call()?;
-    let is_doc = meta.path().is_some_and(|it| it.syntax().text() == "doc");
+/// The file an `include_str!("file")` names, as it is written.
+fn included(call: &syntax::ast::MacroCall) -> Option<String> {
     let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
-    let file = call
-        .token_tree()?
-        .syntax()
-        .descendants_with_tokens()
-        .find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
-    (is_doc && includes).then(|| file.value().ok().map(|it| it.into_owned())).flatten()
+    let mut tokens = call.token_tree()?.syntax().descendants_with_tokens();
+    let file =
+        tokens.find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
+    includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
 }
 
 fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {
