@@ -742,9 +742,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 &cond_place,
                 mode,
             )?,
-            VariantId::UnionId(_) => {
-                return Err(MirLowerError::TypeError("pattern matching on union"));
-            }
+            VariantId::UnionId(u) => self.pattern_matching_variant_fields(
+                shape,
+                u.fields(self.db),
+                variant,
+                current,
+                current_else,
+                &cond_place,
+                mode,
+            )?,
         })
     }
 

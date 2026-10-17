@@ -846,6 +846,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
+    /// Whether arithmetic of the body being evaluated panics when it overflows, which is
+    /// what the code compiled from the body does: a constant is what running it would give.
+    fn checks_overflow(&self, locals: &Locals<'_, 'db>) -> bool {
+        crate::mir::codegen::body_checks_overflow(self.db, &locals.body).unwrap_or(true)
+    }
+
     fn operand_ty(&self, o: &Operand, locals: &Locals<'a, 'db>) -> Result<'db, Ty<'db>> {
         Ok(match &o.kind {
             OperandKind::Copy(p) | OperandKind::Move(p) => self.place_ty(p, locals)?,
@@ -1243,12 +1249,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                     let r = op.run_compare(l, r) as u8;
                                     Owned(vec![r])
                                 }
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
                                         BinOp::Add => l + r,
                                         BinOp::Sub => l - r,
                                         BinOp::Mul => l * r,
                                         BinOp::Div => l / r,
+                                        BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
                                     Owned(
@@ -1276,12 +1283,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                     let r = op.run_compare(l, r) as u8;
                                     Owned(vec![r])
                                 }
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
                                         BinOp::Add => l + r,
                                         BinOp::Sub => l - r,
                                         BinOp::Mul => l * r,
                                         BinOp::Div => l / r,
+                                        BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
                                     // rustc's const eval makes every NaN it computes the
@@ -1307,12 +1315,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                     let r = op.run_compare(l, r) as u8;
                                     Owned(vec![r])
                                 }
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
                                         BinOp::Add => l + r,
                                         BinOp::Sub => l - r,
                                         BinOp::Mul => l * r,
                                         BinOp::Div => l / r,
+                                        BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
                                     // rustc's const eval makes every NaN it computes the
@@ -1338,12 +1347,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                     let r = op.run_compare(l, r) as u8;
                                     Owned(vec![r])
                                 }
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
                                         BinOp::Add => l + r,
                                         BinOp::Sub => l - r,
                                         BinOp::Mul => l * r,
                                         BinOp::Div => l / r,
+                                        BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
                                     Owned(r.value.to_bits().to_le_bytes().into())
@@ -1371,7 +1381,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         | BinOp::Div
                         | BinOp::Rem
                         | BinOp::Sub => {
+                            let wraps = !self.checks_overflow(locals);
                             let r = match op {
+                                BinOp::Add if wraps => l128.wrapping_add(r128),
+                                BinOp::Mul if wraps => l128.wrapping_mul(r128),
+                                BinOp::Sub if wraps => l128.wrapping_sub(r128),
                                 BinOp::Add => l128.checked_add(r128).ok_or_else(|| {
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
@@ -1396,7 +1410,16 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                         BinOp::Shl | BinOp::Shr => {
                             let r = 'b: {
-                                if let Some(shift_amount) = r128.as_u32() {
+                                let bits = lc.len() as u32 * 8;
+                                let amount = match r128.as_u32() {
+                                    Some(it) => Some(it),
+                                    None if self.checks_overflow(locals) => None,
+                                    // The amount an unchecked shift takes is its low bits.
+                                    None => Some(u32::from(r128.to_bytes()[0])),
+                                };
+                                let amount = amount
+                                    .map(|it| if self.checks_overflow(locals) { it } else { it % bits });
+                                if let Some(shift_amount) = amount {
                                     let r = match op {
                                         BinOp::Shl => l128.checked_shl(shift_amount),
                                         BinOp::Shr => l128.checked_shr(shift_amount),
@@ -3594,6 +3617,17 @@ macro_rules! checked_int_op {
     };
 }
 
+macro_rules! wrapping_int_op {
+    ( [ $op:ident ] $( $int_ty:ident )+ ) => {
+        fn $op(self, other: Self) -> Self {
+            match (self, other) {
+                $( (Self::$int_ty(a), Self::$int_ty(b)) => Self::$int_ty(a.$op(b)), )+
+                _ => panic!("incompatible integer types"),
+            }
+        }
+    };
+}
+
 macro_rules! int_bit_shifts {
     ( [ $op:ident ] $( $int_ty:ident )+ ) => {
         fn $op(self, amount: u32) -> Option<Self> {
@@ -3657,6 +3691,9 @@ impl IntValue {
         for_each_int_type! { m, [] }
     }
 
+    for_each_int_type!(wrapping_int_op, [wrapping_add]);
+    for_each_int_type!(wrapping_int_op, [wrapping_sub]);
+    for_each_int_type!(wrapping_int_op, [wrapping_mul]);
     for_each_int_type!(checked_int_op, [checked_add]);
     for_each_int_type!(checked_int_op, [checked_sub]);
     for_each_int_type!(checked_int_op, [checked_div]);

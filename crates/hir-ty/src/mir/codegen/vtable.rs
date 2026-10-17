@@ -3,11 +3,14 @@
 
 use hir_def::{AssocItemId, FunctionId, TraitId};
 use rustc_hash::FxHashSet;
-use rustc_type_ir::{Interner, inherent::Clause as _};
+use rustc_type_ir::{
+    Binder, Interner, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    inherent::{Clause as _, IntoKind as _},
+};
 
 use crate::{
     dyn_compatibility::generics_require_sized_self,
-    next_solver::{DbInterner, TraitRef},
+    next_solver::{DbInterner, Region, TraitRef},
 };
 
 /// `drop_in_place`, size and align come before the slots.
@@ -27,9 +30,16 @@ pub(super) struct VtableLayout<'db> {
 }
 
 impl<'db> VtableLayout<'db> {
-    pub(super) fn of(interner: DbInterner<'db>, trait_ref: TraitRef<'db>) -> Self {
+    /// The vtable of `trait_ref`. `plain` gives the one form of a trait among those the
+    /// program can write it in, which is what tells two supertraits apart.
+    pub(super) fn of(
+        interner: DbInterner<'db>,
+        trait_ref: TraitRef<'db>,
+        plain: &dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+    ) -> Self {
         let mut walk = Walk {
             interner,
+            plain,
             visited: FxHashSet::from_iter([trait_ref]),
             slots: Vec::new(),
             prefixes: Vec::new(),
@@ -69,8 +79,9 @@ pub(super) enum Upcast {
     Load(usize),
 }
 
-struct Walk<'db> {
+struct Walk<'a, 'db> {
     interner: DbInterner<'db>,
+    plain: &'a dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
     visited: FxHashSet<TraitRef<'db>>,
     slots: Vec<Slot<'db>>,
     prefixes: Vec<TraitRef<'db>>,
@@ -79,7 +90,7 @@ struct Walk<'db> {
     emit_vptr: bool,
 }
 
-impl<'db> Walk<'db> {
+impl<'db> Walk<'_, 'db> {
     /// Supertraits first, depth first in declaration order, then the trait's own methods.
     fn visit(&mut self, trait_ref: TraitRef<'db>, vptr: bool) {
         let interner = self.interner;
@@ -88,6 +99,7 @@ impl<'db> Walk<'db> {
             .iter_instantiated(interner, trait_ref.args.as_slice())
             .filter_map(|clause| clause.skip_norm_wip().0.as_trait_clause())
             .map(|pred| interner.instantiate_bound_regions_with_erased(pred).trait_ref)
+            .map(self.plain)
             .collect();
         for supertrait in supertraits {
             if self.visited.insert(supertrait) {
@@ -120,4 +132,37 @@ fn own_methods(interner: DbInterner<'_>, trait_: TraitId) -> Vec<FunctionId> {
         })
         .filter(|&func| !generics_require_sized_self(db, func.into()))
         .collect()
+}
+
+/// `trait_ref` with every lifetime erased and the lifetimes of a `for<'a>` unnamed, as rustc
+/// has a trait when it lays out a vtable.
+pub(super) fn without_lifetimes<'db>(
+    interner: DbInterner<'db>,
+    trait_ref: TraitRef<'db>,
+) -> TraitRef<'db> {
+    trait_ref.fold_with(&mut LifetimeEraser { interner })
+}
+
+struct LifetimeEraser<'db> {
+    interner: DbInterner<'db>,
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for LifetimeEraser<'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.interner
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<DbInterner<'db>, T>,
+    ) -> Binder<DbInterner<'db>, T> {
+        self.interner.anonymize_bound_vars(binder).super_fold_with(self)
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        match region.kind() {
+            RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(self.interner),
+        }
+    }
 }

@@ -396,6 +396,7 @@ impl CodegenUnit {
             !roots.on_demand.is_empty(),
         );
         let mut rounds = 0;
+        let mut start = roots.start;
         loop {
             rounds += 1;
             let mut cg = ObjectCodegen::new(
@@ -414,7 +415,7 @@ impl CodegenUnit {
             let mut queue = roots.entries.to_vec();
             let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
             let mut next = 0;
-            if let Some(main) = roots.start {
+            if let Some(main) = start {
                 cg.define_start(main)?;
             }
             loop {
@@ -462,6 +463,12 @@ impl CodegenUnit {
                 }
             }
             if cg.misfit {
+                rejected.extend(failed);
+                continue;
+            }
+            // The `main` the C runtime calls would call a `main` that is not in the object.
+            if start.is_some_and(|main| skipped.iter().any(|(root, _)| *root == main)) {
+                start = None;
                 rejected.extend(failed);
                 continue;
             }
@@ -1118,6 +1125,18 @@ fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
     let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
     let first = settings.next()?;
     settings.all(|it| it == first).then_some(first)
+}
+
+/// Whether arithmetic of `body` panics when it overflows, when the build says. rustc decides
+/// it twice: the crate the body is written in leaves the check out of what it keeps of the
+/// body unless it has `-C overflow-checks` or the function takes the setting of its callers,
+/// and the crate that compiles the body drops the check unless it has the flag.
+pub(crate) fn body_checks_overflow(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<bool> {
+    let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
+    if written_with == Some(false) || (written_with.is_none() && !body.inherits_overflow_checks) {
+        return Some(false);
+    }
+    build_checks_overflow(db)
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -7284,19 +7303,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// body unless it has `-C overflow-checks` or the function takes the setting of its
     /// callers, and the crate that compiles the body drops the check unless it has the flag.
     fn checks_overflow(&self) -> Result<bool> {
-        let db = self.cg.db;
         let Some(body) = self.body else { return Ok(false) };
-        let inherits = match body.owner {
-            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
-                AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
-            }
-            _ => false,
-        };
-        let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
-        if written_with == Some(false) || (written_with.is_none() && !inherits) {
-            return Ok(false);
-        }
-        match build_checks_overflow(db) {
+        match body_checks_overflow(self.cg.db, body) {
             Some(checked) => Ok(checked),
             // The body is compiled by whichever crate uses it, and that is not known here.
             None => unsupported!("overflow checks differ between the packages of the build"),
@@ -7647,7 +7655,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
                     unsupported!("vtable call on {dyn_ty:?}");
                 };
-                let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(method) else {
+                let Some(slot) = self.vtable_layout(trait_ref).method(method) else {
                     unsupported!("method missing from the vtable of {dyn_ty:?}");
                 };
                 let pointer = self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at());
@@ -7906,7 +7914,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
             unsupported!("vtable call on {dyn_ty:?}");
         };
-        let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(func) else {
+        let Some(slot) = self.vtable_layout(trait_ref).method(func) else {
             unsupported!("method missing from the vtable of {dyn_ty:?}");
         };
         let data = self.builder.ins().load(ptr(), MEM, receiver, 0);
@@ -7933,7 +7941,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         };
         let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
-        Some(self.interner.instantiate_bound_regions_with_erased(principal))
+        Some(self.plain_trait(self.interner.instantiate_bound_regions_with_erased(principal)))
+    }
+
+    /// `trait_ref` without its lifetimes and with its projections resolved: two ways of
+    /// writing one trait are one trait in a vtable.
+    fn plain_trait(&self, trait_ref: TraitRef<'db>) -> TraitRef<'db> {
+        let erased = vtable::without_lifetimes(self.interner, trait_ref);
+        crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .deeply_normalize(
+                &crate::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                erased,
+            )
+            .unwrap_or(erased)
+    }
+
+    fn vtable_layout(&self, trait_ref: TraitRef<'db>) -> VtableLayout<'db> {
+        VtableLayout::of(self.interner, trait_ref, &|it| self.plain_trait(it))
     }
 
     /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a
@@ -8012,7 +8037,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // Only auto traits or lifetimes change.
                     return Ok(vtable);
                 }
-                match VtableLayout::of(self.interner, trait_ref).upcast(target) {
+                match self.vtable_layout(trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
                     Some(Upcast::Load(slot)) => {
                         Ok(self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at()))
@@ -8059,7 +8084,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(id);
         }
         let layout = self.layout(ty)?;
-        let slots = trait_ref.map_or_else(Vec::new, |it| VtableLayout::of(self.interner, it).slots);
+        let slots = trait_ref.map_or_else(Vec::new, |it| self.vtable_layout(it).slots);
         let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * word()];
         bytes[word()..2 * word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..word()]);
         bytes[2 * word()..3 * word()]

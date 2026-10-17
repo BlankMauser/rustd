@@ -1833,6 +1833,12 @@ impl<'db> ExprCollector<'db> {
                         },
                         syntax_ptr,
                     );
+                    let inherits = |attr: ast::Attr| {
+                        attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
+                    };
+                    if ast::HasAttrs::attrs(&e).any(inherits) {
+                        this.store.overflow_inheriting.insert(closure);
+                    }
 
                     (if is_coroutine_closure { body } else { closure }, closure)
                 });

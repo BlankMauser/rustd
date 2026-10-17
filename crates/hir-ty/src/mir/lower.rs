@@ -232,6 +232,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             owner,
             closures: vec![],
             coroutine: None,
+            inherits_overflow_checks: match owner {
+                InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                    hir_def::attrs::AttrFlags::query(db, func.into())
+                        .contains(hir_def::attrs::AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+                }
+                _ => false,
+            },
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -3220,6 +3227,7 @@ fn lower_closure_body<'db>(
         }
     };
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
+    ctx.result.inherits_overflow_checks = store.inherits_overflow_checks(expr);
     let interner = ctx.interner();
     let by_ref = |mutability| {
         Ty::new_ref(interner, Region::new_erased(interner), infer.expr_ty(expr), mutability)

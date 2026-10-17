@@ -30,7 +30,7 @@ DIRECTIVE = re.compile(LINE + r"(?P<name>[\w-]+)(?: *: *| +|$)(?P<value>.*)$", r
 RERUNS = 6
 # How long rustc's program is run over and over to see whether it too does what rustd's did.
 RACE_SECONDS = 20
-MAIN = re.compile(r"^(pub )?fn main\(\)(?P<returns> *->)?", re.M)
+MAIN = re.compile(r"^(pub )?fn +main *\(\)(?P<returns> *->)?", re.M)
 FEATURE = re.compile(r"#!\[(cfg_attr\(.*, *)?feature\(")
 # What a test names beside itself, relative to its own directory.
 MODULE = re.compile(r'^\s*(?:#\[path *= *"(?P<path>[^"]+)"\]\s*)?(?:pub(?:\([\w: ]+\))? )?mod (?P<name>\w+);', re.M)
@@ -62,6 +62,12 @@ INERT = re.compile(
     r"|-C ?target-feature=-crt-static|-C ?debug[-_]assertions(=(yes|on|y|true))?|-C ?overflow-checks(=(yes|on|y|true))?"
     r"|-C ?lto=(no|off)|--error-format(=| )\S+|--diagnostic-width(=| )\S+|-C ?symbol-mangling-version=v0|-C ?panic=unwind"
     r"|--remap-path-prefix(=| )\S+|-C ?link-dead-code|-l ?rust_test_helpers)$")
+# Flags that say how the code is generated, which rustc and rustd are both given.
+HONOURED = re.compile(r"^(-O|-C ?opt-level=\S+|-C ?debug[-_]assertions(=\S+)?|-C ?overflow-checks(=\S+)?|-C ?panic=abort"
+                      r"|-C ?target-(feature|cpu)=\S+)$")
+# What an auxiliary crate's flags may ask of its own package's profile.
+PACKAGE_SETTING = re.compile(r"^-C ?(?P<key>opt-level|overflow-checks|debug[-_]assertions)=(?P<value>\S+)$")
+ON = {"yes": "true", "on": "true", "y": "true", "true": "true", "no": "false", "off": "false", "n": "false", "false": "false"}
 CHUNK = 150
 STALL = 20
 
@@ -73,6 +79,15 @@ class Unit:
         self.test, self.path, self.revision = test, path, revision
         self.edition, self.cfgs, self.env, self.args = "2015", [], {}, []
         self.aux = []
+        # Code generation flags, and the environment of the compiler: set, or None for unset.
+        self.flags, self.rustc_env = [], {}
+
+    @property
+    def build(self):
+        """What a workspace of tests has to share: how its members are compiled."""
+        # A profile setting of one package changes what rustd can say of the others.
+        alone = self.label if any(aux.settings for aux in self.aux) else None
+        return (tuple(self.cfgs), tuple(self.flags), tuple(sorted(self.rustc_env.items(), key=str)), alone)
 
     @property
     def label(self):
@@ -84,6 +99,8 @@ class Aux:
 
     def __init__(self, path, name, proc_macro):
         self.path, self.name, self.proc_macro = path, name, proc_macro
+        # What its own flags ask of its package's profile.
+        self.settings = {}
 
 
 def flags_of(text):
@@ -105,16 +122,10 @@ def refuse(flag):
         return "compile flag: -Z (nightly only)"
     if flag == "--test":
         return "compile flag: --test (the program is libtest's, not the test's `main`)"
-    if flag == "-O" or flag.startswith("-Copt-level"):
-        return "compile flag: optimisation level (rustd emits unoptimised code with debug assertions and overflow checks)"
-    if re.match(r"-C(debug[-_]assertions|overflow-checks)", flag):
-        return "compile flag: debug assertions or overflow checks off (rustd always emits them)"
     if flag.startswith("-Cpanic"):
-        return "compile flag: -C panic=abort"
+        return f"compile flag: {flag}"
     if flag.startswith(("-Clto", "-Clinker-plugin-lto", "-Cembed-bitcode")):
         return "compile flag: LTO (rustc would inline the test into the program, leaving nothing of rustd's to run)"
-    if flag.startswith(("-Ctarget-feature", "-Ctarget-cpu")):
-        return "compile flag: target features"
     return f"compile flag: {flag.split('=')[0].split(' ')[0]}"
 
 
@@ -132,8 +143,12 @@ def auxiliary(path, value, proc_macro, seen=()):
     named = re.search(r'#!\[crate_name *= *"(\w+)"\]', text)
     aux = Aux(found, name or (named.group(1) if named else os.path.basename(file)[:-3].replace("-", "_")), proc_macro)
     for d in DIRECTIVE.finditer(text):
-        if d["name"] == "compile-flags" and any(not INERT.match(f) or f.startswith("--cfg") for f in flags_of(d["value"])):
-            return "auxiliary crate has compile flags of its own"
+        for flag in flags_of(d["value"]) if d["name"] == "compile-flags" else []:
+            setting = PACKAGE_SETTING.match(flag)
+            if setting and (setting["key"] == "opt-level" or setting["value"] in ON):
+                aux.settings[setting["key"].replace("_", "-")] = ON.get(setting["value"], setting["value"])
+            elif not INERT.match(flag) and not re.match(r"--crate-type[= ](lib|rlib)$", flag):
+                return f"auxiliary crate has a compile flag of its own: {flag.split('=')[0].split(' ')[0]}"
         if d["name"] in ("aux-build", "aux-crate", "proc-macro"):
             if found in seen:
                 return "auxiliary crates name each other"
@@ -152,7 +167,7 @@ def classify(test, path):
         return None
     if FEATURE.search(text):
         return "needs a nightly feature (`#![feature]`)"
-    for shape, why in ((r"#!\[no_main\]", "`#![no_main]`"), (r"#!\[no_std\]", "`#![no_std]`"),
+    for shape, why in ((r"#!\[no_main\]", "`#![no_main]`"),
                        (r"#!\[crate_type", "`#![crate_type]`"), (r"#!\[no_core\]", "`#![no_core]`")):
         if re.search(shape, text):
             return f"{why}: not a program with a `main` of its own"
@@ -178,6 +193,11 @@ def classify(test, path):
             elif name == "exec-env":
                 key, _, val = value.partition("=")
                 unit.env[key] = val
+            elif name == "rustc-env":
+                key, _, val = value.partition("=")
+                unit.rustc_env[key.strip()] = val.strip()
+            elif name == "unset-rustc-env":
+                unit.rustc_env[value] = None
             elif name == "run-flags":
                 unit.args += shlex.split(value)
             elif name in ("aux-build", "aux-crate", "proc-macro"):
@@ -195,6 +215,8 @@ def classify(test, path):
                         unit.edition = edition.group(1)
                     elif re.match(r"--cfg[= ]", flag):
                         unit.cfgs.append("--cfg " + flag[6:])
+                    elif HONOURED.match(flag):
+                        unit.flags.append(flag)
                     elif not INERT.match(flag):
                         return refuse(flag)
             elif name not in PLAIN and not name.startswith("ignore-"):
@@ -268,6 +290,9 @@ def write_aux(ws, owner, aux):
             f"[dependencies]\n{needs}")
         shutil.copyfile(aux.path, f"{directory}/src/lib.rs")
         copy_named(aux.path, f"{directory}/src/lib.rs", aux.path)
+        if aux.settings:
+            settings = "".join(f"{key} = {value}\n" for key, value in aux.settings.items())
+            open(f"{ws}/profiles.toml", "a").write(f"[profile.dev.package.{package}]\n{settings}")
     return f'{aux.name} = {{ path = "../{package}", package = "{package}" }}\n'
 
 
@@ -284,7 +309,20 @@ def write_package(ws, name, unit):
         f'[package]\nname = "{name}"\nversion = "0.0.0"\nedition = "{unit.edition}"\n[dependencies]\n{deps}')
     open(f"{directory}/src/lib.rs", "w").write(MAIN.sub(lambda m: "pub fn main()" + (m["returns"] or ""), text, count=1))
     open(f"{directory}/src/main.rs", "w").write(wrapper)
-    return copy_named(unit.path, f"{directory}/src/lib.rs", unit.path)
+    if copy_named(unit.path, f"{directory}/src/lib.rs", unit.path):
+        return beside(unit.path, f"{directory}/src")
+    return None
+
+
+def beside(source, directory):
+    """Puts everything that is beside a test beside its copy, for a test whose modules are not
+    where the names alone say. Returns the reason when a file of the package is in the way."""
+    for entry in os.listdir(os.path.dirname(source)):
+        if entry in ("lib.rs", "main.rs"):
+            return "has a `lib.rs` or `main.rs` beside it, as its package does"
+        if not os.path.lexists(f"{directory}/{entry}"):
+            os.symlink(os.path.join(os.path.dirname(os.path.abspath(source)), entry), f"{directory}/{entry}")
+    return None
 
 
 def run_rustd(ws, work, built, rlib, symbols, env):
@@ -420,11 +458,16 @@ def run_chunk(key, units, base):
         if why:
             results[name]["reason"] = why
             shutil.rmtree(f"{ws}/crates/{name}")
+    profiles = open(f"{ws}/profiles.toml").read() if os.path.exists(f"{ws}/profiles.toml") else ""
     open(f"{ws}/Cargo.toml", "w").write(
-        '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[profile.dev]\ndebug = false\n')
+        f'[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n[profile.dev]\ndebug = false\n{profiles}')
     flags = " ".join(["--print link-args -C save-temps -C link-dead-code --cap-lints allow",
-                      f"-L native={base}/native", *units[0].cfgs])
+                      f"-L native={base}/native", *units[0].cfgs, *units[0].flags])
     env = {**os.environ, "RUSTFLAGS": flags}
+    for key, value in units[0].rustc_env.items():
+        env.pop(key, None)
+        if value is not None:
+            env[key] = value
     out = subprocess.run(["cargo", "build", "--workspace", "--keep-going"], cwd=ws, capture_output=True, text=True, env=env)
     links = {}
     for line in (out.stdout + out.stderr).splitlines():
@@ -520,10 +563,11 @@ def run_chunk(key, units, base):
 
 
 def chunks_of(units):
-    """Workspaces of tests that are built with the same `--cfg`s, which cargo takes for all of one."""
+    """Workspaces of tests that are built with the same flags and compiler environment, which
+    cargo takes for all of one."""
     by_cfg = collections.defaultdict(list)
     for unit in units:
-        by_cfg[tuple(unit.cfgs)].append(unit)
+        by_cfg[unit.build].append(unit)
     return [group[i:i + CHUNK] for group in by_cfg.values() for i in range(0, len(group), CHUNK)]
 
 

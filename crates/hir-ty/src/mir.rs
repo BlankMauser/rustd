@@ -1063,6 +1063,9 @@ pub struct MirBody<'db> {
     pub closures: Vec<InternedClosureId<'db>>,
     /// Set for the body of an `async` block, which is compiled as its `Future::poll`.
     pub coroutine: Option<CoroutineLocals>,
+    /// The body is written with `#[rustc_inherit_overflow_checks]`: its arithmetic is checked
+    /// when the crate that compiles it checks, whatever the crate it is written in does.
+    pub inherits_overflow_checks: bool,
 }
 
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -1702,6 +1705,7 @@ impl MirBody<'_> {
             promoted_locals,
             closures,
             coroutine: _,
+            inherits_overflow_checks: _,
         } = self;
         promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
