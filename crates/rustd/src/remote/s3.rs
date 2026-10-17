@@ -343,11 +343,25 @@ where
         (None, Some(status)) => format!("the service answered {status}"),
         (None, None) => causes(&error),
     };
-    // The service understood and said no. It says 408 and 429 to be asked again.
+    // The service understood and said no. It says 408 and 429 to be asked again. A
+    // certificate that is not trusted now is not trusted in a quarter of a second either.
     match status(&error) {
         Some(400..=499) if !matches!(status(&error), Some(408 | 429)) => Refused(said).into(),
+        None if is_distrust(&error) => Refused(said).into(),
         _ => anyhow::Error::msg(said),
     }
+}
+
+/// Whether the error is the other end's certificate being turned down.
+fn is_distrust(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if matches!(error.downcast_ref(), Some(rustls::Error::InvalidCertificate(_))) {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }
 
 /// An error and what it was caused by, each as it describes itself.
