@@ -6,8 +6,8 @@
 #
 # Needs cmake, ninja, curl, and a native `llvm-tblgen` of the same LLVM version
 # (`llvm-20-dev` from apt.llvm.org has one). Everything goes under `$LLVM_WASM_DIR`
-# (default `~/llvm-wasm`): wasi-sdk, the LLVM sources, a build tree per build type and the
-# prefix `install-<type>` that `LLVM_SYS_201_PREFIX` is then set to.
+# (default `~/llvm-wasm`): wasi-sdk, the LLVM sources and a build tree per build type.
+# `bin/llvm-config` beside this script describes that tree to `llvm-sys`.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 build_type=${1:-Release}
@@ -19,7 +19,6 @@ native_tools=${LLVM_NATIVE_TOOL_DIR:-/usr/lib/llvm-20/bin}
 wasi_sdk=$root/wasi-sdk-$wasi_sdk_version.0-x86_64-linux
 source=$root/llvm-project-$llvm_version.src
 build=$root/build-$build_type
-prefix=$root/install-$build_type
 mkdir -p "$root"
 
 if [ ! -d "$wasi_sdk" ]; then
@@ -42,7 +41,6 @@ emulated="-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS
 cmake -S "$source/llvm" -B "$build" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$wasi_sdk/share/cmake/wasi-sdk-p1.cmake" \
     -DCMAKE_BUILD_TYPE="$build_type" \
-    -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCMAKE_C_FLAGS="$emulated" -DCMAKE_CXX_FLAGS="$emulated" \
     -DUNIX=ON \
     -DLLVM_TARGETS_TO_BUILD=WebAssembly \
@@ -63,4 +61,6 @@ cmake -S "$source/llvm" -B "$build" -G Ninja \
     -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
     -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_RUNTIMES=OFF
 
-ninja -C "$build"
+# The libraries only: LLVM also builds an `llvm-tblgen` for the target, which is not needed
+# and does not link.
+ninja -C "$build" $(ninja -C "$build" -t targets all | sed -n 's/^\(lib\/libLLVM[^:]*\.a\):.*/\1/p')

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Answers what `llvm-sys`'s build script asks an `llvm-config` for, about the LLVM that
+# `build-llvm.sh` built for wasm32-wasip1. The real `llvm-config` of that build is a wasm
+# program, and a native one describes the host's LLVM. Set `LLVM_SYS_201_PREFIX` to the
+# directory above this one.
+set -eu
+root=${LLVM_WASM_DIR:-$HOME/llvm-wasm}
+version=20.1.8
+build=$root/build-${LLVM_WASM_BUILD_TYPE:-Release}
+source=$root/llvm-project-$version.src
+
+for argument in "$@"; do
+    case $argument in
+        --link-shared)
+            echo "llvm-config: LLVM for wasm32 has static libraries only" >&2
+            exit 1
+            ;;
+    esac
+done
+
+case $1 in
+    --version) echo "$version" ;;
+    --prefix) echo "$build" ;;
+    --libdir) echo "$build/lib" ;;
+    --build-mode) echo Release ;;
+    --cflags) echo "-I$source/llvm/include -I$build/include" ;;
+    --system-libs) echo ;;
+    --libnames) (cd "$build/lib" && echo libLLVM*.a) ;;
+    *)
+        echo "llvm-config: no answer for $*" >&2
+        exit 1
+        ;;
+esac

@@ -96,7 +96,7 @@ index 9f9030e79..7146de13d 100644
  #endif
  #ifdef _WIN32
 diff --git a/llvm/lib/Support/Unix/Path.inc b/llvm/lib/Support/Unix/Path.inc
-index 6004e007c..b4f3d99a1 100644
+index 6004e007c..98d42eebc 100644
 --- a/llvm/lib/Support/Unix/Path.inc
 +++ b/llvm/lib/Support/Unix/Path.inc
 @@ -28,7 +28,9 @@
@@ -171,6 +171,15 @@ index 6004e007c..b4f3d99a1 100644
  }
  
  std::error_code setPermissions(const Twine &Path, perms Permissions) {
+@@ -875,7 +890,7 @@ void mapped_file_region::dontNeedImpl() {
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__wasi__)
+     // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
+ #elif defined(POSIX_MADV_DONTNEED)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_DONTNEED);
 @@ -1330,11 +1345,15 @@ std::error_code real_path(const Twine &path, SmallVectorImpl<char> &dest,
  }
  
@@ -279,10 +288,10 @@ index b33e52d88..b18f0a40c 100644
  }
 diff --git a/llvm/lib/Support/WASI/Program.inc b/llvm/lib/Support/WASI/Program.inc
 new file mode 100644
-index 000000000..38f653fac
+index 000000000..008ac47b7
 --- /dev/null
 +++ b/llvm/lib/Support/WASI/Program.inc
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,72 @@
 +//===- Program.inc - WASI: there are no other programs --------------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -293,15 +302,8 @@ index 000000000..38f653fac
 +#include "llvm/Support/Errc.h"
 +#include "llvm/Support/FileSystem.h"
 +
-+namespace llvm {
++using namespace llvm;
 +using namespace sys;
-+
-+ProcessInfo::ProcessInfo() : Pid(0), ReturnCode(0) {}
-+
-+ErrorOr<std::string> sys::findProgramByName(StringRef Name,
-+                                            ArrayRef<StringRef> Paths) {
-+  return errc::no_such_file_or_directory;
-+}
 +
 +static bool Execute(ProcessInfo &PI, StringRef Program,
 +                    ArrayRef<StringRef> Args,
@@ -312,6 +314,15 @@ index 000000000..38f653fac
 +  if (ErrMsg)
 +    *ErrMsg = "WASI cannot start a program";
 +  return false;
++}
++
++namespace llvm {
++
++ProcessInfo::ProcessInfo() : Pid(0), ReturnCode(0) {}
++
++ErrorOr<std::string> sys::findProgramByName(StringRef Name,
++                                            ArrayRef<StringRef> Paths) {
++  return errc::no_such_file_or_directory;
 +}
 +
 +ProcessInfo sys::Wait(const ProcessInfo &PI,
