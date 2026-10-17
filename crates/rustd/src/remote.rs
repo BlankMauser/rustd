@@ -373,13 +373,26 @@ impl Tally {
     }
 }
 
-/// A pack as a manifest lists it: `PACK SIZE KEYS FORMAT`, the hash of the pack, how many
-/// bytes it is, the hash of the list of its keys, and the format of the store it is of.
+/// A pack as a manifest lists it: `PACK SIZE KEYS FORMAT PACKED PACKED_SIZE`, the hash of
+/// the pack, how many bytes it is, the hash of the list of its keys, the format of the
+/// store it is of, and the hash and size of the object that holds it compressed. A line
+/// without the last two is a pack that was sent as it is.
 #[derive(Clone, Copy)]
 struct Listed {
     size: u64,
     keys: Digest,
     format: u32,
+    packed: Option<(Digest, u64)>,
+}
+
+impl Listed {
+    /// The object the pack is in, and the hash of that object.
+    fn object(&self, pack: &Digest) -> (String, Digest) {
+        match self.packed {
+            Some((packed, _)) => (format!("packs/{pack}.pack.zst"), packed),
+            None => (pack_object(pack), *pack),
+        }
+    }
 }
 
 /// What a project's builds were served from.
@@ -400,14 +413,21 @@ impl Manifest {
             let size = fields.next()?.parse().ok()?;
             let keys = Digest::parse(fields.next()?)?;
             let format = fields.next()?.parse().ok()?;
-            Some((pack, Listed { size, keys, format }))
+            let packed = match (fields.next(), fields.next()) {
+                (Some(packed), Some(size)) => Some((Digest::parse(packed)?, size.parse().ok()?)),
+                _ => None,
+            };
+            Some((pack, Listed { size, keys, format, packed }))
         });
         Manifest(packs.collect())
     }
 
     fn lines(&self) -> String {
-        let line = |(pack, it): (&Digest, &Listed)| {
-            format!("{pack} {} {} {}\n", it.size, it.keys, it.format)
+        let line = |(pack, it): (&Digest, &Listed)| match it.packed {
+            Some((packed, size)) => {
+                format!("{pack} {} {} {} {packed} {size}\n", it.size, it.keys, it.format)
+            }
+            None => format!("{pack} {} {} {}\n", it.size, it.keys, it.format),
         };
         self.0.iter().map(line).collect()
     }
@@ -469,13 +489,44 @@ fn keys_of(store: &Path, pack: Digest) -> anyhow::Result<(u64, Vec<u8>)> {
 async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Result<(Listed, u64)> {
     let from = store.to_owned();
     let (size, keys) = tokio::task::spawn_blocking(move || keys_of(&from, pack)).await??;
-    let listed = Listed { size, keys: Digest::of(&keys), format: STORE_FORMAT };
-    remote.send_named_by_hash(&keys_object(&listed.keys), keys).await?;
-    if remote.size(&pack_object(&pack)).await? == Some(size) {
-        return Ok((listed, 0));
+    let keys_digest = Digest::of(&keys);
+    remote.send_named_by_hash(&keys_object(&keys_digest), keys).await?;
+    let (from, aside) = (store.join(pack_file(&pack)), store.join(format!("{pack}.pack.send.tmp")));
+    let packing = aside.clone();
+    let packed = tokio::task::spawn_blocking(move || pack_whole(&from, &packing)).await?;
+    let sent = async {
+        let (packed, packed_size) = packed?;
+        let listed = Listed {
+            size,
+            keys: keys_digest,
+            format: STORE_FORMAT,
+            packed: Some((packed, packed_size)),
+        };
+        let (object, _) = listed.object(&pack);
+        if remote.size(&object).await? == Some(packed_size) {
+            return Ok((listed, 0));
+        }
+        remote.send_file(&object, &aside, packed_size).await?;
+        Ok((listed, packed_size))
     }
-    remote.send_file(&pack_object(&pack), &store.join(pack_file(&pack)), size).await?;
-    Ok((listed, size))
+    .await;
+    _ = tokio::fs::remove_file(&aside).await;
+    sent
+}
+
+/// How hard packs are compressed for the remote: zstd's default, which makes a pack a
+/// seventh of its size at a tenth of a second for 50 MB.
+const PACKING: i32 = 3;
+
+/// Compresses the file `from` into `to`, a temporary file of the store's, and says what
+/// hash and size it has.
+fn pack_whole(from: &Path, to: &Path) -> anyhow::Result<(Digest, u64)> {
+    let mut packed = zstd::Encoder::new(File::create(to)?, PACKING)?;
+    std::io::copy(&mut File::open(from)?, &mut packed)?;
+    packed.finish()?.sync_all()?;
+    // SAFETY: nothing else writes a file this process made under its own name.
+    let bytes = unsafe { memmap2::Mmap::map(&File::open(to)?)? };
+    Ok((Digest::of(&bytes), bytes.len() as u64))
 }
 
 /// Makes the directory a store of this build's format, and seals what ended daemons left
@@ -529,9 +580,22 @@ pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow
     Tally { failed, ..Tally::default() }.settle(said, &remote.traffic)
 }
 
+/// Fetches a pack as its line of the manifest says it is held.
+async fn fetch_pack(
+    remote: &Remote,
+    store: &Path,
+    pack: &Digest,
+    listed: &Listed,
+) -> anyhow::Result<Fetched> {
+    let (object, want) = listed.object(pack);
+    let unpacked = listed.packed.map(|_| *pack);
+    let to = store.join(pack_file(pack));
+    remote.fetch_coded(&object, &want, unpacked, &to, is_pack_of_this_format).await
+}
+
 /// The packs of `missing` that fit in a store that may hold `limit` bytes, the first listed
 /// first, and how many do not.
-fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<Digest>, usize) {
+fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<(Digest, Listed)>, usize) {
     let mut room = limit.unwrap_or(u64::MAX);
     let mut fits = |listed: &Listed| {
         let fits = listed.size <= room;
@@ -539,7 +603,7 @@ fn fitting(missing: Vec<(Digest, Listed)>, limit: Option<u64>) -> (Vec<Digest>, 
         fits
     };
     let (fit, over): (Vec<_>, Vec<_>) = missing.into_iter().partition(|(_, listed)| fits(listed));
-    (fit.into_iter().map(|(pack, _)| pack).collect(), over.len())
+    (fit, over.len())
 }
 
 /// The packs of `missing` that have a key the store lacks, and how many have none. A store
@@ -594,9 +658,8 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
     let (missing, other_format) = manifest.missing(&local);
     let (missing, here_already) = lacking(remote, StoreDir::at(store), missing).await?;
     let (fit, over) = fitting(missing, limit);
-    let fetch = |pack: Digest| {
-        let (from, to) = (pack_object(&pack), store.join(pack_file(&pack)));
-        async move { remote.fetch_file(&from, &pack, &to, is_pack_of_this_format).await }
+    let fetch = |(pack, listed): (Digest, Listed)| async move {
+        fetch_pack(remote, store, &pack, &listed).await
     };
     let tally = Tally::of(fit, remote.traffic.jobs(), fetch).await;
     let mut said = format!(
@@ -831,7 +894,7 @@ struct Lazy {
     remote: Arc<Remote>,
     runtime: Arc<Runtime>,
     /// Each pack and whether it arrived, once it was asked for.
-    packs: Vec<(Digest, OnceLock<bool>)>,
+    packs: Vec<(Digest, Listed, OnceLock<bool>)>,
     holder: FxHashMap<[u8; 32], u32>,
 }
 
@@ -844,10 +907,8 @@ impl Lazy {
         let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
         let (missing, _) = manifest.missing(&local);
         let fetched = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
-            anyhow::Ok((
-                pack,
-                remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await?,
-            ))
+            let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await?;
+            anyhow::Ok((pack, listed, keys))
         }))
         .buffer_unordered(remote.traffic.jobs())
         .collect::<Vec<_>>()
@@ -861,16 +922,16 @@ impl Lazy {
         };
         for fetched in fetched {
             match fetched {
-                Ok((pack, keys)) => lazy.add(pack, &keys),
+                Ok((pack, listed, keys)) => lazy.add(pack, listed, &keys),
                 Err(e) => eprintln!("remote: {e:#}"),
             }
         }
         Ok(lazy)
     }
 
-    fn add(&mut self, pack: Digest, keys: &[u8]) {
+    fn add(&mut self, pack: Digest, listed: Listed, keys: &[u8]) {
         let at = self.packs.len() as u32;
-        self.packs.push((pack, OnceLock::new()));
+        self.packs.push((pack, listed, OnceLock::new()));
         for key in keys.chunks_exact(32) {
             self.holder.entry(key.try_into().expect("32 bytes")).or_insert(at);
         }
@@ -880,15 +941,10 @@ impl Lazy {
     /// compile, which wait here for the pack: the first to ask fetches it.
     fn fetch(&self, key: &[u8; 32]) -> bool {
         let Some(&at) = self.holder.get(key) else { return false };
-        let (pack, arrived) = &self.packs[at as usize];
+        let (pack, listed, arrived) = &self.packs[at as usize];
         *arrived.get_or_init(|| {
-            let to = self.store.join(pack_file(pack));
-            let fetched = self.runtime.block_on(self.remote.fetch_file(
-                &pack_object(pack),
-                pack,
-                &to,
-                is_pack_of_this_format,
-            ));
+            let fetched =
+                self.runtime.block_on(fetch_pack(&self.remote, &self.store, pack, listed));
             match fetched {
                 Ok(Fetched::Whole(bytes)) => {
                     eprintln!("remote: {pack}.pack fetched for a build, {bytes} bytes");
