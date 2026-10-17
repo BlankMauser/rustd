@@ -6,6 +6,7 @@ mod deps;
 mod memory;
 mod outline;
 mod plan;
+mod process;
 mod remote;
 mod splice;
 mod stub;
@@ -245,6 +246,7 @@ struct Resolver<'a> {
     base: Option<PathBuf>,
     rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
+    listed: &'a Listed,
 }
 
 impl Resolver<'_> {
@@ -519,8 +521,10 @@ impl SymbolResolver for Resolver<'_> {
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
+                let listed = self.listed;
                 scope.spawn(move || {
-                    let resolver = Resolver { db: &db, table, root, base, rustc_commit, contents };
+                    let resolver =
+                        Resolver { db: &db, table, root, base, rustc_commit, contents, listed };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -580,11 +584,26 @@ impl SymbolResolver for Resolver<'_> {
         let places = (&*self.root, self.base.as_deref());
         if !krate.data(self.db).origin.is_local() {
             let root = self.crate_root(krate.into())?;
-            return Some(self.contents.library(self.db, krate, &root, &|krate| {
-                Some((self.stable_crate_id(krate), self.crate_root(krate.into())?))
-            }));
+            return Some(self.contents.library(
+                self.db,
+                krate,
+                &root,
+                &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
+                &|krate| process_reads(self.db, krate),
+            ));
         }
-        self.contents.id(self.db, places, krate, &|krate| self.stable_crate_id(krate))
+        self.contents.id(
+            self.db,
+            places,
+            krate,
+            &|krate| self.stable_crate_id(krate),
+            // Every body of the crate has been looked through once it is listed, so that
+            // every variable it asks for is known.
+            &|krate| {
+                self.listed.of(self.db, krate.into());
+                process_reads(self.db, krate)
+            },
+        )
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -1499,7 +1518,15 @@ fn build(
     let start = Instant::now();
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
-    let resolver = Resolver { db, table, root, base, rustc_commit: Default::default(), contents };
+    let resolver = Resolver {
+        db,
+        table,
+        root,
+        base,
+        rustc_commit: Default::default(),
+        contents,
+        listed,
+    };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
@@ -1857,6 +1884,24 @@ fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     built.sort_unstable();
     built.dedup();
     built
+}
+
+/// The variables of the process the build is for that `env!` and `option_env!` in `krate` have
+/// asked for and that are set, sorted. Those the crate's own variables answer are not asked of
+/// the process.
+fn process_reads(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<(String, String)> {
+    let env = krate.env(db);
+    let mut reads: Vec<(String, String)> = db
+        .env_read()
+        .into_iter()
+        .filter(|(of, key)| *of == krate && !env.contains_key(key))
+        .filter_map(|(_, key)| {
+            let value = ide_db::base_db::process_env_var(db, &key)?;
+            Some((key, value))
+        })
+        .collect();
+    reads.sort_unstable();
+    reads
 }
 
 /// The checkout a crate was loaded in, and the one its variables name now.
@@ -2360,7 +2405,23 @@ struct Program {
 }
 
 /// A request, the program it is for, and who waits for the answer.
-type Asked = (Request, Option<Target>, UnixStream);
+type Asked = (Request, Option<Target>, Client);
+
+/// Who asked for a build, and the variables of its process.
+struct Client {
+    stream: UnixStream,
+    env: ide_db::base_db::Env,
+}
+
+impl std::io::Write for &Client {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (&self.stream).write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.stream).flush()
+    }
+}
 
 /// What the daemon waits for.
 enum Event {
@@ -2510,7 +2571,8 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no daemon at {}", socket.display()))?;
     let target = target.map(|it| it.fields()).unwrap_or_default();
-    stream.write_all(format!("{}{target}\n", request.name()).as_bytes())?;
+    let env = process::encode(&process::own());
+    stream.write_all(format!("{}{target}\n{env}\n", request.name()).as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
@@ -2558,17 +2620,21 @@ fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<Wa
 }
 
 /// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>, UnixStream)> {
+fn requested(listener: &UnixListener) -> anyhow::Result<Asked> {
     loop {
         let (stream, _) = listener.accept()?;
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request)?;
+        // The request, then the variables of the client: nothing else is sent.
+        let (mut request, mut env) = (String::new(), String::new());
+        let mut lines = BufReader::new(&stream);
+        lines.read_line(&mut request)?;
+        lines.read_line(&mut env)?;
+        let env = process::decode(env.trim_end_matches('\n'));
         let fields: Vec<&str> = request.trim_end_matches('\n').split('\t').collect();
         let target = Target::parse(&fields[1..]);
         if let Some(request) = Request::parse(fields[0])
             && (fields.len() == 1 || target.is_some())
         {
-            return Ok((request, target, stream));
+            return Ok((request, target, Client { stream, env }));
         }
         // A client that hangs up before the answer is not the daemon's problem.
         let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
@@ -2679,6 +2745,7 @@ fn main() -> anyhow::Result<()> {
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
     let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;
+    ide_db::base_db::set_process_env(&mut db, process::own());
     let Parts { root, base, members } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());
@@ -2872,6 +2939,23 @@ fn main() -> anyhow::Result<()> {
                     };
                     let asked = target.clone();
                     let mut target = target;
+                    // One build is for one process: its variables are what `env!` reads.
+                    if process::differs(&db, &stream.env) {
+                        if !clients.is_empty() {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        builds.settle(&mut db, &mut programs)?;
+                        let reading = process::turn(&mut db, stream.env.clone());
+                        if !reading.is_empty() {
+                            for program in &mut programs {
+                                program.known.touch(&db, Some(&reading));
+                                program.unbuilt.stale = true;
+                            }
+                            listed.touch(&db, Some(&reading));
+                            as_built.lock().unwrap().clear();
+                        }
+                    }
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
                             // What a checkout reads is known once a build of it is over.

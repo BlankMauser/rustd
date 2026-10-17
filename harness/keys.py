@@ -37,13 +37,7 @@ def arg(*more):
 
 
 # What rustd does not do yet: these differ, and are told apart when they do.
-OPEN = {
-    # rustd reads `env!` and `option_env!` from what cargo and build scripts set, not from the
-    # variables of whoever asked for the build.
-    "a variable of the process read by option_env!",
-    # rustd has no profile: it compiles as `dev` does, with debug assertions and overflow checks.
-    "the release profile",
-}
+OPEN = set()
 
 # (name, the change, the line of the program's output it has to show in or None for no line)
 CASES = [
@@ -75,7 +69,7 @@ def build(ws, env, args):
     os.environ.update(env)
     try:
         fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
-        fx.rustd_args = [it for at, it in enumerate(args) if "--features" in args[max(0, at - 1):at + 1]]
+        fx.rustd_args = list(args)
         fx.rustc_build()
         fx.rustd_build()
         left = sum(row[0] == "skipped" and "no rustc symbol" not in row[2] for rows in fx.reports.values() for row in rows)
