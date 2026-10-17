@@ -263,11 +263,12 @@ def round_trip(top, remote, name, crates, target, workspace):
     objects = bucket.objects()
     packs = [it for it in objects if it.startswith("packs/")]
     check("the bucket has A's packs, their keys and the manifest",
-          out.returncode == 0 and packs and sorted("packs/" + it for it in a.packs()) == sorted(packs)
+          out.returncode == 0 and packs and sorted("packs/" + it + ".zst" for it in a.packs()) == sorted(packs)
           and "manifests/default" in objects and len([it for it in objects if it.startswith("keys/")]) == len(packs),
           f"{len(objects)} objects")
     check("every object in the bucket is what its name says",
-          all(digest(bucket.get(it)) == it.split("/")[1].split(".")[0] for it in objects if not it.startswith("manifests/")))
+          all(digest(unpacked(bucket.get(it)) if it.endswith(".zst") else bucket.get(it)) == it.split("/")[1].split(".")[0]
+              for it in objects if not it.startswith("manifests/")))
     out = a.rustd("cache", "push", address)
     check("a second push sends nothing", out.returncode == 0 and out.stdout.startswith("0 packs added"), out.stdout.strip())
 
