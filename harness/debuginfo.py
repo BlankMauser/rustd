@@ -313,6 +313,8 @@ def debugger(tally, what, binary, cwd, place, env=None):
     said = f"{what}: gdb at {os.path.basename(file)}:{line}"
     stop = re.search(r"Breakpoint 1, .*? at (\S+):(\d+)", out, re.S)
     if not stop or stop.group(2) != line or not file.endswith(os.path.basename(stop.group(1))):
+        # What gdb said up to where it would have stopped is what tells why it did not.
+        print("\n".join("    gdb: " + it[:200] for it in (out.split("<where>")[0] + ran.stderr).strip().splitlines()[-12:]))
         return tally.say(said, "NOT STOPPED", (out.strip().splitlines() or ["nothing printed"])[-1][:80])
     value = re.search(r"\$1 = (0x[0-9a-f]+)", out)
     base = re.search(r"^\s*(0x[0-9a-f]+)\s+0x[0-9a-f]+\s+0x[0-9a-f]+\s+0x0\s", out.split("<mapped>")[1], re.M)
