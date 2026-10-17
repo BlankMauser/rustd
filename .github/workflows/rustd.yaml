@@ -13,7 +13,6 @@ concurrency:
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  RUST_BACKTRACE: short
   LLVM_SYS_201_PREFIX: /usr/lib/llvm-20
 
 jobs:
@@ -63,6 +62,7 @@ jobs:
           run asmedits.py
           run includes.py
           run worktrees.py
+          run keys.py
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py
