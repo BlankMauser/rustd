@@ -24,10 +24,10 @@ use cranelift_codegen::{
         DW_AT_language, DW_AT_linkage_name, DW_AT_location, DW_AT_low_pc, DW_AT_name,
         DW_AT_producer, DW_AT_ranges, DW_AT_stmt_list, DW_AT_type, DW_TAG_array_type,
         DW_TAG_base_type, DW_TAG_enumeration_type, DW_TAG_enumerator, DW_TAG_formal_parameter,
-        DW_TAG_lexical_block, DW_TAG_member, DW_TAG_pointer_type, DW_TAG_structure_type,
-        DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_template_type_parameter, DW_TAG_union_type,
-        DW_TAG_variable, DW_TAG_variant, DW_TAG_variant_part, DwAte, Encoding, Format,
-        LineEncoding, RunTimeEndian, SectionId,
+        DW_TAG_lexical_block, DW_TAG_member, DW_TAG_namespace, DW_TAG_pointer_type,
+        DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type,
+        DW_TAG_template_type_parameter, DW_TAG_union_type, DW_TAG_variable, DW_TAG_variant,
+        DW_TAG_variant_part, DwAte, Encoding, Format, LineEncoding, RunTimeEndian, SectionId,
         write::{
             Address, AttributeValue, DwarfUnit, EndianVec, Expression, FileId, LineProgram,
             LineString, Location, LocationList, Range, RangeList, Result as WriteResult, Sections,
@@ -189,6 +189,9 @@ pub(super) struct Field {
 pub(super) struct Tag {
     pub(super) offset: u64,
     pub(super) size: u64,
+    /// Whether the variants are the states of a coroutine, which rustc tells of by their
+    /// numbers, with a name for the tag.
+    pub(super) states: bool,
 }
 
 /// A variant of an enum. `tag` is the value of the tag that says a value is of this variant;
@@ -379,6 +382,8 @@ pub(super) struct DebugContext {
     files: FxHashMap<String, FileId>,
     ranges: Vec<Range>,
     types: FxHashMap<SharedType, UnitEntryId>,
+    /// The modules and functions of the unit that a type is written in, by their paths.
+    namespaces: FxHashMap<String, UnitEntryId>,
     /// Whether the variables of the functions are told of, and not their lines alone.
     variables: bool,
 }
@@ -417,6 +422,7 @@ impl DebugContext {
             files: FxHashMap::default(),
             ranges: Vec::new(),
             types: FxHashMap::default(),
+            namespaces: FxHashMap::default(),
             variables,
         };
         context.begin_unit();
@@ -454,6 +460,7 @@ impl DebugContext {
         let ranges = std::mem::take(&mut self.ranges);
         self.files.clear();
         self.types.clear();
+        self.namespaces.clear();
         self.begin_unit();
         if ranges.is_empty() {
             return;
@@ -511,16 +518,39 @@ impl DebugContext {
             }
             return Some(entry);
         }
-        let root = self.dwarf.unit.root();
         let entry = match &shared {
-            SharedType::Named(tag, name, _) => self.named(root, *tag, name),
-            SharedType::Array(..) => self.dwarf.unit.add(root, DW_TAG_array_type),
+            SharedType::Named(tag, name, _) => {
+                let (within, name) = match ty {
+                    DebugType::Base { .. } | DebugType::Pointer { .. } => (None, name.as_str()),
+                    _ => within(name),
+                };
+                let parent = self.namespace(within);
+                self.named(parent, *tag, name)
+            }
+            SharedType::Array(..) => self.dwarf.unit.add(self.dwarf.unit.root(), DW_TAG_array_type),
         };
         // A type that points to itself finds its entry here.
         of.entries[index as usize] = Some(entry);
         self.types.insert(shared, entry);
         self.fill(of, entry, ty);
         Some(entry)
+    }
+
+    /// The entry of the module or function at `path`, which a debugger puts in front of the
+    /// names of the types in it, as rustc has them. No path is the unit itself.
+    fn namespace(&mut self, path: Option<&str>) -> UnitEntryId {
+        let Some(path) = path else { return self.dwarf.unit.root() };
+        if let Some(&entry) = self.namespaces.get(path) {
+            return entry;
+        }
+        let (outer, name) = match path.rsplit_once("::") {
+            Some((outer, name)) => (Some(outer), name),
+            None => (None, path),
+        };
+        let parent = self.namespace(outer);
+        let entry = self.named(parent, DW_TAG_namespace, name);
+        self.namespaces.insert(path.to_owned(), entry);
+        entry
     }
 
     /// Writes what `ty` is made of into its `entry`.
@@ -565,20 +595,20 @@ impl DebugContext {
             }
             DebugType::Enum { of: it, tag, variants } => {
                 size(&mut self.dwarf.unit, it.size);
-                self.variants(of, entry, it.size, *tag, variants);
-                self.parameters(of, entry, &it.parameters);
+                self.variants(of, entry, it, *tag, variants);
             }
         }
     }
 
     /// The variants of the enum at `entry` the way rustc tells of them: a part of the enum
     /// that is one of several members by the value of another, each member a struct of its
-    /// own with the fields of a variant.
+    /// own with the fields of a variant, and with what the generic parameters of the enum
+    /// stand for: on the enum itself they would have lldb spell its name its own way.
     fn variants(
         &mut self,
         of: &mut FunctionTypes<'_>,
         entry: UnitEntryId,
-        size: u64,
+        whole: &Aggregate,
         tag: Option<Tag>,
         variants: &[Variant],
     ) {
@@ -592,17 +622,27 @@ impl DebugContext {
             entry.set(DW_AT_artificial, AttributeValue::Flag(true));
             entry.set(DW_AT_data_member_location, AttributeValue::Udata(tag.offset));
             unit.get_mut(part).set(DW_AT_discr, AttributeValue::UnitRef(member));
+            if tag.states {
+                let name = self.dwarf.strings.add("__state");
+                self.dwarf.unit.get_mut(member).set(DW_AT_name, AttributeValue::StringRef(name));
+            }
         }
+        let states = tag.is_some_and(|it| it.states);
         for variant in variants {
             let fields = self.named(entry, DW_TAG_structure_type, &variant.name);
-            self.dwarf.unit.get_mut(fields).set(DW_AT_byte_size, AttributeValue::Udata(size));
+            let size = AttributeValue::Udata(whole.size);
+            self.dwarf.unit.get_mut(fields).set(DW_AT_byte_size, size);
+            self.parameters(of, fields, &whole.parameters);
             self.members(of, fields, &variant.fields);
             let choice = self.dwarf.unit.add(part, DW_TAG_variant);
             if let Some(value) = variant.tag {
                 let value = AttributeValue::Udata(value);
                 self.dwarf.unit.get_mut(choice).set(DW_AT_discr_value, value);
             }
-            let member = self.named(choice, DW_TAG_member, &variant.name);
+            let member = match variant.tag {
+                Some(state) if states => self.named(choice, DW_TAG_member, &state.to_string()),
+                _ => self.named(choice, DW_TAG_member, &variant.name),
+            };
             let member = self.dwarf.unit.get_mut(member);
             member.set(DW_AT_type, AttributeValue::UnitRef(fields));
             member.set(DW_AT_data_member_location, AttributeValue::Udata(0));
@@ -873,6 +913,18 @@ impl DebugContext {
 }
 
 /// The address `by` bytes past `start`.
+/// The path a type named `name` is written at and its name there, as in `a::b` and `C<d::E>`.
+/// A name that is not a path, like that of a tuple or of a pointer, is in nothing.
+fn within(name: &str) -> (Option<&str>, &str) {
+    let generics = name.find('<').unwrap_or(name.len());
+    let Some((path, last)) = name[..generics].rsplit_once("::") else { return (None, name) };
+    let plain = |it: char| it.is_alphanumeric() || matches!(it, '_' | ':' | '{' | '}' | '#');
+    if !path.chars().all(plain) || !last.chars().all(plain) {
+        return (None, name);
+    }
+    (Some(path), &name[path.len() + 2..])
+}
+
 fn past(start: Address, by: CodeOffset) -> Address {
     match start {
         Address::Constant(start) => Address::Constant(start + u64::from(by)),

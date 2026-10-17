@@ -14,9 +14,9 @@ whether rustd leaves it out when the profile says `debug = false`.
 
 RUSTD_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
                      jumps, so a frame the cargo build prints may be missing: those are counted.
---only NAME          one of: corpus stress rung2 edits callers locals types scopes profile cost
+--only NAME          one of: corpus stress rung2 edits callers locals types scopes rich profile cost
 """
-import bisect, os, re, shutil, struct, subprocess, sys, tempfile, time
+import bisect, glob, os, re, shutil, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -166,6 +166,69 @@ fn main() {
     println!("{}", scoped(black_box(4)));
 }
 """
+# Closures, what an `async fn` keeps, pointers to `dyn` and enums with fields or without a tag
+# of their own: the types a debugger's printers for Rust look into the shape of.
+RICH_MAIN = """use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
+trait Named { fn name(&self) -> u32; }
+struct Dog { legs: u32 }
+impl Named for Dog { fn name(&self) -> u32 { self.legs } }
+enum Tree { Leaf, Node(Box<Tree>, u32) }
+enum Wide { A(u64, u8), B { text: &'static str }, C }
+
+struct Once(bool);
+impl Future for Once {
+    type Output = u32;
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u32> {
+        if self.0 { Poll::Ready(7) } else { self.0 = true; Poll::Pending }
+    }
+}
+
+async fn steps(start: u32) -> u32 {
+    let first = Once(false).await + start;
+    let kept = [first, 2];
+    let second = Once(false).await;
+    kept[0] + second
+}
+
+fn show(seed: u32) -> u32 {
+    let offset = seed + 1;
+    let mut count = 0u64;
+    let by_ref = |x: u32| x + offset;
+    let by_move = move |x: u32| x * offset;
+    let mut by_mut = || { count += 1; count };
+    let dog = Dog { legs: 4 };
+    let object: &dyn Named = &dog;
+    let boxed: Box<dyn Named> = Box::new(Dog { legs: 3 });
+    let leaf = Tree::Leaf;
+    let node = Tree::Node(Box::new(Tree::Leaf), 5);
+    let wide = Wide::A(9, 1);
+    let wide_b = Wide::B { text: "hi" };
+    let wide_c = Wide::C;
+    let nested: Option<Option<bool>> = Some(None);
+    let ordering = std::cmp::Ordering::Less;
+    let mut future = Box::pin(steps(seed));
+    let fresh = steps(seed);
+    let mut cx = Context::from_waker(Waker::noop());
+    let _ = future.as_mut().poll(&mut cx);
+    let once = &*future;
+    let _ = std::hint::black_box(&once);
+    let sum = by_ref(1) + by_move(2) + by_mut() as u32 + object.name() + boxed.name();
+    println!("{}", sum);
+    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested, &ordering, &fresh));
+    let _ = future.as_mut().poll(&mut cx);
+    let _ = future.as_mut().poll(&mut cx);
+    sum
+}
+
+fn main() {
+    println!("{}", show(std::hint::black_box(10)));
+}
+"""
+RICH = ["by_ref", "by_move", "by_mut", "object", "boxed", "leaf", "node", "wide", "wide_b", "wide_c", "nested",
+        "ordering", "fresh", "*once", "future"]
 SCOPED = ["seed", "value", "inner", "total", "sum", "step"]
 TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
          "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
@@ -721,6 +784,76 @@ def printed_by(debugger, binary, cwd, place, names):
     return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
 
 
+def lldb_path():
+    """The search path `rust-lldb` finds an `lldb` on, or None: distributions name theirs by version."""
+    if shutil.which("lldb"):
+        return os.environ["PATH"]
+    for found in sorted(glob.glob("/usr/lib/llvm-*/bin/lldb"), reverse=True):
+        return os.path.dirname(found) + os.pathsep + os.environ["PATH"]
+    return None
+
+
+def shown_by_lldb(binary, cwd, file, line, names):
+    """What `rust-lldb` shows for each of the names when stopped at a line, addresses aside."""
+    commands = [f"breakpoint set --file {file} --line {line}", "run", *[f"frame variable {name}" for name in names], "kill"]
+    ran = subprocess.run(["rust-lldb", "--batch", *[x for c in commands for x in ("-o", c)], binary],
+                         capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300,
+                         env={**os.environ, "PATH": lldb_path()})
+    shown = {}
+    for name in names:
+        found = re.search(rf"^\(lldb\) frame variable {re.escape(name)}\n(.*?)(?=^\(lldb\) )", ran.stdout, re.S | re.M)
+        # An address of nothing stays what it is: lldb shows bytes it has no place for as zeros.
+        shown[name] = re.sub(r"0x0*[1-9a-f][0-9a-f]*", "0x..", found.group(1).strip()) if found and found.group(1).strip() else None
+    return shown
+
+
+def agreement(names, theirs, ours, lost=()):
+    """How many of the names a debugger shows as it does for a rustc build, which it has no
+    value for or only part of one, and which it shows otherwise. The names are returned with
+    what is said. `lost` are names known to have no whole value, for a debugger that does not
+    say so itself."""
+    partly = (OPTIMIZED_OUT, "<synthetic pointer>", "not available")
+    gone = [name for name in names if ours[name] != theirs[name]
+            and (name in lost or ours[name] and any(it in ours[name] for it in partly))]
+    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in names if ours[name] != theirs[name] and name not in gone]
+    unknown = [name for name in names if theirs[name] is None]
+    return (not wrong and not unknown, gone,
+            f"{len(names) - len(wrong) - len(gone)} of {len(names)}, {len(gone)} optimized out"
+            + (f", but {wrong[0][:160]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else ""))
+
+
+def rich(tally):
+    """Whether closures, the states of an `async fn`, pointers to `dyn` and enums are shown as
+    those of a rustc build are, by the toolchain's gdb and by its lldb."""
+    ws = tempfile.mkdtemp(prefix="rustd-debuginfo-rich-")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, RICH_MAIN)):
+        open(os.path.join(ws, path), "w").write(text)
+    fx = Fixture(ws, ["sline"], ["-p", "sline"])
+    fx.rustc_build()
+    fx.rustd_build()
+    verify(tally, "rich", fx.binary)
+    reference = os.path.join(ws, "target", "debug", "sline")
+    line = RICH_MAIN[:RICH_MAIN.index('println!("{}", sum)')].count("\n") + 1
+    lost = []
+    if shutil.which("rust-gdb"):
+        theirs = printed_by("rust-gdb", reference, ws, f"{MAIN}:{line}", RICH)
+        # A name of rustd's own for the table a `dyn` pointer has is no part of what is shown.
+        ours = {name: it and re.sub(r" <\.L[^>]*>", "", it)
+                for name, it in printed_by("rust-gdb", fx.binary, ws, f"{MAIN}:{line}", RICH).items()}
+        same, lost, said = agreement(RICH, theirs, ours)
+        tally.say("rich: rust-gdb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
+    else:
+        tally.say("rich: rust-gdb shows them", "not looked at", "no rust-gdb to ask")
+    if shutil.which("rust-lldb") and lldb_path():
+        theirs = shown_by_lldb(reference, ws, MAIN, line, RICH)
+        # lldb shows zeros where a value is there in part, so what gdb found to be so is not held against it.
+        same, _, said = agreement(RICH, theirs, shown_by_lldb(fx.binary, ws, MAIN, line, RICH), lost)
+        tally.say("rich: rust-lldb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
+    else:
+        tally.say("rich: rust-lldb shows them", "not looked at", "no rust-lldb or no lldb to ask")
+
+
 def shapes(tally):
     """Whether the debugger shows values of each kind of type as it shows those of a rustc build.
 
@@ -875,6 +1008,7 @@ def main():
         "locals": lambda: variables(tally),
         "types": lambda: shapes(tally),
         "scopes": lambda: scopes(tally),
+        "rich": lambda: rich(tally),
         "profile": lambda: settings(tally),
         "cost": lambda: cost(tally),
     }
