@@ -511,3 +511,99 @@ pub mod x86 {
         out
     }
 }
+
+/// What `x86` has, in AArch64 assembly.
+#[cfg(target_arch = "aarch64")]
+pub mod arm {
+    use std::arch::{asm, naked_asm};
+
+    #[unsafe(naked)]
+    pub extern "C" fn naked_add(a: u64, b: u64) -> u64 {
+        naked_asm!("add x0, x0, x1", "ret")
+    }
+    pub fn naked_functions() -> u64 {
+        naked_add(40, 2)
+    }
+
+    pub fn asm_goto() -> u32 {
+        let mut out = 0;
+        for x in [0u64, 5] {
+            unsafe {
+                asm!("cbnz {0}, {1}", in(reg) x, label { out += 10 }, options(nostack));
+            }
+            out += 1;
+        }
+        out
+    }
+
+    pub fn asm_cfg() -> u64 {
+        let mut v: u64 = 1;
+        unsafe {
+            asm!(
+                "add {0}, {0}, #2",
+                #[cfg(false)]
+                "add {0}, {0}, #100",
+                #[cfg(target_arch = "aarch64")]
+                "add {0}, {0}, #4",
+                inout(reg) v,
+            );
+        }
+        v
+    }
+
+    #[target_feature(enable = "neon")]
+    fn with_neon(a: &[u32; 8]) -> u32 {
+        a.iter().map(|x| x.wrapping_mul(3)).sum()
+    }
+    #[target_feature(enable = "neon")]
+    fn calls_safely(a: &[u32; 8]) -> u32 {
+        let f: unsafe fn(&[u32; 8]) -> u32 = with_neon;
+        with_neon(a) + (|| with_neon(a))() + unsafe { f(a) }
+    }
+    pub fn target_feature_11() -> u32 {
+        let a = [1, 2, 3, 4, 5, 6, 7, 8];
+        if std::arch::is_aarch64_feature_detected!("neon") { unsafe { calls_safely(&a) } } else { 324 }
+    }
+
+    #[unsafe(naked)]
+    pub extern "C" fn naked_const(a: u64) -> u64 {
+        naked_asm!("add x0, x0, #{k}", "ret", k = const NAKED_K)
+    }
+    #[unsafe(naked)]
+    pub extern "C" fn naked_float(a: f64, b: f64) -> f64 {
+        naked_asm!("fadd d0, d0, d1", "ret")
+    }
+    const NAKED_K: u64 = 5 + 2;
+    pub fn naked_more() -> (u64, f64, u64) {
+        let f: extern "C" fn(u64) -> u64 = naked_const;
+        (naked_const(10), naked_float(1.5, 2.25), f(1))
+    }
+
+    pub fn asm_goto_more() -> Vec<u32> {
+        let mut out = Vec::new();
+        for x in 0u64..4 {
+            let hit = 0u32;
+            unsafe {
+                asm!(
+                    "cmp {x}, #1", "b.eq {one}", "cmp {x}, #2", "b.eq {two}",
+                    x = in(reg) x,
+                    one = label { out.push(100) },
+                    two = label { out.push(200); continue },
+                );
+            }
+            out.push(hit);
+        }
+        for x in 0u64..3 {
+            let v = 'found: {
+                unsafe {
+                    asm!("cbnz {0}, {1}", "b {2}", in(reg) x,
+                         label { break 'found x as u32 * 3 }, label { break 'found 77 },
+                         options(noreturn));
+                }
+                99
+            };
+            out.push(v);
+        }
+        out
+    }
+}

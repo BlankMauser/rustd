@@ -700,7 +700,16 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 // Asked for by a guarded call alone, to look at the slot of the frame its
                 // exception arrives in. LLVM lays out the frame, so the slot is one of the
                 // function's own, and this is where it would be the slot of the frame.
+                //
+                // Where exceptions arrive in a register, it is asked for by a function
+                // that takes `...`, to find the arguments on the stack: Cranelift's frame
+                // is what says where they are from it.
                 Opcode::GetFramePointer => {
+                    let target =
+                        crate::mir::codegen::Target::selected().map_err(Unhandled::Llvm)?;
+                    if target.exception_in_register() {
+                        return Err(Unhandled::Shape("the frame pointer"));
+                    }
                     let arrival = self.arrival()?;
                     let above = self.immediate(self.context.i64_type(), -i64::from(ARRIVAL), true);
                     self.set(inst, Operand::Pointer(self.offset(arrival, above)?));

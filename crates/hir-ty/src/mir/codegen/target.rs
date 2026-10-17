@@ -207,7 +207,13 @@ impl Target {
     }
 
     /// The code generator for the target. `regalloc` names Cranelift's register allocator.
-    pub(super) fn isa(&self, regalloc: &str) -> Result<OwnedTargetIsa, String> {
+    /// With `frame_pointers` every function it compiles keeps one, which a function that
+    /// asks for its frame pointer needs.
+    pub(super) fn isa(
+        &self,
+        regalloc: &str,
+        frame_pointers: bool,
+    ) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
         // An image of PE reaches all of itself relative to the instruction, and what it
         // imports through the stubs the linker adds: there is no table of addresses to go
@@ -226,9 +232,10 @@ impl Target {
             flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
             flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
         }
-        if !self.exception_in_register() {
+        if frame_pointers || !self.exception_in_register() {
             // The pads of a convention Cranelift has no landing pads for take the exception
-            // from the frame (see `unwind::seh`), which the frame pointer finds.
+            // from the frame (see `unwind::seh`), which the frame pointer finds. Cranelift
+            // gives a function its frame pointer only when all of them keep one.
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;

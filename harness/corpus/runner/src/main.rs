@@ -450,6 +450,18 @@ fn main() {
     println!("stabilized naked_more {:?}", cases::stabilized::x86::naked_more());
     #[cfg(all(target_arch = "x86_64", unix))]
     println!("stabilized asm_goto_more {:?}", cases::stabilized::x86::asm_goto_more());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm naked_functions {:?}", cases::stabilized::arm::naked_functions());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm asm_goto {:?}", cases::stabilized::arm::asm_goto());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm asm_cfg {:?}", cases::stabilized::arm::asm_cfg());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm target_feature_11 {:?}", cases::stabilized::arm::target_feature_11());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm naked_more {:?}", cases::stabilized::arm::naked_more());
+    #[cfg(target_arch = "aarch64")]
+    println!("stabilized arm asm_goto_more {:?}", cases::stabilized::arm::asm_goto_more());
     #[cfg(panic = "unwind")]
     println!("async_more {:?}", cases::async_more::run());
     println!("const_patterns {:?}", cases::const_patterns::run());
