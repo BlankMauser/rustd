@@ -51,15 +51,14 @@ pub(super) fn emit(
     } else {
         optimization
     };
-    let context = Context::create();
-    let module = context.create_module("rustd");
-    let named: Vec<ir::StackSlot> = recorder.named_slots().collect();
-    Machine::with(optimization, |machine| {
+    Machine::with(optimization, |context, machine| {
+        let module = context.create_module("rustd");
+        let named: Vec<ir::StackSlot> = recorder.named_slots().collect();
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
         tally.time(Phase::Lower, || {
-            lower::Lowering::lower(&context, &module, func, &named, &constants)
+            lower::Lowering::lower(context, &module, func, &named, &constants)
         })?;
         if std::env::var_os("RUSTD_DUMP_LLVM").is_some() {
             eprintln!("{}", module.print_to_string().to_string_lossy());
@@ -90,9 +89,8 @@ pub(super) fn emit(
 /// FIXME: assembly LLVM rejects ends the process: its default diagnostic handler exits on an
 /// error, and inkwell has no way to set another.
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    let context = Context::create();
-    let module = context.create_module("rustd_asm");
-    Machine::with(Optimization::NONE, |machine| {
+    Machine::with(Optimization::NONE, |context, machine| {
+        let module = context.create_module("rustd_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
@@ -134,32 +132,42 @@ impl Optimization {
     }
 }
 
-/// The target as LLVM knows it. One per thread and level: making one costs more than a
-/// small function does.
-struct Machine;
+/// The target as LLVM knows it, one per thread and level: making one costs more than a
+/// small function does. The context the modules are made in is kept with them, as a
+/// machine holds on to things of the last context it compiled a module of: the instruction
+/// selector of AArch64 keeps the source location of the last instruction it saw, and lets
+/// go of it at the next function, by when a context of that one module would be gone.
+#[derive(Default)]
+struct Machine {
+    // Before the context, which has to outlive them.
+    machines: FxHashMap<Optimization, TargetMachine>,
+    context: Option<Context>,
+    /// How many modules were made in the context.
+    modules: usize,
+}
 
 impl Machine {
+    /// How many modules a context is kept for. The constants and source locations of all
+    /// of them stay in it.
+    const MODULES: usize = 1024;
+
     fn with<T>(
         optimization: Optimization,
-        work: impl FnOnce(&TargetMachine) -> Result<T, Unhandled>,
+        work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
-            static MACHINES: RefCell<FxHashMap<Optimization, TargetMachine>> = RefCell::default();
+            static MACHINE: RefCell<Machine> = RefCell::default();
         }
-        // At no optimization LLVM selects AArch64 code with GlobalISel, whose selector
-        // lives in the machine and keeps the debug location of the last instruction it
-        // saw. That location belongs to a context which is gone by the next function,
-        // so such a machine serves one function.
-        let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
-        if emitted.arch == Arch::Aarch64 && optimization.level() == OptimizationLevel::None {
-            return work(&Self::create(optimization)?);
-        }
-        MACHINES.with_borrow_mut(|machines| {
-            let machine = match machines.entry(optimization) {
+        MACHINE.with_borrow_mut(|this| {
+            if this.modules == Self::MODULES {
+                *this = Machine::default();
+            }
+            this.modules += 1;
+            let machine = match this.machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),
                 Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
             };
-            work(machine)
+            work(this.context.get_or_insert_with(Context::create), machine)
         })
     }
 

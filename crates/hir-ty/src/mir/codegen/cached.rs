@@ -100,6 +100,7 @@ pub(super) struct CachedCode {
     bytes: Vec<u8>,
     align: u64,
     relocs: Vec<CachedReloc>,
+    elf_types: Vec<(u32, u32)>,
     unwind: Option<FunctionUnwind>,
     lines: Vec<LineRow>,
     slots: SlotPlaces,
@@ -128,6 +129,7 @@ impl From<&Code> for CachedCode {
                     addend: it.addend,
                 })
                 .collect(),
+            elf_types: code.elf_types.clone(),
             unwind: code.unwind.clone(),
             lines: code.lines.clone(),
             slots: code.slots.clone(),
@@ -155,6 +157,7 @@ impl CachedCode {
                     addend: it.addend,
                 })
                 .collect(),
+            elf_types: self.elf_types.clone(),
             unwind: self.unwind.clone(),
             lines: self.lines.clone(),
             slots: self.slots.clone(),

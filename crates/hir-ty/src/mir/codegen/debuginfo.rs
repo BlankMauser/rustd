@@ -234,10 +234,13 @@ impl SlotPlaces {
         frame: &cranelift_codegen::MachBufferFrameLayout,
         slots: impl Iterator<Item = ir::StackSlot>,
     ) -> SlotPlaces {
-        // FIXME: variables are told of on x86-64 alone, by `rbp`.
-        if isa.triple().architecture != target_lexicon::Architecture::X86_64 {
-            return SlotPlaces::default();
-        }
+        // The register a function with locals has its frame's address in, which is what
+        // Cranelift says where they are from.
+        let register = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_64 => gimli::X86_64::RBP,
+            target_lexicon::Architecture::Aarch64(_) => gimli::AArch64::X29,
+            _ => return SlotPlaces::default(),
+        };
         let to_fp = i64::from(frame.frame_to_fp_offset);
         let slots = slots
             .filter_map(|slot| {
@@ -245,7 +248,7 @@ impl SlotPlaces {
                 Some((slot.as_u32(), VariablePlace::Frame(offset)))
             })
             .collect();
-        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + gimli::X86_64::RBP.0 as u8], slots }
+        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + register.0 as u8], slots }
     }
 }
 

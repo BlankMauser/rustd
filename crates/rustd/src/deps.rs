@@ -26,6 +26,11 @@ use crate::remote::{Digest, Fetched, Remote, Tally, project_name, runtime};
 /// The directories of a profile that hold units, the one cargo trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
 
+/// The archives the lines of a list of units name.
+pub(crate) fn archives(lines: &str) -> impl Iterator<Item = Digest> {
+    Listed::parse(lines).0.into_values()
+}
+
 /// The units a project's builds used and the archive of each: `unit hash` a line.
 struct Listed(BTreeMap<String, Digest>);
 

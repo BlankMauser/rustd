@@ -2,8 +2,9 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-// `box` patterns are unstable: the case is for a nightly toolchain only.
-#![cfg_attr(feature = "nightly", feature(box_patterns))]
+// `box` patterns and 128-bit variable arguments are unstable: the cases are for a nightly
+// toolchain only.
+#![cfg_attr(feature = "nightly", feature(box_patterns, c_variadic_int128))]
 
 pub mod stabilized;
 
@@ -1435,6 +1436,40 @@ pub mod foreign {
         h: i128,
     ) -> u128 {
         (a as u128 + b + c as u128).wrapping_add(d as u128) + e as u128 + f + g as u128 + h as u128
+    }
+
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub struct Aligned {
+        pub a: u64,
+        pub b: u32,
+    }
+
+    /// An aggregate aligned to sixteen bytes that the registers left do not hold is on the
+    /// stack at a multiple of sixteen, and what comes after it follows it there.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn aligned(
+        a: u64,
+        x: Aligned,
+        b: u64,
+        c: u64,
+        d: u64,
+        y: Aligned,
+        e: u8,
+        z: Aligned,
+        f: u128,
+        g: u16,
+    ) -> u128 {
+        let near = a + x.a * 3 + x.b as u64 + b * 5 + c * 7 + d * 11;
+        let far = y.a * 13 + y.b as u64 * 17 + e as u64 * 19 + z.a * 23 + z.b as u64 * 29;
+        (near + far) as u128 + f * 31 + g as u128 * 37
+    }
+
+    /// A 128-bit integer that the registers left do not hold takes them out of use.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn wide_last(a: [u64; 7], b: i128, c: u64, d: u32, e: i128, f: u8) -> i128 {
+        let near = a.iter().enumerate().map(|(at, it)| it * (at as u64 + 1)).sum::<u64>();
+        near as i128 + b * 3 + c as i128 * 5 + d as i128 * 7 + e * 11 + f as i128 * 13
     }
 
     pub fn through_pointer(
