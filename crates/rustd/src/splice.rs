@@ -134,6 +134,13 @@ impl Baseline {
 
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
+    /// Whether a splice leaves what a debugger reads of the executable as it was, so that
+    /// it knows nothing of the code added. A PDB is a file of its own that only the linker
+    /// writes.
+    pub(crate) fn leaves_debug_info(&self) -> bool {
+        matches!(self.image, Executable::Pe(_))
+    }
+
     pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {
         let (addition, len) = match &self.image {
             Executable::Elf(image) => {

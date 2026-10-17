@@ -260,6 +260,28 @@ fn nanos() -> u128 {
     SystemTime::UNIX_EPOCH.elapsed().map_or(0, |it| it.as_nanos())
 }
 
+/// Opens a sealed pack to read it and to say when it was last used. It can still be renamed
+/// and removed by others while it is open, on Windows too: std shares a file for all three.
+fn open_pack(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        // The right to read does not bring the right to set a time there, and without it
+        // a pack that is read from looks unused to a collection. Another user's pack may
+        // not grant it: that one stays as old as it was.
+        OpenOptions::new()
+            .access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+            .open(path)
+            .or_else(|_| File::open(path))
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -859,7 +881,7 @@ impl Store {
     fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Record>)> {
         let path = self.dir.dir.join(name);
         // Evicted since it was listed.
-        let mut file = File::open(&path).ok()?;
+        let mut file = open_pack(&path).ok()?;
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes).ok()?;
         match Pack::check(name, &bytes) {
