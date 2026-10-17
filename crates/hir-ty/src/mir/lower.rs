@@ -2905,7 +2905,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
-        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span);
+        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }
 
@@ -3271,7 +3271,7 @@ fn lower_closure_body<'db>(
     ctx.resolver.reset_to_guard(resolver_guard);
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());
     }
     if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
         let ready = ctx.poll_variant(true)?;
@@ -3436,7 +3436,7 @@ pub fn promoted_mir_body_query<'db>(
         ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
     {
         let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
     }
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
@@ -3544,7 +3544,7 @@ pub fn lower_to_mir_with_store<'db>(
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }
     Ok(ctx.result)
 }
