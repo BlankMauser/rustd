@@ -33,7 +33,7 @@ use inkwell::{
 use rustc_hash::FxHashMap;
 
 use super::{OWN, Unhandled};
-use crate::mir::codegen::unwind;
+use crate::mir::codegen::unwind::{self, seh::ARRIVAL};
 
 type Lowered<T> = Result<T, Unhandled>;
 
@@ -88,6 +88,10 @@ pub(super) struct Lowering<'ctx, 'f> {
     callees: FxHashMap<ir::FuncRef, FunctionValue<'ctx>>,
     globals: FxHashMap<ir::GlobalValue, PointerValue<'ctx>>,
     pads: FxHashMap<Pad, BasicBlock<'ctx>>,
+    /// The block the allocas are in.
+    frame: Option<BasicBlock<'ctx>>,
+    /// Where a guarded call that unwound leaves its exception (see `unwind::seh`).
+    arrival: Option<PointerValue<'ctx>>,
 }
 
 impl<'ctx, 'f> Lowering<'ctx, 'f> {
@@ -102,8 +106,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         Self::mark_signature(context, &func.signature, Side::Callee, |loc, attribute| {
             function.add_attribute(loc, attribute)
         });
-        let cpu = crate::mir::codegen::Target::selected().map_err(Unhandled::Llvm)?.cpu();
-        for (name, value) in [("target-cpu", cpu), ("probe-stack", "inline-asm")] {
+        let target = crate::mir::codegen::Target::selected().map_err(Unhandled::Llvm)?;
+        let probe = target.stack_probe().map(|probe| ("probe-stack", probe));
+        for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }
@@ -125,6 +130,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             callees: FxHashMap::default(),
             globals: FxHashMap::default(),
             pads: FxHashMap::default(),
+            frame: None,
+            arrival: None,
         };
         lowering.body()
     }
@@ -137,6 +144,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             return Err(Unhandled::Shape("function without blocks"));
         };
         let frame = self.context.append_basic_block(self.function, "frame");
+        self.frame = Some(frame);
         self.builder.position_at_end(frame);
         for (slot, data) in self.func.sized_stack_slots.iter() {
             let ty = self.context.i8_type().array_type(data.size);
@@ -532,6 +540,13 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             InstructionData::Call { func_ref, .. } => {
                 let callee = self.callee(func_ref)?;
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
+                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                    let (returned, pad) = self.guard();
+                    let args = self.invoke_arguments(sig, dfg.inst_args(inst))?;
+                    let call =
+                        self.builder.build_direct_invoke(callee, &args, returned, pad, "")?;
+                    return self.finish_guarded(call, sig, dfg.inst_results(inst), returned, pad);
+                }
                 let args = self.arguments(sig, dfg.inst_args(inst))?;
                 let call = self.builder.build_direct_call(callee, &args, "")?;
                 self.finish_call(call, sig, dfg.inst_results(inst))?;
@@ -543,6 +558,13 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     return Err(Unhandled::Shape("indirect call without a callee"));
                 };
                 let callee = self.pointer(*callee)?;
+                if self.func.srcloc(inst) == unwind::seh::guarded() {
+                    let (returned, pad) = self.guard();
+                    let args = self.invoke_arguments(sig, args)?;
+                    let call =
+                        self.builder.build_indirect_invoke(ty, callee, &args, returned, pad, "")?;
+                    return self.finish_guarded(call, sig, dfg.inst_results(inst), returned, pad);
+                }
                 let args = self.arguments(sig, args)?;
                 let call = self.builder.build_indirect_call(ty, callee, &args, "")?;
                 self.finish_call(call, sig, dfg.inst_results(inst))?;
@@ -675,6 +697,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     self.builder.build_fence(AtomicOrdering::SequentiallyConsistent, false, "")?;
                 }
                 Opcode::Nop => {}
+                // Asked for by a guarded call alone, to look at the slot of the frame its
+                // exception arrives in. LLVM lays out the frame, so the slot is one of the
+                // function's own, and this is where it would be the slot of the frame.
+                Opcode::GetFramePointer => {
+                    let arrival = self.arrival()?;
+                    let above = self.immediate(self.context.i64_type(), -i64::from(ARRIVAL), true);
+                    self.set(inst, Operand::Pointer(self.offset(arrival, above)?));
+                }
                 _ => return Err(Unhandled::Opcode(opcode)),
             },
             _ => return Err(Unhandled::Opcode(opcode)),
@@ -1132,6 +1162,78 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         Ok(())
     }
 
+    /// The slot a guarded call that unwound leaves its exception in.
+    fn arrival(&mut self) -> Lowered<PointerValue<'ctx>> {
+        if let Some(known) = self.arrival {
+            return Ok(known);
+        }
+        let at = self.builder.get_insert_block();
+        let frame = self.frame.and_then(BasicBlock::get_terminator);
+        let frame = frame.ok_or(Unhandled::Shape("a frame pointer ahead of the frame"))?;
+        self.builder.position_before(&frame);
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let arrival = self.builder.build_alloca(pointer, "")?;
+        if let Some(at) = at {
+            self.builder.position_at_end(at);
+        }
+        self.arrival = Some(arrival);
+        Ok(arrival)
+    }
+
+    /// The blocks a guarded call continues in: where it returns to, and its landing pad.
+    fn guard(&self) -> (BasicBlock<'ctx>, BasicBlock<'ctx>) {
+        let block = || self.context.append_basic_block(self.function, "");
+        (block(), block())
+    }
+
+    /// Has a guarded call go on in one block whichever way it came back, as Cranelift's
+    /// does: with what it returned, or with the exception in the slot, which is what the
+    /// code after the call looks at.
+    fn finish_guarded(
+        &mut self,
+        call: CallSiteValue<'ctx>,
+        sig: &Signature,
+        results: &[Value],
+        returned: BasicBlock<'ctx>,
+        pad: BasicBlock<'ctx>,
+    ) -> Lowered<()> {
+        let context = self.context;
+        let after = context.append_basic_block(self.function, "");
+        self.builder.position_at_end(returned);
+        let values = self.returned(call, sig)?;
+        self.builder.build_unconditional_branch(after)?;
+
+        let personality = self.personality(unwind::seh::PERSONALITY);
+        let arrival = self.arrival()?;
+        self.builder.position_at_end(pad);
+        let pointer = context.ptr_type(AddressSpace::default());
+        let exception = context.struct_type(&[pointer.into(), context.i32_type().into()], false);
+        // The personality enters the pad for whatever is thrown, with no say of the pad's.
+        let landed = self.builder.build_landing_pad(exception, personality, &[], true, "")?;
+        let payload = self.builder.build_extract_value(landed.into_struct_value(), 0, "")?;
+        self.builder.build_store(arrival, payload)?;
+        self.builder.build_unconditional_branch(after)?;
+
+        self.builder.position_at_end(after);
+        for (&result, value) in std::iter::zip(results, values) {
+            let ty = value.get_type();
+            let phi = self.builder.build_phi(ty, "")?;
+            phi.add_incoming(&[(&value, returned), (&ty.const_zero(), pad)]);
+            self.values.insert(result, phi.as_basic_value().into());
+        }
+        Ok(())
+    }
+
+    /// The function the unwinder asks what to do in a frame of this one.
+    fn personality(&self, name: &str) -> FunctionValue<'ctx> {
+        let personality = self.module.get_function(name).unwrap_or_else(|| {
+            let ty = self.context.i32_type().fn_type(&[], true);
+            self.module.add_function(name, ty, Some(Linkage::External))
+        });
+        self.function.set_personality_function(personality);
+        personality
+    }
+
     /// The blocks an unwinding call continues in: one of its own that hands what it returned
     /// to the block Cranelift names, and the landing pad of its handler.
     fn exception_edges(
@@ -1164,14 +1266,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     fn landing_pad(&mut self, pad: Pad) -> Lowered<BasicBlock<'ctx>> {
         let context = self.context;
         let pointer = context.ptr_type(AddressSpace::default());
-        let personality = match self.module.get_function(super::PERSONALITY) {
-            Some(known) => known,
-            None => {
-                let ty = context.i32_type().fn_type(&[], true);
-                self.module.add_function(super::PERSONALITY, ty, Some(Linkage::External))
-            }
-        };
-        self.function.set_personality_function(personality);
+        let personality = self.personality(super::PERSONALITY);
 
         let resume_at = self.builder.get_insert_block();
         let block = context.append_basic_block(self.function, "");

@@ -10,6 +10,10 @@
 //! the call return with the thrown object, moved to the heap, in the slot. A pad that only
 //! cleans up throws the object again when it is done.
 //!
+//! LLVM has calls that name their pad, and its code keeps nothing where Cranelift's has
+//! the slot. A call of its code goes on at the pad instead of where it returns to, with
+//! the object in the register a function returns in ([`Pads`]).
+//!
 //! Only C++ exceptions are claimed, which is what a Rust panic is for MSVC. The object is
 //! moved as bytes, which is all a panic needs.
 
@@ -39,7 +43,7 @@ use super::FunctionUnwind;
 pub(in super::super) const RESUME: &str = "rustd.seh.resume";
 /// Frees what a landing pad that stops the unwind was entered with.
 pub(in super::super) const RELEASE: &str = "rustd.seh.release";
-const PERSONALITY: &str = "rustd.seh.personality";
+pub(in super::super) const PERSONALITY: &str = "rustd.seh.personality";
 
 /// What the calls that have a landing pad are marked with for [`function`] to find them.
 pub(in super::super) fn guarded() -> ir::SourceLoc {
@@ -74,8 +78,35 @@ pub(super) struct Frame {
     pub(super) info: Vec<u8>,
 }
 
-/// The frame of compiled code and the calls in it that have a landing pad, each as the
-/// address it returns to from the start of the function.
+/// The calls of a function that have a landing pad, as the personality reads them after
+/// their number: three `u32` each, all from the start of the function. A call that returns
+/// to an address after the first and no later than the second has a pad, which is at the
+/// third; or, where that is zero, the call returns with the exception in [`ARRIVAL`].
+#[derive(Default)]
+pub(in super::super) struct Pads(Vec<u8>);
+
+impl Pads {
+    const ENTRY: usize = 12;
+
+    /// A call that returns to `returns_to` and looks at [`ARRIVAL`] when it has.
+    fn returning(&mut self, returns_to: u32) {
+        self.entered(returns_to - 1..returns_to, 0);
+    }
+
+    /// Calls that return to an address after `calls.start` and no later than `calls.end`,
+    /// and go on at `pad` when they unwind.
+    pub(in super::super) fn entered(&mut self, calls: std::ops::Range<u32>, pad: u32) {
+        for word in [calls.start, calls.end, pad] {
+            self.0.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    pub(in super::super) fn finish(self) -> Option<Vec<u8>> {
+        (!self.0.is_empty()).then_some(self.0)
+    }
+}
+
+/// The frame of compiled code and the calls in it that have a landing pad.
 pub(super) fn function(
     code: &cranelift_codegen::CompiledCode,
     info: &winx64::UnwindInfo,
@@ -90,15 +121,15 @@ pub(super) fn function(
         .filter(|it| it.loc == guarded())
         .map(|it| it.start..it.end)
         .collect();
-    let mut calls = Vec::new();
+    let mut calls = Pads::default();
     for call_site in code.buffer.call_sites() {
         // The call ends where it returns to, which may be where the next thing starts.
         if guarded.iter().any(|it| it.contains(&(call_site.ret_addr - 1))) {
-            calls.extend_from_slice(&call_site.ret_addr.to_le_bytes());
+            calls.returning(call_site.ret_addr);
         }
     }
     let frame = Frame { len: code.buffer.data().len() as u32, info: bytes };
-    Ok((frame, (!calls.is_empty()).then_some(calls)))
+    Ok((frame, calls.finish()))
 }
 
 const UWOP_PUSH_NONVOL: u8 = 0;
@@ -298,7 +329,7 @@ impl Tables {
                 xdata[start] |= UNW_FLAG_EHANDLER << 3;
                 handlers.push(xdata.len());
                 xdata.extend_from_slice(&[0; 4]);
-                xdata.extend_from_slice(&(pads.len() as u32 / 4).to_le_bytes());
+                xdata.extend_from_slice(&((pads.len() / Pads::ENTRY) as u32).to_le_bytes());
                 xdata.extend_from_slice(pads);
             }
             pdata.extend_from_slice(&[0; 12]);
@@ -449,12 +480,13 @@ impl Shim<'_> {
 /// `EXCEPTION_DISPOSITION personality(EXCEPTION_RECORD *, void *frame, CONTEXT *,
 /// DISPATCHER_CONTEXT *)`: what the unwinder calls for a frame of a function with landing
 /// pads. The data that follows the handler in the function's `UNWIND_INFO` is the number
-/// of its calls with a pad and then where each returns to.
+/// of entries of [`Pads`] and then the entries.
 fn personality(shim: &mut Shim<'_>) {
     let (record, frame, dispatch) = (shim.param(0), shim.param(1), shim.param(3));
-    let [search, scan, check, next, found, sized, claim, pass] =
+    let [search, scan, check, next, found, sized, claim, arrive, enter, unwind, pass] =
         std::array::from_fn(|_| shim.builder.create_block());
     shim.builder.append_block_param(scan, I64);
+    shim.builder.append_block_param(unwind, I64);
 
     // Frames being unwound have nothing to do: a pad is entered when a handler is looked
     // for, so a frame of ours is never unwound past with a pad left to run.
@@ -485,10 +517,14 @@ fn personality(shim: &mut Shim<'_>) {
     shim.builder.ins().brif(more, check, &[], pass, &[]);
 
     shim.builder.switch_to_block(check);
-    let offset = shim.builder.ins().ishl_imm_u(index, 2);
+    let offset = shim.builder.ins().imul_imm_s(index, Pads::ENTRY as i64);
     let call = shim.builder.ins().iadd(pads, offset);
-    let call = shim.load_u32(call, 4);
-    let hit = shim.builder.ins().icmp(IntCC::Equal, call, returned);
+    let after = shim.load_u32(call, 4);
+    let until = shim.load_u32(call, 8);
+    let pad = shim.load_u32(call, 12);
+    let after = shim.builder.ins().icmp(IntCC::UnsignedLessThan, after, returned);
+    let until = shim.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, returned, until);
+    let hit = shim.builder.ins().band(after, until);
     shim.builder.ins().brif(hit, found, &[], next, &[]);
 
     shim.builder.switch_to_block(next);
@@ -523,7 +559,14 @@ fn personality(shim: &mut Shim<'_>) {
     shim.store(size, block, 16);
     let copy = shim.builder.ins().iadd_imm_s(block, OBJECT);
     shim.copy(copy, object, size);
+    shim.builder.ins().brif(pad, enter, &[], arrive, &[]);
+
+    shim.builder.switch_to_block(enter);
+    let pad = shim.builder.ins().iadd(start, pad);
+    shim.builder.ins().jump(unwind, &[pad.into()]);
+
     // The frame the unwinder names is the frame pointer less what the `UNWIND_INFO` says.
+    shim.builder.switch_to_block(arrive);
     let info = shim.load_u32(entry, 8);
     let info = shim.builder.ins().iadd(image, info);
     let register = shim.builder.ins().uload8(I64, MEM, info, 3);
@@ -531,9 +574,14 @@ fn personality(shim: &mut Shim<'_>) {
     let above = shim.builder.ins().ishl_imm_u(above, 4);
     let frame_pointer = shim.builder.ins().iadd(frame, above);
     shim.store(block, frame_pointer, ARRIVAL);
+    shim.builder.ins().jump(unwind, &[control.into()]);
+
+    // The unwinder puts `block` in the register a function returns in.
+    shim.builder.switch_to_block(unwind);
+    let target = shim.builder.block_params(unwind)[0];
     let context = shim.load(I64, dispatch, 40);
     let history = shim.load(I64, dispatch, 64);
-    shim.system("RtlUnwindEx", &[I64; 6], &[], &[frame, control, record, block, context, history]);
+    shim.system("RtlUnwindEx", &[I64; 6], &[], &[frame, target, record, block, context, history]);
     shim.builder.ins().trap(TrapCode::user(1).expect("a nonzero trap code"));
 
     shim.builder.switch_to_block(pass);

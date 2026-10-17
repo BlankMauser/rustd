@@ -7,13 +7,16 @@
 
 use cranelift_codegen::{
     binemit::Reloc,
-    gimli::{self, BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection},
+    gimli::{
+        self, BaseAddresses, CieOrFde, DW_EH_PE_omit, DW_EH_PE_uleb128, EhFrame, EndianSlice,
+        LittleEndian, Reader, UnwindSection,
+    },
     ir::{LibCall, Signature},
 };
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget, default_libcall_names};
 use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
-    SectionIndex, SectionKind, SymbolSection, elf, macho,
+    SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
 use rustc_hash::FxHashMap;
 
@@ -21,7 +24,7 @@ use super::{OWN, Symbol, Unhandled};
 use crate::mir::codegen::{
     ConstBlob,
     fragment::{Code, Recorder},
-    unwind::{FrameRows, FrameRule, FunctionUnwind},
+    unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
 
 pub(super) struct Emitted<'data> {
@@ -31,6 +34,8 @@ pub(super) struct Emitted<'data> {
     /// The sections that are part of the code, in the order they are in `bytes`.
     inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
+    /// How long the function is at the start of `bytes`.
+    code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
 }
@@ -67,6 +72,7 @@ impl<'data> Emitted<'data> {
             placed: FxHashMap::default(),
             inline: Vec::new(),
             bytes: Vec::new(),
+            code: 0,
             align: 1,
             relocs: Vec::new(),
         };
@@ -79,7 +85,7 @@ impl<'data> Emitted<'data> {
             BinaryFormat::Coff => {
                 emitted.place(text, recorder)?;
                 emitted.relocate(recorder)?;
-                emitted.unwind_coff(text)?
+                emitted.unwind_coff()?
             }
             _ => {
                 emitted.place(text, recorder)?;
@@ -91,6 +97,20 @@ impl<'data> Emitted<'data> {
         Ok(Code { signature, bytes, align, relocs, unwind })
     }
 
+    /// Fills the function, which is all of `code`, up to the length of the shortest one
+    /// there may be, and answers how long it is then: what LLVM makes of an empty body is a
+    /// `ret` alone.
+    fn lengthen(code: &mut Vec<u8>) -> Result<u32, Unhandled> {
+        let target = crate::mir::codegen::Target::selected()
+            .map_err(|_| Unhandled::Shape("a target that is not known"))?;
+        if let Some((shortest, filler)) = target.arch.shortest_function()
+            && code.len() < shortest
+        {
+            code.resize(shortest, filler);
+        }
+        Ok(code.len() as u32)
+    }
+
     /// Lays out `first` and every section its relocations lead to.
     fn place(&mut self, first: SectionIndex, recorder: &mut Recorder<'_>) -> Result<(), Unhandled> {
         let mut pending = vec![first];
@@ -99,10 +119,7 @@ impl<'data> Emitted<'data> {
                 continue;
             }
             let section = self.file.section_by_index(index)?;
-            let holds_addresses = section.relocations().any(|(_, relocation)| {
-                matches!(relocation.flags(), RelocationFlags::Elf { r_type: elf::R_X86_64_64 })
-            });
-            if holds_addresses {
+            if section.relocations().any(|(_, relocation)| Self::is_address(&relocation)) {
                 let blob = self.blob(&section)?;
                 let id = recorder
                     .define_const(blob)
@@ -122,10 +139,15 @@ impl<'data> Emitted<'data> {
             let start = (self.bytes.len() as u64).next_multiple_of(align);
             self.bytes.resize(start as usize, 0);
             self.bytes.extend_from_slice(section.data()?);
+            if index == first {
+                self.code = Self::lengthen(&mut self.bytes)?;
+            }
             self.placed.insert(index, Placement::Inline(start));
             self.inline.push(index);
             for (_, relocation) in section.relocations() {
-                if let SymbolSection::Section(target) = self.symbol(&relocation)?.section() {
+                if let SymbolSection::Section(target) =
+                    Self::symbol(&self.file, &relocation)?.section()
+                {
                     pending.push(target);
                 }
             }
@@ -136,8 +158,13 @@ impl<'data> Emitted<'data> {
     /// A section of addresses of what the function asked for, such as the table LLVM makes
     /// of a `match` that picks one of several constants.
     fn blob(&self, section: &object::Section<'data, '_>) -> Result<ConstBlob, Unhandled> {
-        // Written to only by the loader, which fills in the addresses.
-        if !section.name()?.starts_with(".data.rel.ro") {
+        // Written to only by the loader, which fills in the addresses. A PE image has them
+        // with the rest of what is only read.
+        let read_only = match self.file.format() {
+            BinaryFormat::Coff => section.kind() == SectionKind::ReadOnlyData,
+            _ => section.name()?.starts_with(".data.rel.ro"),
+        };
+        if !read_only {
             return Err(Unhandled::Shape("code that refers to a writable section"));
         }
         let mut blob = ConstBlob {
@@ -147,12 +174,19 @@ impl<'data> Emitted<'data> {
             align: section.align().max(1),
         };
         for (offset, relocation) in section.relocations() {
-            let symbol = self.symbol(&relocation)?;
+            let symbol = Self::symbol(&self.file, &relocation)?;
             let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
             let target = named.and_then(Symbol::parse);
-            let absolute =
-                matches!(relocation.flags(), RelocationFlags::Elf { r_type: elf::R_X86_64_64 });
-            match (target, relocation.addend()) {
+            let absolute = Self::is_address(&relocation);
+            // COFF keeps what is added to the address where the address goes.
+            let held = match blob.bytes.get_mut(offset as usize..).and_then(<[u8]>::first_chunk_mut)
+            {
+                Some(field) if absolute && relocation.has_implicit_addend() => {
+                    i64::from_le_bytes(std::mem::take(field))
+                }
+                _ => 0,
+            };
+            match (target, relocation.addend() + held) {
                 (Some(Symbol::Data(index)), addend) if absolute => {
                     blob.relocs.push((offset as u32, DataId::from_u32(index), addend));
                 }
@@ -165,14 +199,23 @@ impl<'data> Emitted<'data> {
         Ok(blob)
     }
 
-    fn symbol(
-        &self,
+    /// Whether the relocation asks for an address, in the eight bytes one takes.
+    fn is_address(relocation: &object::Relocation) -> bool {
+        matches!(
+            relocation.flags(),
+            RelocationFlags::Elf { r_type: elf::R_X86_64_64 }
+                | RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 }
+        )
+    }
+
+    fn symbol<'file>(
+        file: &'file object::File<'data>,
         relocation: &object::Relocation,
-    ) -> Result<object::Symbol<'data, '_>, Unhandled> {
+    ) -> Result<object::Symbol<'data, 'file>, Unhandled> {
         let RelocationTarget::Symbol(symbol) = relocation.target() else {
             return Err(Unhandled::Shape("a relocation against no symbol"));
         };
-        Ok(self.file.symbol_by_index(symbol)?)
+        Ok(file.symbol_by_index(symbol)?)
     }
 
     /// Fills in what points from one part of the code into another, and turns the rest into
@@ -182,50 +225,89 @@ impl<'data> Emitted<'data> {
             let section = self.file.section_by_index(index)?;
             let Placement::Inline(base) = self.placed[&index] else { continue };
             for (offset, relocation) in section.relocations() {
-                let RelocationFlags::Elf { r_type } = relocation.flags() else {
-                    return Err(Unhandled::Shape("an object that is not ELF"));
-                };
                 let at = base + offset;
-                let symbol = self.symbol(&relocation)?;
+                let (field, addend) = Self::field(&mut self.bytes, at, &relocation)?;
+                let symbol = Self::symbol(&self.file, &relocation)?;
                 let within = match symbol.section() {
                     SymbolSection::Section(target) => Some(self.placed[&target]),
                     _ => None,
                 };
                 if let Some(Placement::Inline(target)) = within {
                     // Both ends are in `bytes`, whose pieces do not move against each other.
-                    let (elf::R_X86_64_PC32 | elf::R_X86_64_PLT32) = r_type else {
+                    let (Field::Near | Field::Call) = field else {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
                     };
                     let target = target + symbol.address();
-                    let value = target.wrapping_add_signed(relocation.addend()).wrapping_sub(at);
-                    let field = self
-                        .bytes
-                        .get_mut(at as usize..at as usize + 4)
-                        .ok_or(Unhandled::Shape("a relocation outside its section"))?;
-                    field.copy_from_slice(&(value as u32).to_le_bytes());
+                    let value = target.wrapping_add_signed(addend).wrapping_sub(at);
+                    Self::fill(&mut self.bytes, at, value as u32)?;
                     continue;
                 }
-                let kind = match r_type {
-                    elf::R_X86_64_PLT32 => Reloc::X86CallPLTRel4,
-                    elf::R_X86_64_PC32 => Reloc::X86PCRel4,
-                    // The relaxable forms are loads from the GOT like any other.
-                    elf::R_X86_64_GOTPCREL
-                    | elf::R_X86_64_GOTPCRELX
-                    | elf::R_X86_64_REX_GOTPCRELX => Reloc::X86GOTPCRel4,
-                    elf::R_X86_64_TLSGD => Reloc::ElfX86_64TlsGd,
-                    other => return Err(Unhandled::Relocation(other)),
+                let kind = match field {
+                    Field::Call => Reloc::X86CallPLTRel4,
+                    Field::Near => Reloc::X86PCRel4,
+                    Field::Got => Reloc::X86GOTPCRel4,
+                    Field::TlsGd => Reloc::ElfX86_64TlsGd,
+                    Field::SectionOffset => Reloc::X86SecRel,
                 };
                 let (name, addend) = match within {
-                    Some(Placement::Blob(id)) => (
-                        ModuleRelocTarget::user(1, id.as_u32()),
-                        relocation.addend() + symbol.address() as i64,
-                    ),
-                    _ => (Self::target(symbol.name()?, recorder)?, relocation.addend()),
+                    Some(Placement::Blob(id)) => {
+                        (ModuleRelocTarget::user(1, id.as_u32()), addend + symbol.address() as i64)
+                    }
+                    _ => (Self::target(symbol.name()?, recorder)?, addend),
                 };
                 self.relocs.push(ModuleReloc { offset: at as u32, kind, name, addend });
             }
         }
         Ok(())
+    }
+
+    /// What the relocation of the four bytes of `bytes` at `at` asks for, and what is added to the
+    /// address it names, counted from the field as ELF counts it. COFF keeps that in the
+    /// field, which is cleared: whoever applies the relocation is given it apart.
+    fn field(
+        bytes: &mut [u8],
+        at: u64,
+        relocation: &object::Relocation,
+    ) -> Result<(Field, i64), Unhandled> {
+        let field = match relocation.flags() {
+            RelocationFlags::Elf { r_type } => match r_type {
+                elf::R_X86_64_PLT32 => Field::Call,
+                elf::R_X86_64_PC32 => Field::Near,
+                // The relaxable forms are loads from the GOT like any other.
+                elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
+                    Field::Got
+                }
+                elf::R_X86_64_TLSGD => Field::TlsGd,
+                other => return Err(Unhandled::Relocation(other)),
+            },
+            RelocationFlags::Coff { typ } => match typ {
+                // The numbered forms say how many bytes of the instruction follow the
+                // field, which `object` has put in the addend.
+                pe::IMAGE_REL_AMD64_REL32
+                | pe::IMAGE_REL_AMD64_REL32_1
+                | pe::IMAGE_REL_AMD64_REL32_2
+                | pe::IMAGE_REL_AMD64_REL32_3
+                | pe::IMAGE_REL_AMD64_REL32_4
+                | pe::IMAGE_REL_AMD64_REL32_5 => Field::Near,
+                pe::IMAGE_REL_AMD64_SECREL => Field::SectionOffset,
+                other => return Err(Unhandled::Relocation(other.into())),
+            },
+            _ => return Err(Unhandled::Shape("an object of a format that is not read")),
+        };
+        if !relocation.has_implicit_addend() {
+            return Ok((field, relocation.addend()));
+        }
+        let held = Self::fill(bytes, at, 0)?;
+        Ok((field, relocation.addend() + i64::from(held as i32)))
+    }
+
+    /// Puts `value` in the four bytes of `bytes` at `at` and answers what was there.
+    fn fill(bytes: &mut [u8], at: u64, value: u32) -> Result<u32, Unhandled> {
+        let field = usize::try_from(at)
+            .ok()
+            .and_then(|at| bytes.get_mut(at..)?.first_chunk_mut())
+            .ok_or(Unhandled::Shape("a relocation outside its section"))?;
+        Ok(u32::from_le_bytes(std::mem::replace(field, value.to_le_bytes())))
     }
 
     /// Lays out the function's section. Every other section its relocations lead to is a
@@ -239,10 +321,12 @@ impl<'data> Emitted<'data> {
         let section = self.file.section_by_index(text)?;
         self.align = section.align().max(1);
         self.bytes.extend_from_slice(section.data()?);
+        self.code = Self::lengthen(&mut self.bytes)?;
         self.placed.insert(text, Placement::Inline(0));
         self.inline.push(text);
         for (_, relocation) in section.relocations() {
-            let SymbolSection::Section(index) = self.symbol(&relocation)?.section() else {
+            let SymbolSection::Section(index) = Self::symbol(&self.file, &relocation)?.section()
+            else {
                 continue;
             };
             if self.placed.contains_key(&index) {
@@ -280,7 +364,7 @@ impl<'data> Emitted<'data> {
             else {
                 return Err(HELD);
             };
-            let symbol = self.symbol(&relocation)?;
+            let symbol = Self::symbol(&self.file, &relocation)?;
             let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
             // The addend is where the address will be.
             let at = offset as usize;
@@ -318,7 +402,7 @@ impl<'data> Emitted<'data> {
                 macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
                 other => return Err(Unhandled::Relocation(other.into())),
             };
-            let symbol = self.symbol(&relocation)?;
+            let symbol = Self::symbol(&self.file, &relocation)?;
             let (name, addend) = match symbol.section() {
                 SymbolSection::Section(target) => match self.placed[&target] {
                     Placement::Blob(id) => {
@@ -408,10 +492,22 @@ impl<'data> Emitted<'data> {
     }
 
     /// The function's entry of `.pdata` as the `UNWIND_INFO` of `.xdata` it names, which is
-    /// taken as it is: the offsets in it are from the start of the function.
-    fn unwind_coff(&self, text: SectionIndex) -> Result<Option<FunctionUnwind>, Unhandled> {
+    /// taken as it is but for the handler: the offsets in it are from the start of the
+    /// function.
+    fn unwind_coff(&self) -> Result<Option<FunctionUnwind>, Unhandled> {
         const MALFORMED: Unhandled = Unhandled::Shape("an unwind table that does not parse");
-        let Some(pdata) = self.file.section_by_name(".pdata") else { return Ok(None) };
+        /// The first version of `UNWIND_INFO`, without a flag and with those of a handler
+        /// that is called both when a handler is looked for and when the frame is unwound.
+        const VERSION: u8 = 1;
+        const HANDLED: u8 = VERSION | 0b11 << 3;
+        let code = self.code;
+        // LLVM writes no entry for a function that calls nothing and leaves the stack as it
+        // found it, which the unwinder takes a function without one for. It gets the entry
+        // that says as much: whoever looks for where a function ends looks in `.pdata`.
+        let Some(pdata) = self.file.section_by_name(".pdata") else {
+            let leaf = vec![VERSION, 0, 0, 0];
+            return Ok(Some(FunctionUnwind::from_unwind_info(code, leaf, seh::Pads::default())));
+        };
         let entry = pdata.data()?;
         // Where the function starts, where it ends and where its `UNWIND_INFO` is.
         let &[_, _, _, _, _, _, _, _, a, b, c, d] = entry else {
@@ -419,7 +515,7 @@ impl<'data> Emitted<'data> {
         };
         let (_, relocation) =
             pdata.relocations().find(|(offset, _)| *offset == 8).ok_or(MALFORMED)?;
-        let symbol = self.symbol(&relocation)?;
+        let symbol = Self::symbol(&self.file, &relocation)?;
         let SymbolSection::Section(xdata) = symbol.section() else { return Err(MALFORMED) };
         let xdata = self.file.section_by_index(xdata)?;
         // The field holds what the linker adds the address of the symbol to.
@@ -427,16 +523,48 @@ impl<'data> Emitted<'data> {
             symbol.address() - xdata.address() + u64::from(u32::from_le_bytes([a, b, c, d]));
         let info = xdata.data()?.get(start as usize..).ok_or(MALFORMED)?;
         let &[version_and_flags, _, codes, _, ..] = info else { return Err(MALFORMED) };
-        // The first version, and no flag: what follows the codes would be a handler or
-        // the entry this one goes on from.
-        if version_and_flags != 1 {
-            return Err(Unhandled::Shape("an unwind table with a handler"));
-        }
         // The codes are two bytes each and an even number of them is there.
-        let len = 4 + usize::from(codes).next_multiple_of(2) * 2;
-        let info = info.get(..len).ok_or(MALFORMED)?;
-        let code = self.file.section_by_index(text)?.size();
-        Ok(Some(FunctionUnwind::from_unwind_info(code as u32, info.to_vec())))
+        let (frame, rest) = info
+            .split_at_checked(4 + usize::from(codes).next_multiple_of(2) * 2)
+            .ok_or(MALFORMED)?;
+        let pads = match version_and_flags {
+            VERSION => seh::Pads::default(),
+            // The address of the personality, which is ours to name, and then its table.
+            HANDLED => Self::pads_coff(rest.get(4..).ok_or(MALFORMED)?)?,
+            // What is left is an entry that goes on from another.
+            _ => return Err(Unhandled::Shape("an unwind table in more than one piece")),
+        };
+        let mut frame = frame.to_vec();
+        frame[0] = VERSION;
+        Ok(Some(FunctionUnwind::from_unwind_info(code, frame, pads)))
+    }
+
+    /// The calls with a landing pad of LLVM's table of them, which is a `.gcc_except_table`
+    /// for a personality LLVM does not know.
+    fn pads_coff(table: &[u8]) -> Result<seh::Pads, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("landing pads that do not parse");
+        let mut table = EndianSlice::new(table, LittleEndian);
+        let mut uleb = |table: &mut EndianSlice<'_, _>| {
+            let value = table.read_uleb128().map_err(|_| MALFORMED)?;
+            u32::try_from(value).map_err(|_| MALFORMED)
+        };
+        // Where the pads are counted from, how the types are written and how the calls
+        // are: from the start of the function, not at all, and as numbers of any length.
+        let header = table.read_u8_array::<[u8; 3]>().map_err(|_| MALFORMED)?;
+        if header != [DW_EH_PE_omit.0, DW_EH_PE_omit.0, DW_EH_PE_uleb128.0] {
+            return Err(Unhandled::Shape("landing pads that name a type"));
+        }
+        let len = uleb(&mut table)?;
+        let mut calls = table.split(len as usize).map_err(|_| MALFORMED)?;
+        let mut pads = seh::Pads::default();
+        while !calls.is_empty() {
+            let (start, len, pad, _action) =
+                (uleb(&mut calls)?, uleb(&mut calls)?, uleb(&mut calls)?, uleb(&mut calls)?);
+            if pad != 0 {
+                pads.entered(start..start.checked_add(len).ok_or(MALFORMED)?, pad);
+            }
+        }
+        Ok(pads)
     }
 
     /// The function's table of landing pads as it is: the offsets in it are from the start
@@ -568,6 +696,21 @@ impl<'data> Emitted<'data> {
         }
         Ok(rules)
     }
+}
+
+/// What a relocation of x86-64 code asks to be put in four bytes of it.
+#[derive(Clone, Copy)]
+enum Field {
+    /// How far away a function is, or the stub the linker makes to reach it.
+    Call,
+    /// How far away something is.
+    Near,
+    /// How far away the entry of the GOT is that holds an address.
+    Got,
+    /// How far away the pair is that `__tls_get_addr` is called with.
+    TlsGd,
+    /// How far into its section something is: a thread-local of a PE image.
+    SectionOffset,
 }
 
 /// The name of a symbol as the module had it: Mach-O puts an underscore before it.

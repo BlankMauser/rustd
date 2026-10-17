@@ -199,6 +199,13 @@ impl Target {
         }
     }
 
+    /// What LLVM is told of how a frame larger than a page reaches the stack it needs. A PE
+    /// image has `__chkstk` for it, which LLVM calls unasked; elsewhere the code touches
+    /// each page itself.
+    pub fn stack_probe(&self) -> Option<&'static str> {
+        (self.object_format != ObjectFormat::Coff).then_some("inline-asm")
+    }
+
     /// The code generator for the target. `regalloc` names Cranelift's register allocator.
     pub(super) fn isa(&self, regalloc: &str) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
