@@ -237,6 +237,9 @@ The merge also brought `keys.py`, which builds with the store another build fill
 after each thing code depends on has changed. With this branch's store: 26 of 26
 right and the 4 cases it lists as open, under both backends.
 
+The run on GitHub after the merge (39028503621) passed whole: fmt and tests, and every
+harness including the four for the store, under both backends.
+
 ## What went wrong on the way
 
 - The toolchain identity first came from VFS source paths alone and was empty for these
