@@ -212,6 +212,7 @@ impl Args {
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
                 }
+                "--doc" => bail!("{DOCTESTS_ARE_NOT_BUILT}"),
                 "--release" => profile = Some("release".to_owned()),
                 "--profile" => profile = Some(value()?),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
@@ -1432,6 +1433,16 @@ struct View {
     /// The project asked for, in `base`.
     project: PathBuf,
 }
+
+/// Why the examples in documentation are not built.
+const DOCTESTS_ARE_NOT_BUILT: &str = "doctests are not built: rustdoc takes each example out of \
+    the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc \
+    tells nobody where that crate and its link line are (`--persist-doctests` and \
+    `--test-builder` are unstable). rustd lacks the two things that would stand in for it: \
+    taking the examples out itself (hidden `#` lines, the `main` put around an example, and \
+    the `should_panic`, `no_run`, `compile_fail`, `ignore` and edition marks of a block), \
+    and linking a program of its own for each, where it only replaces functions of a \
+    program cargo linked";
 
 fn workspace_at(
     project: &Path,
