@@ -4321,10 +4321,15 @@ impl Program {
                 ("resolve", phases.resolve),
                 ("define", phases.define),
                 ("object", phases.object),
+                ("discarded", phases.discarded),
                 (
                     "compile-rest",
                     compile.saturating_sub(
-                        phases.compile + phases.resolve + phases.define + phases.object,
+                        phases.compile
+                            + phases.resolve
+                            + phases.define
+                            + phases.object
+                            + phases.discarded,
                     ),
                 ),
                 ("write", warm.emit),
