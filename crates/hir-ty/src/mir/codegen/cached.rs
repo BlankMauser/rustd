@@ -187,9 +187,15 @@ impl StoredCode {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 1");
+        hasher.update(b"rustd llvm 2");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
+        // Nor does it tell which statement an instruction is of, which the code's lines do.
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                hasher.update(func.srcloc(inst).bits().to_le_bytes());
+            }
+        }
         for (_, name) in func.params.user_named_funcs().iter() {
             hasher.update(name.namespace.to_le_bytes());
             hasher.update(name.index.to_le_bytes());
