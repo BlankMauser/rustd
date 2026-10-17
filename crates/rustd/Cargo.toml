@@ -30,6 +30,8 @@ same-file = "1"
 dunce = "1"
 pdb = "0.8"
 sha2 = "0.10"
+cargo_metadata.workspace = true
+shlex = "2"
 
 hir.workspace = true
 hir-def.workspace = true
@@ -47,6 +49,9 @@ tar = "0.4.44"
 zstd = "0.13.3"
 tikv-jemallocator = { version = "0.5.4", optional = true, features = ["profiling"] }
 tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"
