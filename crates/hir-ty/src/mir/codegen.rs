@@ -42,7 +42,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 
 use crate::mir::is_by_move_coroutine;
@@ -1625,10 +1625,26 @@ fn source_location<'db>(
     let source_map = &Body::with_source_map(db, owner).1;
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => {
+            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+                (Ok(written), _) => written,
+                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
+                    source_map.expr_syntax(*tail).ok()?
+                }
+                (Err(_), _) => return None,
+            }
+        }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
     let mut range = source.value.syntax_node_ptr().text_range();
+    if let MirSpan::ExprEnd(_) = span {
+        // The brace that closes a block, which is where rustc has a scope left.
+        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+        return location_of(db, source.file_id, TextRange::new(last?, range.end()));
+    }
     if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
         // A method call is reported from the method's name on.
         let root = source.file_id.parse_or_expand(db);
@@ -2295,7 +2311,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             );
         }
         let ids = self.stitch(id, compiled)?;
-        let name = self.callee_name(instance.def).to_owned();
+        let name = self.backtrace_name(instance);
         let declared = match instance.def {
             InstanceDef::Fn(func) => Some(func),
             _ => None,
@@ -3127,6 +3143,40 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(id)
     }
 
+    /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
+    /// the last name of it otherwise.
+    fn backtrace_name(&self, instance: &Instance) -> String {
+        let db = self.db;
+        let args = instance.args.as_ref();
+        let ty = || args.as_slice().first().and_then(|arg| arg.ty());
+        let of_closure = |owner: InferBodyId<'db>, expr| match owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                super::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
+            }
+            _ => None,
+        };
+        let name = match instance.def {
+            InstanceDef::Fn(func) => {
+                super::type_name::rustc_function_name(db, func, args.as_slice())
+            }
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::DropGlue => ty()
+                .and_then(|ty| super::type_name::rustc_symbol_type(db, ty))
+                .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
+            InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        };
+        name.unwrap_or_else(|| self.callee_name(instance.def).to_owned())
+    }
+
     fn callee_name(&self, def: InstanceDef) -> &'db str {
         match def {
             InstanceDef::Fn(func) => FunctionSignature::of(self.db, func).name.as_str(),
@@ -3653,8 +3703,9 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
+    /// The block to generate each `Drop` terminator in, with its place and target, and the
+    /// statement the drop is of.
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, MirSpan)>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -5026,8 +5077,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+        for (block, place, target, span) in std::mem::take(&mut self.deferred_drops) {
             self.builder.switch_to_block(block);
+            self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
             let replace =
@@ -5064,7 +5116,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
             self.builder.switch_to_block(suspended);
-            self.drop_live_locals()?;
+            self.at(Self::returns_at(body));
+            self.drop_live_locals(Some(&Self::scope_ends(body)))?;
             self.builder.ins().jump(done, &[]);
         }
         self.emit_cleanup()
@@ -7149,7 +7202,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target));
+                self.deferred_drops.push((block, place.clone(), *target, self.span));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -9620,7 +9673,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
-        self.drop_live_locals()?;
+        self.drop_live_locals(None)?;
         if let Some(state) = &self.suspended {
             let (addr, ty) = (state.addr, state.ty);
             self.store_state(addr, ty, PANICKED);
@@ -9628,8 +9681,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.resume_unwinding(exception)
     }
 
-    /// Drops every local that holds a value.
-    fn drop_live_locals(&mut self) -> Result<()> {
+    /// Drops every local that holds a value. Each is dropped at where `ends` has it, if that is
+    /// given, and where the code being generated is otherwise.
+    fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
         // Locals the body never drops come first, last declared first, and of those the
         // operands of the expression that unwound before the temporaries it borrowed, which
         // live to the end of the statement. The rest go in the order the body drops them when
@@ -9645,10 +9699,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
+            if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
+                self.at(end);
+            }
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
+    }
+
+    /// Where the scope of each local the body drops ends.
+    fn scope_ends(body: &MirBody<'db>) -> FxHashMap<LocalId, MirSpan> {
+        let mut ends = FxHashMap::default();
+        for (_, block) in body.basic_blocks.iter() {
+            if let Some(crate::mir::Terminator {
+                kind: TerminatorKind::Drop { place, .. },
+                span: span @ MirSpan::ExprEnd(_),
+            }) = &block.terminator
+            {
+                ends.entry(place.local).or_insert(*span);
+            }
+        }
+        ends
     }
 
     fn store_state(&mut self, state: Value, ty: Type, value: i64) {
@@ -9752,6 +9824,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().brif(is_suspended, suspended, &[], done, &[]);
         self.in_cleanup = true;
         self.builder.switch_to_block(unresumed);
+        self.at(Self::returns_at(body));
         let TyKind::Coroutine(_, args) = ty.kind() else {
             unsupported!("async body of {ty:?}");
         };
@@ -9765,6 +9838,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.suspended_drop = Some((suspended, done));
         self.builder.switch_to_block(done);
         self.return_()
+    }
+
+    /// Where the body is written to end, which is where rustc has an `async` block dropped.
+    fn returns_at(body: &MirBody<'db>) -> MirSpan {
+        let returns = body.basic_blocks.iter().find_map(|(_, block)| match &block.terminator {
+            Some(crate::mir::Terminator { kind: TerminatorKind::Return, span }) => Some(*span),
+            _ => None,
+        });
+        returns.unwrap_or(MirSpan::Unknown)
     }
 
     /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
