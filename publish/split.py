@@ -69,7 +69,7 @@ def main():
             open(f"{out}/{path}", "w").write(text)
         elif "/" not in path and path.endswith(".md") and changed.get(path) == "A":
             copy(path, "docs/reports/" + path)
-        elif path in ("Cargo.lock", ".gitignore") or path.startswith("publish/"):
+        elif path in ("Cargo.lock", ".gitignore") or path.startswith(("publish/", ".github/")):
             pass
         elif path == ".cargo/config.toml":
             copy(path, path)
