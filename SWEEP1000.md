@@ -5,6 +5,33 @@ merged in. Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This
 updated with each push; a section that says "in progress" has numbers from a sweep that is
 still running.
 
+## Where this stands
+
+Work stopped at this head on request. Done: the merges, the gate below, the fix for the one
+real miscompile the sweep had found (tracing-opentelemetry), and a harness that no longer
+reports tests that differ from run to run as mismatches. Half done: the sweep. Not started:
+the LLVM pass of the sweep.
+
+The gate table below is for `bf8c5edbee`, the merge. The head adds the tracing-opentelemetry
+fix (`5af7f465bf`) and the harness change. On `5af7f465bf` the whole Cranelift gate passed
+again (20 stages, breakers 130 of 130), and so did the tests of `hir-ty`, `hir-def`,
+`parser`, `syntax` and `rustd`. The LLVM gate on it was stopped after its first nine stages
+(difftest, programs, stress, breakers 130 of 130, unwinds, splices, asmedits, includes,
+worktrees), all of which passed; keys, fuzz, backends, debuginfo and the store harnesses
+were not run under LLVM on that commit. `rustd-collate-next` is not merged in.
+
+The sweep was started again from the first crate with the binary of `5af7f465bf` and stopped
+at 43 of 1100 crates under Cranelift: 37 match, 6 untested, none differ, 2,475 tests,
+14,152 of 14,152 functions from rustd. No crate has been run under LLVM. The larger run
+under "Totals" is of an older binary.
+
+What to do next, in order: finish the LLVM gate on the head; run the sweep to the end under
+Cranelift and then LLVM (the command is at the end; it skips crates that have a status
+file); reduce whatever differs; then the open causes: the text of a failed `assert!` that
+rustc breaks over lines (num_enum, proc-macro-crate; it needs rustc's pretty printer for
+expressions), the 32 functions left to rustc listed below, and the untested crates that
+only need features turned on (tokio).
+
 ## The list
 
 `harness/sweep1000.txt` holds 1100 `name-version` lines: the most downloaded crates on
@@ -99,17 +126,21 @@ The 32 functions left to rustc:
 | calling convention `EfiApi` | 3 | r-efi |
 | layout of an array | 1 | wit-bindgen |
 
-The 8 that differ have not been reduced yet. From their logs:
+The 8 that differed, by cause:
 
-| crate | what differs | first reading |
-|---|---|---|
-| tracing-opentelemetry | `layer::tests::otel_context_propagation` fails under rustd only: a span id that should be zero is not | a candidate for a real bug |
-| sysinfo | `check_refresh_process_update` fails under rustc and passes under rustd | the test counts processes of the machine; likely not rustd |
-| openssl | four tests fail under both and print differently | not looked into |
-| semver-parser | `generated_code_is_fresh` fails under both | not looked into |
-| num_enum, proc-macro-crate | tests fail under both: they want a manifest beside the crate that the published crate does not have | the harness should not count a test that fails the same way under rustc |
-| hyper-timeout | `test_upload_timeout` | a timeout test; not looked into |
-| jobserver | nothing in the log names a test | not looked into |
+| crate | what differed | cause | state |
+|---|---|---|---|
+| tracing-opentelemetry | `layer::tests::otel_context_propagation` failed under rustd only: a span id that should be zero was not | statics of one name from a macro reached through an import in a `#[test]` function were numbered in another order than rustc's, so a callsite got the metadata of another | fixed in `5af7f465bf`; cases `late_import_in_body`, `static_in_static` and `blanket/tests/late_import_in_test.rs`. All 50 tests print the same and every function is rustd's |
+| jobserver | `make-as-a-client` prints the path it runs from | rustd's binary is named `<rustc's>-rustd` | the harness now reads that name as rustc's; matches |
+| num_enum, proc-macro-crate | the text of a failed `assert!` over several lines (the tests run cargo on a manifest the published crate does not have, so they fail under both) | rustd prints the expression on one line, rustc as its pretty printer breaks it | open: breakers `assert_message` and `assert_long_expression` |
+| sysinfo | `check_refresh_process_update` fails under rustc and passes under rustd | the test counts processes of the machine; it matches when run again | not rustd |
+| hyper-timeout | `test_upload_timeout` | a timeout test; it matches when run again | not rustd |
+| openssl | a random MIME boundary and port numbers in what four failing tests print | differs between two runs of rustc's binary | not rustd |
+| semver-parser | a test that fails under both and prints how long it took | differs between two runs of rustc's binary | not rustd |
+
+`cratetest.py` now runs rustc's binary three more times when a crate differs. If those runs
+do not print the same, the crate is reported as `UNSTABLE` rather than as a mismatch, and
+`sweepreport.py` shows it as such. openssl and semver-parser are reported that way now.
 
 Of the 126 untested, 83 have no test binary at all (no tests, or the tests do not build under
 cargo either) and 42 have one in which no function of the crate is reached. tokio is the last:

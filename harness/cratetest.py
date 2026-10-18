@@ -6,6 +6,8 @@ usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--skip <test>
 
 Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects for the crate in
 front of rustc's rlib. Both binaries must report the same result for every test.
+A crate whose tests print something else in every run of rustc's own binary is UNSTABLE, not a
+mismatch.
 """
 import argparse, json, os, re, subprocess, sys
 from difftest import Fixture, bucket, compare, discard, RUNNER
@@ -72,6 +74,8 @@ class TestFixture(Fixture):
         return any(r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function" for r in rows)
 
     def normalize(self, stdout):
+        # A test that prints the path it runs from prints the name rustd's binary has.
+        stdout = stdout.replace(os.fsencode(self.binary_path()), os.fsencode(self.reference))
         stdout = re.sub(rb"' \(\d+\) panicked", b"' panicked", stdout)
         return re.sub(rb"finished in [0-9.]+s", b"finished", stdout)
 
@@ -144,6 +148,12 @@ def main():
                             "work": fx.work})
             continue
         if not result["match"]:
+            # Tests that print a port, a random number or what a timeout made of the run
+            # differ between two runs of rustc's binary too, which says nothing of rustd.
+            runs = [fx.behaviour(fx.reference) for _ in range(3)]
+            if any(run != runs[0] for run in runs):
+                result["unstable"] = True
+                print("  unstable: rustc's binary does not print the same twice")
             result["differing_tests"] = differing_tests(fx)
         expected = fx.behaviour(fx.reference)[1]
         result["tests_run"] = len(re.findall(rb"^test .* \.\.\. ", expected, re.M))
@@ -156,7 +166,11 @@ def main():
               "culprits": [c for r in results for c in r.get("culprits", [])]}
     # A crate rustd compiled nothing of matches rustc by construction, which is no result.
     untested = ok and not sum(c["compiled"] for r in results for c in r["crates"].values())
-    if untested:
+    unstable = not ok and all(r["match"] or r.get("unstable") for r in results)
+    if unstable:
+        merged["unstable"] = True
+        print(f"UNSTABLE: {len(results)} test binaries, {total} tests, rustc's differ from run to run")
+    elif untested:
         merged["untested"] = True
         print(f"UNTESTED: {len(results)} test binaries, {total} tests, no function from rustd")
     else:
@@ -164,7 +178,7 @@ def main():
     if a.json:
         json.dump(merged, open(a.json, "w"), indent=1)
     discard(results)
-    sys.exit(2 if untested else 0 if ok else 1)
+    sys.exit(3 if unstable else 2 if untested else 0 if ok else 1)
 
 
 main()
