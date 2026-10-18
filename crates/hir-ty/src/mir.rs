@@ -1068,6 +1068,10 @@ pub struct MirBody<'db> {
     /// The body is written with `#[rustc_inherit_overflow_checks]`: its arithmetic is checked
     /// when the crate that compiles it checks, whatever the crate it is written in does.
     pub inherits_overflow_checks: bool,
+    /// Blocks that rustc builds no way into: where a match arm binds that its tree of tests
+    /// never gets to. They run if control gets there, and what is moved out in them does not
+    /// count for the order a value is dropped in.
+    pub unreached: Vec<BasicBlockId>,
 }
 
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -1415,56 +1419,6 @@ impl MirBody<'_> {
         HeldLocals { locals, yields, conflicts, flagged, parts }
     }
 
-    /// For the end of each block, which of `locals` may have had a part moved out since the
-    /// local last got a whole value. `moves` says whether using a place as an operand takes its
-    /// value, which the operand does not say.
-    pub fn parted_at_block_ends(
-        &self,
-        locals: &[LocalId],
-        moves: impl Fn(&StoredPlace) -> bool,
-    ) -> ArenaMap<BasicBlockId, Vec<bool>> {
-        let mut effects: ArenaMap<BasicBlockId, Vec<(usize, bool)>> = ArenaMap::new();
-        let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
-        let (mut starts, mut ends) = (ArenaMap::new(), ArenaMap::new());
-        for (id, _) in self.basic_blocks.iter() {
-            let mut in_block = Vec::new();
-            let next = self.accesses(id, &mut |local, access| {
-                let Some(at) = locals.iter().position(|&it| it == local) else { return };
-                match access {
-                    Access::Part(projection) => {
-                        if moves(&StoredPlace { local, projection }) {
-                            in_block.push((at, true));
-                        }
-                    }
-                    Access::Write => in_block.push((at, false)),
-                    Access::Read | Access::Borrow => (),
-                }
-            });
-            effects.insert(id, in_block);
-            successors.insert(id, next);
-            starts.insert(id, vec![false; locals.len()]);
-            ends.insert(id, vec![false; locals.len()]);
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (id, _) in self.basic_blocks.iter() {
-                let mut parted = starts[id].clone();
-                for &(at, is_parted) in &effects[id] {
-                    parted[at] = is_parted;
-                }
-                for &successor in &successors[id] {
-                    for (known, &now) in starts[successor].iter_mut().zip(&parted) {
-                        changed |= now && !*known;
-                        *known |= now;
-                    }
-                }
-                ends.insert(id, parted);
-            }
-        }
-        ends
-    }
-
     /// The locals read after the start of each block before they are written, the ones
     /// borrowed anywhere, and the parts of each that are used as an operand.
     fn liveness(
@@ -1762,7 +1716,9 @@ impl MirBody<'_> {
             closures,
             coroutine: _,
             inherits_overflow_checks: _,
+            unreached,
         } = self;
+        unreached.shrink_to_fit();
         promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
         locals.shrink_to_fit();
