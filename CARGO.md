@@ -399,9 +399,7 @@ What the table shows, mode against mode:
   and slower than cargo alone on four: ripgrep 1.32 s against 0.78 s, tokei 1.23 s against
   0.70 s, eza 2.02 s against 1.32 s, axum 0.68 s against 0.41 s. In this mode an edit
   build is cargo's own start-up, rustc's check of the program's crate, and the daemon's
-  link. Which of these is the extra second was not measured apart. My guess is the check:
-  the first one after `enable` has no incremental cache of its own yet. Until that is
-  measured, take plain cargo as correct but not always faster on the first edit.
+  link. See "The plain-cargo edit gap" below for what is known about the extra time.
 - A second worktree's first build is cargo's in both modes (its target directory is new).
   Its edit builds are the daemon's, from the worker the first worktree loaded, in both.
 - The share of functions the daemon compiled is the same in both modes, since it is the
@@ -424,14 +422,46 @@ Builds that went to cargo in these rows, and why (the line each one printed):
 - "`build` is not compiled by rustd ...: unsupported: writable static": tokei's test
   executable has a `static mut` the daemon refuses.
 
-The rows above are from 9fea20bd99, before `rustd-collate` 3d47ed59bf was merged, and
-only nine of the sixteen projects and only Cranelift. starship, tonic, helix, cargo,
-nushell, rust-analyzer and wasmtime, and every project under LLVM, are being run on the
-merged head and will replace this table.
+The rows above are from 9fea20bd99, before `rustd-collate` 3d47ed59bf and
+`rustd-collate-next` 1b022ff6f2 were merged, one run each, nine of the sixteen projects,
+Cranelift only. The table was not rerun on the merged head: the run was started three
+times and stopped each time for a merge, and then the work was stopped. starship, tonic,
+helix, cargo, nushell, rust-analyzer and wasmtime have no rows, and no project has an LLVM
+row in both modes. Treat the numbers as an indication, not a result for the current head.
 
-On this machine the store has to be capped for the run (`RUSTD_CACHE_MAX=1G`): the harness
-keeps everything in `/dev/shm`, which is memory, and with the default 8 GiB limit starship
-alone wrote 7.6 GiB of store in one pass and the workers were killed for memory.
+### The plain-cargo edit gap
+
+Plain cargo after `enable` was slower than cargo alone on the first edit build of four of
+the nine projects. This was looked into with timing lines added to the wrapper and the
+daemon's log on a few projects, then dropped before a fix. What those runs showed:
+
+- The wrapper's rustc check of the program's crate (`--emit=dep-info,metadata`) took from
+  a few hundred milliseconds to seconds. It runs beside the daemon's build, so the build
+  cannot be quicker than it.
+- If the edit comes while the daemon is still loading the workspace, the build is rustc's
+  ("the daemon is still loading the workspace"), and the user pays for cargo's build plus
+  the wrapper.
+- The first edit after a daemon starts with a full store is expensive. Code taken from the
+  store cannot be patched, so that edit compiles a large part of the program again and
+  writes the whole object. One log: 5612 of 22852 functions compiled, object rewritten,
+  2.6 s from edit to binary.
+- Later edits in the same daemon are small: 1 of 22852 functions compiled, spliced, 74 ms
+  from edit to binary in the same log.
+
+So the gap is the check plus, on the first edit, the recompile of store code. How the
+second and later plain-cargo edits compare with cargo alone was not measured across the
+projects. One idea was tried and not finished: have the daemon recompile what it took from
+the store while nobody is waiting, so the first edit is a patch. It built, but was never
+shown to be correct or faster, and it is not in the branch.
+
+### Store size
+
+On this machine the store had to be capped for the runs (`RUSTD_CACHE_MAX=1G`): the
+harness keeps everything in `/dev/shm`, which is memory, and with the default 8 GiB limit
+one harness pass over starship wrote 7.6 GiB of store and the workers were killed for
+memory. That is the only measurement. What the 7.6 GiB is made of, whether the two modes,
+the worktree and the test builds write the same functions more than once, and whether the
+8 GiB default is the right one, were not looked at.
 
 ### Flags, the daemon's lifecycle and plain cargo
 
@@ -799,19 +829,53 @@ And in the third round, with the transparent mode and the store on by default:
 - rustc's borrow check runs beside every daemon build in both modes (see "Errors"). Before,
   a warm daemon built and ran a use after a move.
 
+## Where this stands
+
+Work on this branch was stopped at the merge of `rustd-collate-next` 1b022ff6f2.
+
+Done, and checked on Linux x86-64 under both backends before that merge (2fce84bb11):
+both modes, `enable`/`disable`/`status`, wrapper chaining, the daemon's lifecycle, the
+socket hardening and the nine security findings, rustc's check beside every daemon build,
+the default store, `--help`, the quiet exit on a closed pipe, and the fixes listed under
+"Fixes outside the cargo integration". The gate, `cargo_rustd.py --small`, formatting and
+the five-crate tests passed there.
+
+Half-done:
+
+- The merge of `rustd-collate-next`. It is in the branch (330dd35b25) and builds. The gate on it was still running when this was written.
+  `cargo_rustd.py --small`, the unit tests and clippy were not finished on the merged
+  head: their runs were lost when `/dev/shm` was emptied under them (cause not found) and
+  were not repeated. Clippy was last counted at 168 warnings in `crates/rustd` on
+  2fce84bb11 and never compared with the collated branch, so "nothing new" is not shown.
+- The Windows text in "macOS and Windows" was rewritten from the Windows session's merged
+  code by reading it. Nothing was run on Windows or macOS from this branch.
+- The sixteen-project table, the plain-cargo edit gap and the store size: see
+  "Measurements".
+
+What I would do next, in order:
+
+1. Run `cargo_rustd.py --small`, the five-crate tests and clippy on the merged head, and
+   find what empties `/dev/shm` (run the scripts one at a time with a marker file).
+2. The edit gap: measure the second and third plain-cargo edits against cargo alone on the
+   four slow projects. If the first edit is the problem, finish recompiling store code in
+   the background; if the check is, look at sharing rustc's incremental directory or
+   skipping the check when cargo already ran it for the library.
+3. The store: break one starship pass down by what wrote it.
+4. The sixteen-project table in both modes under both backends, one project at a time.
+5. `publish/overlay/docs/cargo.md` brought in line with this file.
+
 ## What is open
 
 - The sixteen-project table on the merged head, under both backends and in both modes. Nine
-  projects under Cranelift are in; the rest are running.
-- Plain cargo's first edit build is slower than cargo alone on four of nine projects, and
-  the cause is not measured (see "Measurements").
+  projects under Cranelift from before the last two merges are all there is.
+- Plain cargo's first edit build is slower than cargo alone on four of nine projects. What
+  is known is under "The plain-cargo edit gap"; it is not fixed.
 - Under plain cargo the daemon answers for programs only. Library crates of the workspace
   are rustc's. Fallback is per invocation or per program in both modes, not per crate
   inside one link.
 - Test executables built optimised or without incremental compilation are cargo's.
 - The store grows fast: one pass of the harness over starship wrote 7.6 GiB, which is
-  nearly the default limit. What is in it, and whether the worktree and the test builds
-  write the same functions more than once, has not been looked at.
+  nearly the default limit. See "Store size".
 - A long `RUSTD_HOME` makes a worker's socket path longer than the system allows (108
   bytes on Linux, 104 on macOS). The build then goes to cargo with "path must be shorter
   than SUN_LEN" in the reason. `~/.cache/rustd` and `$XDG_RUNTIME_DIR/rustd` are well
