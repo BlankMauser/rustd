@@ -257,7 +257,9 @@ def unwinding(tally, what, binary):
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
-    lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
+    # The row that ends a sequence is at the first byte after it, which is where the next
+    # function starts when the linker puts one there: it is no line of that function's.
+    lined = sorted({int(a, 16) for a, row in re.findall(r"^0x([0-9a-f]{16}) +[1-9](.*)$", rows, re.M) if "end_sequence" not in row})
     unentered = [(a, b) for a, b in bare if any(a <= row < b for row in lined)]
     without = len(unentered)
     beyond = sum(a in ends and ends[a] > b for a, b in ours)

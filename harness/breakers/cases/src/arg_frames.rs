@@ -45,6 +45,9 @@ fn level(depth: u32, seed: u64) -> u64 {
     sum ^ level(depth - 1, sum.wrapping_add(1))
 }
 
+/// On a thread with the 8 MiB a main thread has on Linux: the main thread of Windows has
+/// one, which the levels overflow as rustc builds them too.
 pub fn run() -> u64 {
-    level(150, 7)
+    let levels = std::thread::Builder::new().stack_size(8 << 20).spawn(|| level(150, 7));
+    levels.unwrap().join().unwrap()
 }
