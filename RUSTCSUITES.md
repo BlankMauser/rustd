@@ -1,8 +1,7 @@
 # rustc's own test suites through rustd
 
 Branch `rustd-rustc-suites`, off `rustd-collate`; round two merges `rustd-collate` again, last at
-`14ee89181b`, and carries one commit of `rustd-fuzz` (`5fba09c841`, see "Round two:
-differing"). Everything below was measured on one Linux x86-64 VM with stable
+`3d47ed59bf`. Everything below was measured on one Linux x86-64 VM with stable
 `rustc 1.99.0` and the rust-lang/rust checkout at the `1.99.0` tag. Each number is from a
 single run unless it says otherwise. "Cranelift" is `cargo build -p rustd --release`; "LLVM"
 is the same with `--features llvm` (`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20`), run with
@@ -17,8 +16,8 @@ they say otherwise.
 
 | suite | backend | tests run | matching | differing | left out | functions from rustd | left to rustc |
 |---|---|---|---|---|---|---|---|
-| `tests/ui` run-pass | Cranelift | 2785 | 2771 | 14 | 997 | 5721 of 5745 | 24 |
-| `tests/ui` run-pass | LLVM | 2786 | 2771 | 15 | 996 | 5727 of 5749 | 22 |
+| `tests/ui` run-pass | Cranelift | 2787 | 2773 | 14 | 995 | 5726 of 5750 | 24 |
+| `tests/ui` run-pass | LLVM | 2785 | 2770 | 15 | 997 | 5723 of 5745 | 22 |
 | `coretests` | Cranelift | 1197 | 1197 | 0 | see Part 2 | 1494 of 1499 | 5 |
 | `coretests` | LLVM | 1197 | 1197 | 0 | | 1494 of 1499 | 5 |
 | `alloctests` | Cranelift | 703 | 703 | 0 | | 966 of 966 | 0 |
@@ -29,9 +28,11 @@ they say otherwise.
 No rustd crash, hang or link error in any of the eight runs.
 
 Round one ended at 2690 `tests/ui` tests run, 4 differing, 57 functions left to rustc, and 11
-left in the libraries. Round two runs 96 more tests and leaves 24 + 6 functions to rustc (22 + 6 on LLVM). The
-Cranelift run has one test fewer because in it one test was seen to race (rustc's own
-program did what rustd's did) and was left out; which tests do that varies from run to run.
+left in the libraries. Round two runs about 96 more tests and leaves 24 + 6 functions to rustc (22 + 6 on LLVM).
+The two backends do not run the same number of tests because the tests that are left out
+for printing something else in every run, or for racing, vary from run to run: 11 in the
+Cranelift run and 13 in the LLVM run here, and the four runs on this head and the one before
+it had 2785, 2786, 2787 and 2785 tests. The differing tests were the same in each.
 The differing count went from 4 to 14 (15 on LLVM) because tests that were left out are now
 run, not because anything that matched stopped matching: 9 of the new ones are a family of
 tests marked `known-bug` upstream, one needs the optimiser, and the LLVM one comes from the
@@ -134,7 +135,7 @@ panicked on overflow in a build with checks off.
 
 ### 3. Harness limits
 
-Left out went from 1114 of 3804 to 996 of 3782 (997 in the last Cranelift run). The total is 22 lower because the harness
+Left out went from 1114 of 3804 to 996 of 3782 (995 and 997 in the last two runs). The total is 22 lower because the harness
 now takes a test's revisions and `ignore-`/`only-` directives per revision; I did not check
 that this accounts for all 22. By limit:
 
@@ -150,7 +151,7 @@ that this accounts for all 22. By limit:
 | 18 + 9 do not build as a package | 19 + 11 | not lifted |
 
 `run-flags`, `exec-env` and `edition` were already honoured; in the last run 4 tests with
-`exec-env`, 147 with an edition directive and 257 with auxiliary crates ran. 13 or 14 tests
+`exec-env`, 147 with an edition directive and 257 with auxiliary crates ran. 11 to 14 tests
 are left out in each run because rustc's own program prints something else every time; the
 exact tests vary between runs.
 
@@ -213,7 +214,7 @@ drops. `rustd-collate` at `8f21942505` dropped the finished inner vectors before
 elements of the one under construction, where rustc drops the innermost operands first; it
 matched at `ce52276cf5`. The `rustd-fuzz` branch had fixed the same thing from a fuzzer
 finding (`5fba09c841`, breaker `unwind_nested_operands`), so that commit is cherry-picked
-here unchanged apart from its context lines, and will merge away when `rustd-fuzz` lands.
+here unchanged apart from its context lines. `rustd-collate` has it too as of `3d47ed59bf`.
 
 Two things broke when `rustd-collate` `14ee89181b` was merged, and both are fixed here:
 
@@ -241,6 +242,13 @@ and executed `rm -rf rustd; mkdir rustd` there. I found no sign a `~/rustd` exis
 and removed what the script made. The repository checkout is elsewhere and was not touched.
 
 ### Round two: gate
+
+This gate was run on the merge of `rustd-collate` `14ee89181b` (`617524cf63`, pushed as
+`f8b880e65a`), not on the head of the branch. On the head, which merges `3d47ed59bf`, both
+binaries build, the four suites were run on both backends (the Summary numbers), and the
+Cranelift leg of the gate passed its first nine scripts (`difftest.py` through
+`worktrees.py`) before the run was stopped; the rest of that leg, the LLVM leg and
+`cargo test` were not run on it.
 
 The harness list of `.github/workflows/rustd.yaml` as of `rustd-collate` `14ee89181b`, run
 from `harness/` with `RUSTD_BIN` at each binary, plus `cargo_rustd.py --small`. Every script
@@ -272,6 +280,25 @@ The 8 that `breakers.py` calls open are five cases that still differ (`assert_me
 `test_assert_expand_2015` in `hir-def` carried a FIXME saying its expected expansion was the
 wrong one (`panic_2021!` in a 2015 crate); with the panic-edition rule of this round the
 expansion is `$crate::panic!`, and the test now expects that.
+
+### Where this stands
+
+Done: the merge of `rustd-collate` `3d47ed59bf`, the suite runs on it under both backends,
+the two regressions the `14ee89181b` merge brought (`library_panic_location`,
+`unit_slice_constant`), and items 2, 3, 5 and 6 of round two.
+
+Half-done: the gate on the head, as said above. Item 1: 24 + 6 functions are still left to
+rustc (22 + 6 on LLVM), each with a stated reason, but the list is not down to "nightly-only
+or should be refused"; the table in item 1 says which are not done. `rustd-collate-next` is
+not merged.
+
+Not done: item 4 (`tests/run-make`), `remote.py`, and any target but Linux x86-64.
+
+Next, in this order: finish the gate on the head under both backends and `cargo test`;
+`asm!` with more than one `sym` and with a constant operand (3 functions); the proc-macro
+token spacing behind `macro_reads_its_spelling` and the reserved-prefix cases (8);
+`extern "win64"` on Linux once an ABI can be chosen per function (4); `codegen/issue-28950.rs`,
+which needs the large temporary removed without an optimiser.
 
 ## Part 1: `tests/ui` run-pass
 
