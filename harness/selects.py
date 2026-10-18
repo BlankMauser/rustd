@@ -24,7 +24,8 @@ fn mark(what: &str) {
     use std::io::Write;
     let to = concat!(env!("CARGO_MANIFEST_DIR"), "/../ran");
     let mut ran = std::fs::OpenOptions::new().create(true).append(true).open(to).unwrap();
-    writeln!(ran, "{what}").unwrap();
+    // One write, so that the lines of scripts that run at once stay whole.
+    ran.write_all(format!("{what}\n").as_bytes()).unwrap();
 }
 '''
 PACKAGE = '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n'

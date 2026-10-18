@@ -29,6 +29,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLV
 cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
+import contextlib
 import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -249,7 +250,9 @@ def served(side, command, ask):
                 time.sleep(0.1)
         return "no answer"
     finally:
-        os.killpg(server.pid, signal.SIGKILL)
+        # A server that exited left no group to kill.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(server.pid, signal.SIGKILL)
         server.wait()
         # The port is free again before the other side's server asks for it.
         for _ in range(100):

@@ -1174,7 +1174,9 @@ def lazy(top, remote, a, crates, target, workspace, expected):
 
 
 def checks():
-    top = os.path.realpath(tempfile.mkdtemp(prefix="rustd-remote-"))
+    # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
+    short = "/tmp" if sys.platform == "darwin" else None
+    top = os.path.realpath(tempfile.mkdtemp(prefix="rustd-remote-", dir=short))
     workspace, crates, target = os.path.join(HERE, "stress"), ["sapp", "sbase", "smid"], ["-p", "sapp"]
     remotes = []
     if REAL:
