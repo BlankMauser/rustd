@@ -1,5 +1,5 @@
 {
- "rustd": "/home/ubuntu/repos/rustd/target/release/rustd",
+ "rustd": "/home/ubuntu/scratch/bin-cl/rustd",
  "toolchain": "1.99.0",
  "projects": [
   {
@@ -8,79 +8,79 @@
    "wrong": [],
    "times": {
     "cold build": [
-     6.0,
-     6.48
+     4.62,
+     4.84
     ],
     "cold run": [
-     0.6,
-     0.47
+     0.03,
+     1.33
     ],
     "warm-up": [
-     6.87,
+     1.9,
      null
     ],
     "warm build": [
-     0.02,
-     0.44
+     0.07,
+     1.24
     ],
     "warm run": [
      0.03,
-     0.45
+     1.21
     ],
     "cold test": [
-     2.89,
-     6.13
+     4.56,
+     4.64
     ],
     "test warm-up": [
-     3.87,
+     2.75,
      null
     ],
     "warm test": [
-     0.95,
-     1.35
+     1.0,
+     2.36
     ],
     "edit build": [
-     0.34,
-     0.86
+     0.39,
+     2.43
     ],
     "edit run": [
      0.04,
-     0.49
+     1.43
     ],
     "edit test": [
-     2.25,
-     1.6
+     4.23,
+     2.55
     ],
     "broken": [
-     0.38,
-     0.2
+     0.6,
+     0.51
     ],
     "mended": [
      0.27,
-     0.55
+     1.53
     ],
     "mended run": [
      0.04,
-     0.6
+     2.1
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (7s so far)",
+    "cold run": "unchanged: the daemon is still loading the workspace (5s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready; ready",
+    "test warm-up": "ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/ripgrep/crates/printer/src/standard.rs changed",
-    "broken": "cargo: the crate root has errors, `cargo check` shows them: mismatched types",
+    "edit test": "cargo: `rg`: the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/ripgrep/crates/core/main.rs changed",
+    "broken": "cargo: `rg`: the crate root has errors, `cargo check` shows them: mismatched types, and /tmp/rustd-cargo-jwsajgf3/ripgrep/crates/core/main.rs changed",
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 3852864, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3874245, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/814d6e5afab94bcc/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: loading for 5s\n  worker: pid 3855188, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/aaae1e0d74ee349e/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: ready\n  worker: pid 3874230, /dev/shm/rustd-cargo-cu96c_gg/ripgrep/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/7b68db9009240efb/log\n    /dev/shm/rustd-cargo-cu96c_gg/ripgrep: loading for 5s\n/dev/shm/rustd-cargo-cu96c_gg/ripgrep (dev, 9e5a8950668fc957): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (7s so far)\n/dev/shm/rustd-cargo-cu96c_gg/ripgrep (test, 5fec3c4e1f4b74cf): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/ripgrep/crates/printer/src/standard.rs changed\n"
+   "status": "daemon: pid 1988536, version 0.0.0-3f17830-18df8773dab89e41, exits after 1800s idle\n  worker: pid 1988539, /tmp/rustd-cargo-jwsajgf3/ripgrep/, log /tmp/rustd-cargo-jwsajgf3/home/workers/c3ec8961798cce8436d0a11009778b8d/log\n    /tmp/rustd-cargo-jwsajgf3/ripgrep: ready\n  worker: pid 2004243, /tmp/rustd-cargo-jwsajgf3/ripgrep/, log /tmp/rustd-cargo-jwsajgf3/home/workers/12976a2d27e0c55eaca18c3d7361f1b3/log\n    /tmp/rustd-cargo-jwsajgf3/ripgrep: loading for 9s\n/tmp/rustd-cargo-jwsajgf3/ripgrep (test, 3963238479dc8d49): 1 builds by the daemon, 1 by cargo\n  1 x `rg`: the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/ripgrep/crates/core/main.rs changed\n/tmp/rustd-cargo-jwsajgf3/ripgrep (dev, fe170496ef75a7be): 6 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "fd",
@@ -88,12 +88,12 @@
    "wrong": [],
    "times": {
     "cold build": [
-     21.91,
-     21.98
+     19.94,
+     22.66
     ],
     "cold run": [
-     0.06,
-     0.44
+     0.08,
+     1.04
     ],
     "warm-up": [
      0.02,
@@ -101,47 +101,47 @@
     ],
     "warm build": [
      0.03,
-     0.55
+     1.01
     ],
     "warm run": [
      0.05,
-     0.55
+     1.01
     ],
     "cold test": [
-     5.9,
-     5.52
+     4.31,
+     4.37
     ],
     "test warm-up": [
-     3.02,
+     3.29,
      null
     ],
     "warm test": [
-     0.64,
-     1.05
+     0.69,
+     1.61
     ],
     "edit build": [
      0.16,
-     0.51
+     1.02
     ],
     "edit run": [
      0.04,
-     0.44
-    ],
-    "edit test": [
-     0.9,
      1.03
     ],
+    "edit test": [
+     2.1,
+     1.66
+    ],
     "broken": [
-     0.57,
-     0.23
+     0.51,
+     0.37
     ],
     "mended": [
-     0.17,
-     0.41
+     0.2,
+     1.04
     ],
     "mended run": [
-     0.05,
-     0.42
+     0.04,
+     1.03
     ]
    },
    "built": {
@@ -151,16 +151,16 @@
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready; ready",
+    "test warm-up": "ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "daemon",
-    "broken": "cargo: the crate root has errors, `cargo check` shows them: mismatched types",
+    "edit test": "cargo: `fd`: the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/fd/src/main.rs changed",
+    "broken": "cargo: `fd`: the crate root has errors, `cargo check` shows them: mismatched types, and /tmp/rustd-cargo-jwsajgf3/fd/src/main.rs changed",
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 3887167, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3895887, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/452f0bf08448618f/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n  worker: pid 3887170, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/e8540e94d22ba866/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n  worker: pid 3895884, /dev/shm/rustd-cargo-cu96c_gg/fd/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/63610fdae8b722b0/log\n    /dev/shm/rustd-cargo-cu96c_gg/fd: ready\n/dev/shm/rustd-cargo-cu96c_gg/fd (dev, a60aa5a87d0cc04c): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/fd (test, cfc4fe13eeebae56): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 2016331, version 0.0.0-3f17830-18df8773dab89e41, exits after 1800s idle\n  worker: pid 2016334, /tmp/rustd-cargo-jwsajgf3/fd/, log /tmp/rustd-cargo-jwsajgf3/home/workers/0367dce20fc07ba3a855de263bd54a8f/log\n    /tmp/rustd-cargo-jwsajgf3/fd: ready\n  worker: pid 2038948, /tmp/rustd-cargo-jwsajgf3/fd/, log /tmp/rustd-cargo-jwsajgf3/home/workers/1ed8824f521ef680519dc5af82155247/log\n    /tmp/rustd-cargo-jwsajgf3/fd: loading for 5s\n/tmp/rustd-cargo-jwsajgf3/fd (test, 73497fbd32a834ce): 1 builds by the daemon, 1 by cargo\n  1 x `fd`: the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/fd/src/main.rs changed\n/tmp/rustd-cargo-jwsajgf3/fd (dev, e96017f936312d01): 7 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "bat",
@@ -248,79 +248,79 @@
    "wrong": [],
    "times": {
     "cold build": [
-     5.81,
-     6.79
+     5.27,
+     5.5
     ],
     "cold run": [
-     0.55,
-     0.42
+     0.03,
+     0.75
     ],
     "warm-up": [
-     5.28,
+     2.46,
      null
     ],
     "warm build": [
-     0.03,
-     0.39
+     0.04,
+     0.71
     ],
     "warm run": [
-     0.04,
-     0.36
+     0.03,
+     0.74
     ],
     "cold test": [
-     4.73,
-     4.92
+     3.91,
+     3.88
     ],
     "test warm-up": [
-     2.77,
+     1.92,
      null
     ],
     "warm test": [
-     0.38,
-     0.82
+     0.34,
+     1.08
     ],
     "edit build": [
      0.13,
-     0.34
+     0.72
     ],
     "edit run": [
-     0.04,
-     0.35
+     0.03,
+     0.74
     ],
     "edit test": [
-     0.6,
-     0.75
+     1.5,
+     1.11
     ],
     "broken": [
-     0.37,
-     0.2
+     0.45,
+     0.3
     ],
     "mended": [
-     0.19,
-     0.34
+     0.16,
+     0.74
     ],
     "mended run": [
      0.03,
-     0.39
+     0.73
     ]
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "cargo: the daemon is still loading the workspace (7s so far)",
+    "cold run": "unchanged: the daemon is still loading the workspace (6s so far)",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready; ready",
+    "test warm-up": "ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "daemon",
-    "broken": "cargo: the crate root has errors, `cargo check` shows them: mismatched types",
+    "edit test": "cargo: `hyperfine`: the tests of `hyperfine` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/hyperfine/src/main.rs changed",
+    "broken": "cargo: `hyperfine`: the crate root has errors, `cargo check` shows them: mismatched types, and /tmp/rustd-cargo-jwsajgf3/hyperfine/src/main.rs changed",
     "mended": "daemon",
     "mended run": "daemon"
    },
-   "status": "daemon: pid 3975735, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 3978042, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/ae12cb0fc91f018c/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n  worker: pid 3980989, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/f56c9585b1ac4b67/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n  worker: pid 3980992, /dev/shm/rustd-cargo-cu96c_gg/hyperfine/, log /dev/shm/rustd-cargo-cu96c_gg/home/workers/98263539fc13a5c4/log\n    /dev/shm/rustd-cargo-cu96c_gg/hyperfine: ready\n/dev/shm/rustd-cargo-cu96c_gg/hyperfine (dev, ecf6d3ec44663b22): 6 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (7s so far)\n/dev/shm/rustd-cargo-cu96c_gg/hyperfine (test, 707e352a8a78eb42): 2 builds by the daemon, 0 by cargo\n"
+   "status": "daemon: pid 2047766, version 0.0.0-3f17830-18df8773dab89e41, exits after 1800s idle\n  worker: pid 2063443, /tmp/rustd-cargo-jwsajgf3/hyperfine/, log /tmp/rustd-cargo-jwsajgf3/home/workers/08d70d9c097f8eb2a6e9b76ce15f60fc/log\n    /tmp/rustd-cargo-jwsajgf3/hyperfine: loading for 4s\n  worker: pid 2047769, /tmp/rustd-cargo-jwsajgf3/hyperfine/, log /tmp/rustd-cargo-jwsajgf3/home/workers/74eac79ab174f415437d7d55bc0c2115/log\n    /tmp/rustd-cargo-jwsajgf3/hyperfine: ready\n/tmp/rustd-cargo-jwsajgf3/hyperfine (test, 1ef1b3511c0a5183): 1 builds by the daemon, 1 by cargo\n  1 x `hyperfine`: the tests of `hyperfine` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/hyperfine/src/main.rs changed\n/tmp/rustd-cargo-jwsajgf3/hyperfine (dev, f5f1713dbf2149a2): 6 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "just",
@@ -554,14 +554,14 @@
   [
    "cold",
    "cargo rustd run -- fail",
-   "cargo: the daemon is still loading the workspace (317ms so far)",
+   "unchanged: the daemon is still loading the workspace (329ms so far)",
    3,
    "same"
   ],
   [
    "cold",
    "cargo rustd run --release",
-   "cargo: rustd builds the dev profile only",
+   "cargo",
    0,
    "same"
   ],
@@ -610,7 +610,7 @@
   [
    "cold",
    "cargo rustd run --profile quick",
-   "cargo: rustd builds the dev profile only",
+   "cargo",
    0,
    "same"
   ],
@@ -624,7 +624,7 @@
   [
    "cold",
    "RUSTFLAGS=--cfg extra cargo rustd run",
-   "cargo: RUSTFLAGS is set, and the daemon loads the workspace without it",
+   "cargo",
    0,
    "same"
   ],
@@ -638,7 +638,7 @@
   [
    "cold",
    "cargo rustd build --all-features",
-   "cargo: --all-features is not loaded by the daemon yet",
+   "cargo",
    0,
    "same"
   ],
@@ -673,28 +673,35 @@
   [
    "cold",
    "cargo rustd test greets",
-   "cargo: the daemon is still loading the workspace (445ms so far)",
+   "unchanged: the daemon is still loading the workspace (888ms so far)",
    0,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "cargo: the daemon is still loading the workspace (558ms so far)",
+   "unchanged: the daemon is still loading the workspace (956ms so far)",
    101,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test",
-   "cargo: the daemon is still loading the workspace (701ms so far)",
+   "unchanged: the daemon is still loading the workspace (1s so far)",
    101,
    "same"
   ],
   [
    "cold",
    "cargo rustd test --no-run",
-   "cargo: the daemon is still loading the workspace (808ms so far)",
+   "unchanged: the daemon is still loading the workspace (1s so far)",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "CARGO_INCREMENTAL=0 cargo rustd test",
+   "unchanged: the daemon is still loading the workspace (1s so far)",
    0,
    "same"
   ],
@@ -715,7 +722,7 @@
   [
    "warm",
    "cargo rustd run --release",
-   "cargo: rustd builds the dev profile only",
+   "daemon",
    0,
    "same"
   ],
@@ -764,7 +771,7 @@
   [
    "warm",
    "cargo rustd run --profile quick",
-   "cargo: rustd builds the dev profile only",
+   "daemon",
    0,
    "same"
   ],
@@ -778,7 +785,7 @@
   [
    "warm",
    "RUSTFLAGS=--cfg extra cargo rustd run",
-   "cargo: RUSTFLAGS is set, and the daemon loads the workspace without it",
+   "daemon",
    0,
    "same"
   ],
@@ -792,7 +799,7 @@
   [
    "warm",
    "cargo rustd build --all-features",
-   "cargo: --all-features is not loaded by the daemon yet",
+   "daemon",
    0,
    "same"
   ],
@@ -848,6 +855,13 @@
   [
    "warm",
    "cargo rustd test --no-run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "CARGO_INCREMENTAL=0 cargo rustd test",
    "daemon",
    0,
    "same"
@@ -869,7 +883,7 @@
   [
    "edit",
    "cargo rustd run --release",
-   "cargo: rustd builds the dev profile only",
+   "daemon",
    0,
    "same"
   ],
@@ -918,7 +932,7 @@
   [
    "edit",
    "cargo rustd run --profile quick",
-   "cargo: rustd builds the dev profile only",
+   "daemon",
    0,
    "same"
   ],
@@ -932,7 +946,7 @@
   [
    "edit",
    "RUSTFLAGS=--cfg extra cargo rustd run",
-   "cargo: RUSTFLAGS is set, and the daemon loads the workspace without it",
+   "daemon",
    0,
    "same"
   ],
@@ -946,7 +960,7 @@
   [
    "edit",
    "cargo rustd build --all-features",
-   "cargo: --all-features is not loaded by the daemon yet",
+   "daemon",
    0,
    "same"
   ],
@@ -960,49 +974,56 @@
   [
    "edit",
    "cargo rustd test",
-   "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/flags/util/src/lib.rs changed",
-   101,
+   "cargo: `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed",
+   0,
    "same"
   ],
   [
    "edit",
    "cargo rustd test --test it",
-   "cargo: the daemon has not loaded this build of the workspace",
-   101,
+   "cargo: `app`: the daemon has not loaded this build of the workspace, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed",
+   0,
    "same"
   ],
   [
    "edit",
    "cargo rustd test -p util --lib",
-   "daemon",
+   "cargo: `util`: the tests of `util` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed",
    0,
    "same"
   ],
   [
    "edit",
    "cargo rustd test greets",
-   "cargo: the daemon is still loading the workspace (360ms so far)",
-   101,
+   "unchanged: the daemon is still loading the workspace (543ms so far)",
+   0,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "cargo: the daemon is still loading the workspace (42ms so far)",
+   "unchanged: the daemon is still loading the workspace (581ms so far)",
    101,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test",
-   "cargo: the daemon is still loading the workspace (165ms so far)",
+   "unchanged: the daemon is still loading the workspace (678ms so far)",
    101,
    "same"
   ],
   [
    "edit",
    "cargo rustd test --no-run",
-   "cargo: the daemon is still loading the workspace (269ms so far)",
+   "unchanged: the daemon is still loading the workspace (734ms so far)",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "CARGO_INCREMENTAL=0 cargo rustd test",
+   "unchanged: the daemon is still loading the workspace (771ms so far)",
    0,
    "same"
   ]
@@ -1016,7 +1037,12 @@
   [
    "the first build starts one",
    true,
-   "pid 4100807"
+   "pid 2082217"
+  ],
+  [
+   "a program that runs cargo on its checkout builds, and the next run is right",
+   true,
+   "daemon, nested 0, then cargo"
   ],
   [
    "a later build is the daemon's, by the same daemon",
@@ -1026,7 +1052,7 @@
   [
    "a worktree is loaded by the same daemon and the same worker",
    true,
-   "workers [4100810]"
+   "workers [2082224]"
   ],
   [
    "a build in the worktree is the daemon's",
@@ -1041,29 +1067,94 @@
   [
    "a client of another build replaces the daemon",
    true,
-   "pid 4100807 then 4102008"
+   "pid 2082217 then 2084266"
   ],
   [
    "the workers of the daemon it replaced are gone",
    true,
-   "[4100810]"
+   "[2082224]"
   ],
   [
    "idle for RUSTD_IDLE_SECS, the daemon and its workers exit",
    true,
-   "daemon 4102270, workers [4102273]"
+   "daemon 2084517, workers [2084520]"
   ],
   [
    "workers exit when the daemon is killed",
    true,
-   "workers [4102943]"
+   "workers [2085576]"
   ],
   [
    "the build after that starts a daemon again and succeeds",
    true,
    ""
+  ],
+  [
+   "16 clients at once on 4 worktrees each run their own tree's program",
+   true,
+   "16 of 16 right, 16 built by the daemon, 1 worker"
+  ],
+  [
+   "a client killed while its build is held leaves the daemon serving",
+   true,
+   "daemon"
+  ],
+  [
+   "the build whose daemon is killed is cargo's, is right, and says so",
+   true,
+   "cargo: `app`: the daemon ended before it answered (killed?), its log is /tmp/rustd-cargo-jwsajgf3/home-life/daemon.log, and /tmp/rustd-cargo-jwsajgf3/life/app/src/main.rs changed"
+  ],
+  [
+   "the workers of the killed daemon are gone",
+   true,
+   "[2086850]"
+  ],
+  [
+   "the build after that is a new daemon's",
+   true,
+   "daemon"
+  ],
+  [
+   "status by another build says the daemon is another build, and leaves it",
+   true,
+   "daemon: another build of rustd, version 0.0.0-3f17830-18df8773dab89e41; the next build replaces it"
+  ],
+  [
+   "a build by another build of rustd is cargo's, says why, and replaces the daemon",
+   true,
+   "cargo: this build's state was written by another build of rustd"
+  ],
+  [
+   "and the first build of rustd replaces that one the same way",
+   true,
+   "cargo: this build's state was written by another build of rustd"
+  ],
+  [
+   "the user's own raw request is answered",
+   true,
+   "answer: {\"Status\":{\"pid\":2091970,\"version\":\"0.0.0-3f17830-18"
+  ],
+  [
+   "a second user can't reach the socket",
+   true,
+   "modes 700 600, connect: Permission denied"
+  ],
+  [
+   "with the modes opened, the daemon turns the second user away by its uid",
+   true,
+   "'answer: [Errno 104] Connection reset by peer'"
+  ],
+  [
+   "and still answers its own user",
+   true,
+   "answer: {\"Status\":{\"pid\":2091970,\"version\":\"0.0.0-3f17830-18"
+  ],
+  [
+   "the client says nothing to a socket a second user serves",
+   true,
+   "status 1, heard: 0"
   ]
  ],
  "wrong": [],
- "flags_status": "daemon: pid 4091034, version 0.0.0-2c36f38-18df50e91b3728b7, exits after 1800s idle\n  worker: pid 4092360, /dev/shm/rustd-cargo-cu96c_gg/flags/app, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/097b1e4dcd2da708/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4100237, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/d0074e63241607f9/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: loading for 340ms\n  worker: pid 4091037, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/f597c39936a0f344/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4092033, /dev/shm/rustd-cargo-cu96c_gg/flags/app, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/86fc9b75c70fec99/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4099480, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/bcaeb4730bf0e386/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: loading for 766ms\n  worker: pid 4091670, /dev/shm/rustd-cargo-cu96c_gg/flags/, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/084ca4f068ca472b/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n  worker: pid 4095529, /dev/shm/rustd-cargo-cu96c_gg/flags/util, log /dev/shm/rustd-cargo-cu96c_gg/home-flags/workers/e84eaa32ac546a44/log\n    /dev/shm/rustd-cargo-cu96c_gg/flags: ready\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, 4f0997d91413c7b3): 5 builds by the daemon, 9 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/rustd-cargo-cu96c_gg/flags/util/src/lib.rs changed\n  1 x the daemon is still loading the workspace (165ms so far)\n  1 x the daemon is still loading the workspace (269ms so far)\n  1 x the daemon is still loading the workspace (360ms so far)\n  1 x the daemon is still loading the workspace (42ms so far)\n  1 x the daemon is still loading the workspace (445ms so far)\n  1 x the daemon is still loading the workspace (558ms so far)\n  1 x the daemon is still loading the workspace (701ms so far)\n  1 x the daemon is still loading the workspace (808ms so far)\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, 4435ae61cb8f100a): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (test, b8fcf6862ab2e9be): 1 builds by the daemon, 1 by cargo\n  1 x the daemon has not loaded this build of the workspace\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, f99114aa91dcc129): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, ee8ac764746e7d6b): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, fa47015092d8737b): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 2e40474cf836ca49): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 20d83b5f7e2a30d4): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 76367848f52037db): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 15e57ab1e141ac1f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 8ebafdd1a6c9eb01): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-cu96c_gg/flags (dev, 8155fd112a16c70e): 4 builds by the daemon, 1 by cargo\n  1 x the daemon is still loading the workspace (317ms so far)\n"
+ "flags_status": "daemon: pid 2069461, version 0.0.0-3f17830-18df8773dab89e41, exits after 1800s idle\n  worker: pid 2071855, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/41f9db10f97e691d0687986592158be1/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2069464, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/fdf9f63aa0f1973422fc731d96fdb2eb/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2074338, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/273a698c3bdfeda70302f3e068098b72/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2070807, /tmp/rustd-cargo-jwsajgf3/flags/app, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/340990efacf928aab3c9671bd061c83d/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2071344, /tmp/rustd-cargo-jwsajgf3/flags/app, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/f0a967e3c43599bf41d7ab07f3bbc33a/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2070510, /tmp/rustd-cargo-jwsajgf3/flags/app, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/976cc4dc2b8487141240ab392b51cff6/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2073992, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/0448d2bc3e61eb738c5d6dff93b71b25/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2081340, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/87dd42e93c01659748f9034228c28d95/log\n    /tmp/rustd-cargo-jwsajgf3/flags: loading for 876ms\n    /tmp/rustd-cargo-jwsajgf3/flags: loading for 462ms\n  worker: pid 2070205, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/0e2c6a70e32b59277b5a6dbabc1e42e8/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2069848, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/8827638ea4a22c08102e8b8a65bc5cc7/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n  worker: pid 2073226, /tmp/rustd-cargo-jwsajgf3/flags/, log /tmp/rustd-cargo-jwsajgf3/home-flags/workers/bcbc4d5627f9b34d2971f46fb896b3c2/log\n    /tmp/rustd-cargo-jwsajgf3/flags: ready\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 21a669c65624ea2a): 4 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, de4f9179c29a9802): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 20f4d7ba00aadd24): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (test, 527119977b2537b9): 1 builds by the daemon, 1 by cargo\n  1 x `app`: the daemon has not loaded this build of the workspace, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 7dac7409e2181ec7): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (test, e1e8edc7ae155d9d): 0 builds by the daemon, 1 by cargo\n  1 x `util`: the tests of `util` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed\n/tmp/rustd-cargo-jwsajgf3/flags (release, cf0924b4a56998c7): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, e2843caa8c6e63db): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 626392832ca7a2f2): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 05fb6a46c8fec7e3): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (quick, ca07b742dab3571c): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, e4a2c101829b53ba): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 247d06f87a4c07da): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (test, b764173a21f174ea): 6 builds by the daemon, 1 by cargo\n  1 x `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jwsajgf3/flags/util/src/lib.rs changed\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 32ab9942238c3d6e): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jwsajgf3/flags (dev, 052baeeb0d479009): 2 builds by the daemon, 0 by cargo\n"
 }
