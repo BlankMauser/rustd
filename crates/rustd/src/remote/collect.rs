@@ -18,7 +18,10 @@ use std::{
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use super::{Digest, Listed, Manifest, REUSE_FOR, Remote, keys_object, transfer::Object};
+use super::{
+    Digest, LIST_MAX, Listed, Manifest, NotRewritten, REUSE_FOR, Remote, keys_object,
+    transfer::Object,
+};
 
 /// The directories of a remote whose objects a list names.
 const NAMED: [&str; 3] = ["packs/", "keys/", "units/"];
@@ -130,8 +133,15 @@ async fn delist(
         manifest.0.retain(|pack, _| !old.contains(pack) && !redundant.contains(pack));
         manifest.lines()
     };
-    remote.shrink_list(name, shrink).await?;
-    collected.rewritten += 1;
+    match remote.shrink_list(name, shrink).await {
+        Ok(()) => collected.rewritten += 1,
+        // A signed list is not one a machine without a key takes lines out of.
+        Err(e) if e.is::<NotRewritten>() => {
+            eprintln!("remote: {e:#}");
+            collected.untrusted += 1;
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -140,7 +150,8 @@ async fn delist(
 /// stays. A pack whose keys cannot be had stays, and stands in for nothing.
 async fn redundant(remote: &Remote, listed: Vec<(Digest, Listed)>) -> BTreeSet<Digest> {
     let asked = stream::iter(listed.into_iter().map(|(pack, listed)| async move {
-        let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await;
+        let most = listed.keys_max(remote);
+        let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await;
         Some((pack, listed.format, keys.ok().filter(|it| !it.is_empty())?))
     }));
     let mut known: Vec<_> =
@@ -213,7 +224,7 @@ async fn named(remote: &Remote) -> anyhow::Result<BTreeSet<String>> {
 }
 
 async fn lines_of(remote: &Remote, name: &str) -> anyhow::Result<String> {
-    let read = remote.read_small(name).await?;
+    let read = remote.read_small(name, LIST_MAX).await?;
     let (bytes, _) = read.with_context(|| format!("`{name}` went away while it was read"))?;
     String::from_utf8(bytes).with_context(|| format!("`{name}` is not text"))
 }
