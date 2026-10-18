@@ -105,6 +105,12 @@ impl S3 {
         Ok(S3 { client: Client::from_conf(config.build()), bucket, prefix, patience, traffic })
     }
 
+    /// The bucket and the prefix, which is what the lists of this remote are remembered
+    /// under: the same bucket reached another way is the same remote.
+    pub(crate) fn place(&self) -> String {
+        format!("s3://{}/{}", self.bucket, self.prefix)
+    }
+
     fn key(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
     }
@@ -129,10 +135,12 @@ impl S3 {
         }
     }
 
-    /// The whole of a small object and the version it was read at.
+    /// The whole of a small object and the version it was read at, when it is at most
+    /// `most` bytes. How long the service says it is is not believed: the bytes are counted.
     pub(crate) async fn read_small(
         &self,
         name: &str,
+        most: u64,
     ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         let request = self.client.get_object().bucket(&self.bucket).key(self.key(name));
@@ -144,13 +152,13 @@ impl S3 {
             Err(e) => return Err(failed(e)).with_context(|| format!("fetching {name}")),
         };
         let version = Version(object.e_tag);
-        let body = tokio::time::timeout(self.patience, object.body.collect()).await;
-        let bytes = body
-            .map_err(|_| anyhow::anyhow!("no bytes for {:?}", self.patience))
-            .and_then(|it| Ok(it?.into_bytes()))
-            .with_context(|| format!("fetching {name}"))?;
+        let body = super::read_at_most(super::Body::S3(object.body), most, name);
+        let bytes = match tokio::time::timeout(self.patience, body).await {
+            Ok(bytes) => bytes?,
+            Err(_) => bail!("fetching {name}: no bytes for {:?}", self.patience),
+        };
         self.traffic.received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Ok(Some((bytes.to_vec(), version)))
+        Ok(Some((bytes, version)))
     }
 
     /// The object under `name` as a listing would have it, if there is one.

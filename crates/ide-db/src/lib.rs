@@ -147,6 +147,11 @@ impl RootDatabase {
         self.files.env_read()
     }
 
+    /// The variables `env!` has found unset, by the crate asking.
+    pub fn env_unset(&self) -> Vec<(base_db::Crate, String)> {
+        self.files.env_unset()
+    }
+
     /// Has `krate` be compiled with `env`.
     pub fn set_env(&mut self, krate: base_db::Crate, env: base_db::Env) {
         use salsa::Setter as _;
@@ -221,6 +226,10 @@ impl SourceDatabase for RootDatabase {
 
     fn env_is_read(&self, krate: base_db::Crate, key: &str) {
         self.files.env_is_read(krate, key);
+    }
+
+    fn env_is_unset(&self, krate: base_db::Crate, key: &str) {
+        self.files.env_is_unset(krate, key);
     }
 
     fn include_source(&self, path: base_db::AnchoredPath<'_>) {

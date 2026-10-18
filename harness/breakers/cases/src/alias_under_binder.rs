@@ -1,43 +1,40 @@
-//! yoke names `for<'a> fn(<Y as Yokeable<'a>>::Output)`: a projection that mentions the
-//! lifetime of the binder around it. Normalizing it with the lifetime still bound panicked.
+//! wasmtime's `HasData`: `fn(&mut T) -> D::Data<'_>` is `for<'a> fn(&'a mut T) -> D::Data<'a>`,
+//! an alias that names the lifetime of the binder around it. Monomorphization normalized it
+//! as if it stood alone, the solver panicked on the escaping bound variable, and the worker
+//! went down with it, so nothing of the workspace was the daemon's.
 
-use std::borrow::Cow;
+use std::marker::PhantomData;
 
-trait Lend<'a> {
-    type Out: 'a;
+pub trait HasData {
+    type Data<'a>;
 }
 
-impl<'a> Lend<'a> for Cow<'static, str> {
-    type Out = Cow<'a, str>;
+pub struct HasSelf<T>(PhantomData<T>);
+
+impl<T: 'static> HasData for HasSelf<T> {
+    type Data<'a> = &'a mut T;
 }
 
-impl<'a> Lend<'a> for u32 {
-    type Out = &'a u32;
+#[inline(never)]
+fn with<T, D: HasData>(
+    state: &mut T,
+    get: fn(&mut T) -> D::Data<'_>,
+    then: fn(D::Data<'_>) -> usize,
+) -> usize {
+    then(get(state))
 }
 
-fn attach<Y: for<'a> Lend<'a>, R>(
-    cart: &str,
-    f: for<'a> fn(&'a str) -> <Y as Lend<'a>>::Out,
-    g: for<'a> fn(<Y as Lend<'a>>::Out) -> R,
-) -> R {
-    g(f(cart))
+fn whole(table: &mut Vec<u32>) -> &mut Vec<u32> {
+    table
 }
 
-fn borrow(text: &str) -> Cow<'_, str> {
-    Cow::Borrowed(text)
+fn grown(table: &mut Vec<u32>) -> usize {
+    table.push(3);
+    table.len()
 }
 
-fn length(text: Cow<'_, str>) -> usize {
-    text.len()
-}
-
-fn pick(_: &str) -> &u32 {
-    &7
-}
-
-pub fn run() -> (usize, u32) {
-    (
-        attach::<Cow<'static, str>, _>("yoked", borrow, length),
-        attach::<u32, _>("", pick, |n| *n + 1),
-    )
+pub fn run() -> String {
+    let mut table = vec![1, 2];
+    let len = with::<Vec<u32>, HasSelf<Vec<u32>>>(&mut table, whole, grown);
+    format!("{len} {table:?}")
 }

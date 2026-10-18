@@ -1010,6 +1010,7 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
+        db.env_is_unset(arg_id.loc(db).krate, key.as_str());
         err = Some(ExpandError::other(
             span,
             if key.as_str() == "OUT_DIR" {

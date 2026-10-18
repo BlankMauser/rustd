@@ -2347,17 +2347,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(*callee).kind() else {
                     return false;
                 };
-                // A tuple struct's or variant's constructor makes an aggregate of its
-                // arguments, which rustc's `promote_consts::Validator::validate_rvalue`
-                // promotes when each operand is.
-                let promoted = match def.0 {
+                // A tuple struct or variant is made of its fields, as a record literal is.
+                let makes_value = match def.0 {
                     CallableDefId::FunctionId(func) => {
                         hir_def::attrs::AttrFlags::query(self.db, func.into())
                             .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE)
                     }
                     CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
                 };
-                promoted && args.clone().iter().all(|&it| self.is_promotable(it))
+                makes_value && args.clone().iter().all(|&it| self.is_promotable(it))
             }
             &Expr::Ref { expr, mutability, .. } => {
                 mutability.is_shared() && self.is_promotable(expr)
