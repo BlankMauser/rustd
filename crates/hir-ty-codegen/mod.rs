@@ -528,10 +528,16 @@ impl CodegenUnit {
                     .iter()
                     .copied()
                     .filter(|root| !denied.contains(root) && !left.contains(root))
-                    .filter(|&root| symbols.function(root).is_some())
                     .collect();
                 let start = stdx::time::Instant::now();
-                symbols.in_parallel(ours.len(), &|db, _, at| _ = compiled_root(db, ours[at]));
+                // One without a symbol is not compiled, and is still lowered to be told why.
+                symbols.in_parallel(
+                    ours.len(),
+                    &|db, symbols, at| match symbols.function(ours[at]) {
+                        Some(_) => _ = compiled_root(db, ours[at]),
+                        None => _ = db.mir_body(ours[at].into()),
+                    },
+                );
                 cg.phases.compile += start.elapsed();
                 while let Some(&root) = queue.get(next) {
                     next += 1;
@@ -615,6 +621,7 @@ impl CodegenUnit {
             if failed.is_empty() {
                 let instances = cg.instances.len();
                 if let Some(store) = store::Store::global() {
+                    cg.written();
                     store.flush();
                     let (hits, misses) = store.take_counts();
                     if hits + misses != 0 {
@@ -971,7 +978,8 @@ struct ObjectCodegen<'a, 'db> {
     debug: Option<DebugContext>,
     /// The types of the variables a debugger is told of, by the environment they are in.
     types: FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>,
-    kept_types: cached::KeptTypes,
+    /// Writes what is kept to the store, once there is something to keep.
+    writer: Option<cached::Writer>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1039,6 +1047,9 @@ struct ObjectCodegen<'a, 'db> {
     /// An entry did not fit the object, which now lacks a function it declares.
     misfit: bool,
 }
+
+/// Why an entry with a file of its own under what stands for cargo's directory is not kept.
+const OF_CARGO: &str = "a file under what stands for cargo's directory";
 
 /// What became of the instances an object was built from, as entries of the store.
 #[derive(Default)]
@@ -2590,7 +2601,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unwind,
             debug,
             types: FxHashMap::default(),
-            kept_types: cached::KeptTypes::default(),
+            writer: None,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -3090,26 +3101,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let key = cached::Entry::key(&name, debug.is_some(), program.flatten().as_ref());
         let Some(key) = key else { return };
-        // Also of an entry the store has: the sets may have been dropped from under it.
-        let types = debug.iter().flat_map(|it| &it.types);
-        let types: Vec<_> = types.map(|it| self.kept_types.keep(store, it)).collect();
-        let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
-        if !check && store.has(&key) {
-            return;
+        let check = std::env::var_os("RUSTD_CACHE_CHECK");
+        let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
+        if check.is_none() && store.has(&key) {
+            let kept = cached::Kept::Types(sets());
+            return self.writer(store).keep(kept);
         }
-        let stored = store.get(&key).filter(|_| check);
-        let Some(mut entry) = self.entry(instance, compiled, ids, debug) else {
+        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
-        if let Some(debug) = &mut entry.debug {
-            debug.stored_types = types;
-        }
-        if !entry.leave(self.symbols.cargo_home().as_deref()) {
-            let _: Option<()> = self.kept.unkept("a file under what stands for cargo's directory");
+        let mut entry = Box::new(entry);
+        let Some(check) = check else {
+            return self.writer(store).keep(cached::Kept::Entry { key, entry });
+        };
+        // The entry as it would be written is set against the one that is there.
+        let stored = store.get(&key);
+        let mut alone = cached::Writer::alone(store, self.symbols.cargo_home());
+        let Some(bytes) = alone.encoded(&mut entry) else {
+            let _: Option<()> = self.kept.unkept(OF_CARGO);
             return;
-        }
-        let Some(bytes) = entry.encode() else { return };
+        };
         match stored {
             None => {
                 store.insert(&key, &bytes);
@@ -3119,12 +3131,26 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             Some(stored) => {
                 self.kept.differing += 1;
                 eprintln!("entry of `{name}` is not what was compiled");
-                if let Some(path) = std::env::var_os("RUSTD_CACHE_CHECK").filter(|it| it != "1") {
-                    let at = std::path::Path::new(&path).join(self.kept.differing.to_string());
+                if check != "1" {
+                    let at = std::path::Path::new(&check).join(self.kept.differing.to_string());
                     let was = cached::Entry::decode(&stored);
                     _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
                 }
             }
+        }
+    }
+
+    fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer {
+        let home = || self.symbols.cargo_home();
+        self.writer.get_or_insert_with(|| cached::Writer::new(store, home()))
+    }
+
+    /// Waits for what was kept to be in the store.
+    fn written(&mut self) {
+        let Some(written) = self.writer.as_mut().map(|it| it.finish()) else { return };
+        self.kept.added += written.added;
+        if written.of_cargo != 0 {
+            *self.kept.unkept.entry(OF_CARGO).or_default() += written.of_cargo;
         }
     }
 

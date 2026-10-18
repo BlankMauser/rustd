@@ -507,6 +507,116 @@ impl KeptTypes {
     }
 }
 
+/// What the store is given of a compiled instance.
+pub(super) enum Kept {
+    Entry {
+        key: [u8; KEY],
+        entry: Box<Entry>,
+    },
+    /// The sets of an entry the store has: they may have been dropped from under it.
+    Types(Vec<TypeSet>),
+}
+
+/// How many entries a [`Writer`] added, and how many it did not for a file of theirs
+/// under what stands for cargo's directory.
+#[derive(Default)]
+pub(super) struct Written {
+    pub(super) added: usize,
+    pub(super) of_cargo: usize,
+}
+
+/// Gives the store what is compiled on a thread of its own, so that the thread that
+/// compiles does not wait for an entry to be written before it stitches the next.
+pub(super) struct Writer {
+    store: &'static Store,
+    cargo_home: Option<String>,
+    types: KeptTypes,
+    written: Written,
+    thread: Option<(std::sync::mpsc::Sender<Kept>, std::thread::JoinHandle<Written>)>,
+    /// Whether there is no thread to be had, and the entries are written where they are kept.
+    alone: bool,
+}
+
+impl Writer {
+    pub(super) fn new(store: &'static Store, cargo_home: Option<String>) -> Self {
+        let mut writer = Writer::alone(store, cargo_home);
+        writer.alone = false;
+        writer
+    }
+
+    /// A writer that writes where it is asked to.
+    pub(super) fn alone(store: &'static Store, cargo_home: Option<String>) -> Self {
+        let (types, written) = Default::default();
+        Writer { store, cargo_home, types, written, thread: None, alone: true }
+    }
+
+    pub(super) fn keep(&mut self, kept: Kept) {
+        if self.thread.is_none() && !self.alone {
+            let (jobs, queued) = std::sync::mpsc::channel::<Kept>();
+            let mut writer = Writer::alone(self.store, self.cargo_home.clone());
+            let work = move || {
+                queued.into_iter().for_each(|kept| writer.write(kept));
+                std::mem::take(&mut writer.written)
+            };
+            match std::thread::Builder::new().name("rustd store".to_owned()).spawn(work) {
+                Ok(thread) => self.thread = Some((jobs, thread)),
+                Err(_) => self.alone = true,
+            }
+        }
+        match &self.thread {
+            Some((jobs, _)) => _ = jobs.send(kept),
+            None => self.write(kept),
+        }
+    }
+
+    fn write(&mut self, kept: Kept) {
+        let (key, mut entry) = match kept {
+            Kept::Entry { key, entry } => (key, entry),
+            Kept::Types(types) => {
+                types.iter().for_each(|it| _ = self.types.keep(self.store, it));
+                return;
+            }
+        };
+        match self.encoded(&mut entry) {
+            Some(bytes) => {
+                self.store.insert(&key, &bytes);
+                self.written.added += 1;
+            }
+            None => self.written.of_cargo += 1,
+        }
+    }
+
+    /// The entry as the store keeps it, with its sets of types in the store. `None` is an
+    /// entry with a file of its own under what stands for cargo's directory.
+    pub(super) fn encoded(&mut self, entry: &mut Entry) -> Option<Vec<u8>> {
+        if let Some(debug) = &mut entry.debug {
+            let keys = debug.types.iter().map(|it| self.types.keep(self.store, it));
+            debug.stored_types = keys.collect();
+        }
+        entry.leave(self.cargo_home.as_deref()).then(|| entry.encode())?
+    }
+
+    /// Waits for everything kept so far to be in the store, and tells what was written
+    /// since the last time.
+    pub(super) fn finish(&mut self) -> Written {
+        let mut written = std::mem::take(&mut self.written);
+        if let Some((jobs, thread)) = self.thread.take() {
+            drop(jobs);
+            if let Ok(theirs) = thread.join() {
+                written.added += theirs.added;
+                written.of_cargo += theirs.of_cargo;
+            }
+        }
+        written
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// An entry on the way down from the one asked about.
 struct Visit {
     name: Arc<str>,
