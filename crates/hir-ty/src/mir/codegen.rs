@@ -5852,13 +5852,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        let mut parted: Vec<LocalId> = Vec::new();
-        for moved in &self.moved_paths {
-            if !parted.contains(&moved.local) {
-                parted.push(moved.local);
-            }
-        }
-        let parted_at_end = body.parted_at_block_ends(&parted, |place| self.moves_part(place));
         let drops = std::mem::take(&mut self.deferred_drops);
         let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
             true => FxHashMap::default(),
@@ -5867,11 +5860,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (block, place, target, span, from) in drops {
             self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
-            // A local that has not lost a part on any way here is dropped as one value.
-            let whole = parted
-                .iter()
-                .position(|&it| it == place.local)
-                .is_none_or(|at| !parted_at_end[from][at]);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
@@ -5890,7 +5878,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let dropped = self.builder.create_block();
                     self.guarded(
                         |this| {
-                            this.drop_place(&place, false, dropped)?;
+                            this.drop_place(&place, dropped)?;
                             this.builder.switch_to_block(dropped);
                             Ok(())
                         },
@@ -5902,7 +5890,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     )?;
                     self.builder.ins().jump(target, &[]);
                 }
-                _ => self.drop_place(&place, whole, target)?,
+                _ => self.drop_place(&place, target)?,
             }
         }
         self.moved_here = None;
@@ -5987,14 +5975,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some((path, ty))
     }
 
-    /// Whether using `place` as an operand moves a part out of its local, as far as is known.
-    fn moves_part(&self, place: &StoredPlace) -> bool {
-        let is_moved = |path: &Vec<u32>| {
-            self.moved_paths.iter().any(|it| it.local == place.local && it.path == *path)
-        };
-        self.moved_out_paths(place).is_none_or(|paths| paths.iter().any(is_moved))
-    }
-
     /// Says that the fields of `place` are all there again, after an assignment to it. A
     /// subslice of an array is its elements, as it is for a move out.
     fn clear_moved(&mut self, place: &StoredPlace) {
@@ -6042,9 +6022,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(bit)
     }
 
-    /// Drops what is left of a place, which is nothing if its local holds no value. `whole`
-    /// says that no part of the local can have been moved out.
-    fn drop_place(&mut self, place: &StoredPlace, whole: bool, target: ir::Block) -> Result<()> {
+    /// Drops what is left of a place, which is nothing if its local holds no value.
+    fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -6062,11 +6041,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let local = place.local;
         let place = self.place_ref(place)?;
-        if whole {
-            self.drop_value(place.addr, place.meta, place.ty.ty)?;
-        } else {
-            self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
-        }
+        self.drop_unmoved(place.addr, place.meta, place.ty.ty, local, &mut path, state)?;
         self.builder.ins().jump(target, &[]);
         Ok(())
     }
@@ -6296,6 +6271,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let mut moved = starts[&id].clone();
             self.moves_of_block(&body.basic_blocks[id], &mut moved);
             for next in successors(body, id) {
+                if body.unreached.contains(&next) {
+                    continue;
+                }
                 let known = starts.entry(next).or_insert_with(|| {
                     pending.push(next);
                     FxHashSet::default()
@@ -11085,7 +11063,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
                 self.at(end);
             }
-            self.drop_place(&place, false, next)?;
+            self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
