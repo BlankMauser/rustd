@@ -13,7 +13,7 @@ use rustc_abi::{
     AddressSpace, BackendRepr, FieldsShape, Float, Integer, LayoutCalculator, Niche, Primitive,
     ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange,
 };
-use rustc_index::IndexVec;
+use rustc_index::{IndexVec, bit_set::BitMatrix};
 use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
@@ -294,7 +294,11 @@ pub fn layout_of_ty_query(
             //     return Ok(tcx.mk_layout(LayoutS::scalar(cx, data_ptr)));
             // }
 
-            let unsized_part = struct_tail_erasing_lifetimes(db, pointee);
+            // The tail can be behind an associated type, such as `A::Dyn`.
+            let normalize = |ty| {
+                infer_ctxt.at(&cause, trait_env.param_env(db)).deeply_normalize(ty).unwrap_or(ty)
+            };
+            let unsized_part = struct_tail_erasing_lifetimes(db, pointee, &normalize);
             // FIXME(next-solver)
             /*
             if let TyKind::AssociatedType(id, subst) = unsized_part.kind(Interner) {
@@ -332,15 +336,89 @@ pub fn layout_of_ty_query(
             ptr.valid_range_mut().start = 1;
             Layout::scalar(dl, ptr)
         }
-        TyKind::Closure(_, args) => {
-            return db.layout_of_ty(args.as_closure().tupled_upvars_ty().store(), trait_env);
+        TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
+            // Not the layout of the tuple of captures: a tuple's last field can be unsized and
+            // so stays last, where a closure's fields are all free to move.
+            let upvars = ty.closure_upvars_ty().expect("a closure");
+            let fields = rustc_type_ir::inherent::Ty::tuple_fields(upvars)
+                .iter()
+                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
+            let fields = fields.iter().collect::<IndexVec<_, _>>();
+            cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
         }
-        TyKind::Coroutine(_, args) => {
-            return db.layout_of_ty(args.as_coroutine().tupled_upvars_ty().store(), trait_env);
-        }
-        TyKind::CoroutineClosure(_, args) => {
-            return db
-                .layout_of_ty(args.as_coroutine_closure().tupled_upvars_ty().store(), trait_env);
+        TyKind::Coroutine(id, args) => {
+            // Laid out as rustc lays it out, which a program can tell by the size: what was
+            // captured and where the body left off, then for each place it yields what is kept
+            // there, one such set over another. `CoroutineFrame` says which field is which.
+            let args = args.as_coroutine();
+            let parent_args = GenericArgs::new_from_slice(args.parent_args());
+            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
+                db.monomorphized_mir_body_for_coroutine_by_move(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(),
+                )
+            } else {
+                db.monomorphized_mir_body_for_coroutine(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(),
+                )
+            }
+            .map_err(|_| LayoutError::Unknown)?;
+            let held = body.locals_held_across_yields(|local| {
+                crate::drop::has_drop_glue(
+                    &infer_ctxt,
+                    body.locals[local].ty.as_ref(),
+                    trait_env.param_env(db),
+                ) != crate::drop::DropGlue::None
+            });
+            let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
+                .iter()
+                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            // A local only holds a value some of the time, so nothing of it is a niche.
+            let locals = held
+                .locals
+                .iter()
+                .map(|&local| {
+                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                    let mut layout = LayoutData::unit(dl, true);
+                    layout.size = of.size;
+                    layout.align = of.align;
+                    Ok(layout)
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?;
+            let flags: Vec<Layout> = held
+                .flagged()
+                .map(|at| {
+                    let bits = Integer::from_size(Size::from_bytes(held.flag_bytes(at)))
+                        .expect("a flag of one to eight bytes");
+                    Layout::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false)))
+                })
+                .collect();
+            let mut prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
+            prefix.extend(&flags);
+            let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
+            let locals = locals.iter().collect::<Vec<_>>();
+            let locals = locals.iter().collect::<IndexVec<usize, _>>();
+            // The body has not started, has returned or has panicked, and holds nothing then.
+            let mut kept: IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, usize>> =
+                IndexVec::from_elem_n(IndexVec::new(), CoroutineFrame::SUSPENDED);
+            kept.extend(held.yields.iter().map(|it| it.kept.iter().copied().collect()));
+            let mut conflicts = BitMatrix::new(locals.len(), locals.len());
+            for a in 0..locals.len() {
+                for b in 0..locals.len() {
+                    if held.conflict(a, b) {
+                        conflicts.insert(a, b);
+                    }
+                }
+            }
+            let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
+            let state = &state;
+            cx.calc.coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
         }
         TyKind::CoroutineWitness(_, _) => {
             return Err(LayoutError::NotImplemented);
@@ -390,8 +468,8 @@ pub fn layout_of_ty_query(
                     }
                 }
                 PatternKind::NotNull => {
-                    if let BackendRepr::Scalar(scalar) | BackendRepr::ScalarPair(scalar, _) =
-                        &mut layout.backend_repr
+                    if let BackendRepr::Scalar(scalar)
+                    | BackendRepr::ScalarPair { a: scalar, b: _, .. } = &mut layout.backend_repr
                     {
                         scalar.valid_range_mut().start = 1;
                         let niche = Niche {
@@ -528,7 +606,11 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
     }
 }
 
-fn struct_tail_erasing_lifetimes<'a>(db: &'a dyn HirDatabase, pointee: Ty<'a>) -> Ty<'a> {
+pub(crate) fn struct_tail_erasing_lifetimes<'a>(
+    db: &'a dyn HirDatabase,
+    pointee: Ty<'a>,
+    normalize: &dyn Fn(Ty<'a>) -> Ty<'a>,
+) -> Ty<'a> {
     match pointee.kind() {
         TyKind::Adt(def, args) => {
             let struct_id = match def.def_id() {
@@ -539,15 +621,15 @@ fn struct_tail_erasing_lifetimes<'a>(db: &'a dyn HirDatabase, pointee: Ty<'a>) -
             let mut it = data.fields().iter().rev();
             match it.next() {
                 Some((f, _)) => {
-                    let last_field_ty = field_ty(db, struct_id.into(), f, args);
-                    struct_tail_erasing_lifetimes(db, last_field_ty)
+                    let last_field_ty = normalize(field_ty(db, struct_id.into(), f, args));
+                    struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
                 }
                 None => pointee,
             }
         }
         TyKind::Tuple(tys) => {
             if let Some(last_field_ty) = tys.iter().next_back() {
-                struct_tail_erasing_lifetimes(db, last_field_ty)
+                struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
             } else {
                 pointee
             }
@@ -567,4 +649,59 @@ fn field_ty<'a>(
 
 fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
     Scalar::Initialized { value, valid_range: WrappingRange::full(value.size(dl)) }
+}
+
+/// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of
+/// its layout are the captures, the drop flags of each held local that needs them, and
+/// the state: where the body left off. The held locals are fields of its variants, one for
+/// each place the body yields at.
+#[derive(Debug, Clone, Copy)]
+pub struct CoroutineFrame {
+    pub upvars: usize,
+    pub flags: usize,
+}
+
+impl CoroutineFrame {
+    /// The first of the states that are a place the body yielded at; before it come not yet
+    /// started, returned and panicked.
+    pub const SUSPENDED: usize = 3;
+
+    /// The flag of the `index`th of the locals that have one.
+    pub fn drop_flag(self, index: usize) -> usize {
+        self.upvars + index
+    }
+
+    /// Where the `index`th of the held locals is in the future: among what is kept at any of
+    /// the places it is kept at, which are one place.
+    pub fn local_offset(
+        layout: &Layout,
+        held: &crate::mir::HeldLocals,
+        index: usize,
+    ) -> Option<Size> {
+        let Variants::Multiple { variants, .. } = &layout.variants else { return None };
+        held.yields.iter().zip(variants.iter().skip(Self::SUSPENDED)).find_map(|(point, kept)| {
+            let field = point.kept.iter().position(|&it| it == index)?;
+            Some(kept.field_offsets[RustcFieldIdx::new(field)])
+        })
+    }
+
+    /// The integer the state is, as wide as rustc has it.
+    pub fn state_of(layout: &Layout) -> Option<Scalar> {
+        match &layout.variants {
+            Variants::Multiple { tag, .. } => Some(*tag),
+            _ => None,
+        }
+    }
+
+    fn state_scalar(yields: usize) -> Scalar {
+        let last = (Self::SUSPENDED + yields - 1) as u128;
+        Scalar::Initialized {
+            value: Primitive::Int(Integer::fit_unsigned(last), false),
+            valid_range: WrappingRange { start: 0, end: last },
+        }
+    }
+
+    pub fn state(self) -> usize {
+        self.upvars + self.flags
+    }
 }

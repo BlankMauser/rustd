@@ -11,18 +11,20 @@ mod probe;
 
 use either::Either;
 use hir_expand::name::Name;
+use intern::Symbol;
 use salsa::SalsaValue;
 use span::Edition;
 use tracing::{debug, instrument};
 
 use base_db::Crate;
 use hir_def::{
-    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, FunctionId, GenericParamId, HasModule,
-    ImplId, ItemContainerId, ModuleId, TraitId,
+    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
+    GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::{Body, path::GenericArgs as HirGenericArgs},
     hir::{ExprId, generics::GenericParams},
+    item_scope::ItemScope,
     lang_item::LangItems,
     nameres::{DefMap, block_def_map, crate_def_map},
     resolver::Resolver,
@@ -37,6 +39,7 @@ use rustc_type_ir::{
     try_visit,
 };
 use stdx::impl_from;
+use syntax::SyntaxKind;
 use triomphe::Arc;
 
 use crate::{
@@ -472,13 +475,32 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
                 .map(|method| (Either::Right((impl_, method)), impl_subst));
         }
     };
-    let item =
+    let item_of = |impl_id: ImplId| {
         impl_id.impl_items(infcx.interner.db).items.iter().find_map(|(n, it)| match *it {
             AssocItemId::FunctionId(f) => (n == name).then_some(AssocItemId::FunctionId(f)),
             AssocItemId::ConstId(c) => (n == name).then_some(AssocItemId::ConstId(c)),
             AssocItemId::TypeAliasId(_) => None,
-        })?;
-    Some((Either::Left(item), impl_subst))
+        })
+    };
+    if let Some(item) = item_of(impl_id) {
+        return Some((Either::Left(item), impl_subst));
+    }
+    // A specializing impl takes the items it leaves out from the impl it specializes: the
+    // closest one that has the item.
+    let db = infcx.interner.db;
+    let parent =
+        crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())?;
+    let parent_args = infcx.fresh_args_for_item(Span::Dummy, parent.into());
+    let parent_trait_ref =
+        db.impl_trait(parent)?.instantiate(infcx.interner, parent_args).skip_norm_wip();
+    let mut ocx = ObligationCtxt::new(infcx);
+    ocx.eq(&ObligationCause::dummy(), env, trait_ref, parent_trait_ref).ok()?;
+    let parent_args = infcx.resolve_vars_if_possible(parent_args);
+    if parent_args.has_non_region_infer() {
+        return None;
+    }
+    let parent_args = parent_args.fold_with(&mut ReplaceInferWithError::new(infcx.interner));
+    Some((Either::Left(item_of(parent)?), parent_args))
 }
 
 pub(crate) fn find_matching_impl<'db>(
@@ -519,6 +541,76 @@ pub(crate) fn find_matching_impl<'db>(
         )),
         ImplSource::Param(_) | ImplSource::Builtin(..) => None,
     }
+}
+
+/// The crates rustc loads to compile `krate`, and so the ones whose impls it knows of: `krate`,
+/// the dependencies it names and what those load in turn. A dependency that is never named
+/// is not loaded, and with it go the impls that leave a type open: `assert_eq!(1.5, s.parse()
+/// .unwrap())` parses an `f64` until serde_json's `impl PartialEq<Value> for f64` is seen, and
+/// a test of a crate whose benches use criterion depends on serde_json.
+///
+/// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
+/// of the same name does) and less where a macro of another crate alone names the dependency.
+#[salsa::tracked(returns(deref))]
+pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+    let _p = tracing::info_span!("loaded_crates").entered();
+    let identifiers: FxHashSet<_> = crate_def_map(db, krate)
+        .modules(db)
+        .filter_map(|(_, module)| module.origin.file_id())
+        .flat_map(|file| {
+            let tokens = file.parse(db).syntax_node().descendants_with_tokens();
+            tokens.filter_map(|it| it.into_token()).filter(|it| it.kind() == SyntaxKind::IDENT)
+        })
+        .map(|ident| Symbol::intern(ident.text()))
+        .collect();
+    let named = |name: &Symbol| identifiers.contains(name);
+    let mut loaded = FxHashSet::default();
+    let mut ordered = vec![krate];
+    loaded.insert(krate);
+    for dep in &krate.data(db).dependencies {
+        let data = dep.crate_id.data(db);
+        let is_loaded = dep.is_sysroot()
+            || data.origin.is_lang()
+            || data.is_proc_macro
+            || named(dep.name.symbol());
+        if !is_loaded {
+            continue;
+        }
+        // The same of the dependency: the crates of its tests and benches are among its own.
+        for &dep in loaded_crates(db, dep.crate_id) {
+            if loaded.insert(dep) {
+                ordered.push(dep);
+            }
+        }
+    }
+    ordered.into()
+}
+
+/// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
+/// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
+/// name, and those are looked into in every crate. A function can hold one as well, of a type
+/// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
+/// functions are looked into in the crates of the workspace alone: lowering every body of
+/// every dependency for this is too much.
+fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
+    let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
+    if !krate.data(db).origin.is_local() {
+        return holders;
+    }
+    let declared = scope.declarations().filter_map(|def| match def {
+        ModuleDefId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+        ModuleDefId::StaticId(it) => Some(DefWithBodyId::from(it)),
+        _ => None,
+    });
+    holders.extend(declared);
+    let in_impls =
+        scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(|(_, item)| match *item {
+            AssocItemId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::ConstId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::TypeAliasId(_) => None,
+        });
+    holders.extend(in_impls);
+    holders
 }
 
 #[salsa::tracked(returns(ref))]
@@ -563,6 +655,13 @@ pub fn simplified_type_module(db: &dyn HirDatabase, ty: &SimplifiedType<'_>) -> 
     }
 }
 
+/// A `SimplifiedType` as the argument of a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct SelfTyKey<'db>(
+    // SAFETY: as for the maps below, it only contains `SolverDefId<'db>`.
+    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))] pub SimplifiedType<'db>,
+);
+
 #[derive(Debug, PartialEq, Eq, SalsaValue)]
 pub struct InherentImpls<'db> {
     // SAFETY: necessary due to `SimplifiedType<'db>`.
@@ -581,6 +680,17 @@ impl<'db> InherentImpls<'db> {
         let crate_def_map = crate_def_map(db, krate);
 
         Self::collect_def_map(db, crate_def_map)
+    }
+
+    /// The inherent impls of `krate` for one type. An impl added for another type changes
+    /// `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_self_ty(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_crate(db, krate).for_self_ty(&self_ty.0).into()
     }
 
     #[salsa::tracked(returns(ref))]
@@ -612,8 +722,8 @@ impl<'db> InherentImpls<'db> {
             def_map: &DefMap,
             map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>,
         ) {
-            for (_module_id, module_data) in def_map.modules() {
-                for impl_id in module_data.scope.inherent_impls() {
+            for (_module_id, module_data) in def_map.modules(db) {
+                for impl_id in module_data.scope(db).inherent_impls() {
                     let interner = DbInterner::new_no_crate(db);
                     let self_ty = db.impl_self_ty(impl_id);
                     let self_ty = self_ty.instantiate_identity().skip_norm_wip();
@@ -624,11 +734,8 @@ impl<'db> InherentImpls<'db> {
                     }
                 }
 
-                // To better support custom derives, collect impls in all unnamed const items.
-                // const _: () = { ... };
-                for konst in module_data.scope.unnamed_consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, map);
                     }
                 }
@@ -713,7 +820,39 @@ impl<'db> TraitImpls<'db> {
 
     #[salsa::tracked(returns(deref))]
     pub fn for_crate_and_deps(db: &'db dyn HirDatabase, krate: Crate) -> Box<[Arc<Self>]> {
-        krate.transitive_deps(db).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
+        loaded_crates(db, krate).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
+    }
+
+    /// The impls of one trait for one type in `krate` and its dependencies. An impl added for
+    /// another trait or type changes `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_and_deps_for_trait_and_self_ty(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        let mut found = Vec::new();
+        for impls in Self::for_crate_and_deps(db, krate) {
+            let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
+            found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
+            found.extend(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)));
+        }
+        found.into()
+    }
+
+    /// The blanket impls of one trait in `krate` and its dependencies.
+    #[salsa::tracked(returns(deref))]
+    pub fn blanket_in_crate_and_deps(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> Box<[ImplId]> {
+        Self::for_crate_and_deps(db, krate)
+            .iter()
+            .flat_map(|impls| impls.blanket_impls(trait_))
+            .copied()
+            .collect()
     }
 }
 
@@ -735,8 +874,8 @@ impl<'db> TraitImpls<'db> {
             lang_items: &LangItems,
             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
         ) {
-            for (_module_id, module_data) in def_map.modules() {
-                for impl_id in module_data.scope.trait_impls() {
+            for (_module_id, module_data) in def_map.modules(db) {
+                for impl_id in module_data.scope(db).trait_impls() {
                     let trait_ref = match db.impl_trait(impl_id) {
                         Some(tr) => tr.instantiate_identity().skip_norm_wip(),
                         None => continue,
@@ -769,7 +908,7 @@ impl<'db> TraitImpls<'db> {
                     }
                 }
 
-                for impl_id in module_data.scope.builtin_derive_impls() {
+                for impl_id in module_data.scope(db).builtin_derive_impls() {
                     let loc = impl_id.loc(db);
                     let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
                     let entry = map.entry(trait_id).or_default();
@@ -780,11 +919,8 @@ impl<'db> TraitImpls<'db> {
                     entry.1.push(impl_id);
                 }
 
-                // To better support custom derives, collect impls in all unnamed const items.
-                // const _: () = { ... };
-                for konst in module_data.scope.unnamed_consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, lang_items, map);
                     }
                 }
@@ -853,11 +989,21 @@ impl<'db> TraitImpls<'db> {
         block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
-        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
-        for impl_ in blocks.filter_map(|block| Self::for_block(db, block)) {
+        try_visit!(Self::for_each_block(db, block, for_each));
+        for impl_ in Self::for_crate_and_deps(db, krate) {
             try_visit!(for_each(impl_));
         }
-        for impl_ in Self::for_crate_and_deps(db, krate) {
+        R::output()
+    }
+
+    /// The impls of `block` and of the blocks around it.
+    pub fn for_each_block<R: VisitorResult>(
+        db: &'db dyn HirDatabase,
+        block: Option<BlockIdLt<'db>>,
+        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+    ) -> R {
+        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
+        for impl_ in blocks.filter_map(|block| Self::for_block(db, block)) {
             try_visit!(for_each(impl_));
         }
         R::output()
@@ -875,7 +1021,17 @@ impl<'db> TraitImpls<'db> {
         for impl_ in in_self_and_deps {
             try_visit!(for_each(impl_));
         }
+        Self::for_each_block_trait_and_type(db, type_block, trait_block, for_each)
+    }
 
+    /// The impls of two blocks and of the blocks around them, one for a trait and one for a
+    /// self type.
+    pub fn for_each_block_trait_and_type<R: VisitorResult>(
+        db: &'db dyn HirDatabase,
+        type_block: Option<BlockIdLt<'db>>,
+        trait_block: Option<BlockIdLt<'db>>,
+        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+    ) -> R {
         // We must not provide duplicate impls to the solver. Therefore we work with the following strategy:
         // start from each block, and walk ancestors until you meet the other block. If they never meet,
         // that means there can't be duplicate impls; if they meet, we stop the search of the deeper block.

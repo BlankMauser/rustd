@@ -8,8 +8,9 @@ use rustc_next_trait_solver::{
     solve::{GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt},
 };
 use rustc_type_ir::{
-    Interner, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
-    inherent::IntoKind,
+    ClauseKind, Interner, PredicateKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+    TypeVisitor,
+    inherent::{IntoKind, Term as _},
     solve::{Certainty, NoSolution},
 };
 
@@ -171,6 +172,16 @@ impl<'db> FulfillmentCtxt<'db> {
                 }
 
                 let goal = obligation.as_goal();
+                // Nothing lists what makes a type well formed yet (`well_formed_goals`), so the
+                // solver can only call this ambiguous, however often it is asked. Left pending,
+                // a large body gathers thousands of them, each looked at again with every
+                // expression.
+                if let PredicateKind::Clause(ClauseKind::WellFormed(term)) =
+                    goal.predicate.kind().skip_binder()
+                    && !infcx.shallow_resolve_term(term).is_infer()
+                {
+                    continue;
+                }
                 let delegate = <&SolverContext<'db>>::from(infcx);
                 if let Some(certainty) =
                     delegate.compute_goal_fast_path(goal, obligation.cause.span())

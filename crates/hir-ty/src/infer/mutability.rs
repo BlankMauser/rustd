@@ -38,8 +38,8 @@ impl<'db> InferenceContext<'db> {
                                 PlaceOp::Deref,
                             ) {
                                 self.table.register_predicates(infer_ok.obligations);
+                                *d = OverloadedDeref(mutability);
                             }
-                            *d = OverloadedDeref(mutability);
                         }
                     }
                     Adjust::Borrow(b) => match b {
@@ -89,7 +89,7 @@ impl<'db> InferenceContext<'db> {
             Expr::Block { id: _, statements, tail, label: _, unsafe_: _ } => {
                 for st in statements.iter() {
                     match st {
-                        Statement::Let { pat, type_ref: _, initializer, else_branch } => {
+                        Statement::Let { pat, type_ref: _, initializer, else_branch, .. } => {
                             if let Some(i) = initializer {
                                 self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));
                             }

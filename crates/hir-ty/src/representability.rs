@@ -87,12 +87,22 @@ fn representability_adt_ty<'db>(
     Representability::Representable
 }
 
-fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
+fn no_params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
     let generics = GenericParams::of(db, def_id.into());
-    let mut params_in_repr = (0..generics.len_early_bound_lifetimes()
-        + generics.len_type_or_consts())
+    (0..generics.len_early_bound_lifetimes() + generics.len_type_or_consts())
         .map(|_| false)
-        .collect::<Box<[bool]>>();
+        .collect()
+}
+
+fn params_in_repr_cycle(db: &dyn HirDatabase, _: salsa::Id, def_id: AdtId) -> Box<[bool]> {
+    no_params_in_repr(db, def_id)
+}
+
+// This is a query because a chain of types that each hold the one before several times would
+// otherwise be walked once per path through it.
+#[salsa::tracked(cycle_result = params_in_repr_cycle, returns(ref))]
+fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
+    let mut params_in_repr = no_params_in_repr(db, def_id);
     let mut handle_variant = |variant| {
         for field in db.field_types(variant).values() {
             params_in_repr_ty(

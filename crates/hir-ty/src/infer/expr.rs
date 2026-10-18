@@ -770,7 +770,12 @@ impl<'db> InferenceContext<'db> {
                 });
                 expected
             }
-            Expr::OffsetOf(_) => self.types.types.usize,
+            Expr::OffsetOf(offset) => {
+                // MIR lowering needs the type whose fields these are.
+                let container = self.make_ty(offset.container);
+                self.result.type_of_type_placeholder.insert(offset.container, container.store());
+                self.types.types.usize
+            }
             Expr::InlineAsm(asm) => {
                 let check_expr_asm_operand = |this: &mut Self, expr, is_input: bool| {
                     let ty = this.infer_expr_no_expect(expr, ExprIsRead::Yes);
@@ -953,6 +958,11 @@ impl<'db> InferenceContext<'db> {
             return self.types.types.error;
         };
         self.write_variant_resolution(expr.into(), variant);
+
+        // The ADT's where clauses are what a closure in a field gets its signature from.
+        if let TyKind::Adt(adt, args) = adt_ty.kind() {
+            self.add_required_obligations_for_value_path(expr.into(), adt.def_id().into(), args);
+        }
 
         // Prohibit struct expressions when non-exhaustive flag is set.
         if self.has_applicable_non_exhaustive(variant.into()) {
@@ -1472,7 +1482,7 @@ impl<'db> InferenceContext<'db> {
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let { pat, type_ref, initializer, else_branch } => {
+                        Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                             let decl_ty = type_ref
                                 .as_ref()
                                 .map(|&tr| this.make_ty(tr))

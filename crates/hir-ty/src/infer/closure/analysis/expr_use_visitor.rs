@@ -6,7 +6,7 @@
 
 use either::Either;
 use hir_def::{
-    AdtId, HasModule, VariantId,
+    AdtId, VariantId,
     attrs::AttrFlags,
     hir::{
         Array, AsmOperand, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, MatchArm, Pat,
@@ -1051,7 +1051,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     #[instrument(skip(self), level = "debug")]
     fn walk_captures(&mut self, closure_expr: ExprId) {
         fn upvar_is_local_variable(upvars: UpvarsRef<'_>, var_id: BindingId) -> bool {
-            upvars.contains(var_id)
+            !upvars.contains(var_id)
         }
 
         // If we have a nested closure, we want to include the fake reads present in the nested
@@ -1371,6 +1371,10 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                     )),
                     (Some(ValueNs::LocalBinding(var_id)), None) => {
                         self.cat_local(expr.into(), expr_ty, var_id)
+                    }
+                    // `Alias::Variant`, which only inference resolves.
+                    (None, None) if self.cx.result.variant_resolution_for_expr(expr).is_some() => {
+                        Ok(self.cat_rvalue(expr.into(), expr_ty))
                     }
                     (None, None) => Err(ErrorGuaranteed),
                 }
@@ -1741,18 +1745,16 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     #[instrument(skip(self), level = "debug")]
     fn is_multivariant_adt(&mut self, node: ExprOrPatIdPacked, ty: Ty<'db>) -> bool {
         if let TyKind::Adt(def, _) = self.cx.structurally_resolve_type(node, ty).kind() {
-            // Note that if a non-exhaustive SingleVariant is defined in another crate, we need
-            // to assume that more cases will be added to the variant in the future. This mean
-            // that we should handle non-exhaustive SingleVariant the same way we would handle
-            // a MultiVariant.
+            // A non-exhaustive enum of one variant may be given more in another crate's eyes,
+            // so it is handled like one of several. The crate it is defined in handles it the
+            // same way: what a closure captures does not depend on where the enum is from.
             match def.def_id() {
                 AdtId::StructId(_) | AdtId::UnionId(_) => false,
                 AdtId::EnumId(did) => {
-                    let has_foreign_non_exhaustive = || {
+                    let non_exhaustive = || {
                         AttrFlags::query(self.cx.db, did.into()).contains(AttrFlags::NON_EXHAUSTIVE)
-                            && did.krate(self.cx.db) != self.cx.krate()
                     };
-                    did.enum_variants(self.cx.db).variants.len() > 1 || has_foreign_non_exhaustive()
+                    did.enum_variants(self.cx.db).variants.len() > 1 || non_exhaustive()
                 }
             }
         } else {

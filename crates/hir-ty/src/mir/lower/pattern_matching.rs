@@ -7,7 +7,7 @@ use hir_def::{
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
-    BindingMode, ByRef,
+    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef,
     mir::{
         FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, Projection,
         lower::{
@@ -17,7 +17,10 @@ use crate::{
         },
     },
 };
-use crate::{method_resolution::CandidateId, next_solver::GenericArgs};
+use crate::{
+    method_resolution::CandidateId,
+    next_solver::{GenericArgs, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt},
+};
 
 macro_rules! not_supported {
     ($x: expr) => {
@@ -77,6 +80,24 @@ impl<'db> MirLowerCtx<'_, 'db> {
             pattern,
             MatchingMode::Check,
         )?;
+        let current = match std::mem::take(&mut self.arm_unreached) {
+            true => self.unreached_block(current, pattern.into()),
+            false => current,
+        };
+        // Bindings are dropped in the reverse of the order the pattern names them, whichever
+        // alternative of an or-pattern ends up binding them.
+        let mut bindings = Vec::new();
+        let mut alternatives = false;
+        self.store.walk_pats(pattern, &mut |pat| match &self.store[pat] {
+            Pat::Or(_) => alternatives = true,
+            &Pat::Bind { id, .. } if !bindings.contains(&id) => bindings.push(id),
+            _ => (),
+        });
+        if alternatives {
+            for binding in bindings {
+                self.push_storage_live(binding, current)?;
+            }
+        }
         let (current, current_else) = self.pattern_match_inner(
             current,
             current_else,
@@ -85,6 +106,46 @@ impl<'db> MirLowerCtx<'_, 'db> {
             MatchingMode::Bind,
         )?;
         Ok((current, current_else))
+    }
+
+    /// Goes on from `current` in a block that rustc has no way into: what is moved out there
+    /// is not counted where a drop asks what may be gone.
+    fn unreached_block(&mut self, current: BasicBlockId, span: MirSpan) -> BasicBlockId {
+        let block = self.new_basic_block();
+        self.set_goto(current, block, span);
+        self.result.unreached.push(block);
+        block
+    }
+
+    /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
+    /// rustc tries them. A choice maps an or-pattern to the index of its alternative.
+    pub(super) fn or_expansions(&self, pattern: PatId) -> Vec<Vec<(PatId, usize)>> {
+        if let Pat::Or(alternatives) = &self.store[pattern] {
+            return alternatives
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &alternative)| {
+                    self.or_expansions(alternative).into_iter().map(move |mut choice| {
+                        choice.push((pattern, i));
+                        choice
+                    })
+                })
+                .collect();
+        }
+        let mut expansions = vec![Vec::new()];
+        self.store[pattern].walk_child_pats(|child| {
+            let children = self.or_expansions(child);
+            if children.len() == 1 && children[0].is_empty() {
+                return;
+            }
+            expansions = expansions
+                .iter()
+                .flat_map(|choice| {
+                    children.iter().map(move |child| [&choice[..], &child[..]].concat())
+                })
+                .collect();
+        });
+        expansions
     }
 
     pub(super) fn pattern_match_assignment(
@@ -137,7 +198,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Pat::Wild => (current, current_else),
             Pat::Tuple { args, ellipsis } => {
-                let place_ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+                let place_ty = self.place_ty(&cond_place);
                 let subst = match place_ty.kind() {
                     TyKind::Tuple(s) => s,
                     _ => {
@@ -155,6 +216,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     &cond_place,
                     mode,
                 )?
+            }
+            Pat::Or(pats) if let Some(&chosen) = self.or_choices.get(&pattern) => {
+                self.pattern_match_inner(current, current_else, cond_place, pats[chosen], mode)?
             }
             Pat::Or(pats) => {
                 let then_target = self.new_basic_block();
@@ -205,7 +269,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     mode,
                 )?
             }
-            Pat::Range { start, end, range_type: _ } => {
+            Pat::Range { start, end, range_type } => {
                 let mut add_check = |l: &ExprId, binop| -> Result<'db, ()> {
                     let lv =
                         self.lower_literal_or_const_to_operand(self.infer.pat_ty(pattern), l)?;
@@ -240,7 +304,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         add_check(start, BinOp::Le)?;
                     }
                     if let Some(end) = end {
-                        add_check(end, BinOp::Ge)?;
+                        let op = match range_type {
+                            syntax::ast::RangeOp::Exclusive => BinOp::Gt,
+                            syntax::ast::RangeOp::Inclusive => BinOp::Ge,
+                        };
+                        add_check(end, op)?;
                     }
                 }
                 (current, current_else)
@@ -289,7 +357,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                             );
                         } else {
                             let c = Operand::from_concrete_const(
-                                pattern_len.to_le_bytes().into(),
+                                crate::mir::lower::word_bytes(pattern_len),
                                 MemoryMap::default(),
                                 Ty::new_usize(self.interner()),
                             );
@@ -350,8 +418,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     )?;
                 }
                 for (i, &pat) in suffix.iter().enumerate() {
+                    // Offset 0 from the end is the last element.
                     let next_place = cond_place.project(ProjectionElem::ConstantIndex {
-                        offset: i as u64,
+                        offset: (suffix.len() - 1 - i) as u64,
                         from_end: true,
                     });
                     (current, current_else) =
@@ -386,6 +455,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     ) = (mode, &pr)
                     {
                         let local = self.binding_local(*binding)?;
+                        let ty = self.result.locals[local].ty.as_ref();
+                        current = self.drop_assigned(local.into(), ty, current, pattern.into());
                         self.push_match_assignment(
                             current,
                             local,
@@ -486,7 +557,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 )?
             }
             Pat::Ref { pat, mutability: _ } => {
-                let ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+                let ty = self.place_ty(&cond_place);
                 if !ty.is_ref() {
                     return Err(MirLowerError::TypeError(
                         "non reference type matched with reference pattern",
@@ -500,10 +571,19 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     mode == MatchingMode::Assign,
                     "Pat::Expr can only come in destructuring assignments"
                 );
-                let Some((lhs_place, current)) = self.lower_expr_as_place(current, expr, false)?
+                // Inference records on the assignee how the value is coerced to its type; the
+                // assignee itself is a place, as rustc's desugaring to `let lhs = value;
+                // assignee = lhs;` has it.
+                if !self.assigned_value_is_copied(expr) {
+                    not_supported!("a coercion in a destructuring assignment");
+                }
+                let Some((lhs_place, current)) =
+                    self.lower_expr_as_place_without_adjust(current, expr, false)?
                 else {
                     return Ok((current, current_else));
                 };
+                let ty = self.expr_ty_without_adjust(expr);
+                let current = self.drop_assigned(lhs_place, ty, current, expr.into());
                 self.push_assignment(
                     current,
                     lhs_place,
@@ -512,9 +592,25 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 );
                 (current, current_else)
             }
-            Pat::Box { .. } => not_supported!("box pattern"),
+            &Pat::Box { inner } => {
+                let cond_place = cond_place.project(ProjectionElem::Deref);
+                self.pattern_match_inner(current, current_else, cond_place, inner, mode)?
+            }
             Pat::Deref { .. } => not_supported!("deref pattern"),
         })
+    }
+
+    /// Whether the value a destructuring assignment gives to `assignee` is stored as it is:
+    /// it is not coerced, or is a reference that is reborrowed.
+    fn assigned_value_is_copied(&self, assignee: ExprId) -> bool {
+        match self.infer.expr_adjustments.get(&assignee).map_or(&[][..], |it| &**it) {
+            [] => true,
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_)), target },
+            ] => target.as_ref() == self.expr_ty_without_adjust(assignee),
+            _ => false,
+        }
     }
 
     fn pattern_match_binding(
@@ -528,6 +624,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let target_place = self.binding_local(id)?;
         self.push_storage_live(id, current)?;
+        if let BindingMode(ByRef::No, _) = mode
+            && self.guarded_moves.is_some()
+            && !self
+                .infcx
+                .type_is_copy_modulo_regions(self.env, self.result.locals[target_place].ty.as_ref())
+            && let Some(moves) = &mut self.guarded_moves
+        {
+            moves.push((target_place, cond_place));
+        }
         self.push_match_assignment(current, target_place, mode, cond_place, span);
         Ok((current, current_else))
     }
@@ -592,6 +697,16 @@ impl<'db> MirLowerCtx<'_, 'db> {
         Ok((then_target, Some(else_target)))
     }
 
+    /// The type of a place, normalized: the local of a `?` has the type `<R as Try>::Residual`.
+    fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
+        let ty = place.ty(&self.result, &self.infcx, self.env).ty;
+        if !matches!(ty.kind(), TyKind::Alias(..)) {
+            return ty;
+        }
+        let mut ocx = ObligationCtxt::new(&self.infcx);
+        ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty).unwrap_or(ty)
+    }
+
     fn pattern_matching_variant(
         &mut self,
         cond_place: Place<'db>,
@@ -602,7 +717,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         shape: AdtPatternShape<'_>,
         mode: MatchingMode,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
-        let place_ty = cond_place.ty(&self.result, &self.infcx, self.env).ty;
+        let place_ty = self.place_ty(&cond_place);
         let Some((place_adt, _)) = place_ty.as_adt() else {
             return Err(MirLowerError::TypeError("non ADT type matched with ADT pattern"));
         };
@@ -612,7 +727,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
         Ok(match variant {
             VariantId::EnumVariantId(v) => {
-                if mode == MatchingMode::Check {
+                // A pattern for the only variant of an enum always matches, and a closure that
+                // captures one field of such an enum has no discriminant to read.
+                let only_variant = hir_def::Lookup::lookup(&v, self.db)
+                    .parent
+                    .enum_variants(self.db)
+                    .variants
+                    .len()
+                    == 1;
+                if mode == MatchingMode::Check && !only_variant {
                     let e = self.const_eval_discriminant(v)? as u128;
                     let tmp = self.discr_temp_place(current);
                     self.push_assignment(

@@ -10,6 +10,15 @@ use crate::{
 };
 
 impl<'db> MirLowerCtx<'_, 'db> {
+    /// A temporary is dropped before the ones that were made while computing its value.
+    fn declare_last(&mut self, local: LocalId) {
+        let scope = self.drop_scopes.iter_mut().rev().find(|it| it.locals.contains(&local));
+        if let Some(scope) = scope {
+            scope.locals.retain(|&it| it != local);
+            scope.locals.push(local);
+        }
+    }
+
     fn lower_expr_to_some_place_without_adjust(
         &mut self,
         expr_id: ExprId,
@@ -21,6 +30,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         else {
             return Ok(None);
         };
+        self.declare_last(place.local);
         Ok(Some((place, current)))
     }
 
@@ -40,6 +50,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         else {
             return Ok(None);
         };
+        self.declare_last(place.local);
         Ok(Some((place, current)))
     }
 
@@ -167,9 +178,18 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     _ => false,
                 };
                 if !is_builtin {
-                    let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
+                    let Some((mut p, current)) = self.lower_expr_as_place(current, *expr, true)?
+                    else {
                         return Ok(None);
                     };
+                    // Inference borrows the operand itself when the deref is a mutable one, so
+                    // the place is that reference and not the value it points to.
+                    let borrowed = self.infer.expr_adjustments.get(expr).is_some_and(|it| {
+                        matches!(it.last(), Some(Adjustment { kind: Adjust::Borrow(_), .. }))
+                    });
+                    if borrowed {
+                        p = p.project(ProjectionElem::Deref);
+                    }
                     return self.lower_overloaded_deref(
                         current,
                         p,
@@ -202,13 +222,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Expr::Index { base, index } => {
                 let base_ty = self.expr_ty_after_adjustments(*base);
-                let index_ty = self.expr_ty_after_adjustments(*index);
-                if !matches!(index_ty.kind(), TyKind::Uint(rustc_ast_ir::UintTy::Usize))
-                    || !matches!(
-                        base_ty.strip_reference().kind(),
-                        TyKind::Array(..) | TyKind::Slice(..)
-                    )
-                {
+                if !is_builtin_index(self.infer, *base, *index) {
                     let Some(index_fn) = self.infer.method_resolution(expr_id) else {
                         return Err(MirLowerError::UnresolvedMethod(
                             "[overloaded index]".to_owned(),

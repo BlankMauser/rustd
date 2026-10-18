@@ -1,5 +1,6 @@
-use std::{fmt, hash::Hash, num::NonZero};
+use std::{borrow::Cow, fmt, hash::Hash, num::NonZero};
 
+use hir_def::{AdtId, VariantId};
 use intern::{Interned, InternedRef, impl_internable};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::{Size, TargetDataLayout};
@@ -9,8 +10,10 @@ use stdx::never;
 use crate::{
     MemoryMap, ParamEnvAndCrate, consteval,
     db::HirDatabase,
+    layout::Layout,
     mir::{IsSigned, pad16},
     next_solver::{Const, Consts, TyKind, WorldExposer},
+    utils::detect_variant_from_bytes,
 };
 
 use super::{DbInterner, Ty};
@@ -216,9 +219,47 @@ pub(super) fn allocation_to_const<'db>(
             });
             ValTreeKind::Branch(Consts::new_from_iter(items))
         }
-        TyKind::Adt(..) => {
-            // FIXME: This requires `adt_const_params`.
-            return Const::error(interner);
+        TyKind::Adt(def, args) => {
+            // Like rustc: the fields in order, after the variant index if it is an enum.
+            let db = interner.db;
+            let Ok(layout) = db.layout_of_ty(ty.store(), param_env.store()) else {
+                return Const::error(interner);
+            };
+            let mut items = Vec::new();
+            let (variant, layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
+                AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
+                AdtId::UnionId(_) => return Const::error(interner),
+                AdtId::EnumId(id) => {
+                    let Some((variant, layout)) =
+                        detect_variant_from_bytes(&layout, db, data_layout, memory, id)
+                    else {
+                        return Const::error(interner);
+                    };
+                    let variants = &id.enum_variants(db).variants;
+                    let Some(index) = variants.values().position(|it| it.0 == variant) else {
+                        return Const::error(interner);
+                    };
+                    items.push(Const::new_valtree(
+                        interner,
+                        interner.default_types().types.u32,
+                        ValTreeKind::Leaf(ScalarInt::from(index as u32)),
+                    ));
+                    (variant.into(), layout)
+                }
+            };
+            for (i, (_, field)) in db.field_types(variant).iter().enumerate() {
+                let field = field.ty().instantiate(interner, args).skip_norm_wip();
+                let offset = layout.fields.offset(i).bytes_usize();
+                let Ok(field_layout) = db.layout_of_ty(field.store(), param_env.store()) else {
+                    return Const::error(interner);
+                };
+                let Some(bytes) = memory.get(offset..offset + field_layout.size.bytes_usize())
+                else {
+                    return Const::error(interner);
+                };
+                items.push(allocation_to_const(interner, field, bytes, memory_map, param_env));
+            }
+            ValTreeKind::Branch(Consts::new_from_iter(items))
         }
         TyKind::FnDef(..) => {
             // FIXME: Fn items.

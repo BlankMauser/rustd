@@ -398,26 +398,27 @@ impl<'db> InferenceContext<'db> {
                 continue;
             }
 
-            if let Some(const_arg) = fn_generic_args.get(const_idx).and_then(|it| it.konst())
-                && let ConstKind::Infer(_) = const_arg.kind()
-            {
-                // Instantiate the generic arg with an error type, to prevent errors from it.
-                // FIXME: Actually lower the expression as const.
-                _ = self
-                    .table
-                    .at(&ObligationCause::dummy())
-                    .eq(self.types.consts.error, const_arg)
-                    .map(|infer_ok| self.table.register_infer_ok(infer_ok));
-            }
-
-            let expected = if let Some(&const_param) = const_params.get(const_idx) {
-                Expectation::has_type(self.db.const_param_ty(const_param))
-            } else {
-                Expectation::None
+            let const_arg = fn_generic_args.get(const_idx).and_then(|it| it.konst());
+            let Some(&const_param) = const_params.get(const_idx) else {
+                self.infer_expr(args[arg_idx as usize], &Expectation::None, ExprIsRead::Yes);
+                continue;
             };
-
-            self.infer_expr(args[arg_idx as usize], &expected, ExprIsRead::Yes);
-            // FIXME: evaluate and unify with the const
+            let ty = self.db.const_param_ty(const_param);
+            match const_arg {
+                Some(const_arg) if matches!(const_arg.kind(), ConstKind::Infer(_)) => {
+                    // The argument is the const generic argument, written in the old place.
+                    let value = self.create_anon_const(args[arg_idx as usize], ty);
+                    _ = self
+                        .table
+                        .at(&ObligationCause::dummy())
+                        .eq(value, const_arg)
+                        .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+                }
+                _ => {
+                    let expected = Expectation::has_type(ty);
+                    self.infer_expr(args[arg_idx as usize], &expected, ExprIsRead::Yes);
+                }
+            }
         }
         legacy_const_generics_indices.sort_unstable();
         legacy_const_generics_indices

@@ -131,6 +131,22 @@ pub enum MemoryMap<'db> {
 pub struct ComplexMemoryMap<'db> {
     memory: IndexMap<usize, Box<[u8]>, FxBuildHasher>,
     vtable: VTableMap<'db>,
+    /// The address ranges that are the memory of a static, as start and size.
+    statics: Vec<StaticMemory>,
+    /// What the address of a piece of `memory` was a multiple of where it was made, for
+    /// those where that is known.
+    aligns: IndexMap<usize, usize, FxBuildHasher>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticMemory {
+    start: usize,
+    size: usize,
+    id: hir_def::StaticId,
+}
+
+impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
+    fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
 impl ComplexMemoryMap<'_> {
@@ -146,9 +162,45 @@ impl ComplexMemoryMap<'_> {
             }
         }
     }
+
+    fn note_align(&mut self, addr: usize, align: usize) {
+        self.aligns.insert(addr, align);
+    }
 }
 
 impl<'db> MemoryMap<'db> {
+    /// The static whose memory holds `addr`, and the offset of `addr` in it.
+    pub(crate) fn static_at(&self, addr: usize) -> Option<(hir_def::StaticId, usize)> {
+        let MemoryMap::Complex(map) = self else { return None };
+        map.statics.iter().find_map(|it| {
+            let offset = addr.checked_sub(it.start)?;
+            (offset < it.size.max(1)).then_some((it.id, offset))
+        })
+    }
+
+    /// The memory that holds `addr`, with the address it starts at.
+    pub(crate) fn memory_at(&self, addr: usize) -> Option<(usize, &[u8])> {
+        match self {
+            MemoryMap::Empty => None,
+            MemoryMap::Simple(memory) => (addr == 0).then_some((0, &**memory)),
+            MemoryMap::Complex(map) => match map.memory.get(&addr) {
+                Some(memory) => Some((addr, &**memory)),
+                None => map.memory.iter().find_map(|(&start, memory)| {
+                    (start..start + memory.len()).contains(&addr).then_some((start, &**memory))
+                }),
+            },
+        }
+    }
+
+    /// What the piece of memory at `start` was aligned to where it was made, if that was
+    /// recorded.
+    pub(crate) fn align_at(&self, start: usize) -> Option<usize> {
+        match self {
+            MemoryMap::Empty | MemoryMap::Simple(_) => None,
+            MemoryMap::Complex(map) => map.aligns.get(&start).copied(),
+        }
+    }
+
     pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
@@ -169,7 +221,11 @@ impl<'db> MemoryMap<'db> {
     ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
-            let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
+            let align = match self.align_at(addr) {
+                Some(align) => align,
+                None if addr == 0 => 64,
+                None => (addr - (addr & (addr - 1))).min(64),
+            };
             f(val, align).map(|it| (addr, it))
         };
         match self {

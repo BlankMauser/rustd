@@ -9,7 +9,7 @@ use hir_def::{
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -31,20 +31,27 @@ use crate::{
     },
 };
 
+// rustd's code generator, in the repository this one is a submodule of.
+#[path = "../../../../../crates/hir-ty-codegen/mod.rs"]
+pub mod codegen;
 mod eval;
 mod lower;
 mod monomorphization;
+mod type_name;
 
 pub use eval::{
     Evaluator, IsSigned, MirEvalError, VTableMap, interpret_mir, pad16,
     render_const_using_debug_impl,
 };
 pub use lower::{
-    MirLowerError, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,
-    mir_body_query,
+    MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
+    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
+    mir_body_query, promoted_mir_body_query,
 };
 pub use monomorphization::{
-    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_query,
+    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
+    monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
+    monomorphized_promoted_mir_body_query,
 };
 
 pub type BasicBlockId = Idx<BasicBlock>;
@@ -976,7 +983,38 @@ pub enum StatementKind {
     //Retag(RetagKind, Box<Place>),
     //AscribeUserType(Place, UserTypeProjection, Variance),
     //Intrinsic(Box<NonDivergingIntrinsic>),
+    InlineAsm(Box<InlineAsm>),
     Nop,
+}
+
+/// An `asm!` block. One that does not return is followed by `Unreachable`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct InlineAsm {
+    /// The pieces name `operands` by index.
+    pub template: Box<[hir_def::hir::AsmPiece]>,
+    pub operands: Box<[AsmOperand]>,
+    pub options: hir_def::hir::AsmOptions,
+    /// Where the block says how it ended, when it has labels: 0 for running off its end, and
+    /// otherwise the label it jumped to, counted from 1. A `SwitchInt` follows.
+    pub taken: Option<StoredPlace>,
+    /// The block is the whole of a `#[naked]` function: its code and nothing else.
+    pub naked: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AsmOperand {
+    /// A register that holds `input` when the block starts, and whose value when the block
+    /// ends goes to `output`. With neither it is one the block overwrites.
+    Reg {
+        reg: hir_def::hir::InlineAsmRegOrRegClass,
+        input: Option<Operand>,
+        output: Option<StoredPlace>,
+    },
+    Const(Operand),
+    /// A `label` block, which the template jumps to.
+    Label,
+    /// A function or a static, which the template names.
+    Sym(Operand),
 }
 impl StatementKind {
     fn with_span(self, span: MirSpan) -> Statement {
@@ -1021,17 +1059,565 @@ pub struct MirBody<'db> {
     pub binding_locals: ArenaMap<BindingId, LocalId>,
     pub upvar_locals: FxHashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
     pub param_locals: Vec<LocalId>,
+    /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
+    /// value has to outlive the call.
+    pub promoted_locals: Vec<(LocalId, ExprId)>,
     /// This field stores the closures directly owned by this body. It is used
     /// in traversing every mir body.
     pub closures: Vec<InternedClosureId<'db>>,
+    /// Set for the body of an `async` block, which is compiled as its `Future::poll`.
+    pub coroutine: Option<CoroutineLocals>,
+    /// Blocks that rustc builds no way into: where a match arm binds that its tree of tests
+    /// never gets to. They run if control gets there, and what is moved out in them does not
+    /// count for the order a value is dropped in.
+    pub unreached: Vec<BasicBlockId>,
+    /// The locals that scopes hold, in the order the scopes end: the innermost scope first,
+    /// and within a scope the local declared last first. Of two locals that hold a value at
+    /// once, the earlier one here is dropped first, also by a landing pad.
+    pub scope_ends: Vec<LocalId>,
+}
+
+/// The locals an `async` body has on top of the ones it declares. Its parameters are a
+/// reference to the future and the `&mut Context` of the current `poll`, and the return slot
+/// has the type of the block's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, salsa::SalsaValue)]
+pub struct CoroutineLocals {
+    /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
+    pub poll: LocalId,
+    pub context: LocalId,
+}
+
+/// The locals an `async` block keeps from one `poll` to the next, in the order the body
+/// declares them: at each place it yields, the ones that hold a value then and are used after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldLocals {
+    pub locals: Vec<LocalId>,
+    /// The places the body yields at, in the order of the states of the future.
+    pub yields: Vec<YieldPoint>,
+    conflicts: Vec<bool>,
+    flagged: Vec<bool>,
+    /// How many parts of each may be moved out on their own.
+    parts: Vec<u32>,
+}
+
+/// One `await`: where the body goes on from, and which of the held locals are kept over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YieldPoint {
+    pub resume: BasicBlockId,
+    pub kept: Vec<usize>,
+}
+
+impl HeldLocals {
+    pub fn contains(&self, local: LocalId) -> bool {
+        self.locals.binary_search(&local).is_ok()
+    }
+
+    /// Whether the `a`th and the `b`th of the locals may both hold a value at some point, and
+    /// so can't share memory.
+    pub fn conflict(&self, a: usize, b: usize) -> bool {
+        self.conflicts[a * self.locals.len() + b]
+    }
+
+    /// Whether the future has to say if the local holds a value: where it yields does not say
+    /// it, or a part of the value may be gone.
+    pub fn is_flagged(&self, at: usize) -> bool {
+        self.flagged[at]
+    }
+
+    /// The size of the flag of a flagged local: a bit for the whole and one for each part that
+    /// may be gone.
+    pub fn flag_bytes(&self, at: usize) -> u64 {
+        match self.parts[at] {
+            0..8 => 1,
+            8..16 => 2,
+            16..32 => 4,
+            _ => 8,
+        }
+    }
+
+    /// The held locals whose flag is in the future, in order.
+    pub fn flagged(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.locals.len()).filter(|&at| self.flagged[at])
+    }
+}
+
+/// What a block does with a local, as `MirBody::accesses` tells it.
+enum Access {
+    Read,
+    /// The whole of it is given a value, or its storage ends.
+    Write,
+    Borrow,
+    /// A part of it is used as an operand, and so perhaps moved out.
+    Part(StoredProjection),
 }
 
 impl MirBody<'_> {
+    /// The locals that may hold a value when the body yields: the ones an `async` block has to
+    /// keep from one `poll` to the next. `moved_by_use` says whether using a local as an operand
+    /// takes its value, which the operand does not say.
+    pub fn locals_held_across_yields(&self, moved_by_use: impl Fn(LocalId) -> bool) -> HeldLocals {
+        let index = |local: LocalId| local.into_raw().into_u32() as usize;
+        let mut moved = vec![false; self.locals.len()];
+        for (local, _) in self.locals.iter() {
+            moved[index(local)] = moved_by_use(local);
+        }
+        let take = |held: &mut [bool], operand: &Operand| {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind
+                && place.projection.as_slice().is_empty()
+                && moved[index(place.local)]
+            {
+                held[index(place.local)] = false;
+            }
+        };
+        let mut start = vec![false; self.locals.len()];
+        for &param in &self.param_locals {
+            start[index(param)] = true;
+        }
+        // What a block does to the locals held on entry to it, and the blocks that follow.
+        // `gains` is told of a local about to be given a value, before the operands it is
+        // computed from are taken, and `yields` of what is held where the block yields.
+        let transfer = |id: BasicBlockId,
+                        held: &mut Vec<bool>,
+                        gains: &mut dyn FnMut(&[bool], usize),
+                        yields: &mut dyn FnMut(&[bool])| {
+            let block = &self.basic_blocks[id];
+            for statement in &block.statements {
+                match &statement.kind {
+                    StatementKind::Assign(place, rvalue) => {
+                        gains(held, index(place.local));
+                        match rvalue {
+                            Rvalue::UnaryOp(_, operand)
+                            | Rvalue::Cast(_, operand, _)
+                            | Rvalue::Repeat(operand, _)
+                            | Rvalue::Use(operand) => take(held, operand),
+                            Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                                take(held, lhs);
+                                take(held, rhs);
+                            }
+                            Rvalue::Aggregate(_, operands) => {
+                                operands.iter().for_each(|it| take(held, it));
+                            }
+                            Rvalue::CopyForDeref(_)
+                            | Rvalue::Discriminant(_)
+                            | Rvalue::Len(_)
+                            | Rvalue::Ref(..) => (),
+                            Rvalue::ThreadLocalRef(n)
+                            | Rvalue::AddressOf(n)
+                            | Rvalue::BinaryOp(n)
+                            | Rvalue::NullaryOp(n) => match *n {},
+                        }
+                        held[index(place.local)] = true;
+                    }
+                    StatementKind::StorageDead(local) => held[index(*local)] = false,
+                    StatementKind::InlineAsm(asm) => {
+                        for operand in &asm.operands {
+                            let AsmOperand::Reg { input, output, .. } = operand else { continue };
+                            if let Some(input) = input {
+                                take(held, input);
+                            }
+                            if let Some(output) = output {
+                                gains(held, index(output.local));
+                                held[index(output.local)] = true;
+                            }
+                        }
+                        if let Some(taken) = &asm.taken {
+                            held[index(taken.local)] = true;
+                        }
+                    }
+                    StatementKind::FakeRead(_)
+                    | StatementKind::Deinit(_)
+                    | StatementKind::StorageLive(_)
+                    | StatementKind::Nop => (),
+                }
+            }
+            let mut successors = SmallVec::<[BasicBlockId; 2]>::new();
+            match block.terminator.as_ref().map(|it| &it.kind) {
+                Some(TerminatorKind::SwitchInt { discr, targets }) => {
+                    take(held, discr);
+                    successors.extend(targets.all_targets().iter().copied());
+                }
+                Some(
+                    TerminatorKind::Goto { target }
+                    | TerminatorKind::FalseEdge { real_target: target, .. }
+                    | TerminatorKind::FalseUnwind { real_target: target, .. },
+                ) => successors.push(*target),
+                Some(TerminatorKind::Drop { place, target, .. }) => {
+                    if place.projection.as_slice().is_empty() {
+                        held[index(place.local)] = false;
+                    }
+                    successors.push(*target);
+                }
+                Some(TerminatorKind::DropAndReplace { place, value, target, .. }) => {
+                    gains(held, index(place.local));
+                    take(held, value);
+                    held[index(place.local)] = true;
+                    successors.push(*target);
+                }
+                Some(TerminatorKind::Call { func, args, destination, target, .. }) => {
+                    gains(held, index(destination.local));
+                    take(held, func);
+                    args.iter().for_each(|it| take(held, it));
+                    held[index(destination.local)] = true;
+                    successors.extend(*target);
+                }
+                Some(TerminatorKind::Assert { cond, target, .. }) => {
+                    take(held, cond);
+                    successors.push(*target);
+                }
+                Some(TerminatorKind::Yield { value, resume_arg, resume, .. }) => {
+                    take(held, value);
+                    yields(held);
+                    gains(held, index(resume_arg.local));
+                    held[index(resume_arg.local)] = true;
+                    successors.push(*resume);
+                }
+                Some(
+                    TerminatorKind::UnwindResume
+                    | TerminatorKind::CoroutineDrop
+                    | TerminatorKind::Abort
+                    | TerminatorKind::Return
+                    | TerminatorKind::Unreachable,
+                )
+                | None => (),
+            }
+            successors
+        };
+        // What is held on entry to each block: on some way to it, or on every way.
+        let solve = |on_every_way: bool| {
+            let mut entry: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+            entry.insert(self.start_block, start.clone());
+            let mut worklist = vec![self.start_block];
+            while let Some(id) = worklist.pop() {
+                let mut held = entry[id].clone();
+                let successors = transfer(id, &mut held, &mut |_, _| (), &mut |_| ());
+                for successor in successors {
+                    match entry.get_mut(successor) {
+                        Some(known) => {
+                            let mut changed = false;
+                            for (known, &held) in known.iter_mut().zip(&held) {
+                                let joined =
+                                    if on_every_way { *known && held } else { *known || held };
+                                changed |= joined != *known;
+                                *known = joined;
+                            }
+                            if changed {
+                                worklist.push(successor);
+                            }
+                        }
+                        None => {
+                            entry.insert(successor, held.clone());
+                            worklist.push(successor);
+                        }
+                    }
+                }
+            }
+            entry
+        };
+        let entry = solve(false);
+        let surely = solve(true);
+        let at_yield = |entry: &ArenaMap<BasicBlockId, Vec<bool>>, id: BasicBlockId| {
+            let mut held = entry[id].clone();
+            let mut at = Vec::new();
+            transfer(id, &mut held, &mut |_, _| (), &mut |held| at = held.to_vec());
+            at
+        };
+        // A value nothing reads after the yield need not be kept, unless it has a destructor to
+        // run or something may point at it.
+        let (live, borrowed, parted) = self.liveness();
+        let mut across = vec![false; self.locals.len()];
+        let mut unsure = vec![false; self.locals.len()];
+        let mut points = Vec::new();
+        for (id, block) in self.basic_blocks.iter() {
+            let Some(TerminatorKind::Yield { resume, .. }) =
+                block.terminator.as_ref().map(|it| &it.kind)
+            else {
+                continue;
+            };
+            if !entry.contains_idx(id) {
+                continue;
+            }
+            let (may, must) = (at_yield(&entry, id), at_yield(&surely, id));
+            let kept: Vec<bool> = (0..self.locals.len())
+                .map(|at| {
+                    // What `poll` is given is given again.
+                    !start[at] && may[at] && (moved[at] || borrowed[at] || live[*resume][at])
+                })
+                .collect();
+            for at in 0..self.locals.len() {
+                across[at] |= kept[at];
+                unsure[at] |= kept[at] && !must[at];
+            }
+            points.push((*resume, kept));
+        }
+        let locals: Vec<LocalId> =
+            self.locals.iter().map(|(local, _)| local).filter(|&it| across[index(it)]).collect();
+        let yields = points
+            .into_iter()
+            .map(|(resume, kept)| YieldPoint {
+                resume,
+                kept: (0..locals.len()).filter(|&at| kept[index(locals[at])]).collect(),
+            })
+            .collect();
+        let flagged = locals
+            .iter()
+            .map(|&it| moved[index(it)] && (unsure[index(it)] || !parted[index(it)].is_empty()))
+            .collect();
+        // Each of the elements of a subslice is a part.
+        let parts = locals
+            .iter()
+            .map(|&it| {
+                let parts = parted[index(it)].iter().map(|part| match part.as_slice().last() {
+                    Some(ProjectionElem::Subslice { .. }) => u64::BITS,
+                    _ => 1,
+                });
+                parts.sum()
+            })
+            .collect();
+        // Two of them that may hold a value at once can't share memory. With what is held on
+        // entry to each block known, one more pass over the blocks finds every such pair.
+        let mut slot = vec![None; self.locals.len()];
+        for (at, &local) in locals.iter().enumerate() {
+            slot[index(local)] = Some(at);
+        }
+        let words = locals.len().div_ceil(64);
+        let mut together = vec![0u64; locals.len() * words];
+        let bits = |held: &[bool]| {
+            let mut bits = vec![0u64; words];
+            for (at, &local) in locals.iter().enumerate() {
+                if held[index(local)] {
+                    bits[at / 64] |= 1 << (at % 64);
+                }
+            }
+            bits
+        };
+        let mut with = |at: usize, bits: &[u64]| {
+            for (known, bits) in together[at * words..][..words].iter_mut().zip(bits) {
+                *known |= bits;
+            }
+        };
+        for (id, held) in entry.iter() {
+            let on_entry = bits(held);
+            for at in 0..locals.len() {
+                if on_entry[at / 64] & 1 << (at % 64) != 0 {
+                    with(at, &on_entry);
+                }
+            }
+            let mut held = held.clone();
+            let mut gains = |held: &[bool], local: usize| {
+                if let Some(at) = slot[local] {
+                    with(at, &bits(held));
+                }
+            };
+            transfer(id, &mut held, &mut gains, &mut |_| ());
+        }
+        let mut conflicts = vec![false; locals.len() * locals.len()];
+        for a in 0..locals.len() {
+            for b in 0..locals.len() {
+                if a != b && together[a * words + b / 64] & 1 << (b % 64) != 0 {
+                    conflicts[a * locals.len() + b] = true;
+                    conflicts[b * locals.len() + a] = true;
+                }
+            }
+        }
+        HeldLocals { locals, yields, conflicts, flagged, parts }
+    }
+
+    /// The locals read after the start of each block before they are written, the ones
+    /// borrowed anywhere, and the parts of each that are used as an operand.
+    fn liveness(
+        &self,
+    ) -> (ArenaMap<BasicBlockId, Vec<bool>>, Vec<bool>, Vec<FxHashSet<StoredProjection>>) {
+        let index = |local: LocalId| local.into_raw().into_u32() as usize;
+        let count = self.locals.len();
+        let (mut borrowed, mut parted) = (vec![false; count], vec![FxHashSet::default(); count]);
+        let mut live: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+        let mut written: ArenaMap<BasicBlockId, Vec<bool>> = ArenaMap::new();
+        let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
+        for (id, _) in self.basic_blocks.iter() {
+            let (mut reads, mut writes) = (vec![false; count], vec![false; count]);
+            let next = self.accesses(id, &mut |local, access| match access {
+                Access::Read => reads[index(local)] |= !writes[index(local)],
+                Access::Write => writes[index(local)] = true,
+                Access::Borrow => borrowed[index(local)] = true,
+                Access::Part(part) => {
+                    if !part.as_slice().contains(&ProjectionElem::Deref) {
+                        parted[index(local)].insert(part);
+                    }
+                }
+            });
+            live.insert(id, reads);
+            written.insert(id, writes);
+            successors.insert(id, next);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (id, _) in self.basic_blocks.iter() {
+                for &successor in &successors[id] {
+                    for at in 0..count {
+                        if live[successor][at] && !written[id][at] && !live[id][at] {
+                            live[id][at] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        (live, borrowed, parted)
+    }
+
+    /// Tells `f` of what a block does with locals, in the order it does it, and returns the
+    /// blocks that follow. Dropping a local is not among it: that reads nothing of a value
+    /// without a destructor, and one with a destructor is kept regardless.
+    fn accesses(
+        &self,
+        id: BasicBlockId,
+        f: &mut dyn FnMut(LocalId, Access),
+    ) -> SmallVec<[BasicBlockId; 2]> {
+        fn indices(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            for elem in place.projection.as_slice() {
+                if let ProjectionElem::Index(local) = elem {
+                    f(*local, Access::Read);
+                }
+            }
+        }
+        fn read(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            indices(place, f);
+            f(place.local, Access::Read);
+        }
+        fn write(place: &StoredPlace, f: &mut dyn FnMut(LocalId, Access)) {
+            indices(place, f);
+            let whole = place.projection.as_slice().is_empty();
+            f(place.local, if whole { Access::Write } else { Access::Read });
+        }
+        fn is_within(place: &StoredPlace) -> bool {
+            !place.projection.as_slice().contains(&ProjectionElem::Deref)
+        }
+        fn operand(operand: &Operand, f: &mut dyn FnMut(LocalId, Access)) {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+                read(place, f);
+                if !place.projection.as_slice().is_empty() {
+                    f(place.local, Access::Part(place.projection.clone()));
+                }
+            }
+        }
+        let block = &self.basic_blocks[id];
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Assign(place, rvalue) => {
+                    match rvalue {
+                        Rvalue::UnaryOp(_, it)
+                        | Rvalue::Cast(_, it, _)
+                        | Rvalue::Repeat(it, _)
+                        | Rvalue::Use(it) => operand(it, f),
+                        Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                            operand(lhs, f);
+                            operand(rhs, f);
+                        }
+                        Rvalue::Aggregate(_, operands) => {
+                            operands.iter().for_each(|it| operand(it, f));
+                        }
+                        Rvalue::Ref(_, from) => {
+                            read(from, f);
+                            if is_within(from) {
+                                f(from.local, Access::Borrow);
+                            }
+                        }
+                        Rvalue::CopyForDeref(from)
+                        | Rvalue::Discriminant(from)
+                        | Rvalue::Len(from) => read(from, f),
+                        Rvalue::ThreadLocalRef(n)
+                        | Rvalue::AddressOf(n)
+                        | Rvalue::BinaryOp(n)
+                        | Rvalue::NullaryOp(n) => match *n {},
+                    }
+                    write(place, f);
+                }
+                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                    f(*local, Access::Write)
+                }
+                StatementKind::InlineAsm(asm) => {
+                    for it in &asm.operands {
+                        match it {
+                            AsmOperand::Reg { input, output, .. } => {
+                                input.iter().for_each(|it| operand(it, f));
+                                output.iter().for_each(|it| write(it, f));
+                            }
+                            AsmOperand::Const(it) | AsmOperand::Sym(it) => operand(it, f),
+                            AsmOperand::Label => (),
+                        }
+                    }
+                    asm.taken.iter().for_each(|it| write(it, f));
+                }
+                StatementKind::FakeRead(_) | StatementKind::Deinit(_) | StatementKind::Nop => (),
+            }
+        }
+        let mut successors = SmallVec::new();
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::SwitchInt { discr, targets }) => {
+                operand(discr, f);
+                successors.extend(targets.all_targets().iter().copied());
+            }
+            Some(
+                TerminatorKind::Goto { target }
+                | TerminatorKind::FalseEdge { real_target: target, .. }
+                | TerminatorKind::FalseUnwind { real_target: target, .. },
+            ) => successors.push(*target),
+            Some(TerminatorKind::Drop { place, target, .. }) => {
+                indices(place, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::DropAndReplace { place, value, target, .. }) => {
+                operand(value, f);
+                write(place, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::Call { func, args, destination, target, .. }) => {
+                operand(func, f);
+                args.iter().for_each(|it| operand(it, f));
+                write(destination, f);
+                successors.extend(*target);
+            }
+            Some(TerminatorKind::Assert { cond, target, .. }) => {
+                operand(cond, f);
+                successors.push(*target);
+            }
+            Some(TerminatorKind::Yield { value, resume_arg, resume, .. }) => {
+                operand(value, f);
+                write(resume_arg, f);
+                successors.push(*resume);
+            }
+            Some(
+                TerminatorKind::UnwindResume
+                | TerminatorKind::CoroutineDrop
+                | TerminatorKind::Abort
+                | TerminatorKind::Return
+                | TerminatorKind::Unreachable,
+            )
+            | None => (),
+        }
+        successors
+    }
+
+    /// The future the body of an `async` block waits for at `point`: going on from there
+    /// starts by borrowing it, to poll it again.
+    pub fn awaited(&self, point: &YieldPoint) -> Option<LocalId> {
+        let assigned =
+            self.basic_blocks[point.resume].statements.iter().find_map(|it| match &it.kind {
+                StatementKind::Assign(_, rvalue) => Some(rvalue),
+                _ => None,
+            })?;
+        match assigned {
+            Rvalue::Ref(_, future) => Some(future.local),
+            _ => None,
+        }
+    }
+
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
+    pub(crate) fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
         fn for_operand(op: &mut Operand, f: &mut impl FnMut(&mut StoredPlace)) {
             match &mut op.kind {
                 OperandKind::Copy(p) | OperandKind::Move(p) => {
@@ -1072,6 +1658,27 @@ impl MirBody<'_> {
                         }
                     }
                     StatementKind::FakeRead(p) | StatementKind::Deinit(p) => f(p),
+                    StatementKind::InlineAsm(asm) => {
+                        for operand in &mut asm.operands {
+                            match operand {
+                                AsmOperand::Reg { input, output, .. } => {
+                                    if let Some(input) = input {
+                                        for_operand(input, &mut f);
+                                    }
+                                    if let Some(output) = output {
+                                        f(output);
+                                    }
+                                }
+                                AsmOperand::Const(value) | AsmOperand::Sym(value) => {
+                                    for_operand(value, &mut f)
+                                }
+                                AsmOperand::Label => (),
+                            }
+                        }
+                        if let Some(taken) = &mut asm.taken {
+                            f(taken);
+                        }
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::Nop => (),
@@ -1122,8 +1729,15 @@ impl MirBody<'_> {
             binding_locals,
             upvar_locals,
             param_locals,
+            promoted_locals,
             closures,
+            coroutine: _,
+            unreached,
+            scope_ends,
         } = self;
+        unreached.shrink_to_fit();
+        scope_ends.shrink_to_fit();
+        promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
         locals.shrink_to_fit();
         binding_locals.shrink_to_fit();
@@ -1137,15 +1751,27 @@ impl MirBody<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
 pub enum MirSpan {
     ExprId(ExprId),
+    /// Where the expression ends: what leaving a scope does is taken to be written there.
+    ExprEnd(ExprId),
     PatId(PatId),
     BindingId(BindingId),
     SelfParam,
     Unknown,
 }
 impl_from!(ExprId, PatId for MirSpan);
+
+impl MirSpan {
+    /// The end of what this is the whole of.
+    pub fn end(self) -> MirSpan {
+        match self {
+            MirSpan::ExprId(expr) => MirSpan::ExprEnd(expr),
+            other => other,
+        }
+    }
+}
 
 impl From<&ExprId> for MirSpan {
     fn from(value: &ExprId) -> Self {
@@ -1220,7 +1846,12 @@ impl<'db> PlaceTy<'db> {
                 TyKind::Closure(_, args) => {
                     args.as_closure().tupled_upvars_ty().tuple_fields()[f.0 as usize]
                 }
-                // FIXME TyKind::Coroutine / TyKind::CoroutineClosure...
+                TyKind::Coroutine(_, args) => {
+                    args.as_coroutine().tupled_upvars_ty().tuple_fields()[f.0 as usize]
+                }
+                TyKind::CoroutineClosure(_, args) => {
+                    args.as_coroutine_closure().tupled_upvars_ty().tuple_fields()[f.0 as usize]
+                }
                 TyKind::Tuple(tys) => tys
                     .get(f.0 as usize)
                     .cloned()
@@ -1277,25 +1908,27 @@ impl<'db> PlaceTy<'db> {
         }
         match *elem {
             ProjectionElem::Deref => {
-                let ty = structurally_normalize(self.ty).builtin_deref(true).unwrap_or_else(|| {
-                    panic!("deref projection of non-dereferenceable ty {:?}", self)
-                });
+                // Lowering a deref pattern on a smart pointer gets here, for one.
+                let ty = structurally_normalize(self.ty)
+                    .builtin_deref(true)
+                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed));
                 PlaceTy::from_ty(ty)
             }
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                PlaceTy::from_ty(structurally_normalize(self.ty).builtin_index().unwrap())
-            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => PlaceTy::from_ty(
+                structurally_normalize(self.ty)
+                    .builtin_index()
+                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed)),
+            ),
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
                 PlaceTy::from_ty(match structurally_normalize(self.ty).kind() {
                     TyKind::Slice(..) => self.ty,
-                    TyKind::Array(inner, _) /*if !from_end*/ => Ty::new_array_opt(tcx, inner, to.checked_sub(from).map(|x| x.into())),
-                    // TyKind::Array(inner, size) if from_end => {
-                    //     let size = size
-                    //         .try_to_target_usize(tcx)
-                    //         .expect("expected subslice projection on fixed-size array");
-                    //     let len = size - from - to;
-                    //     Ty::new_array(tcx, *inner, len)
-                    // }
+                    // `to` counts from the end.
+                    TyKind::Array(inner, size) => Ty::new_array_opt(
+                        tcx,
+                        inner,
+                        crate::consteval::try_const_usize(tcx.db, size)
+                            .and_then(|size| size.checked_sub(from as u128 + to as u128)),
+                    ),
                     _ => panic!("cannot subslice non-array type: `{:?}`", self),
                 })
             }

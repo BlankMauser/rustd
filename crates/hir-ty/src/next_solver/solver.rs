@@ -183,21 +183,25 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             // Builtin derive traits don't have type/consts assoc items.
             return FetchEligibleAssocItemResponse::Err(ErrorGuaranteed);
         };
-        let impl_items = impl_id.impl_items(self.0.interner.db());
+        let db = self.0.interner.db;
+        let impl_items = impl_id.impl_items(db);
         let id = match trait_assoc_def_id.0 {
             TermId::TypeAliasId(trait_assoc_id) => {
-                let trait_assoc_data = TypeAliasSignature::of(self.0.interner.db, trait_assoc_id);
-                impl_items
-                    .items
-                    .iter()
-                    .find_map(|(impl_assoc_name, impl_assoc_id)| {
-                        if let AssocItemId::TypeAliasId(impl_assoc_id) = *impl_assoc_id
-                            && *impl_assoc_name == trait_assoc_data.name
-                        {
-                            Some(impl_assoc_id)
-                        } else {
-                            None
-                        }
+                let trait_assoc_data = TypeAliasSignature::of(db, trait_assoc_id);
+                let type_of = |impl_id: hir_def::ImplId| {
+                    impl_id.impl_items(db).items.iter().find_map(|(name, id)| match *id {
+                        AssocItemId::TypeAliasId(id) if *name == trait_assoc_data.name => Some(id),
+                        _ => None,
+                    })
+                };
+                type_of(impl_id)
+                    // A specializing impl has the types of the impl it specializes.
+                    .or_else(|| {
+                        let ancestor =
+                            crate::specialization::specialized_ancestor(db, impl_id, |it| {
+                                type_of(it).is_some()
+                            })?;
+                        type_of(ancestor)
                     })
                     .or_else(|| {
                         if trait_assoc_data.ty.is_some() { Some(trait_assoc_id) } else { None }
