@@ -459,8 +459,8 @@ impl Resolver<'_> {
             }
             match_ast! {
                 match node {
-                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_string())),
-                    ast::Static(it) => inner.push(it.name()?.text().to_string()),
+                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_owned())),
+                    ast::Static(it) => inner.push(it.name()?.text().to_owned()),
                     // Anonymous constants have numbers we don't know.
                     ast::BlockExpr(it) => if it.const_token().is_some() { return None },
                     ast::ConstArg(_) => return None,

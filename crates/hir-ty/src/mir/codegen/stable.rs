@@ -587,7 +587,7 @@ fn file_name(
     out: &mut String,
     file: HirFileId,
 ) -> Option<()> {
-    let mut written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
+    let written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
         file_name(db, symbols, out, file)?;
         write!(out, "#{}", id.into_raw()).ok()
     };
