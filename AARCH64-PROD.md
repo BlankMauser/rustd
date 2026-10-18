@@ -7,40 +7,77 @@ the result under `qemu-aarch64`. The two are never mixed in one number.
 
 ## Where it stands
 
-The head this file describes is this branch with `rustd-collate` at 14ee89181b merged in, which
-brings `rustd-security` and with it `storeguards.py` and `selects.py`.
+Work on this branch stopped here. This section says what is done, what is half done and what
+would come next; the sections after it give the detail.
 
-The gate on that head is green on an x86-64 Linux host under both backends (the list is at the
-end of this file). The native AArch64 numbers below are from the workflow run on the commit
-before that merge, 0a069156c8
-([run 39087233000](https://github.com/DioxusLabs/rustd/actions/runs/39087233000)). In that run
-the Cranelift harness job and both `projects` jobs were green natively. The LLVM harness job
-failed on one row of `debuginfo.py`, which is open. `storeguards.py` and `selects.py` have not
-run natively yet; the run on this head is their first.
+The head has `rustd-collate-next` at 1b022ff6f2 merged in. That merge has not had a whole gate:
+the run on it was stopped before the end. What it showed, on an x86-64 Linux host:
 
-Open on native AArch64:
+- Cranelift: 21 of the 22 harnesses passed (the table at the end of this file).
+  `cargo_rustd.py` failed on one check of the daemon's life, "16 clients at once on 4 worktrees
+  each run their own tree's program": 15 of 16 were right. That check came with the merge and
+  was not looked into, so it is not known whether it fails every time. The five projects of
+  that run (ripgrep, fd, bat, cargo, cargo-lib) were the same as cargo at every step.
+- LLVM at -O2 with fast emit: the first nine harnesses passed (corpus, programs, stress,
+  breakers, unwinds, splices, asmedits, includes, worktrees). The run was stopped in `keys.py`;
+  the thirteen after it did not run.
 
-- `debuginfo.py` with LLVM: the corpus has one function with lines and no entry in `.eh_frame`
-  (section 2). It does not show when the same corpus is built for AArch64 on an x86-64 host.
-- A 32-bit target has not been tried.
+The last head with a whole gate green under both backends is the commit before the merge of
+`rustd-collate` 14ee89181b, that is 0a069156c8. On the merge of 3d47ed59bf the Cranelift leg was
+green and the LLVM leg was stopped part way.
 
-Open on every platform, seen while working here:
+Nothing on this head has run natively. The last native run is on da50733d91
+([run 39093559068](https://github.com/DioxusLabs/rustd/actions/runs/39093559068)), which is
+this branch with 14ee89181b merged. Natively in that run:
 
-- `remote.py` has two checks that fail now and then on the runners, on either architecture:
-  "packs the store made one of are not fetched again" and "twelve packs with three requests at
-  a time: never more in flight". Neither has failed on the local host.
+- Cranelift harness job: every harness right except one row of `debuginfo.py`, which was the
+  harness and is fixed (section 2). `storeguards.py` and `selects.py` passed, `remote.py` was
+  right on every check, `buildmodel.py` 190 of 190.
+- LLVM harness job: failed in `remote.py` on the pull that stops one pack short, which is
+  fixed (section 1). Its `debuginfo.py` was all right.
+- Both `projects` jobs failed in the harness itself, which killed a served program that had
+  already ended; `rustd-collate-next` has a fix for that. Before that, with LLVM, the project
+  `just` differed from cargo by one test in two steps (one test fewer in a step cargo built
+  for both sides, one more in the next). Not looked into; it looks like the comparison and not
+  the build, since the first of the two was cargo's build on both sides.
+
+Done:
+
+- fd's unit test that failed under rustd (section 3), on every platform.
+- The pull that now and then stopped one pack short (section 1), on every platform.
+- The `debuginfo.py` rows that were wrong natively: both were the harness (section 2).
+- The worker that was stopped as idle while loading (section 1).
+- `aarch64-unknown-linux-musl`, one attempt (section 4).
+
+Half done:
+
+- The gate on this head, as above.
+- Native confirmation of this head: the workflow run on the push is the first.
+
+Not done, and what I would do next, in this order:
+
+1. Run the gate whole on this head and look into the "16 clients" check.
+2. Read the native run of this head; the two fixes above have not been seen natively.
+3. Look into the one-test difference in `just` natively.
+4. `armv7-unknown-linux-gnueabihf` under qemu, one attempt. Not tried.
+5. The causes of the musl failures.
+
+Seen on Windows and left to the Windows work: `storeshared.py` with Cranelift fails with
+`cache verify` saying a pack is corrupt because access to it is denied while daemons run.
+`verify` counts a pack it may not read as corrupt; my guess, not checked, is that Windows
+answers the same way for a pack that is being removed.
 
 ## What passes natively
 
-From run 39087233000, on `ubuntu-24.04-arm`, with Cranelift and with LLVM at -O2 with fast emit.
-The counts are the same under both backends unless two are given.
+From run 39093559068 (da50733d91), on `ubuntu-24.04-arm`, the Cranelift harness job. The LLVM
+harness job of that run stopped at `remote.py`, which is last, with the same counts up to there.
 
 | Harness | Native AArch64 |
 |---|---|
 | `difftest.py corpus --layouts` | MATCH, 825 of 825 functions from rustd, 0 of 903 layouts differ |
 | `programs.py` | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts |
-| `breakers.py` | 58 of 58, 7 open |
+| `breakers.py` | 62 of 62, 7 open |
 | `unwinds.py` | 8 of 8 |
 | `splices.py` | 71 of 71 |
 | `RUSTD_SPLICE=1 farsplices.py` | 6 of 6 |
@@ -48,12 +85,14 @@ The counts are the same under both backends unless two are given.
 | `includes.py` | 9 of 9 |
 | `worktrees.py` | 62 of 62 |
 | `keys.py` | 46 of 46, 0 open |
-| `backends.py` (LLVM leg) | LLVM compiled all 825 functions and their 11,069 instances itself |
-| `debuginfo.py` | Cranelift: all right, perf included. LLVM: 1 row wrong (section 2) |
+| `debuginfo.py` | all right but the `.eh_frame` row of the corpus, which was the harness (section 2); perf named 95 frames in 109 samples |
 | `buildmodel.py` | 190 of 190 as expected, 4 rows not run (see below) |
-| `storekills.py --kills 100`, `storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py` | pass |
-| `remote.py` with MinIO's arm64 binary | 91 of 91 |
-| `cargo_rustd.py`, all eight projects, flags, daemon | same as cargo at every step |
+| `storekills.py --kills 100`, `storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py`, `storeguards.py`, `selects.py` | pass |
+| `remote.py` with MinIO's arm64 binary | every check right with Cranelift; with LLVM one wrong, fixed since (section 1) |
+
+`cargo_rustd.py` did not finish natively in that run (see above). In the run before it, 39087233000
+on 0a069156c8, all eight projects, the flag table and the daemon's life were the same as cargo
+under both backends.
 
 The fuzzer's smoke run is x86-64 only in the workflow: only x86-64 has been fuzzed.
 
@@ -104,22 +143,21 @@ out there as on x86-64.
 
 Natively 91 of 91 checks are right under both backends in run 39087233000.
 
-The run before it had 90 of 91 natively, and I took that for an AArch64 fault. It is not: in
-run 39087233000 the same check failed on the x86-64 runner and passed on both AArch64 jobs. The
-check is "packs the store made one of are not fetched again": 24 packs of 64 KiB are pushed,
-another machine pulls them, its store makes one pack of them, and a second pull should fetch
-nothing. When it fails, the second pull fetches one pack and the store ends with 24 records in
-2 packs, and the first pull printed nothing on its standard output, so the first pull is what
-went wrong and stopped one pack short. Why is not known. The check now prints the first pull's
-exit status and what it said on standard error.
-
-A second check failed once on the x86-64 runner: "twelve packs with three requests at a time:
-never more in flight". Not looked into.
+One check failed now and then on the runners, on either architecture and either backend:
+"packs the store made one of are not fetched again". 24 packs of 64 KiB are pushed, another
+machine pulls them, its store makes one pack of them, and a second pull should fetch nothing.
+When it failed, the first pull had stopped one pack short with "incomplete frame". The cause:
+a fetched pack is written to a file by a task that runs behind the fetch, and the file was
+read again for unpacking before the last write had landed. The fetch now waits for the file
+to be written whole first. A unit test pulls such a pack 500 times; on a loaded machine it
+failed in 5 of 8 runs of 5,000 pulls without the fix and in none of 8 with it. The same fix
+came in with `rustd-collate-next`, and the merge keeps that one. Not yet seen natively.
 
 ### `storeguards.py`
 
-In the gate and the workflow since `rustd-security` was merged. It passes on x86-64 under both
-backends. It has not run natively yet.
+In the gate and the workflow since `rustd-security` was merged. It passes natively with
+Cranelift (run 39093559068) and on x86-64 under both backends; natively with LLVM that run
+shows it passing too, as it comes before `remote.py`.
 
 ## 2. `debuginfo.py`
 
@@ -141,13 +179,12 @@ Natively with Cranelift it names 104 frames of rustd's functions in 108 samples,
 a line, 28 samples unwound back to `main`. Natively with LLVM: 26 frames in 53 samples, none
 without a line, 13 back to `main`.
 
-One row is wrong natively with LLVM: "corpus: .eh_frame and the ranges" finds 1 of 11,735
-functions that has lines and no entry in `.eh_frame`. With Cranelift natively there is none,
-and with LLVM building the same corpus for AArch64 on an x86-64 host there is none either (6
-functions with no entry, all six naked functions with no lines). Natively five of the six are
-counted as assembly alone and the sixth has a line, so the likeliest reading is that one naked
-function is given a line row natively, not that a compiled function lost its entry; that is a
-guess. The row now names the function, so the next native run says which.
+One row was wrong natively now and then, under either backend: "corpus: .eh_frame and the
+ranges" found 1 function with lines and no entry in `.eh_frame`. It was the harness. The
+function was the naked `stabilized::arm::naked_add`, which has no entry and no lines, as it
+should. The row of the line table that ends a sequence is at the first byte after the code it
+ends, and when the linker put `naked_add` right there, the harness took that row for a line of
+`naked_add`. It no longer counts rows that end a sequence. Not yet seen natively.
 
 The perf row failed once on the x86-64 runner with LLVM ("NO LINE" for `runner::main`). That
 was the harness: `main` of the corpus's runner is rustc's code, and rustc gives some of its
@@ -209,31 +246,32 @@ generation.
 
 ### `armv7-unknown-linux-gnueabihf`
 
-Not tried yet.
+Not tried.
 
 ## Local gate
 
-Run on an x86-64 Linux host for the x86-64 target, each backend in turn (Cranelift, then LLVM
-at -O2 with fast emit). Every harness passed under both; the counts are the same under both.
+Run on an x86-64 Linux host for the x86-64 target on this head, Cranelift first, then LLVM at
+-O2 with fast emit. The run was stopped during the LLVM leg. The table is the Cranelift leg;
+the LLVM leg had the same counts for the first nine rows and did not get further.
 
 | Harness | Result |
 |---|---|
 | `difftest.py corpus --layouts` | MATCH, 822 of 822 functions from rustd, 0 of 893 layouts differ |
 | `programs.py` | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts |
-| `breakers.py` | 58 of 58, 7 open |
+| `breakers.py` | 94 of 94, 6 open |
 | `unwinds.py` | 8 of 8 |
 | `splices.py` | 71 of 71 |
 | `asmedits.py` | 10 of 10 |
 | `includes.py` | 9 of 9 |
 | `worktrees.py` | 62 of 62 |
 | `keys.py` | 46 of 46, 0 open |
-| `fuzz/fuzz.py smoke` | 2 programs, 0 differences, 0 crashes |
-| `backends.py` (LLVM leg) | LLVM compiled all 822 functions and their 11,051 instances |
-| `debuginfo.py` | all right; perf ran in the LLVM leg only (38 frames in 23 samples, none without a line) |
+| `fuzz/fuzz.py smoke`, `fuzz/edits.py smoke` | 2 programs, 0 differences, 0 crashes; edits pass |
+| `backends.py` (LLVM leg) | not run |
+| `debuginfo.py` | all right; perf named 81 frames in 36 samples, none without a line |
 | `buildmodel.py` (Cranelift leg, runs both backends) | 194 of 194 as expected |
 | `storekills.py --kills 100`, `storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py`, `storeguards.py`, `selects.py` | pass |
-| `remote.py` with MinIO | 91 of 91 |
-| `cargo_rustd.py ripgrep fd bat cargo cargo-lib` | same as cargo at every step, flags and daemon checks pass |
+| `remote.py` with MinIO | 117 of 117 |
+| `cargo_rustd.py ripgrep fd bat cargo cargo-lib` | the five projects same as cargo at every step; FAILED on one daemon check, "16 clients at once", 15 of 16 |
 
 Nothing of this branch ran under qemu for this head.
