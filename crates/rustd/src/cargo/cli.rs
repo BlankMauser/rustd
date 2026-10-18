@@ -376,6 +376,13 @@ fn unsupported_target(triple: &str) -> Option<String> {
     use hir_ty::mir::codegen::{ObjectFormat, Target};
     match Target::select(triple) {
         Ok(target) if target.object_format == ObjectFormat::Elf => None,
+        // `link.exe`'s line is the one other the plan takes apart; `lld-link` and the GNU
+        // linker of `-windows-gnu` are not.
+        Ok(target)
+            if target.object_format == ObjectFormat::Coff && triple == "x86_64-pc-windows-msvc" =>
+        {
+            None
+        }
         Ok(_) => Some(format!("programs for {triple} are not linked through `cargo rustd` yet")),
         Err(why) => Some(why),
     }

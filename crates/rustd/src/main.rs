@@ -3416,6 +3416,18 @@ pub(crate) fn end_with_reader() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // Windows has no such signal: the write fails, and `println!` panics of it.
+    #[cfg(windows)]
+    {
+        let panicked = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let said = panic.payload().downcast_ref::<String>();
+            if said.is_some_and(|it| it.starts_with("failed printing to stdout")) {
+                std::process::exit(1);
+            }
+            panicked(panic)
+        }));
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -3436,10 +3448,6 @@ fn main() -> anyhow::Result<()> {
             return remote::command(std::env::args().skip(2));
         }
         _ => {}
-    }
-    #[cfg(windows)]
-    if let Some(script) = cargo::script::stood_in_front_of() {
-        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {

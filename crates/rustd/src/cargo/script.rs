@@ -20,6 +20,9 @@ use sha2::{Digest as _, Sha256};
 
 /// The variable that names the script itself to `rustd build-script`.
 const REAL: &str = "RUSTD_BUILD_SCRIPT";
+/// The executable that stands in front of a script on Windows, installed beside this one.
+#[cfg(windows)]
+const STUB: &str = "rustd-rustc.exe";
 
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "rustd-ran.json";
@@ -53,31 +56,23 @@ pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
 }
 
 /// Has cargo run the script rustc linked at `linked` through `rustd build-script`. There is
-/// no shell to say so in a file cargo runs, so this executable is linked there under the
-/// script's name, and [`stood_in_front_of`] is how it knows. Where it can't be linked, on
-/// another volume, cargo runs the script itself and a change it reruns for is cargo's to
-/// build.
+/// no shell to say so in a file cargo runs, so `rustd-rustc` is linked there under the
+/// script's name, with this executable named in a file beside it: `rustd-rustc` knows by its
+/// name that it is a script, and runs `rustd build-script`. It is that one and not this
+/// executable because Windows deletes no name of a program that runs, and the daemon runs
+/// for as long as a `cargo clean` may come. Where it can't be linked, on another volume,
+/// cargo runs the script itself and a change it reruns for is cargo's to build.
 #[cfg(windows)]
 pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
+    let rustd = std::env::current_exe()?;
     let real = real_of(linked);
     std::fs::rename(linked, &real)?;
-    if std::fs::hard_link(std::env::current_exe()?, linked).is_err() {
+    let named = std::fs::write(real.with_extension("rustd"), rustd.as_os_str().as_encoded_bytes());
+    let stood = named.and_then(|()| std::fs::hard_link(rustd.with_file_name(STUB), linked));
+    if stood.is_err() {
         std::fs::rename(&real, linked)?;
     }
     Ok(())
-}
-
-/// The script this executable stands in front of, when it runs under the name of one:
-/// the name rustc linked it under, or the one cargo gives it in the same directory.
-#[cfg(windows)]
-pub(crate) fn stood_in_front_of() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let name = exe.file_stem()?.to_str()?;
-    if !name.starts_with("build_script_") && !name.starts_with("build-script-") {
-        return None;
-    }
-    let beside = std::fs::read_dir(exe.parent()?).ok()?.flatten().map(|it| it.path());
-    beside.into_iter().find(|it| it.to_str().is_some_and(|it| it.ends_with(".exe.real")))
 }
 
 fn real_of(linked: &Path) -> PathBuf {
