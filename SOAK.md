@@ -314,7 +314,7 @@ the 345-step run on 260255fa9b the median was 5034 MB, the 95th percentile 6091 
 16.8 GB over 10 workers, 118 descriptors, 120 threads and 19 MB in the daemon. The samples
 over the ceiling are from between a worker growing and the daemon's next look, and from
 loads of several workspaces at once; the ceiling is checked when a request arrives, not
-continuously. The rows `a ceiling on memory` and `no ceiling` show an evicted workspace
+continuously. The rows `memory ceiling` and `no memory ceiling` show an evicted workspace
 built right afterwards. The cost is visible in the soak: requests for a stopped worker get
 "the daemon's worker ended (signal: 9)" or "has not loaded this workspace" and are built by
 cargo.
