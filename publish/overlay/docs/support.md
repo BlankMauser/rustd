@@ -4,7 +4,7 @@ Every cell here points at a report or a harness run. "CI" is GitHub Actions run
 39057174862 on commit 888e87df74, the last run recorded in the reports that covered all
 four native platforms under both backends ([reports/PLAT-ABI2.md](reports/PLAT-ABI2.md)).
 "Local" is a run of the gate on Linux x86-64 at f191c6e42a, the commit these docs were
-written against, under both backends (see [results.md](results.md)). "Unverified" means
+written against, under both backends (see [results.md](results.md)). [platforms.md](platforms.md) describes each port. "Unverified" means
 nobody recorded running it; it does not mean it is known to fail.
 
 "Yes" has a narrow meaning: the named harness passes there. It does not mean your project
@@ -49,9 +49,9 @@ to stable; those are marked where they are used.
    AArch64, where a branch reaches only 128 MB. Not every edit can be spliced: about 60 of
    the 71 steps are, and the rest link in full by design (an executable somebody else
    wrote, a static that grew, a running executable, and similar).
-4. [reports/WINDOWS.md](reports/WINDOWS.md): 71 of 71 with 61 spliced and 10 full links,
+4. [platforms.md](platforms.md), Windows: 71 of 71 with 61 spliced and 10 full links,
    and the harness fails on Windows if the count is not 61.
-5. [reports/MACOS.md](reports/MACOS.md): `splices.py` 71 of 71. Executables with chained
+5. [platforms.md](platforms.md), macOS: `splices.py` 71 of 71. Executables with chained
    fixups are declined and linked in full; that was measured with
    `MACOSX_DEPLOYMENT_TARGET=13.0`. rustc's default target of 11.0 splices.
 6. [reports/DEBUGINFO.md](reports/DEBUGINFO.md) for x86-64 and PLAT-ABI2 for native
@@ -76,7 +76,7 @@ to stable; those are marked where they are used.
 12. [reports/FUZZ.md](reports/FUZZ.md). Linux x86-64 only; the smoke run is in that CI job.
 
 Other targets. `x86_64-apple-darwin` is refused: with the triple forced through, the link
-fails on the unwind table (MACOS-ABI2.md). Windows targets other than x86-64 MSVC have
+fails on the unwind table ([platforms.md](platforms.md)). Windows targets other than x86-64 MSVC have
 nothing implemented or run. Cross compiling from Linux x86-64 to
 `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` is covered by the build-model
 harness below.

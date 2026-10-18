@@ -142,7 +142,8 @@ The target is an input of the process (`target.rs`): `--target <triple>`, else t
 Everything platform-dependent asks the `Target` for architecture, object format, calling
 convention and unwind format, and never asks what rustd itself was built for. The parser
 accepts x86-64, AArch64 and wasm32 with ELF, Mach-O, COFF or wasm objects. What has been
-run on each is in [support.md](support.md).
+run on each is in [support.md](support.md), and how each port works is in
+[platforms.md](platforms.md).
 
 ## Linking and splicing
 

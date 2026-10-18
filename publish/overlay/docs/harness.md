@@ -134,24 +134,10 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 
 ## The fuzzer
 
-`harness/fuzz/gen.py` writes valid, deterministic, terminating Rust programs from a seed.
-`harness/fuzz/fuzz.py` builds each with cargo and with rustd under each backend, runs them
-and compares the output. A finding is a case whose output differs, a function left to
-rustc, or a build rustd did not finish. Each finding is reduced and written to
-`harness/fuzz/found/` with the seed that makes it again.
-
-    python3 fuzz/fuzz.py smoke                               # short, fixed seeds, for CI
-    python3 fuzz/fuzz.py run --seed S --rounds N --jobs 8    # N programs from seed S
-    python3 fuzz/fuzz.py repro S-ROUND [CASE ...]            # one program again
-    python3 fuzz/fuzz.py check found/FILE.rs                 # a reduction on its own
-    python3 fuzz/fuzz.py report DIR                          # add up the logs of a run
-
-`run` takes `--cases` (cases per program, 30 by default), `--backends`, `--reduce` (seconds
-a reduction may take) and `--out`. The exit status is 1 when there is a finding.
-
-The fuzzer builds whole programs. It does not edit a program and splice the change in, so
-the daemon's incremental path is not fuzzed. It has only been run on Linux x86-64, and its
-programs are single-crate and use only `std`.
+`fuzz/fuzz.py` builds generated programs with cargo and with rustd under each backend and
+compares what they print. `fuzz/fuzz.py smoke` is part of the gate. How to run longer
+runs, what a finding is and what the fuzzer does not cover are in
+[fuzzing.md](fuzzing.md).
 
 ## Adding a corpus case
 

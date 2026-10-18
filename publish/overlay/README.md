@@ -21,6 +21,9 @@ worktrees at once.
 This is a prototype, published for the first time. Nobody outside the project has used it.
 Read this section before relying on it.
 
+- It was written largely with AI assistance under human direction. What stands behind it
+  is the testing: every change is judged by comparing rustd's output with rustc's
+  ([docs/harness.md](docs/harness.md)).
 - rustc is still required and still does the first build. rustd replaces the code of
   workspace crates in a program cargo and rustc linked; it does not produce `.rlib` or
   `.rmeta` files.
@@ -180,9 +183,12 @@ MIT or Apache-2.0, at your option, the same as rust-analyzer and rustc. See
 
 - [docs/cargo.md](docs/cargo.md): using `cargo rustd`
 - [docs/support.md](docs/support.md): the support matrix
+- [docs/platforms.md](docs/platforms.md): the state of each platform
 - [docs/cache.md](docs/cache.md): the disk store and the S3 remote
 - [docs/architecture.md](docs/architecture.md): how it works
 - [docs/results.md](docs/results.md): measurements and where each came from
 - [docs/harness.md](docs/harness.md): the test harnesses
+- [docs/fuzzing.md](docs/fuzzing.md): the differential fuzzer
 - [docs/contributing.md](docs/contributing.md): layout, patches, moving the rust-analyzer pin
+- [SECURITY.md](SECURITY.md): reporting a problem, and what the daemon and a shared store trust
 - `docs/reports/`: the working reports the above were written from

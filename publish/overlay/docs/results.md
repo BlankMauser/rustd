@@ -11,6 +11,12 @@ given is the one that last changed the report, marked "report at". Commits are o
 development branch (`rustd-collate` and the branches merged into it), not of the published
 tree; `vendor/source.rev` says which development commit a published tree was made from.
 
+Reports are named by file. Those under [reports/](reports/) are published with this
+tree. BREAKERS.md and the other `harness/*.md` files are in `harness/`. WINDOWS.md,
+MACOS.md, MACOS-ABI2.md, AARCH64.md and RUSTD.md are earlier reports that
+[platforms.md](platforms.md) and these documents replace; they are on the development
+branch only.
+
 Where two reports give different numbers for the same thing, the later report is used and
 the difference is listed under [Disagreements](#disagreements).
 

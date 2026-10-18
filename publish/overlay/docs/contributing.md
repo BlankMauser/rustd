@@ -2,7 +2,7 @@
 
 ## AI use
 
-Most of this code was written with AI assistance under human direction. The same is true
+This code was written largely with AI assistance under human direction. The same is true
 of the harnesses, the reports under `docs/reports/` and these documents. The reports are
 written in the first person by the session that did the work; "I ran" in a report means
 that session ran it.
@@ -25,6 +25,7 @@ you send them, including fixes you find here and want to upstream.
     demo/                     small projects the harnesses and the scoreboard build
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
+    SECURITY.md               what to know before sharing a store, and how to report a problem
     vendor/rust-analyzer/     rust-analyzer, a git submodule at the pinned commit
     vendor/rust-analyzer.rev  that commit
     vendor/patches/           rustd's changes to rust-analyzer, one patch per crate
@@ -39,9 +40,9 @@ part of a patch, and `publish/overlay/` is copied over the result. If you are wo
 that branch, edit files where they are and edit these documents under `publish/overlay/`.
 
 `crates/hir-ty-codegen` is not a crate. It is the module `hir_ty::mir::codegen`, kept
-outside the submodule because all of it is rustd's. To build, its files have to be at
-`vendor/rust-analyzer/crates/hir-ty/src/mir/codegen.rs` and `.../mir/codegen/`, and the
-patch to `hir-ty` declares the module.
+outside the submodule because all of it is rustd's. `vendor/apply.py` links it into
+`vendor/rust-analyzer/crates/hir-ty/src/mir/`, and the patch to `hir-ty` declares the
+module.
 
 ## The rust-analyzer pin and the patches
 
@@ -56,16 +57,15 @@ After cloning:
     python3 vendor/apply.py
     cargo +1.99.0 build -p rustd --release
 
-<!-- APPLY-PY: `vendor/apply.py` was not in the tree at the commit these documents were
-     written against (f191c6e42a). The steps in this section were checked by doing by hand
-     what it has to do: `git apply` each patch in the submodule and copy
-     `crates/hir-ty-codegen/*` to `vendor/rust-analyzer/crates/hir-ty/src/mir/`. Adjust the
-     wording below to what the script actually does, in particular whether it copies or
-     links the code generator and whether it can be run twice. -->
+`apply.py` resets the submodule to the pinned commit, applies every file in
+`vendor/patches/`, and links `crates/hir-ty-codegen` into `hir-ty` as the `codegen` module.
+It can be run again at any time and always starts from the pin, so **it discards
+uncommitted edits in `vendor/rust-analyzer`**; regenerate the patch first if you have
+changed something there. After it runs, the submodule shows as modified in `git status`.
+That is expected; do not commit the submodule pointer.
 
-`apply.py` applies every patch to the submodule's working tree and puts the code generator
-where `hir-ty` expects it. The submodule then shows as modified in `git status`. That is
-expected; do not commit the submodule pointer.
+`python3 vendor/apply.py --check` exits 1 when the submodule is not what the pin and the
+patches give, which is how to tell that the patches changed under you after a pull.
 
 ### Changing a patched rust-analyzer file
 
@@ -89,15 +89,16 @@ rustd needs. Code that is only rustd's belongs in `crates/hir-ty-codegen` or
 `crates/rustd`. Fixes that are simply rust-analyzer bugs should be sent upstream, under
 their rules.
 
-A change to the code generator is made in `crates/hir-ty-codegen`. If `apply.py` copied
-those files into the submodule, copy your edit back or apply again before building.
+A change to the code generator is made in `crates/hir-ty-codegen`. The submodule sees
+those files through a link, so there is nothing to copy.
 
 ### Moving the pin
 
 Moving the pin means rebasing the patch series onto a newer rust-analyzer.
 
-1. In `vendor/rust-analyzer`, with the patches applied and committed on a local branch,
-   rebase that branch onto the new upstream commit and resolve conflicts.
+1. In `vendor/rust-analyzer`, after `apply.py`, commit the patched tree on a local
+   branch (leaving out the linked code generator), rebase that branch onto the new
+   upstream commit and resolve conflicts.
 2. Build, and run the whole gate under both backends ([harness.md](harness.md)). A newer
    rust-analyzer changes inference, MIR lowering and layout queries, any of which can
    change generated code. The corpus with `--layouts`, `breakers.py` and
