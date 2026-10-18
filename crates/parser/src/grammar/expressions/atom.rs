@@ -271,6 +271,14 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         //     builtin#offset_of(Foo, (bar.baz.0));
         // }
         while !p.at(EOF) && !p.at(T![')']) {
+            // `0.1` is lexed as a float; whoever reads the name splits it.
+            if p.at(FLOAT_NUMBER) {
+                let m = p.start();
+                p.bump_any();
+                m.complete(p, NAME_REF);
+                p.eat(T![.]);
+                continue;
+            }
             name_ref_mod_path_or_index(p);
             if !p.at(T![')']) {
                 p.expect(T![.]);
@@ -444,8 +452,9 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
         } else if allow_templates {
             dir_spec.abandon(p);
             op.abandon(p);
-            op_n.abandon(p);
-            if expr(p).is_none() {
+            // The attributes of a template are the template expression's.
+            let r = Restrictions { forbid_structs: false, prefer_stmt: false };
+            if expr_bp(p, Some(op_n), r, 1).is_none() {
                 p.err_and_bump("expected asm template");
             }
             continue;

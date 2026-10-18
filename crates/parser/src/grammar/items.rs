@@ -6,7 +6,7 @@ mod use_item;
 pub(crate) use self::{
     adt::{record_field_list, variant_list},
     expressions::{match_arm_list, record_expr_field_list},
-    traits::assoc_item_list,
+    traits::{assoc_item_list, trait_item_list},
     use_item::use_tree_list,
 };
 use super::*;
@@ -21,7 +21,7 @@ pub(super) fn mod_contents(p: &mut Parser<'_>, stop_on_r_curly: bool) {
     attributes::inner_attrs(p);
     while !(p.at(EOF) || (p.at(T!['}']) && stop_on_r_curly)) {
         // We can set `is_in_extern=true`, because it only allows `safe fn`, and there is no ambiguity here.
-        item_or_macro(p, stop_on_r_curly, true);
+        item_or_macro(p, stop_on_r_curly, true, false);
     }
 }
 
@@ -45,11 +45,16 @@ pub(super) const ITEM_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![;],
 ]);
 
-pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_extern: bool) {
+pub(super) fn item_or_macro(
+    p: &mut Parser<'_>,
+    stop_on_r_curly: bool,
+    is_in_extern: bool,
+    is_in_trait: bool,
+) {
     let m = p.start();
     attributes::outer_attrs(p);
 
-    let m = match opt_item(p, m, is_in_extern) {
+    let m = match opt_item(p, m, is_in_extern, is_in_trait) {
         Ok(()) => {
             if p.at(T![;]) {
                 p.err_and_bump(
@@ -106,7 +111,12 @@ pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_ext
 }
 
 /// Try to parse an item, completing `m` in case of success.
-pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Result<(), Marker> {
+pub(super) fn opt_item(
+    p: &mut Parser<'_>,
+    m: Marker,
+    is_in_extern: bool,
+    is_in_trait: bool,
+) -> Result<(), Marker> {
     // test_err pub_expr
     // fn foo() { pub 92; }
     let has_visibility = opt_visibility(p, false);
@@ -171,7 +181,10 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
 
     // test safe_outside_of_extern
     // fn foo() { safe = true; }
-    if is_in_extern && p.at_contextual_kw(T![safe]) {
+    if is_in_extern && p.at_contextual_kw(T![safe]) && !p.nth_at(1, T![!]) && !p.nth_at(1, T![::]) {
+        // test safe_macro_call
+        // safe!(A);
+        // safe::b!();
         p.eat_contextual_kw(T![safe]);
         has_mods = true;
     }
@@ -227,7 +240,7 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
 
     // items
     match p.current() {
-        T![fn] => fn_(p, m),
+        T![fn] => fn_(p, m, is_in_trait),
 
         T![const] if p.nth(1) != T!['{'] => consts::konst(p, m),
         T![static] if matches!(p.nth(1), IDENT | T![_] | T![mut]) => consts::static_(p, m),
@@ -429,7 +442,7 @@ fn macro_def(p: &mut Parser<'_>, m: Marker) {
 
 // test fn_
 // fn foo() {}
-fn fn_(p: &mut Parser<'_>, m: Marker) {
+fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     p.bump(T![fn]);
 
     name_r(p, ITEM_RECOVERY_SET);
@@ -438,7 +451,7 @@ fn fn_(p: &mut Parser<'_>, m: Marker) {
     generic_params::opt_generic_param_list(p);
 
     if p.at(T!['(']) {
-        params::param_list_fn_def(p);
+        params::param_list_fn_def(p, is_in_trait);
     } else {
         p.error("expected function arguments");
     }
