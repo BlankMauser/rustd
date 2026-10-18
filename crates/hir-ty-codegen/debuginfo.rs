@@ -98,8 +98,12 @@ pub(super) struct Place {
     pub(super) column: u32,
 }
 
-/// A type among the types of a [`FunctionDebug`], by its place in them.
+/// A type among the types of a [`TypeSet`], by its place in them.
 pub(super) type TypeIndex = u32;
+
+/// A type and every type it is made of, the type itself first. The functions with a
+/// variable of the type share the one set.
+pub(super) type TypeSet = std::sync::Arc<[DebugType]>;
 
 /// What a debugger is told of a type: its name, its size, and what it is made of as far as
 /// that is told. A type names the types it is made of by their place in the same list, so
@@ -142,31 +146,6 @@ pub(super) enum DebugType {
 impl DebugType {
     /// How many types inside each other a debugger is told of.
     pub(super) const DEEPEST: u32 = 128;
-
-    /// Every type this one is made of, as it names them.
-    fn parts_mut(&mut self) -> Vec<&mut TypeIndex> {
-        match self {
-            DebugType::Base { .. } | DebugType::Names { .. } => Vec::new(),
-            DebugType::Pointer { to, .. } => to.iter_mut().collect(),
-            DebugType::Array { of, .. } => vec![of],
-            DebugType::Struct(of) | DebugType::Union(of) => of.parts_mut().collect(),
-            DebugType::Enum { of, variants, .. } => {
-                let variants = variants.iter_mut().flat_map(|it| &mut it.fields);
-                of.parts_mut().chain(variants.map(|it| &mut it.ty)).collect()
-            }
-        }
-    }
-}
-
-/// Adds `types`, which name each other by their places among themselves, to the end of
-/// `all`, and returns where the first of them is then.
-pub(super) fn add_types(all: &mut Vec<DebugType>, types: &[DebugType]) -> TypeIndex {
-    let first = all.len() as TypeIndex;
-    all.extend(types.iter().cloned().map(|mut ty| {
-        ty.parts_mut().into_iter().for_each(|part| *part += first);
-        ty
-    }));
-    first
 }
 
 /// A name, a size, the fields and the types the generic parameters stand for.
@@ -176,13 +155,6 @@ pub(super) struct Aggregate {
     pub(super) size: u64,
     pub(super) fields: Vec<Field>,
     pub(super) parameters: Vec<(String, TypeIndex)>,
-}
-
-impl Aggregate {
-    fn parts_mut(&mut self) -> impl Iterator<Item = &mut TypeIndex> {
-        let parameters = self.parameters.iter_mut().map(|(_, ty)| ty);
-        self.fields.iter_mut().map(|it| &mut it.ty).chain(parameters)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,7 +296,8 @@ pub(super) struct Scope {
 pub(super) struct VariableDebug {
     pub(super) name: String,
     pub(super) param: bool,
-    pub(super) ty: TypeIndex,
+    /// Which of the [`FunctionDebug::types`] the type is the first of.
+    pub(super) ty: u32,
     pub(super) place: VariablePlace,
     /// The scope the name is known in, by its place among the scopes: `None` is all of the
     /// function.
@@ -345,8 +318,12 @@ pub(super) struct FunctionDebug {
     pub(super) declared: Option<Place>,
     /// Where the code is from, from each offset on, in the order of the offsets.
     pub(super) rows: Vec<(CodeOffset, Place)>,
-    /// The types of the variables and what those are made of.
-    pub(super) types: Vec<DebugType>,
+    /// The types of the variables and what those are made of. The store keeps a set once,
+    /// for every function that has it: see `stored_types`.
+    #[serde(skip)]
+    pub(super) types: Vec<TypeSet>,
+    /// The keys `types` are in the store under, of an entry of the store.
+    pub(super) stored_types: Vec<[u8; super::store::KEY]>,
     pub(super) scopes: Vec<Scope>,
     pub(super) variables: Vec<VariableDebug>,
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
@@ -362,6 +339,7 @@ impl FunctionDebug {
             declared: None,
             rows: Vec::new(),
             types: Vec::new(),
+            stored_types: Vec::new(),
             scopes: Vec::new(),
             variables: Vec::new(),
             frame_base: Vec::new(),
@@ -460,6 +438,9 @@ pub(super) struct Dwarf {
     /// The addresses the entries of a unit kept apart name by their place in this list.
     addresses: Vec<Address>,
     types: FxHashMap<SharedType, UnitEntryId>,
+    /// The entry of the type each set seen is of, by where the set is, with the set so that
+    /// nothing else comes to be there.
+    sets: FxHashMap<usize, (TypeSet, Option<UnitEntryId>)>,
     /// The modules and functions of the unit that a type is written in, by their paths.
     namespaces: FxHashMap<String, UnitEntryId>,
     /// Whether the variables of the functions are told of, and not their lines alone.
@@ -501,6 +482,7 @@ impl Dwarf {
             files: FxHashMap::default(),
             ranges: Vec::new(),
             types: FxHashMap::default(),
+            sets: FxHashMap::default(),
             namespaces: FxHashMap::default(),
             variables,
         };
@@ -553,6 +535,7 @@ impl Dwarf {
         let id = std::mem::take(&mut self.id).finish();
         self.files.clear();
         self.types.clear();
+        self.sets.clear();
         self.namespaces.clear();
         self.begin_unit();
         if ranges.is_empty() {
@@ -583,6 +566,18 @@ impl Dwarf {
         let id = program.add_file(LineString::String(name.as_bytes().to_vec()), directory, None);
         self.files.insert(name.to_owned(), id);
         id
+    }
+
+    /// The entry of the type a set is of, which is found once for the unit.
+    fn set(&mut self, types: &TypeSet) -> Option<UnitEntryId> {
+        let at = types.as_ptr() as usize;
+        if let Some((_, entry)) = self.sets.get(&at) {
+            return *entry;
+        }
+        let mut of = FunctionTypes { types, entries: vec![None; types.len()], inside: 0 };
+        let entry = self.ty(&mut of, 0);
+        self.sets.insert(at, (types.clone(), entry));
+        entry
     }
 
     /// The entry of the type at `index` of `of`. A type inside more than
@@ -824,14 +819,10 @@ impl Dwarf {
         }
         let base = Expression::raw(debug.frame_base.clone());
         self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
-        let mut types = FunctionTypes {
-            types: &debug.types,
-            entries: vec![None; debug.types.len()],
-            inside: 0,
-        };
         let mut blocks = vec![None; debug.scopes.len()];
         for variable in &debug.variables {
-            let Some(ty) = self.ty(&mut types, variable.ty) else { continue };
+            let Some(types) = debug.types.get(variable.ty as usize) else { continue };
+            let Some(ty) = self.set(types) else { continue };
             let parent = match variable.scope {
                 None => Some(function),
                 Some(scope) => self.block(function, start, debug, &mut blocks, scope),

@@ -971,6 +971,7 @@ struct ObjectCodegen<'a, 'db> {
     debug: Option<DebugContext>,
     /// The types of the variables a debugger is told of, by the environment they are in.
     types: FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>,
+    kept_types: cached::KeptTypes,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1898,7 +1899,8 @@ fn describe_variables<'db>(
             Some(&first) => first,
             None => {
                 let Some(described) = types.describe(ty) else { continue };
-                let first = debuginfo::add_types(&mut debug.types, &described);
+                let first = debug.types.len() as u32;
+                debug.types.push(described);
                 firsts.insert(ty, first);
                 first
             }
@@ -2588,6 +2590,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unwind,
             debug,
             types: FxHashMap::default(),
+            kept_types: cached::KeptTypes::default(),
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -3087,6 +3090,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let key = cached::Entry::key(&name, debug.is_some(), program.flatten().as_ref());
         let Some(key) = key else { return };
+        // Also of an entry the store has: the sets may have been dropped from under it.
+        let types = debug.iter().flat_map(|it| &it.types);
+        let types: Vec<_> = types.map(|it| self.kept_types.keep(store, it)).collect();
         let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
         if !check && store.has(&key) {
             return;
@@ -3096,6 +3102,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed_requests += 1;
             return;
         };
+        if let Some(debug) = &mut entry.debug {
+            debug.stored_types = types;
+        }
         if !entry.leave(self.symbols.cargo_home().as_deref()) {
             let _: Option<()> = self.kept.unkept("a file under what stands for cargo's directory");
             return;

@@ -13,7 +13,6 @@ use hir_def::{
     AdtId, EnumId, GenericDefId, VariantId, expr_store::ExpressionStore,
     hir::generics::GenericParamDataRef, item_tree::FieldsShape as Written,
 };
-use std::rc::Rc;
 
 use rustc_abi::{TagEncoding, Variants};
 use rustc_hash::FxHashMap;
@@ -23,7 +22,7 @@ use rustc_type_ir::{
 };
 
 use super::super::vtable::{HEADER, VtableLayout};
-use super::{Aggregate, DebugType, Field, Tag, TypeIndex, Variant};
+use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeSet, Variant};
 use crate::{
     InferenceResult, ParamEnvAndCrate,
     closure_analysis::ProjectionKind,
@@ -69,7 +68,7 @@ pub(in super::super) struct Types<'db> {
     told: Vec<DebugType>,
     /// Where each type that is told of, or is being told of, is among `told`.
     known: FxHashMap<Ty<'db>, TypeIndex>,
-    described: FxHashMap<Ty<'db>, Option<Rc<[DebugType]>>>,
+    described: FxHashMap<Ty<'db>, Option<TypeSet>>,
     names: FxHashMap<Ty<'db>, Option<String>>,
     normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
@@ -93,13 +92,13 @@ impl<'db> Types<'db> {
 
     /// The type and every type it is made of, with the type itself first. `None` is a type
     /// that has no layout or no name rustc would spell.
-    pub(in super::super) fn describe(&mut self, ty: Ty<'db>) -> Option<Rc<[DebugType]>> {
+    pub(in super::super) fn describe(&mut self, ty: Ty<'db>) -> Option<TypeSet> {
         if let Some(described) = self.described.get(&ty) {
             return described.clone();
         }
         self.told.clear();
         self.known.clear();
-        let described = self.ty(ty, POINTERS).map(|_| Rc::from(self.told.as_slice()));
+        let described = self.ty(ty, POINTERS).map(|_| TypeSet::from(self.told.as_slice()));
         self.described.insert(ty, described.clone());
         described
     }

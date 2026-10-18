@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConstBlob, DataIdentity,
-    debuginfo::{FunctionDebug, LineRow, SlotPlaces},
+    debuginfo::{FunctionDebug, LineRow, SlotPlaces, TypeSet},
     fragment::Code,
     store::{KEY, Store},
     unwind::FunctionUnwind,
@@ -342,7 +342,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd entry 8");
+        field(b"rustd entry 9");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -478,6 +478,33 @@ struct Known {
     entries: FxHashMap<Arc<str>, Option<Arc<Entry>>>,
     /// Whether the program can be built from an entry and everything it calls.
     usable: FxHashMap<Arc<str>, bool>,
+    types: FxHashMap<[u8; KEY], Option<TypeSet>>,
+}
+
+/// The sets of types that were given to the store, each when the first entry with a
+/// variable of the type was.
+#[derive(Default)]
+pub(super) struct KeptTypes {
+    /// By where the set is, with the set so that nothing else comes to be there.
+    keys: FxHashMap<usize, (TypeSet, [u8; KEY])>,
+}
+
+impl KeptTypes {
+    /// The key the set is in the store under, which is of nothing but what the set tells.
+    pub(super) fn keep(&mut self, store: &Store, types: &TypeSet) -> [u8; KEY] {
+        let at = types.as_ptr() as usize;
+        if let Some((_, key)) = self.keys.get(&at) {
+            return *key;
+        }
+        let bytes = postcard::to_allocvec(&**types).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(b"rustd types 1");
+        hasher.update(&bytes);
+        let key = hasher.finalize().into();
+        store.insert(&key, &bytes);
+        self.keys.insert(at, (types.clone(), key));
+        key
+    }
 }
 
 /// An entry on the way down from the one asked about.
@@ -524,7 +551,12 @@ impl Entries {
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let read = || {
             let key = Entry::key(name, self.debug, self.program.as_ref())?;
-            Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
+            let mut entry = Entry::decode(&self.store.get(&key)?)?;
+            if let Some(debug) = &mut entry.debug {
+                let types = debug.stored_types.iter().map(|key| self.types(key));
+                debug.types = types.collect::<Option<_>>()?;
+            }
+            entry.arrived(self.cargo_home.as_deref())
         };
         let tally = super::backend::Tally::global();
         let entry = (!banned)
@@ -533,6 +565,18 @@ impl Entries {
             .map(Arc::new);
         self.known().entries.insert(Arc::from(name), entry.clone());
         entry
+    }
+
+    /// The set of types kept under `key`, which every entry with a variable of the type
+    /// shares.
+    fn types(&self, key: &[u8; KEY]) -> Option<TypeSet> {
+        if let Some(known) = self.known().types.get(key) {
+            return known.clone();
+        }
+        let types = self.store.get(key).and_then(|it| postcard::from_bytes::<Vec<_>>(&it).ok());
+        let types = types.map(TypeSet::from);
+        self.known().types.insert(*key, types.clone());
+        types
     }
 
     fn settle(&self, name: Arc<str>, usable: bool) {
@@ -682,7 +726,7 @@ mod tests {
         debug.files.push("src/lib.rs".to_owned());
         debug.declared = Some(Place { file: 0, line: 3, column: 1 });
         debug.rows.push((4, Place { file: 0, line: 4, column: 5 }));
-        debug.types = types;
+        debug.types = vec![types.into()];
         debug.scopes.push(Scope { parent: None, ranges: vec![(0, 8)] });
         debug.frame_base = vec![cranelift_codegen::gimli::DW_OP_reg6.0];
         debug.variables.push(VariableDebug {
@@ -812,10 +856,22 @@ mod tests {
         assert_eq!(distinct.len(), keys.len());
     }
 
+    /// The entry as it comes back from a store, which keeps its sets of types apart.
+    fn read_back(written: &Entry) -> Entry {
+        let mut read = Entry::decode(&written.encode().unwrap()).unwrap();
+        if let (Some(read), Some(written)) = (&mut read.debug, &written.debug) {
+            let stored = |it: &TypeSet| postcard::to_allocvec(&**it).unwrap();
+            let sets = written.types.iter().map(stored);
+            read.types =
+                sets.map(|it| postcard::from_bytes::<Vec<_>>(&it).unwrap().into()).collect();
+        }
+        read
+    }
+
     #[test]
     fn an_entry_is_read_back_as_it_was_written() {
         let written = entry();
-        let read = Entry::decode(&written.encode().unwrap()).unwrap();
+        let read = read_back(&written);
         assert_eq!(read, written);
         follow(&read);
     }
@@ -861,7 +917,7 @@ mod tests {
     #[test]
     fn types_and_scopes_inside_too_many_others_are_read_and_end() {
         let deep = Entry { debug: Some(debug(nested(40_000))), ..entry() };
-        assert_eq!(Entry::decode(&deep.encode().unwrap()).unwrap(), deep);
+        assert_eq!(read_back(&deep), deep);
         let mut ring = debug(vec![DebugType::Array { of: 0, len: 2 }]);
         ring.scopes[0].parent = Some(0);
         let mut chain = debug(nested(6));
