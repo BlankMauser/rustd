@@ -641,6 +641,10 @@ impl SymbolResolver for Resolver<'_> {
         Some(format!("rustd.{id:x}.{path}"))
     }
 
+    fn private(&self, func: FunctionId) -> bool {
+        !self.is_generic(func) && self.path(func).is_some_and(|path| self.table.private(&path))
+    }
+
     fn defines(&self, symbol: &str) -> bool {
         self.table.defines(symbol)
     }

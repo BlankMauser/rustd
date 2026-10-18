@@ -421,7 +421,7 @@ impl Compiler {
             .skipped
             .iter()
             // A generic function has no code of its own to be missing, only that of its uses.
-            .filter(|(_, why)| !matches!(why, CodegenError::NoSymbol))
+            .filter(|(_, why)| !why.no_symbol())
             .filter(|(func, _)| func.krate(db).data(db).origin.is_local())
             .map(|&(func, ref why)| {
                 let name = resolver

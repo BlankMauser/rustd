@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
+use object::{Object, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
@@ -25,6 +25,8 @@ pub(crate) struct SymbolTable {
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
+    /// The paths of the functions defined under a symbol private to its object, hashed.
+    private: FxHashSet<u64>,
 }
 
 struct NestedSymbol {
@@ -42,6 +44,8 @@ struct Placed {
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
 struct Symbol {
+    /// Whether only the object that defines it can link to it.
+    private: bool,
     name: String,
     place: Option<u64>,
     with_ids: String,
@@ -98,7 +102,7 @@ impl SymbolTable {
         let mut table = SymbolTable::default();
         let mut symbols = Vec::new();
         for name in names {
-            table.add_name(name, &mut symbols);
+            table.add_name(name, false, &mut symbols);
         }
         table.index(symbols);
         table
@@ -107,13 +111,17 @@ impl SymbolTable {
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
         let table = self;
-        for Symbol { name, place, with_ids, path } in symbols {
+        for Symbol { private, name, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
             } else {
                 path
             };
+            if private {
+                table.private.insert(Self::hashed(&path));
+                continue;
+            }
             // A closure is not an item nested in itself.
             let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
             if path.contains("::{") && !unnamed {
@@ -142,6 +150,11 @@ impl SymbolTable {
         rustc_hash::FxBuildHasher.hash_one(symbol)
     }
 
+    /// Whether the function at `path` is defined under a symbol private to its object.
+    pub(crate) fn private(&self, path: &str) -> bool {
+        self.private.contains(&Self::hashed(path))
+    }
+
     pub(crate) fn defines(&self, symbol: &str) -> bool {
         self.names.contains(&Self::hashed(symbol))
     }
@@ -157,7 +170,8 @@ impl SymbolTable {
                 && symbol.section() == object::SymbolSection::Unknown;
             let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
             let linkable = symbol.is_undefined() || (defined && symbol.is_global());
-            if !linkable {
+            let private = defined && symbol.is_local() && symbol.kind() == SymbolKind::Text;
+            if !linkable && !private {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
@@ -167,12 +181,14 @@ impl SymbolTable {
                 object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
                 _ => name,
             };
-            self.add_name(name, symbols);
+            self.add_name(name, private, symbols);
         }
     }
 
-    fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
-        self.names.insert(Self::hashed(name));
+    fn add_name(&mut self, name: &str, private: bool, symbols: &mut Vec<Symbol>) {
+        if !private {
+            self.names.insert(Self::hashed(name));
+        }
         // The memory a static points to is a symbol that demangles to the static's path.
         if name.starts_with("_RNn") {
             return;
@@ -190,6 +206,7 @@ impl SymbolTable {
         }
         // `{:#}` drops the crate disambiguator hashes.
         symbols.push(Symbol {
+            private,
             name: name.to_owned(),
             place: V0::place(name),
             with_ids,

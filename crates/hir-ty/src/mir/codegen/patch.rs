@@ -256,7 +256,7 @@ impl Frozen {
         base: &Base,
     ) -> Option<(FunctionId, String)> {
         let now = || {
-            let theirs = base.skipped.iter().filter(|it| !matches!(it.1, CodegenError::NoSymbol));
+            let theirs = base.skipped.iter().filter(|it| !it.1.no_symbol());
             theirs.map(|(root, why)| (*root, why))
         };
         let distrusted = |root: FunctionId| self.distrusted.contains(&root.krate(db));
@@ -528,10 +528,8 @@ impl Base {
                 parents.push(parent);
             }
         }
-        let left = skipped
-            .iter()
-            .map(|(root, e)| (!matches!(e, CodegenError::NoSymbol)).then(|| Left::of(db, *root)))
-            .collect();
+        let left =
+            skipped.iter().map(|(root, e)| (!e.no_symbol()).then(|| Left::of(db, *root))).collect();
         let (their_statics, walked) = TheirStatics::walk(db, left_to_rustc(skipped));
         let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
         let rejected = cg
