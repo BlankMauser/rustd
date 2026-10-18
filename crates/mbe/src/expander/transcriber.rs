@@ -10,23 +10,23 @@ use super::TokensOrigin;
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
-    parser::{ConcatMetaVarExprElem, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'t> Bindings<'t> {
-    fn get(&self, name: &Symbol, span: Span) -> Result<&Binding<'t>, ExpandError> {
+    fn get(&self, name: &MetaVar, span: Span) -> Result<&Binding<'t>, ExpandError> {
         match self.inner.get(name) {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
-                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.as_str()))),
+                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.sym().as_str()))),
             )),
         }
     }
 
     fn get_fragment(
         &self,
-        name: &Symbol,
+        name: &MetaVar,
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
@@ -171,7 +171,8 @@ fn expand_subtree(
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     let mut err = None;
-    'ops: for op in template.iter() {
+    let mut ops = template.iter().peekable();
+    'ops: while let Some(op) = ops.next() {
         match op {
             Op::Literal(it) => builder.push(tt::Leaf::from({
                 let mut it = it.clone();
@@ -202,7 +203,7 @@ fn expand_subtree(
             }
             Op::Var { name, id, .. } => {
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, builder, marker);
+                    expand_var(ctx, name, *id, Follower::of(ops.peek().copied()), builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -301,7 +302,7 @@ fn expand_subtree(
                             // err at it.
                             // FIXME: Do what rustc does for repetitions.
                             let var_value = match ctx.bindings.get_fragment(
-                                &var.sym,
+                                &MetaVar::new(var.sym.clone(), var.span),
                                 var.span,
                                 &mut ctx.nesting,
                                 marker,
@@ -377,15 +378,38 @@ fn expand_subtree(
     ExpandResult { value: (), err }
 }
 
+/// What a template has after a metavariable, where that says how the variable's tokens must
+/// be grouped to stay the operand they were matched as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follower {
+    /// `<`, which would take a type for a path to give generic arguments to.
+    Angle,
+    /// `.` or `?`, which bind tighter than the `-` of a negative literal.
+    Postfix,
+    Other,
+}
+
+impl Follower {
+    fn of(op: Option<&Op>) -> Follower {
+        let Some(Op::Punct(puncts)) = op else { return Follower::Other };
+        match puncts.as_slice() {
+            [first, ..] if first.char == '<' => Follower::Angle,
+            [only] if matches!(only.char, '.' | '?') => Follower::Postfix,
+            _ => Follower::Other,
+        }
+    }
+}
+
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
-    v: &Symbol,
+    v: &MetaVar,
     id: Span,
+    follower: Follower,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     // We already handle $crate case in mbe parser
-    debug_assert!(*v != sym::crate_);
+    debug_assert!(*v.sym() != sym::crate_);
 
     match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
@@ -408,8 +432,9 @@ fn expand_var(
                     let mut span = id;
                     marker(&mut span);
 
-                    // Check if this is a simple negative literal (MINUS + LITERAL)
-                    // that should not be wrapped in parentheses
+                    // A negative literal can be a generic argument or a pattern as it is,
+                    // and neither in parentheses. It needs them only before what would
+                    // otherwise apply to the literal alone.
                     let is_negative_literal = matches!(
                         sub.iter().collect_array(),
                         Some([
@@ -418,20 +443,53 @@ fn expand_var(
                         ])
                     );
 
-                    let wrap_in_parens = !is_negative_literal
-                        && !matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]))
-                        && sub.try_into_subtree().is_none_or(|it| {
-                            it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible
+                    // A fragment is one token tree to the macro it is passed on to, also when
+                    // it is one token: the `0` of an expression is not the `0` of a rule.
+                    let is_leaf =
+                        matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
+                    // The fragment is a group without delimiters whatever it is; inside it,
+                    // parentheses keep an expression of several tokens together where it is
+                    // parsed again.
+                    let whole = (is_negative_literal && follower != Follower::Postfix)
+                        || sub.try_into_subtree().is_some_and(|it| {
+                            it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
                         });
-                    if wrap_in_parens {
+                    let parenthesized = !(is_leaf || is_macro_call(sub) || whole);
+                    if !whole {
+                        builder.open(tt::DelimiterKind::Invisible, span);
+                    }
+                    if parenthesized {
                         builder.open(tt::DelimiterKind::Parenthesis, span);
                     }
                     builder.extend_with_tt_alone(sub);
-                    if wrap_in_parens {
+                    if parenthesized {
+                        builder.close(span);
+                    }
+                    if !whole {
                         builder.close(span);
                     }
                 }
-                Fragment::Path(tt) => fix_up_and_push_path_tt(ctx, builder, tt),
+                Fragment::Path(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    fix_up_and_push_path_tt(ctx, builder, tt);
+                    builder.close(span);
+                }
+                Fragment::Ty(tt) if follower == Follower::Angle => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Parenthesis, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
+                Fragment::Ty(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
                 Fragment::Empty => (),
             };
             ExpandResult::ok(())
@@ -450,9 +508,12 @@ fn expand_var(
             //     }
             // ```
             // We just treat it a normal tokens
+            let mut span = id;
+            marker(&mut span);
+            let sym = v.sym().clone();
             builder.extend([
-                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span: id }),
-                tt::Leaf::from(tt::Ident { sym: v.clone(), span: id, is_raw: tt::IdentIsRaw::No }),
+                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span }),
+                tt::Leaf::from(tt::Ident { sym, span, is_raw: tt::IdentIsRaw::No }),
             ]);
             ExpandResult::ok(())
         }
@@ -507,17 +568,25 @@ fn expand_repeat(
         }
 
         if let Some(sep) = separator {
+            let marked = |mut leaf: tt::Leaf| {
+                match &mut leaf {
+                    tt::Leaf::Literal(it) => marker(&mut it.span),
+                    tt::Leaf::Punct(it) => marker(&mut it.span),
+                    tt::Leaf::Ident(it) => marker(&mut it.span),
+                }
+                leaf
+            };
             match sep {
-                Separator::Ident(ident) => builder.push(tt::Leaf::from(ident.clone())),
-                Separator::Literal(lit) => builder.push(tt::Leaf::from(lit.clone())),
+                Separator::Ident(ident) => builder.push(marked(ident.clone().into())),
+                Separator::Literal(lit) => builder.push(marked(lit.clone().into())),
                 Separator::Puncts(puncts) => {
                     for &punct in puncts {
-                        builder.push(tt::Leaf::from(punct));
+                        builder.push(marked(punct.into()));
                     }
                 }
                 Separator::Lifetime(punct, ident) => {
-                    builder.push(tt::Leaf::from(*punct));
-                    builder.push(tt::Leaf::from(ident.clone()));
+                    builder.push(marked((*punct).into()));
+                    builder.push(marked(ident.clone().into()));
                 }
             };
         }
@@ -538,6 +607,30 @@ fn expand_repeat(
         err = Some(ExpandError::new(ctx.call_site, ExpandErrorKind::UnexpectedToken));
     }
     ExpandResult { value: (), err }
+}
+
+/// Whether the tokens of an expression are one macro call, `path!(..)`.
+///
+/// Such a fragment is not put in parentheses: it binds as tightly as they would make it, and
+/// rustc expands `$e;` of one as a macro in statement position, which may expand to several
+/// statements (`is_mac_call` of `InvocationCollectorNode for ast::Stmt` in
+/// `compiler/rustc_expand/src/expand.rs` takes a `StmtKind::Semi` of a macro call for one).
+fn is_macro_call(tokens: tt::TokenTreesView<'_>) -> bool {
+    let mut elements = tokens.iter().peekable();
+    let mut bang = false;
+    while let Some(element) = elements.next() {
+        let last = elements.peek().is_none();
+        match element {
+            tt::TtElement::Subtree(..) => return bang && last,
+            tt::TtElement::Leaf(tt::Leaf::Punct(punct)) if punct.char == '!' && !bang => {
+                bang = true
+            }
+            tt::TtElement::Leaf(tt::Leaf::Punct(punct)) if punct.char == ':' && !bang => {}
+            tt::TtElement::Leaf(tt::Leaf::Ident(_)) if !bang => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Inserts the path separator `::` between an identifier and its following generic
