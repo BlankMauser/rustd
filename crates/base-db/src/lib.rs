@@ -38,6 +38,7 @@ use rustc_hash::{FxHashSet, FxHasher};
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
+use vfs::AbsPath;
 pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
@@ -74,6 +75,24 @@ pub struct Files {
     files: Arc<DashMap<vfs::FileId, FileText, BuildHasherDefault<FxHasher>>>,
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
+    included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
+    /// Files an `include!` named that are not in the VFS, with the source root of the file
+    /// that includes them.
+    included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
+    /// Directories whose files are read from another directory: a checkout that is looked at
+    /// as the one it was loaded as with other contents.
+    views: Arc<std::sync::RwLock<Vec<View>>>,
+    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
+    env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
+    /// The variables `env!` has found unset, by the crate asking.
+    env_unset: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
+}
+
+#[derive(Debug)]
+struct View {
+    base: std::path::PathBuf,
+    over: std::path::PathBuf,
+    built: Vec<std::path::PathBuf>,
 }
 
 impl Files {
@@ -84,6 +103,11 @@ impl Files {
                 panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
             }
         }
+    }
+
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.contains_key(&file_id)
     }
 
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
@@ -115,6 +139,100 @@ impl Files {
                 vacant.insert(text);
             }
         };
+    }
+
+    /// Has the files under `base` read from where they are under `over` from now on, but for
+    /// those under one of `built`: what a build writes is not part of a checkout. Nothing is
+    /// read again for it: whoever watches the disk does that.
+    pub fn set_view(
+        &self,
+        base: &std::path::Path,
+        over: &std::path::Path,
+        built: Vec<std::path::PathBuf>,
+    ) {
+        let mut views = self.views.write().unwrap_or_else(|it| it.into_inner());
+        views.retain(|it| it.base != base);
+        if base != over {
+            let (base, over) = (base.to_owned(), over.to_owned());
+            views.push(View { base, over, built });
+        }
+    }
+
+    /// Where the file known as `path` is read from.
+    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        let views = self.views.read().unwrap_or_else(|it| it.into_inner());
+        let over = views
+            .iter()
+            .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
+            .find_map(|it| Some(it.over.join(path.strip_prefix(&it.base).ok()?)));
+        over.unwrap_or_else(|| path.to_owned())
+    }
+
+    /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
+    /// first time it is asked for. Whoever watches the disk keeps it current with
+    /// [`Files::reload_included_file`].
+    pub fn included_file(
+        &self,
+        db: &dyn SourceDatabase,
+        path: &AbsPath,
+        durability: Durability,
+    ) -> IncludedFile {
+        *self.included.entry(path.to_path_buf()).or_insert_with(|| {
+            IncludedFile::builder(self.read_included(path)).durability(durability).new(db)
+        })
+    }
+
+    fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
+        std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
+    }
+
+    /// Notes a file an `include!` names that the VFS has not: whoever owns the VFS puts it
+    /// in the source root, see [`Files::included_sources`].
+    pub fn include_source(&self, path: &AbsPath, root: SourceRootId) {
+        self.included_sources.entry(path.to_path_buf()).or_insert(root);
+    }
+
+    pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
+        self.included_sources.iter().map(|it| (it.key().clone(), *it.value())).collect()
+    }
+
+    pub fn env_is_read(&self, krate: Crate, key: &str) {
+        if !self.env_read.contains_key(&(krate, key.to_owned())) {
+            self.env_read.insert((krate, key.to_owned()), ());
+        }
+    }
+
+    pub fn env_read(&self) -> Vec<(Crate, String)> {
+        self.env_read.iter().map(|it| it.key().clone()).collect()
+    }
+
+    pub fn env_is_unset(&self, krate: Crate, key: &str) {
+        self.env_unset.insert((krate, key.to_owned()), ());
+    }
+
+    pub fn env_unset(&self) -> Vec<(Crate, String)> {
+        self.env_unset.iter().map(|it| it.key().clone()).collect()
+    }
+
+    pub fn included_files(&self) -> Vec<AbsPathBuf> {
+        self.included.iter().map(|it| it.key().clone()).collect()
+    }
+
+    /// Whether the file on disk is what was read of it.
+    pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
+        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
+        *file.bytes(db) == self.read_included(path)
+    }
+
+    /// Reads the file again, and says whether it changed.
+    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
+        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
+        let bytes = self.read_included(path);
+        let changed = *file.bytes(db) != bytes;
+        if changed {
+            file.set_bytes(db).to(bytes);
+        }
+        changed
     }
 
     /// Source root of the file.
@@ -214,11 +332,44 @@ pub struct LocalRoots {
     pub roots: FxHashSet<SourceRootId>,
 }
 
+/// The variables of the process a build is for, which `env!` and `option_env!` read where
+/// the crate's own have nothing: those of whoever asked for the build.
+#[salsa::input(singleton, debug)]
+pub struct ProcessEnv {
+    #[returns(ref)]
+    pub vars: Env,
+}
+
+/// The variable `key` of the process the build is for.
+pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+    ProcessEnv::try_get(db)?.vars(db).get(key)
+}
+
+/// Has builds from here on be for a process with the variables `vars`.
+pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
+    use salsa::Setter as _;
+    match ProcessEnv::try_get(db) {
+        Some(env) => {
+            env.set_vars(db).to(vars);
+        }
+        None => {
+            ProcessEnv::new(db, vars);
+        }
+    }
+}
+
 #[salsa::input(debug)]
 pub struct FileText {
     #[returns(ref)]
     pub text: Arc<str>,
     pub file_id: vfs::FileId,
+}
+
+/// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
+#[salsa::input(debug)]
+pub struct IncludedFile {
+    #[returns(ref)]
+    pub bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 #[salsa::input(debug)]
@@ -273,6 +424,22 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         let source_root = self.source_root(source_root.source_root_id(self));
         source_root.source_root(self).resolve_path(path)
     }
+
+    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS.
+    fn included_file(&self, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
+        None
+    }
+
+    /// Notes that `include!` names a file `resolve_path` has nothing for: a file that is not
+    /// source by its extension, say, which the VFS does not load until it is asked to.
+    fn include_source(&self, _path: AnchoredPath<'_>) {}
+
+    /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
+    fn env_is_read(&self, _krate: Crate, _key: &str) {}
+
+    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
+    /// crate down for.
+    fn env_is_unset(&self, _krate: Crate, _key: &str) {}
 
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;

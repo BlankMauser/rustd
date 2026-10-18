@@ -841,6 +841,11 @@ impl CrateGraphBuilder {
         None
     }
 
+    /// Sets a variable `env!` reads in `krate`, as a build script of it would.
+    pub fn set_env(&mut self, krate: CrateBuilderId, key: &str, value: &str) {
+        self.arena[krate].env.set(key, value);
+    }
+
     /// Removes all crates from this crate graph except for the ones in `to_keep` and fixes up the dependencies.
     /// Returns a mapping from old crate ids to new crate ids.
     pub fn remove_crates_except(
@@ -898,6 +903,10 @@ impl Env {
 
     pub fn get(&self, env: &str) -> Option<String> {
         self.entries.get(env).cloned()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(key, value)| (&**key, &**value))
     }
 
     pub fn extend_from_other(&mut self, other: &Env) {
