@@ -545,9 +545,12 @@ impl WorkspaceBuildScripts {
                 if cargo_comp_time_deps_available {
                     requires_unstable_options = true;
                     cmd.arg("--compile-time-deps");
-                    // we can pass this unconditionally, because we won't actually build the
-                    // binaries, and as such, this will succeed even on targets without libtest
-                    cmd.arg("--all-targets");
+                    // The binaries are not built, so this succeeds even on targets without
+                    // libtest. It also runs the build scripts and builds the proc macros of
+                    // dev-dependencies, which a build that has no tests in it does not.
+                    if config.all_targets {
+                        cmd.arg("--all-targets");
+                    }
                 } else {
                     // --all-targets includes tests, benches and examples in addition to the
                     // default lib and bins. This is an independent concept from the --target
