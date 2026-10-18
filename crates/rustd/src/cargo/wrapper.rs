@@ -252,16 +252,16 @@ impl Unit {
             return Err(why);
         }
         let (checkout, at) = state.asked_for(dir)?;
-        let dep_info = self.dep_info(rustc);
+        let checked = self.checked(rustc);
         let answer = super::synced(checkout).and_then(|programs| {
             programs.get(at).cloned().unwrap_or(Err("the daemon said nothing of it".to_owned()))
         });
-        let read = dep_info.join().map_err(|_| "rustc did not run".to_owned());
-        answer?;
+        let read = checked.join().map_err(|_| "rustc did not run".to_owned());
         let read = read?.map_err(|it| format!("rustc did not run: {it}"))?;
         if !read.status.success() {
-            return Err("rustc does not read the source the daemon compiled".to_owned());
+            return Err("rustc finds errors in the source".to_owned());
         }
+        answer?;
         let binary = &checkout.programs[at].binary;
         let record = self.as_record(0, Vec::new(), None);
         let linked = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
@@ -273,11 +273,15 @@ impl Unit {
         Ok(())
     }
 
-    /// Runs rustc for the dep-info of the unit alone, which cargo reads to know what the
-    /// program was compiled from. What it says is kept until the program is the daemon's.
-    fn dep_info(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
+    /// Has rustc check the unit, as `cargo check` would, while the daemon builds it: the
+    /// daemon has no borrow checker and compiles a program rustc would turn down, and the
+    /// warnings are rustc's to give. It also writes the dep-info cargo reads to know what
+    /// the program was compiled from. What it says is kept until the program is the
+    /// daemon's.
+    fn checked(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
         let emits = |it: &String| it.starts_with("--emit=");
-        let args = self.args.iter().map(|it| if emits(it) { "--emit=dep-info" } else { it });
+        let check = "--emit=dep-info,metadata";
+        let args = self.args.iter().map(|it| if emits(it) { check } else { it });
         let mut command = Command::new(rustc);
         command.args(args).stdin(Stdio::null());
         std::thread::spawn(move || command.output())

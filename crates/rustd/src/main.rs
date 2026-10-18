@@ -3078,9 +3078,49 @@ fn end_with_input() {
     std::process::exit(0);
 }
 
+const HELP: &str = "\
+rustd: a daemon that keeps Rust workspaces compiled and builds edits from memory
+
+usage: rustd <command>
+
+  enable            plain `cargo build|run|test|check` go through rustd from now on
+  disable           cargo's configuration is put back as it was
+  status            whether rustd is enabled, what the daemon has loaded, what fell back
+  stop              ends the daemon; the next build starts one
+  cargo <command>   what `cargo rustd <command>` runs: build, run, test, check
+  cache <verb>      the disk store: stats, gc, verify, push, pull, keygen
+  --help, --version
+
+`cargo rustd build|run|test|check` takes cargo's flags. CARGO.md is the guide.";
+
+/// Has a command that prints for a reader end quietly when the reader stops reading,
+/// instead of failing on the closed pipe. Not for a process that writes to sockets.
+pub(crate) fn end_with_reader() {
+    #[cfg(unix)]
+    // SAFETY: restores the default action of a signal, before any thread is started.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("cache") {
-        return remote::command(std::env::args().skip(2));
+    let stands_in_for_rustc = std::env::var_os("RUSTD_WRAPS_RUSTC").is_some();
+    match std::env::args().nth(1).as_deref() {
+        _ if stands_in_for_rustc => {}
+        None | Some("--help" | "-h" | "help") => {
+            end_with_reader();
+            println!("{HELP}");
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("rustd {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("cache") => {
+            end_with_reader();
+            return remote::command(std::env::args().skip(2));
+        }
+        _ => {}
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {

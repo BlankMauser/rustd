@@ -148,11 +148,13 @@ SMALL = ["ripgrep", "fd", "hyperfine"]
 MODES = {"rustd": "`cargo rustd`", "plain": "plain cargo after `rustd enable`"}
 
 # What cargo and `cargo rustd` print about the build, which is not the program's output.
-STATUS = re.compile(r"^\s*((Compiling|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
+STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
 
 
 def base_env(home):
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RUSTD_HOME=home, CARGO_TERM_COLOR="never")
+    # The store is on by default, in the user's cache directory: a run has one of its own.
+    env["RUSTD_CACHE"] = os.path.join(home, "store")
     env["PATH"] = os.path.dirname(RUSTD) + os.pathsep + env["PATH"]
     for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET"):
         env.pop(name, None)
@@ -327,6 +329,19 @@ def served(side, command, ask):
                 break
 
 
+def checking(root):
+    """Whether a `cargo check` runs below `root`: the one `cargo rustd` starts after cargo
+    built, for the dependencies to be checked by the time the daemon builds."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            if b"check" in words[1:2] and os.readlink(f"/proc/{pid}/cwd").startswith(root):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def wait_warm(side, root):
     """Waits until the daemon has every build of `root` loaded or has given up on one. The
     result is the seconds it took and how each ended."""
@@ -335,7 +350,7 @@ def wait_warm(side, root):
     while time.time() - began < WARMUP_SECS:
         _, status = side.cargo("status")
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
-        if states and not any(s.startswith("loading") for s in states):
+        if states and not any(s.startswith("loading") for s in states) and not checking(root):
             return time.time() - began, states
         time.sleep(0.25)
     return time.time() - began, ["not loaded in time"]
@@ -579,7 +594,7 @@ def daemon(work):
 
     other = os.path.join(work, "other-build")
     os.makedirs(other, exist_ok=True)
-    for name in ("rustd", "cargo-rustd"):
+    for name in ("rustd", "cargo-rustd", "rustd-rustc"):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     edit(ws, "five")
@@ -609,8 +624,80 @@ def daemon(work):
     _, again = here.cargo("run")
     check("the build after that starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status()[0] not in (None, pid))
     here.cargo("stop")
+    manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
     return checks
+
+
+USE_AFTER_MOVE = """
+fn taken(text: String) -> usize { text.len() }
+pub fn moved() -> usize { let text = String::new(); taken(text) + text.len() }
+"""
+
+
+def manners(work, ws, env, here, check, edit):
+    """What the commands say for themselves, a daemon that is going away, the store that is
+    on without being asked for, and an error only rustc's borrow checker finds."""
+    for argv in (["rustd", "--help"], ["rustd", "-h"], ["cargo", "rustd", "--help"], ["cargo", "rustd", "-h"]):
+        ran = subprocess.run([RUSTD, *argv[1:]] if argv[0] == "rustd" else argv, cwd=ws, env=env, capture_output=True, text=True)
+        listed = all(word in ran.stdout for word in ("enable", "disable", "status", "stop"))
+        check(f"`{' '.join(argv)}` lists the commands and exits 0", ran.returncode == 0 and listed, f"exit {ran.returncode}")
+
+    here.cargo("build")
+    wait_warm(here, ws)
+    for argv in ([RUSTD, "status"], [RUSTD, "cache", "stats"], [RUSTD, "--help"], ["cargo", "rustd", "status"], ["cargo", "rustd", "--help"]):
+        shown = subprocess.Popen(argv, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        shown.stdout.close()
+        said = shown.stderr.read()
+        code = shown.wait()
+        name = " ".join(["rustd" if argv[0] == RUSTD else argv[0], *argv[1:]])
+        # Cargo's subcommand ends by the signal; `cargo-rustd` has no status to pass on and says 1.
+        check(f"`{name}` whose reader went away ends without a word", not said.strip() and code in (0, 1, -signal.SIGPIPE), f"exit {code} {said.strip()[:120]}")
+
+    left = []
+    for turn in range(5):
+        here.cargo("stop")
+        edit(ws, f"stopped {turn}")
+        _, after = here.cargo("run")
+        left.append(after.returncode == 0 and "hello world" in after.stdout and "answer" not in after.stderr and "EOF" not in after.stderr)
+        wait_warm(here, ws)
+    check("a build straight after `stop` starts a daemon and is not a fallback over the one leaving", all(left), f"{sum(left)} of 5")
+    here.cargo("stop")
+
+    lib = os.path.join(ws, "util/src/lib.rs")
+    main = os.path.join(ws, "app/src/main.rs")
+    for file, name in ((main, "the program's crate"), (lib, "a library of the workspace")):
+        kept = open(file).read()
+        here.cargo("build")
+        wait_warm(here, ws)
+        open(file, "a").write(USE_AFTER_MOVE)
+        _, wrong = here.cargo("run")
+        check(f"a use after a move in {name} fails a warm `cargo rustd run` with rustc's error", wrong.returncode == 101 and "E0382" in wrong.stderr, f"exit {wrong.returncode}")
+        _, checked = here.cargo("check")
+        check(f"and `cargo rustd check` of it", checked.returncode == 101 and "E0382" in checked.stderr, f"exit {checked.returncode}")
+        open(file, "w").write(kept)
+        _, mended = here.cargo("run")
+        check("and the build once it is mended is right", mended.returncode == 0 and "hello world" in mended.stdout, how_built(mended.stderr))
+    here.cargo("stop")
+
+    for value, kept in ((None, True), ("off", False), ("0", False), ("", False)):
+        cache = os.path.join(work, f"cache-{value}")
+        home = os.path.join(work, f"home-store-{value}")
+        own = base_env(home)
+        own.pop("RUSTD_CACHE")
+        own["XDG_CACHE_HOME"] = cache
+        if value is not None:
+            own["RUSTD_CACHE"] = value
+        side = Side(ws, own, True)
+        edit(ws, f"store {value}")
+        side.cargo("build")
+        wait_warm(side, ws)
+        store = os.path.join(cache, "rustd", "store")
+        filled = os.path.isdir(store) and any(files for _, _, files in os.walk(store))
+        stats = subprocess.run([RUSTD, "cache", "stats"], cwd=ws, env=own, capture_output=True, text=True)
+        side.cargo("stop")
+        asked = "unset" if value is None else repr(value)
+        check(f"RUSTD_CACHE {asked}: the store is {'on, in the user cache directory' if kept else 'off'}", filled == kept and (stats.returncode == 0) == kept, f"`rustd cache stats` exit {stats.returncode}")
 
 
 def abuse(work, ws, tree, env, check, status, alive):
@@ -672,7 +759,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     other = os.path.join(work, "other-build")
     older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     pid = status()[0]
-    seen = older.cargo("status")[1].stdout.splitlines()[0]
+    seen = next((line for line in older.cargo("status")[1].stdout.splitlines() if line.startswith("daemon:")), "")
     check("status by another build says the daemon is another build, and leaves it", "another build of rustd" in seen and status()[0] == pid, seen)
     edit("skew")
     _, skewed = older.cargo("run", "skew")
@@ -894,6 +981,17 @@ def plain(work):
     mine, how, wrong = same("run", "mended")
     check("and the build after it is mended is right", mine.returncode == 0 and not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
 
+    wait_warm(here, ws)
+    for file, name in ((broken, "the program's crate"), (os.path.join(ws, "util/src/lib.rs"), "a library of the workspace")):
+        kept = open(file).read()
+        open(file, "a").write(USE_AFTER_MOVE)
+        mine, how, wrong = same("run", "moved")
+        check(f"a use after a move in {name} fails a warm `cargo run` with rustc's error", mine.returncode == 101 and "error[E0382]" in mine.stderr and not wrong, how[:90])
+        open(file, "w").write(kept)
+        mine, how, wrong = same("run", "mended")
+        check("and the build after it is mended is right", mine.returncode == 0 and not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
+        wait_warm(here, ws)
+
     root = os.path.join(work, "plain-installed")
     _, installed = here.cargo("install", "--path", "app", "--root", root, "--bin", "app")
     ran = subprocess.run([os.path.join(root, "bin/app"), "installed"], capture_output=True, text=True)
@@ -976,7 +1074,7 @@ def plain(work):
     touch("off")
     n = len(calls("outer"))
     mine, how, wrong = same("run", "off")
-    check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and "rustd" not in mine.stderr and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n)
+    check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^rustd:|\[rustd\]", mine.stderr, re.M) and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(calls('outer')) - n} calls of the wrapper; {mine.stderr.strip()[-300:]}")
     subprocess.run([RUSTD, "stop"], env=env, capture_output=True)
     subprocess.run([os.path.join(other, "rustd"), "stop"], env=env, capture_output=True)
     return checks

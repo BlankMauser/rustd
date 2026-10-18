@@ -256,7 +256,10 @@ impl Built {
             match message? {
                 Message::CompilerArtifact(artifact) => built.artifacts.push(artifact),
                 Message::BuildScriptExecuted(script) => built.scripts.push(script),
-                Message::TextLine(line) => println!("{line}"),
+                // Whoever reads this may stop reading before its end.
+                Message::TextLine(line) => {
+                    let _ = writeln!(std::io::stdout(), "{line}");
+                }
                 _ => {}
             }
         }

@@ -230,6 +230,10 @@ impl Worker {
         let config = &checkout.config;
         let mut command = Command::new(std::env::current_exe()?);
         command.arg(checkout.project()).arg("--own-target");
+        match store() {
+            Some(store) => command.env("RUSTD_CACHE", store),
+            None => command.env_remove("RUSTD_CACHE"),
+        };
         if let Some(target) = &config.target {
             command.args(["--target", target]);
         }
@@ -443,6 +447,19 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     Ok(Path::new(&home.context("no RUSTD_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/rustd"))
+}
+
+/// The disk store of the user's builds: the directory `RUSTD_CACHE` names, none when it
+/// says `off`, and without it `rustd/store` in the user's cache directory. Unlike `home`
+/// it is not in `XDG_RUNTIME_DIR`, which does not outlive the session.
+pub(crate) fn store() -> Option<PathBuf> {
+    if let Some(named) = std::env::var_os("RUSTD_CACHE") {
+        return (!hir_ty::mir::codegen::store_is_off(&named)).then(|| PathBuf::from(named));
+    }
+    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
+    Some(caches.join("rustd/store"))
 }
 
 pub(crate) fn socket_in(home: &Path) -> PathBuf {

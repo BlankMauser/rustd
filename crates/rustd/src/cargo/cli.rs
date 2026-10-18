@@ -122,6 +122,7 @@ pub(crate) enum Asked {
     Stop,
     Enable,
     Disable,
+    Help,
 }
 
 /// A build command and its arguments, split into what is cargo's to read and what is the
@@ -169,9 +170,10 @@ impl Asked {
     /// From the arguments after `cargo rustd`.
     pub(crate) fn parse(args: Vec<String>) -> Asked {
         let Some((first, rest)) = args.split_first() else {
-            return Asked::Cargo(vec!["help".to_owned()]);
+            return Asked::Help;
         };
         match (first.as_str(), Subcommand::named(first)) {
+            ("--help" | "-h" | "help", _) => Asked::Help,
             (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
@@ -273,6 +275,16 @@ impl Invocation {
 
     /// Why this command is cargo's alone, when it is clear before anything is built.
     pub(crate) fn only_cargo(&self) -> Option<String> {
+        let surroundings = match () {
+            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
+            _ if !wrapper_installed() => "`rustd-rustc` is not installed next to `rustd`",
+            _ => return self.asks_for_cargo(),
+        };
+        Some(surroundings.to_owned())
+    }
+
+    /// Why what was typed is cargo's alone, wherever it is typed.
+    fn asks_for_cargo(&self) -> Option<String> {
         let flags = &self.flags;
         let reason = match () {
             _ if flags.doc => "doc tests are built by rustdoc",
@@ -280,7 +292,6 @@ impl Invocation {
             _ if flags.unstable => "unstable cargo flags",
             _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -336,6 +347,11 @@ fn another_wrapper() -> bool {
     let ours = super::switch::wrapper_path().ok();
     std::env::var_os(super::switch::VARIABLE)
         .is_some_and(|it| !it.is_empty() && Some(Path::new(&it)) != ours.as_deref())
+}
+
+/// Whether the wrapper cargo is to run in place of rustc is where rustd looks for it.
+fn wrapper_installed() -> bool {
+    super::switch::wrapper_path().is_ok_and(|it| it.is_file())
 }
 
 /// Why rustd does not build for `triple`, when it does not.
@@ -414,12 +430,13 @@ mod tests {
     #[test]
     fn what_is_cargos_alone() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
-        assert_eq!(Asked::parse(Vec::new()), Asked::Cargo(vec!["help".to_owned()]));
+        assert_eq!(Asked::parse(Vec::new()), Asked::Help);
+        assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
         for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
-            assert!(build("build", args).only_cargo().is_some(), "{args}");
+            assert!(build("build", args).asks_for_cargo().is_some(), "{args}");
         }
         for args in ["--release", "--profile bench", "-p a -p b", "--all-features"] {
-            assert_eq!(build("build", args).only_cargo(), None, "{args}");
+            assert_eq!(build("build", args).asks_for_cargo(), None, "{args}");
         }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
