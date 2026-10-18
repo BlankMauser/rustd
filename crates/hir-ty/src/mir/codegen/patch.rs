@@ -531,10 +531,8 @@ impl Base {
                 parents.push(parent);
             }
         }
-        let left = skipped
-            .iter()
-            .map(|(root, e)| (!e.no_symbol()).then(|| Left::of(db, *root)))
-            .collect();
+        let left =
+            skipped.iter().map(|(root, e)| (!e.no_symbol()).then(|| Left::of(db, *root))).collect();
         let from_rustc: Vec<FunctionId> = left_to_rustc(db, cg.symbols, skipped).collect();
         let (their_statics, walked) = TheirStatics::walk(db, from_rustc.iter().copied());
         let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
