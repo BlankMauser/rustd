@@ -842,7 +842,13 @@ the five-crate tests passed there.
 
 Half-done:
 
-- The merge of `rustd-collate-next`. It is in the branch (330dd35b25) and builds. The gate on it was still running when this was written.
+- The merge of `rustd-collate-next`. It is in the branch (330dd35b25) and builds. The ten gate
+  scripts pass on it under Cranelift and under LLVM `-O2` fast emit (difftest MATCH, 0 of
+  893 layouts; programs 22 of 22; stress 99 of 99; breakers 94 of 94, 6 open; unwinds 8 of
+  8; splices 71 of 71; asmedits 10 of 10; includes 9 of 9; worktrees 62 of 62; keys 46 of
+  46). The two backends ran side by side, and LLVM's `difftest.py` failed in that run with
+  exit 1 just after the runner was built, with no message kept; run again on its own it
+  passed. I took that for two runs building the same runner at once and did not check it.
   `cargo_rustd.py --small`, the unit tests and clippy were not finished on the merged
   head: their runs were lost when `/dev/shm` was emptied under them (cause not found) and
   were not repeated. Clippy was last counted at 168 warnings in `crates/rustd` on
