@@ -47,11 +47,11 @@ Read this section before relying on it.
 
 On macOS arm64, Linux x86-64 and Linux AArch64:
 
-    curl -fsSL https://raw.githubusercontent.com/DioxusLabs/rustd/main/site/install.sh | sh
+    curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh
 
 On Windows x86-64, in PowerShell:
 
-    irm https://raw.githubusercontent.com/DioxusLabs/rustd/main/site/install.ps1 | iex
+    irm https://dioxuslabs.github.io/rustd/install.ps1 | iex
 
 The script downloads the latest [release](https://github.com/DioxusLabs/rustd/releases),
 checks it against the release's SHA-256 sums and puts `rustd`, `cargo-rustd` and

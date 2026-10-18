@@ -1,6 +1,6 @@
 # Installs rustd, cargo-rustd and rustd-rustc from a GitHub release.
 #
-#   irm https://raw.githubusercontent.com/DioxusLabs/rustd/main/site/install.ps1 | iex
+#   irm https://dioxuslabs.github.io/rustd/install.ps1 | iex
 #
 # $env:RUSTD_VERSION names the release (`latest` unless set); $env:RUSTD_INSTALL_DIR is where
 # the three binaries go (cargo's bin directory unless set).

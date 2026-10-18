@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs rustd, cargo-rustd and rustd-rustc from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/DioxusLabs/rustd/main/site/install.sh | sh
+#   curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh
 #
 # RUSTD_VERSION names the release: the latest numbered one unless set, or the newest build
 # of main (`nightly`) while there is none.
