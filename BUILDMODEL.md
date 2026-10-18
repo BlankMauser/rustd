@@ -1,7 +1,9 @@
 # Cargo's build model in rustd
 
-Branch `rustd-build-model`. The fourth round has `rustd-collate` at 14ee89181b
-merged in (the third from 1547078a30, the second from 0151c01218). Linux x86-64, Rust 1.99.0,
+Branch `rustd-build-model`. The head has `rustd-collate-next` 1b022ff6f2 merged in (before
+it `rustd-collate` 3d47ed59bf and 14ee89181b; the third round from 1547078a30, the second
+from 0151c01218). Work stopped here; "Where this stands" below says what is done, what is
+half done and what would come next. Linux x86-64, Rust 1.99.0,
 LLVM 20.
 
 This is a survey of which parts of cargo's build model rustd follows, with a small project
@@ -602,7 +604,71 @@ Inferred, not measured:
 - `Flags::of` in `plan.rs` asks `cargo config get` for the configuration, which is how
   project-model already reads it; it is an unstable cargo command.
 
+## Where this stands
+
+Done and measured under both backends: everything in this report up to and including the
+merge of 14ee89181b, with the whole gate in the table below.
+
+Half done: the merges after that. `rustd-collate` 3d47ed59bf is merged (094c139694, one
+conflict in the flag cases of `harness/cargo_rustd.py`; both sides' cases are kept, and the
+case with `-C target-cpu=x86-64-v3` only runs on an x86-64 host). The whole Cranelift leg
+passed on that merge; its LLVM leg was stopped after `buildmodel.py` (105 of 105) to merge
+the next head. `rustd-collate-next` 1b022ff6f2 is merged on top (03e4d294df, conflicts in
+`codegen.rs`, `codegen/cached.rs`, `cargo/plan.rs`, `main.rs`, `outline.rs`, `symbols.rs`).
+What was kept: both sides' additions to `SymbolResolver`; the timed store read with this
+branch's program identity in the key; `LinkLine::command` with this branch's signature (the
+objects ahead, the binary) over the new MSVC flavour; `crates_to_build` from the other side,
+asked for every crate of `Args::crates()`; `Listed::left_to_rustc` stays removed, since the
+daemon widens what it builds instead. A unit test of `cargo/plan.rs` was brought to the
+merged signature (f030070c92). On this head: it builds with `--features llvm`, `cargo fmt`
+is clean, the unit tests pass (1026, 0 failed), and the Cranelift leg of the gate was run,
+see "The gate on the head" below. The LLVM leg was not run on this head, because work was
+stopped; the MSVC link path of `LinkLine::command` is only covered by its unit test here.
+
+What would come next, in order: the LLVM leg of the gate on the head; then the open items
+above (generic copies of the standard library in programs that differ in
+`overflow-checks`; `cargo/units.rs` reading the planner's unit graph; `Flags::of` without
+the unstable `cargo config get`; `cargo rustd` with `lto` in the profile; diagnostic text
+of `compile_fail` doctests).
+
+The fix of the build-script markers of `selects.py` (one write for a line) is in, since
+2c2ba1432d.
+
+### The gate on the head
+
+Run with `RUSTD_BACKEND=cranelift` only, on the binary of 03e4d294df (the head differs from
+it by the unit test alone). Every harness of the gate passed:
+
+| command | result |
+|---|---|
+| `python3 buildmodel.py --backend cranelift --jobs 6` | 105 of 105 as expected, 0 WRONG |
+| `python3 keys.py` | 52 of 52 right, 0 open, 8 functions refused |
+| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 0 of 893 layouts differ |
+| `python3 programs.py` | 22 of 22 right |
+| `python3 stress.py` | 99 of 99 right, 0 restarts |
+| `python3 breakers.py` | 94 of 94 right, 6 open, 0 functions skipped |
+| `python3 unwinds.py` | 8 of 8 right |
+| `python3 splices.py` | 71 of 71 right |
+| `python3 asmedits.py` | 10 of 10 right |
+| `python3 includes.py` | 9 of 9 right |
+| `python3 worktrees.py` | 62 of 62 right |
+| `python3 debuginfo.py` | all right |
+| `python3 storecorrupts.py` | PASS, 40 damaged stores |
+| `python3 storefull.py` | PASS, 6 full disks |
+| `python3 storekills.py` | PASS, 300 kills |
+| `python3 storelib.py` | exit 0 |
+| `python3 storeshared.py` | PASS, 180 builds |
+| `python3 storeguards.py` | all right |
+| `python3 selects.py` | 3 of 3 right |
+| `python3 remote.py` | 117 of 117 right |
+| `python3 fuzz/fuzz.py smoke --backends cranelift` | exit 0 |
+| `python3 cargo_rustd.py --only-checks` | PASS |
+| `python3 doctests.py` | 30 same, 0 refused, 0 WRONG |
+
 ## Regression gate
+
+The table of this section is of the merge of 14ee89181b, the last head both legs ran on.
+
 
 Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`
 from the head of the branch (the merge of `rustd-collate` 14ee89181b and the fix of rustd in
