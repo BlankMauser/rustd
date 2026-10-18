@@ -1,7 +1,8 @@
 # rustc's own test suites through rustd
 
-Branch `rustd-rustc-suites`, off `rustd-collate`; round two merges `rustd-collate` again at
-`0151c01218` or later. Everything below was measured on one Linux x86-64 VM with stable
+Branch `rustd-rustc-suites`, off `rustd-collate`; round two merges `rustd-collate` again, last at
+`14ee89181b`, and carries one commit of `rustd-fuzz` (`5fba09c841`, see "Round two:
+differing"). Everything below was measured on one Linux x86-64 VM with stable
 `rustc 1.99.0` and the rust-lang/rust checkout at the `1.99.0` tag. Each number is from a
 single run unless it says otherwise. "Cranelift" is `cargo build -p rustd --release`; "LLVM"
 is the same with `--features llvm` (`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20`), run with
@@ -16,8 +17,8 @@ they say otherwise.
 
 | suite | backend | tests run | matching | differing | left out | functions from rustd | left to rustc |
 |---|---|---|---|---|---|---|---|
-| `tests/ui` run-pass | Cranelift | 2786 | 2772 | 14 | 996 | 5728 of 5753 | 25 |
-| `tests/ui` run-pass | LLVM | 2786 | 2771 | 15 | 996 | 5729 of 5752 | 23 |
+| `tests/ui` run-pass | Cranelift | 2785 | 2771 | 14 | 997 | 5721 of 5745 | 24 |
+| `tests/ui` run-pass | LLVM | 2786 | 2771 | 15 | 996 | 5727 of 5749 | 22 |
 | `coretests` | Cranelift | 1197 | 1197 | 0 | see Part 2 | 1494 of 1499 | 5 |
 | `coretests` | LLVM | 1197 | 1197 | 0 | | 1494 of 1499 | 5 |
 | `alloctests` | Cranelift | 703 | 703 | 0 | | 966 of 966 | 0 |
@@ -28,7 +29,9 @@ they say otherwise.
 No rustd crash, hang or link error in any of the eight runs.
 
 Round one ended at 2690 `tests/ui` tests run, 4 differing, 57 functions left to rustc, and 11
-left in the libraries. Round two runs 96 more tests and leaves 25 + 6 functions to rustc.
+left in the libraries. Round two runs 96 more tests and leaves 24 + 6 functions to rustc (22 + 6 on LLVM). The
+Cranelift run has one test fewer because in it one test was seen to race (rustc's own
+program did what rustd's did) and was left out; which tests do that varies from run to run.
 The differing count went from 4 to 14 (15 on LLVM) because tests that were left out are now
 run, not because anything that matched stopped matching: 9 of the new ones are a family of
 tests marked `known-bug` upstream, one needs the optimiser, and the LLVM one comes from the
@@ -41,7 +44,7 @@ differing, 1 link error; LLVM 2649 run, 17 differing, 1 link error; `coretests` 
 
 ### 1. Functions left to rustc
 
-Round one left 57 functions in `tests/ui` and 11 in the libraries. 31 are left now (25 + 5 +
+Round one left 57 functions in `tests/ui` and 11 in the libraries. 30 are left now (24 + 5 +
 1 on Cranelift), and that includes functions of the tests that are newly run. Each fix below
 has a reduced case in `harness/breakers/` unless it says otherwise. The first column is the
 round-one count for that reason where the round-one table had one; I did not re-derive it
@@ -86,7 +89,7 @@ column, and the test still matches because rustc's copy of the function runs.
 |---|---|---|---|
 | 6 | names or bodies missing because "a macro of the crate did not expand: proc-macro panicked" | `proc-macro/attr-args.rs`, `attr-cfg.rs`, `attr-on-trait.rs`, `derive-same-struct.rs`, `expand-with-a-macro.rs`, `load-two.rs` | These macros `assert_eq!` on `TokenStream::to_string()` of their input. rustd runs proc macros through the toolchain's proc-macro server, whose token streams do not print with rustc's spacing, so the macro panics. rustd should refuse here: it cannot give the macro the input rustc gives it. Breaker `macro_reads_its_spelling` (left). The reason names the first macro of the crate that failed, which may not be the one the function uses. |
 | 4 | calling convention `win64` | `asm/x86_64/multiple-clobber-abi.rs`, `c-variadic/same-program-multiple-abis-x86_64.rs` (2), `extern/extern-calling-convention-test.rs` | `extern "win64"` on Linux. The Windows x64 argument code exists in rustd but is only selected for Windows targets; choosing an ABI per function is the work on `rustd-plat-abi2`. |
-| 3 | inline assembly with a `sym` | `abi/abi-sysv64-register-usage.rs`, `asm/x86_64/multiple-clobber-abi.rs`, `c-variadic/naked.rs` | rustd assembles `asm!` text itself and has no way yet to put the symbol of a function or static into it. Not done. |
+| 2 | `asm!` with a `sym` | `abi/abi-sysv64-register-usage.rs`, `asm/x86_64/multiple-clobber-abi.rs` | rustd assembles `asm!` text itself. The `rustd-plat-abi2` work that came in with `rustd-collate` puts one `sym` operand into it, which is what took `c-variadic/naked.rs` off this list; these two have more than one. Not done here. |
 | 1 | an `asm!` constant that is not a literal | `asm/x86_64/const.rs` | `const constfn(5)` as an operand. rustd lowers a `const { }` expression as ordinary code in the body, so there is no value when the text is assembled. Not done. |
 | 2 | incomplete expression | `rust-2021/reserved-prefixes-via-macro.rs`, `rust-2024/reserved-guarded-strings-via-macro.rs` | A proc macro makes tokens that would be a reserved prefix if written in the source. rustd turns the stream back into text and parses it again, where they are one token. Not done. |
 | 1 | body has errors | `parser/macro/statement-boundaries.rs` | An `$e:expr` fragment that is an `if` or block, followed by something that could continue it. rustc keeps the fragment as one expression; rustd pastes its tokens and reads a statement boundary. Breaker `fragment_ends_statement` (left). |
@@ -98,10 +101,10 @@ column, and the test still matches because rustc's copy of the function runs.
 | 5 (`coretests`) | the caller's location in a constant | `panic::location::*` | rustd does not know the file name rustc records there. Breaker `caller_in_constant` (left). |
 | 1 (std) | `type_name` of a function item with type arguments | `type-name-unsized.rs` | Not done. |
 
-So the list is not down to "nightly-only or should be refused". By my reading 12 of the 31
+So the list is not down to "nightly-only or should be refused". By my reading 12 of the 30
 are refusals rustd should keep making (proc-macro spelling 6, `TypeId` constant 1, `CACHE` 1,
-Win64 until `rustd-plat-abi2` 4), 2 are a Cranelift limit, and 17 are gaps I did not close
-(`asm!` 4, reserved prefixes 2, fragment boundary 1, anonymous constants 3, the coherence
+Win64 until `rustd-plat-abi2` 4), 2 are a Cranelift limit, and 16 are gaps I did not close
+(`asm!` 3, reserved prefixes 2, fragment boundary 1, anonymous constants 3, the coherence
 case 1, caller location 5, `type_name` 1). None is silent.
 
 ### 2. Release-mode comparisons
@@ -110,7 +113,8 @@ Round one left out 60 tests for flags: 47 set an optimisation level, 5 turn chec
 ask for LTO. The harness now passes `-O`, `-C opt-level`, `-C debug-assertions`,
 `-C overflow-checks`, `-C panic=abort` and `-C target-feature`/`target-cpu` to cargo for the
 workspace the test is built in, and rustd reads them from the build as it reads a profile. Counted over the tests
-that ran in the last Cranelift run:
+that ran in an earlier Cranelift run of this round (2787 tests run; the set has not changed
+since but for the tests that race):
 
 | flag in `compile-flags` | tests run | matching | differing |
 |---|---|---|---|
@@ -130,7 +134,7 @@ panicked on overflow in a build with checks off.
 
 ### 3. Harness limits
 
-Left out went from 1114 of 3804 to 996 of 3782. The total is 22 lower because the harness
+Left out went from 1114 of 3804 to 996 of 3782 (997 in the last Cranelift run). The total is 22 lower because the harness
 now takes a test's revisions and `ignore-`/`only-` directives per revision; I did not check
 that this accounts for all 22. By limit:
 
@@ -146,7 +150,7 @@ that this accounts for all 22. By limit:
 | 18 + 9 do not build as a package | 19 + 11 | not lifted |
 
 `run-flags`, `exec-env` and `edition` were already honoured; in the last run 4 tests with
-`exec-env`, 147 with an edition directive and 257 with auxiliary crates ran. 12 to 14 tests
+`exec-env`, 147 with an edition directive and 257 with auxiliary crates ran. 13 or 14 tests
 are left out in each run because rustc's own program prints something else every time; the
 exact tests vary between runs.
 
@@ -203,9 +207,71 @@ now run:
 The harness prints the `known-bug` issue next to a differing test and counts them: 10 of the
 14 (the nine above and `metavar_cross_edition_recursive_macros.rs`).
 
+`array-slice-vec/nested-vec-3.rs` differed for a while in this round and matches at this
+head. It builds a `vec!` of `vec!`s and panics in the middle, and checks the order of the
+drops. `rustd-collate` at `8f21942505` dropped the finished inner vectors before the
+elements of the one under construction, where rustc drops the innermost operands first; it
+matched at `ce52276cf5`. The `rustd-fuzz` branch had fixed the same thing from a fuzzer
+finding (`5fba09c841`, breaker `unwind_nested_operands`), so that commit is cherry-picked
+here unchanged apart from its context lines, and will merge away when `rustd-fuzz` lands.
+
+Two things broke when `rustd-collate` `14ee89181b` was merged, and both are fixed here:
+
+- Four tests differed on Cranelift (`io-checks/write-macro-error.rs`,
+  `iterators/iter-filter-count-debug-check.rs`, `iterators/iter-sum-overflow-debug.rs`,
+  `iterators/iter-sum-overflow-overflow-checks.rs`; the LLVM run was not made at that
+  point). Each panics in code of the standard library that is compiled into the test, and
+  prints where. rustc names the file where the sources are installed
+  (`~/.rustup/toolchains/../lib/rustlib/src/rust/library/..`); rustd printed
+  `/rustc/<commit>/library/..`. The collated store names library files by where they were
+  built so that an entry means the same on every machine, and the same name had become
+  what the program says. Now the program is given the installed path, and the path is
+  rewritten to the built one when an entry is stored and back when it is loaded, as is
+  already done for files under the cargo home. Breaker `library_panic_location`, and a unit
+  test in `codegen/cached.rs` for the round trip.
+- `coretests` did not finish compiling: after 12 minutes rustd was still in
+  `Evaluator::patch_addresses`. `tests/slice.rs` has `const EMPTY_MAX: &[()] = &[(); usize::MAX]`
+  and takes a reference to it. When a constant's memory is copied, rustd goes over every
+  element behind a slice to carry addresses over, and did so for elements of no size too.
+  A value without bytes is now skipped. Breaker `unit_slice_constant`; it hangs on the
+  binary from before the fix (stopped after 60 seconds) and takes seconds after.
+
 One mistake of mine to report: a probe script ran in my home directory after a failed `cd`
 and executed `rm -rf rustd; mkdir rustd` there. I found no sign a `~/rustd` existed before,
 and removed what the script made. The repository checkout is elsewhere and was not touched.
+
+### Round two: gate
+
+The harness list of `.github/workflows/rustd.yaml` as of `rustd-collate` `14ee89181b`, run
+from `harness/` with `RUSTD_BIN` at each binary, plus `cargo_rustd.py --small`. Every script
+exited 0 on both backends. `buildmodel.py` runs on the Cranelift leg and `backends.py` on
+the LLVM leg, as in the workflow. `remote.py` was not run: there is no MinIO on this machine.
+
+| command | Cranelift | LLVM |
+|---|---|---|
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions, 0 of 893 layouts differ | the same |
+| `programs.py` | 22 of 22 | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
+| `breakers.py` | 80 of 80, 8 open, 0 functions skipped | the same |
+| `unwinds.py`, `splices.py`, `asmedits.py`, `includes.py`, `worktrees.py` | 8 of 8, 71 of 71, 10 of 10, 9 of 9, 62 of 62 | the same |
+| `keys.py` | 46 of 46 | 46 of 46 |
+| `fuzz/fuzz.py smoke` | 505 functions, 0 differences, 0 crashes, 0 left to rustc | the same |
+| `backends.py corpus runner cases --bin runner --levels 2f` | not part of this leg | same output as cargo's |
+| `debuginfo.py` | all right | all right |
+| `buildmodel.py` | 194 of 194 | not part of this leg |
+| `storekills.py --kills 100`, `storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py`, `storeguards.py`, `selects.py` | pass | pass |
+| `cargo_rustd.py --small` | pass | pass |
+
+The 8 that `breakers.py` calls open are five cases that still differ (`assert_message`,
+`unreachable_arm_move`, `raw_write_then_match`, `future_unwind_flags`,
+`fragment_edition_through_macro`) and three that rustd refuses with a reason
+(`caller_in_constant`, `fragment_ends_statement`, `macro_reads_its_spelling`).
+
+`cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
+-p syntax -p rustd`: 1013 passed, 0 failed. One expectation was changed for that:
+`test_assert_expand_2015` in `hir-def` carried a FIXME saying its expected expansion was the
+wrong one (`panic_2021!` in a 2015 crate); with the panic-edition rule of this round the
+expansion is `$crate::panic!`, and the test now expects that.
 
 ## Part 1: `tests/ui` run-pass
 

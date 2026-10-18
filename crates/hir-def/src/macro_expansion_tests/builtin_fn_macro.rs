@@ -246,7 +246,6 @@ fn main() {
     );
 }
 
-// FIXME: This is the wrong expansion, see FIXME on `builtin_fn_macro::use_panic_2021`
 #[test]
 fn test_assert_expand_2015() {
     check(
@@ -261,7 +260,7 @@ fn main() {
 fn main() {
      {
         if !(true ) {
-            $crate::panic::panic_2021!("{} {:?}", arg1(a, b, c), arg2);
+            $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
 }
