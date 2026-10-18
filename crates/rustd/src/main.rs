@@ -1773,10 +1773,65 @@ fn workspace_at(
         }
     }
     if load_config.load_out_dirs_from_check {
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
+            && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
+        {
+            seed_own_target(cargo.target_directory().as_ref());
+        }
         let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
         workspace.set_build_scripts(build_scripts);
     }
     Ok((workspace, debug))
+}
+
+/// Starts rustd's own target directory from what cargo built in `target`, so that the build
+/// scripts and proc macros cargo has are not built again. Without it the first load is a
+/// second build of those.
+fn seed_own_target(target: &Path) {
+    let own = target.join("rust-analyzer");
+    if own.exists() {
+        return;
+    }
+    let seeding = target.join(format!("rust-analyzer.{}", std::process::id()));
+    let profiles = |dir: &Path| -> Vec<PathBuf> {
+        let dirs = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|it| it.path());
+        dirs.filter(|it| it.join(".fingerprint").is_dir()).collect()
+    };
+    let mut found = profiles(target);
+    for triple in std::fs::read_dir(target).into_iter().flatten().flatten() {
+        found.extend(profiles(&triple.path()));
+    }
+    for profile in found {
+        let Ok(within) = profile.strip_prefix(target) else { continue };
+        let to = seeding.join(within);
+        // A fingerprint says its artifact is whole, so the fingerprints are read before the
+        // artifacts are: cargo may be building here.
+        _ = copy_tree(&profile.join(".fingerprint"), &to.join(".fingerprint"), false);
+        // A build script writes to its directory in place; rustc and the linker replace
+        // what they write, as cargo's own links out of `deps` rely on.
+        _ = copy_tree(&profile.join("build"), &to.join("build"), false);
+        _ = copy_tree(&profile.join("deps"), &to.join("deps"), true);
+    }
+    if std::fs::rename(&seeding, &own).is_err() {
+        _ = std::fs::remove_dir_all(&seeding);
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path, link: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type()?.is_dir() {
+            copy_tree(&from, &to, link)?;
+        } else if !link || std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to)?;
+            // Cargo takes what is newer than its fingerprint to have changed.
+            let modified = entry.metadata()?.modified()?;
+            std::fs::File::options().write(true).open(&to)?.set_modified(modified)?;
+        }
+    }
+    Ok(())
 }
 
 /// What the checkouts loaded have in common, and what holding them costs.
@@ -3527,6 +3582,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
+    hir_ty::mir::codegen::identify_ahead();
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
     let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;

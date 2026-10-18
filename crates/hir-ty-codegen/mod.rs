@@ -109,8 +109,8 @@ pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArgume
 pub use patch::{Stale, StaleSteps};
 pub use store::{
     Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
-    fetch_missing_with, is_off as store_is_off, is_pack, limit_from_env, name_file_whole,
-    pack_format, pack_keys, pack_name, parse_size, seal_open, write_file_whole,
+    fetch_missing_with, identify_ahead, is_off as store_is_off, is_pack, limit_from_env,
+    name_file_whole, pack_format, pack_keys, pack_name, parse_size, seal_open, write_file_whole,
 };
 mod type_id;
 mod unwind;
@@ -531,13 +531,16 @@ impl CodegenUnit {
                     .collect();
                 let start = stdx::time::Instant::now();
                 // One without a symbol is not compiled, and is still lowered to be told why.
-                symbols.in_parallel(
-                    ours.len(),
-                    &|db, symbols, at| match symbols.function(ours[at]) {
-                        Some(_) => _ = compiled_root(db, ours[at]),
-                        None => _ = db.mir_body(ours[at].into()),
-                    },
-                );
+                let told = cg.debug.is_some().then_some(&cg.told);
+                symbols.in_parallel(ours.len(), &|db, symbols, at| {
+                    if symbols.function(ours[at]).is_none() {
+                        _ = db.mir_body(ours[at].into());
+                    } else if let (Ok(compiled), Some(told)) =
+                        (compiled_root(db, ours[at]).as_ref(), told)
+                    {
+                        told.ahead(db, &mut FxHashMap::default(), compiled);
+                    }
+                });
                 cg.phases.compile += start.elapsed();
                 while let Some(&root) = queue.get(next) {
                     next += 1;
@@ -977,7 +980,9 @@ struct ObjectCodegen<'a, 'db> {
     /// What a debugger is told about the functions, when the build tells one anything.
     debug: Option<DebugContext>,
     /// The types of the variables a debugger is told of, by the environment they are in.
-    types: FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>,
+    types: OwnTypes<'db>,
+    /// What those types are told as, and the ones the threads that compile told of.
+    told: ToldTypes,
     /// Writes what is kept to the store, once there is something to keep.
     writer: Option<cached::Writer>,
     imports: FxHashMap<String, FuncId>,
@@ -1879,13 +1884,56 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
+/// What the types of variables are told as, for every thread: the threads that compile
+/// find it ahead of the one that puts the functions in the object, which has it to wait
+/// for otherwise.
+#[derive(Default)]
+struct ToldTypes(
+    std::sync::Mutex<FxHashMap<(StoredParamEnvAndCrate, StoredTy), Option<debuginfo::TypeSet>>>,
+);
+
+/// The types a thread tells of itself, by the environment they are in.
+type OwnTypes<'db> = FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>;
+
+impl ToldTypes {
+    fn told<'db>(
+        &self,
+        db: &'db dyn HirDatabase,
+        own: &mut OwnTypes<'db>,
+        env: &StoredParamEnvAndCrate,
+        ty: &StoredTy,
+    ) -> Option<debuginfo::TypeSet> {
+        let key = (env.clone(), ty.clone());
+        if let Some(told) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return told.clone();
+        }
+        let types =
+            own.entry(env.clone()).or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
+        let told = types.describe(ty.as_ref());
+        // Another thread may have told of it meanwhile, and the functions share one set.
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(told).clone()
+    }
+
+    /// Tells of the types of the variables of `compiled`, for [`describe_variables`] to find.
+    fn ahead<'db>(
+        &self,
+        db: &'db dyn HirDatabase,
+        own: &mut OwnTypes<'db>,
+        compiled: &CompiledFunction,
+    ) {
+        if let (Some(_), Some((env, variables))) = (&compiled.source, &compiled.variables) {
+            variables.iter().for_each(|it| _ = self.told(db, own, env, &it.ty));
+        }
+    }
+}
+
 /// What a debugger is told of `variables`, which are of the body of `owner` and are where
 /// `debug` has the places of, each in the scope `scopes` has for its binding. A variable of
 /// a type that is not told of is left out.
 fn describe_variables<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
-    types: &mut debuginfo::Types<'db>,
+    (told, own, env): (&ToldTypes, &mut OwnTypes<'db>, &StoredParamEnvAndCrate),
     variables: &[Variable],
     places: &SlotPlaces,
     scopes: &FxHashMap<BindingId, u32>,
@@ -1909,7 +1957,7 @@ fn describe_variables<'db>(
         let ty = match firsts.get(&ty) {
             Some(&first) => first,
             None => {
-                let Some(described) = types.describe(ty) else { continue };
+                let Some(described) = told.told(db, own, env, &variable.ty) else { continue };
                 let first = debug.types.len() as u32;
                 debug.types.push(described);
                 firsts.insert(ty, first);
@@ -2601,6 +2649,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unwind,
             debug,
             types: FxHashMap::default(),
+            told: ToldTypes::default(),
             writer: None,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
@@ -2790,9 +2839,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // Each wave is compiled on every core, and then put in the object one by one.
             let wave = std::mem::take(&mut self.pending);
             let start = stdx::time::Instant::now();
+            let told = self.debug.is_some().then_some(&self.told);
             self.symbols.in_parallel(wave.len(), &|db, _, at| {
                 let (instance, env, _) = &wave[at];
-                _ = compiled_instance(db, instance.clone(), env.clone());
+                let compiled = compiled_instance(db, instance.clone(), env.clone());
+                if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
+                    told.ahead(db, &mut FxHashMap::default(), compiled);
+                }
             });
             self.phases.compile += start.elapsed();
             for (instance, env, id) in wave {
@@ -2856,7 +2909,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         let (entries, owned) = (self.entries.as_deref(), &self.own_statics.crates);
+        let told = self.debug.is_some().then_some(&self.told);
         self.symbols.in_parallel(threads, &|db, symbols, _| {
+            let mut types = OwnTypes::default();
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
             // What the store has is not compiled, nor looked into for what it calls.
             let in_store = |callee: &Instance| {
@@ -2884,6 +2939,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let working = Working(&ahead, &idle);
                 let mut found = Vec::new();
                 if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
+                    if let Some(told) = told {
+                        told.ahead(db, &mut types, compiled);
+                    }
                     for request in &compiled.requests.funcs {
                         let FuncTarget::Instance(callee, asked) = &request.target else {
                             continue;
@@ -3061,10 +3119,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             };
             rows.sort_by_key(|row| row.0);
             let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
-            let types = self
-                .types
-                .entry(env.clone())
-                .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
+            let types = (&self.told, &mut self.types, env);
             describe_variables(db, *owner, types, variables, places, &scopes, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;

@@ -89,6 +89,23 @@ pub fn compiles_against(toolchain: &str) {
     _ = TOOLCHAIN.set(toolchain.to_owned());
 }
 
+/// What the bytes of this process's executable come to.
+fn program() -> Option<[u8; KEY]> {
+    static PROGRAM: OnceLock<Option<[u8; KEY]>> = OnceLock::new();
+    *PROGRAM.get_or_init(|| {
+        let program = std::fs::read(std::env::current_exe().ok()?).ok()?;
+        Some(Sha256::digest(program).into())
+    })
+}
+
+/// Reads the executable on a thread of its own, for the store that is opened once the
+/// workspace is loaded: it is tens of megabytes to hash.
+pub fn identify_ahead() {
+    if std::env::var_os("RUSTD_CACHE").is_some_and(|it| !is_off(&it)) {
+        std::thread::spawn(program);
+    }
+}
+
 /// What a value depends on that its key does not say: the format it is written in, the build
 /// of rustd that made it and the toolchain it was made for.
 #[derive(Clone, Copy)]
@@ -109,8 +126,8 @@ impl Identity {
         let toolchain = TOOLCHAIN.get().ok_or_else(|| {
             io::Error::other("the toolchain the program was built with is not known")
         })?;
-        let program = std::fs::read(std::env::current_exe()?)?;
-        Ok(Identity::new(&Sha256::digest(program), toolchain))
+        let program = program().ok_or_else(|| io::Error::other("the program cannot be read"))?;
+        Ok(Identity::new(&program, toolchain))
     }
 
     fn key(&self, key: &[u8; KEY]) -> [u8; KEY] {
