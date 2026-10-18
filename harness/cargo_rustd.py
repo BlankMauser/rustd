@@ -536,6 +536,8 @@ def daemon(work):
     for file, text in FLAG_WORKSPACE.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
+    # A file that is no text, beside the sources: the daemon loads the workspace all the same.
+    open(os.path.join(ws, "util/src/not-text.bin"), "wb").write(b"\xff\xfe\x00\x80")
     with open(os.path.join(ws, "app/src/bin/nested.rs"), "w") as nested:
         nested.write('fn main() {\n    let cargo = std::process::Command::new("cargo").arg("build").status();\n    std::process::exit(cargo.ok().and_then(|it| it.code()).unwrap_or(1));\n}\n')
     git = lambda *args, cwd=ws: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=cwd, check=True, capture_output=True)
@@ -1089,7 +1091,10 @@ def worktree(ours, row, build, run, edits, work):
     built from nothing, which is cargo's, then edited as the first was and built again. What
     its program says after the edit has to be what the first one's says."""
     git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ours.ws, capture_output=True, text=True)
-    tree = os.path.realpath(os.path.join(work, row["project"] + "-worktree"))
+    # One place for each way of building: a daemon still loading the first writes there
+    # while it is removed, and what that leaves is not the second's.
+    mode = "plain" if ours.plain else "rustd"
+    tree = os.path.realpath(os.path.join(work, f"{row['project']}-worktree-{mode}"))
     added = git("worktree", "add", "-q", "--detach", tree)
     if added.returncode != 0:
         row["wrong"].append(f"worktree: {added.stderr[-200:]}")
