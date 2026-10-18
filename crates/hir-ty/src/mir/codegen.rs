@@ -167,6 +167,11 @@ pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
+    /// Whether rustc compiled the function into an object that keeps it to itself: what rustc
+    /// compiled goes on calling that copy, and nothing built here can stand in for it.
+    fn kept(&self, _func: FunctionId) -> bool {
+        false
+    }
     fn static_(&self, id: StaticId) -> Option<String>;
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
@@ -2445,7 +2450,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let db = self.db;
         db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let Some(symbol) = self.symbols.function(func) else {
-            return Err(CodegenError::NoSymbol);
+            return Err(if self.symbols.kept(func) {
+                CodegenError::Unsupported("rustc's object keeps the function to itself".to_owned())
+            } else {
+                CodegenError::NoSymbol
+            });
         };
         let start = stdx::time::Instant::now();
         let compiled = compiled_root(db, func);

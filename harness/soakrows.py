@@ -646,6 +646,80 @@ mod tests {
             row.warm()
 
 
+def kept_to_an_object(row):
+    """Tests built without incremental compilation, where rustc keeps to one object the
+    functions nothing outside it calls: a test sets a thread local that a function of another
+    module reads, and then a test changes into one that fails."""
+    lib = row.path("core/src/lib.rs")
+    with open(lib, "a") as text:
+        text.write("""
+pub mod clock {
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static SET: std::cell::RefCell<Option<u64>> = None.into();
+    }
+
+    #[cfg(not(test))]
+    fn now() -> u64 {
+        7
+    }
+
+    #[cfg(test)]
+    fn now() -> u64 {
+        SET.with_borrow(|set| set.unwrap_or(7))
+    }
+
+    pub fn after(then: u64) -> bool {
+        now() > then
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::clock::{SET, after};
+
+    struct Set;
+
+    impl Set {
+        fn new(now: u64) -> Set {
+            SET.with_borrow_mut(|set| *set = Some(now));
+            Set
+        }
+    }
+
+    impl Drop for Set {
+        fn drop(&mut self) {
+            SET.with_borrow_mut(|set| *set = None);
+        }
+    }
+
+    #[test]
+    fn after_what_was_set() {
+        let _set = Set::new(100);
+        assert!(after(50));
+        assert!(super::mark() > 0);
+    }
+
+    #[test]
+    fn sums() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+""")
+    args = ("-p", "soak-core")
+    row.both("cold tests", command="test", args=args)
+    row.warm()
+    row.edit()
+    row.both("edited, tests", command="test", args=args)
+    row.warm()
+    in_place(lib, open(lib).read().replace("assert_eq!(1 + 1, 2);", "assert_eq!(1 + 1, 3);"))
+    _, ours = row.both("a test that now fails", command="test", args=args)
+    if "sums ... FAILED" not in ours.stdout:
+        raise Wrong(f"the test that fails was not seen to: {ours.stdout[-300:]}")
+    row.edit()
+    row.both("edited again, tests", command="test", args=args)
+
+
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 
 ROWS = {
@@ -670,6 +744,7 @@ ROWS = {
     "no memory ceiling": (no_ceiling, {"RUSTD_MEMORY_MAX": "off"}),
     "tests of a proc macro": (proc_macro_tests, {}),
     "a function that is another under test": (another_under_test, {}),
+    "functions rustc keeps to an object": (kept_to_an_object, {"CARGO_INCREMENTAL": "0"}),
 }
 
 

@@ -25,6 +25,9 @@ pub(crate) struct SymbolTable {
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
+    /// The paths of the functions an object keeps to itself: rustc found no use of them
+    /// outside it, so nothing of another object can name them or stand in for them.
+    kept: FxHashSet<String>,
 }
 
 struct NestedSymbol {
@@ -40,12 +43,28 @@ struct Placed {
     place: Option<u64>,
 }
 
-/// A linkable symbol: its mangled name and its path with and without crate ids.
+/// A symbol of the link: its mangled name and its path with and without crate ids.
 struct Symbol {
     name: String,
+    /// Whether another object can name it.
+    linkable: bool,
     place: Option<u64>,
     with_ids: String,
     path: String,
+}
+
+impl Symbol {
+    /// A function that its object keeps to itself, when its name is one of Rust's.
+    fn kept(name: &str) -> Option<Symbol> {
+        let demangled = rustc_demangle::try_demangle(name).ok()?;
+        Some(Symbol {
+            name: name.to_owned(),
+            linkable: false,
+            place: V0::place(name),
+            with_ids: demangled.to_string(),
+            path: format!("{demangled:#}"),
+        })
+    }
 }
 
 impl SymbolTable {
@@ -107,13 +126,17 @@ impl SymbolTable {
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
         let table = self;
-        for Symbol { name, place, with_ids, path } in symbols {
+        for Symbol { name, linkable, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
             } else {
                 path
             };
+            if !linkable {
+                table.kept.insert(path);
+                continue;
+            }
             // A closure is not an item nested in itself.
             let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
             if path.contains("::{") && !unnamed {
@@ -157,7 +180,7 @@ impl SymbolTable {
                 && symbol.section() == object::SymbolSection::Unknown;
             let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
             let linkable = symbol.is_undefined() || (defined && symbol.is_global());
-            if !linkable {
+            if !linkable && !(defined && symbol.kind() == object::SymbolKind::Text) {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
@@ -167,8 +190,17 @@ impl SymbolTable {
                 object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
                 _ => name,
             };
-            self.add_name(name, symbols);
+            if linkable {
+                self.add_name(name, symbols);
+            } else {
+                symbols.extend(Symbol::kept(name));
+            }
         }
+    }
+
+    /// Whether rustc compiled the function at `path` into an object that keeps it to itself.
+    pub(crate) fn keeps(&self, path: &str) -> bool {
+        self.kept.contains(path)
     }
 
     fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
@@ -191,6 +223,7 @@ impl SymbolTable {
         // `{:#}` drops the crate disambiguator hashes.
         symbols.push(Symbol {
             name: name.to_owned(),
+            linkable: true,
             place: V0::place(name),
             with_ids,
             path: format!("{demangled:#}"),
@@ -585,7 +618,7 @@ mod tests {
 
     use rustc_hash::FxHashMap;
 
-    use super::{SymbolTable, V0};
+    use super::{Symbol, SymbolTable, V0};
 
     fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
         let mut table = SymbolTable::default();
@@ -610,6 +643,20 @@ mod tests {
     fn a_test_named_as_a_crate_of_the_sysroot() {
         let placed = placed(&[("tests/test.rs", &[(7, 6), (8, 300)])]);
         assert_eq!(placed, [("tests/test.rs".to_owned(), 8)]);
+    }
+
+    #[test]
+    fn a_function_kept_to_its_object_is_no_symbol() {
+        let kept = "_RNvNtCs7aCYEL8njSF_2h24send5apply";
+        let named = "_RNvNtCs7aCYEL8njSF_2h24send4take";
+        let mut table = SymbolTable::default();
+        let mut symbols = Vec::new();
+        symbols.extend(Symbol::kept(kept));
+        table.add_name(named, &mut symbols);
+        table.index(symbols);
+        assert!(table.keeps("h2::send::apply") && table.get("h2::send::apply").is_none());
+        assert!(!table.keeps("h2::send::take") && table.get("h2::send::take") == Some(named));
+        assert!(table.defines(named) && !table.defines(kept));
     }
 
     #[test]

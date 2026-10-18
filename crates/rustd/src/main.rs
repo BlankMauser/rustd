@@ -641,6 +641,10 @@ impl SymbolResolver for Resolver<'_> {
         self.debug.then(|| self.root.to_string_lossy().into_owned())
     }
 
+    fn kept(&self, func: FunctionId) -> bool {
+        !self.is_generic(func) && self.path(func).is_some_and(|path| self.table.keeps(&path))
+    }
+
     fn function(&self, func: FunctionId) -> Option<String> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
