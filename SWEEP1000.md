@@ -1,6 +1,6 @@
 # The test suites of 1100 crates.io crates through rustd
 
-Branch `rustd-sweep-2`: `rustd-collate` at `14ee89181b` with `rustd-sweep-1000` (`f4fca15318`)
+Branch `rustd-sweep-2`: `rustd-collate` at `3d47ed59bf` with `rustd-sweep-1000` (`f4fca15318`)
 merged in. Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is
 updated with each push; a section that says "in progress" has numbers from a sweep that is
 still running.
@@ -16,7 +16,7 @@ this one in versions and in order.
 ## The gate at the merge
 
 Every harness below was run under Cranelift and then under LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`)
-on the merge with `rustd-collate` at `14ee89181b`, one backend at a time, with the binary of
+on the merge with `rustd-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend at a time, with the binary of
 `LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm`.
 
 | harness | Cranelift | LLVM |
@@ -24,7 +24,7 @@ on the merge with `rustd-collate` at `14ee89181b`, one backend at a time, with t
 | `difftest.py corpus --bin runner --crate cases --layouts` | match, 0 of 893 layouts differ | match, 0 of 893 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 128 of 128, 8 open, 0 skipped | 128 of 128, 8 open, 0 skipped |
+| `breakers.py` | 129 of 129, 7 open or left to rustc, 0 skipped | 129 of 129, 7 open or left to rustc, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
@@ -41,19 +41,19 @@ on the merge with `rustd-collate` at `14ee89181b`, one backend at a time, with t
 | `storeshared.py` | pass, 180 builds | pass, 180 builds |
 | `storeguards.py` | all right | all right |
 | `selects.py` | 3 of 3 | 3 of 3 |
+| `cargo_rustd.py --small` | pass | (Cranelift leg only) |
 
 `cargo fmt --all -- --check` is clean and `cargo test --release -p hir-ty -p hir-def -p parser
 -p syntax -p rustd` passes.
 
-Not run: `remote.py` (no minio on this machine), `worktrees.py --join --together` and
-`--overlay`, and `cargo_rustd.py --small`. The last one was started and stopped after 17
-minutes in which it used no processor time; its log ends at ripgrep's cold build with cargo
-exiting 101. Whether that is this machine (its `TMPDIR` is `/dev/shm`) or the merge was not
-looked into.
+Not run: `remote.py` (no minio on this machine) and `worktrees.py --join --together` and
+`--overlay`. `cargo_rustd.py --small` did not finish on the previous push (it sat idle at
+ripgrep's cold build and was stopped); it passes on this one, in 196 seconds, and the stall
+has not been seen again or explained.
 
 Clippy (`cargo clippy -p rustd --all-targets -- --cap-lints warn`) was compared with
 `rustd-collate` at `f191c6e42a` on the previous push: the same 97 kinds of warning, three more
-instances, two of which are fixed here. It was not compared again after this merge.
+instances, two of which are fixed here. It was not compared again after the later merges.
 
 Where `rustd-collate` and this branch had fixed the same thing, one fix was kept:
 
@@ -69,8 +69,9 @@ expansion error (this branch's). The file name under a stable name goes through 
 `file_name`.
 
 The open breakers are `raw_write_then_match`, `future_unwind_flags`,
-`fragment_edition_through_macro`, `assert_long_expression`, `assert_message` and
-`unreachable_arm_move`.
+`fragment_edition_through_macro`, `assert_long_expression` and `assert_message`; rustd
+prints something else than rustc in each. `caller_in_constant` and `empty_array_by_impl` are
+left to rustc with a reason. `unreachable_arm_move` was fixed in `rustd-collate`.
 
 ## Totals
 
