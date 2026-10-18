@@ -51,7 +51,7 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
             After each step cargo builds again and the client names what it linked.
 """
 from concurrent.futures import ThreadPoolExecutor
-import argparse, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
+import errno, argparse, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -373,7 +373,14 @@ class Case:
             mine = f"{binary}.client{n}"
             for _ in range(200):
                 shutil.copy(binary, mine)
-                ran = self.behaviour(mine, env)
+                try:
+                    ran = self.behaviour(mine, env)
+                except OSError as busy:
+                    # Another thread's child, forked while the copy was open, holds it for a moment.
+                    if busy.errno != errno.ETXTBSY:
+                        raise
+                    time.sleep(0.05)
+                    continue
                 if open(mine, "rb").read() == open(binary, "rb").read():
                     return ran
                 time.sleep(0.05)
