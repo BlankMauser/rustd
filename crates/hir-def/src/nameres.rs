@@ -435,12 +435,6 @@ impl<'db> ModuleScope<'db> {
         self.scope(db).get_legacy_macro(&name).map(Box::from)
     }
 
-    /// The visibility the module declares an enum with; depends on that only.
-    #[salsa::tracked]
-    fn declared_enum(self, db: &'db dyn SourceDatabase, id: crate::EnumId) -> Option<Visibility> {
-        self.scope(db).declared_enum(id)
-    }
-
     #[salsa::tracked(returns(ref))]
     fn traits(self, db: &'db dyn SourceDatabase) -> Box<[crate::TraitId]> {
         self.scope(db).traits().collect()
@@ -1015,20 +1009,6 @@ impl ModuleData {
             ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
                 .legacy_macro(db, name.clone())
                 .as_deref(),
-        }
-    }
-
-    /// The visibility this module declares an enum with, when it is the one declaring it.
-    pub(crate) fn declared_enum(
-        &self,
-        db: &dyn SourceDatabase,
-        id: crate::EnumId,
-    ) -> Option<Visibility> {
-        match &self.scope {
-            ScopeSlot::Building { scope, .. } => scope.declared_enum(id),
-            ScopeSlot::Collected(scope) => {
-                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*scope).declared_enum(db, id)
-            }
         }
     }
 

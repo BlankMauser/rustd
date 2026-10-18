@@ -24,8 +24,9 @@ sys.path.insert(0, HERE)
 from storelib import Checkout, Daemon, cache, files, scratch, stats, verify
 
 SIZE = 8 << 20
-# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB.
-ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 1 << 20]
+# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB
+# with Cranelift and 0.9 MB with LLVM.
+ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 768 << 10]
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
 NO_ROOM = "No space left on device"
 
@@ -122,6 +123,10 @@ def kept_again(checkout, disk):
     print(f"  room made: {numbers['packs']} packs with {numbers['records']} records kept, and found by the next daemon")
 
 
+# The remote is a directory of this user's, whose lists nobody signs.
+UNSIGNED = {"RUSTD_REMOTE_UNSIGNED": "1"}
+
+
 def commands(checkout, disk, work):
     """`rustd cache` on a full disk: pull fails cleanly, gc makes room."""
     remote = os.path.join(work, "remote")
@@ -132,15 +137,18 @@ def commands(checkout, disk, work):
     status, out = cache(disk.store, "gc", "--max", "0")
     if status != 0 or files(disk.store, ".pack"):
         fail(f"gc --max 0: {out}")
+    status, out = cache(disk.store, "pull", remote, env={"RUSTD_REMOTE_UNSIGNED": ""})
+    if status == 0 or "RUSTD_REMOTE_UNSIGNED=1" not in out or files(disk.store, ".pack"):
+        fail(f"pull from lists nobody signed was not refused: {out}")
     disk.leave(64 << 10)
-    status, out = cache(disk.store, "pull", remote)
+    status, out = cache(disk.store, "pull", remote, env=UNSIGNED)
     if status == 0 or NO_ROOM not in out:
         fail(f"pull into a full store did not fail with the reason: {out}")
     whole, _, verified = verify(disk.store)
     if not whole or files(disk.store, ".tmp"):
         fail(f"pull into a full store left something behind: {os.listdir(disk.store)}\n{verified}")
     os.remove(disk.ballast)
-    status, out = cache(disk.store, "pull", remote)
+    status, out = cache(disk.store, "pull", remote, env=UNSIGNED)
     whole, numbers, verified = verify(disk.store)
     if status != 0 or not whole or numbers["packs"] != packs:
         fail(f"pull with room: {out}\n{verified}")

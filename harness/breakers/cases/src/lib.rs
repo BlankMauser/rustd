@@ -63,6 +63,7 @@ cases![
     fragment_token,
     blanket_in_fn,
     lifetime_only_callee,
+    arg_frames,
     panic_columns,
     panic_column_width,
     panic_index_operand,
@@ -103,4 +104,7 @@ cases![
     fragment_edition_through_macro,
     let_else_drops,
     tail_tuple_drops,
+    promoted_constructor,
+    renamed_variant_pattern,
+    alias_under_binder,
 ];

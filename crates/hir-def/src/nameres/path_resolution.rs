@@ -445,7 +445,8 @@ impl DefMap {
         }
     }
 
-    /// The visibility an enum is declared with, in the module that declares it.
+    /// The visibility `e` is declared with. Its variants are that visible, even when the
+    /// path reached the enum through a more private import.
     fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
         let module = e.lookup(db).container;
         let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
@@ -453,7 +454,12 @@ impl DefMap {
         } else {
             &module.def_map(db).module(db, module)
         };
-        module_data.declared_enum(db, e)
+        let def = ModuleDefId::from(e);
+        module_data
+            .scope(db)
+            .types()
+            .find(|(_, item)| item.def == def && item.import.is_none())
+            .map(|(_, item)| item.vis)
     }
 
     fn resolve_remaining_segments<'a>(
@@ -527,12 +533,7 @@ impl DefMap {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
 
-                    // A variant is as visible as its enum, whatever the name the enum was
-                    // reached by: `use Enum::Variant` works through a private import of `Enum`.
-                    let vis = match curr.import {
-                        Some(_) => self.declared_enum_visibility(db, e).unwrap_or(curr.vis),
-                        None => curr.vis,
-                    };
+                    let vis = self.declared_enum_visibility(db, e).unwrap_or(curr.vis);
                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
                             PerNs::both(variant.into(), variant.into(), vis, None)
