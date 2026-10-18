@@ -1,6 +1,6 @@
 # Cargo's build model in rustd
 
-Branch `rustd-build-model`. The fourth round has `rustd-collate` at f191c6e42a
+Branch `rustd-build-model`. The fourth round has `rustd-collate` at 14ee89181b
 merged in (the third from 1547078a30, the second from 0151c01218). Linux x86-64, Rust 1.99.0,
 LLVM 20.
 
@@ -19,13 +19,16 @@ Measured with
     RUSTD_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
     RUSTD_BIN=... RUSTD_OPT=2 RUSTD_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
 
-Result: 104 of 104 as expected under Cranelift and 104 of 104 under LLVM, 0 WRONG. The two
-tables are the same but for the backend column: 99 supported and 5 refused. Of the 5, 2 are
+Result: 105 of 105 as expected under Cranelift and 105 of 105 under LLVM, 0 WRONG. The two
+tables are the same but for the backend column: 100 supported and 5 refused. Of the 5, 2 are
 projects cargo itself turns down and 3 are `lto` with rustc's own LTO link line (in a
 workspace, fat and thin, and in a program of one crate). The cases have 36 invalidation
-steps between them and all 36 come out the same as cargo's rebuild; none is refused. The
-third round ended at 100 cases; the fourth adds the two `lto` rows of a program of one
-crate, doctests of two members of a workspace and doctests with `--target`, and outside the
+steps between them that cargo has built for, and all 36 come out the same as cargo's
+rebuild. The case `overflow_checks_stale` has 4 steps more, of which the 2 asked with what
+cargo linked before an edit are refused, as they should be, and the 2 after cargo has built
+are the same. The third round ended at 100 cases; the fourth adds the two `lto` rows of a
+program of one crate, doctests of two members of a workspace, doctests with `--target`, the
+stale overflow evidence, and outside the
 table the doctests of 30 crates from crates.io, 30 of 30 the same as `cargo test --doc`
 under each backend.
 
@@ -49,7 +52,9 @@ feature that stops working, or a refusal that starts to pass, is seen.
 unification and the third S3 round (a6b6b5ede8, one conflict in
 `crates/hir-ty/src/mir/codegen.rs`, where each side had added a field to `ObjectCodegen`;
 both are kept), then 8f21942505 with the fuzzer (9cf4286511, no conflict), then f191c6e42a, which only adds
-the two files under `publish/` (34d3333c9d, no conflict; the gate was not run again for it). In `main.rs` the
+the two files under `publish/` (34d3333c9d, no conflict), then 14ee89181b with the security
+round, the second round of the cargo drop-in, the docs and the publish tooling (1b4047e6f4,
+conflicts in ten files, see below). In `main.rs` the
 third round's widening is kept over the second round's refusal as it had been resolved in
 `rustd-collate`; `Cargo.lock` is `rustd-collate`'s, which has the dependencies of the remote
 store. A unit test of `cargo/cli.rs` that still expected `--release`, a custom profile and
@@ -170,7 +175,10 @@ are fixed:
 - The daemon went by the objects of before the edit. It now refuses in such a program when
   a source that cargo's dep-info lists for a crate is newer than what rustc built of the
   crate, and says that cargo has to build first. Programs whose crates all check alike are
-  not affected: every copy behaves as every other.
+  not affected: every copy behaves as every other. A file a build script wrote under
+  `OUT_DIR` is compared by what is in it, not by when it was written: cargo runs a script
+  again without building the crate again when the script says the same, and going by the
+  time refused a `keys.py` case that was right.
 - After cargo had built again and the client named the new link, the daemon still had the
   symbols it read when it started. In such a program it now reads them again when the files
   are newer than its reading, and compiles the program from them.
@@ -179,6 +187,38 @@ The case has four steps under each backend: refused, the same once cargo has bui
 after the edit back, the same again. The steps that ask with the link of before are marked
 `"stale"` in `case.json`; every other step of the harness has cargo build first, which is
 why this was not seen before.
+
+### The merge of 14ee89181b
+
+The second round of the cargo drop-in and this branch had both taken release and custom
+profiles, feature flags and `RUSTFLAGS` away from cargo, each in its own way. What is kept:
+
+- `plan::Selection` stays the one notion of which build is meant. The drop-in's separate
+  fields of a worker (`features`, `packages`, `workspace`, `profile` and the rest) are
+  dropped for it, and `Invocation::selection` now carries the packages named with `-p` and
+  `--workspace`, which the drop-in had started to hand to the daemon.
+- `cargo/plan.rs` keeps this branch's rule that a crate built with LTO is cargo's when
+  `cargo rustd` runs cargo itself; the drop-in's new rule for test harnesses is kept as it
+  came.
+- The key of a store entry has both additions: each field written with its length (the
+  security round) and the program an entry is of when crates differ in `overflow-checks`
+  (this branch). The identity of such a program is made from the crates' content ids, which
+  the security round made 32 bytes; the tag of the key moved to `rustd entry 8`.
+- The drop-in now gives every cargo it runs the wrapper's variables, so that the cargo of
+  `cargo rustd test --doc` does not build the workspace a second time. rustd in rustdoc's
+  place saw those variables and took itself for the rustc wrapper; every doc test run ended
+  in "No such file or directory". `main` now tells the two apart by what cargo gives each:
+  rustc's path first to the wrapper, flags alone to rustdoc. `cargo_rustd.py` caught it (5
+  flag cases under each of cold, warm and edit).
+- `cargo_rustd.py` has both sides' cases. The program of its workspace prints three lines
+  for this branch's cases, so the checks of the daemon's life that compared its whole output
+  with one line now compare the first line.
+
+`selects.py` failed once in CI on `rustd-collate` (run 39086041463, LLVM leg) with two
+markers on one line: "build script of devdepbuild script of dep". The scripts wrote their
+line with `writeln!` to a file opened for appending, which is two writes, the text and then
+the newline (seen with `strace`), and cargo runs build scripts at the same time. The line
+is now written in one write. The selection itself was right.
 
 ## Third round
 
@@ -565,11 +605,16 @@ Inferred, not measured:
 ## Regression gate
 
 Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`
-from 9cf4286511 (the merge of `rustd-collate` 8f21942505), once with
-`RUSTD_BACKEND=cranelift` and once with `RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`, one
-after the other. The numbers were the same under both. The head of the branch differs from
-that binary only by a later merge of `rustd-collate` that adds the files under `publish/`
-and by this report.
+from the head of the branch (the merge of `rustd-collate` 14ee89181b and the fix of rustd in
+rustdoc's place after it), once with `RUSTD_BACKEND=cranelift` and once with
+`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`, one after the other. The numbers were the
+same under both.
+
+The Cranelift leg ran on the binary of the merge itself, where `cargo_rustd.py` and
+`doctests.py` failed on rustd taking itself for the rustc wrapper. Those two were run again
+under Cranelift on the fixed binary and pass; the other Cranelift rows are of the binary
+before the fix, which changes only which part of rustd answers when cargo runs it as
+rustdoc. The whole LLVM leg ran on the fixed binary.
 
 | command | result |
 |---|---|
@@ -577,7 +622,7 @@ and by this report.
 | `python3 backends.py corpus runner cases --bin runner --levels 2f` (LLVM leg) | the program prints the same as cargo's; LLVM produced 11801 of 11801 functions (100%) |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
-| `python3 breakers.py` | 58 of 58 right, 7 open, 0 functions skipped |
+| `python3 breakers.py` | 62 of 62 right, 7 open, 0 functions skipped |
 | `python3 unwinds.py` | 8 of 8 right |
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
@@ -585,21 +630,23 @@ and by this report.
 | `python3 worktrees.py` | 62 of 62 right |
 | `python3 keys.py` | 52 of 52 right, 0 open, 8 functions refused |
 | `python3 debuginfo.py` | all right |
-| `python3 buildmodel.py --backend <backend> --jobs 6` | 104 of 104 as expected, 0 WRONG (100 of 100 in the gate; the 4 new cases were run after it with the same binary) |
+| `python3 buildmodel.py --backend <backend> --jobs 6` | 105 of 105 as expected, 0 WRONG |
 | `python3 doctests.py` | 30 crates the same as `cargo test --doc`, 0 left to rustdoc, 0 WRONG |
 | `python3 storecorrupts.py` | PASS, 40 damaged stores detected, discarded and rebuilt |
 | `python3 storefull.py` | PASS, 6 full disks |
 | `python3 storekills.py` | PASS, 300 kills |
 | `python3 storeshared.py` | PASS, 180 builds on a shared store |
-| `python3 remote.py` (MinIO in `~/s3tools/minio`) | 91 of 91 right |
+| `python3 storeguards.py` | all right |
+| `python3 selects.py` | 3 of 3 right |
+| `python3 remote.py` (MinIO in `~/s3tools/minio`) | 117 of 117 right |
 | `python3 fuzz/fuzz.py smoke --backends <backend>` | 2 programs, 505 functions compiled by rustd, 0 differences, 0 crashes |
 | `python3 cargo_rustd.py --only-checks` | PASS |
 | `cargo fmt --all -- --check` | clean |
-| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 966 passed, 0 failed |
+| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 1021 passed, 0 failed |
 
 The open cases of `breakers.py` came with `rustd-collate` and are not of this work.
-`cargo_rustd.py` picks its own backend and was run without its timings of real projects.
-Clippy on `rustd` and `hir` has no warning in the lines this round touched.
+`cargo_rustd.py` was run without its timings of real projects. Clippy on `rustd` has no
+warning in the lines this round touched.
 
 ## The table
 
@@ -673,6 +720,7 @@ One row per case. "invalidation" is what each step of the case came to under one
 | `overflow-checks = false` in dev | `overflow_checks_off` | both | supported |  |  |
 | `overflow-checks = true` in release | `overflow_checks_on` | both | supported |  |  |
 | per-package `overflow-checks` | `overflow_checks_package` | both | supported |  |  |
+| `overflow-checks` of one package, and an edit that moves a function to where rustc compiles it in its callers | `overflow_checks_stale` | both | supported |  | the function becomes small, asked with what cargo linked before: refused (the crates of the program differ in `overflow-checks` and dep/src/lib.rs was written after rustc built it: which crate's copy of a function a call reaches is read from what rustc built, so cargo has to build first); cargo builds the small function, and the client asks with what it linked: same; the function becomes large again, asked with what cargo linked before: refused (the crates of the program differ in `overflow-checks` and dep/src/lib.rs was written after rustc built it: which crate's copy of a function a call reaches is read from what rustc built, so cargo has to build first); cargo builds the large function, and the client asks with what it linked: same |
 | `panic = "abort"` | `panic_abort` | both | supported |  |  |
 | `panic = "abort"` in release | `panic_abort_release` | both | supported |  |  |
 | `panic = "unwind"` (the default) | `panic_unwind` | both | supported |  |  |
