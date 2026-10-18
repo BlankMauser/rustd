@@ -129,6 +129,10 @@ struct ExpressionOnlyStore {
     /// to variables and have hygiene (some refer to items, we don't know at this stage).
     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
 
+    /// The edition of each block that a macro wrote: it is the macro's, not the one of the crate
+    /// that uses the macro.
+    block_editions: FxHashMap<ExprId, Edition>,
+
     /// Maps expression roots to their origin.
     ///
     /// Note: while every root expr is an inference root (aka. an `AnonConst`), there could be other roots that do not appear here.
@@ -268,6 +272,7 @@ pub struct ExpressionStoreBuilder {
     pub types: Arena<TypeRef>,
     block_scopes: Vec<BlockId>,
     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    block_editions: FxHashMap<ExprId, Edition>,
     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
@@ -352,6 +357,7 @@ impl ExpressionStoreBuilder {
             mut bindings,
             mut binding_owners,
             mut ident_hygiene,
+            mut block_editions,
             inference_roots: mut expr_roots,
             mut types,
             mut lifetimes,
@@ -379,6 +385,7 @@ impl ExpressionStoreBuilder {
         bindings.shrink_to_fit();
         binding_owners.shrink_to_fit();
         ident_hygiene.shrink_to_fit();
+        block_editions.shrink_to_fit();
         types.shrink_to_fit();
         lifetimes.shrink_to_fit();
 
@@ -423,6 +430,7 @@ impl ExpressionStoreBuilder {
                     binding_owners,
                     block_scopes: block_scopes.into_boxed_slice(),
                     ident_hygiene,
+                    block_editions,
                     expr_roots: expr_roots
                         .expect("should always finish with a `Some(_)` expr_roots"),
                 }))
@@ -675,7 +683,7 @@ impl ExpressionStore {
             Expr::OffsetOf(OffsetOf { container, fields: _ }) => visitor.on_type(*container),
             Expr::Path(path) => visitor.on_path(path),
             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
-            Expr::InlineAsm(InlineAsm { operands, options: _, kind: _ }) => {
+            Expr::InlineAsm(InlineAsm { operands, .. }) => {
                 operands.iter().for_each(|(_, op)| match op {
                     AsmOperand::In { expr, reg: _ }
                     | AsmOperand::Out { expr: Some(expr), late: _, reg: _ }
@@ -701,7 +709,7 @@ impl ExpressionStore {
             Expr::Block { statements, tail, id: _, label: _, unsafe_: _ } => {
                 for stmt in statements {
                     match stmt {
-                        Statement::Let { initializer, else_branch, pat, type_ref } => {
+                        Statement::Let { initializer, else_branch, pat, type_ref, is_super: _ } => {
                             visitor.on_expr_opt(*initializer);
                             visitor.on_expr_opt(*else_branch);
                             visitor.on_pat(*pat);
@@ -879,6 +887,11 @@ impl ExpressionStore {
 
     fn binding_hygiene(&self, binding: BindingId) -> HygieneId {
         self.assert_expr_only().bindings[binding].hygiene
+    }
+
+    /// The edition a block was written in, when a macro wrote it.
+    pub fn block_edition(&self, block: ExprId) -> Option<Edition> {
+        self.assert_expr_only().block_editions.get(&block).copied()
     }
 
     pub fn expr_path_hygiene(&self, expr: ExprId) -> HygieneId {

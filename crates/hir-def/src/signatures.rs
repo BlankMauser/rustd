@@ -1054,10 +1054,21 @@ pub struct InactiveEnumVariantCode {
     pub ast_id: span::FileAstId<ast::Variant>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EnumVariants {
     pub variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
 }
+
+// The order of the variants is part of the enum: discriminants and layout follow it. Two
+// `IndexMap`s with the same entries are equal whatever their order.
+impl PartialEq for EnumVariants {
+    fn eq(&self, other: &Self) -> bool {
+        self.variants.len() == other.variants.len()
+            && self.variants.iter().eq(other.variants.iter())
+    }
+}
+
+impl Eq for EnumVariants {}
 
 #[salsa::tracked]
 impl EnumVariants {

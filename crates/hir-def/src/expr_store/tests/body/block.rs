@@ -196,7 +196,7 @@ fn f() {
                 ),
                 block: Some(
                     BlockId(
-                        Id(781),
+                        Id(881),
                     ),
                 ),
                 containing_module_inside_def_map: None,

@@ -58,7 +58,10 @@ pub mod proc_macro;
 #[cfg(test)]
 mod tests;
 
-use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::{
+    hash::Hash,
+    ops::{Deref, DerefMut, Index, IndexMut},
+};
 
 use base_db::{Crate, SourceDatabase};
 use either::Either;
@@ -69,9 +72,10 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
-use syntax::{AstNode, SmolStr, SyntaxNode, ToSmolStr, ast};
+use syntax::{AstNode, SmolStr, SyntaxNode, TextSize, ToSmolStr, ast};
 use triomphe::Arc;
 use tt::TextRange;
 
@@ -101,10 +105,16 @@ fn enable_builtin_derive_fast_path() -> bool {
     ENABLE_BUILTIN_DERIVE_FAST_PATH.get()
 }
 
-#[inline(always)]
+/// Whether builtin derives are recorded instead of expanded. A code generator needs the bodies
+/// of the derived methods, so it turns this off before anything is analysed.
+#[cfg(not(test))]
+pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
 #[cfg(not(test))]
 fn enable_builtin_derive_fast_path() -> bool {
-    true
+    !EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const PREDEFINED_TOOLS: &[SmolStr] = &[
@@ -177,7 +187,7 @@ pub struct DefMap {
     block: Option<BlockInfo>,
     pub root: ModuleId,
     /// The modules and their data declared in this crate.
-    pub modules: ModulesMap,
+    modules: ModulesSlot,
     /// The prelude module for this crate. This either comes from an import
     /// marked with the `prelude_import` attribute, or (in the normal case) from
     /// a dependency (`std` or `core`).
@@ -195,8 +205,6 @@ pub struct DefMap {
     // FIXME: Figure out a better way for the IDE layer to resolve these?
     derive_helpers_in_scope:
         FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,
-    /// A mapping from [`hir_expand::MacroDefId`] to [`crate::MacroId`].
-    pub macro_def_to_macro_id: FxHashMap<ErasedAstId, MacroId>,
 
     /// The diagnostics that need to be emitted for this crate.
     diagnostics: Vec<DefDiagnostic>,
@@ -270,22 +278,6 @@ struct BlockInfo {
     block: BlockId,
     /// The containing module.
     parent: ModuleId,
-}
-
-impl std::ops::Index<ModuleIdLt<'_>> for DefMap {
-    type Output = ModuleData;
-
-    fn index(&self, id: ModuleIdLt<'_>) -> &ModuleData {
-        self.modules
-            .get(&unsafe { id.to_static() })
-            .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
-    }
-}
-
-impl std::ops::IndexMut<ModuleId> for DefMap {
-    fn index_mut(&mut self, id: ModuleId) -> &mut ModuleData {
-        &mut self.modules[id]
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -362,7 +354,7 @@ impl ModuleOrigin {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleData {
     /// Where does this module come from?
     pub origin: ModuleOrigin,
@@ -372,8 +364,89 @@ pub struct ModuleData {
     ///
     /// [`None`] for block modules because they are always its `DefMap`'s root.
     pub parent: Option<ModuleId>,
-    pub children: FxIndexMap<Name, ModuleId>,
-    pub scope: ItemScope,
+    scope: ScopeSlot,
+}
+
+/// The modules of a `DefMap`, held by the database on their own: a `DefMap` stays what it was
+/// when a module is added to it, and so does everything that was resolved through it.
+#[salsa::tracked]
+struct Modules<'db> {
+    root: ModuleIdLt<'db>,
+    #[tracked]
+    #[returns(ref)]
+    table: ModulesMap,
+}
+
+#[salsa::tracked]
+impl<'db> Modules<'db> {
+    /// One module of a collected `DefMap`. Depends on the modules there are, and is the same
+    /// for as long as the module is.
+    #[salsa::tracked(returns(ref))]
+    fn module(self, db: &'db dyn SourceDatabase, module: ModuleId) -> Option<ModuleData> {
+        self.table(db).get(&module).cloned()
+    }
+}
+
+impl ModulesSlot {
+    /// The modules of a `DefMap` that is being collected.
+    fn building(&mut self) -> &mut ModulesMap {
+        match self {
+            ModulesSlot::Building(modules) => modules,
+            ModulesSlot::Collected(_) => {
+                panic!("the modules of a collected `DefMap` are read-only")
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModulesSlot {
+    /// While the `DefMap` is being collected.
+    Building(ModulesMap),
+    /// A `Modules`, once it is.
+    Collected(salsa::Id),
+}
+
+/// The items of one module, held by the database on their own. A query that reads the scope of
+/// a module then depends on that scope and not on the whole `DefMap`, so adding an item to one
+/// module leaves what was resolved through the others alone.
+#[salsa::tracked]
+struct ModuleScope<'db> {
+    module: ModuleIdLt<'db>,
+    #[tracked]
+    #[returns(ref)]
+    scope: ItemScope,
+    #[tracked]
+    #[returns(ref)]
+    children: FxIndexMap<Name, ModuleId>,
+}
+
+#[salsa::tracked]
+impl<'db> ModuleScope<'db> {
+    /// What one name means in the module. Adding or removing another item leaves this equal,
+    /// so a query that only looked names up is not re-run.
+    #[salsa::tracked]
+    fn name(self, db: &'db dyn SourceDatabase, name: Name) -> PerNs {
+        self.scope(db).get(&name)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn legacy_macro(self, db: &'db dyn SourceDatabase, name: Name) -> Option<Box<[MacroId]>> {
+        self.scope(db).get_legacy_macro(&name).map(Box::from)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn traits(self, db: &'db dyn SourceDatabase) -> Box<[crate::TraitId]> {
+        self.scope(db).traits().collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeSlot {
+    /// While the `DefMap` is being collected.
+    Building { scope: Box<ItemScope>, children: FxIndexMap<Name, ModuleId> },
+    /// A `ModuleScope`, once it is.
+    Collected(salsa::Id),
 }
 
 #[inline]
@@ -418,8 +491,9 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
         module_data,
         None,
     );
-    let (def_map, local_def_map) =
+    let (mut def_map, local_def_map) =
         collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
+    def_map.hand_over_scopes(db);
 
     DefMapPair::new(db, def_map, local_def_map)
 }
@@ -444,12 +518,13 @@ pub fn block_def_map<'db>(db: &'db dyn SourceDatabase, block_id: BlockIdLt<'db>)
         Some(BlockInfo { block: block_id, parent: module }),
     );
 
-    let (def_map, _) = collector::collect_defs(
+    let (mut def_map, _) = collector::collect_defs(
         db,
         def_map,
         TreeId::new(ast_id.file_id, Some(block_id)),
         Some(local_def_map.local(db)),
     );
+    def_map.hand_over_scopes(db);
     def_map
 }
 
@@ -481,14 +556,13 @@ impl DefMap {
         DefMap {
             block,
             root,
-            modules,
+            modules: ModulesSlot::Building(modules),
             krate,
             prelude: None,
             macro_use_prelude: FxHashMap::default(),
             derive_helpers_in_scope: FxHashMap::default(),
             diagnostics: Vec::new(),
             data: crate_data,
-            macro_def_to_macro_id: FxHashMap::default(),
         }
     }
     fn shrink_to_fit(&mut self) {
@@ -503,17 +577,58 @@ impl DefMap {
             krate: _,
             prelude: _,
             data: _,
-            macro_def_to_macro_id,
         } = self;
 
-        macro_def_to_macro_id.shrink_to_fit();
         macro_use_prelude.shrink_to_fit();
         diagnostics.shrink_to_fit();
-        modules.shrink_to_fit();
         derive_helpers_in_scope.shrink_to_fit();
-        for (_, module) in modules.iter_mut() {
-            module.children.shrink_to_fit();
-            module.scope.shrink_to_fit();
+        if let ModulesSlot::Building(modules) = modules {
+            modules.shrink_to_fit();
+            for (_, module) in modules.iter_mut() {
+                module.children_mut().shrink_to_fit();
+                module.scope_mut().shrink_to_fit();
+            }
+        }
+    }
+
+    /// Hands the scope of every module to the database. Called once, when collection is done.
+    fn hand_over_scopes(&mut self, db: &dyn SourceDatabase) {
+        let ModulesSlot::Building(modules) = &mut self.modules else { return };
+        for (id, module) in modules.iter_mut() {
+            if let ScopeSlot::Building { scope, children } = &mut module.scope {
+                let scope = ModuleScope::new(
+                    db,
+                    id,
+                    std::mem::take(&mut **scope),
+                    std::mem::take(children),
+                );
+                module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
+            }
+        }
+        let modules = Modules::new(db, self.root, std::mem::replace(modules, ModulesMap::new()));
+        self.modules = ModulesSlot::Collected(salsa::plumbing::AsId::as_id(&modules));
+    }
+
+    /// One module of the `DefMap`; depends on that module only.
+    pub fn module<'a>(&'a self, db: &'a dyn SourceDatabase, id: ModuleIdLt<'_>) -> &'a ModuleData {
+        let id = unsafe { id.to_static() };
+        let found = match &self.modules {
+            ModulesSlot::Building(modules) => modules.get(&id),
+            ModulesSlot::Collected(modules) => {
+                <Modules<'a> as salsa::plumbing::FromId>::from_id(*modules).module(db, id).as_ref()
+            }
+        };
+        found
+            .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
+    }
+
+    /// Every module of the `DefMap`; depends on which there are.
+    fn table<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ModulesMap {
+        match &self.modules {
+            ModulesSlot::Building(modules) => modules,
+            ModulesSlot::Collected(id) => {
+                <Modules<'a> as salsa::plumbing::FromId>::from_id(*id).table(db)
+            }
         }
     }
 }
@@ -525,7 +640,7 @@ impl DefMap {
         db: &'a dyn SourceDatabase,
         file_id: FileId,
     ) -> impl Iterator<Item = ModuleId> + 'a {
-        self.modules
+        self.table(db)
             .iter()
             .filter(move |(_, data)| {
                 data.origin.file_id().map(|file_id| file_id.file_id(db)) == Some(file_id)
@@ -533,16 +648,20 @@ impl DefMap {
             .map(|(id, _)| id)
     }
 
-    pub fn modules(&self) -> impl Iterator<Item = (ModuleId, &ModuleData)> + '_ {
-        self.modules.iter()
+    pub fn modules<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+    ) -> impl Iterator<Item = (ModuleId, &'a ModuleData)> + 'a {
+        self.table(db).iter()
     }
 
     /// Returns all inline modules (mod name { ... }) in the crate that are associated with the given macro expansion.
-    pub fn inline_modules_for_macro_file(
-        &self,
+    pub fn inline_modules_for_macro_file<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
         file_id: MacroCallId,
-    ) -> impl Iterator<Item = ModuleId> + '_ {
-        self.modules
+    ) -> impl Iterator<Item = ModuleId> + 'a {
+        self.table(db)
             .iter()
             .filter(move |(_, data)| {
                 matches!(
@@ -616,8 +735,12 @@ impl DefMap {
 
     /// Returns the module containing `local_mod`, either the parent `mod`, or the module (or block) containing
     /// the block, if `self` corresponds to a block expression.
-    pub fn containing_module(&self, local_mod: ModuleIdLt<'_>) -> Option<ModuleId> {
-        match self[local_mod].parent {
+    pub fn containing_module(
+        &self,
+        db: &dyn SourceDatabase,
+        local_mod: ModuleIdLt<'_>,
+    ) -> Option<ModuleId> {
+        match self.module(db, local_mod).parent {
             Some(parent) => Some(parent),
             None => self.block.map(|BlockInfo { parent, .. }| parent),
         }
@@ -655,9 +778,10 @@ impl DefMap {
         ) {
             format_to!(buf, "{}\n", path);
 
-            map[module].scope.dump(db, buf);
+            map.module(db, module).scope(db).dump(db, buf);
 
-            for (name, child) in map[module].children.iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
+            for (name, child) in
+                map.module(db, module).children(db).iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
             {
                 let path = format!("{path}::{}", name.display(db, Edition::LATEST));
                 buf.push('\n');
@@ -749,6 +873,99 @@ impl DefMap {
     }
 }
 
+impl DefMap {
+    /// The `macro_rules!` that `name` is in the textual scope of `module`: the latest one of
+    /// this map, or the latest one an enclosing block defines before the block inside it.
+    pub(crate) fn legacy_macro_in_textual_scope<'db>(
+        &self,
+        db: &'db dyn SourceDatabase,
+        module: ModuleIdLt<'db>,
+        name: &Name,
+    ) -> Option<MacroId> {
+        if let Some(&latest) =
+            self.module(db, module).legacy_macro_in_scope(db, name).and_then(<[_]>::last)
+        {
+            return Some(latest);
+        }
+        let mut inner = self.block;
+        while let Some(BlockInfo { block, parent }) = inner {
+            let map = parent.def_map(db);
+            let defined =
+                map.module(db, parent).legacy_macro_in_scope(db, name).unwrap_or_default();
+            let visible = SourcePosition::latest_before(db, defined, block.ast_id(db).erase());
+            if visible.is_some() {
+                return visible;
+            }
+            inner = map.block;
+        }
+        None
+    }
+
+    /// The `macro_rules!` of `module` that a call at `call` names by `name`, when the module
+    /// defines one before the call. Items of a trait or an impl are collected after the
+    /// module is, when a later `macro_rules!` of the same name has joined the scope.
+    pub(crate) fn legacy_macro_before<'db>(
+        &self,
+        db: &'db dyn SourceDatabase,
+        module: ModuleIdLt<'db>,
+        name: &Name,
+        call: ErasedAstId,
+    ) -> Option<MacroId> {
+        let defined = self.module(db, module).legacy_macro_in_scope(db, name)?;
+        SourcePosition::latest_before(db, defined, call)
+    }
+}
+
+/// Where a node starts in its file and, inside a macro expansion, where each call that led
+/// to that expansion starts.
+struct SourcePosition(SmallVec<[(HirFileId, TextSize); 2]>);
+
+impl SourcePosition {
+    fn new(db: &dyn SourceDatabase, mut file: HirFileId, range: TextRange) -> Self {
+        let mut calls = SmallVec::from_iter([(file, range.start())]);
+        while let Some(call) = file.macro_file() {
+            let node = call.call_node(db);
+            file = node.file_id;
+            calls.push((file, node.value.text_range().start()));
+        }
+        SourcePosition(calls)
+    }
+
+    /// The last of `macros`, which are in definition order, that is defined before `node`.
+    fn latest_before(
+        db: &dyn SourceDatabase,
+        macros: &[MacroId],
+        node: ErasedAstId,
+    ) -> Option<MacroId> {
+        match macros {
+            [] => None,
+            [only] => Some(*only),
+            _ => {
+                let node = Self::new(db, node.file_id, node.to_range(db));
+                macros
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&it| Self::of_macro(db, it).is_none_or(|it| it.precedes(&node)))
+            }
+        }
+    }
+
+    fn of_macro(db: &dyn SourceDatabase, id: MacroId) -> Option<Self> {
+        let MacroId::MacroRulesId(id) = id else { return None };
+        let ast_id = id.lookup(db).id;
+        Some(Self::new(db, ast_id.file_id, ast_id.to_range(db)))
+    }
+
+    /// Whether this is before `other` in the innermost file both are in.
+    fn precedes(&self, other: &Self) -> bool {
+        let shared = self.0.iter().find_map(|(file, offset)| {
+            other.0.iter().find(|it| it.0 == *file).map(|it| *offset < it.1)
+        });
+        shared.unwrap_or(true)
+    }
+}
+
 impl ModuleData {
     pub(crate) fn new(
         origin: ModuleOrigin,
@@ -759,8 +976,84 @@ impl ModuleData {
             origin,
             visibility,
             parent,
-            children: Default::default(),
-            scope: ItemScope::default(),
+            scope: ScopeSlot::Building { scope: Box::default(), children: FxIndexMap::default() },
+        }
+    }
+
+    pub fn scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
+        match &self.scope {
+            ScopeSlot::Building { scope, .. } => scope,
+            ScopeSlot::Collected(id) => {
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
+            }
+        }
+    }
+
+    /// What `name` means in this module; depends on that name only.
+    pub fn name_in_scope(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
+        match &self.scope {
+            ScopeSlot::Building { scope, .. } => scope.get(name),
+            ScopeSlot::Collected(id) => {
+                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*id).name(db, name.clone())
+            }
+        }
+    }
+
+    pub(crate) fn legacy_macro_in_scope<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+        name: &Name,
+    ) -> Option<&'a [MacroId]> {
+        match &self.scope {
+            ScopeSlot::Building { scope, .. } => scope.get_legacy_macro(name),
+            ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
+                .legacy_macro(db, name.clone())
+                .as_deref(),
+        }
+    }
+
+    /// The traits in scope in this module; depends on those only.
+    pub fn traits_in_scope<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+    ) -> impl Iterator<Item = crate::TraitId> + 'a {
+        let (building, collected) = match &self.scope {
+            ScopeSlot::Building { scope, .. } => (Some(scope.traits()), None),
+            ScopeSlot::Collected(id) => (
+                None,
+                Some(
+                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
+                        .traits(db)
+                        .iter()
+                        .copied(),
+                ),
+            ),
+        };
+        building.into_iter().flatten().chain(collected.into_iter().flatten())
+    }
+
+    /// The modules declared in this one, by name.
+    pub fn children<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a FxIndexMap<Name, ModuleId> {
+        match &self.scope {
+            ScopeSlot::Building { children, .. } => children,
+            ScopeSlot::Collected(id) => {
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).children(db)
+            }
+        }
+    }
+
+    pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
+        match &mut self.scope {
+            ScopeSlot::Building { children, .. } => children,
+            ScopeSlot::Collected(_) => panic!("the children of a collected module are read-only"),
+        }
+    }
+
+    /// The scope of a module of the `DefMap` being collected.
+    pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
+        match &mut self.scope {
+            ScopeSlot::Building { scope, .. } => scope,
+            ScopeSlot::Collected(_) => panic!("the scope of a collected module is read-only"),
         }
     }
 
@@ -886,7 +1179,7 @@ fn sub_namespace_match(
 
 /// A newtype wrapper around `FxHashMap<ModuleId, ModuleData>` that implements `IndexMut`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct ModulesMap {
+pub(crate) struct ModulesMap {
     inner: FxIndexMap<ModuleId, ModuleData>,
 }
 

@@ -784,6 +784,9 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Type::InferType(_inner) => TypeRef::Placeholder,
             ast::Type::FnPtrType(inner) => {
+                // Taken before the parameters are lowered: a function pointer among them
+                // is not what the `for` is written on.
+                let binder = self.for_type_binder.take().map(|b| b.into());
                 let ret_ty = inner
                     .ret_type()
                     .and_then(|rt| rt.ty())
@@ -820,7 +823,6 @@ impl<'db> ExprCollector<'db> {
                 let abi = inner.abi().map(lower_abi).unwrap_or(ExternAbi::Rust);
                 params.push((None, ret_ty));
 
-                let binder = self.for_type_binder.take().map(|b| b.into());
                 TypeRef::Fn(Box::new(FnType {
                     is_varargs,
                     is_unsafe: inner.unsafe_token().is_some(),
@@ -1147,6 +1149,7 @@ impl<'db> ExprCollector<'db> {
                 type_ref: None,
                 initializer: Some(expr),
                 else_branch: None,
+                is_super: false,
             });
             self_param.user_written = child_binding_id;
         }
@@ -1191,6 +1194,7 @@ impl<'db> ExprCollector<'db> {
                     type_ref: None,
                     initializer: Some(expr),
                     else_branch: None,
+                    is_super: false,
                 });
             }
             let expr = self.alloc_expr_desugared(Expr::Path(name.clone().into()));
@@ -1202,6 +1206,7 @@ impl<'db> ExprCollector<'db> {
                 type_ref: None,
                 initializer: Some(expr),
                 else_branch: None,
+                is_super: false,
             });
 
             let parent_binding_id = self.alloc_binding(name, BindingAnnotation::Mutable, hygiene);
@@ -1628,7 +1633,12 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
             }
             ast::Expr::ParenExpr(e) => {
-                let inner = self.collect_expr_opt(e.expr());
+                // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
+                // those go with it.
+                let inner = match e.expr() {
+                    Some(inner) => self.maybe_collect_expr(inner)?,
+                    None => self.missing_expr(),
+                };
                 // make the paren expr point to the inner expression as well for IDE resolution
                 let src = self.expander.in_file(syntax_ptr);
                 self.store.expr_map.insert(src, inner.into());
@@ -1891,7 +1901,10 @@ impl<'db> ExprCollector<'db> {
                 }
             }
 
-            ast::Expr::Literal(e) => self.alloc_expr(Expr::Literal(e.kind().into()), syntax_ptr),
+            ast::Expr::Literal(e) => {
+                let literal = self.module_path_literal().unwrap_or_else(|| e.kind().into());
+                self.alloc_expr(Expr::Literal(literal), syntax_ptr)
+            }
             ast::Expr::IndexExpr(e) => {
                 let base = self.collect_expr_opt(e.base());
                 let index = self.collect_expr_opt(e.index());
@@ -1921,7 +1934,19 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::AsmExpr(e) => self.lower_inline_asm(e, syntax_ptr),
             ast::Expr::OffsetOfExpr(e) => {
                 let container = self.lower_type_ref_opt_disallow_impl_trait(e.ty());
-                let fields = e.fields().map(|it| it.as_name()).collect();
+                // A float token is two tuple indices: `0.1`.
+                let fields = e
+                    .fields()
+                    .flat_map(|it| match it.syntax().first_token() {
+                        Some(token) if token.kind() == syntax::SyntaxKind::FLOAT_NUMBER => token
+                            .text()
+                            .split('.')
+                            .filter_map(|index| index.parse().ok())
+                            .map(Name::new_tuple_field)
+                            .collect(),
+                        _ => vec![it.as_name()],
+                    })
+                    .collect();
                 self.alloc_expr(Expr::OffsetOf(OffsetOf { container, fields }), syntax_ptr)
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
@@ -2357,6 +2382,7 @@ impl<'db> ExprCollector<'db> {
                             type_ref: Some(type_ref),
                             initializer: Some(expr_id),
                             else_branch: None,
+                            is_super: false,
                         }]),
                         tail: Some(tail_expr),
                         label: None,
@@ -2607,6 +2633,32 @@ impl<'db> ExprCollector<'db> {
         self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
     }
 
+    /// The path of the module being lowered when the literal being lowered is what
+    /// `module_path!()` expanded to, which is a placeholder: the expander doesn't know modules.
+    fn module_path_literal(&self) -> Option<Literal> {
+        let call = self.expander.current_file_id().macro_file()?;
+        let hir_expand::MacroDefKind::BuiltIn(
+            _,
+            hir_expand::builtin::BuiltinFnLikeExpander::ModulePath,
+        ) = call.loc(self.db).def.kind
+        else {
+            return None;
+        };
+        let mut module = self.module;
+        let mut segments = Vec::new();
+        while let Some(parent) = module.containing_module(self.db) {
+            if !module.is_block_module(self.db) {
+                segments.push(module.name(self.db)?.symbol().as_str().to_owned());
+            }
+            // SAFETY: the module is of this database.
+            module = unsafe { parent.to_static() };
+        }
+        let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
+        segments.push(krate.crate_name().symbol().as_str().to_owned());
+        segments.reverse();
+        Some(Literal::String(Symbol::intern(&segments.join("::"))))
+    }
+
     fn collect_macro_call<T, U>(
         &mut self,
         mcall: ast::MacroCall,
@@ -2619,14 +2671,27 @@ impl<'db> ExprCollector<'db> {
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
 
-        let block_call = self.def_map.modules[self.module].scope.macro_invoc(
+        let block_call = self.def_map.module(self.db, self.module).scope(self.db).macro_invoc(
             self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
         );
         let res = match block_call {
             // fast path, macro call is in a block module
             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
             None => {
-                let resolver = |path: &_| {
+                let resolver = |path: &ModPath| {
+                    // The latest `macro_rules!` of that name before the call, which is not
+                    // the last one of the block when a later statement defines it again.
+                    let shadowing = path.as_ident().and_then(|name| {
+                        let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
+                        let defs = self
+                            .def_map
+                            .module(self.db, self.def_map.root)
+                            .legacy_macro_in_scope(self.db, name)?;
+                        defs.get(seen.checked_sub(1)?).copied()
+                    });
+                    if shadowing.is_some() {
+                        return shadowing;
+                    }
                     self.def_map
                         .resolve_path(
                             self.local_def_map,
@@ -2705,7 +2770,9 @@ impl<'db> ExprCollector<'db> {
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
-                None => None,
+                // What does not expand is not nothing: a block that ends in it has its type,
+                // not `()`.
+                None => Some(this.alloc_expr(Expr::Missing, syntax_ptr)),
             },
         );
         expansion.inspect(|&tail| {
@@ -2729,7 +2796,14 @@ impl<'db> ExprCollector<'db> {
                     .let_else()
                     .and_then(|let_else| let_else.block_expr())
                     .map(|block| self.collect_block(block));
-                statements.push(Statement::Let { pat, type_ref, initializer, else_branch });
+                let is_super = stmt.super_token().is_some();
+                statements.push(Statement::Let {
+                    pat,
+                    type_ref,
+                    initializer,
+                    else_branch,
+                    is_super,
+                });
             }
             ast::Stmt::ExprStmt(stmt) => {
                 let expr = stmt.expr();
@@ -2752,8 +2826,11 @@ impl<'db> ExprCollector<'db> {
                     return;
                 };
                 let name = name.as_name();
-                let macro_id =
-                    self.def_map.modules[self.def_map.root].scope.get(&name).take_macros();
+                let macro_id = self
+                    .def_map
+                    .module(self.db, self.def_map.root)
+                    .name_in_scope(self.db, &name)
+                    .take_macros();
                 self.collect_macro_def(statements, macro_id);
             }
             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
@@ -2767,9 +2844,10 @@ impl<'db> ExprCollector<'db> {
                 let name = name.as_name();
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name.clone()).or_insert(0);
-                let macro_id = self.def_map.modules[self.def_map.root]
-                    .scope
-                    .get_legacy_macro(&name)
+                let macro_id = self
+                    .def_map
+                    .module(self.db, self.def_map.root)
+                    .legacy_macro_in_scope(self.db, &name)
                     .and_then(|it| it.get(*macro_defs_count))
                     .copied();
                 *macro_defs_count += 1;
@@ -2822,7 +2900,11 @@ impl<'db> ExprCollector<'db> {
             };
         let prev_def_map = mem::replace(&mut self.def_map, def_map);
         let prev_local_module = mem::replace(&mut self.module, module);
-        let prev_legacy_macros_count = mem::take(&mut self.current_block_legacy_macro_defs_count);
+        // A block without items of its own is still in the scope the count is of.
+        let prev_legacy_macros_count = match block_id {
+            Some(_) => mem::take(&mut self.current_block_legacy_macro_defs_count),
+            None => self.current_block_legacy_macro_defs_count.clone(),
+        };
 
         let mut statements = Vec::new();
         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));
@@ -2839,9 +2921,17 @@ impl<'db> ExprCollector<'db> {
             None
         });
 
+        let written_in = block
+            .stmt_list()
+            .and_then(|it| it.l_curly_token())
+            .map(|it| self.expander.ctx_for_range(it.text_range()))
+            .filter(|it| !it.is_root());
         let syntax_node_ptr = AstPtr::new(&block.into());
         let expr = mk_block(self, block_id, statements.into_boxed_slice(), tail);
         let expr_id = self.alloc_expr(expr, syntax_node_ptr);
+        if let Some(written_in) = written_in {
+            self.store.block_editions.insert(expr_id, written_in.edition(self.db));
+        }
 
         self.def_map = prev_def_map;
         self.module = prev_local_module;

@@ -46,8 +46,8 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
         return None;
     }
 
-    for (_, module_data) in crate_def_map.modules() {
-        for impl_def in module_data.scope.inherent_impls() {
+    for (_, module_data) in crate_def_map.modules(db) {
+        for impl_def in module_data.scope(db).inherent_impls() {
             lang_items.collect_lang_item(db, impl_def);
             for &(_, assoc) in impl_def.impl_items(db).items.iter() {
                 match assoc {
@@ -58,7 +58,7 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
             }
         }
 
-        for def in module_data.scope.declarations() {
+        for def in module_data.scope(db).declarations() {
             match def {
                 ModuleDefId::TraitId(trait_) => {
                     lang_items.collect_lang_item(db, trait_);
@@ -155,19 +155,20 @@ fn resolve_core_trait(
     modules: &[Symbol],
     name: Symbol,
 ) -> Option<TraitId> {
-    let mut current = &core_def_map[core_def_map.root];
+    let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope.type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
         else {
             return None;
         };
         if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
             return None;
         }
-        current = &core_def_map[cur];
+        current = core_def_map.module(db, cur);
     }
-    let Some((ModuleDefId::TraitId(trait_), _)) = current.scope.type_(&Name::new_symbol_root(name))
+    let Some((ModuleDefId::TraitId(trait_), _)) =
+        current.scope(db).type_(&Name::new_symbol_root(name))
     else {
         return None;
     };
@@ -180,19 +181,19 @@ fn resolve_core_macro(
     modules: &[Symbol],
     name: Symbol,
 ) -> Option<MacroId> {
-    let mut current = &core_def_map[core_def_map.root];
+    let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope.type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
         else {
             return None;
         };
         if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
             return None;
         }
-        current = &core_def_map[cur];
+        current = core_def_map.module(db, cur);
     }
-    current.scope.makro(&Name::new_symbol_root(name))
+    current.scope(db).makro(&Name::new_symbol_root(name))
 }
 
 impl LangItems {
@@ -323,8 +324,8 @@ pub fn crate_notable_traits(db: &dyn SourceDatabase, krate: Crate) -> Option<Box
 
     let crate_def_map = crate_def_map(db, krate);
 
-    for (_, module_data) in crate_def_map.modules() {
-        for def in module_data.scope.declarations() {
+    for (_, module_data) in crate_def_map.modules(db) {
+        for def in module_data.scope(db).declarations() {
             if let ModuleDefId::TraitId(trait_) = def
                 && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
             {
@@ -578,6 +579,7 @@ language_item_table! { LangItems =>
     ExchangeMalloc,          sym::exchange_malloc,     FunctionId;
     BoxFree,                 sym::box_free,            FunctionId;
     DropInPlace,             sym::drop_in_place,       FunctionId;
+    DropGlue,                sym::drop_glue,           FunctionId;
     AllocLayout,             sym::alloc_layout,        StructId;
 
     Start,                   sym::start,               FunctionId;

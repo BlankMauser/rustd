@@ -13,8 +13,8 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let mut fn_def = None;
-    'outer: for (_, module) in def_map.modules() {
-        for decl in module.scope.declarations() {
+    'outer: for (_, module) in def_map.modules(&db) {
+        for decl in module.scope(&db).declarations() {
             if let ModuleDefId::FunctionId(it) = decl {
                 fn_def = Some(it);
                 break 'outer;
@@ -33,8 +33,8 @@ fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let mut fn_def = None;
-    'outer: for (_, module) in def_map.modules() {
-        for decl in module.scope.declarations() {
+    'outer: for (_, module) in def_map.modules(&db) {
+        for decl in module.scope(&db).declarations() {
             if let ModuleDefId::FunctionId(it) = decl {
                 fn_def = Some(it);
                 break 'outer;
@@ -157,6 +157,21 @@ mod m {
     }
 }
 "#,
+    );
+}
+
+#[test]
+fn unresolved_macro_at_the_end_of_a_block_is_missing() {
+    pretty_print(
+        r#"
+fn main() -> u8 {
+    nothing_of_this_name!()
+}
+"#,
+        expect![[r#"
+            fn main() {
+                �
+            }"#]],
     );
 }
 
@@ -478,6 +493,32 @@ const fn f(x: i32) -> i32 {
         }
         _ => {}
     }
+}
+
+#[test]
+fn three_dot_range_pattern_is_inclusive() {
+    let (db, body) = lower(
+        r#"
+fn f(x: char) -> bool {
+    match x {
+        'a'...'z' => true,
+        _ => false,
+    }
+}"#,
+    );
+
+    let body = Body::of(&db, body);
+    let ranges = body.assert_expr_only().pats.iter().filter(|(_, pat)| {
+        matches!(
+            pat,
+            Pat::Range {
+                start: Some(_),
+                end: Some(_),
+                range_type: syntax::ast::RangeOp::Inclusive
+            }
+        )
+    });
+    assert_eq!(ranges.count(), 1);
 }
 
 #[test]

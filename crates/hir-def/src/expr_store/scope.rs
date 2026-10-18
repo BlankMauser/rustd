@@ -311,7 +311,7 @@ impl ExprScopeVisitor<'_> {
 
             for stmt in statements {
                 match stmt {
-                    Statement::Let { pat, initializer, else_branch, type_ref } => {
+                    Statement::Let { pat, initializer, else_branch, type_ref, .. } => {
                         this.on_type_opt(*type_ref);
                         this.on_expr_opt(*initializer);
                         this.on_expr_opt(*else_branch);
@@ -419,7 +419,7 @@ mod tests {
         let crate_def_map = crate_def_map(db, krate);
 
         let module = crate_def_map.modules_for_file(db, file_id).next().unwrap();
-        let (_, def) = crate_def_map[module].scope.entries().next().unwrap();
+        let (_, def) = crate_def_map.module(db, module).scope(db).entries().next().unwrap();
         match def.take_values().unwrap() {
             ModuleDefId::FunctionId(it) => it,
             _ => panic!(),

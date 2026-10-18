@@ -121,7 +121,7 @@ impl PerNsGlobImports {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ItemScope {
     /// Defs visible in this scope. This includes `declarations`, but also
     /// imports. The imports belong to this module and can be resolved by using them on
@@ -171,7 +171,7 @@ pub struct ItemScope {
     derive_macros: FxHashMap<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeriveMacroInvocation {
     attr_id: AttrId,
     /// The `#[derive]` call
@@ -244,7 +244,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope;
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(ModuleDefId::MacroId(def)) => {
@@ -259,7 +259,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope;
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(def) => {
@@ -274,7 +274,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    scope = &module_id.def_map(db)[module_id].scope;
+                    scope = module_id.def_map(db).module(db, module_id).scope(db);
                     import = i;
                 }
                 ImportOrDef::Def(def) => {
@@ -338,6 +338,16 @@ impl ItemScope {
 
     pub fn unnamed_consts(&self) -> impl Iterator<Item = ConstId> + '_ {
         self.unnamed_consts.iter().copied()
+    }
+
+    /// Every const of the module, named or not. An impl in the block of any of them is an impl
+    /// of the crate.
+    pub fn consts(&self) -> impl Iterator<Item = ConstId> + '_ {
+        let named = self.declarations.iter().filter_map(|&def| match def {
+            ModuleDefId::ConstId(konst) => Some(konst),
+            _ => None,
+        });
+        self.unnamed_consts().chain(named)
     }
 
     /// Iterate over all legacy textual scoped macros visible at the end of the module

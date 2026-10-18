@@ -58,8 +58,8 @@ fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let errors = def_map
-        .modules()
-        .flat_map(|module| module.1.scope.all_macro_calls())
+        .modules(&db)
+        .flat_map(|module| module.1.scope(&db).all_macro_calls())
         .filter_map(|macro_call| {
             let errors = macro_call.parse_macro_expansion_error(&db)?;
             let errors = errors.err.as_ref()?.render_to_string(&db);
@@ -109,7 +109,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
     let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
-    let source = def_map[def_map.root].definition_source(&db);
+    let source = def_map.module(&db, def_map.root).definition_source(&db);
     let source_file = match source.value {
         ModuleSource::SourceFile(it) => it,
         ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),
@@ -186,7 +186,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         expanded_text.replace_range(range, &text);
     }
 
-    for decl_id in def_map[def_map.root].scope.declarations() {
+    for decl_id in def_map.module(&db, def_map.root).scope(&db).declarations() {
         // FIXME: I'm sure there's already better way to do this
         let src = match decl_id {
             ModuleDefId::AdtId(AdtId::StructId(struct_id)) => {
@@ -222,7 +222,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
     }
 
-    for (_, module) in def_map.modules() {
+    for (_, module) in def_map.modules(&db) {
         let Some(src) = module.declaration_source(&db) else {
             continue;
         };
@@ -237,7 +237,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
     }
 
-    for impl_id in def_map[def_map.root].scope.impls() {
+    for impl_id in def_map.module(&db, def_map.root).scope(&db).impls() {
         let src = impl_id.lookup(&db).source(&db);
         if let Some(macro_file) = src.file_id.macro_file()
             && let MacroKind::DeriveBuiltIn | MacroKind::Derive = macro_file.kind(&db)
@@ -264,9 +264,12 @@ fn resolve_macro_call_id(
     ast_id: AstId<ast::MacroCall>,
     ast_ptr: InFile<AstPtr<ast::MacroCall>>,
 ) -> Option<MacroCallId> {
-    def_map.modules().find_map(|module| {
-        for decl in
-            module.1.scope.declarations().chain(module.1.scope.unnamed_consts().map(Into::into))
+    def_map.modules(db).find_map(|module| {
+        for decl in module
+            .1
+            .scope(db)
+            .declarations()
+            .chain(module.1.scope(db).unnamed_consts().map(Into::into))
         {
             let body = match decl {
                 ModuleDefId::FunctionId(it) => it.into(),
@@ -286,7 +289,7 @@ fn resolve_macro_call_id(
                 return Some(res);
             }
         }
-        module.1.scope.macro_invoc(ast_id)
+        module.1.scope(db).macro_invoc(ast_id)
     })
 }
 
@@ -459,7 +462,7 @@ m!(g);
     let (db, file_id) = TestDB::with_single_file(fixture);
     let krate = db.test_crate();
     let def_map = crate_def_map(&db, krate);
-    let source = def_map[def_map.root].definition_source(&db);
+    let source = def_map.module(&db, def_map.root).definition_source(&db);
     let source_file = match source.value {
         ModuleSource::SourceFile(it) => it,
         ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),

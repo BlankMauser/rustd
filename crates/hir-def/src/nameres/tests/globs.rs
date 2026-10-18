@@ -490,3 +490,72 @@ use reexport_2::*;
         "#]],
     );
 }
+
+#[test]
+fn variant_alias_reexported() {
+    check(
+        r#"
+//- /lib.rs
+mod index {
+    pub enum MinusPlusIndex { Minus, Plus }
+}
+mod panels {
+    use super::index::*;
+    pub use super::index::MinusPlusIndex as PanelSide;
+    pub use MinusPlusIndex::Minus as Left;
+    pub use MinusPlusIndex::Plus as Right;
+}
+use panels::{Left, Right};
+"#,
+        expect![[r#"
+            crate
+            - Left : type (import) value (import)
+            - Right : type (import) value (import)
+            - index : type
+            - panels : type
+
+            crate::index
+            - MinusPlusIndex : type
+
+            crate::panels
+            - Left : type (import) value (import)
+            - MinusPlusIndex : type (glob)
+            - PanelSide : type (import)
+            - Right : type (import) value (import)
+        "#]],
+    );
+}
+
+#[test]
+fn variant_reexported_through_private_enum_import() {
+    check(
+        r#"
+mod minusplus {
+    pub enum Index { Minus, Plus }
+}
+mod sides {
+    use super::minusplus::Index;
+    pub use Index::Minus as Left;
+}
+mod numbers {
+    use super::sides::Left;
+}
+"#,
+        expect![[r#"
+            crate
+            - minusplus : type
+            - numbers : type
+            - sides : type
+
+            crate::minusplus
+            - Index : type
+
+            crate::numbers
+            - Left : type (import) value (import)
+
+            crate::sides
+            - Index : type (import)
+            - Left : type (import) value (import)
+        "#]],
+    );
+}

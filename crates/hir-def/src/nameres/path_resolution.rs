@@ -20,7 +20,7 @@ use span::Edition;
 use stdx::TupleExt;
 
 use crate::{
-    AdtId, ModuleDefId, ModuleId,
+    AdtId, EnumId, Lookup, ModuleDefId, ModuleId,
     item_scope::{BUILTIN_SCOPE, ImportOrExternCrate},
     nameres::{
         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, assoc::TraitItems,
@@ -318,7 +318,7 @@ impl DefMap {
                 for _ in 0..lvl {
                     // Loop invariant: at the beginning of each loop, `local_id` must refer to a
                     // non-block module.
-                    if let Some(parent) = def_map.modules[local_id].parent {
+                    if let Some(parent) = def_map.module(db, local_id).parent {
                         (def_map, local_id) =
                             adjust_to_nearest_non_block_module(db, def_map, parent);
                     } else {
@@ -445,6 +445,23 @@ impl DefMap {
         }
     }
 
+    /// The visibility `e` is declared with. Its variants are that visible, even when the
+    /// path reached the enum through a more private import.
+    fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
+        let module = e.lookup(db).container;
+        let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
+            &self.module(db, module)
+        } else {
+            &module.def_map(db).module(db, module)
+        };
+        let def = ModuleDefId::from(e);
+        module_data
+            .scope(db)
+            .types()
+            .find(|(_, item)| item.def == def && item.import.is_none())
+            .map(|(_, item)| item.vis)
+    }
+
     fn resolve_remaining_segments<'a>(
         &self,
         db: &dyn SourceDatabase,
@@ -504,23 +521,24 @@ impl DefMap {
                     }
 
                     let module_data = if module.block(db) == self.block_id() {
-                        &self[module]
+                        &self.module(db, module)
                     } else {
-                        &module.def_map(db)[module]
+                        &module.def_map(db).module(db, module)
                     };
 
                     // Since it is a qualified path here, it should not contains legacy macros
-                    module_data.scope.get(segment)
+                    module_data.name_in_scope(db, segment)
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
 
+                    let vis = self.declared_enum_visibility(db, e).unwrap_or(curr.vis);
                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
-                            PerNs::both(variant.into(), variant.into(), curr.vis, None)
+                            PerNs::both(variant.into(), variant.into(), vis, None)
                         } else {
-                            PerNs::types(variant.into(), curr.vis, None)
+                            PerNs::types(variant.into(), vis, None)
                         }
                     });
                     // FIXME: Need to filter visibility here and below? Not sure.
@@ -634,15 +652,16 @@ impl DefMap {
         //  - current module / scope
         //  - extern prelude / macro_use prelude
         //  - std prelude
-        let from_legacy_macro = self[module]
-            .scope
-            .get_legacy_macro(name)
+        let from_legacy_macro = self
+            .module(db, module)
+            .legacy_macro_in_scope(db, name)
             // FIXME: shadowing
             .and_then(|it| it.last())
             .copied()
             .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
             .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None));
-        let from_scope = self[module].scope.get(name).filter_macro(db, expected_macro_subns);
+        let from_scope =
+            self.module(db, module).name_in_scope(db, name).filter_macro(db, expected_macro_subns);
         let from_builtin = match self.block {
             Some(_) => {
                 // Only resolve to builtins in the root `DefMap`.
@@ -727,9 +746,9 @@ impl DefMap {
         let from_crate_root = match self.block {
             Some(_) => {
                 let def_map = self.crate_root(db).def_map(db);
-                def_map[def_map.root].scope.get(name)
+                def_map.module(db, def_map.root).name_in_scope(db, name)
             }
-            None => self[self.root].scope.get(name),
+            None => self.module(db, self.root).name_in_scope(db, name),
         };
         let from_extern_prelude = || {
             if self.block.is_some() && module == self.root {
@@ -745,7 +764,7 @@ impl DefMap {
     fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
         if let Some((prelude, _use)) = self.prelude {
             let def_map = if prelude.krate(db) == self.krate { self } else { prelude.def_map(db) };
-            def_map[prelude].scope.get(name)
+            def_map.module(db, prelude).name_in_scope(db, name)
         } else {
             PerNs::none()
         }

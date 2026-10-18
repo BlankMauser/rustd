@@ -23,6 +23,7 @@ use either::Either;
 use hir_expand::{
     InFile, Lookup,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
+    mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
@@ -32,7 +33,7 @@ use rustc_abi::ReprOptions;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, T,
+    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
     ast::{self, HasAttrs, TokenTreeChildren},
 };
 use tt::TextSize;
@@ -160,6 +161,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
             match second_segment {
                 None => match &*first_segment {
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
+                    "inline" if !tt.syntax().text().contains_char('n') => {
+                        attr_flags.insert(AttrFlags::IS_INLINE)
+                    }
                     "doc" => extract_doc_tt_attr(attr_flags, tt),
                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
@@ -189,6 +193,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rust_analyzer" => match &*second_segment {
                         "completions" => extract_ra_completions(attr_flags, tt),
                         "macro_style" => extract_ra_macro_style(attr_flags, tt),
+                        "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
                         _ => {}
                     },
                     _ => {}
@@ -229,11 +234,21 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rustc_paren_sugar" => attr_flags.insert(AttrFlags::RUSTC_PAREN_SUGAR),
                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
+                    "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
+                    "rustc_pass_indirectly_in_non_rustic_abis" => {
+                        attr_flags.insert(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+                    }
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
+                    "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
+                    "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
+                    "rustc_inherit_overflow_checks" => {
+                        attr_flags.insert(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+                    }
+                    "thread_local" => attr_flags.insert(AttrFlags::THREAD_LOCAL),
                     "pointee" => attr_flags.insert(AttrFlags::IS_POINTEE),
                     "non_exhaustive" => attr_flags.insert(AttrFlags::NON_EXHAUSTIVE),
                     "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
@@ -353,6 +368,15 @@ bitflags::bitflags! {
         const DIAGNOSTIC_DO_NOT_RECOMMEND = 1 << 51;
 
         const HAS_RUSTC_MUST_IMPLEMENT_ONE_OF = 1 << 52;
+
+        const TRACK_CALLER = 1 << 53;
+        const THREAD_LOCAL = 1 << 54;
+        const RUSTC_PROMOTABLE = 1 << 55;
+        const HAS_DEFINE_OPAQUE = 1 << 56;
+        const RUSTC_INHERIT_OVERFLOW_CHECKS = 1 << 57;
+        const RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 58;
+        /// `#[inline]` or `#[inline(always)]`: the crates that use the function compile it.
+        const IS_INLINE = 1 << 59;
     }
 }
 
@@ -417,7 +441,7 @@ fn attrs_source(
         AttrDefId::ModuleId(id) => {
             let def_map = id.def_map(db);
             let krate = def_map.krate();
-            let (definition, declaration, extra_crate_attrs) = match def_map[id].origin {
+            let (definition, declaration, extra_crate_attrs) = match def_map.module(db, id).origin {
                 ModuleOrigin::CrateRoot { definition } => {
                     let definition_source = definition.parse(db).tree();
                     let definition = InFile::new(definition.into(), definition_source.into());
@@ -502,6 +526,23 @@ fn collect_attrs<BreakValue>(
         || cfg_options.get_or_insert_with(|| krate.cfg_options(db)),
         move |meta, _| callback(meta),
     )
+}
+
+/// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
+/// rustc expands the expression of a key-value attribute before it reads it
+/// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
+fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    let (source, _, _, krate) = attrs_source(db, owner);
+    let value = collect_attrs(db, owner, |attr| match attr {
+        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name) => match attr.expr() {
+            Some(value) => ControlFlow::Break(value),
+            None => ControlFlow::Continue(()),
+        },
+        _ => ControlFlow::Continue(()),
+    })?;
+    let resolver = resolver_for_attr_def_id(db, owner);
+    let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
+    Some(Symbol::intern(&value))
 }
 
 fn collect_field_attrs<T>(
@@ -735,6 +776,18 @@ impl AttrFlags {
     #[inline]
     pub fn lang_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
         AttrFlags::query(db, owner).lang_item_with_attrs(db, owner)
+    }
+
+    /// The symbol a foreign item is declared to link against, if it is not its own name.
+    #[salsa::tracked(returns(clone))]
+    pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        symbol_attr(db, owner, "link_name")
+    }
+
+    /// The symbol `#[export_name]` gives an item.
+    #[salsa::tracked(returns(clone))]
+    pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        symbol_attr(db, owner, "export_name")
     }
 
     #[inline]
@@ -1222,6 +1275,57 @@ impl AttrFlags {
         }
     }
 
+    /// The type aliases a function names in `#[define_opaque(..)]`, which has expanded to
+    /// `#[rust_analyzer::define_opaque(..)]` by now.
+    pub fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> &[ModPath] {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_DEFINE_OPAQUE) {
+            return &[];
+        }
+        return define_opaque(db, owner);
+
+        #[salsa::tracked(returns(deref))]
+        fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> Box<[ModPath]> {
+            let mut result = Vec::new();
+            collect_attrs::<Infallible>(db, owner.into(), |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && attr
+                        .path()
+                        .as_up_to_two_segment()
+                        .is_some_and(|(_, tool)| tool.is_some_and(|it| it == "define_opaque"))
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let tokens = TokenTreeChildren::new(&tt)
+                        .filter_map(NodeOrToken::into_token)
+                        .collect_vec();
+                    for path in tokens.split(|it| it.kind() == T![,]) {
+                        let mut kind = PathKind::Plain;
+                        let mut segments = Vec::new();
+                        for token in path {
+                            match token.kind() {
+                                T![crate] => kind = PathKind::Crate,
+                                T![self] => kind = PathKind::SELF,
+                                T![super] => {
+                                    kind = match kind {
+                                        PathKind::Super(n) => PathKind::Super(n + 1),
+                                        _ => PathKind::Super(1),
+                                    }
+                                }
+                                SyntaxKind::IDENT => segments
+                                    .push(Name::new_symbol_root(Symbol::intern(token.text()))),
+                                _ => {}
+                            }
+                        }
+                        if !segments.is_empty() {
+                            result.push(ModPath::from_segments(kind, segments));
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+            result.into_boxed_slice()
+        }
+    }
+
     pub fn must_implement_one_of(db: &dyn SourceDatabase, owner: TraitId) -> Option<&[Name]> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_RUSTC_MUST_IMPLEMENT_ONE_OF)
         {
@@ -1283,7 +1387,7 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
         if !ident.kind().is_any_identifier() {
             continue;
         }
-        let repr = match ident.text() {
+        let repr = match ident.text().trim_start_matches("r#") {
             "packed" => {
                 let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
                     let tt = tt.clone();

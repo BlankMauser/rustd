@@ -480,8 +480,24 @@ pub struct OffsetOf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
+    /// What to assemble, the template strings joined by newlines. `None` when a string could
+    /// not be read or names an operand that is not there.
+    pub template: Option<Box<[AsmPiece]>>,
     pub options: AsmOptions,
     pub kind: InlineAsmKind,
+    /// The template is nothing but assembler comments, so the block emits no instructions.
+    /// Crates use this as an optimization barrier.
+    pub comment_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AsmPiece {
+    Lit(Box<str>),
+    /// The operand at `index`, written as its `modifier` says: `{0:e}`.
+    Operand {
+        index: usize,
+        modifier: Option<char>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -678,6 +694,8 @@ pub enum Statement {
         type_ref: Option<TypeRefId>,
         initializer: Option<ExprId>,
         else_branch: Option<ExprId>,
+        /// `super let`: the binding lives as long as the value of the block it is in.
+        is_super: bool,
     },
     Expr {
         expr: ExprId,

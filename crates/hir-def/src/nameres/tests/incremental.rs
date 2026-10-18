@@ -299,6 +299,8 @@ fn f() { foo }
                 "HirFileId::ast_id_map_",
                 "EditionedFileId::parse_",
                 "real_span_map",
+                "Modules < 'db >::module_",
+                "ModuleScope < 'db >::name_",
                 "MacroId::definition_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map_",
@@ -435,6 +437,8 @@ pub struct S {}
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
                 "MacroCallId::macro_arg_",
+                "Modules < 'db >::module_",
+                "ModuleScope < 'db >::name_",
                 "MacroId::definition_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map_",
@@ -514,9 +518,11 @@ m!(Z);
         &db,
         || {
             let crate_def_map = crate_def_map(&db, krate);
-            let module_data = &crate_def_map
-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
-            assert_eq!(module_data.scope.resolutions().count(), 4);
+            let module_data = &crate_def_map.module(
+                &db,
+                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
+            );
+            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
         expect![[r#"
@@ -548,6 +554,7 @@ m!(Z);
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
                 "MacroCallId::macro_arg_",
+                "Modules < 'db >::module_",
             ]
         "#]],
     );
@@ -564,9 +571,11 @@ m!(Z);
         &db,
         || {
             let crate_def_map = crate_def_map(&db, krate);
-            let module_data = &crate_def_map
-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
-            assert_eq!(module_data.scope.resolutions().count(), 4);
+            let module_data = &crate_def_map.module(
+                &db,
+                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
+            );
+            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
         expect![[r#"
@@ -650,4 +659,31 @@ fn execute_assert_events(
         assert_eq!(n, *count, "Expected {event} to be executed {count} times, but only got {n}");
     }
     expect.assert_debug_eq(&events);
+}
+
+#[test]
+fn item_after_impl_is_its_own_span_anchor() {
+    use hir_expand::HirFileId;
+    use syntax::{
+        AstNode,
+        ast::{self, HasModuleItem},
+    };
+
+    let (db, pos) = TestDB::with_position(
+        r#"
+struct S;
+impl S {
+    fn first(&self) {}
+    fn last(&self) {$0}
+}
+struct AfterImpl;
+"#,
+    );
+    let file_id = HirFileId::from(pos.file_id);
+    let after_impl = pos.file_id.parse(&db).tree().items().last().unwrap();
+    assert!(matches!(after_impl, ast::Item::Struct(_)));
+    let span = file_id.span_map(&db).span_for_range(after_impl.syntax().text_range());
+
+    assert_eq!(span.anchor.ast_id, file_id.ast_id_map(&db).ast_id(&after_impl).erase());
+    assert_eq!(u32::from(span.range.start()), 0);
 }

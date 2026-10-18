@@ -407,6 +407,7 @@ impl<'db> Resolver<'db> {
         if skip_to_mod {
             return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path));
         }
+        let path_hygiene = hygiene_id;
 
         if n_segments <= 1 {
             let mut hygiene_info = hygiene_info(db, hygiene_id);
@@ -497,6 +498,12 @@ impl<'db> Resolver<'db> {
         }
 
         if let Some(res) = self.module_scope.resolve_path_in_value_ns(db, path) {
+            return Some(res);
+        }
+
+        if let Some(res) = macro_def_site(db, path_hygiene)
+            .and_then(|module| module.resolver(db).module_scope.resolve_path_in_value_ns(db, path))
+        {
             return Some(res);
         }
 
@@ -629,11 +636,11 @@ impl<'db> Resolver<'db> {
         //         def: m.module.into(),
         //     }),
         // );
-        def_map[module_id].scope.entries().for_each(|(name, def)| {
+        def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
             res.add_per_ns(name, def);
         });
 
-        def_map[module_id].scope.legacy_macros().for_each(|(name, macs)| {
+        def_map.module(db, module_id).scope(db).legacy_macros().for_each(|(name, macs)| {
             macs.iter().for_each(|&mac| {
                 res.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
             })
@@ -651,7 +658,7 @@ impl<'db> Resolver<'db> {
         });
         if let Some((prelude, _use)) = def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            for (name, def) in prelude_def_map[prelude].scope.entries() {
+            for (name, def) in prelude_def_map.module(db, prelude).scope(db).entries() {
                 res.add_per_ns(name, def)
             }
         }
@@ -663,8 +670,10 @@ impl<'db> Resolver<'db> {
         &'a self,
         db: &'a dyn SourceDatabase,
     ) -> impl Iterator<Item = Name> + 'a {
-        self.module_scope.def_map[self.module_scope.module_id]
-            .scope
+        self.module_scope
+            .def_map
+            .module(db, self.module_scope.module_id)
+            .scope(db)
             .extern_crate_decls()
             .filter_map(|id| {
                 let loc = id.lookup(db);
@@ -693,7 +702,9 @@ impl<'db> Resolver<'db> {
 
         for scope in self.scopes() {
             match scope {
-                Scope::BlockScope(m) => traits.extend(m.def_map[m.module_id].scope.traits()),
+                Scope::BlockScope(m) => {
+                    traits.extend(m.def_map.module(db, m.module_id).traits_in_scope(db))
+                }
                 &Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                     let impl_data = ImplSignature::of(db, impl_);
                     if let Some(target_trait) = impl_data.target_trait
@@ -710,17 +721,22 @@ impl<'db> Resolver<'db> {
         // Fill in the prelude traits
         if let Some((prelude, _use)) = self.module_scope.def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            traits.extend(prelude_def_map[prelude].scope.traits());
+            traits.extend(prelude_def_map.module(db, prelude).traits_in_scope(db));
         }
         // Fill in module visible traits
-        traits.extend(self.module_scope.def_map[self.module_scope.module_id].scope.traits());
+        traits.extend(
+            self.module_scope.def_map.module(db, self.module_scope.module_id).traits_in_scope(db),
+        );
         traits
     }
 
-    pub fn traits_in_scope_from_block_scopes(&self) -> impl Iterator<Item = TraitId> + '_ {
+    pub fn traits_in_scope_from_block_scopes<'a>(
+        &'a self,
+        db: &'a dyn SourceDatabase,
+    ) -> impl Iterator<Item = TraitId> + 'a {
         self.scopes()
             .filter_map(|scope| match scope {
-                Scope::BlockScope(m) => Some(m.def_map[m.module_id].scope.traits()),
+                Scope::BlockScope(m) => Some(m.def_map.module(db, m.module_id).traits_in_scope(db)),
                 _ => None,
             })
             .flatten()
@@ -730,9 +746,9 @@ impl<'db> Resolver<'db> {
         self.item_scope_().2
     }
 
-    pub fn item_scope(&self) -> &ItemScope {
+    pub fn item_scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
         let (def_map, _, local_id) = self.item_scope_();
-        &def_map[local_id].scope
+        def_map.module(db, local_id).scope(db)
     }
 
     pub fn krate(&self) -> Crate {
@@ -984,6 +1000,19 @@ fn handle_macro_def_scope(
     }
 }
 
+/// The module of the `macro` whose expansion produced a name. Items named in such a macro are
+/// the ones in scope where the macro is defined.
+// FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
+fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
+    let (_, def) = hygiene_info(db, hygiene_id)?;
+    crate::crate_def_map(db, def.krate).modules(db).find_map(|(_, data)| {
+        data.scope(db).macros().find_map(|(_, it)| match it.def {
+            MacroId::Macro2Id(id) if it.def.definition(db) == def => Some(id.lookup(db).container),
+            _ => None,
+        })
+    })
+}
+
 #[inline]
 fn hygiene_info(
     db: &dyn SourceDatabase,
@@ -1053,14 +1082,16 @@ impl<'db> Scope<'db> {
     fn process_names(&self, acc: &mut ScopeNames, db: &'db dyn SourceDatabase) {
         match self {
             Scope::BlockScope(m) => {
-                m.def_map[m.module_id].scope.entries().for_each(|(name, def)| {
+                m.def_map.module(db, m.module_id).scope(db).entries().for_each(|(name, def)| {
                     acc.add_per_ns(name, def);
                 });
-                m.def_map[m.module_id].scope.legacy_macros().for_each(|(name, macs)| {
-                    macs.iter().for_each(|&mac| {
-                        acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
-                    })
-                });
+                m.def_map.module(db, m.module_id).scope(db).legacy_macros().for_each(
+                    |(name, macs)| {
+                        macs.iter().for_each(|&mac| {
+                            acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
+                        })
+                    },
+                );
             }
             &Scope::GenericParams { params, def: parent } => {
                 if let GenericDefId::ImplId(impl_) = parent {
