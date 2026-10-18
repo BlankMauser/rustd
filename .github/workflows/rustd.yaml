@@ -69,9 +69,9 @@ jobs:
         run: sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
       # MinIO as one program in the home directory, which is where remote.py looks for it and
       # needs it: it kills the service and starts it again. The image is the one that is still
-      # published; the runner's docker takes a file out of it without root.
+      # published, for both architectures; the runner's docker takes a file out of it without
+      # root.
       - name: MinIO
-        if: matrix.os == 'ubuntu-24.04'
         run: |
           image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
           mkdir -p "$HOME/s3tools"
@@ -113,9 +113,43 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          run storeguards.py
+          run selects.py
           if [ -x "$HOME/s3tools/minio" ]; then run remote.py; fi
           echo "failed:${failed:- none}"
           test -z "$failed"
+
+  # `cargo rustd` in place of cargo on projects as they are published, natively on AArch64:
+  # what the programs print and what every test says has to be what cargo gives.
+  projects:
+    name: projects (${{ matrix.backend }}, aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      - name: cargo rustd
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          status=0
+          python3 cargo_rustd.py || status=$?
+          cat CARGO-RUSTD.md
+          exit $status
 
   windows-checks:
     name: fmt and tests (windows)
@@ -263,3 +297,32 @@ jobs:
           run storeshared.py
           echo "failed:${failed:- none}"
           test -z "$failed"
+
+  cargo-rustd:
+    name: cargo rustd (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      # ripgrep, fd and hyperfine at pinned commits, the flags, and the daemon's life,
+      # the second user among it. Incremental compilation is left to the profile, as on a
+      # developer's machine: with it off the tests of every project are cargo's (the
+      # harness has that case among the flags).
+      - name: cargo rustd against cargo
+        working-directory: harness
+        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
