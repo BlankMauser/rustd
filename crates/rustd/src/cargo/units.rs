@@ -3,6 +3,7 @@
 //! both. The command reads them to know what a program is linked from.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +39,10 @@ pub(crate) struct Record {
     pub(crate) copies: Vec<Copied>,
     /// The copy of the line rustc ran the linker with, for a crate that is linked.
     pub(crate) link_line: Option<PathBuf>,
+    /// The variables cargo set for the unit that say where the build puts its programs:
+    /// `CARGO_BIN_EXE_<name>`, which `env!` reads in an integration test.
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
 }
 
 /// A file rustc wrote and the copy the daemon reads in its place.
@@ -274,6 +279,18 @@ fn is_copy(one: &Path, other: &Path) -> bool {
         && std::fs::read(one).ok().zip(std::fs::read(other).ok()).is_some_and(|(a, b)| a == b)
 }
 
+/// The variables cargo set for the units of `used` to name the places of the build. One
+/// request has one of each, so two units told different places are cargo's to build.
+pub(crate) fn places_named(used: &[Record]) -> Result<BTreeMap<String, String>, String> {
+    let mut env = BTreeMap::new();
+    for (name, value) in used.iter().flat_map(|it| &it.env) {
+        if env.insert(name.clone(), value.clone()).is_some_and(|was| was != *value) {
+            return Err(format!("two packages of the build are given a different {name}"));
+        }
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +320,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_units_told_different_places_are_not_one_request() {
+        let told = |program: &str| Record {
+            env: [("CARGO_BIN_EXE_cli".to_owned(), program.to_owned())].into(),
+            ..record(&[])
+        };
+        let same = [told("/ws/target/debug/cli"), told("/ws/target/debug/cli")];
+        assert_eq!(places_named(&same).map(|it| it.len()), Ok(1));
+        let apart = [told("/ws/target/debug/cli"), told("/ws/target/debug/deps/cli-1")];
+        assert!(places_named(&apart).is_err_and(|why| why.contains("CARGO_BIN_EXE_cli")));
+    }
+
     fn record(args: &[&str]) -> Record {
         Record {
             id: "a-1".to_owned(),
@@ -313,6 +342,7 @@ mod tests {
             stamp: 1,
             copies: Vec::new(),
             link_line: None,
+            env: BTreeMap::new(),
         }
     }
 

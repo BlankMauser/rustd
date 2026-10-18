@@ -87,6 +87,8 @@ mod cached;
 mod debuginfo;
 mod float_pair;
 mod fragment;
+#[cfg(test)]
+mod fuzz;
 mod home;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
@@ -140,6 +142,28 @@ macro_rules! unsupported {
     };
 }
 
+/// What a crate is by what is written in it and what it is built on: a SHA-256, all of it.
+/// The names made from it are what another machine's store is asked for code by, so it is
+/// as hard to find two crates of one id as two files of one hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentId(pub [u8; 32]);
+
+impl fmt::Display for ContentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// Where cargo keeps the sources it fetched of registries and of git, as what is stored names
+/// it: the same on every machine, whoever's home the directory is in.
+pub const CARGO_HOME: &str = "/cargo";
+
+/// `path` with the directory `to` in place of the directory `from` it is under.
+pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
+    let rest = path.strip_prefix(from)?;
+    rest.starts_with(['/', '\\']).then(|| format!("{to}{rest}"))
+}
+
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
@@ -163,8 +187,13 @@ pub trait SymbolResolver {
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
     /// What stands for a crate that is not rustc's alone to build, the same wherever the
     /// same sources are built on the same crates.
-    fn content_id(&self, krate: Crate) -> Option<u64> {
+    fn content_id(&self, krate: Crate) -> Option<ContentId> {
         _ = krate;
+        None
+    }
+    /// Where cargo keeps the sources it fetched on this machine, when the crates of the
+    /// program tell: [`CARGO_HOME`] stands for it in what is stored.
+    fn cargo_home(&self) -> Option<String> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -2113,6 +2142,8 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        argument_slots: Vec::new(),
+        free_argument_slots: Vec::new(),
         index_spans: Default::default(),
         in_cleanup: false,
         guarded: false,
@@ -2124,7 +2155,6 @@ fn build<'db>(
         location: None,
         span: MirSpan::Unknown,
         constant_locals: Vec::new(),
-        copies: ArgumentCopies::default(),
         args: None,
         suspended: None,
         suspended_drop: None,
@@ -2322,7 +2352,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store, debugged))),
+                .map(|store| {
+                    let home = symbols.cargo_home();
+                    std::sync::Arc::new(cached::Entries::new(store, debugged, home))
+                }),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2677,10 +2710,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return;
         }
         let stored = store.get(&key).filter(|_| check);
-        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
+        let Some(mut entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
+        if !entry.leave(self.symbols.cargo_home().as_deref()) {
+            let _: Option<()> = self.kept.unkept("a file under what stands for cargo's directory");
+            return;
+        }
         let Some(bytes) = entry.encode() else { return };
         match stored {
             None => {
@@ -2774,13 +2811,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Only a crate of the checkout is compiled with where the checkout is.
         let placed =
             self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
+        let home = self.symbols.cargo_home();
         let mut datas = Vec::with_capacity(ids.datas.len());
         for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
-            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request
-                && placed
-                && self.symbols.names_place(&blob.bytes)
-            {
-                return self.kept.unkept("data with the place of the checkout");
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
+                if placed && self.symbols.names_place(&blob.bytes) {
+                    return self.kept.unkept("data with the place of the checkout");
+                }
+                if home.as_deref().is_some_and(|home| cached::holds(&blob.bytes, home)) {
+                    return self.kept.unkept("data with the place of cargo's directory");
+                }
             }
             datas.push(match request {
                 DataRequest::Blob { blob, identity } => {
@@ -3930,6 +3970,18 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Whether every pointer in the blob is whole inside it and to one of the first `funcs`
+    /// functions or the first `datas` data objects, which a blob read from the store is
+    /// not known to be.
+    fn sound(&self, funcs: usize, datas: usize) -> bool {
+        let inside = |offset: u32| {
+            self.bytes.len().checked_sub(word()).is_some_and(|last| offset as usize <= last)
+        };
+        (self.align == 0 || self.align.is_power_of_two())
+            && self.relocs.iter().all(|&(at, to, _)| inside(at) && (to.as_u32() as usize) < datas)
+            && self.fn_relocs.iter().all(|&(at, to)| inside(at) && (to.as_u32() as usize) < funcs)
+    }
+
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
     fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
         self.bytes[offset..offset + word()].fill(0);
@@ -4030,39 +4082,6 @@ struct LocalSlot {
     borrowed: bool,
 }
 
-/// The stack a function has for the copies of arguments it passes by pointer. A callee owns
-/// its copy only until it returns, so the calls of a function take turns with the same stack.
-#[derive(Default)]
-struct ArgumentCopies {
-    /// The copies of calls not made yet, by the address each is passed as.
-    lent: Vec<(Value, ArgumentCopy)>,
-    spare: Vec<ArgumentCopy>,
-}
-
-#[derive(Clone, Copy)]
-struct ArgumentCopy {
-    slot: ir::StackSlot,
-    size: u32,
-    align_shift: u8,
-}
-
-impl ArgumentCopies {
-    /// The smallest spare copy that holds `size` bytes at that alignment.
-    fn spare(&mut self, size: u32, align_shift: u8) -> Option<ArgumentCopy> {
-        let fits = |it: &&ArgumentCopy| it.size >= size && it.align_shift >= align_shift;
-        let smallest = self.spare.iter().filter(fits).map(|it| it.size).min()?;
-        let at = self.spare.iter().position(|it| fits(&it) && it.size == smallest)?;
-        Some(self.spare.swap_remove(at))
-    }
-
-    /// The call with `args` is made: what it was lent is spare again.
-    fn returned(&mut self, args: &[Value]) {
-        let (back, lent) = self.lent.drain(..).partition(|(addr, _)| args.contains(addr));
-        self.lent = lent;
-        self.spare.extend(back.into_iter().map(|(_, copy): (Value, ArgumentCopy)| copy));
-    }
-}
-
 struct FunctionCx<'cx, 'db> {
     cg: &'cx mut Recorder<'db>,
     /// `None` while generating a shim that has no MIR.
@@ -4095,6 +4114,11 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// The slots the arguments of the calls so far were copied to since the last were
+    /// freed, each with its size and the power of two it is aligned to.
+    argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
+    /// The ones whose call has returned.
+    free_argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
     /// The index expression each local that holds an index was made for.
     index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
@@ -4114,7 +4138,6 @@ struct FunctionCx<'cx, 'db> {
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
-    copies: ArgumentCopies,
     /// What the body's generic parameters stand for, when it is the body of an instance.
     args: Option<StoredGenericArgs>,
     /// While compiling an `async` body: where it says where it left off.
@@ -4989,7 +5012,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
-                let copy = self.argument_copy(layout);
+                let copy = self.argument_slot(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
             }
@@ -5133,25 +5156,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.blob_addr(blob).ok()
     }
 
-    /// Stack for the copy of an argument of `layout` that the next call is passed.
-    fn argument_copy(&mut self, layout: &Layout) -> Value {
+    /// Storage for the copy of an argument a callee is handed. The copy is the callee's
+    /// until it returns and nobody's after, so a later call has its own in the same place:
+    /// a function that calls a hundred others has the frame of its widest call and not
+    /// of all of them.
+    fn argument_slot(&mut self, layout: &Layout) -> Value {
         let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
         if align > 16 {
             return self.stack_slot(layout);
         }
         let align_shift = align.trailing_zeros() as u8;
-        let copy = self.copies.spare(size, align_shift).unwrap_or_else(|| ArgumentCopy {
-            slot: self.builder.create_sized_stack_slot(StackSlotData::new(
+        let free = self.free_argument_slots.iter().position(|it| it.1 == (size, align_shift));
+        let slot = match free {
+            Some(free) => self.free_argument_slots.swap_remove(free).0,
+            None => self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 size,
                 align_shift,
             )),
-            size,
-            align_shift,
-        });
-        let addr = self.builder.ins().stack_addr(ptr(), copy.slot, 0);
-        self.copies.lent.push((addr, copy));
-        addr
+        };
+        self.argument_slots.push((slot, (size, align_shift)));
+        self.builder.ins().stack_addr(ptr(), slot, 0)
     }
 
     fn stack_slot(&mut self, layout: &Layout) -> Value {
@@ -9109,6 +9134,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let PassMode::Indirect = ret_mode {
             values.push(dst);
         }
+        // The calls before this one have returned.
+        self.free_argument_slots.append(&mut self.argument_slots);
         for (&(addr, ty), &mode) in args.iter().zip(&arg_modes) {
             let layout = self.layout(ty)?;
             self.pass(mode, addr, &layout, &mut values);
@@ -10305,7 +10332,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Calls a function that may unwind. When this function has values to drop, the call gets a
     /// landing pad that drops them and resumes unwinding.
     fn invoke(&mut self, callee: ir::FuncRef, args: &[Value]) -> Vec<Value> {
-        self.copies.returned(args);
         let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call(callee, args);
             return self.builder.inst_results(call).to_vec();
@@ -10321,7 +10347,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn invoke_indirect(&mut self, sig: ir::SigRef, pointer: Value, args: &[Value]) -> Vec<Value> {
-        self.copies.returned(args);
         let Some(pad) = self.landing_pad_for_call() else {
             let call = self.builder.ins().call_indirect(sig, pointer, args);
             return self.builder.inst_results(call).to_vec();

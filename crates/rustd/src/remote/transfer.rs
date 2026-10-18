@@ -133,6 +133,52 @@ impl fmt::Display for Traffic {
     }
 }
 
+/// How much may still be written of what a remote sends, when what it sends does not say.
+pub(crate) struct Room {
+    left: Option<AtomicU64>,
+    of: u64,
+}
+
+impl Room {
+    /// Room for `most` bytes, or for any number of them.
+    pub(crate) fn of(most: Option<u64>) -> Room {
+        Room { left: most.map(AtomicU64::new), of: most.unwrap_or(u64::MAX) }
+    }
+
+    /// Takes room for `bytes` that are about to be written: an error when there is not
+    /// that much left, before any of them is.
+    pub(crate) fn take(&self, bytes: u64) -> anyhow::Result<()> {
+        let Some(left) = &self.left else { return Ok(()) };
+        let took =
+            left.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(bytes));
+        match took {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                bail!("the remote holds more than the {} bytes that are taken from it", self.of)
+            }
+        }
+    }
+}
+
+/// An object that is longer than what is taken of one.
+#[derive(Debug)]
+pub(crate) struct TooLong {
+    pub(super) name: String,
+    pub(super) most: u64,
+}
+
+impl fmt::Display for TooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "rejected {}: it is longer than the {} bytes that are taken of it",
+            self.name, self.most
+        )
+    }
+}
+
+impl std::error::Error for TooLong {}
+
 /// The bytes of an object from some offset on, as they arrive.
 pub(super) enum Body {
     File(File),
@@ -140,7 +186,7 @@ pub(super) enum Body {
 }
 
 impl Body {
-    async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+    pub(super) async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
             Body::File(file) => {
                 let mut chunk = vec![0; CHUNK];
@@ -154,9 +200,12 @@ impl Body {
 }
 
 /// A failure that waiting does not cure: the service said no, a list names what is not
-/// there, or a file of this machine could not be written.
+/// there, an object is longer than is taken, or a file of this machine could not be written.
 pub(super) fn is_final(error: &anyhow::Error) -> bool {
-    error.is::<Refused>() || error.is::<Missing>() || error.is::<std::io::Error>()
+    error.is::<Refused>()
+        || error.is::<Missing>()
+        || error.is::<TooLong>()
+        || error.is::<std::io::Error>()
 }
 
 impl super::Remote {
@@ -214,12 +263,12 @@ impl Partial {
         let mut path = to.as_os_str().to_owned();
         path.push(if packed { ".zst.tmp" } else { ".fetch.tmp" });
         let path = PathBuf::from(path);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // What is fetched into a store is the store's, which no other user reads.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Ok(None),
@@ -288,13 +337,13 @@ impl Partial {
     async fn unpack(
         self,
         to: &Path,
-        want: Digest,
+        (want, most): (Digest, u64),
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<bool> {
         let (from, to) = (self.path, to.to_owned());
         drop(self.file);
         let unpacked = tokio::task::spawn_blocking(move || {
-            let unpacked = unpack_whole(&from, &to, want, is_wanted);
+            let unpacked = unpack_whole(&from, &to, (want, most), is_wanted);
             _ = std::fs::remove_file(&from);
             unpacked
         });
@@ -302,11 +351,13 @@ impl Partial {
     }
 }
 
-/// Writes what the zstd file `from` holds to `to`, whole or not at all.
+/// Writes what the zstd file `from` holds to `to`, whole or not at all, when it is at most
+/// `most` bytes: a file is small for what it unpacks to, and no more than that many bytes
+/// of what comes out are ever on the disk.
 fn unpack_whole(
     from: &Path,
     to: &Path,
-    want: Digest,
+    (want, most): (Digest, u64),
     is_wanted: fn(&[u8]) -> bool,
 ) -> std::io::Result<bool> {
     use std::io::{Read, Write};
@@ -315,13 +366,21 @@ fn unpack_whole(
     let aside = PathBuf::from(aside);
     let unpack = || {
         let mut packed = zstd::Decoder::new(std::fs::File::open(from)?)?;
-        let mut file = std::fs::File::create(&aside)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // What is fetched into a store is the store's, which no other user reads.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&aside)?;
         let (mut hash, mut start, mut chunk) = (Sha256::new(), Vec::new(), vec![0; CHUNK]);
+        let mut left = most;
         loop {
             let read = packed.read(&mut chunk)?;
             if read == 0 {
                 break;
             }
+            let Some(rest) = left.checked_sub(read as u64) else { return Ok(false) };
+            left = rest;
             let wanted = START.saturating_sub(start.len()).min(read);
             start.extend_from_slice(&chunk[..wanted]);
             hash.update(&chunk[..read]);
@@ -349,8 +408,9 @@ fn unpack_whole(
 }
 
 impl super::Remote {
-    /// Fetches the object `name` into the file `to` if its bytes hash to `want` and start as
-    /// `is_wanted` says the file has to.
+    /// Fetches the object `name` into the file `to` if its bytes hash to `want`, start as
+    /// `is_wanted` says the file has to and are at most `most`. An object that is longer is
+    /// counted as rejected, and no more of it than `most` bytes is ever on the disk.
     ///
     /// A transfer that breaks off is taken up from the byte it stopped at, a few times with
     /// a growing wait in between, and by the next process after this one is stopped. Bytes
@@ -361,33 +421,40 @@ impl super::Remote {
         name: &str,
         want: &Digest,
         to: &Path,
+        most: u64,
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<Fetched> {
-        self.fetch_coded(name, want, None, to, is_wanted).await
+        self.fetch_coded(name, want, None, to, most, is_wanted).await
     }
 
     /// As [`Self::fetch_file`], for an object that may be the file compressed with zstd:
-    /// `unpacked` is then the hash of the file, and `want` that of the object. The object
-    /// is checked before it is unpacked and the file after, so the name of a file vouches
-    /// for it however it travelled.
+    /// `unpacked` is then the hash of the file and the most it may unpack to, and `want`
+    /// and `most` are those of the object. The object is checked before it is unpacked and
+    /// the file after, so the name of a file vouches for it however it travelled, and
+    /// neither is longer than it was listed as.
     pub(crate) async fn fetch_coded(
         &self,
         name: &str,
         want: &Digest,
-        unpacked: Option<Digest>,
+        unpacked: Option<(Digest, u64)>,
         to: &Path,
+        most: u64,
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<Fetched> {
         let _permit = self.traffic.permit().await?;
         let Some(mut partial) = Partial::open(to, unpacked.is_some()).await? else {
             return Ok(Fetched::Elsewhere);
         };
+        // What a stopped process left is not the start of this object.
+        if partial.len > most {
+            partial.empty().await?;
+        }
         let mut left_by_another = partial.len != 0;
         let mut received = 0;
         let mut resumes = 0;
         loop {
             let had = partial.len;
-            let appended = self.append_rest(name, &mut partial, &mut received).await;
+            let appended = self.append_rest(name, &mut partial, most, &mut received).await;
             // A transfer that got further is not the same failure again.
             if partial.len > had {
                 resumes = 0;
@@ -396,6 +463,9 @@ impl super::Remote {
                 Ok(()) => {}
                 Err(e) if is_final(&e) => {
                     partial.discard().await;
+                    if e.is::<TooLong>() {
+                        self.traffic.rejected.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Err(e.context(format!("fetching {name}")));
                 }
                 Err(e) if resumes == RESUMES => {
@@ -437,11 +507,12 @@ impl super::Remote {
         }
     }
 
-    /// Appends what the object has after the bytes of `partial`.
+    /// Appends what the object has after the bytes of `partial`, to `most` bytes in all.
     async fn append_rest(
         &self,
         name: &str,
         partial: &mut Partial,
+        most: u64,
         received: &mut u64,
     ) -> anyhow::Result<()> {
         let Some(mut body) = self.read_from(name, partial.len).await? else {
@@ -453,6 +524,9 @@ impl super::Remote {
             let Some(chunk) = chunk else { return Ok(()) };
             self.traffic.received.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             *received += chunk.len() as u64;
+            if partial.len + chunk.len() as u64 > most {
+                return Err(TooLong { name: name.to_owned(), most }.into());
+            }
             partial.append(&chunk).await?;
         }
     }

@@ -96,34 +96,69 @@ pub(super) struct Place {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum DebugType {
     /// A number, a `bool` or a `char`, whose bytes are read as the `DW_ATE_*` of `encoding`.
-    Base {
-        name: String,
-        size: u64,
-        encoding: u8,
-    },
+    Base { name: String, size: u64, encoding: u8 },
     /// A pointer of one word. `to` is `None` where what it points to is not told.
     Pointer {
         name: String,
+        #[serde(deserialize_with = "DebugType::nested")]
         to: Option<Box<DebugType>>,
     },
     Array {
+        #[serde(deserialize_with = "DebugType::nested")]
         of: Box<DebugType>,
         len: u64,
     },
     /// A struct, a tuple, or a pointer of two words. One without fields may have some that
     /// are not told.
-    Struct {
-        name: String,
-        size: u64,
-        fields: Vec<Field>,
-    },
+    Struct { name: String, size: u64, fields: Vec<Field> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct Field {
     pub(super) name: String,
     pub(super) offset: u64,
+    #[serde(deserialize_with = "DebugType::nested")]
     pub(super) ty: DebugType,
+}
+
+impl DebugType {
+    /// How many types deep one is described: what is in a type deeper than this is not
+    /// told, and bytes that say they are deeper are not read as a type. Reading one takes
+    /// a few frames of the stack for each.
+    pub(super) const DEEPEST: u32 = 128;
+
+    /// How many types deep this one is described, itself counted.
+    fn depth(&self) -> u32 {
+        1 + match self {
+            DebugType::Base { .. } | DebugType::Pointer { to: None, .. } => 0,
+            DebugType::Pointer { to: Some(of), .. } | DebugType::Array { of, .. } => of.depth(),
+            DebugType::Struct { fields, .. } => {
+                fields.iter().map(|it| it.ty.depth()).max().unwrap_or(0)
+            }
+        }
+    }
+
+    /// The type as it is kept, or `None` when it is deeper than one that is read back.
+    pub(super) fn kept(self) -> Option<DebugType> {
+        (self.depth() <= Self::DEEPEST).then_some(self)
+    }
+
+    /// Reads what is of a type inside another, no deeper than [`Self::DEEPEST`].
+    fn nested<'de, D, T>(from: D) -> Result<T, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: serde::Deserialize<'de>,
+    {
+        thread_local!(static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        let depth = DEPTH.get();
+        if depth >= Self::DEEPEST {
+            return Err(serde::de::Error::custom("a type inside too many others"));
+        }
+        DEPTH.set(depth + 1);
+        let read = T::deserialize(from);
+        DEPTH.set(depth);
+        read
+    }
 }
 
 /// A parameter or a `let` of a function, and where its value is from the frame pointer.
