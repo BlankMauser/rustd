@@ -65,7 +65,7 @@ By hand, with `cargo rustd` from that build:
 | ripgrep: second git worktree | first build cargo's, 16 s; joined the same worker; edit by the daemon, 0.44 s wall |
 | `RUSTD_CACHE` set when the daemon starts | store filled: 1 pack, 26,377 records, 57,153,509 bytes; `rustd cache verify` exit 0 |
 | `rustd cache push` and `pull` to a directory remote | 1 pack, 7,744,971 bytes compressed, sent and fetched |
-| Published layout: `split.py`, patches applied, `cargo build -p rustd --release` | builds, after two manual steps; see [contributing.md](contributing.md) |
+| Published layout: recursive clone, `cargo build -p rustd --release --locked` | builds |
 
 ## 2. Corpus and layouts, per platform
 

@@ -2,7 +2,7 @@
 
 There are two ways to use rustd from cargo. `cargo rustd <command>` is an explicit
 subcommand, described here. The second, switching rustd on globally so that plain `cargo`
-goes through it, has its own section at the end, which is a placeholder for now.
+goes through it, has its own section at the end.
 
 Everything in this file was checked against the code in `crates/rustd/src/cargo/` and run on
 Linux x86-64. The design notes it was written from are in
@@ -220,10 +220,83 @@ a shell without the variable keeps no store, whatever later shells have set.
 
 ## Plain `cargo`, switched on globally
 
-<!-- GLOBAL-MODE: this section is a placeholder. The global switch is being written on
-     another branch and was not present at the commit these docs were written against
-     (f191c6e42a). Fill it from that branch's report: how to switch it on and off, what it
-     changes in cargo's configuration, how it differs from `cargo rustd`, and how to tell
-     which one built a program. -->
+`cargo rustd` needs whoever runs the build to type something different. The global switch is
+for when they won't: agents, scripts, editors that call `cargo build` themselves.
 
-Not documented yet.
+    rustd enable     # plain cargo now goes through rustd, for this user
+    rustd status     # is it on, and what the daemon served or left to rustc
+    rustd disable    # back to how it was
+
+`rustd`, `cargo-rustd` and `rustd-rustc` have to be in the same directory.
+
+### What `enable` changes
+
+One key in `$CARGO_HOME/config.toml` (usually `~/.cargo/config.toml`):
+
+    [build]
+    rustc-workspace-wrapper = "<dir>/rustd-rustc"
+
+No shell profile or environment variable is touched. `enable` keeps a copy of the file as it
+was in `rustd-enabled.json` next to it. `disable` restores that copy byte for byte, or, if
+you edited the file in between, removes only its own line.
+
+### Wrappers you already have
+
+- `build.rustc-wrapper` or `RUSTC_WRAPPER` (sccache and the like) is left alone and runs
+  around `rustd-rustc`.
+- An existing `rustc-workspace-wrapper` is chained: `rustd-rustc` runs rustc through it, and
+  `disable` puts your line back.
+- `enable` and `status` print both, so you can see what will run.
+
+A `RUSTC_WORKSPACE_WRAPPER` in the environment, or a project `.cargo/config.toml` that sets
+the key, takes precedence over the user config. rustd is not used in that workspace, and
+`rustd status` run there says so.
+
+### What you get, and what you don't
+
+The daemon, its loaded workspaces, the sharing between worktrees and the store are the same
+ones `cargo rustd` uses. The difference is where rustd sits. Cargo still plans the build and
+calls the wrapper once per crate; the daemon answers for programs and test executables, and
+workspace library crates are still compiled by rustc. A build with nothing to do costs what
+cargo's own no-op costs.
+
+When the daemon cannot serve a unit, rustc builds it and one line on stderr says why:
+
+    rustd: the daemon had not loaded the build yet; rustc links `app`
+
+`rustd status` counts these by reason. A build never fails because rustd is enabled: a
+daemon that is missing, dies during the build, or is another version (it gets replaced) all
+end in rustc doing the work. An error rustd cannot diagnose itself, such as a use after
+move, fails with rustc's message and status 101, as under cargo.
+
+The store is on by default in this mode and in `cargo rustd`: `$XDG_CACHE_HOME/rustd/store`,
+else `~/.cache/rustd/store`, limited to 8 GiB. `RUSTD_CACHE=<dir>` moves it, `RUSTD_CACHE=off`
+disables it, `RUSTD_CACHE_MAX` sets the limit. The socket and logs are in
+`$XDG_RUNTIME_DIR/rustd`, else `~/.cache/rustd`.
+
+### What has been checked
+
+On Linux x86-64, under both backends, with a generated workspace, each of these gave the
+same output, exit status and test results as cargo alone on the first build, a warm build
+and a build after an edit: `cargo test`, `test --doc`, `test --no-fail-fast` with a failing
+test, `run --example`, `run --release`, `run --target <host>`, `run --bin`,
+`run --features -p`, `check`, `check --all-targets`, `build --workspace --all-targets`,
+`cargo install --path`, and a `cargo check --message-format=json` running beside a build.
+Also: 12 builds at once over 3 worktrees on one daemon, the daemon killed during a build,
+both kinds of user wrapper, and the `enable`/`disable` round trip. ripgrep, fd and hyperfine
+match cargo on every step. `harness/cargo_rustd.py` runs all of this.
+
+Not checked: a proc macro defined in the workspace, `--target` for another triple,
+`cargo install` from the registry, a real rust-analyzer session next to it, real sccache (a
+stand-in wrapper was used). On macOS and Windows every build is cargo's in this mode and
+nothing was run.
+
+### Known problems
+
+- Edits are slower than with `cargo rustd`, and on four of nine projects slower than cargo
+  alone (one run each, Cranelift: ripgrep 1.32 s against 0.78 s, eza 2.02 against 1.32,
+  tokei 1.23 against 0.70, axum 0.68 against 0.41). The cause has not been measured yet.
+- The store grows fast: one harness pass over starship wrote 7.6 GiB.
+- A socket path over 108 bytes cannot be bound; the build goes to cargo and says so. The
+  default locations are well under that.
+

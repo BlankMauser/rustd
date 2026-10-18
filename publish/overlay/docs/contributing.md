@@ -26,89 +26,72 @@ you send them, including fixes you find here and want to upstream.
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
     SECURITY.md               what to know before sharing a store, and how to report a problem
-    vendor/rust-analyzer/     rust-analyzer, a git submodule at the pinned commit
-    vendor/rust-analyzer.rev  that commit
-    vendor/patches/           rustd's changes to rust-analyzer, one patch per crate
+    vendor/rust-analyzer/     rust-analyzer with rustd's changes, a git submodule
     vendor/rustc_abi/         rustc's layout crate, copied from the 1.99.0 tag
-    vendor/apply.py           applies the patches to the submodule
-    vendor/source.rev         the commit of the development branch this tree was generated from
+    vendor/source.rev         the commit of the old development branch this tree last took from
 
-The published tree is generated. Development happens on a branch that is rust-analyzer's
-tree with rustd's changes made in place, and `publish/split.py` on that branch writes the
-layout above: rustd's own files are copied, every rust-analyzer file rustd changed becomes
-part of a patch, and `publish/overlay/` is copied over the result. If you are working on
-that branch, edit files where they are and edit these documents under `publish/overlay/`.
+`crates/hir-ty-codegen` is not a crate. It is the module `hir_ty::mir::codegen`, which uses
+private items of `hir-ty`. It is kept outside the submodule because all of it is rustd's:
+`mir.rs` in the submodule declares the module with a `#[path]` that points back here. So
+the submodule builds only as part of this repository.
 
-`crates/hir-ty-codegen` is not a crate. It is the module `hir_ty::mir::codegen`, kept
-outside the submodule because all of it is rustd's. `vendor/apply.py` links it into
-`vendor/rust-analyzer/crates/hir-ty/src/mir/`, and the patch to `hir-ty` declares the
-module.
+## rust-analyzer
 
-## The rust-analyzer pin and the patches
-
-`vendor/rust-analyzer` is pinned to the commit rustd forked from, recorded in
-`vendor/rust-analyzer.rev`. rustd changes about 160 files of rust-analyzer in 22 crates.
-Those changes are in `vendor/patches/<crate>.patch`, one file per crate under `crates/`,
-and `workspace.patch` for files outside them. Each is a plain `git diff` against the pin.
+`vendor/rust-analyzer` is a submodule of this same repository, on its `rust-analyzer`
+branch. That branch is upstream rust-analyzer at the commit rustd forked from
+(`dd5ed69d4b`) with rustd's changes committed on top: about 160 files in 24 crates. `main`
+records which commit of that branch it builds with, as git does for any submodule.
 
 After cloning:
 
-    git submodule update --init
-    python3 vendor/apply.py
+    git clone --recursive https://github.com/DioxusLabs/rustd
     cargo +1.99.0 build -p rustd --release
 
-`apply.py` resets the submodule to the pinned commit, applies every file in
-`vendor/patches/`, and links `crates/hir-ty-codegen` into `hir-ty` as the `codegen` module.
-It can be run again at any time and always starts from the pin, so **it discards
-uncommitted edits in `vendor/rust-analyzer`**; regenerate the patch first if you have
-changed something there. After it runs, the submodule shows as modified in `git status`.
-That is expected; do not commit the submodule pointer.
+or `git submodule update --init` in a clone made without `--recursive`. There is nothing
+else to run. After a pull that moves the submodule, `git submodule update` again.
 
-`python3 vendor/apply.py --check` exits 1 when the submodule is not what the pin and the
-patches give, which is how to tell that the patches changed under you after a pull.
+### Changing a rust-analyzer file
 
-### Changing a patched rust-analyzer file
-
-Edit the file in `vendor/rust-analyzer` after the patches are applied, build and test, then
-regenerate the patch of the crate you touched from the submodule's working tree:
+Edit the file in `vendor/rust-analyzer`, build and test from the root as usual. Then
+commit in two places:
 
     cd vendor/rust-analyzer
-    git add -A crates/<crate> ':!crates/hir-ty/src/mir/codegen.rs' ':!crates/hir-ty/src/mir/codegen'
-    git diff --cached --no-renames --full-index --binary HEAD -- crates/<crate> \
-        > ../patches/<crate>.patch
-    git reset -q
+    git switch rust-analyzer      # once; a fresh submodule is on a detached commit
+    git commit -am "..."
+    git push origin rust-analyzer
+    cd ../..
+    git add vendor/rust-analyzer  # main now builds with the new commit
+    git commit
 
-The `git add` is there so that files the patch creates are in the diff; the two exclusions
-keep the code generator, which lives in `crates/hir-ty-codegen`, out of the `hir-ty` patch.
-Run on an unchanged tree, this reproduces the existing patch byte for byte, so the diff of
-`vendor/patches/` in your commit is your change and nothing else. Commit the patch file.
+Push the submodule before `main`, or `main` names a commit nobody else can fetch. The
+`rust-analyzer` branch only moves forward; do not rebase or force-push it, because old
+commits of `main` name commits on it.
 
-Keep the patches small. A change to rust-analyzer should be something rust-analyzer could
-take: a bug fix in MIR lowering or inference, a missing piece of the language, an accessor
-rustd needs. Code that is only rustd's belongs in `crates/hir-ty-codegen` or
-`crates/rustd`. Fixes that are simply rust-analyzer bugs should be sent upstream, under
+A change to rust-analyzer should be something rust-analyzer could take: a bug fix in MIR
+lowering or inference, a missing piece of the language, an accessor rustd needs. Code that
+is only rustd's belongs in `crates/hir-ty-codegen` or `crates/rustd`, where a change is one
+ordinary commit. Fixes that are simply rust-analyzer bugs should be sent upstream, under
 their rules.
 
-A change to the code generator is made in `crates/hir-ty-codegen`. The submodule sees
-those files through a link, so there is nothing to copy.
+### Moving to a newer rust-analyzer
 
-### Moving the pin
-
-Moving the pin means rebasing the patch series onto a newer rust-analyzer.
-
-1. In `vendor/rust-analyzer`, after `apply.py`, commit the patched tree on a local
-   branch (leaving out the linked code generator), rebase that branch onto the new
-   upstream commit and resolve conflicts.
-2. Build, and run the whole gate under both backends ([harness.md](harness.md)). A newer
+1. In `vendor/rust-analyzer`, merge the new upstream commit into the `rust-analyzer`
+   branch and resolve conflicts. Merge, not rebase, so the branch keeps moving forward.
+2. Update `Cargo.toml` and `Cargo.lock` at the root for dependencies rust-analyzer changed.
+3. Build, and run the whole gate under both backends ([harness.md](harness.md)). A newer
    rust-analyzer changes inference, MIR lowering and layout queries, any of which can
    change generated code. The corpus with `--layouts`, `breakers.py` and
    `fuzz/fuzz.py smoke` are the ones that notice first.
-3. Regenerate every patch against the new commit, write the new commit to
-   `vendor/rust-analyzer.rev`, and update the submodule pointer.
-4. Update `Cargo.toml` and `Cargo.lock` at the root for dependencies rust-analyzer changed.
+4. Push the branch, then commit the new submodule commit on `main`.
 
-Nobody has moved the pin yet, so this procedure is the intended one and has not been
+Nobody has done this yet, so this procedure is the intended one and has not been
 exercised.
+
+### Where the history is
+
+`main` began as a tree generated from a development branch that was rust-analyzer's tree
+with rustd's changes made in place. That branch and its history are kept as
+`rustd-collate` and `rustd-spike`. `publish/split.py` there is what wrote this layout.
 
 The toolchain is a separate pin. rustd is built for Rust 1.99.0 and `vendor/rustc_abi` is
 rustc's crate from that tag. Moving to another Rust version means taking the new
