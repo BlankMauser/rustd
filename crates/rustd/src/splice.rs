@@ -1496,8 +1496,9 @@ impl<'a> Patch<'a> {
             |target, added| address(target, added, false),
         )?;
         let mut header = image.header;
-        if let Some(at) = described.headers_offset {
+        if let Some((at, count)) = described.headers {
             header.e_shoff.set(e, at);
+            header.e_shnum.set(e, count);
         }
         header.e_phoff.set(e, offset + headers_at);
         header.e_phnum.set(e, u16::try_from(segments.len())?);

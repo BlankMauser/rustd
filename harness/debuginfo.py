@@ -689,8 +689,19 @@ def program(tally, what, workspace, crates, package, inject=None):
     return fx
 
 
-def edits(tally):
-    """The program of its own, a step at a time under a daemon."""
+def edits(tally, apart=False):
+    """The program of its own, a step at a time under a daemon. With `apart`, the profile has
+    what a debugger reads kept beside the objects, and the edits go into a program built so."""
+    if apart:
+        os.environ["CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"] = "unpacked"
+        try:
+            return edited(tally, "edits, kept apart")
+        finally:
+            del os.environ["CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"]
+    edited(tally, "edits")
+
+
+def edited(tally, part):
     ws = tempfile.mkdtemp(prefix="rustd-debuginfo-edits-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, EDITS_MAIN)):
@@ -729,17 +740,24 @@ def edits(tally):
         how = "not linked" if not links else "spliced" if links[-1].startswith("spliced") else "linked in full"
         spliced += how == "spliced"
         if not (reply.stdout + reply.stderr).strip().startswith("ok"):
-            tally.say(f"edits: {what}", "REFUSED", (reply.stdout + reply.stderr).strip()[:60])
+            tally.say(f"{part}: {what}", "REFUSED", (reply.stdout + reply.stderr).strip()[:60])
             continue
-        compare(tally, f"edits: {what} ({how})", backtraces(built(reference, "sline"), ws), backtraces(binary, ws))
-        verify(tally, f"edits: {what}", binary)
-        unwinding(tally, f"edits: {what}", binary)
+        compare(tally, f"{part}: {what} ({how})", backtraces(built(reference, "sline"), ws), backtraces(binary, ws))
+        verify(tally, f"{part}: {what}", binary)
+        unwinding(tally, f"{part}: {what}", binary)
     ours = backtraces(binary, ws)
     if place := call_site(ours):
-        debugger(tally, "edits: the last binary", binary, ws, place[2:])
+        debugger(tally, f"{part}: the last binary", binary, ws, place[2:])
+    line = open(os.path.join(ws, MAIN)).read().split("must(length)")[0].count("\n") + 1
+    theirs, mine = (printed_by("gdb", it, ws, f"{MAIN}:{line}", ["at"])["at"] for it in (built(reference, "sline"), binary))
+    right = mine == theirs or (LLVM and mine == "<optimized out>")
+    tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
+    if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
+        kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("rustd ', unit)) for unit in units(binary))
+        tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
     daemon.kill()
     if os.environ.get("RUSTD_SPLICE") != "0":
-        tally.say("edits: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")
+        tally.say(f"{part}: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")
 
 
 def described(binary):
@@ -1084,7 +1102,7 @@ def main():
                                    "items.iter().map(|it| {\n        " + PANIC + "\n        it.area()\n    }).sum()")),
         "rung2": lambda: program(tally, "rung2", os.path.join(HERE, "rung2"), ["rung2"], "rung2",
                                  ("src/main.rs", ".map_ok(|it| it + 1)", ".map_ok(|it| {\n        " + PANIC + "\n        it + 1\n    })")),
-        "edits": lambda: edits(tally),
+        "edits": lambda: (edits(tally), edits(tally, apart=True)),
         "callers": lambda: callers(tally),
         "locals": lambda: variables(tally),
         "types": lambda: shapes(tally),

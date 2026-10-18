@@ -10901,6 +10901,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.create_block(),
             self.builder.create_block(),
         );
+        // Dropping is laid out behind the body, so that the code a function begins with is
+        // that of its first statement and not of the drops of a future given up half-way.
+        for block in [drop, resumed, unresumed, suspended] {
+            self.builder.set_cold_block(block);
+        }
         self.builder.switch_to_block(drop);
         self.store_state(state.addr, state.ty, RETURNED);
         self.builder.ins().brif(at, resumed, &[], unresumed, &[]);

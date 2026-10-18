@@ -67,6 +67,7 @@ has `rustd-collate` f191c6e42a merged in). What `debuginfo.py` printed:
 | scopes (30 names by block) | 30 of 30 | 23 of 30; 7 optimized out, 2 of them kept by rustc |
 | rich (`rust-gdb` and `rust-lldb`, 15 values) | 15 of 15 in both | 14 of 15 in both; the one is lost by rustc too |
 | profile, 11 settings | all followed | all followed |
+| edits, and again with `split-debuginfo = "unpacked"` | 6 of 6 spliced, frames same, in both | 6 of 6 spliced, frames same, in both |
 | last line | `all right (cranelift)` | `all right, 2 open (llvm)` |
 
 The gate: difftest MATCH with 0 of 893 layouts differing, programs 22 of 22, stress 99 of 99,
@@ -169,8 +170,19 @@ the linked build, and that `llvm-dwarfdump --verify` has no error.
 Limits: the split writer writes little-endian sections and has only been run on Linux
 x86-64. `lldb` 20 reports the ranges of a block in a split DWARF 4 unit as invalid; it does
 the same for a rustc build with `split-debuginfo` of more than one unit, and the script
-counts those messages instead of failing on them. A splice into a program built with split
-debug info has not been tested.
+counts those messages instead of failing on them.
+
+A splice into a program built with `unpacked` is checked by `debuginfo.py --only edits`,
+which now runs its six edits a second time with the profile set so (`edits, kept apart`).
+After the last splice the units the linker placed are still skeletons with their `.dwo`
+files, the unit of the spliced code is whole in the appended sections, the backtraces are
+those of a fresh cargo build, every instruction has a line, and gdb stops at a line of the
+edited program and prints an argument there as it does for the cargo build (under LLVM
+the argument is `<optimized out>`, which the row lets pass, so there it shows only that
+gdb stops). All six edits are spliced under both backends. A splice into a
+`packed` program has not been tried; the `.dwp` is written at the link and a splice does
+not write it again, which should not matter since spliced units are not split, but that is
+inferred and not measured.
 
 ### Real projects
 
@@ -183,40 +195,40 @@ debug info has not been tested.
 
 | | ripgrep | axum hello-world |
 |---|---|---|
-| `llvm-dwarfdump --verify`, rustd's units | 91 units, 0 errors | sound |
-| gdb: stop at each place, name the same arguments and locals as the cargo build, same plain values | 6 places, all as cargo's | 3 of 5 as cargo's; 2 not compared, see below |
+| `llvm-dwarfdump --verify`, rustd's units | 91 units, 0 errors | 31 units, 0 errors |
+| gdb: stop at each place, name the same arguments and locals as the cargo build, same plain values | 6 places, all as cargo's | 6 places, all as cargo's |
 | panic with `RUST_BACKTRACE=1`, frames of the workspace by file:line | 5 frames, same | 6 frames, same |
-| `perf record --call-graph dwarf`, `perf report` | 146 symbols, 50 of rustd's functions, 0 without a name | 124 symbols, 66 of rustd's, 0 without a name |
-| `perf script` lines | 133 frames in rustd's functions, 0 without a line | 63 frames, 0 without a line |
-| `addr2line` at the start of every rustd function | 23,153 functions, 0 without a name, 0 without a line | 7,653 functions, 0 and 0 |
+| `perf record --call-graph dwarf`, `perf report` | 151 symbols, 58 of rustd's functions, 0 without a name | 128 symbols, 74 of rustd's, 0 without a name |
+| `perf script` lines | 163 frames in rustd's functions, 0 without a line | 80 frames, 0 without a line |
+| `addr2line` at the start of every rustd function | 23,255 functions, 0 without a name, 0 without a line | 7,696 functions, 0 and 0 |
 
-These are Cranelift numbers, taken on the head before the merge of `rustd-collate`
-8f21942505 and not taken again since.
+These are Cranelift numbers, taken at this head.
 
 Under LLVM (`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`), at this head:
 
 | | ripgrep | axum hello-world |
 |---|---|---|
 | `llvm-dwarfdump --verify`, rustd's units | 91 units, 0 errors | 30 units, 0 errors |
-| gdb places | 5 of 6 as cargo's; at one, `let mut searched = false;`, the optimizer left the line no code | 3 of 5 as cargo's, 1 value optimized out; 2 not compared, see below |
+| gdb places | 5 of 6 as cargo's; at one, `let mut searched = false;`, the optimizer left the line no code | 6 places, all as cargo's; 2 values optimized out |
 | panic frames | 5, same | 6, same |
-| `perf report` | 107 symbols, 15 of rustd's functions, 0 without a name | 52 symbols, 17 of rustd's, 0 without a name |
-| `perf script` lines | 108 frames in rustd's functions, 0 without a line | 39 frames, 0 without a line |
+| `perf report` | 94 symbols, 10 of rustd's functions, 0 without a name | 59 symbols, 15 of rustd's, 0 without a name |
+| `perf script` lines | 88 frames in rustd's functions, 0 without a line | 33 frames, 0 without a line |
 | `addr2line` | 23,260 functions, 0 and 0 | 7,581 functions, 0 and 0 |
 
 A place where optimized code has no instruction is reported as `no code` and passes only
-under LLVM and only if gdb itself says the line "contains no code". Two of the five axum
-places (the handler's line and one in `axum::serve`) are `not looked at` under either backend
-because gdb does not stop there in the cargo build within the script's 90 seconds, so there
-is nothing to compare with; I have not found out why. The script is not part of the gate or
-of CI, since it clones from GitHub.
+under LLVM and only if gdb itself says the line "contains no code". The axum places were
+five, two of which gdb did not stop at in the cargo build either, so there was nothing to
+compare with; they are now six, each a statement gdb does stop at in the cargo build: two
+in `main`, the handler's panic, two in `axum::serve` and one in the router. The script is not part of the gate or of CI, since it
+clones from GitHub.
 
 Getting there fixed things the small fixtures had not shown: fat pointers to structs with an
 unsized tail were opaque; functions were not nested under their module, so gdb printed bare
 names; compiler-made locals had names; rows of code written inside a macro inside a closure
 pointed at the enclosing function; the code that drops everything when a future is dropped
-half-way had the line of the `async` block, so a breakpoint there stopped in the drop path
-(it is now laid out as cold code at the end); and perf could not unwind through spliced
+half-way had the line of the `async` block and was laid out first, so a breakpoint on the
+handler's line stopped in the drop path (that code, and the blocks that panic when a
+finished future is polled again, are now cold and laid out behind the body); and perf could not unwind through spliced
 code, because the segment a splice appends was not as far from the unwind table in the file
 as in memory. `Image::behind` in `crates/rustd/src/splice.rs` now places it so.
 
@@ -236,17 +248,20 @@ with `RUSTD_DEBUGINFO=0` and without.
 
 | | Cranelift | LLVM -O2 |
 |---|---:|---:|
-| Compile + link, no debug | 5.69 s | 6.69 s |
-| Compile + link, debug | 6.73 s (+18.3%) | 7.72 s (+15.4%) |
-| Object, no debug | 41,500,464 | 37,074,800 |
-| Object, debug | 50,533,848 (+21.8%) | 47,080,264 (+27.0%) |
-| Sections a debugger reads | 4,717,348 | 4,886,745 |
-| Their relocations | 4,316,036 | 5,118,719 |
-| Binary, no debug | 86,999,056 | 83,614,040 |
-| Binary, debug | 91,716,400 | 88,500,784 |
+| Compile + link, no debug | 6.12 s | 6.53 s |
+| Compile + link, debug | 6.92 s (+13.1%) | 7.43 s (+13.8%) |
+| Object, no debug | 41,500,256 | 37,074,800 |
+| Object, debug | 50,533,168 (+21.8%) | 47,080,264 (+27.0%) |
+| Sections a debugger reads | 4,716,874 | 4,886,745 |
+| Their relocations | 4,316,038 | 5,118,719 |
+| Binary, no debug | 86,998,848 | 83,614,040 |
+| Binary, debug | 91,715,720 | 88,500,784 |
 
-Measured on a quiet machine at this head; the time differs by a point or two between runs
-(Cranelift gave +16.7%, +19.2% and +18.3% on three occasions).
+Measured at this head with nothing else running. The sizes are exact; the time is not: over
+five runs of this and the previous head Cranelift gave +13.1%, +16.7%, +16.8%, +18.3% and
++19.2%, and LLVM +13.8% and +15.4% (and +25.3% once with 8.46 s and 10.61 s, a run I take
+for disturbed since the same binary gave 6.53 s and 7.43 s an hour later). Read the time as
+"about 13 to 19 percent".
 
 Round two had +13.4% and +10.4% in time and +16.0% and +20.4% in object size. The growth
 since is the lexical blocks, the captures and coroutine variants, the namespaces, and the
@@ -449,8 +464,13 @@ is a compilation unit of its own, so the executable's units are untouched. The o
 replaced function is still in the file behind its jump and what the executable says about it
 stays true.
 
-If the executable has no section of a kind the patch has, or the section is compressed
-(`SHF_COMPRESSED`), the splice is refused with that reason and rustd links in full instead.
+If the executable has no section of a kind the patch has, the splice adds one: a new header
+at the end of the table, its name added to a copy of the section names written the same way,
+and `e_shnum` updated. Until this round that was refused. It happens with split debug info
+under LLVM, where the executable's location lists are in the `.dwo` files and the patch,
+which is not split, has a `.debug_loc`; three of the six edits of the `kept apart` run were
+linked in full for it before. If a section is compressed (`SHF_COMPRESSED`), the splice is
+refused with that reason and rustd links in full instead.
 
 A function is put in the patch again not only when its code changes but when any of its
 lines change, so adding a line at the top of a file re-describes the functions below it. Its
@@ -676,9 +696,9 @@ callee, that is inlining, which also needs `DW_TAG_inlined_subroutine` (above).
 Locals that Cranelift keeps in a register and unsized locals are not described. I did not
 count how many variables rustc describes for the same code.
 
-Split debug info and the splice. A splice into a program built with `split-debuginfo` other
-than `off` has not been tested, and neither has a real project with it; only the `profile`
-part of the harness builds that way. The split writer is little-endian only.
+Split debug info. A splice into an `unpacked` program is checked (`edits, kept apart`); one
+into a `packed` program is not, and neither is a real project with either setting. The
+split writer is little-endian only.
 
 The real-project check (`realdebug.py`) is not in the gate or in CI: it clones from GitHub
 and takes minutes.

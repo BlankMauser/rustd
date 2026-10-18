@@ -45,8 +45,9 @@ CHECKS = {
                "    " + PANIC + '\n    Html("<h1>Hello, World!</h1>")'),
         places=[("examples/hello-world/src/main.rs", 'println!("listening on {}"'),
                 ("examples/hello-world/src/main.rs", "axum::serve(listener, app).await.unwrap();"),
-                ("examples/hello-world/src/main.rs", 'Html("<h1>Hello, World!</h1>")'),
-                ("axum/src/serve/mod.rs", "let (signal_tx, signal_rx) = watch::channel(());"),
+                ("examples/hello-world/src/main.rs", PANIC),
+                ("axum/src/serve/mod.rs", "let (_close_tx, close_rx) = watch::channel(());"),
+                ("axum/src/serve/mod.rs", "let hyper_service = TowerToHyperService::new(tower_service);"),
                 ("axum/src/routing/mod.rs", "let (req, state) = match self.inner.path_router.call_with_state(req, state) {")],
     ),
 }
