@@ -1,9 +1,9 @@
 # The test suites of 1100 crates.io crates through rustd
 
-Branch `rustd-sweep-2`: `rustd-collate` at `f191c6e42a` (which has the fuzzer of `rustd-fuzz`)
-with `rustd-apps-merged` (`14fad54fcd`) and `rustd-sweep-1000` (`f4fca15318`) merged in.
-Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is updated with each
-push; a section that says "in progress" has numbers from a sweep that is still running.
+Branch `rustd-sweep-2`: `rustd-collate` at `14ee89181b` with `rustd-sweep-1000` (`f4fca15318`)
+merged in. Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is
+updated with each push; a section that says "in progress" has numbers from a sweep that is
+still running.
 
 ## The list
 
@@ -16,55 +16,103 @@ this one in versions and in order.
 ## The gate at the merge
 
 Every harness below was run under Cranelift and then under LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`)
-on the merge with `rustd-collate` at `8f21942505`, one backend at a time. The one commit of
-`rustd-collate` after that, `f191c6e42a`, adds `publish/` and changes nothing that is built or
-tested, so the gate was not run again for it.
+on the merge with `rustd-collate` at `14ee89181b`, one backend at a time, with the binary of
+`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm`.
 
 | harness | Cranelift | LLVM |
 |---|---|---|
 | `difftest.py corpus --bin runner --crate cases --layouts` | match, 0 of 893 layouts differ | match, 0 of 893 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 124 of 124, 8 open, 0 skipped | 124 of 124, 8 open, 0 skipped |
+| `breakers.py` | 128 of 128, 8 open, 0 skipped | 128 of 128, 8 open, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
 | `RUSTD_SPLICE=1 worktrees.py` | 62 of 62 | 62 of 62 |
 | `keys.py` | 46 of 46 | 46 of 46 |
+| `fuzz/fuzz.py smoke` | 2 programs, 505 functions, 0 differences | 2 programs, 505 functions, 0 differences |
+| `backends.py corpus runner cases --bin runner --levels 2f` | (LLVM only) | prints the same as cargo's |
 | `debuginfo.py` | all right | all right |
 | `buildmodel.py` | 194 of 194 | (runs both) |
 | `storekills.py --kills 100` | pass | pass |
 | `storecorrupts.py --rounds 4` | pass | pass |
 | `storefull.py` | pass | pass |
 | `storeshared.py` | pass, 180 builds | pass, 180 builds |
-| `fuzz/fuzz.py smoke` | 2 programs, 505 functions, 0 differences | 2 programs, 505 functions, 0 differences |
+| `storeguards.py` | all right | all right |
+| `selects.py` | 3 of 3 | 3 of 3 |
 
 `cargo fmt --all -- --check` is clean and `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p rustd` passes. `cargo clippy -p rustd --all-targets -- --cap-lints warn` prints
-147 warnings for the `rustd` binary; they were not compared against a clippy run of
-`rustd-collate`, so "no new warnings" is not established.
+-p syntax -p rustd` passes.
 
-The merge made one breaker that was listed as open pass: `backtrace_line`. It is now in the
-passing set. The open breakers are the union of both sides' lists: `raw_write_then_match`,
-`future_unwind_flags`, `fragment_edition_through_macro`, `assert_long_expression`,
-`assert_message` and `unreachable_arm_move` (`harness/breakers.py` counts 8 open cases over
-them).
+Not run: `remote.py` (no minio on this machine), `worktrees.py --join --together` and
+`--overlay`, and `cargo_rustd.py --small`. The last one was started and stopped after 17
+minutes in which it used no processor time; its log ends at ripgrep's cold build with cargo
+exiting 101. Whether that is this machine (its `TMPDIR` is `/dev/shm`) or the merge was not
+looked into.
+
+Clippy (`cargo clippy -p rustd --all-targets -- --cap-lints warn`) was compared with
+`rustd-collate` at `f191c6e42a` on the previous push: the same 97 kinds of warning, three more
+instances, two of which are fixed here. It was not compared again after this merge.
+
+Where `rustd-collate` and this branch had fixed the same thing, one fix was kept:
+
+| what | kept | case |
+|---|---|---|
+| An alias that names the lifetime of a binder around it, in monomorphization | `rustd-collate`'s: normalize with placeholders and put the bound lifetimes back | `alias_under_binder` (collate's) and `alias_under_binder_projection` (this branch's, renamed) |
+| A variant reexported through a private import of its enum | this branch's: the visibility the enum is declared with, kept by the module scope | both `nameres` tests, `variant_alias_reexported` and `variant_reexported_through_private_enum_import` |
+| A tuple struct's constructor as a promotable aggregate | identical in both | `promoted_constructor` |
+
+An unset `env!` variable both records the read for the build key (collate's) and is an
+expansion error (this branch's). The file name under a stable name goes through collate's
+`stored` (a path under cargo's home is named the same on every machine), inside this branch's
+`file_name`.
+
+The open breakers are `raw_write_then_match`, `future_unwind_flags`,
+`fragment_edition_through_macro`, `assert_long_expression`, `assert_message` and
+`unreachable_arm_move`.
 
 ## Totals
 
-In progress, and not yet a result for this head. The sweep was restarted from the first crate
-with the binary of this head once its gate was green; the LLVM pass follows the Cranelift one.
+In progress, and not a result for this head. What follows is the Cranelift sweep on the
+binary of an earlier push (`a9b62fbfce`), stopped at 578 of the 1100 crates for this merge.
+It is run again from the first crate on this head, and LLVM after it.
 
-A partial Cranelift run on the binary of the previous push (`ba877c6c8c`) reached 175 of the
-1100 crates before it was stopped: 140 match, 29 untested (no test binary, or no function of
-the crate reached by a test; the `windows_*` crates are ten of them), 6 stopped by the
-harness and not by rustd, 22,419 tests, 43,985 of 44,009 functions from rustd. The 24 left to
-rustc were in two crates: generic-array (15: `UnresolvedMethod` and layouts of `GenericArray`,
-the next-solver cause `harness/BREAKERS.md` lists as open) and ring (9:
-`MissingFunctionDefinition` and `NotSupported`). Mismatches seen in that run were thrown away
-unexamined, because a second sweep was by mistake running over the same build directories at
-the time, so it says nothing about how many crates differ.
+| | Cranelift, 578 of 1100 crates |
+|---|---|
+| tests print the same as under rustc | 443 |
+| differ | 8 |
+| untested | 126 |
+| timed out at 25 minutes | 1 (base64) |
+| tests run and compared | 36,880 |
+| functions from rustd | 130,580 of 130,612 |
+
+The 32 functions left to rustc:
+
+| reason | functions | crates |
+|---|---|---|
+| `UnresolvedMethod`, and two layouts of `GenericArray` (the next-solver cause `harness/BREAKERS.md` has as open) | 15 | generic-array |
+| `MissingFunctionDefinition` | 6 | ring |
+| `NotSupported` | 4 | encode_unicode, ring |
+| LLVM intrinsic `x86.aesni.aeskeygenassist` | 3 | aes |
+| calling convention `EfiApi` | 3 | r-efi |
+| layout of an array | 1 | wit-bindgen |
+
+The 8 that differ have not been reduced yet. From their logs:
+
+| crate | what differs | first reading |
+|---|---|---|
+| tracing-opentelemetry | `layer::tests::otel_context_propagation` fails under rustd only: a span id that should be zero is not | a candidate for a real bug |
+| sysinfo | `check_refresh_process_update` fails under rustc and passes under rustd | the test counts processes of the machine; likely not rustd |
+| openssl | four tests fail under both and print differently | not looked into |
+| semver-parser | `generated_code_is_fresh` fails under both | not looked into |
+| num_enum, proc-macro-crate | tests fail under both: they want a manifest beside the crate that the published crate does not have | the harness should not count a test that fails the same way under rustc |
+| hyper-timeout | `test_upload_timeout` | a timeout test; not looked into |
+| jobserver | nothing in the log names a test | not looked into |
+
+Of the 126 untested, 83 have no test binary at all (no tests, or the tests do not build under
+cargo either) and 42 have one in which no function of the crate is reached. tokio is the last:
+171 test binaries, all left out because they need features that are off by default.
 
 ## How to rerun
 
