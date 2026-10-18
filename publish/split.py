@@ -110,6 +110,7 @@ def main():
     text = open(fuzz).read()
     assert text.count('"src/mir/codegen/corpus"') == 1
     open(fuzz, "w").write(text.replace('"src/mir/codegen/corpus"', f'"../../../../{CODEGEN_AT}/corpus"'))
+    subprocess.run(["rustfmt", "--edition", "2024", fuzz], check=True)
 
     wasm = f"{out}/crates/rustd-wasm/Cargo.toml"
     text = open(wasm).read()
