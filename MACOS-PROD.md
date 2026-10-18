@@ -181,8 +181,16 @@ made, since the callee owns it and nothing of it is read afterwards. `parse_expr
 
 The margin is thin, and this is measured: with `ulimit -s`, that input needs between 6 and
 7 MiB of stack in rustd's binary and between 4 and 5 MiB in rustc's, and the main thread
-has 8. The frames are still about a third larger than rustc's. I did not find what the
-rest is; my guess is temporaries that rustc's MIR does not have, which is not measured.
+has 8. The frames are still about a third larger than rustc's (`parse_expression`: 4064
+bytes against 3024). Part of the reason is measured: the MIR rustd compiles for
+`parse_expression` has 63 locals where rustc's has 41 (9 `Expression` against 5, 8
+`Result<Infallible, CompileError>` against 3, 6 `Box<Expression>` against 2), most of the
+extra ones being copies of a value made just before a call, and every local gets a stack
+slot of its own because the code generator ignores `StorageLive` and `StorageDead`. That
+the extra locals add up to the whole difference is inferred, not measured. Sharing slots
+between locals that are never live together would close it, but nothing has ever checked
+the storage statements of this MIR (the interpreter ignores them too), so it is not a
+small change and it is not done.
 This is shared code and changes what Cranelift emits on every target.
 
 ### Debug settings
@@ -290,7 +298,7 @@ of the head is in the final message of the round, not here.
 2. x86_64-apple-darwin, from the list above.
 3. Debug info of a stripped binary and of a binary linked with `-dead_strip`: not looked at.
 4. A test of the store under a real loss of power, on a real drive.
-5. Why rustd's Cranelift frames are a third larger than rustc's: `just` passes with about
-   1 MiB of stack to spare.
+5. rustd's Cranelift frames are a third larger than rustc's, so `just` passes with about
+   1 MiB of stack to spare: share stack slots between locals that are not live together.
 6. Variables under LLVM and enums in debug info, on every format.
 7. The clippy error in `remote.rs`.
