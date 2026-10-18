@@ -180,15 +180,20 @@ fn status() -> anyhow::Result<i32> {
                 daemon.idle_secs.map_or("never".to_owned(), |it| format!("after {it}s idle"));
             let _ = writeln!(
                 said,
-                "daemon: pid {}, version {}, exits {idle}",
-                daemon.pid, daemon.version
+                "daemon: pid {}, version {}, exits {idle}, workers hold {}",
+                daemon.pid,
+                daemon.version,
+                daemon
+                    .memory_max
+                    .map_or("any amount".to_owned(), |it| format!("at most {} MB", it >> 20))
             );
             for worker in daemon.workers {
                 let _ = writeln!(
                     said,
-                    "  worker: pid {}, {}, log {}",
+                    "  worker: pid {}, {}, {}log {}",
                     worker.pid,
                     worker.project.display(),
+                    worker.resident.map(|it| format!("{} MB, ", it >> 20)).unwrap_or_default(),
                     worker.log.display()
                 );
                 for (root, warmth) in worker.checkouts {

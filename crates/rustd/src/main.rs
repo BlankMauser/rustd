@@ -1029,6 +1029,8 @@ impl Checkouts {
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
         let project = dunce::canonicalize(project).ok()?;
+        // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
+        project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
             if self.splits[at].is_some() {
@@ -1494,13 +1496,23 @@ const DOCTESTS_ARE_NOT_BUILT: &str = "doctests are not built: rustdoc takes each
     and linking a program of its own for each, where it only replaces functions of a \
     program cargo linked";
 
+/// The absolute path as the ones of the loaded files are held, which are UTF-8.
+fn absolute_utf8(path: PathBuf) -> anyhow::Result<AbsPathBuf> {
+    let path = paths::Utf8PathBuf::from_path_buf(path).map_err(|path| {
+        anyhow::anyhow!("{} is not UTF-8, which a loaded path is", path.display())
+    })?;
+    AbsPathBuf::try_from(path).map_err(|path| anyhow::anyhow!("{path} is not absolute"))
+}
+
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
 ) -> anyhow::Result<(ProjectWorkspace, bool)> {
-    let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
+    // By its real path, as the files of it are named by those who ask for a build: a
+    // project reached through a link is the one it links to.
+    let root = absolute_utf8(dunce::canonicalize(project)?)?;
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     let mut debug = false;
@@ -1750,9 +1762,11 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
     std::thread::scope(|scope| {
         // The bodies of one file are next to each other, and the edited file's are the slow
         // ones: each thread takes every nth, so that they are spread over all of them.
+        let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
             let (db, bodies) = (db.clone(), &bodies);
             scope.spawn(move || {
+                PROBING.set(probing);
                 hir::attach_db(&db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
                         Body::of(&db, body);
@@ -1780,6 +1794,21 @@ thread_local! {
     /// Set on a thread that asks about what an edit may have removed. A query about something
     /// that is gone panics, which is the answer and not worth a report.
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Has the thread be one that probes for as long as it lives.
+pub(crate) struct Probing(bool);
+
+impl Probing {
+    pub(crate) fn new() -> Probing {
+        Probing(PROBING.replace(true))
+    }
+}
+
+impl Drop for Probing {
+    fn drop(&mut self) {
+        PROBING.set(self.0);
+    }
 }
 
 fn build(
@@ -4412,7 +4441,7 @@ impl Program {
 
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
-    Ok(VfsPath::from(AbsPathBuf::assert_utf8(dunce::canonicalize(path)?)))
+    Ok(VfsPath::from(absolute_utf8(dunce::canonicalize(path)?)?))
 }
 
 fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {

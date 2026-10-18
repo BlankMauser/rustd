@@ -32,7 +32,7 @@ request took and who built it. A failure prints the seed and the step, and keeps
 sides said in `failures/STEP`. `--resume` goes on from the last whole step of a work
 directory; `--report` prints what a work directory measured.
 """
-import argparse, collections, concurrent.futures, glob, json, os, random, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, collections, concurrent.futures, glob, json, os, random, re, shutil, signal, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -42,6 +42,7 @@ from cargo_rustd import RUSTD, PROJECTS, base_env, how_built, program_output, te
 BEGIN, END = "// soak:begin", "// soak:end"
 MODEL = "soak-model.json"
 REQUEST_SECS = 1800
+ODD = ("link failed", "did not answer", "worker ended", "panicked")
 WARM_SECS = 600
 GIT = ["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", "-c", "advice.detachedHead=false", "-c", "commit.gpgsign=false"]
 
@@ -351,9 +352,14 @@ class Soak:
     def __init__(self, args):
         self.args = args
         self.work = args.work
+        self.reference = threading.Lock()
         self.state_path = os.path.join(self.work, "state.json")
         self.home, self.store = os.path.join(self.work, "home"), os.path.join(self.work, "store")
         self.env = dict(base_env(self.home), RUSTD_CACHE=self.store, SOAK_REPORT="1", RUSTD_IDLE_SECS=str(args.idle))
+        if not args.debuginfo:
+            # A tenth of the disk, for cargo and the daemon alike; the switch of profile to
+            # release and back is a step of its own.
+            self.env.update(CARGO_PROFILE_DEV_DEBUG="0", CARGO_PROFILE_TEST_DEBUG="0", CARGO_INCREMENTAL="0")
         self.env.pop("RUSTD_REMOTE", None)
         self.metrics = open(os.path.join(self.work, "metrics.jsonl"), "a")
         self.requests, self.touched, self.killed, self.log_at = [], [], False, {}
@@ -414,7 +420,8 @@ class Soak:
 
     # Asking.
     def reference_env(self, tree):
-        return dict(self.env, CARGO_TARGET_DIR=tree.path("target-ref"))
+        # Nothing is built from it twice, so what an incremental build keeps is only room.
+        return dict(self.env, CARGO_TARGET_DIR=tree.path("target-ref"), CARGO_INCREMENTAL="0")
 
     def command(self, tree, kind, feature):
         """The arguments after `cargo [rustd]` and the variables of a request of `kind`."""
@@ -433,6 +440,16 @@ class Soak:
     def ask(self, tree, argv, env, ours=True, cancel=None):
         """Runs one request to its end. `cancel` is how long to wait and the signal to send."""
         base = self.env if ours else self.reference_env(tree)
+        if not ours:
+            # Cold: cargo starts from nothing, and what it built does not stay on the disk.
+            # One at a time: each is as large as the project's whole build.
+            with self.reference:
+                return self.ask_cargo(tree, argv, env, base)
+        return self.ask_cargo(tree, argv, env, base, ours, cancel)
+
+    def ask_cargo(self, tree, argv, env, base, ours=False, cancel=None):
+        if not ours:
+            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         began = time.time()
         child = subprocess.Popen(["cargo", *(["rustd"] if ours else []), *argv], cwd=tree.root, env=dict(base, **env),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -456,9 +473,14 @@ class Soak:
             except ProcessLookupError:
                 pass
         ran = subprocess.CompletedProcess(argv, child.returncode, out, err)
+        if "No space left on device" in err:
+            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
+            raise RuntimeError(f"the disk of {self.work} is full")
         if ours:
             self.requests.append(dict(tree=os.path.relpath(tree.root, self.work), kind=argv[0], secs=round(time.time() - began, 3),
                                       built=how_built(err), cancelled=cancelled))
+        else:
+            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         return ran
 
     def status(self, tree=None):
@@ -558,13 +580,16 @@ class Soak:
 
     def verify(self, tree, rng):
         """Builds `tree` one of the ways there are, and compares at the sampled rate."""
-        if rng.random() < self.args.warm:
-            self.wait_warm(tree)
+        warm = rng.random() < self.args.warm
         if rng.random() < 0.15 and self.direct(tree) is not None:
             return
         kind = rng.choices(["exit", "run", "test", "build"], [35, 30, 20, 15])[0]
         feature = rng.random() < 0.12
         argv, env = self.command(tree, kind, feature)
+        if warm:
+            # The daemon loads a build when it is first asked for, which cargo answers.
+            self.ask(tree, argv, env)
+            self.wait_warm(tree)
         if rng.random() < self.args.sample:
             self.compare(tree, kind, feature)
         else:
@@ -806,6 +831,22 @@ class Soak:
             found += [f"{log}: {line}" for line in text.splitlines() if "panicked" in line or "RUST_BACKTRACE" in line and "panicked" in line]
         return found
 
+    def keep_odd(self, step):
+        """Keeps the logs of the daemon and its workers beside a refusal that is not the
+        ordinary kind (a link that failed, a worker that ended or did not answer)."""
+        odd = [r for r in self.requests if any(it in (r["built"] or "") for it in ODD)]
+        if not odd or self.state.setdefault("odd", 0) >= 40:
+            return
+        self.state["odd"] += 1
+        where = os.path.join(self.work, "odd", f"step-{step}")
+        os.makedirs(where, exist_ok=True)
+        with open(os.path.join(where, "requests.json"), "w") as out:
+            json.dump(odd, out, indent=1)
+        home = self.env["RUSTD_HOME"]
+        for log in [os.path.join(home, "daemon.log"), *glob.glob(os.path.join(home, "workers", "*", "log"))]:
+            if os.path.exists(log):
+                shutil.copy(log, os.path.join(where, os.path.relpath(log, home).replace(os.sep, "_")))
+
     def fail(self, step, why, files=None):
         seed = self.state["seed"]
         where = os.path.join(self.work, "failures", str(step))
@@ -822,6 +863,16 @@ class Soak:
         self.state["failures"].append(dict(step=step, why=why[:2000]))
         print(f"FAIL at step {step} of seed {seed}: {why}\n  kept in {where}\n  again: soak.py --seed {seed} --steps {step} --projects {','.join(self.args.projects)} --worktrees {self.args.worktrees} --sample {self.args.sample}  ({self.state['backend']})", flush=True)
 
+    def make_room(self, least=4 << 30):
+        """Keeps the soak from filling its disk: the reference builds go first, which are
+        then cold again, and then what cargo and the daemon built, which is built again."""
+        for name in ("target-ref", "target"):
+            for tree in self.trees():
+                if shutil.disk_usage(self.work).free >= least:
+                    return
+                shutil.rmtree(tree.path(name), ignore_errors=True)
+                print(f"       room: {tree.path(name)} removed", flush=True)
+
     def run(self):
         began = time.time()
         while self.state["step"] < self.args.steps and time.time() - began < self.args.hours * 3600:
@@ -830,6 +881,7 @@ class Soak:
             kind = rng.choices([k for k, _ in self.STEPS], [w for _, w in self.STEPS])[0]
             self.requests, self.touched, self.killed = [], [], False
             started, said, failed = time.time(), "", False
+            self.make_room()
             try:
                 said = getattr(self, f"step_{kind}")(rng)
                 for tree in {t.root: t for t in self.touched}.values():
@@ -845,6 +897,7 @@ class Soak:
                 failed = True
                 self.fail(step, f"[{kind}] {said}: the harness could not go on: {error}")
             self.state["step"] = step
+            self.keep_odd(step)
             line = self.measure(step, kind, said, time.time() - started)
             self.keep()
             if not self.args.quiet or failed or step % 25 == 0:
@@ -935,6 +988,7 @@ def main():
     parser.add_argument("--sample", type=float, default=0.5, help="the share of requests compared with cargo")
     parser.add_argument("--warm", type=float, default=0.7, help="the share of builds that wait for the daemon to have loaded")
     parser.add_argument("--idle", type=int, default=1800, help="RUSTD_IDLE_SECS of the daemon")
+    parser.add_argument("--debuginfo", action="store_true", help="build with the debug info of the profiles, which takes the disk for it")
     parser.add_argument("--stop", action="store_true", help="stop at the first failure")
     parser.add_argument("--quiet", action="store_true", help="a line every 25 steps and for every failure")
     args = parser.parse_args()
@@ -951,6 +1005,8 @@ def main():
         os.makedirs(args.work, exist_ok=True)
     print(f"seed {args.seed}, {backend()}, in {args.work}", flush=True)
     soak = Soak(args)
+    if not shutil.which("cargo-rustd", path=soak.env["PATH"].split(os.pathsep)[0]):
+        sys.exit("no cargo-rustd beside the rustd of RUSTD_BIN")
     if args.resume:
         for tree in soak.trees():
             tree.write(tree.model())

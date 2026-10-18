@@ -7,7 +7,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -63,26 +63,23 @@ pub(super) struct Asked {
 
 impl Asked {
     pub(super) fn fetch_from(&self, lazy: Lazy) {
-        if let Ok(mut now) = self.lazy.write() {
-            *now = Some(Arc::new(lazy));
-        }
+        *self.lazy.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(lazy));
     }
 
     /// Whether the manifest is what it was when it was last pulled from.
     fn saw(&self, manifest: Option<Digest>) -> bool {
-        self.seen.lock().is_ok_and(|seen| *seen == manifest)
+        *crate::lock(&self.seen) == manifest
     }
 
     /// Notes what the manifest is, and says whether that is not what it was.
     pub(super) fn see(&self, manifest: Option<Digest>) -> bool {
-        let Ok(mut seen) = self.seen.lock() else { return false };
-        std::mem::replace(&mut *seen, manifest) != manifest
+        std::mem::replace(&mut *crate::lock(&self.seen), manifest) != manifest
     }
 
     /// Whether the pack that holds `key` is in the store now. A key that stays lacking has
     /// the task look at the manifest, once for all that are lacking by then.
     pub(super) fn fetch(&self, key: &[u8; 32]) -> bool {
-        let lazy = self.lazy.read().ok().and_then(|it| it.clone());
+        let lazy = self.lazy.read().unwrap_or_else(PoisonError::into_inner).clone();
         if lazy.is_some_and(|it| it.fetch(key)) {
             return true;
         }

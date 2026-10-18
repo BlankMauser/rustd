@@ -622,7 +622,10 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
     hasher.update(text);
     let key: [u8; 32] = hasher.finalize().into();
     let assembled = ASSEMBLED.get_or_init(Mutex::default);
-    if let Some(code) = assembled.lock().ok().and_then(|it| it.get(&key).cloned()) {
+    // Also after a thread panicked with it: the map is whole between any two statements.
+    let known =
+        |key: &[u8; 32]| assembled.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned();
+    if let Some(code) = known(&key) {
         return Ok(code);
     }
     let store = Store::global();
@@ -637,9 +640,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
             code
         }
     });
-    if let Ok(mut assembled) = assembled.lock() {
-        assembled.insert(key, code.clone());
-    }
+    assembled.lock().unwrap_or_else(|e| e.into_inner()).insert(key, code.clone());
     Ok(code)
 }
 

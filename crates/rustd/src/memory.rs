@@ -20,9 +20,23 @@ pub(crate) fn report_dir() -> Option<PathBuf> {
 
 /// Megabytes of memory the process has resident.
 pub(crate) fn resident() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find_map(|it| it.strip_prefix("VmRSS:"))?;
-    Some(line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()? / 1024)
+    Some(resident_of(std::process::id())? >> 20)
+}
+
+/// Bytes of memory a process has resident, where the system says so in `/proc`.
+pub(crate) fn resident_of(pid: u32) -> Option<u64> {
+    kilobytes(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?, "VmRSS:")
+}
+
+/// Bytes of memory the machine has, where the system says so in `/proc`.
+pub(crate) fn of_the_machine() -> Option<u64> {
+    kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
+}
+
+/// The bytes a line of `/proc` such as `VmRSS:   1234 kB` says.
+fn kilobytes(text: &str, name: &str) -> Option<u64> {
+    let line = text.lines().find_map(|it| it.strip_prefix(name))?;
+    line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
 /// Bytes allocated and not freed, when the allocator counts them.
@@ -96,4 +110,17 @@ fn write_heap_profile(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(feature = "heap-profile"))]
 fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_of_proc_is_read_as_bytes() {
+        let status = "Name:\trustd\nVmRSS:\t    2048 kB\nThreads:\t4\n";
+        assert_eq!(kilobytes(status, "VmRSS:"), Some(2048 << 10));
+        assert_eq!(kilobytes(status, "VmSwap:"), None);
+        assert_eq!(kilobytes("VmRSS: many kB\n", "VmRSS:"), None);
+    }
 }

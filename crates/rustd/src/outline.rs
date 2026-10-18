@@ -89,10 +89,12 @@ fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
     };
     // A function the edit took away is an edit to more than bodies, and asking for its body
     // panics.
+    let probing = crate::Probing::new();
     let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::lower(db, functions.iter().map(|&it| it.into()).collect());
         Written::of(db, &functions)
     }));
+    drop(probing);
     let seen = match seen {
         Ok(Some(seen)) => seen,
         Ok(None) => {
@@ -100,6 +102,10 @@ fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
                 eprintln!("outline: {file:?} is included in another file");
             }
             return None;
+        }
+        // An interrupted build is not a function that is gone.
+        Err(stopped) if stopped.is::<ide_db::base_db::salsa::Cancelled>() => {
+            std::panic::resume_unwind(stopped)
         }
         Err(_) => {
             if stats {

@@ -346,7 +346,10 @@ impl State {
         counts: Counts,
     ) -> anyhow::Result<State> {
         let metadata = metadata(asked)?;
-        let root = metadata.workspace_root.clone().into_std_path_buf();
+        // By its real path, as rustc's working directory and so the sources of the units
+        // are: a workspace reached through a link is the one it links to.
+        let root = metadata.workspace_root.as_std_path();
+        let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_owned());
         let dir = metadata.target_directory.as_std_path().join("rustd").join(key);
         let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
         let artifacts: Vec<&Artifact> =
@@ -368,7 +371,7 @@ impl State {
             counts,
         };
         let project = match project(asked, cwd, &metadata) {
-            Ok(project) => project,
+            Ok(project) => dunce::canonicalize(&project).unwrap_or(project),
             Err(why) => {
                 state.refusal = Some(why);
                 root.clone()
@@ -466,7 +469,11 @@ impl State {
         // Cargo runs the doc tests of the packages it runs the tests of.
         let tested: FxHashSet<_> =
             artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
-        let documented = |it: &&Package| it.targets.iter().any(|it| it.is_lib() && it.doctest);
+        // A proc macro is a library with doc tests as much as any other.
+        let library = |it: &cargo_metadata::Target| {
+            it.is_lib() || it.is_rlib() || it.is_dylib() || it.is_proc_macro()
+        };
+        let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
         state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);

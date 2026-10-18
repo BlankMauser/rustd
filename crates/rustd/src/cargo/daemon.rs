@@ -9,7 +9,10 @@ use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -32,6 +35,53 @@ use crate::{
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
 const IDLE: Duration = Duration::from_secs(1800);
+
+/// How often the workers are looked at for ones to stop.
+const REAP: Duration = Duration::from_secs(1);
+
+/// The share of the machine's memory the workers may hold when `RUSTD_MEMORY_MAX` does not
+/// say: one part in this many.
+const MEMORY_SHARE: u64 = 2;
+
+/// The most the workers may have resident together, from `RUSTD_MEMORY_MAX`: a size, or
+/// `off` for no limit. Half of the machine's memory when it does not say, and no limit
+/// where the system does not tell how much that is.
+fn memory_max() -> Result<Option<u64>, String> {
+    match std::env::var("RUSTD_MEMORY_MAX") {
+        Err(_) => Ok(crate::memory::of_the_machine().map(|it| it / MEMORY_SHARE)),
+        Ok(text) if text == "off" => Ok(None),
+        Ok(text) => hir_ty::mir::codegen::parse_size(&text)
+            .map(Some)
+            .ok_or_else(|| format!("RUSTD_MEMORY_MAX=`{text}` is neither a size nor `off`")),
+    }
+}
+
+/// What a worker holds and how much it is in use.
+struct Held {
+    resident: u64,
+    asked: Instant,
+    answering: bool,
+}
+
+/// The workers to stop for the rest to hold no more than `most`: the ones asked longest
+/// ago first. One that is answering a request is left, and so is the one asked last, which
+/// would only be started again.
+fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
+    let mut all: u64 = holding.iter().map(|it| it.1.resident).sum();
+    let last = holding.iter().map(|it| it.1.asked).max();
+    let mut idle: Vec<&(String, Held)> =
+        holding.iter().filter(|it| !it.1.answering && Some(it.1.asked) != last).collect();
+    idle.sort_by_key(|it| it.1.asked);
+    let mut stopped = Vec::new();
+    for (id, held) in idle {
+        if all <= most {
+            break;
+        }
+        all -= held.resident;
+        stopped.push(id.clone());
+    }
+    stopped
+}
 
 /// How often a worker that is loading is looked at.
 const POLL: Duration = Duration::from_millis(20);
@@ -85,6 +135,8 @@ pub(crate) struct Status {
     pub(crate) pid: u32,
     pub(crate) version: String,
     pub(crate) idle_secs: Option<u64>,
+    /// The most the workers may have resident together, in bytes.
+    pub(crate) memory_max: Option<u64>,
     pub(crate) workers: Vec<WorkerStatus>,
 }
 
@@ -93,6 +145,8 @@ pub(crate) struct WorkerStatus {
     pub(crate) pid: u32,
     pub(crate) project: PathBuf,
     pub(crate) log: PathBuf,
+    /// The bytes it has resident, where the system tells.
+    pub(crate) resident: Option<u64>,
     /// Each checkout the worker holds and how warm it is.
     pub(crate) checkouts: Vec<(PathBuf, String)>,
 }
@@ -211,6 +265,25 @@ struct Worker {
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
+    /// The requests it is answering now.
+    answering: AtomicUsize,
+}
+
+/// Counts a request among those a worker is answering for as long as it lives, also when
+/// the thread that asks unwinds.
+struct Answering<'a>(&'a AtomicUsize);
+
+impl<'a> Answering<'a> {
+    fn new(count: &'a AtomicUsize) -> Answering<'a> {
+        count.fetch_add(1, Ordering::SeqCst);
+        Answering(count)
+    }
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Worker {
@@ -266,6 +339,7 @@ impl Worker {
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
         })
     }
 
@@ -304,6 +378,7 @@ impl Worker {
     /// `started_on` is whether the worker was started on the checkout's first program, which
     /// is then built already.
     fn warm(&self, checkout: &Checkout, started_on: bool) {
+        let _answering = Answering::new(&self.answering);
         let warmth = match self.warmed(checkout, started_on) {
             Ok(()) => Warmth::Ready,
             Err(why) => Warmth::Failed(format!("{why:#}")),
@@ -355,6 +430,7 @@ impl Worker {
     /// Brings the programs of `checkout` up to date, all at once: the worker builds the
     /// requests that wait for it together.
     fn sync(&self, checkout: &Checkout) -> Reply {
+        let _answering = Answering::new(&self.answering);
         let asked: Vec<anyhow::Result<Result<String, String>>> = std::thread::scope(|scope| {
             let asking: Vec<_> = checkout
                 .programs
@@ -374,12 +450,22 @@ impl Worker {
         }
     }
 
+    /// Forgets the checkouts whose directory is gone, as that of a worktree that was
+    /// removed is. Whether any is left.
+    fn has_checkouts(&self) -> bool {
+        let mut checkouts = lock(&self.checkouts);
+        checkouts.retain(|_, loaded| loaded.root.is_dir());
+        !checkouts.is_empty()
+    }
+
     fn status(&self) -> WorkerStatus {
         let checkouts = lock(&self.checkouts);
+        let pid = lock(&self.child).id();
         WorkerStatus {
-            pid: lock(&self.child).id(),
+            pid,
             project: self.project.clone(),
             log: self.log.clone(),
+            resident: crate::memory::resident_of(pid),
             checkouts: checkouts
                 .values()
                 .map(|it| (it.root.clone(), it.warmth.describe()))
@@ -393,6 +479,8 @@ struct Daemon {
     version: String,
     home: PathBuf,
     idle: Option<Duration>,
+    /// The most the workers may have resident together, in bytes.
+    memory_max: Option<u64>,
     workers: Mutex<FxHashMap<String, Arc<Worker>>>,
     asked: Mutex<Instant>,
 }
@@ -420,6 +508,12 @@ pub(crate) fn version() -> String {
     let built = executable.map(|it| (it.len(), it.modified().map_or(0, stamp_of)));
     let (len, written) = built.unwrap_or_default();
     format!("{}-{len:x}-{written:x}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether the file this process runs from was removed or replaced, as an install does. A
+/// worker is started from that file.
+fn executable_is_gone() -> bool {
+    std::env::current_exe().is_ok_and(|it| !it.exists())
 }
 
 /// `rustd daemon`: serves the user's builds until it has been idle for long enough or is
@@ -451,6 +545,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         version: version(),
         home,
         idle,
+        memory_max: memory_max().map_err(anyhow::Error::msg)?,
         workers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
     });
@@ -508,6 +603,7 @@ impl Daemon {
                 pid: std::process::id(),
                 version: self.version.clone(),
                 idle_secs: self.idle.map(|it| it.as_secs()),
+                memory_max: self.memory_max,
                 workers: lock(&self.workers).values().map(|it| it.status()).collect(),
             }),
             Request::Stop => Reply::Stopping,
@@ -575,23 +671,60 @@ impl Daemon {
         Ok(())
     }
 
-    /// Stops the workers nobody has asked for the idle time, and the daemon when nobody has
-    /// asked it.
+    /// Once a second, stops the workers that are of no use: the ones nobody has asked for
+    /// the idle time, the ones whose checkouts are gone, and the ones asked longest ago
+    /// when together they hold more than they may. Ends the daemon when nobody has asked it
+    /// for the idle time, and when the file it runs from is gone.
     fn reap(&self) {
-        let Some(idle) = self.idle else { return };
         loop {
-            std::thread::sleep(idle.min(Duration::from_secs(1)));
-            if lock(&self.asked).elapsed() >= idle {
+            std::thread::sleep(self.idle.map_or(REAP, |idle| idle.min(REAP)));
+            if let Some(idle) = self.idle.filter(|&idle| lock(&self.asked).elapsed() >= idle) {
                 eprintln!("idle for {idle:.0?}");
                 self.end();
             }
-            lock(&self.workers).retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle;
-                if !keep {
-                    worker.stop();
-                }
-                keep
+            let mut workers = lock(&self.workers);
+            let answering = workers.values().any(|it| it.answering.load(Ordering::SeqCst) != 0);
+            if !answering && executable_is_gone() {
+                drop(workers);
+                eprintln!("the file this daemon runs from is gone, and no worker can be started");
+                self.end();
+            }
+            workers.retain(|id, worker| {
+                let idle = self.idle.is_some_and(|idle| lock(&worker.asked).elapsed() >= idle);
+                let why = match () {
+                    _ if idle => "nobody asked it for the idle time",
+                    _ if !worker.has_checkouts() => "its checkouts are gone",
+                    _ => return true,
+                };
+                eprintln!("worker {id} stopped: {why}");
+                worker.stop();
+                false
             });
+            if let Some(most) = self.memory_max {
+                let held = |worker: &Arc<Worker>| {
+                    let resident = crate::memory::resident_of(lock(&worker.child).id());
+                    Held {
+                        resident: resident.unwrap_or(0),
+                        asked: *lock(&worker.asked),
+                        answering: worker.answering.load(Ordering::SeqCst) != 0,
+                    }
+                };
+                let holding: Vec<(String, Held)> =
+                    workers.iter().map(|(id, worker)| (id.clone(), held(worker))).collect();
+                for id in over(&holding, most) {
+                    if let Some(worker) = workers.remove(&id) {
+                        let all: u64 = holding.iter().map(|it| it.1.resident).sum();
+                        eprintln!(
+                            "worker {id} of {} stopped: the workers hold {} MB, over the {} MB \
+                             of RUSTD_MEMORY_MAX, and it was asked longest ago",
+                            worker.project.display(),
+                            all >> 20,
+                            most >> 20
+                        );
+                        worker.stop();
+                    }
+                }
+            }
         }
     }
 
@@ -603,5 +736,34 @@ impl Daemon {
         let _ = std::fs::remove_file(socket_in(&self.home));
         eprintln!("daemon of pid {} ends at {:?}", std::process::id(), SystemTime::now());
         std::process::exit(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_workers_asked_longest_ago_are_stopped_for_the_rest_to_fit() {
+        let start = Instant::now();
+        let held = |resident: u64, asked: u64, answering: bool| Held {
+            resident,
+            asked: start + Duration::from_secs(asked),
+            answering,
+        };
+        let holding = |workers: [Held; 4]| {
+            let ids = ["a", "b", "c", "d"].map(str::to_owned);
+            ids.into_iter().zip(workers).collect::<Vec<_>>()
+        };
+        let idle =
+            || [held(40, 3, false), held(30, 1, false), held(20, 2, false), held(10, 4, false)];
+        assert_eq!(over(&holding(idle()), 100), Vec::<String>::new());
+        assert_eq!(over(&holding(idle()), 70), ["b"]);
+        assert_eq!(over(&holding(idle()), 45), ["b", "c", "a"]);
+        // The one asked last stays, whatever it holds.
+        assert_eq!(over(&holding(idle()), 0), ["b", "c", "a"]);
+        // One that is answering stays.
+        let busy = [held(40, 3, false), held(30, 1, true), held(20, 2, false), held(10, 4, false)];
+        assert_eq!(over(&holding(busy), 70), ["c", "a"]);
     }
 }
