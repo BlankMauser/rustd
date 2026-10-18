@@ -111,10 +111,10 @@ not rerun locally on that commit; the CI legs ran it.
 | `worktrees.py` | 58 of 58 |
 | `keys.py` | 36 of 36 |
 | `debuginfo.py` | all right |
-| `buildmodel.py` | 180 of 180 (run one commit earlier) |
+| `buildmodel.py` | 208 of 208 (CI on `51339e5`) |
 
-`buildmodel.py` on native AArch64: 176 of 176, with four rows that need an x86-64 host not
-run (same report, CI).
+`buildmodel.py` on native AArch64: 204 of 204, with four rows that need an x86-64 host not
+run (the same CI run).
 
 ## 4. rustc's own test suites
 

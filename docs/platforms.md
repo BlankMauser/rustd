@@ -60,7 +60,7 @@ made while the program is running is linked in full, because the kernel refuses 
 
 Runs natively on `ubuntu-24.04-arm` in CI under both backends, including `debuginfo.py`
 (under Cranelift gdb prints 9 of 9 locals; under LLVM no locals are described),
-`buildmodel.py` (176 of 176, four rows that need an x86-64 host not run), `storefull.py`
+`buildmodel.py` (204 of 204, four rows that need an x86-64 host not run), `storefull.py`
 and `farsplices.py`.
 
 A `b` or `bl` reaches 128 MB. When a function and its replacement are further apart than
