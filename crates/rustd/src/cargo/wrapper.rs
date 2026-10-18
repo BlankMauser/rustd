@@ -303,7 +303,7 @@ impl Unit {
     /// Whether rustc keeps incremental state for the unit, so that a check of it now
     /// makes the next one short.
     fn is_incremental(&self) -> bool {
-        self.args.iter().any(|it| it.starts_with(INCREMENTAL))
+        self.args.iter().any(|it| it.split_once('=').is_some_and(|(name, _)| name == INCREMENTAL))
     }
 
     /// Says in one line why rustc links the program and not the daemon, and counts it.
