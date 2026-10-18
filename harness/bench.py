@@ -55,7 +55,7 @@ def parameter(file, name, returns, callers):
 
 PROJECTS = {
     "ripgrep": dict(
-        repo="BurntSushi/ripgrep", tag="15.1.0",
+        repo="BurntSushi/ripgrep", tag="15.1.0", rev="af60c2de9d85e7f3d81c78601669468cf02dabab",
         run=["-n", "--no-heading", "--sort", "path", "fn main", "crates/core/main.rs", "build.rs"],
         edits=dict(
             body=body("crates/core/main.rs", "fn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {"),
@@ -65,7 +65,7 @@ PROJECTS = {
         ),
     ),
     "cargo": dict(
-        repo="rust-lang/cargo", tag="0.92.0",
+        repo="rust-lang/cargo", tag="0.92.0", rev="ea2d97820c16195b0ca3fadb4319fe512c199a43",
         run=["--version"],
         edits=dict(
             body=body("src/cargo/ops/cargo_compile/mod.rs", "pub fn compile<'a>(ws: &Workspace<'a>, options: &CompileOptions) -> CargoResult<Compilation<'a>> {"),
@@ -75,7 +75,7 @@ PROJECTS = {
         ),
     ),
     "nushell": dict(
-        repo="nushell/nushell", tag="0.108.0",
+        repo="nushell/nushell", tag="0.108.0", rev="da141be11b3acaa55b39321e5f9651d02aa2ed6f",
         run=["-n", "-c", "[3 1 2] | sort | str join ','"],
         edits=dict(
             body=body("src/main.rs", "fn main() -> Result<()> {"),
