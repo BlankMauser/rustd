@@ -57,12 +57,6 @@ PROJECTS = {
         run=["--plain", "--color=never", "rustfmt.toml"],
         edits=[("src/bin/bat/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
-    # Its own unit tests: the tests of its commands build projects with the cargo under test.
-    "cargo": dict(
-        repo="rust-lang/cargo", tag="0.99.0",
-        run=["--list"], test=["--lib"],
-        edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
-    ),
     "hyperfine": dict(
         repo="sharkdp/hyperfine", tag="v1.19.0", rev="12fec42098642a19855ead34c8cb1e0be28c8ead",
         run=["--help"],
@@ -91,6 +85,12 @@ PROJECTS = {
         repo="rust-lang/cargo", tag="0.92.0", rev="ea2d97820c16195b0ca3fadb4319fe512c199a43",
         run=["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path", "crates/cargo-platform/Cargo.toml"],
         test=["-p", "cargo-platform"],
+        edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
+    # The unit tests of cargo's own library, which is most of cargo.
+    "cargo-lib": dict(
+        repo="rust-lang/cargo", tag="0.99.0", rev="797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+        run=["--list"], test=["--lib"],
         edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
     "rust-analyzer": dict(

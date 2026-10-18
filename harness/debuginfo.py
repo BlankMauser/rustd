@@ -258,12 +258,21 @@ def unwinding(tally, what, binary):
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
     lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9]", rows, re.M)})
-    without = sum(any(a <= row < b for row in lined) for a, b in bare)
+    unentered = [(a, b) for a, b in bare if any(a <= row < b for row in lined)]
+    without = len(unentered)
     beyond = sum(a in ends and ends[a] > b for a, b in ours)
     filled = sum(a in ends and ends[a] < b for a, b in ours)
     verdict = "NO FUNCTIONS" if not ours else "DISAGREE" if without or beyond else "agree"
     tally.say(f"{what}: .eh_frame and the ranges", verdict,
-              f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone")
+              f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone"
+              + (f": none for {named_at(binary, unentered[0][0])} at {unentered[0][0]:#x} to {unentered[0][1]:#x}" if unentered else ""))
+
+
+def named_at(binary, address):
+    """What the debug info calls the function at `address`."""
+    found = subprocess.run([DWARFDUMP, f"--lookup={address:#x}", binary], capture_output=True, text=True).stdout
+    names = re.findall(r'DW_AT_(?:linkage_)?name\s+\("([^"]*)"\)', found)
+    return names[-1] if names else "a function with no name"
 
 
 def profiler(tally, what, binary, cwd, crates):
@@ -279,7 +288,9 @@ def profiler(tally, what, binary, cwd, crates):
     script = subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
     frames = re.findall(r"^\s+[0-9a-f]+ (\S+)\n\s+(\S+)$", script, re.M)
     mine = [(name, line) for name, line in frames if any(f"{len(c)}{c}" in name or f"{c}::" in name for c in crates)]
-    lost = [name for name, line in mine if not re.search(r"\.rs:\d+$", line)]
+    # A line 0 of one of rustc's codegen units is rustc saying of its own code that it has no
+    # line: the crate's functions that were left to rustc are not what is asked about here.
+    lost = [name for name, line in mine if not re.search(r"\.rs:\d+$|-cgu\.\d+:0$", line)]
     stacks = [stack for stack in script.split("\n\n") if stack.strip()]
     through = sum(bool(re.search(r"4main\b|::main\b", stack)) for stack in stacks)
     verdict = "NO SAMPLES" if not mine else "NO LINE" if lost else "NOT UNWOUND" if not through else "named"
