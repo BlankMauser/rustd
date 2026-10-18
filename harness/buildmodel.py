@@ -25,6 +25,11 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   artifact  the name of the target that is run, when it is not the selected one or the package
   archive   the build is an archive and has no link line: rustd's objects are given to `run`
   unbuilt   why nothing of rustd can be asked to build this at all: the row is that refusal
+  doctests  the case is `cargo test --doc` of the package: once with rustdoc, once with rustd
+            as cargo's RUSTDOC, and what the test harness prints and returns is compared
+  link      more arguments to cargo for the build rustd links against, which the reference
+            is built without
+  says      what rustd has to say on stderr as it builds
   crates    the crates rustd compiles
   cargo     more arguments to cargo: ["--release"], ["--features", "x"]
   rustd     more arguments to rustd
@@ -35,9 +40,13 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
             it is given ARTIFACT, and RUSTD_OBJECTS with rustd's objects for the second build
   args      what the program is run with
   expect    "supported" (the default) or "refused"
+  handed    rustd is given the link line of the build and links by itself
   fails     cargo itself turns the project down, and so must rustd
   steps     [{"what": .., "edit": [[file, old, new]], "write": {file: text}, "env": {..},
               "run": [shell commands in the project], "clients": how many ask at once,
+              "paused": the clients ask while the daemon is held in the middle of the reload,
+              "stale": the client asks with what cargo linked before the step, as one
+              that leaves the build to the daemon does,
               "expect": "same" | "refused"}]
             After each step cargo builds again and the client names what it linked.
 """
@@ -176,6 +185,7 @@ class Case:
             # Joined with what the project's own configuration has, which RUSTFLAGS would replace.
             config = ["--config", "build.rustflags=" + json.dumps(flags)]
         profile = ["--profile", self.verb] if self.verb != "build" else []
+        config += self.spec.get("link", [])
         command = ["cargo", "build", *config, *self.cargo_args] if whole else \
             ["cargo", "rustc", *config, *self.select, *profile, *self.cargo_args, "--", *ask]
         run = subprocess.run(command, cwd=self.ws, capture_output=True, text=True, env=env)
@@ -221,14 +231,23 @@ class Case:
         if link is None:
             raise Wrong("cargo printed no link line for rustd's objects to go on")
         obj, report = os.path.join(self.work, "rustd.o"), os.path.join(self.work, "report.tsv")
+        out = os.path.join(self.work, "out")
+        os.makedirs(out, exist_ok=True)
+        binary = os.path.join(out, os.path.basename(linkline.output_of(link))) if not self.spec.get("archive") else None
+        handed = []
+        if self.spec.get("handed"):
+            handed = ["--link-cmd", linkline.join(linkline.with_output(linkline.ahead(link, [obj], RUSTD), binary))]
         run = subprocess.run(
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), "--out", obj, "--report", report,
-             *self.rustd_args, *self.symbols(link, env)], capture_output=True, text=True, env=env, timeout=600)
+             *self.rustd_args, *handed, *self.symbols(link, env)],
+            cwd=self.link_dir(), capture_output=True, text=True, env=env, timeout=600)
         open(os.path.join(self.work, "rustd.stderr"), "w").write(run.stderr)
         if run.returncode < 0:
             raise Wrong(f"rustd died of signal {-run.returncode}: " + run.stderr[-300:])
         if run.returncode != 0:
             raise Refused(reason_of(run.stderr))
+        if self.spec.get("says", "") not in run.stderr:
+            raise Wrong(f"rustd did not say `{self.spec['says']}`")
         compiled, skipped = self.left_to_rustc(report)
         if skipped:
             raise Refused(f"{len(skipped)} functions left to rustc: {skipped[0][1]}: {skipped[0][2][:160]}")
@@ -236,9 +255,8 @@ class Case:
             raise Wrong("rustd compiled nothing, so nothing was compared")
         if self.spec.get("archive"):
             return link[0], [obj], compiled
-        out = os.path.join(self.work, "out")
-        os.makedirs(out, exist_ok=True)
-        binary = os.path.join(out, os.path.basename(linkline.output_of(link)))
+        if handed:
+            return binary, [], compiled
         linked = subprocess.run(linkline.with_output(linkline.ahead(link, [obj], RUSTD), binary), cwd=self.link_dir(), capture_output=True, text=True, env=env)
         if linked.returncode != 0:
             raise Wrong("the link with rustd's objects failed: " + (linked.stderr + linked.stdout)[-400:])
@@ -263,6 +281,7 @@ class Case:
                 if daemon.poll() is not None:
                     return [("the daemon starts", "WRONG", open(log_path).read()[-300:])]
                 time.sleep(0.05)
+            self.last_asked = ["--crate", self.crates[0], *ask]
             return [self.step(step, env, daemon, socket, binary) for step in self.spec["steps"]]
         finally:
             daemon.kill()
@@ -299,7 +318,12 @@ class Case:
         for command in step.get("run", []):
             subprocess.run(command, shell=True, cwd=self.ws, check=True, capture_output=True, env=env)
         time.sleep(0.02)
-        ask = [RUSTD, "sync", socket, *self.asked(env)]
+        before = self.behaviour(binary, env) if step.get("paused") else None
+        if not step.get("stale"):
+            self.last_asked = self.asked(env)
+        ask = [RUSTD, "sync", socket, *self.last_asked]
+        if step.get("paused"):
+            return self.mid_reload(step, env, daemon, ask, binary, before)
         # Clients that ask at once race the reload: each is answered from one model.
         racing = [subprocess.Popen(ask, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
                   for _ in range(step.get("clients", 1) - 1)]
@@ -324,6 +348,70 @@ class Case:
             verdict = ("WRONG", f"expected {expect}, got {verdict[0]}: {verdict[1]}")
         return (step["what"], verdict[0], verdict[1][:300])
 
+    def mid_reload(self, step, env, daemon, ask, binary, before):
+        """Catches the daemon in the middle of loading the checkout again (it waits there for
+        RUSTD_RELOAD_PAUSE_MS and says so) and has clients ask meanwhile. Each runs the program
+        it is answered with: that is the one from before the change or cargo's of after it."""
+        log = os.path.join(self.work, "daemon.log")
+        pauses = lambda: open(log).read().count("reload: paused")
+        paused, deadline = pauses(), time.time() + 120
+        first = subprocess.Popen(ask, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        while pauses() == paused:
+            if time.time() > deadline or daemon.poll() is not None:
+                first.kill()
+                return (step["what"], "WRONG", "the daemon did not stop in the middle of a reload")
+            time.sleep(0.02)
+
+        def client(n):
+            said = subprocess.run(ask, capture_output=True, text=True, timeout=300, env=env)
+            said = (said.stdout + said.stderr).strip()
+            if not said.startswith("ok"):
+                return said
+            # Another client's answer may be linking over the file: taken once it holds still.
+            mine = f"{binary}.client{n}"
+            for _ in range(200):
+                shutil.copy(binary, mine)
+                ran = self.behaviour(mine, env)
+                if open(mine, "rb").read() == open(binary, "rb").read():
+                    return ran
+                time.sleep(0.05)
+            return "the program did not hold still"
+
+        with ThreadPoolExecutor(step["clients"]) as pool:
+            answers = list(pool.map(client, range(step["clients"])))
+        answers.append(client("first") if first.communicate(timeout=300)[0].strip().startswith("ok") else "the first was refused")
+        after = self.behaviour(self.cargo(env), env)
+        if before == after:
+            return (step["what"], "WRONG", "the change does not show in cargo's program")
+        mixed = [it for it in answers if it not in (before, after)]
+        if mixed:
+            return (step["what"], "WRONG", f"{len(mixed)} of {len(answers)} clients got neither the old nor the new program: {mixed[0]!r}"[:300])
+        if self.behaviour(binary, env) != after:
+            return (step["what"], "WRONG", "the program is not cargo's once the reload is over")
+        new = sum(it == after for it in answers)
+        return (step["what"], "same", f"{len(answers)} clients mid-reload: {len(answers) - new} old, {new} new")
+
+    def doctests(self, env):
+        """`cargo test --doc` with rustdoc and with rustd in its place."""
+        def tested(target_dir, **more):
+            run = subprocess.run(["cargo", "test", "--doc", *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
+                                 cwd=self.ws, capture_output=True, text=True, timeout=900,
+                                 env={**env, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir), **more})
+            return run.returncode, doctest_report(run.stdout), run.stderr
+        want = tested("target-ref")
+        got = tested("target", RUSTDOC=RUSTD, RUSTD_RUSTDOC="rustdoc")
+        left = re.search(r"rustd: the doctests are left to rustdoc: (.*)", got[2])
+        if left:
+            raise Refused(left.group(1))
+        if want[:2] != got[:2]:
+            lines = [f"cargo's `{w}`, rustd's `{g}`" for w, g in zip(want[1], got[1]) if w != g]
+            raise Wrong((lines[0] if lines else f"cargo's ends with {want[0]} after {len(want[1])} lines, rustd's with {got[0]} after {len(got[1])}")[:300])
+        built = re.findall(r"doctests: compiled (\d+) of (\d+) fns", got[2])
+        if not built:
+            raise Wrong("rustd did not say what it built for the doctests")
+        tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
+        return ("supported", f"{tests} doctests the same, {sum(int(n) for n, _ in built)} of {sum(int(n) for _, n in built)} functions of the library", [])
+
     def row(self):
         """The case's line of the table."""
         steps = []
@@ -334,6 +422,8 @@ class Case:
         env = dict(self.env)
         try:
             self.prepare()
+            if self.spec.get("doctests"):
+                return self.doctests(env)
             artifact = self.cargo(env)
             if artifact is None and not self.spec.get("fails"):
                 return ("WRONG", "the case itself does not build with cargo: " + self.cargo_error[-300:], steps)
@@ -360,6 +450,26 @@ class Case:
         finally:
             if not self.keep and hasattr(self, "ws"):
                 shutil.rmtree(self.ws, ignore_errors=True)
+
+
+def doctest_report(stdout):
+    """What a run of doctests printed, without what differs from run to run: the order the
+    tests finished in, how long they took, and the numbers of the threads."""
+    out = re.sub(r"finished in [0-9.]+s", "finished", stdout)
+    # rustdoc builds the examples of an edition 2024 crate as one program and says how long
+    # that took; rustd builds each alone.
+    out = re.sub(r"\nall doctests ran in [0-9.]+s; merged doctests compilation took [0-9.]+s\n", "\n", out)
+    out = re.sub(r"thread '(.*?)' \(\d+\) panicked", r"thread '\1' panicked", out)
+    blocks = re.split(r"\n(?=---- )", out)
+    # The last failure is followed by the names of all of them and the result.
+    ends = []
+    if len(blocks) > 1:
+        blocks[-1], _, end = blocks[-1].partition("\n\nfailures:\n")
+        ends = sorted(l for l in end.splitlines() if l.startswith("    ")) + [l for l in end.splitlines() if not l.startswith("    ")]
+    lines = blocks[0].splitlines()
+    tests = sorted(l for l in lines if l.startswith("test ") and not l.startswith("test result"))
+    rest = [l for l in lines if l not in tests]
+    return tests + rest + sorted(b.strip("\n") for b in blocks[1:]) + ends
 
 
 def differ(want, got):

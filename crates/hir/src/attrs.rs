@@ -236,6 +236,13 @@ impl HasAttrs for Function {
     }
 }
 
+impl HasAttrs for crate::ExternBlock {
+    #[inline]
+    fn attr_id(self, _: &dyn HirDatabase) -> AttrsOwner {
+        AttrsOwner::AttrDef(AttrDefId::ExternBlockId(self.id))
+    }
+}
+
 impl HasAttrs for Impl {
     fn attr_id(self, _db: &dyn HirDatabase) -> AttrsOwner {
         match self.id {

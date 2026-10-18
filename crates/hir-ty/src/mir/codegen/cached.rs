@@ -332,14 +332,18 @@ impl Entry {
     /// An entry kept with what a debugger is told is not the one kept without.
     ///
     /// Whether the code checks arithmetic for overflow is in the name.
-    pub(super) fn key(name: &str, debug: bool) -> Option<[u8; KEY]> {
+    ///
+    /// `program` is the one program the entry is of, where what the calls of an entry reach
+    /// is not the same in every program that has a function of its name.
+    pub(super) fn key(name: &str, debug: bool, program: Option<&[u8; 32]>) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
         // Each with its length, so that no two lists of them are the same bytes.
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd entry 7");
+        field(b"rustd entry 8");
+        field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
         // Nor is code for one target what another runs.
@@ -462,6 +466,8 @@ pub(super) struct Entries {
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
+    /// The one program the entries are of, when they are not of any: see [`Entry::key`].
+    program: Option<[u8; 32]>,
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
     known: Mutex<Known>,
@@ -488,8 +494,13 @@ struct Visit {
 }
 
 impl Entries {
-    pub(super) fn new(store: &'static Store, debug: bool, cargo_home: Option<String>) -> Entries {
-        Entries { store, debug, cargo_home, known: Mutex::default() }
+    pub(super) fn new(
+        store: &'static Store,
+        debug: bool,
+        program: Option<[u8; 32]>,
+        cargo_home: Option<String>,
+    ) -> Entries {
+        Entries { store, debug, program, cargo_home, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -512,7 +523,7 @@ impl Entries {
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let read = || {
-            let key = Entry::key(name, self.debug)?;
+            let key = Entry::key(name, self.debug, self.program.as_ref())?;
             Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
         };
         let tally = super::backend::Tally::global();
@@ -792,7 +803,7 @@ mod tests {
         let (one, other) = (super::super::ContentId(one), super::super::ContentId(other));
         assert_eq!(one.to_string().len(), 64);
         assert_ne!(one.to_string(), other.to_string());
-        let key = |name: &str, debug| Entry::key(name, debug).unwrap();
+        let key = |name: &str, debug| Entry::key(name, debug, None).unwrap();
         let named = |id: &super::super::ContentId| key(&format!("~{id}:run"), false);
         assert_ne!(named(&one), named(&other));
         let name = format!("~{one}:run");

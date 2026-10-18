@@ -128,7 +128,8 @@ impl Plan {
         }
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
-        plan.link_cmd = link.command(&plan, &dir.join("link.args"))?;
+        plan.link_cmd =
+            link.command(&[&plan.patch, &plan.object], &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
     }
 }
@@ -158,11 +159,14 @@ fn harness_alone(unit: &Record) -> Option<String> {
 /// cargo itself, and refuses there what it does not build.
 fn unsupported(unit: &Record) -> Option<String> {
     let name = &unit.crate_name;
-    let flag = ["instrument-coverage", "profile-generate", "profile-use"]
-        .into_iter()
-        .find(|it| unit.codegen(it).is_some());
-    if let Some(flag) = flag {
-        return Some(format!("`{name}` is built with -C {flag}"));
+    let off = |value: Option<&str>| matches!(value, None | Some("off" | "no" | "n" | "false"));
+    if !off(unit.codegen("lto")) || unit.codegen("linker-plugin-lto").is_some() {
+        return Some(format!("`{name}` is built with LTO"));
+    }
+    for flag in ["instrument-coverage", "profile-generate", "profile-use"] {
+        if unit.codegen(flag).is_some() {
+            return Some(format!("`{name}` is built with -C {flag}"));
+        }
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
@@ -174,7 +178,7 @@ fn unsupported(unit: &Record) -> Option<String> {
 }
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
-struct LinkLine {
+pub(crate) struct LinkLine {
     env: Vec<(String, String)>,
     linker: String,
     args: Vec<String>,
@@ -203,7 +207,7 @@ impl Flavor {
 
 impl LinkLine {
     /// `None` for a line that is of no linker the daemon knows.
-    fn parse(line: &str) -> Option<LinkLine> {
+    pub(crate) fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
         let first = words.iter().position(|it| !is_assignment(it))?;
         let env = words[..first]
@@ -227,8 +231,13 @@ impl LinkLine {
         self.args.get(at + 1).map(|it| &**it)
     }
 
+    /// Whether `file` is one of what is linked.
+    pub(crate) fn has(&self, file: &str) -> bool {
+        self.args.iter().any(|it| it == file)
+    }
+
     /// What rustc built that is linked, and the standard library's crates next to it.
-    fn rustc_files(&self) -> Vec<PathBuf> {
+    pub(crate) fn rustc_files(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> =
             self.args.iter().filter(|it| is_rustc_file(it)).map(PathBuf::from).collect();
         let library = files.iter().find_map(|it| {
@@ -249,9 +258,15 @@ impl LinkLine {
         files
     }
 
-    /// The command that links the plan's executable, with its arguments in the file at
-    /// `response`: a line with all of them is longer than a process may be given.
-    fn command(mut self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
+    /// The command that links `binary` with the objects `ahead` before everything rustc
+    /// built, with its arguments in the file at `response`: a line with all of them is longer
+    /// than a process may be given.
+    pub(crate) fn command(
+        mut self,
+        ahead: &[&Path],
+        binary: &Path,
+        response: &Path,
+    ) -> anyhow::Result<String> {
         if self.flavor == Flavor::Msvc {
             self.args.retain(|it| !it.eq_ignore_ascii_case(WARNINGS_FAIL));
         }
@@ -260,25 +275,25 @@ impl LinkLine {
             .iter()
             .position(|it| is_rustc_file(it))
             .context("nothing of rustc's is linked")?;
-        let ours = [&plan.patch, &plan.object].map(|it| it.display().to_string());
+        let ours = ahead.iter().map(|it| it.display().to_string()).collect();
         match self.flavor {
-            Flavor::Cc => self.command_of_cc(ours, first, plan, response),
-            Flavor::Msvc => self.command_of_msvc(ours, first, plan, response),
+            Flavor::Cc => self.command_of_cc(ours, first, binary, response),
+            Flavor::Msvc => self.command_of_msvc(ours, first, binary, response),
         }
     }
 
     fn command_of_cc(
         mut self,
-        ours: [String; 2],
+        ours: Vec<String>,
         first: usize,
-        plan: &Plan,
+        binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
         self.args.splice(first..first, ours.into_iter().chain([FIRST_DEFINITION_STAYS.to_owned()]));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
-            plan.binary.display().to_string();
+            binary.display().to_string();
         let quoted: Vec<String> = self
             .args
             .iter()
@@ -299,14 +314,14 @@ impl LinkLine {
     /// is not in the line; here the line says it.
     fn command_of_msvc(
         mut self,
-        ours: [String; 2],
+        ours: Vec<String>,
         first: usize,
-        plan: &Plan,
+        binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
         let stays = FIRST_DEFINITION_STAYS_MSVC.map(str::to_owned);
         self.args.splice(first..first, ours.into_iter().chain(stays));
-        let binary = plan.binary.display();
+        let binary = binary.display();
         for arg in &mut self.args {
             if arg.starts_with(OUT) {
                 *arg = format!("{OUT}{binary}");
@@ -441,7 +456,7 @@ mod tests {
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap();
         assert_eq!(link.flavor, Flavor::Msvc);
-        let command = link.command(&plan, &response).unwrap();
+        let command = link.command(&[&plan.patch, &plan.object], &plan.binary, &response).unwrap();
         assert_eq!(command, format!(r#""C:\v c\link.exe" "@{}""#, response.display()));
         let args = std::fs::read_to_string(&response).unwrap();
         let args: Vec<&str> = args
@@ -487,7 +502,10 @@ mod tests {
             stamp: 0,
         };
         let response = dir.join("link.args");
-        let command = LinkLine::parse(LINE).unwrap().command(&plan, &response).unwrap();
+        let command = LinkLine::parse(LINE)
+            .unwrap()
+            .command(&[&plan.patch, &plan.object], &plan.binary, &response)
+            .unwrap();
         let response_arg = format!("@{}", response.display());
         assert_eq!(
             shlex::split(&command).unwrap(),

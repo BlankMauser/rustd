@@ -7,7 +7,7 @@
 //! per crate that does.
 
 use base_db::{Crate, FileId};
-use hir_def::{CallableDefId, DefWithBodyId, HasModule, Lookup};
+use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeSuperVisitable, TypeVisitable, TypeVisitor,
@@ -74,6 +74,36 @@ impl<'db> Mentions<'db> {
         };
         self.crates.insert(krate);
         self.bodies.push(owner);
+    }
+}
+
+/// The crates the name of an instance mentions, or `None` when one of them can't be told. Only
+/// a crate that depends on all of them can have compiled a copy of it.
+pub(super) fn mentioned_crates(
+    db: &dyn HirDatabase,
+    instance: &Instance,
+) -> Option<FxHashSet<Crate>> {
+    let mentions = Mentions::of(db, instance);
+    (!mentions.opaque).then_some(mentions.crates)
+}
+
+/// The function the code of an instance is written in: its own, or the one a closure or an
+/// `async` block is in. The symbol of every copy of the instance has its name.
+pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<FunctionId> {
+    let owner = match instance.def {
+        InstanceDef::Fn(func) => return Some(func),
+        InstanceDef::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
+        InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+            InternedCoroutineId::from_id(id).loc(db).owner
+        }
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => return None,
+    };
+    match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => Some(func),
+        _ => None,
     }
 }
 

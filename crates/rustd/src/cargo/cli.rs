@@ -9,6 +9,8 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
+use crate::plan::Selection;
+
 /// The flags of cargo's build commands that take their value as the next argument.
 const VALUED: &[&str] = &[
     "-p",
@@ -70,7 +72,8 @@ const BUILD_ENV: &[&str] = &[
     "RUSTD_SPLICE",
 ];
 
-/// The variables a worker is started with: the ones that pick its toolchain and its backend.
+/// The variables a worker is started with: the ones that pick its toolchain and its backend,
+/// and the ones cargo reads flags and profiles from.
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -287,7 +290,6 @@ impl Invocation {
     fn asks_for_cargo(&self) -> Option<String> {
         let flags = &self.flags;
         let reason = match () {
-            _ if flags.doc => "doc tests are built by rustdoc",
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
             _ if flags.excludes => "--exclude is not loaded by the daemon yet",
@@ -301,6 +303,21 @@ impl Invocation {
     pub(crate) fn profile(&self) -> &str {
         let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
         self.flags.profile.as_deref().unwrap_or(of_command)
+    }
+
+    /// Which build of the package the command is, as the daemon plans it. With no package
+    /// named it is the one of the directory the worker is started in.
+    pub(crate) fn selection(&self) -> Selection {
+        Selection {
+            profile: self.flags.profile.clone().unwrap_or_else(|| "dev".to_owned()),
+            features: self.flags.features.clone(),
+            no_default_features: self.flags.no_default_features,
+            all_features: self.flags.all_features,
+            packages: self.flags.packages.clone(),
+            workspace: self.flags.workspace,
+            target: self.target(),
+            dev_deps: self.subcommand == Subcommand::Test,
+        }
     }
 
     /// The triple cargo builds for, when it is told one.
@@ -435,7 +452,9 @@ mod tests {
         for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
             assert!(build("build", args).asks_for_cargo().is_some(), "{args}");
         }
-        for args in ["--release", "--profile bench", "-p a -p b", "--all-features"] {
+        for args in
+            ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
+        {
             assert_eq!(build("build", args).asks_for_cargo(), None, "{args}");
         }
         assert_eq!(build("test", "--release").profile(), "release");

@@ -721,6 +721,12 @@ impl Module {
         scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into()).collect()
     }
 
+    pub fn extern_blocks(self, db: &dyn HirDatabase) -> Vec<ExternBlock> {
+        let def_map = self.id.def_map(db);
+        let scope = def_map.module(db, self.id).scope(db);
+        scope.extern_blocks().map(|id| ExternBlock { id }).collect()
+    }
+
     pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);

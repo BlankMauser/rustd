@@ -523,14 +523,7 @@ impl State {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
             cfg_test: unit_test,
-            dev_deps: asked.subcommand == Subcommand::Test,
-            features: asked.flags.features.clone(),
-            no_default_features: asked.flags.no_default_features,
-            all_features: asked.flags.all_features,
-            packages: asked.flags.packages.clone(),
-            workspace: asked.flags.workspace,
-            profile: asked.flags.profile.clone(),
-            target: asked.target(),
+            selection: asked.selection(),
             env: worker_env(),
         };
         let checkout = |unit_test: bool| Checkout {

@@ -332,8 +332,7 @@ impl<'db> Recorder<'db> {
             rustc_type_ir::RegionKind::ReBound(..) => region,
             _ => Region::new_erased(interner),
         });
-        let checked = super::compiled_checked(self.db, def, args, self.checked);
-        let instance = Instance { def, args: args.store(), checked };
+        let instance = Instance { def, args: args.store(), checked: self.checked };
         Ok(self.func(FuncTarget::Instance(instance, env.store()), sig))
     }
 

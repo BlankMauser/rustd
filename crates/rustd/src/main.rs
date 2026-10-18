@@ -1,9 +1,12 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+#![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
+
 mod cargo;
 mod content;
 mod deps;
+mod doctest;
 mod inputs;
 mod memory;
 mod outline;
@@ -83,6 +86,9 @@ struct Args {
     /// is a directory, each crate is a program of its own instead: `out` and `report` get a
     /// file per crate, and a crate that fails gets a `.error` file instead of ending the run.
     batch: Vec<String>,
+    /// The root files of the crates the daemon builds without having been asked to: the ones
+    /// the crates asked for use, whose source is no longer what rustc compiled.
+    widened: Vec<String>,
     out: PathBuf,
     symbol_files: Vec<PathBuf>,
     watch: bool,
@@ -103,30 +109,17 @@ struct Args {
     isolate: Option<PathBuf>,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
-    /// Load what the tests, examples and benchmarks of the workspace depend on: a target of
-    /// those kinds is built.
-    dev_deps: bool,
     /// Run build scripts and build proc macros in a directory of rustd's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
     own_target: bool,
-    /// Cargo features to build the workspace's crates with, on top of the default ones.
-    features: Vec<String>,
-    /// Build without the default features of the package, as `--no-default-features` does.
-    no_default_features: bool,
-    /// The packages cargo is asked for with `-p`: none is what `cargo build` builds there.
-    packages: Vec<String>,
-    /// Whether every member is built, as `--workspace` has it.
-    workspace: bool,
-    /// Build with every feature of the package, as `--all-features` does.
-    all_features: bool,
-    /// The cargo profile the program is built with: `dev` unless told otherwise.
-    profile: String,
+    /// Which build of the package this is: its profile, features, packages and target. The
+    /// target is the triple to emit code for, when it is not the host: the workspace is
+    /// loaded as cargo builds it for that target, and the objects are of its format and
+    /// architecture.
+    selection: plan::Selection,
     /// Other checkouts of projects to load into the same database, for requests that name
     /// one as their `--project`. What they have in common with `project` is there once.
     also: Vec<PathBuf>,
-    /// The triple to emit code for, when it is not the host: the workspace is loaded as
-    /// cargo builds it for that target, and the objects are of its format and architecture.
-    target: Option<String>,
     /// What the code has a debugger told: what `profile` asks for.
     debug: plan::Described,
     /// The root of the workspace `project` is in. Another checkout has crates of the same
@@ -143,6 +136,11 @@ impl Args {
     fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
         path.strip_prefix(&self.checkout).ok().or(base)
+    }
+
+    /// The crates that are built into the program's object, the one asked for first.
+    fn crates(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.krate).chain(&self.batch).chain(&self.widened)
     }
 
     /// Whether the file is one the checkout is built from. A file of the checkout it shares
@@ -166,8 +164,7 @@ impl Args {
         Ok(root)
     }
 
-    fn parse() -> anyhow::Result<Args> {
-        let mut args = std::env::args().skip(1);
+    fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         let mut project = None;
         let mut krate = None;
         let mut batch = Vec::new();
@@ -225,7 +222,6 @@ impl Args {
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
                 }
-                "--doc" => bail!("{DOCTESTS_ARE_NOT_BUILT}"),
                 "--release" => profile = Some("release".to_owned()),
                 "--profile" => profile = Some(value()?),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
@@ -236,6 +232,7 @@ impl Args {
             project: project.context("missing project path")?,
             krate: krate.context("missing --crate")?,
             batch,
+            widened: Vec::new(),
             out: out.context("missing --out")?,
             symbol_files,
             watch,
@@ -247,16 +244,18 @@ impl Args {
             deny,
             isolate,
             cfg_test,
-            dev_deps,
             own_target,
-            features,
-            no_default_features,
-            packages,
-            workspace,
-            all_features,
-            profile: profile.unwrap_or_else(|| "dev".to_owned()),
+            selection: plan::Selection {
+                profile: profile.unwrap_or_else(|| "dev".to_owned()),
+                features,
+                no_default_features,
+                all_features,
+                packages,
+                workspace,
+                target,
+                dev_deps: cfg_test || dev_deps,
+            },
             also,
-            target,
             debug: plan::Described::NOTHING,
             checkout: PathBuf::new(),
             base: None,
@@ -775,6 +774,14 @@ impl SymbolResolver for Resolver<'_> {
         self.table.defines(symbol)
     }
 
+    fn makers(&self, function: &str) -> Vec<u64> {
+        self.table.makers(function).collect()
+    }
+
+    fn copies(&self, symbol: &str) -> Vec<(String, u64)> {
+        self.table.copies(symbol).map(|(copy, of)| (copy.to_owned(), of)).collect()
+    }
+
     fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
         self.own_crate_id(krate).is_none()
     }
@@ -1050,6 +1057,84 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
     Ok(found)
 }
 
+/// Why what rustc built does not say which copy of a function a call reaches any more, in a
+/// program whose crates differ in `-C overflow-checks`: rustc decides by the source which
+/// crate compiles a function, and a source was written after it did.
+fn stale_copies(db: &RootDatabase, table: &SymbolTable, args: &Args) -> Option<String> {
+    let written = table.written_since_built()?;
+    let built = args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten();
+    let built: Vec<Crate> = built.collect();
+    checks_differ(db, &built).then(|| {
+        format!(
+            "the crates of the program differ in `overflow-checks` and {} was written after \
+             rustc built it: which crate's copy of a function a call reaches is read from \
+             what rustc built, so cargo has to build first",
+            args.inside(written).unwrap_or(written).display()
+        )
+    })
+}
+
+/// Whether the crates cargo builds of the program of `built` do not all have
+/// `-C overflow-checks` alike.
+fn checks_differ(db: &RootDatabase, built: &[Crate]) -> bool {
+    let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
+    let program: FxHashSet<ide_db::base_db::Crate> = built
+        .iter()
+        .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
+        .filter(|it| !it.data(db).origin.is_lang())
+        .collect();
+    let mut checks = program.iter().map(|it| it.cfg_options(db).check_atom(&flag));
+    checks.next().is_some_and(|first| checks.any(|it| it != first))
+}
+
+/// Fails when rustc linked none of the libraries rustd builds a program with `lto` from:
+/// rustc then compiled the whole program from bitcode as it linked it, and the functions
+/// rustd leaves to rustc are not there to be linked against by name.
+fn linked_from_libraries(db: &RootDatabase, args: &Args) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.link_cmd.as_deref().is_none_or(links_core),
+        "the link command has no library of `core`, as rustc's has not with `lto`: rustd \
+         links against a build with `lto = \"off\"`"
+    );
+    if args.symbol_files.is_empty() {
+        return Ok(());
+    }
+    let mut built = Vec::new();
+    for named in args.crates() {
+        built.extend(crates_named(db, named, args)?);
+    }
+    let used: FxHashSet<Crate> =
+        built.iter().flat_map(|it| it.dependencies(db)).map(|it| it.krate).collect();
+    // A proc macro is a library of the compiler's, not of the program.
+    let is_proc_macro = |krate: &Crate| ide_db::base_db::Crate::from(*krate).data(db).is_proc_macro;
+    let libraries: Vec<String> = built
+        .iter()
+        .filter(|it| used.contains(it) && !is_proc_macro(it))
+        .filter_map(|it| Some(format!("lib{}", it.display_name(db)?.crate_name().as_str())))
+        .collect();
+    let linked = |library: &String| {
+        let mut files = args.symbol_files.iter().filter_map(|it| it.file_name()?.to_str());
+        files.any(|it| it.starts_with(library.as_str()))
+    };
+    anyhow::ensure!(
+        libraries.is_empty() || libraries.iter().any(linked),
+        "rustc linked the program without a library of `{}`, as it does with `lto`: rustd \
+         links against a build with `lto = \"off\"`",
+        libraries[0].trim_start_matches("lib")
+    );
+    Ok(())
+}
+
+/// Whether a link command names `core` as a library, by itself or in the shared library of
+/// std. One that reads its files from elsewhere is taken to.
+fn links_core(command: &str) -> bool {
+    let mut files = command.split_whitespace().map(|it| it.trim_matches(['"', '\'']));
+    files.any(|it| {
+        let name = it.rsplit(['/', '\\']).next().unwrap_or(it);
+        it.starts_with('@') || name.starts_with("libcore-") || name.starts_with("libstd-")
+    })
+}
+
 /// Every crate called `krate`, of the checkout or not.
 fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
     let is_file = krate.ends_with(".rs");
@@ -1137,8 +1222,8 @@ struct Checkouts {
     inputs: inputs::Inputs,
     /// Which build of each project is loaded.
     selection: plan::Selection,
-    /// For each of `roots`, what its profile has a debugger told of the code.
-    debug: Vec<plan::Described>,
+    /// For each of `roots`, what its plan says of the program as a whole.
+    debug: Vec<plan::Whole>,
 }
 
 impl Checkouts {
@@ -1159,10 +1244,16 @@ impl Checkouts {
             Some("0") => plan::Level::Nothing,
             Some("lines") => plan::Level::Lines,
             Some(_) => plan::Level::Full,
-            None => self.debug[at].level,
+            None => self.debug[at].debug.level,
         };
-        let debug = plan::Described { level, ..self.debug[at] };
+        let debug = plan::Described { level, ..self.debug[at].debug };
         Ok(Parts { root, base, members, debug })
+    }
+
+    /// Whether the program of the checkout `project` is of is one rustc links from bitcode.
+    fn lto(&self, project: &Path) -> anyhow::Result<bool> {
+        let root = self.root_of(project)?;
+        Ok(self.roots.iter().zip(&self.debug).any(|((_, it), whole)| *it == root && whole.lto))
     }
 
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
@@ -1452,6 +1543,7 @@ impl Checkouts {
         for (&at, (workspace, debug, config)) in stale.iter().zip(loaded) {
             self.place(at, workspace, debug, &config);
         }
+        pause_mid_reload();
         let mut failed = Ok(());
         for at in 0..self.roots.len() {
             let Some(base) = self.splits[at].as_ref().map(|it| it.base.clone()) else { continue };
@@ -1483,7 +1575,7 @@ impl Checkouts {
         &self,
         at: usize,
         env: &ide_db::base_db::Env,
-    ) -> anyhow::Result<(ProjectWorkspace, plan::Described, CargoConfig)> {
+    ) -> anyhow::Result<(ProjectWorkspace, plan::Whole, CargoConfig)> {
         let (project, root) = &self.roots[at];
         let mut config = self.cargo_config.clone();
         config.extra_env.extend(self.inputs.variables(root, env));
@@ -1497,7 +1589,7 @@ impl Checkouts {
         &mut self,
         at: usize,
         workspace: ProjectWorkspace,
-        debug: plan::Described,
+        debug: plan::Whole,
         config: &CargoConfig,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
@@ -1506,6 +1598,17 @@ impl Checkouts {
         self.roots[at].1 = root;
         self.splits[at] = None;
         self.debug[at] = debug;
+    }
+}
+
+/// Waits for `RUSTD_RELOAD_PAUSE_MS` where a reload has the new workspaces of its checkouts
+/// and the crates are still the old ones, and says so: what `harness/buildmodel.py` holds a
+/// reload at while it sends the requests that must not see the two mixed.
+fn pause_mid_reload() {
+    let pause = std::env::var("RUSTD_RELOAD_PAUSE_MS").ok().and_then(|it| it.parse().ok());
+    if let Some(pause) = pause {
+        eprintln!("reload: paused");
+        std::thread::sleep(Duration::from_millis(pause));
     }
 }
 
@@ -1635,26 +1738,16 @@ struct View {
     project: PathBuf,
 }
 
-/// Why the examples in documentation are not built.
-const DOCTESTS_ARE_NOT_BUILT: &str = "doctests are not built: rustdoc takes each example out of \
-    the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc \
-    tells nobody where that crate and its link line are (`--persist-doctests` and \
-    `--test-builder` are unstable). rustd lacks the two things that would stand in for it: \
-    taking the examples out itself (hidden `#` lines, the `main` put around an example, and \
-    the `should_panic`, `no_run`, `compile_fail`, `ignore` and edition marks of a block), \
-    and linking a program of its own for each, where it only replaces functions of a \
-    program cargo linked";
-
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
-) -> anyhow::Result<(ProjectWorkspace, plan::Described)> {
+) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
-    let mut debug = plan::Described::NOTHING;
+    let mut debug = plan::Whole { debug: plan::Described::NOTHING, lto: false };
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1670,7 +1763,7 @@ fn workspace_at(
         let triple = triple.first().context("no target to build for")?;
         let asked = plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
         let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
-        debug = plan.described()?;
+        debug = plan.whole()?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
@@ -1700,7 +1793,7 @@ fn report_sharing(db: &RootDatabase) {
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
-    for name in std::iter::once(&args.krate).chain(&args.batch) {
+    for name in args.crates() {
         for krate in crates_named(db, name, args)? {
             let krate: ide_db::base_db::Crate = krate.into();
             crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
@@ -1986,7 +2079,7 @@ fn build(
     // is only here for what this one uses of it.
     let mut main = None;
     let mut local = Vec::new();
-    for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
+    for (at, krate) in args.crates().enumerate() {
         for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
             let listed = listed.of(db, krate);
@@ -2437,11 +2530,12 @@ fn place(
 
 /// The arguments to cargo that have it run the build scripts of the build `args` asks for.
 fn selected(args: &Args) -> Vec<String> {
-    let mut selected = vec!["--profile".to_owned(), args.profile.clone()];
-    for package in &args.packages {
+    let selection = &args.selection;
+    let mut selected = vec!["--profile".to_owned(), selection.profile.clone()];
+    for package in &selection.packages {
         selected.extend(["--package".to_owned(), package.clone()]);
     }
-    if args.workspace {
+    if selection.workspace {
         selected.push("--workspace".to_owned());
     }
     selected
@@ -2492,23 +2586,6 @@ impl CratesAsLoaded {
 /// The source files the daemon watches.
 struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
-}
-
-/// Why an edit is to a crate the daemon does not build, when one is.
-fn left_to_rustc(
-    db: &RootDatabase,
-    listed: &Listed,
-    edited: &[vfs::FileId],
-    watched: &Sources,
-) -> Option<String> {
-    let (file, krate) = edited.iter().find_map(|&it| Some((it, listed.left_to_rustc(db, it)?)))?;
-    let path = watched.paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
-    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
-    let name = name.unwrap_or_else(|| "a crate without a name".to_owned());
-    Some(format!(
-        "{path} is of `{name}`, which the program uses and the daemon was not asked to \
-         build: rustc's copy of it is from before the edit, name the crate with `--crate`"
-    ))
 }
 
 /// Why the source as it is can't be built by the daemon, when it can't.
@@ -2740,6 +2817,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             project: args.project.clone(),
             krate: krate.clone(),
             batch: Vec::new(),
+            widened: Vec::new(),
             out: out.join(format!("{krate}.o")),
             symbol_files: Vec::new(),
             watch: false,
@@ -2751,16 +2829,9 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             deny: None,
             isolate: None,
             cfg_test: args.cfg_test,
-            dev_deps: args.dev_deps,
             own_target: args.own_target,
-            features: args.features.clone(),
-            no_default_features: args.no_default_features,
-            packages: args.packages.clone(),
-            workspace: args.workspace,
-            all_features: args.all_features,
-            profile: args.profile.clone(),
+            selection: args.selection.clone(),
             also: Vec::new(),
-            target: args.target.clone(),
             debug: args.debug,
             checkout: args.checkout.clone(),
             base: args.base.clone(),
@@ -2856,6 +2927,7 @@ impl Target {
             debug,
             krate,
             batch,
+            widened: Vec::new(),
             out,
             patch,
             link_cmd,
@@ -3361,17 +3433,26 @@ fn main() -> anyhow::Result<()> {
     {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
-    let mut args = Args::parse()?;
-    // As cargo does: the flag, then the environment, then the host.
-    if args.target.is_none() {
-        args.target = std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+    if std::env::var_os(doctest::ENABLED).is_some() {
+        return doctest::command(std::env::args_os().skip(1));
     }
-    let emits = match &args.target {
+    run(Args::parse(std::env::args().skip(1))?, None)
+}
+
+/// Loads the workspace `args` names and builds what they ask for, then serves it when they
+/// ask for that. With `doc` the build is of a library whose examples are then run.
+fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
+    // As cargo does: the flag, then the environment, then the host.
+    if args.selection.target.is_none() {
+        args.selection.target =
+            std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+    }
+    let emits = match &args.selection.target {
         Some(triple) => hir_ty::mir::codegen::Target::select(triple),
         None => hir_ty::mir::codegen::Target::selected(),
     };
     let emits = emits.map_err(anyhow::Error::msg)?;
-    if args.target.is_some() {
+    if args.selection.target.is_some() {
         eprintln!("target: {}", emits.triple());
     }
     let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
@@ -3416,16 +3497,16 @@ fn main() -> anyhow::Result<()> {
         // The variables of whoever asks for a build: those of crates are read as rustc does.
         extra_env_for_commands_only: true,
         sysroot: Some(sysroot),
-        target: args.target.clone(),
+        target: args.selection.target.clone(),
         set_test: args.cfg_test,
         // Tests, benches and examples are what dev-dependencies are for: cargo runs the
         // build scripts and the proc macros of those only for a build that has them.
-        all_targets: args.cfg_test || args.dev_deps,
-        features: match args.all_features {
+        all_targets: args.cfg_test || args.selection.dev_deps,
+        features: match args.selection.all_features {
             true => CargoFeatures::All,
             false => CargoFeatures::Selected {
-                features: args.features.clone(),
-                no_default_features: args.no_default_features,
+                features: args.selection.features.clone(),
+                no_default_features: args.selection.no_default_features,
             },
         },
         // The build scripts say what the build asked for says, not what `cargo check` of the
@@ -3438,16 +3519,7 @@ fn main() -> anyhow::Result<()> {
         },
         ..Default::default()
     };
-    let selection = plan::Selection {
-        profile: args.profile.clone(),
-        features: args.features.clone(),
-        no_default_features: args.no_default_features,
-        all_features: args.all_features,
-        packages: args.packages.clone(),
-        workspace: args.workspace,
-        target: args.target.clone(),
-        dev_deps: args.cfg_test || args.dev_deps,
-    };
+    let selection = args.selection.clone();
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
@@ -3483,6 +3555,9 @@ fn main() -> anyhow::Result<()> {
     let mut tree = tree::Tree::new(&db, vfs, &sources);
 
     let start = Instant::now();
+    if checkouts.lto(&args.project)? {
+        linked_from_libraries(&db, &args)?;
+    }
     let mut resolved = resolve_crates(&db, &args)?;
     // Resolving the names finds the files `include!` names that were not loaded. With those
     // in, there may be more.
@@ -3520,6 +3595,18 @@ fn main() -> anyhow::Result<()> {
     let mut outlines = outline::Outlines::default();
     let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
+    if let Some(asked) = doc {
+        let krate = *crates_named(&db, &args.krate, &args)?.first().context("no such crate")?;
+        let built = build(&db, &table, &args, &mut known, &listed)?;
+        eprint!("doctests: ");
+        report(&built);
+        doctest::document(&mut db, krate);
+        let code = doctest::run(&db, asked, krate, &args.out, emits.triple())?;
+        std::process::exit(code);
+    }
+    if let Some(stale) = stale_copies(&db, &table, &args) {
+        anyhow::bail!(stale);
+    }
     let mut cold = build(&db, &table, &args, &mut known, &listed)?;
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
@@ -4501,9 +4588,75 @@ impl Program {
                     Arc::new(SymbolTable::load(&self.args.symbol_files, &self.args.root()?)?);
                 self.distrust_rustc(db, files, None);
                 self.unbuilt.named_anew = true;
+                self.args.widened.clear();
             }
             None => self.known.distrust(db, new),
         }
+        Ok(())
+    }
+
+    /// Takes over from rustc the crates that an edit since the last build is to, of those the
+    /// program uses and the daemon was not asked to build, and the crates between them and
+    /// the ones it was: rustc's copies of them are from before the edit. The result is why
+    /// one can't be taken over, when one can't.
+    fn widen(&mut self, db: &RootDatabase) -> Option<String> {
+        let built: Vec<ide_db::base_db::Crate> = self
+            .args
+            .crates()
+            .filter_map(|name| crates_named(db, name, &self.args).ok())
+            .flatten()
+            .map(Into::into)
+            .collect();
+        let used: FxHashSet<_> = built.iter().flat_map(|it| it.transitive_deps(db)).collect();
+        let edited: Vec<_> = self
+            .unbuilt
+            .edited
+            .iter()
+            .filter_map(|&file| outline::left_to_rustc(db, &built, &used, file))
+            .collect();
+        if edited.is_empty() {
+            return None;
+        }
+        let mut stale: Vec<_> = edited.iter().flat_map(|it| it.transitive_rev_deps(db)).collect();
+        stale.retain(|it| used.contains(it) && !built.contains(it));
+        stale.sort_unstable();
+        stale.dedup();
+        for &krate in &stale {
+            let Some(root) = crate_root_file(db, krate.into()) else {
+                let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
+                return Some(format!(
+                    "an edit is to `{}`, which the program uses and the daemon was not asked to \
+                     build: its root file has no path to build it by",
+                    name.unwrap_or_default()
+                ));
+            };
+            let root = root.display().to_string();
+            eprintln!("widened: {root} is built here from now on, rustc's copy is of before");
+            self.args.widened.push(root);
+        }
+        self.known.distrust(db, &edited);
+        self.known.forget_base();
+        (self.whole, self.moved) = (None, true);
+        None
+    }
+
+    /// Reads what rustc built again when it has built since, in a program whose crates
+    /// differ in `-C overflow-checks`: which crate holds a copy of a function decides
+    /// whether a call of it checks, and what was compiled by the copies of before is not
+    /// kept.
+    fn read_copies_again(&mut self, db: &RootDatabase) -> anyhow::Result<()> {
+        let args = &self.args;
+        let built: Vec<Crate> =
+            args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten().collect();
+        if !self.table.built_since_read() || !checks_differ(db, &built) {
+            return Ok(());
+        }
+        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?);
+        let patching = self.known.patching;
+        self.known = Rejections::default();
+        self.known.patching = patching;
+        (self.whole, self.moved) = (None, true);
+        self.unbuilt.stale = true;
         Ok(())
     }
 
@@ -4513,7 +4666,7 @@ impl Program {
     fn same_as(&self, db: &RootDatabase, other: &Program) -> bool {
         let (ours, theirs) = (&self.args, &other.args);
         let crates = |args: &Args| {
-            let names = std::iter::once(&args.krate).chain(&args.batch);
+            let names = args.crates();
             names.map(|it| crates_named(db, it, args).ok()).collect::<Option<Vec<_>>>()
         };
         !self.unbuilt.stale
@@ -4521,7 +4674,7 @@ impl Program {
             && self.known.patches()
             && self.known.patching == other.known.patching
             && Arc::ptr_eq(&self.table, &other.table)
-            && (ours.cfg_test, &ours.features) == (theirs.cfg_test, &theirs.features)
+            && (ours.cfg_test, &ours.selection) == (theirs.cfg_test, &theirs.selection)
             && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
     }
 
@@ -4536,6 +4689,10 @@ impl Program {
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
+        // The crates left to rustc are as edited when a client has named what it built since.
+        let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
+        let unnamed = if named_anew { None } else { self.widen(db) };
+        self.read_copies_again(db)?;
         let Program { args, table, known, unbuilt, wrote, whole, tests, .. } = self;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
@@ -4552,7 +4709,6 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
-        let named_anew = std::mem::take(&mut unbuilt.named_anew);
         let mut edited = unbuilt.edited.clone();
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // Neither is what no crate that is built reads: an example, or a test.
@@ -4577,11 +4733,11 @@ impl Program {
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let stale = if named_anew { None } else { left_to_rustc(db, listed, &edited, paths) };
-        let mut failed = stale
+        let mut failed = unnamed
             .or_else(|| refusal(db, &edited, paths, out_of_date))
             .or(broken)
             .or_else(|| warm.unset.clone());
+        failed = failed.or_else(|| stale_copies(db, table, args));
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         match tests {
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
@@ -4698,6 +4854,16 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_command_of_lto_has_no_core() {
+        let ordinary = r#"cc "/t/deps/app-1.app.0.rcgu.o" "/sysroot/lib/libcore-667b96598095cbda.rlib" -o /t/app"#;
+        let lto = r#"cc "/t/deps/app-1.app.0.rcgu.o" "/sysroot/lib/libcompiler_builtins-2ae2.rlib" -o /t/app"#;
+        assert!(links_core(ordinary));
+        assert!(links_core("cc @/t/link.args"));
+        assert!(links_core("cc /sysroot/lib/libstd-44675f186029a4cd.so"));
+        assert!(!links_core(lto));
+    }
 
     #[test]
     fn the_commit_of_a_toolchain_is_the_one_its_library_has_its_sources_under() {

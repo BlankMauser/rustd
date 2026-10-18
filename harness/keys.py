@@ -44,6 +44,10 @@ def arg(*more):
     return lambda ws, env, args: args.extend(more)
 
 
+# What rustd says of a function it leaves to rustc because the copy of an instance it calls
+# is one rustc picked and rustd cannot tell which.
+REFUSED = "overflow checks"
+
 # What rustd does not do yet: these differ, and are told apart when they do.
 OPEN = set()
 
@@ -67,6 +71,9 @@ CASES = [
     ("overflow checks of a package that calls generic code", append("Cargo.toml", "\n[profile.dev.package.klib]\noverflow-checks = false\n"), "checks"),
     ("overflow checks of the package of the program", append("Cargo.toml", "\n[profile.dev.package.kapp]\noverflow-checks = false\n"), "checks"),
     ("overflow checks of one package in release", both(append("Cargo.toml", "\n[profile.release.package.kdep]\noverflow-checks = true\n"), arg("--release")), "checks"),
+    ("overflow checks of the program alone in release", both(append("Cargo.toml", "\n[profile.release.package.kapp]\noverflow-checks = true\n"), arg("--release")), "checks"),
+    ("overflow checks of all but the package a small function is written in, in release", both(append("Cargo.toml", "\n[profile.release]\noverflow-checks = true\n[profile.release.package.kdep]\noverflow-checks = false\n"), arg("--release")), "checks"),
+    ("overflow checks of all but the package whose copy of generic code the program uses", append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n[profile.dev.package.klib]\noverflow-checks = true\n"), "checks"),
     ("debug assertions of one package", append("Cargo.toml", "\n[profile.dev.package.klib]\ndebug-assertions = false\n"), "assertions"),
     ("a constant of a dependency", replace("kdep/src/lib.rs", "SCALE: u32 = 3", "SCALE: u32 = 4"), "scaled"),
     ("an inlined function of a dependency", replace("kdep/src/lib.rs", "x + 1", "x + 2"), "scaled"),
@@ -80,7 +87,7 @@ def size(directory):
 
 
 def build(ws, env, args):
-    """What cargo's program prints and what rustd's does, and how many functions were left to rustc."""
+    """What cargo's program prints and what rustd's does, and the functions that were left to rustc."""
     saved = dict(os.environ)
     os.environ.update(env)
     try:
@@ -88,8 +95,8 @@ def build(ws, env, args):
         fx.rustd_args = list(args)
         fx.rustc_build()
         fx.rustd_build()
-        left = sum(row[0] == "skipped" and "no rustc symbol" not in row[2] for rows in fx.reports.values() for row in rows)
-        return fx.behaviour(fx.reference), fx.behaviour(fx.binary), left
+        skipped = [row for rows in fx.reports.values() for row in rows if row[0] == "skipped" and "no rustc symbol" not in row[2]]
+        return fx.behaviour(fx.reference), fx.behaviour(fx.binary), skipped
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -99,7 +106,7 @@ def build(ws, env, args):
 def main():
     work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-keys-"))
     chosen = sys.argv[1:]
-    wrong = total = fixed = 0
+    wrong = total = fixed = refusals = 0
     for name, change, line in CASES:
         if chosen and not any(it in name for it in chosen):
             continue
@@ -124,14 +131,21 @@ def main():
                 problems.append("the second build differs")
             if line and before == want:
                 problems.append("cargo's program is the same after the change")
-            if left:
-                problems.append(f"{left} functions left to rustc")
+            # Where the crates differ in overflow checks, rustd leaves to rustc a function that
+            # calls a copy it cannot tell the checks of. The function the case is about has to
+            # be rustd's all the same, or the case shows nothing.
+            refused = [row for row in left if REFUSED in row[2] and row[1].split("::")[-1] != line]
+            if len(left) > len(refused):
+                problems.append(f"{len(left) - len(refused)} functions left to rustc")
+            refusals += len(refused)
             known = name in OPEN
             fixed += known and not problems
             wrong += bool(problems) and not known
             print(f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more", flush=True)
             for problem in problems:
                 print(f"    {problem}")
+            for row in refused:
+                print(f"    refused {row[1]}: {row[2][:160]}")
             if want != got:
                 ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
                 for a, b in zip(theirs, ours):
@@ -140,7 +154,7 @@ def main():
                 if len(ours) != len(theirs):
                     print(f"    rustd: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
     still = sum(2 for name, _, _ in CASES if name in OPEN and (not chosen or any(it in name for it in chosen))) - fixed
-    print(f"{total - wrong - still} of {total - still} right, {still} open; {work}")
+    print(f"{total - wrong - still} of {total - still} right, {still} open, {refusals} functions refused; {work}")
     if fixed:
         print(f"{fixed} of the open cases are the same now: take them out of OPEN")
     sys.exit(1 if wrong or fixed else 0)

@@ -8,8 +8,8 @@ mod ancestor;
 mod cli;
 mod client;
 mod package;
-mod plan;
-mod run;
+pub(crate) mod plan;
+pub(crate) mod run;
 mod say;
 pub(crate) mod script;
 mod state;
@@ -44,6 +44,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     let code = match asked {
         Asked::Build(asked) => match asked.only_cargo() {
+            None if asked.flags.doc => run::only_doc_tests(&asked.typed)?,
             Some(reason) => {
                 say::fallback(&reason, &format!("this is `cargo {}`", asked.subcommand.name()));
                 let typed = std::iter::once(asked.subcommand.name().to_owned()).chain(asked.typed);
@@ -325,7 +326,6 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
             if stopped || picked || !state.doc_tests {
                 return Ok(code);
             }
-            say::fallback("doc tests are built by rustdoc", "running `cargo test --doc`");
             Ok(code.max(run::doc_tests(asked)?))
         }
     }

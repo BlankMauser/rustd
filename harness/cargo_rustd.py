@@ -504,11 +504,11 @@ def project(name, spec, work, mode):
 
 
 FLAG_WORKSPACE = {
-    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
+    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.release]\npanic = "abort"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
-    "util/src/lib.rs": 'pub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
+    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
-    "app/src/main.rs": 'fn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
+    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
@@ -519,6 +519,11 @@ FLAG_CASES = [
     ("run", [], {}),
     ("run", ["--", "fail"], {}),
     ("run", ["--release"], {}),
+    ("run", ["--release", "--", "fail"], {}),
+    ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
+    # A processor of x86-64 is one only there.
+    *([("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"})] if host().startswith("x86_64") else []),
+    ("run", ["--no-default-features", "-p", "app"], {}),
     # The host named: what is built for is the same, where it is put is not.
     ("run", ["--target", host()], {}),
     ("run", ["-p", "app"], {}),
@@ -539,6 +544,8 @@ FLAG_CASES = [
     ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
     ("test", [], {"FLAGS_FAIL": "1"}),
     ("test", ["--no-run"], {}),
+    ("test", ["--doc"], {}),
+    ("test", ["--doc", "--features", "loud", "-p", "util"], {}),
     ("test", [], {"CARGO_INCREMENTAL": "0"}),
 ]
 
@@ -752,6 +759,11 @@ def manners(work, ws, env, here, check, edit):
         check(f"RUSTD_CACHE {asked}: the store is {'on, in the user cache directory' if kept else 'off'}", filled == kept and (stats.returncode == 0) == kept, f"`rustd cache stats` exit {stats.returncode}")
 
 
+def greets(out, greeting):
+    """Whether the program of the workspace said `greeting` before what it says of its build."""
+    return out.splitlines()[:1] == [greeting]
+
+
 def abuse(work, ws, tree, env, check, status, alive):
     """The daemon under what it is not asked for politely: many clients at once, a client
     and a daemon killed while a build is asked for, and a client that is another user."""
@@ -772,7 +784,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     spawn = lambda root, *args: subprocess.Popen(["cargo", "rustd", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
     clients = [(n, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees)]
     ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
-    right = [code == 0 and out[0] == f"tree{n} c{i}\n" for n, i, out, code in ended]
+    right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
     by_daemon = sum(how_built(out[1]) == "daemon" for _, _, out, _ in ended)
     check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker")
 
@@ -789,7 +801,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     client.wait()
     freed()
     _, after = here.cargo("run", "again")
-    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and after.stdout == "tree0 again\n" and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and greets(after.stdout, "tree0 again") and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
 
     edit("held two")
     held()
@@ -800,13 +812,13 @@ def abuse(work, ws, tree, env, check, status, alive):
     freed()
     out, err = client.communicate(timeout=600)
     said = how_built(err)
-    check("the build whose daemon is killed is cargo's, is right, and says so", waits and client.returncode == 0 and out == "tree0 killed\n" and "the daemon ended before it answered" in said, said)
+    check("the build whose daemon is killed is cargo's, is right, and says so", waits and client.returncode == 0 and greets(out, "tree0 killed") and "the daemon ended before it answered" in said, said)
     time.sleep(1)
     check("the workers of the killed daemon are gone", not any(alive(p) for p in workers), f"{workers}")
     wait_warm(here, ws)
     edit("after")
     _, after = here.cargo("run", "after")
-    check("the build after that is a new daemon's", after.returncode == 0 and after.stdout == "tree0 after\n" and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
 
     other = os.path.join(work, "other-build")
     older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
@@ -816,11 +828,11 @@ def abuse(work, ws, tree, env, check, status, alive):
     edit("skew")
     _, skewed = older.cargo("run", "skew")
     said = how_built(skewed.stderr)
-    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and skewed.stdout == "tree0 skew\n" and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
     wait_warm(older, ws)
     edit("back")
     _, back = here.cargo("run", "back")
-    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and back.stdout == "tree0 back\n" and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
     wait_warm(here, ws)
 
     stranger(env["RUSTD_HOME"], check)

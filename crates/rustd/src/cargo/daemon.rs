@@ -102,16 +102,8 @@ pub(crate) struct WorkerConfig {
     /// The directory of the package being built, from the root of the checkout.
     pub(crate) project: PathBuf,
     pub(crate) cfg_test: bool,
-    pub(crate) dev_deps: bool,
-    pub(crate) features: Vec<String>,
-    pub(crate) no_default_features: bool,
-    pub(crate) all_features: bool,
-    /// The packages named with `-p`.
-    pub(crate) packages: Vec<String>,
-    pub(crate) workspace: bool,
-    /// The profile, when it is not the one cargo has for the command.
-    pub(crate) profile: Option<String>,
-    pub(crate) target: Option<String>,
+    /// Which build the worker stands in for, as the daemon's own plan of it has it.
+    pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
 }
@@ -234,32 +226,12 @@ impl Worker {
             Some(store) => command.env("RUSTD_CACHE", store),
             None => command.env_remove("RUSTD_CACHE"),
         };
-        if let Some(target) = &config.target {
-            command.args(["--target", target]);
-        }
+        command.args(config.selection.flags());
         if config.cfg_test {
             command.arg("--cfg-test");
         }
-        if config.dev_deps {
+        if config.selection.dev_deps {
             command.arg("--dev-deps");
-        }
-        if !config.features.is_empty() {
-            command.args(["--features", &config.features.join(",")]);
-        }
-        if config.no_default_features {
-            command.arg("--no-default-features");
-        }
-        if config.all_features {
-            command.arg("--all-features");
-        }
-        for package in &config.packages {
-            command.args(["--package", package]);
-        }
-        if config.workspace {
-            command.arg("--workspace");
-        }
-        if let Some(profile) = &config.profile {
-            command.args(["--profile", profile]);
         }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));

@@ -40,6 +40,7 @@ hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 ide-db.workspace = true
+pulldown-cmark.workspace = true
 load-cargo.workspace = true
 project-model.workspace = true
 vfs.workspace = true
