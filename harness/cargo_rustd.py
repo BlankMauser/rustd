@@ -32,6 +32,8 @@ and keeps the others. `--small` is the three projects of the CI job.
 import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from difftest import host
 ROOT = os.path.dirname(HERE)
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
@@ -383,9 +385,11 @@ FLAG_CASES = [
     ("run", ["--release"], {}),
     ("run", ["--release", "--", "fail"], {}),
     ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
-    ("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"}),
+    # A processor of x86-64 is one only there.
+    *([("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"})] if host().startswith("x86_64") else []),
     ("run", ["--no-default-features", "-p", "app"], {}),
-    ("run", ["--target", "x86_64-unknown-linux-gnu"], {}),
+    # The host named: what is built for is the same, where it is put is not.
+    ("run", ["--target", host()], {}),
     ("run", ["-p", "app"], {}),
     ("run", ["--features", "loud", "-p", "app"], {}),
     ("run", ["--bin", "other"], {}),
