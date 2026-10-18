@@ -4,7 +4,8 @@
 
 use std::{
     collections::BTreeMap,
-    io::BufReader,
+    fs::OpenOptions,
+    io::{BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -21,16 +22,13 @@ use super::{
     cli::{Invocation, Subcommand, worker_env},
     daemon::{self, Checkout, WorkerConfig},
     plan::Plan,
-    script,
+    script, switch,
     units::{self, Record, stamp_now, stamp_of},
     wrapper,
 };
 
 /// The toolchain whose layouts and symbol names this rustd has: `harness/toolchain`.
 const TOOLCHAIN: &str = include_str!("../../../../harness/toolchain");
-
-/// The names cargo reads its configuration from in `.cargo` of a directory.
-const CONFIGS: [&str; 2] = [".cargo/config.toml", ".cargo/config"];
 
 /// The names rustup reads the toolchain of a directory from.
 const TOOLCHAIN_FILES: [&str; 2] = ["rust-toolchain.toml", "rust-toolchain"];
@@ -44,6 +42,9 @@ pub(crate) struct State {
     pub(crate) root: PathBuf,
     /// When the cargo build this is the state of started.
     built_at: u128,
+    /// When the last check by rustc that passed the source started: the cargo build, or
+    /// the `cargo check` of a build by the daemon since.
+    checked_at: u128,
     /// The profile, as cargo's `Finished` line names it.
     pub(crate) profile: String,
     pub(crate) programs: Vec<Program>,
@@ -86,6 +87,9 @@ pub(crate) struct Program {
     names: Vec<PathBuf>,
     /// A hard link to the executable rustc linked, to give cargo back before it builds.
     cargos: PathBuf,
+    /// The directory of the record of the unit rustc linked it from, when it is known.
+    #[serde(default)]
+    unit: Option<PathBuf>,
     /// Where it is among the programs of its checkout in `checkouts`.
     pub(crate) asked_as: Option<(usize, usize)>,
     /// Why the daemon is never asked for it, when it is not.
@@ -255,7 +259,10 @@ impl Built {
             match message? {
                 Message::CompilerArtifact(artifact) => built.artifacts.push(artifact),
                 Message::BuildScriptExecuted(script) => built.scripts.push(script),
-                Message::TextLine(line) => println!("{line}"),
+                // Whoever reads this may stop reading before its end.
+                Message::TextLine(line) => {
+                    let _ = writeln!(std::io::stdout(), "{line}");
+                }
                 _ => {}
             }
         }
@@ -265,6 +272,10 @@ impl Built {
 }
 
 impl State {
+    /// The file in the record of a unit that names the builds its program is in, a key a
+    /// line.
+    pub(crate) const STATES: &str = "states";
+
     fn path(key: &str) -> anyhow::Result<PathBuf> {
         Ok(daemon::home()?.join("states").join(format!("{key}.json")))
     }
@@ -285,12 +296,60 @@ impl State {
         Ok(state)
     }
 
+    /// The states that have the program rustc linked from the unit recorded in `unit`, by
+    /// their keys: the builds of the checkout that share the unit.
+    pub(crate) fn of_unit(unit: &Path) -> Vec<String> {
+        let keys = std::fs::read_to_string(unit.join(State::STATES)).unwrap_or_default();
+        keys.lines().map(str::to_owned).collect()
+    }
+
+    /// Forgets the builds `keys`: rustc has linked a program of theirs again, and what
+    /// they kept of cargo's is not what cargo has now.
+    pub(crate) fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
+        for key in keys {
+            for path in [State::path(key), State::kept_path(key)].into_iter().flatten() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// The program linked from the unit recorded in `unit`, the checkout it is asked for
+    /// in, and where it is among that checkout's programs. `Err` is why the daemon is not
+    /// asked for it.
+    pub(crate) fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
+        let program = self.of_unit_dir(unit).ok_or("the build no longer has the program")?;
+        match (program.asked_as, &program.left_to_cargo) {
+            (Some((checkout, at)), _) => Ok((&self.checkouts[checkout], at)),
+            (None, why) => Err(why.clone().unwrap_or_default()),
+        }
+    }
+
+    fn of_unit_dir(&self, unit: &Path) -> Option<&Program> {
+        self.programs.iter().find(|it| it.unit.as_deref() == Some(unit))
+    }
+
+    /// Has `binary` be what cargo has of the program linked from the unit recorded in
+    /// `unit`: cargo was given it where it had rustc's, for the source as it is now.
+    pub(crate) fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
+        match self.of_unit_dir(unit) {
+            Some(program) => place(binary, &program.cargos),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn write(&self) -> anyhow::Result<()> {
         let path = State::path(&self.key)?;
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
         std::fs::write(&new, serde_json::to_vec(self)?)?;
         std::fs::rename(&new, &path)?;
+        for unit in self.programs.iter().filter_map(|it| it.unit.as_deref()) {
+            if !State::of_unit(unit).contains(&self.key) {
+                let mut states =
+                    OpenOptions::new().create(true).append(true).open(unit.join(State::STATES))?;
+                writeln!(states, "{}", self.key)?;
+            }
+        }
         let kept: Vec<(&Path, &Path)> = self
             .programs
             .iter()
@@ -383,6 +442,19 @@ impl State {
         Ok(cargos)
     }
 
+    /// Whether rustc has not seen the source as it is: a file a program is compiled from
+    /// was written since the last check that passed. A build of no program is one of
+    /// libraries, whose files are not listed.
+    pub(crate) fn unchecked(&self) -> bool {
+        let written = |it: &Program| it.newer_input(self.checked_at).is_some();
+        self.programs.is_empty() || self.programs.iter().any(written)
+    }
+
+    /// Records that a check by rustc that started at `stamp` passed the source.
+    pub(crate) fn checked(&mut self, stamp: u128) {
+        self.checked_at = stamp;
+    }
+
     /// The programs cargo built that the daemon is never asked for, and why.
     pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
@@ -411,6 +483,7 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
+            checked_at: built.started,
             profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),
@@ -514,6 +587,7 @@ impl State {
                 executable: executable.clone().into_std_path_buf(),
                 names,
                 cargos,
+                unit: unit.and_then(|it| Some(Record::dir_for(&it.out_dir()?).join(&it.id))),
                 asked_as,
                 left_to_cargo,
                 inputs: inputs.into_iter().collect(),
@@ -561,7 +635,7 @@ impl Program {
         std::iter::once(&*self.executable).chain(self.names.iter().map(|it| &**it))
     }
 
-    /// The first of its source files that was written after cargo started.
+    /// The first of its source files that was written after `built_at`.
     fn newer_input(&self, built_at: u128) -> Option<&Path> {
         let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
         self.inputs.iter().find(newer).map(PathBuf::as_path)
@@ -570,7 +644,7 @@ impl Program {
 
 /// Has `to` be the file `from` is, under a second name: what was at `to` stays as it is
 /// for whoever runs it.
-fn place(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut new = to.as_os_str().to_owned();
     new.push(format!(".{}.new", std::process::id()));
     let _ = std::fs::remove_file(&new);
@@ -586,7 +660,7 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 /// without it builds each program again and puts its own where this build's is, under a
 /// program that is running.
 pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
-    command.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?).env(wrapper::ENABLED, "1");
+    command.env(switch::VARIABLE, switch::wrapper_path()?).env(wrapper::DRIVEN, "1");
     Ok(())
 }
 
@@ -757,7 +831,7 @@ fn guards(
         },
         Guard::files(
             "cargo's configuration",
-            named_above(cwd, &CONFIGS).chain(cargo_home_configs()),
+            named_above(cwd, &switch::CONFIGS).chain(switch::home_configs()),
         ),
         Guard::files("the toolchain file", named_above(cwd, &TOOLCHAIN_FILES)),
     ];
@@ -787,13 +861,6 @@ fn guards(
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
 fn named_above<'a>(dir: &'a Path, names: &'a [&str]) -> impl Iterator<Item = PathBuf> + 'a {
     dir.ancestors().flat_map(move |dir| names.iter().map(move |name| dir.join(name)))
-}
-
-fn cargo_home_configs() -> Vec<PathBuf> {
-    let home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
-    let home = home.or_else(|| Some(Path::new(&std::env::var_os("HOME")?).join(".cargo")));
-    let in_home = |home: PathBuf| ["config.toml", "config"].map(|it| home.join(it));
-    home.map(in_home).into_iter().flatten().collect()
 }
 
 /// The units that run during the build, and the libraries of the workspace they are built

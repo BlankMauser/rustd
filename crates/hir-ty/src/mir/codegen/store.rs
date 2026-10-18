@@ -934,14 +934,19 @@ struct New {
     pending: Vec<u8>,
 }
 
+/// Whether a value of `RUSTD_CACHE` says there is to be no store.
+pub fn is_off(value: &std::ffi::OsStr) -> bool {
+    value.is_empty() || value == "off" || value == "0"
+}
+
 impl Store {
-    /// The store of this process: the directory `RUSTD_CACHE` names, when it is set. A
+    /// The store of this process: the directory `RUSTD_CACHE` names, when it names one. A
     /// directory that cannot be used is said once, and the process compiles without one.
     pub(super) fn global() -> Option<&'static Store> {
         static STORE: OnceLock<Option<Store>> = OnceLock::new();
         STORE
             .get_or_init(|| {
-                let dir = std::env::var_os("RUSTD_CACHE")?;
+                let dir = std::env::var_os("RUSTD_CACHE").filter(|it| !is_off(it))?;
                 let opened = Identity::current().and_then(|identity| {
                     Store::open(Path::new(&dir), identity, Tuning::from_env()?)
                 });

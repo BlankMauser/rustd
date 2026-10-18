@@ -32,6 +32,7 @@ pdb = "0.8"
 sha2 = "0.10"
 cargo_metadata.workspace = true
 shlex = "2"
+toml.workspace = true
 
 hir.workspace = true
 hir-def.workspace = true

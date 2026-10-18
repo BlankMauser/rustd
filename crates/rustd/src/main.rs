@@ -106,6 +106,9 @@ struct Args {
     /// Load what the tests, examples and benchmarks of the workspace depend on: a target of
     /// those kinds is built.
     dev_deps: bool,
+    /// Run build scripts and build proc macros in a directory of rustd's own under the
+    /// target directory, so that nothing here waits for a cargo that is building there.
+    own_target: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
     /// Build without the default features of the package, as `--no-default-features` does.
@@ -180,6 +183,7 @@ impl Args {
         let mut isolate = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
+        let mut own_target = false;
         let mut features = Vec::new();
         let mut no_default_features = false;
         let (mut packages, mut workspace) = (Vec::new(), false);
@@ -210,6 +214,7 @@ impl Args {
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
                 "--dev-deps" => dev_deps = true,
+                "--own-target" => own_target = true,
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
@@ -243,6 +248,7 @@ impl Args {
             isolate,
             cfg_test,
             dev_deps,
+            own_target,
             features,
             no_default_features,
             packages,
@@ -1350,11 +1356,16 @@ impl Checkouts {
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-                && self.cargo_config.target_dir_config == TargetDirectoryConfig::None
+                && !matches!(
+                    self.cargo_config.target_dir_config,
+                    TargetDirectoryConfig::Directory(_)
+                )
             {
                 let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-                self.cargo_config.target_dir_config =
-                    TargetDirectoryConfig::Directory(target.to_owned());
+                let scripts = self.cargo_config.target_dir_config.target_dir(Some(target));
+                self.cargo_config.target_dir_config = TargetDirectoryConfig::Directory(
+                    scripts.map_or_else(|| target.to_owned(), |it| it.into_owned()),
+                );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
             self.inputs.watch(&root, &workspace, &self.cargo_config);
@@ -2710,6 +2721,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             isolate: None,
             cfg_test: args.cfg_test,
             dev_deps: args.dev_deps,
+            own_target: args.own_target,
             features: args.features.clone(),
             no_default_features: args.no_default_features,
             packages: args.packages.clone(),
@@ -3240,9 +3252,49 @@ fn end_with_input() {
     std::process::exit(0);
 }
 
+const HELP: &str = "\
+rustd: a daemon that keeps Rust workspaces compiled and builds edits from memory
+
+usage: rustd <command>
+
+  enable            plain `cargo build|run|test|check` go through rustd from now on
+  disable           cargo's configuration is put back as it was
+  status            whether rustd is enabled, what the daemon has loaded, what fell back
+  stop              ends the daemon; the next build starts one
+  cargo <command>   what `cargo rustd <command>` runs: build, run, test, check
+  cache <verb>      the disk store: stats, gc, verify, push, pull, keygen
+  --help, --version
+
+`cargo rustd build|run|test|check` takes cargo's flags. CARGO.md is the guide.";
+
+/// Has a command that prints for a reader end quietly when the reader stops reading,
+/// instead of failing on the closed pipe. Not for a process that writes to sockets.
+pub(crate) fn end_with_reader() {
+    #[cfg(unix)]
+    // SAFETY: restores the default action of a signal, before any thread is started.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("cache") {
-        return remote::command(std::env::args().skip(2));
+    let stands_in_for_rustc = std::env::var_os("RUSTD_WRAPS_RUSTC").is_some();
+    match std::env::args().nth(1).as_deref() {
+        _ if stands_in_for_rustc => {}
+        None | Some("--help" | "-h" | "help") => {
+            end_with_reader();
+            println!("{HELP}");
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("rustd {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("cache") => {
+            end_with_reader();
+            return remote::command(std::env::args().skip(2));
+        }
+        _ => {}
     }
     #[cfg(windows)]
     if let Some(script) = cargo::script::stood_in_front_of() {
@@ -3252,11 +3304,12 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("build-script") {
         return cargo::script::command(std::env::args_os().skip(2));
     }
-    if std::env::var_os(cargo::wrapper::ENABLED).is_some() {
-        return cargo::wrapper::command(std::env::args_os().skip(1));
-    }
     match std::env::args().nth(1).as_deref() {
+        Some("rustc-wrapper") => return cargo::wrapper::command(std::env::args_os().skip(2)),
         Some("cargo") => return cargo::command(std::env::args().skip(2)),
+        Some("enable" | "disable" | "status" | "stop") => {
+            return cargo::command(std::env::args().skip(1));
+        }
         Some("daemon") => return cargo::daemon::serve(),
         _ => {}
     }
@@ -3348,6 +3401,10 @@ fn main() -> anyhow::Result<()> {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
+        target_dir_config: match args.own_target {
+            true => TargetDirectoryConfig::UseSubdirectory,
+            false => TargetDirectoryConfig::None,
+        },
         ..Default::default()
     };
     let selection = plan::Selection {

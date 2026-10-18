@@ -4,6 +4,7 @@
 pub(crate) mod daemon;
 pub(crate) mod wrapper;
 
+mod ancestor;
 mod cli;
 mod client;
 mod plan;
@@ -11,9 +12,15 @@ mod run;
 mod say;
 pub(crate) mod script;
 mod state;
+mod switch;
 mod units;
 
-use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    process::{Command, Stdio},
+    time::Instant,
+};
 
 use anyhow::Context as _;
 
@@ -24,7 +31,17 @@ use state::{Built, Counts, State};
 
 /// `rustd cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
-    let code = match Asked::parse(args.collect()) {
+    let args: Vec<String> = args.collect();
+    if let [word, cargo, rest @ ..] = args.as_slice()
+        && word == SETTLE
+    {
+        return settle(cargo.parse().context("`settle` is told the cargo to wait for")?, rest);
+    }
+    let asked = Asked::parse(args);
+    if !matches!(asked, Asked::Build(_) | Asked::Cargo(_)) {
+        crate::end_with_reader();
+    }
+    let code = match asked {
         Asked::Build(asked) => match asked.only_cargo() {
             Some(reason) => {
                 say::fallback(&reason, &format!("this is `cargo {}`", asked.subcommand.name()));
@@ -36,8 +53,50 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Cargo(args) => plain_cargo(args)?,
         Asked::Status => status()?,
         Asked::Stop => stop()?,
+        Asked::Enable => switch::enable()?,
+        Asked::Disable => switch::disable()?,
+        Asked::Help => {
+            println!("{HELP}");
+            0
+        }
     };
     std::process::exit(code)
+}
+
+const HELP: &str = "\
+cargo rustd: builds with the rustd daemon, with cargo's flags
+
+usage: cargo rustd <command> [cargo's flags]
+
+  build, run, test   by the daemon when it has the workspace loaded, by cargo otherwise
+  check              `cargo check`
+  status             whether rustd is enabled, what the daemon has loaded, what fell back
+  stop               ends the daemon; the next build starts one
+  enable, disable    plain `cargo build|run|test|check` through rustd, and back
+
+Any other command is cargo's own. CARGO.md is the guide.";
+
+/// What a wrapper runs rustd with once rustc has linked a program under plain cargo.
+pub(super) const SETTLE: &str = "settle";
+
+/// Has the daemon load the build `typed` is the cargo command of, which the cargo `cargo`
+/// is running: the build is asked of cargo again, which waits for that cargo to be done
+/// with the target directory, has nothing left to compile and says what it built. This
+/// process has that cargo's directory and environment. Nobody reads what it says but the
+/// log.
+fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
+    let settled = (|| {
+        let asked = cli::of_cargo(typed).context("`settle` is told a build command")?;
+        let cwd = std::env::current_dir()?;
+        let key = asked.key(&cwd);
+        eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
+        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default())? {
+            state.write()?;
+        }
+        anyhow::Ok(())
+    })();
+    wrapper::settled(cargo);
+    settled
 }
 
 /// Runs cargo with `args` and nothing of rustd's.
@@ -53,14 +112,15 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let key = asked.key(&cwd);
     let known = State::read(&key);
-    let state = match known.map(by_daemon) {
+    let state = match known.map(|state| by_daemon(state, asked)) {
+        Ok(Err(Left::WithErrors(code))) => return Ok(code),
         Ok(Ok(state)) => {
             let took = started.elapsed().as_secs_f64();
             let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
             say::status(asked.flags.quiet, "Finished", &finished);
             state
         }
-        Ok(Err((state, reason))) => {
+        Ok(Err(Left::ToCargo(state, reason))) => {
             say::fallback(&reason, "building with cargo");
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
@@ -83,15 +143,35 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     after_build(asked, &state, &cwd)
 }
 
+/// Why the daemon's programs are not the build.
+enum Left {
+    /// The build is cargo's, with the state so far and the reason.
+    ToCargo(Box<State>, String),
+    /// `cargo check` turned the source down and said why; this is its exit status.
+    WithErrors(i32),
+}
+
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
-/// them. A program the daemon does not build stays as cargo built it while its source is
-/// what cargo compiled. `Err` is the state and why the build is cargo's.
-fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
+/// them, once `cargo check` has passed the source as it is now: the daemon has no borrow
+/// checker and builds programs rustc turns down, and the warnings are rustc's to give. A program the
+/// daemon does not build stays as cargo built it while its source is what cargo compiled.
+fn by_daemon(mut state: State, typed: &Invocation) -> Result<State, Left> {
     if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
-        return Err((Box::new(state), reason));
+        return Err(Left::ToCargo(Box::new(state), reason));
     }
+    let checking = state.unchecked().then(|| (units::stamp_now(), check_of(typed).spawn()));
     let asked: Vec<Result<Vec<Result<(), String>>, String>> =
         state.checkouts.iter().map(synced).collect();
+    if let Some((began, checking)) = checking {
+        match checking.and_then(|mut check| check.wait()) {
+            Ok(status) if status.success() => state.checked(began),
+            Ok(status) => return Err(Left::WithErrors(run::exit_code(status))),
+            Err(error) => {
+                let reason = format!("`cargo check` did not run: {error}");
+                return Err(Left::ToCargo(Box::new(state), reason));
+            }
+        }
+    }
     let answers: Vec<Vec<Result<(), String>>> = std::iter::zip(&asked, &state.checkouts)
         .map(|(answer, checkout)| match answer {
             Ok(programs) => programs.clone(),
@@ -100,7 +180,7 @@ fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
         .collect();
     let cargos = match state.settle(&answers) {
         Ok(cargos) => cargos,
-        Err(reason) => return Err((Box::new(state), reason)),
+        Err(reason) => return Err(Left::ToCargo(Box::new(state), reason)),
     };
     let unchanged = "it is as cargo built it, and its source has not changed";
     for (answer, checkout) in std::iter::zip(&asked, &state.checkouts) {
@@ -124,7 +204,7 @@ fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
 
 /// Asks the daemon for the programs of `checkout`, and says how each went. `Err` is why it
 /// has no part in any.
-fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
+pub(super) fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
     if checkout.programs.is_empty() {
         return Ok(Vec::new());
     }
@@ -147,7 +227,7 @@ fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
 /// `checkout` as a request names it: with the variables of this process, which `env!`
 /// reads where cargo set none. The ones that make rustd the wrapper are cargo's alone.
 fn asking(checkout: &Checkout) -> Checkout {
-    let wraps = |name: &str| name == wrapper::ENABLED || name == "RUSTC_WORKSPACE_WRAPPER";
+    let wraps = |name: &str| name == wrapper::DRIVEN || name == switch::VARIABLE;
     let mut env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| !wraps(name)).collect();
     env.extend(checkout.env.clone());
@@ -162,6 +242,37 @@ fn warmed(checkout: &Checkout) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(why) => Err(format!("{why:#}")),
     }
+}
+
+/// The `cargo check` of what `asked` builds: the same packages, targets, features and
+/// profile, and for `test` the test targets with `cfg(test)`. It says what rustc has to
+/// say and nothing of its own.
+fn check_of(asked: &Invocation) -> Command {
+    let mut check = Command::new(state::cargo_path());
+    check.arg("check").args(&asked.build_args).stdin(Stdio::null()).stdout(Stdio::null());
+    if !asked.flags.quiet {
+        check.arg("--quiet");
+    }
+    if asked.subcommand == Subcommand::Test {
+        if !asked.flags.selects_targets {
+            check.arg("--tests");
+        }
+        if asked.flags.profile.is_none() {
+            check.args(["--profile", "test"]);
+        }
+    }
+    check
+}
+
+/// Has cargo check the dependencies of what `asked` builds while the daemon loads, so
+/// that the check of the first build by the daemon has only the workspace to look at.
+/// Nobody waits for it: a check that comes while it runs waits for cargo's lock.
+fn check_ahead(asked: &Invocation) {
+    let mut check = check_of(asked);
+    check.stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut check, 0);
+    let _ = check.spawn();
 }
 
 /// Builds with cargo, and has the daemon load what cargo built for the builds to come.
@@ -179,6 +290,7 @@ fn by_cargo(
     };
     let mut state = State::after(asked, cwd, key, built, counts)?;
     if state.refusal.is_none() {
+        check_ahead(asked);
         let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
         let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();
         for why in cold {
@@ -222,6 +334,9 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
 fn status() -> anyhow::Result<i32> {
     use std::fmt::Write as _;
     let mut said = String::new();
+    for line in switch::status(&std::env::current_dir()?).into_iter().chain(wrapper::tallied()) {
+        let _ = writeln!(said, "{line}");
+    }
     match client::ask(Request::Status, Start::Never)? {
         Some(Reply::Status(daemon)) => {
             let idle =
@@ -277,7 +392,10 @@ fn status() -> anyhow::Result<i32> {
 /// `cargo rustd stop`: has the daemon stop its workers and exit.
 fn stop() -> anyhow::Result<i32> {
     match client::ask(Request::Stop, Start::Never)? {
-        Some(_) => println!("daemon: stopping"),
+        Some(_) => {
+            client::gone(&daemon::socket_in(&daemon::home()?));
+            println!("daemon: stopped");
+        }
         None => println!("daemon: not running"),
     }
     Ok(0)

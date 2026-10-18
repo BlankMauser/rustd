@@ -917,7 +917,7 @@ const USAGE: &str = "usage: rustd cache push|pull REMOTE [PROJECT]\n       \
                      rustd cache keygen FILE\n       \
                      rustd cache forget REMOTE";
 
-/// `rustd cache VERB`, on the store `RUSTD_CACHE` names.
+/// `rustd cache VERB`, on the store of the user's builds.
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
     if verb == "keygen" {
@@ -927,7 +927,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     if verb == "gc" && args.next_if(|it| it == "--remote").is_some() {
         return collect_remote(args);
     }
-    let store = PathBuf::from(std::env::var_os("RUSTD_CACHE").context("RUSTD_CACHE is not set")?);
+    let store = crate::cargo::daemon::store().context("RUSTD_CACHE says there is no store")?;
     match verb.as_str() {
         "stats" => stats(&store),
         "gc" => collect(&store, args),
