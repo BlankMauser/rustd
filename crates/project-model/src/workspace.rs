@@ -414,7 +414,10 @@ impl ProjectWorkspace {
                 .expect("failed to spawn thread");
             let cargo_env = Builder::new()
                 .name("ProjectWorkspace::cargo_env".to_owned())
-                .spawn_scoped(s, move || cargo_config_env(&config_file, &config.extra_env))
+                .spawn_scoped(s, move || {
+                    let told = !config.extra_env_for_commands_only;
+                    cargo_config_env(&config_file, &config.extra_env, told)
+                })
                 .expect("failed to spawn thread");
             thread::Result::Ok((
                 rustc_cfg.join()?,
@@ -432,9 +435,11 @@ impl ProjectWorkspace {
                 Err(e) => std::panic::resume_unwind(e),
             };
 
-        for (key, value) in config.extra_env.iter() {
-            if let Some(value) = value {
-                cargo_env.insert(key.clone(), value.clone());
+        if !config.extra_env_for_commands_only {
+            for (key, value) in config.extra_env.iter() {
+                if let Some(value) = value {
+                    cargo_env.insert(key.clone(), value.clone());
+                }
             }
         }
 
@@ -608,7 +613,8 @@ impl ProjectWorkspace {
             config.no_deps,
         );
         let cargo_script = fetch_metadata.exec(false, &|_| ()).ok().map(|(ws, error)| {
-            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env);
+            let told = !config.extra_env_for_commands_only;
+            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env, told);
             (
                 CargoWorkspace::new(ws, detached_file.clone(), cargo_config_extra_env, false),
                 WorkspaceBuildScripts::default(),
@@ -1299,7 +1305,18 @@ fn cargo_to_crate_graph(
                     // Add test cfg for local crates
                     cfg_options.insert_atom(sym::test);
                 }
-                cfg_options.insert_atom(sym::rust_analyzer);
+                if !sysroot_as_built() {
+                    cfg_options.insert_atom(sym::rust_analyzer);
+                }
+            }
+            match &cargo[pkg].profile_cfg {
+                Some(profile) => cfg_options.apply_diff(profile.clone()),
+                // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
+                None if sysroot_as_built() && !cargo.is_sysroot() => {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::overflow_checks);
+                }
+                None => {}
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
@@ -1330,7 +1347,14 @@ fn cargo_to_crate_graph(
                 cargo,
                 pkg_data,
                 build_data.zip(Some(build_scripts.error().is_some())),
-                cfg_options.clone(),
+                {
+                    // Cargo builds a test target, and nothing else of the package, as a test.
+                    let mut cfg_options = cfg_options.clone();
+                    if sysroot_as_built() && matches!(kind, TargetKind::Test) {
+                        cfg_options.insert_atom(sym::test);
+                    }
+                    cfg_options
+                },
                 file_id,
                 name,
                 kind,
@@ -1804,6 +1828,18 @@ fn extend_crate_graph_with_sysroot(
     (SysrootPublicDeps { deps: pub_deps }, libproc_macro)
 }
 
+/// The sysroot is analyzed with `cfg(miri)` and `cfg(debug_assertions)` by default, which
+/// picks the simplest code paths. A consumer that links against the prebuilt standard library
+/// needs the configuration that library was built with instead.
+/// Likewise the crates cargo builds: its dev profile has `cfg(debug_assertions)`, and nothing
+/// it builds has `cfg(rust_analyzer)`.
+pub static SYSROOT_AS_BUILT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn sysroot_as_built() -> bool {
+    SYSROOT_AS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn sysroot_to_crate_graph(
     crate_graph: &mut CrateGraphBuilder,
     sysroot: &Sysroot,
@@ -1812,6 +1848,27 @@ fn sysroot_to_crate_graph(
     crate_ws_data: Arc<CrateWorkspaceData>,
 ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     let _p = tracing::info_span!("sysroot_to_crate_graph").entered();
+    let arch = rustc_cfg.iter().find_map(|atom| match atom {
+        CfgAtom::KeyValue { key, value } if key.as_str() == "target_arch" => Some(value.clone()),
+        _ => None,
+    });
+    let (public_deps, proc_macro) =
+        sysroot_crates_to_crate_graph(crate_graph, sysroot, rustc_cfg, load, crate_ws_data);
+    // The build script of `std` is not run: what it says of the target is said here.
+    let std = public_deps.deps.iter().find(|(name, ..)| name.as_str() == "std");
+    if let (Some(&(_, std, _)), Some(arch)) = (std, arch) {
+        crate_graph.set_env(std, "STD_ENV_ARCH", arch.as_str());
+    }
+    (public_deps, proc_macro)
+}
+
+fn sysroot_crates_to_crate_graph(
+    crate_graph: &mut CrateGraphBuilder,
+    sysroot: &Sysroot,
+    rustc_cfg: Vec<CfgAtom>,
+    load: FileLoader<'_>,
+    crate_ws_data: Arc<CrateWorkspaceData>,
+) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     match sysroot.workspace() {
         RustLibSrcWorkspace::Workspace { ws: cargo, .. } => {
             let (sysroot_cg, sysroot_pm) = cargo_to_crate_graph(
@@ -1821,14 +1878,18 @@ fn sysroot_to_crate_graph(
                 &Sysroot::empty(),
                 rustc_cfg,
                 &CfgOverrides {
-                    global: CfgDiff::new(
-                        vec![
-                            CfgAtom::Flag(sym::debug_assertions),
-                            CfgAtom::Flag(sym::miri),
-                            CfgAtom::Flag(sym::bootstrap),
-                        ],
-                        vec![CfgAtom::Flag(sym::test)],
-                    ),
+                    global: if sysroot_as_built() {
+                        CfgDiff::new(vec![], vec![CfgAtom::Flag(sym::test)])
+                    } else {
+                        CfgDiff::new(
+                            vec![
+                                CfgAtom::Flag(sym::debug_assertions),
+                                CfgAtom::Flag(sym::miri),
+                                CfgAtom::Flag(sym::bootstrap),
+                            ],
+                            vec![CfgAtom::Flag(sym::test)],
+                        )
+                    },
                     ..Default::default()
                 },
                 &WorkspaceBuildScripts::default(),
@@ -1846,10 +1907,14 @@ fn sysroot_to_crate_graph(
                 &Sysroot::empty(),
                 &FxHashMap::default(),
                 &CfgOverrides {
-                    global: CfgDiff::new(
-                        vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
-                        vec![],
-                    ),
+                    global: if sysroot_as_built() {
+                        CfgDiff::new(vec![], vec![])
+                    } else {
+                        CfgDiff::new(
+                            vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
+                            vec![],
+                        )
+                    },
                     ..Default::default()
                 },
                 false,
@@ -1863,8 +1928,10 @@ fn sysroot_to_crate_graph(
             let cfg_options = {
                 let mut cfg_options = CfgOptions::default();
                 cfg_options.extend(rustc_cfg);
-                cfg_options.insert_atom(sym::debug_assertions);
-                cfg_options.insert_atom(sym::miri);
+                if !sysroot_as_built() {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::miri);
+                }
                 cfg_options
             };
             let sysroot_crates: FxHashMap<

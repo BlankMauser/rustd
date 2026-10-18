@@ -135,6 +135,7 @@
         env: Env {
             entries: {
                 "CARGO": "$CARGO$",
+                "CARGO_BIN_NAME": "hello-world",
                 "CARGO_CRATE_NAME": "hello_world",
                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
@@ -220,6 +221,7 @@
         env: Env {
             entries: {
                 "CARGO": "$CARGO$",
+                "CARGO_BIN_NAME": "an-example",
                 "CARGO_CRATE_NAME": "an_example",
                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",

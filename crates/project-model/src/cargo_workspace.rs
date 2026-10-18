@@ -138,6 +138,8 @@ pub struct CargoConfig {
     pub config_path: Option<AbsPathBuf>,
     /// Extra env vars to set when invoking the cargo command
     pub extra_env: FxHashMap<String, Option<String>>,
+    /// Whether `extra_env` is only what cargo and rustc are run with, and no crate is told it.
+    pub extra_env_for_commands_only: bool,
     pub invocation_strategy: InvocationStrategy,
     /// Optional path to use instead of `target` when building
     pub target_dir_config: TargetDirectoryConfig,
@@ -145,6 +147,9 @@ pub struct CargoConfig {
     pub set_test: bool,
     /// Load the project without any dependencies
     pub no_deps: bool,
+    /// Run the build scripts as a build of the manifest's package has them, not as a build of
+    /// every member of its workspace does: the features of the two differ.
+    pub only_manifest_package: bool,
 }
 
 pub type Package = Idx<PackageData>;
@@ -176,6 +181,12 @@ pub struct PackageData {
     pub features: FxHashMap<String, Vec<String>>,
     /// List of features enabled on this package
     pub active_features: Vec<String>,
+    /// What the profile cargo builds the package with changes of the toolchain's cfg, when the
+    /// build is known.
+    pub profile_cfg: Option<cfg::CfgDiff>,
+    /// Whether the package is one the build was asked for, which cargo tells its crates with
+    /// `CARGO_PRIMARY_PACKAGE`.
+    pub primary: bool,
     /// Package id
     pub id: Arc<PackageId>,
     /// Authors as given in the `Cargo.toml`
@@ -427,6 +438,8 @@ impl CargoWorkspace {
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
+                profile_cfg: None,
+                primary: false,
                 metadata: meta.rust_analyzer.unwrap_or_default(),
                 all_member_deps: None,
             });
@@ -526,6 +539,59 @@ impl CargoWorkspace {
             is_sysroot,
             env: cargo_env,
         }
+    }
+
+    /// Replaces the features `cargo metadata` resolved for a package, which are those of a
+    /// build of the whole workspace.
+    pub fn set_active_features(&mut self, package: Package, features: Vec<String>) {
+        self.packages[package].active_features = features;
+    }
+
+    /// Sets what the profile the package is built with changes of the toolchain's cfg.
+    pub fn set_profile_cfg(&mut self, package: Package, cfg: cfg::CfgDiff) {
+        self.packages[package].profile_cfg = Some(cfg);
+    }
+
+    /// Sets whether the package is one the build was asked for.
+    pub fn set_primary(&mut self, package: Package, primary: bool) {
+        self.packages[package].primary = primary;
+    }
+
+    /// Leaves out what only tests, examples and benchmarks depend on.
+    pub fn drop_dev_dependencies(&mut self) {
+        for (_, package) in self.packages.iter_mut() {
+            package.dependencies.retain(|it| it.kind != DepKind::Dev);
+        }
+    }
+
+    /// The workspace with each member package `moved` picks, by its directory, at the place
+    /// under `to` that it has under `from`. The workspace is told to be where it was.
+    pub fn placed(
+        &self,
+        from: &AbsPath,
+        to: &AbsPath,
+        moved: &dyn Fn(&AbsPath) -> bool,
+    ) -> CargoWorkspace {
+        let place = |path: &AbsPath| match path.strip_prefix(from) {
+            Some(inside) => to.join(inside),
+            None => path.to_path_buf(),
+        };
+        let mut placed = self.clone();
+        let mut targets = Vec::new();
+        for (_, package) in placed.packages.iter_mut() {
+            if !package.is_member || !moved(package.manifest.parent()) {
+                continue;
+            }
+            let manifest: &AbsPath = package.manifest.as_ref();
+            package.manifest =
+                ManifestPath::try_from(place(manifest)).expect("a manifest is in a directory");
+            targets.extend(package.targets.iter().copied());
+        }
+        for target in targets {
+            let root = place(&placed.targets[target].root);
+            placed.targets[target].root = root;
+        }
+        placed
     }
 
     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
@@ -850,5 +916,33 @@ impl FetchMetadata {
         .with_context(|| format!("Failed to run `{:?}`", command.cargo_command()));
         progress("cargo metadata: finished".to_owned());
         res
+    }
+}
+
+impl PackageData {
+    /// `rust-version` as the manifest has it, which is what cargo hands to `env!`: cargo's
+    /// metadata, and so `rust_version`, has `1.70` as `1.70.0`.
+    pub(crate) fn rust_version_as_written(&self) -> Option<String> {
+        let parsed = self.rust_version.as_ref()?.to_string();
+        let written = |manifest: &Utf8Path, tables: &[&str]| {
+            let manifest: toml::Table = std::fs::read_to_string(manifest).ok()?.parse().ok()?;
+            let table = tables.iter().try_fold(&manifest, |table, key| table.get(*key)?.as_table());
+            table?.get("rust-version")?.as_str().map(str::to_owned)
+        };
+        let manifest: &Utf8Path = self.manifest.as_ref();
+        let of_workspace = || {
+            manifest
+                .ancestors()
+                .skip(2)
+                .find_map(|dir| written(&dir.join("Cargo.toml"), &["workspace", "package"]))
+        };
+        let written = written(manifest, &["package"]).or_else(of_workspace);
+        // Only what parses to the version cargo reports is the manifest's.
+        let same = |it: &String| match it.matches('.').count() {
+            0 => format!("{it}.0.0") == parsed,
+            1 => format!("{it}.0") == parsed,
+            _ => *it == parsed,
+        };
+        Some(written.filter(same).unwrap_or(parsed))
     }
 }
