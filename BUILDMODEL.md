@@ -19,12 +19,15 @@ Measured with
     RUSTD_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
     RUSTD_BIN=... RUSTD_OPT=2 RUSTD_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
 
-Result: 100 of 100 as expected under Cranelift and 100 of 100 under LLVM, 0 WRONG. The two
-tables are the same but for the backend column: 96 supported and 4 refused. Of the 4, 2 are
-projects cargo itself turns down and 2 are `lto` with rustc's own LTO link line. The cases
-have 36 invalidation steps between them and all 36 come out the same as cargo's rebuild;
-none is refused. That is unchanged from the third round; the fourth adds the doctests of 30
-crates from crates.io, 30 of 30 the same as `cargo test --doc` under each backend.
+Result: 104 of 104 as expected under Cranelift and 104 of 104 under LLVM, 0 WRONG. The two
+tables are the same but for the backend column: 99 supported and 5 refused. Of the 5, 2 are
+projects cargo itself turns down and 3 are `lto` with rustc's own LTO link line (in a
+workspace, fat and thin, and in a program of one crate). The cases have 36 invalidation
+steps between them and all 36 come out the same as cargo's rebuild; none is refused. The
+third round ended at 100 cases; the fourth adds the two `lto` rows of a program of one
+crate, doctests of two members of a workspace and doctests with `--target`, and outside the
+table the doctests of 30 crates from crates.io, 30 of 30 the same as `cargo test --doc`
+under each backend.
 
 The second round ended at 97 cases per backend, 92 supported and 5 refused, with 31 steps of
 which 2 were refused. The first ended at 90 cases, 82 supported and 8 refused, with 16 steps
@@ -139,9 +142,20 @@ list of failures after it, so two runs with the same failures in another order d
 
 A daemon that is given a link command for a program with `lto` in its profile now looks in
 it for `core` as a library (`libcore-*.rlib`, or std's shared library). rustc's LTO link has
-neither, also for a program of one crate, and rustd refuses with the sentence. What is left
-is the client that links by itself (`--out` only, as `buildmodel.py` does for its rows):
-rustd never sees that link and cannot say anything of it.
+neither, also for a program of one crate, and rustd refuses with the sentence. The rows
+`lto_single` and `lto_single_linked` hand rustd the link line (`"handed"` in `case.json`):
+with the line of a build with `lto = "off"` the program is the same as cargo's, with rustc's
+LTO line rustd refuses. What is left is the client that links by itself (`--out` only, as
+`buildmodel.py` does for its other rows): rustd never sees that link and cannot say anything
+of it, and the linker's undefined symbols are what that client gets.
+
+### Doctests of a workspace and of another target
+
+`doctest_members` runs `cargo test --doc -p app -p util` where `app` uses `util` (8
+examples, 3 of the 4 library functions from rustd; the fourth is generic). `doctest_cross`
+runs the doctests with `--target aarch64-unknown-linux-gnu` under qemu, with examples
+marked `ignore-aarch64` and `ignore-x86_64` (4 examples, 2 of 2 functions). Both are the
+same as cargo's under both backends.
 
 ## Third round
 
@@ -515,13 +529,11 @@ Inferred, not measured:
   last build: an edit that adds an instantiation or moves a function across rustc's
   inlining threshold is seen with the old objects until cargo builds again. Generic code
   that std ships a copy of was not examined.
-- `lto`: a client that links a single-crate program by itself with rustc's LTO link line
-  gets the linker's error; rustd only sees a link command it is given. `-C lto` in
-  `RUSTFLAGS` is refused.
+- `lto`: a client that links by itself with rustc's LTO link line gets the linker's error;
+  rustd only sees a link command it is given. `-C lto` in `RUSTFLAGS` is refused.
 - Doctests: rustdoc prints nothing of the errors of a `compile_fail` example that fails to
   compile as it should, so those are not compared; where rustd cannot build the library the
-  examples are left to rustdoc with the reason printed (none of the 30 crates). Doctests of
-  a workspace with several members, and with `--target`, were not run.
+  examples are left to rustdoc with the reason printed (none of the 30 crates).
 - `cargo/units.rs` still keeps its own records of what rustc was run with (it does not read
   the unit graph), and `cargo/plan.rs` plans the link from them.
 - `Flags::of` in `plan.rs` asks `cargo config get` for the configuration, which is how
@@ -550,7 +562,7 @@ and by this report.
 | `python3 worktrees.py` | 62 of 62 right |
 | `python3 keys.py` | 52 of 52 right, 0 open, 8 functions refused |
 | `python3 debuginfo.py` | all right |
-| `python3 buildmodel.py --backend <backend> --jobs 6` | 100 of 100 as expected, 0 WRONG |
+| `python3 buildmodel.py --backend <backend> --jobs 6` | 104 of 104 as expected, 0 WRONG (100 of 100 in the gate; the 4 new cases were run after it with the same binary) |
 | `python3 doctests.py` | 30 crates the same as `cargo test --doc`, 0 left to rustdoc, 0 WRONG |
 | `python3 storecorrupts.py` | PASS, 40 damaged stores detected, discarded and rebuilt |
 | `python3 storefull.py` | PASS, 6 full disks |
@@ -602,6 +614,8 @@ One row per case. "invalidation" is what each step of the case came to under one
 | `[replace]` | `dep_replace` | both | supported |  |  |
 | vendored dependency (`[source] directory`) | `dep_vendored` | both | supported |  |  |
 | doctests | `doctest` | both | supported |  |  |
+| doctests with `--target aarch64-unknown-linux-gnu` | `doctest_cross` | both | supported |  |  |
+| doctests of two members of a workspace, one using the other | `doctest_members` | both | supported |  |  |
 | editions 2015, 2018, 2021 and 2024 in one graph | `editions_mixed` | both | supported |  |  |
 | `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_CRATE_NAME`, `CARGO_BIN_NAME` | `env_cargo_pkg` | both | supported |  | the version in the manifest changes: same |
 | `env!` of a variable of the process | `env_env` | both | supported |  | the variable changes: same |
@@ -620,6 +634,8 @@ One row per case. "invalidation" is what each step of the case came to under one
 | `lto = true` | `lto_fat` | both | supported |  |  |
 | `lto = true`, and what rustd links against built with it | `lto_fat_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: rustd links against a build with `lto = "off"` |  |
 | `lto = "off"` | `lto_off` | both | supported |  |  |
+| `lto = true` in a program of one crate, rustd given the link line | `lto_single` | both | supported |  |  |
+| `lto = true` in a program of one crate, rustd given the link line built with it | `lto_single_linked` | both | refused | the link command has no library of `core`, as rustc's has not with `lto`: rustd links against a build with `lto = "off"` |  |
 | `lto = "thin"` | `lto_thin` | both | supported |  |  |
 | `lto = "thin"`, and what rustd links against built with it | `lto_thin_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: rustd links against a build with `lto = "off"` |  |
 | proc macro: attribute | `macro_attribute` | both | supported |  |  |

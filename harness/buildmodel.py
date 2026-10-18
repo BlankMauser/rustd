@@ -39,6 +39,7 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
             it is given ARTIFACT, and RUSTD_OBJECTS with rustd's objects for the second build
   args      what the program is run with
   expect    "supported" (the default) or "refused"
+  handed    rustd is given the link line of the build and links by itself
   fails     cargo itself turns the project down, and so must rustd
   steps     [{"what": .., "edit": [[file, old, new]], "write": {file: text}, "env": {..},
               "run": [shell commands in the project], "clients": how many ask at once,
@@ -222,9 +223,16 @@ class Case:
         if link is None:
             raise Wrong("cargo printed no link line for rustd's objects to go on")
         obj, report = os.path.join(self.work, "rustd.o"), os.path.join(self.work, "report.tsv")
+        out = os.path.join(self.work, "out")
+        os.makedirs(out, exist_ok=True)
+        binary = os.path.join(out, os.path.basename(linkline.output_of(link))) if not self.spec.get("archive") else None
+        handed = []
+        if self.spec.get("handed"):
+            handed = ["--link-cmd", linkline.join(linkline.with_output(linkline.ahead(link, [obj], RUSTD), binary))]
         run = subprocess.run(
             [RUSTD, self.ws, *(x for c in self.crates for x in ("--crate", c)), "--out", obj, "--report", report,
-             *self.rustd_args, *self.symbols(link, env)], capture_output=True, text=True, env=env, timeout=600)
+             *self.rustd_args, *handed, *self.symbols(link, env)],
+            cwd=self.link_dir(), capture_output=True, text=True, env=env, timeout=600)
         open(os.path.join(self.work, "rustd.stderr"), "w").write(run.stderr)
         if run.returncode < 0:
             raise Wrong(f"rustd died of signal {-run.returncode}: " + run.stderr[-300:])
@@ -239,9 +247,8 @@ class Case:
             raise Wrong("rustd compiled nothing, so nothing was compared")
         if self.spec.get("archive"):
             return link[0], [obj], compiled
-        out = os.path.join(self.work, "out")
-        os.makedirs(out, exist_ok=True)
-        binary = os.path.join(out, os.path.basename(linkline.output_of(link)))
+        if handed:
+            return binary, [], compiled
         linked = subprocess.run(linkline.with_output(linkline.ahead(link, [obj], RUSTD), binary), cwd=self.link_dir(), capture_output=True, text=True, env=env)
         if linked.returncode != 0:
             raise Wrong("the link with rustd's objects failed: " + (linked.stderr + linked.stdout)[-400:])
