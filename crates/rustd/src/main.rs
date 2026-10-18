@@ -265,6 +265,8 @@ struct Resolver<'a> {
     /// Whether the code is to say which lines it is of.
     debug: bool,
     listed: &'a Listed,
+    /// For each crate asked about, the paths that functions written in its bodies share.
+    shared_paths: std::cell::RefCell<FxHashMap<Crate, FxHashSet<String>>>,
 }
 
 impl Resolver<'_> {
@@ -328,6 +330,47 @@ impl Resolver<'_> {
         }
         let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
         generic(hir::Impl::from(imp).into())
+    }
+
+    /// Whether another function written in a body of the crate has this one's path. rustc
+    /// tells such functions apart by a number that the path does not show, so its symbol for
+    /// the path may be the other's.
+    fn shares_path(&self, func: FunctionId) -> bool {
+        let module = hir::Function::from(func).module(self.db);
+        if !is_in_body(self.db, module) {
+            return false;
+        }
+        let Some(path) = self.path(func) else { return false };
+        let krate = module.krate(self.db);
+        if let Some(shared) = self.shared_paths.borrow().get(&krate) {
+            return shared.contains(&path);
+        }
+        let shared = self.paths_shared_in(krate);
+        let shares = shared.contains(&path);
+        self.shared_paths.borrow_mut().insert(krate, shared);
+        shares
+    }
+
+    /// The paths that more than one of the functions written in the bodies of a crate have.
+    fn paths_shared_in(&self, krate: Crate) -> FxHashSet<String> {
+        let mut seen = FxHashSet::default();
+        let mut shared = FxHashSet::default();
+        // Asked for without listing the crate as one that is built.
+        let listed = self.listed.functions.lock().unwrap().get(&krate).cloned();
+        let functions = match &listed {
+            Some(listed) => listed.functions.clone(),
+            None => functions_of(self.db, krate),
+        };
+        for func in functions {
+            if !is_in_body(self.db, hir::Function::from(func).module(self.db)) {
+                continue;
+            }
+            let Some(path) = self.path(func) else { continue };
+            if !seen.insert(path.clone()) {
+                shared.insert(path);
+            }
+        }
+        shared
     }
 
     /// rustc's `StableCrateId` of a crate it built something of.
@@ -577,6 +620,7 @@ impl SymbolResolver for Resolver<'_> {
                         contents,
                         debug,
                         listed,
+                        shared_paths: Default::default(),
                     };
                     hir::attach_db(&db, || {
                         loop {
@@ -617,6 +661,11 @@ impl SymbolResolver for Resolver<'_> {
         // nothing to name, the more so in a crate of such alone, which rustc builds nothing
         // of. One of a name that another in the same function has is not to be taken for it.
         if self.is_generic(func) {
+            return None;
+        }
+        // The symbol of a path is the one rustc gave a function it built under it, which is
+        // not known to be this one when a body has two of the path.
+        if self.shares_path(func) {
             return None;
         }
         let path = self.path(func)?;
@@ -796,6 +845,11 @@ impl SymbolResolver for Resolver<'_> {
         let item = ModuleDef::from(item);
         self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
     }
+}
+
+/// Whether what the module declares is written in a body.
+fn is_in_body(db: &RootDatabase, module: Module) -> bool {
+    module.nearest_non_block_module(db) != module
 }
 
 /// Whether rustc numbers the node as a closure: a closure, or an `async` block.
@@ -1646,53 +1700,17 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     // The first thing asked of a crate after an edit: name resolution is redone here.
     hir_def::nameres::crate_def_map(db, krate.into());
     let resolved = start.elapsed();
-    let mut modules: Vec<Module> = vec![krate.root_module(db)];
-    let mut functions = Vec::new();
-    // Each scope's functions, and the bodies whose blocks declare more scopes.
-    let mut bodies: Vec<DefWithBodyId> = Vec::new();
-    let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
-        for def in scope.declarations() {
-            match def {
-                // A function declared in an `extern` block has no body to compile.
-                ModuleDefId::FunctionId(id)
-                    if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) =>
-                {
-                    functions.push(id);
-                    bodies.push(id.into());
-                }
-                ModuleDefId::ConstId(id) => bodies.push(id.into()),
-                ModuleDefId::StaticId(id) => bodies.push(id.into()),
-                _ => {}
-            }
-        }
-        bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
-        for imp in scope.impls() {
-            for &(_, item) in imp.impl_items(db).items.iter() {
-                match item {
-                    AssocItemId::FunctionId(id) => {
-                        functions.push(id);
-                        bodies.push(id.into());
-                    }
-                    AssocItemId::ConstId(id) => bodies.push(id.into()),
-                    AssocItemId::TypeAliasId(_) => {}
-                }
-            }
-        }
-    };
-    while let Some(module) = modules.pop() {
-        modules.extend(module.children(db));
-        let id = hir_def::ModuleId::from(module);
-        scope(id.def_map(db).module(db, id).scope(db), &mut bodies);
-    }
+    let mut declared = Declared::default();
+    declared.in_modules(db, krate);
     let scopes = start.elapsed();
-    let count = bodies.len();
+    let count = declared.bodies.len();
     // A body's blocks include those of the blocks in it, but not those of the items in them.
-    while !bodies.is_empty() {
-        let round = lower(db, std::mem::take(&mut bodies));
+    while !declared.bodies.is_empty() {
+        let round = lower(db, std::mem::take(&mut declared.bodies));
         for body in round {
             for (_, def_map) in Body::of(db, body).blocks(db) {
                 for (_, module) in def_map.modules(db) {
-                    scope(module.scope(db), &mut bodies);
+                    declared.in_scope(db, module.scope(db));
                 }
             }
         }
@@ -1704,7 +1722,64 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
             start.elapsed() - scopes
         );
     }
-    functions
+    declared.functions
+}
+
+/// The functions of a crate that no body declares, as its modules are now. The ones listed
+/// for a build are from before the edits since, and the bodies of those may be gone.
+fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+    let mut declared = Declared::default();
+    declared.in_modules(db, krate);
+    declared.functions
+}
+
+/// What scopes declare that has code.
+#[derive(Default)]
+struct Declared {
+    functions: Vec<FunctionId>,
+    /// The bodies whose blocks declare more scopes.
+    bodies: Vec<DefWithBodyId>,
+}
+
+impl Declared {
+    fn in_modules(&mut self, db: &RootDatabase, krate: Crate) {
+        let mut modules: Vec<Module> = vec![krate.root_module(db)];
+        while let Some(module) = modules.pop() {
+            modules.extend(module.children(db));
+            let id = hir_def::ModuleId::from(module);
+            self.in_scope(db, id.def_map(db).module(db, id).scope(db));
+        }
+    }
+
+    fn in_scope(&mut self, db: &RootDatabase, scope: &ItemScope) {
+        for def in scope.declarations() {
+            match def {
+                // A function declared in an `extern` block has no body to compile.
+                ModuleDefId::FunctionId(id)
+                    if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) =>
+                {
+                    self.functions.push(id);
+                    self.bodies.push(id.into());
+                }
+                ModuleDefId::ConstId(id) => self.bodies.push(id.into()),
+                ModuleDefId::StaticId(id) => self.bodies.push(id.into()),
+                _ => {}
+            }
+        }
+        self.bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                match item {
+                    AssocItemId::FunctionId(id) => {
+                        self.functions.push(id);
+                        self.bodies.push(id.into());
+                    }
+                    AssocItemId::ConstId(id) => self.bodies.push(id.into()),
+                    AssocItemId::TypeAliasId(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Lowers the bodies on all threads and hands them back. An edit to a file has every body in
@@ -1766,6 +1841,7 @@ fn build(
         contents,
         debug,
         listed,
+        shared_paths: Default::default(),
     };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();

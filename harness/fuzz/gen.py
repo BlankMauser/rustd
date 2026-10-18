@@ -229,6 +229,7 @@ class Gen(Scenes):
         self.blk, self.blocks, self.ldepth = 0, 0, 0
         self.scale = {}
         self.functions = 0
+        self.phases, self.cut = [], None
 
     # ---- plumbing -------------------------------------------------------------------------
 
@@ -2507,15 +2508,27 @@ class Gen(Scenes):
         self.statics, self.constant, self.cap = [], False, WORK
         self.pool = [self.scalar() for _ in range(6)]
         self.pool = list(dict.fromkeys(self.pool))
+        self.phase("adts")
         self.make_adts()
         for _ in range(self.r.choice([2, 4, 6])):
             self.ty(lambda x: x.kind != "param")
+        self.phase("constants")
         self.make_constants()
+        self.phase("traits")
         self.make_traits()
-        for _ in range(self.r.choice([1, 2, 3, 4, 5, 6, 8])):
+        for index in range(self.r.choice([1, 2, 3, 4, 5, 6, 8])):
+            self.phase(f"fn{index}")
             self.make_fn()
+        self.phase("run")
         self.make_run()
         return self.lines
+
+    def phase(self, name):
+        """Notes that a part of the case starts. From the part named by `cut` on, the case is
+        generated from other random numbers: the same case with that part and the rest edited."""
+        self.phases.append(name)
+        if self.cut and self.cut[0] == name:
+            self.r = random.Random(f"{self.key}/{self.cut[1]}")
 
 
 class Trait:
@@ -2539,8 +2552,19 @@ def case(seed, index):
             lines = gen.case()
         except NoValue:
             continue
+        gen.index = index if attempt == 0 else f"{index}/{attempt}"
         return lines, gen
     raise SystemExit(f"case {index} of seed {seed}: no program after 8 attempts")
+
+
+def variant(seed, index, name, cut):
+    """The case `index` of `seed` generated anew from the part `cut` names, or None when that gave no program."""
+    gen = Gen(seed, index)
+    gen.name, gen.cut = name, cut
+    try:
+        return gen.case()
+    except NoValue:
+        return None
 
 
 def module(name, lines):
