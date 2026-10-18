@@ -243,6 +243,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             closures: vec![],
             coroutine: None,
             unreached: vec![],
+            scope_ends: vec![],
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -3159,7 +3160,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// Don't call directly
     fn pop_drop_scope_assume_dropped_internal(&mut self) {
-        self.drop_scopes.pop();
+        if let Some(scope) = self.drop_scopes.pop() {
+            self.result.scope_ends.extend(scope.locals.iter().rev());
+        }
     }
 
     /// Don't call directly
@@ -3169,6 +3172,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
+        self.result.scope_ends.extend(scope.locals.iter().rev());
         self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }
