@@ -745,6 +745,195 @@ pub fn pretty(tkns: TokenTreesView<'_>) -> String {
     }
 }
 
+/// The text `stringify!` gives for tokens. This follows rustc's `print_tts`: a space goes after
+/// a token that had one in the source, unless it is one of the places rustc never puts one.
+/// A token written in the body of a macro always counts as having one.
+///
+/// `source_joined` says whether the source has another token right after the one at a span, or
+/// `None` if the token is not from the source.
+///
+/// One difference from rustc is left: what an `ident` or `lifetime` fragment matched counts as
+/// followed by a space there, and here it is treated like a `tt` fragment.
+pub fn stringify(
+    tkns: TokenTreesView<'_>,
+    source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+) -> String {
+    let mut text = String::new();
+    write_stringified(tkns.iter(), source_joined, &mut text);
+    return text;
+
+    /// The operators that are one token to rustc and several here.
+    const OPERATORS: &[&str] = &[
+        "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "..", "...", "..=", "<<", ">>",
+        "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<-",
+    ];
+
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "for",
+        "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "ref", "return", "self",
+        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+        "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro", "override",
+        "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
+    ];
+
+    fn start(tt: &TtElement<'_>) -> Span {
+        match tt {
+            TtElement::Leaf(leaf) => *leaf.span(),
+            TtElement::Subtree(subtree, _) => subtree.delimiter.open,
+        }
+    }
+
+    fn end(tt: &TtElement<'_>) -> Span {
+        match tt {
+            TtElement::Leaf(leaf) => *leaf.span(),
+            TtElement::Subtree(subtree, _) => subtree.delimiter.close,
+        }
+    }
+
+    fn punct(tt: &TtElement<'_>) -> Option<char> {
+        match tt {
+            TtElement::Leaf(Leaf::Punct(punct)) => Some(punct.char),
+            _ => None,
+        }
+    }
+
+    /// Whether rustc's token for `prev` has a spacing other than `Alone`. `operator` is the
+    /// part of an operator that ends with `prev`.
+    fn joined(
+        prev: &TtElement<'_>,
+        next: &TtElement<'_>,
+        operator: &str,
+        source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+    ) -> bool {
+        let in_source = match prev {
+            TtElement::Leaf(Leaf::Punct(it)) if !it.span.ctx.is_root() => {
+                // A token of a macro's body is `Alone` to rustc.
+                return matches!(it.spacing, Spacing::Joint)
+                    && punct(next).is_some_and(|next| {
+                        OPERATORS.iter().any(|it| {
+                            it.strip_prefix(operator).is_some_and(|rest| rest.starts_with(next))
+                        })
+                    });
+            }
+            TtElement::Leaf(leaf) if !leaf.span().ctx.is_root() => return false,
+            TtElement::Leaf(leaf) => source_joined(*leaf.span(), &leaf.to_string()),
+            TtElement::Subtree(subtree, _) => {
+                let close = match subtree.delimiter.kind {
+                    // What a macro puts around an expression it was passed.
+                    DelimiterKind::Parenthesis
+                        if subtree.delimiter.open == subtree.delimiter.close =>
+                    {
+                        return false;
+                    }
+                    DelimiterKind::Parenthesis => ")",
+                    DelimiterKind::Brace => "}",
+                    // rustc does the same, for the `hex-literal` crate.
+                    DelimiterKind::Bracket if !subtree.delimiter.close.ctx.is_root() => {
+                        return false;
+                    }
+                    DelimiterKind::Bracket => "]",
+                    DelimiterKind::Invisible => return false,
+                };
+                source_joined(subtree.delimiter.close, close)
+            }
+        };
+        if let Some(it) = in_source {
+            return it;
+        }
+        // The spacing of a token made by a macro says what follows it now.
+        matches!(prev, TtElement::Leaf(Leaf::Punct(Punct { spacing: Spacing::Joint, .. })))
+            || adjacent(end(prev), start(next))
+    }
+
+    /// rustc's `idents_would_merge`.
+    fn idents_would_merge(prev: &TtElement<'_>, next: &TtElement<'_>) -> bool {
+        matches!((prev, next), (TtElement::Leaf(Leaf::Ident(_)), TtElement::Leaf(Leaf::Ident(_))))
+    }
+
+    /// Whether `next` starts where `prev` ends.
+    fn adjacent(prev: Span, next: Span) -> bool {
+        prev.anchor == next.anchor
+            && prev.range.end() == next.range.start()
+            && prev.range != next.range
+    }
+
+    /// rustc's `space_between`.
+    fn space_between(prev: &TtElement<'_>, next: &TtElement<'_>) -> bool {
+        match (prev, next) {
+            (_, _) if punct(prev) == Some('.') && punct(next).is_none() => false,
+            (_, TtElement::Leaf(Leaf::Ident(_))) if punct(prev) == Some('$') => false,
+            (_, _) if punct(prev).is_none() && matches!(punct(next), Some(',' | ';' | '.')) => {
+                false
+            }
+            (TtElement::Leaf(Leaf::Ident(ident)), TtElement::Subtree(subtree, _))
+                if subtree.delimiter.kind == DelimiterKind::Parenthesis =>
+            {
+                ident.is_raw.no() && KEYWORDS.contains(&ident.sym.as_str())
+            }
+            (_, TtElement::Subtree(subtree, _)) if punct(prev) == Some('#') => {
+                subtree.delimiter.kind != DelimiterKind::Bracket
+            }
+            _ => true,
+        }
+    }
+
+    fn write_stringified(
+        tkns: TtIter<'_>,
+        source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+        text: &mut String,
+    ) {
+        let mut tkns = tkns.peekable();
+        let mut operator = String::new();
+        while let Some(tkn) = tkns.next() {
+            match &tkn {
+                TtElement::Leaf(Leaf::Punct(punct)) => {
+                    operator.push(punct.char);
+                    text.push(punct.char);
+                }
+                TtElement::Leaf(leaf) => text.push_str(&leaf.to_string()),
+                TtElement::Subtree(subtree, content) => {
+                    let (open, close) = match subtree.delimiter.kind {
+                        // What a macro puts around an expression it was passed, which is not
+                        // in the source.
+                        DelimiterKind::Parenthesis
+                            if subtree.delimiter.open == subtree.delimiter.close =>
+                        {
+                            ("", "")
+                        }
+                        // rustc puts a space inside a brace where the source had one after
+                        // the opening one.
+                        DelimiterKind::Brace => match content.clone().next() {
+                            Some(first)
+                                if !source_joined(subtree.delimiter.open, "{").unwrap_or(
+                                    subtree.delimiter.open != subtree.delimiter.close
+                                        && adjacent(subtree.delimiter.open, start(&first)),
+                                ) =>
+                            {
+                                ("{ ", " }")
+                            }
+                            _ => ("{", "}"),
+                        },
+                        DelimiterKind::Bracket => ("[", "]"),
+                        DelimiterKind::Parenthesis => ("(", ")"),
+                        DelimiterKind::Invisible => ("", ""),
+                    };
+                    text.push_str(open);
+                    write_stringified(content.clone(), source_joined, text);
+                    text.push_str(close);
+                }
+            }
+            let Some(next) = tkns.peek() else { break };
+            let is_joined = joined(&tkn, next, &operator, source_joined);
+            if !is_joined || punct(&tkn).is_none() {
+                operator.clear();
+            }
+            if if is_joined { idents_would_merge(&tkn, next) } else { space_between(&tkn, next) } {
+                text.push(' ');
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TransformTtAction<'a> {
     Keep,
