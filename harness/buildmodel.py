@@ -197,12 +197,14 @@ class Case:
         try:
             # rustc's `symbols.o` asks for what the libraries need of one another, which a linker
             # that reads archives in order finds no other way: `-C save-temps` keeps the file.
-            line = [a for a in linker_line(printed) if not a.endswith("symbols.o") or os.path.exists(a)]
+            line = linker_line(printed)
         except SystemExit:
             return None
         # A DLL of MSVC exports what the directives of `symbols.o` name: its `.def` is empty.
-        exports = linkline.msvc(line) and any(a.upper() == "/DLL" for a in line)
-        return [a for a in line if exports or not a.endswith("symbols.o")]
+        if linkline.msvc(line):
+            exports = any(a.upper() == "/DLL" for a in line)
+            return [a for a in line if exports or not a.endswith("symbols.o")]
+        return [a for a in line if not a.endswith("symbols.o") or os.path.exists(a)]
 
     def archive(self, env):
         """cargo's archive of the package with every symbol kept, in place of a link line."""

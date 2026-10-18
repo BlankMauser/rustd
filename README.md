@@ -39,8 +39,8 @@ Read this section before relying on it.
 - The code rustd generates is for the edit loop. Each function is compiled alone and nothing
   is inlined across functions, under either backend.
 - When rustd cannot build something it says so in one line and cargo or rustc builds it. It
-  is not supposed to guess. It has still been wrong: a fuzzer found sixteen problems,
-  eleven of them miscompiles. Five known differences from rustc are open and listed in
+  is not supposed to guess. It has still been wrong: a fuzzer found twenty-one
+  problems, most of them miscompiles. Four known differences from rustc are open and listed in
   [docs/support.md](docs/support.md).
 
 ## Build from source
@@ -145,7 +145,7 @@ were left out, for reasons listed in the results.
 | LLVM | yes | yes | yes | yes | no |
 | Full link | yes | yes | yes | yes | older branch only |
 | Splice | yes | yes | yes | yes, not with chained fixups | older branch only |
-| Debug info | yes | yes | no | unverified | no |
+| Debug info | yes | yes | lines only | unverified | no |
 | `cargo rustd` | yes | unverified | not run | not run | no |
 | Disk store | yes | yes | yes | yes | unverified |
 | S3 remote | yes, not real AWS | unverified | unverified | unverified | unverified |
@@ -159,18 +159,16 @@ build-model features.
 
 These are refused with a reason, and rustc or cargo builds them instead:
 
-- doctests, and `lto = true` or `"thin"`;
-- through `cargo rustd`: `--release` and any profile but dev and test, `RUSTFLAGS`,
-  `--all-features`, `--no-default-features`, more than one `-p`, `--exclude`, more than
-  one `--target`, `--message-format`, `-Z` flags, and a `RUSTC_WORKSPACE_WRAPPER` that is
-  already set;
+- `lto = true` or `"thin"`;
+- through `cargo rustd`: `--exclude`, more than one `--target`, `--message-format`, `-Z`
+  flags, and a `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;
 - a few language features, among them `sym` operands in `asm!` that is not naked, some
   variadic function definitions, and vectors in a C ABI;
 - any edit to a manifest, `Cargo.lock`, cargo configuration, a build script or a proc macro:
   that build is cargo's, and the daemon reloads afterwards.
 
-Not there at all: diagnostics, optimised output comparable to `--release`, debug info on
-Windows, and targets other than the ones in the table.
+Not there at all: diagnostics, optimised output comparable to `--release`, types and
+variables in Windows debug info, and targets other than the ones in the table.
 
 ## rust-analyzer
 

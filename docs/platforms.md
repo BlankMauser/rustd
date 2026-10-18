@@ -103,10 +103,11 @@ What is specific to the port:
 - The daemon's socket is an AF_UNIX socket. The check that only the user can reach it is
   not implemented on Windows.
 
-Not there: debug info is not written, and the PDB is stale after a splice. `cargo rustd`
+Debug info is CodeView procedures and line tables: backtraces and breakpoints by line work,
+a debugger shows no types, parameters or locals. The PDB is stale after a splice until the
+next full link. `cargo rustd`
 hands every build to cargo, because its link step is written for ELF, and has not been run
-on Windows. `buildmodel.py`, `debuginfo.py`, `storefull.py`, `remote.py` and the fuzzer
-are not run. The GNU and ARM64 Windows targets have nothing implemented.
+on Windows. `remote.py` and the fuzzer are not run. The GNU and ARM64 Windows targets have nothing implemented.
 
 ## macOS arm64
 

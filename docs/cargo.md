@@ -76,16 +76,12 @@ A whole invocation goes to cargo when any of these hold (`Invocation::only_cargo
 
 | Condition | Reason printed |
 |---|---|
-| `--release`, or `--profile` other than `dev` and `test` | rustd builds the dev profile only |
-| `cargo rustd test --doc` | doc tests are built by rustdoc |
-| `--message-format`, `--build-plan`, `--unit-graph` | `--message-format` is cargo's to answer |
+| `--message-format` | `--message-format` is cargo's to answer |
 | a `-Z` flag | unstable cargo flags |
-| `--all-features` | not loaded by the daemon yet |
-| `--no-default-features` | not loaded by the daemon yet |
-| more than one `-p`, or `--exclude` | a selection of several packages is not loaded by the daemon yet |
+| `--exclude` | `--exclude` is not loaded by the daemon yet |
 | more than one `--target` | several targets in one build |
-| `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_BUILD_RUSTFLAGS` set | the daemon loads the workspace without it |
-| `RUSTC_WORKSPACE_WRAPPER` set | it is set already |
+| `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `RUSTC_WORKSPACE_WRAPPER` is set to another wrapper |
+| `rustd-rustc` missing | `rustd-rustc` is not installed next to `rustd` |
 | `--target` or `CARGO_BUILD_TARGET` naming a target that is not ELF, or one rustd does not know | programs for the triple are not linked through `cargo rustd` yet |
 
 A single build goes to cargo when:
@@ -103,7 +99,8 @@ A single build goes to cargo when:
   Errors rust-analyzer does not find are not caught here; see "Known problems";
 - the daemon refused the build or failed.
 
-Doc tests are always run by `cargo test --doc`.
+Doc tests go through rustd in rustdoc's place. An example rustd cannot build is left to
+rustdoc, with a line saying why.
 
 The fallback is per invocation or per program, not per crate. If one program of an
 invocation cannot be the daemon's, cargo builds the invocation.

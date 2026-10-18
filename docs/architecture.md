@@ -2,7 +2,7 @@
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
 published tree: `crates/rustd` is the daemon, `crates/hir-ty-codegen` is the code generator
-(it is compiled as the module `hir_ty::mir::codegen` of the patched rust-analyzer, see
+(it is compiled as the module `hir_ty::mir::codegen` of rustd's rust-analyzer branch, see
 [contributing.md](contributing.md)), and `vendor/rust-analyzer` is the front end.
 
 ## The idea
