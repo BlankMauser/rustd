@@ -77,7 +77,7 @@ const BUILD_ENV: &[&str] = &[
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
-    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_",
     "CARGO_PROFILE_",
     "RUSTUP_TOOLCHAIN",
     "RUSTUP_HOME",
@@ -118,7 +118,7 @@ impl Subcommand {
 /// What the user asked for.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Asked {
-    Build(Invocation),
+    Build(Box<Invocation>),
     /// A subcommand that is cargo's alone, with its arguments.
     Cargo(Vec<String>),
     Status,
@@ -173,7 +173,7 @@ impl Asked {
             return Asked::Cargo(vec!["help".to_owned()]);
         };
         match (first.as_str(), Subcommand::named(first)) {
-            (_, Some(subcommand)) => Asked::Build(Invocation::parse(subcommand, rest)),
+            (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
             _ => Asked::Cargo(args),
@@ -253,11 +253,11 @@ impl Invocation {
         let reason = match () {
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
-            _ if flags.packages.len() > 1 || flags.excludes => {
-                "a selection of several packages is not loaded by the daemon yet"
-            }
+            _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if set("RUSTC_WORKSPACE_WRAPPER") => "RUSTC_WORKSPACE_WRAPPER is set already",
+            _ if set("RUSTC_WORKSPACE_WRAPPER") && !set(super::wrapper::ENABLED) => {
+                "RUSTC_WORKSPACE_WRAPPER is set already"
+            }
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -265,21 +265,22 @@ impl Invocation {
 
     /// The profile, as cargo's `Finished` line names it.
     pub(crate) fn profile(&self) -> &str {
-        let unnamed = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
-        self.flags.profile.as_deref().unwrap_or(unnamed)
+        let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
+        self.flags.profile.as_deref().unwrap_or(of_command)
     }
 
-    /// Which build of the package the command is, as the daemon plans it. The package is
-    /// the one of the directory the worker is started in.
+    /// Which build of the package the command is, as the daemon plans it. With no package
+    /// named it is the one of the directory the worker is started in.
     pub(crate) fn selection(&self) -> Selection {
         Selection {
             profile: self.flags.profile.clone().unwrap_or_else(|| "dev".to_owned()),
             features: self.flags.features.clone(),
             no_default_features: self.flags.no_default_features,
             all_features: self.flags.all_features,
+            packages: self.flags.packages.clone(),
+            workspace: self.flags.workspace,
             target: self.target(),
             dev_deps: self.subcommand == Subcommand::Test,
-            ..Selection::default()
         }
     }
 
@@ -355,7 +356,7 @@ mod tests {
     fn build(subcommand: &str, args: &str) -> Invocation {
         let words = std::iter::once(subcommand).chain(args.split_whitespace());
         match Asked::parse(words.map(str::to_owned).collect()) {
-            Asked::Build(invocation) => invocation,
+            Asked::Build(invocation) => *invocation,
             other => panic!("{other:?}"),
         }
     }
@@ -398,12 +399,16 @@ mod tests {
     fn what_is_cargos_alone() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Cargo(vec!["help".to_owned()]));
-        for args in ["--message-format json", "-p a -p b", "--target mips-unknown-none"] {
+        for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
             assert!(build("build", args).only_cargo().is_some(), "{args}");
         }
-        for args in ["--release", "--profile bench", "--all-features", "--no-default-features"] {
-            assert!(build("build", args).only_cargo().is_none(), "{args}");
+        for args in
+            ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
+        {
+            assert_eq!(build("build", args).only_cargo(), None, "{args}");
         }
+        assert_eq!(build("test", "--release").profile(), "release");
+        assert_eq!(build("test", "").profile(), "test");
     }
 
     #[test]

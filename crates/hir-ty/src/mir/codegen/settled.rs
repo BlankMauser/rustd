@@ -49,13 +49,17 @@ impl Mixed {
             return None;
         }
         let identity = |&(krate, checks): &(Crate, bool)| {
-            Some((symbols.content_id(krate).or_else(|| symbols.stable_crate_id(krate))?, checks))
+            let id = match symbols.content_id(krate) {
+                Some(content) => content.0.to_vec(),
+                None => symbols.stable_crate_id(krate)?.to_le_bytes().to_vec(),
+            };
+            Some((id, checks))
         };
         let key = crates.iter().map(identity).collect::<Option<Vec<_>>>().map(|mut ids| {
             ids.sort_unstable();
             let mut hasher = Sha256::new();
             for (id, checks) in ids {
-                hasher.update(id.to_le_bytes());
+                hasher.update(id);
                 hasher.update([u8::from(checks)]);
             }
             hasher.finalize().into()
