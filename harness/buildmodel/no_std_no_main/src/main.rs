@@ -3,9 +3,21 @@
 
 use core::fmt::Write;
 
+#[cfg(not(windows))]
 #[link(name = "c")]
 extern "C" {
     fn write(fd: i32, bytes: *const u8, len: usize) -> isize;
+    fn exit(status: i32) -> !;
+}
+
+/// The C runtime of MSVC, which is also what calls `main`.
+#[cfg(windows)]
+#[link(name = "msvcrt")]
+#[link(name = "ucrt")]
+#[link(name = "vcruntime")]
+extern "C" {
+    #[link_name = "_write"]
+    fn write(fd: i32, bytes: *const u8, len: u32) -> i32;
     fn exit(status: i32) -> !;
 }
 
@@ -17,7 +29,7 @@ struct Out;
 
 impl Write for Out {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        unsafe { write(1, text.as_ptr(), text.len()) };
+        unsafe { write(1, text.as_ptr(), text.len() as _) };
         Ok(())
     }
 }

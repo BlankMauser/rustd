@@ -405,7 +405,7 @@ fn function_name(path: &str) -> Option<String> {
 }
 
 /// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
-/// built as a test binary, and the files of its source, which the dep-info file cargo leaves
+/// built as a program, and the files of its source, which the dep-info file cargo leaves
 /// next to it lists, the one the crate starts at first.
 fn crate_sources(rlib: &Path, root: &Path) -> Option<(String, Vec<PathBuf>)> {
     let file = rlib.file_name()?.to_str()?;
@@ -413,7 +413,9 @@ fn crate_sources(rlib: &Path, root: &Path) -> Option<(String, Vec<PathBuf>)> {
         Some(stem) => stem.strip_prefix("lib")?,
         None => file.strip_suffix(".rcgu.o")?.split_once('.')?.0,
     };
-    let (name, _) = stem.rsplit_once('-')?;
+    // A crate's name has no `-`. cargo gives the program of an MSVC or Apple target no hash:
+    // the file of its symbols is named after it.
+    let name = stem.rsplit_once('-').map_or(stem, |(name, _)| name);
     let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
     let (_, sources) = dep_info.lines().next()?.split_once(": ")?;
     // FIXME: a path with a space in it is escaped.

@@ -235,9 +235,13 @@ impl Worker {
         command.arg("--out").arg(&first.object).arg("--patch").arg(&first.patch);
         command.arg("--link-cmd").arg(&first.link_cmd).arg("--splice").arg(&first.binary);
         command.arg("--socket").arg(&socket);
-        for file in &first.symbol_files {
-            command.arg("--symbols").arg(file);
-        }
+        // In a file: a program of many crates has more of them than fit the command line
+        // of a process on Windows.
+        let symbols = dir.join("symbols");
+        let listed: String =
+            first.symbol_files.iter().map(|it| format!("{}\n", it.display())).collect();
+        std::fs::write(&symbols, listed)?;
+        command.arg("--symbols-in").arg(&symbols);
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
         command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
@@ -306,6 +310,13 @@ impl Worker {
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
         self.set(&checkout.key, warmth);
+        // Nobody could ask it for a build until now.
+        *lock(&self.asked) = Instant::now();
+    }
+
+    /// Whether a checkout is still being loaded.
+    fn loads(&self) -> bool {
+        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
     }
 
     fn warmed(&self, checkout: &Checkout, started_on: bool) -> anyhow::Result<()> {
@@ -612,7 +623,8 @@ impl Daemon {
                 self.end();
             }
             lock(&self.workers).retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle;
+                // Loading can take longer than the idle time, and is what was asked for.
+                let keep = worker.loads() || lock(&worker.asked).elapsed() < idle;
                 if !keep {
                     worker.stop();
                 }

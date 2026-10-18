@@ -51,7 +51,7 @@ use hir_def::{
 };
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_symbol, link_name,
+    exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -191,6 +191,12 @@ impl Args {
                 "--crate" => krate = Some(value()?),
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
+                "--symbols-in" => {
+                    let listed = value()?;
+                    let listed = std::fs::read_to_string(&listed)
+                        .with_context(|| format!("reading the symbol files in {listed}"))?;
+                    symbol_files.extend(listed.lines().map(PathBuf::from));
+                }
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
                 "--binary" | "--splice" => splice = Some(PathBuf::from(value()?)),
@@ -264,6 +270,8 @@ struct Resolver<'a> {
     /// Whether the code is to say which lines it is of.
     debug: bool,
     listed: &'a Listed,
+    /// For each crate asked about, the paths that functions written in its bodies share.
+    shared_paths: std::cell::RefCell<FxHashMap<Crate, FxHashSet<String>>>,
 }
 
 impl Resolver<'_> {
@@ -329,25 +337,83 @@ impl Resolver<'_> {
         generic(hir::Impl::from(imp).into())
     }
 
-    /// rustc's `StableCrateId` of a crate it built something of.
+    /// Whether another function written in a body of the crate has this one's path. rustc
+    /// tells such functions apart by a number that the path does not show, so its symbol for
+    /// the path may be the other's.
+    fn shares_path(&self, func: FunctionId) -> bool {
+        let module = hir::Function::from(func).module(self.db);
+        if !is_in_body(self.db, module) {
+            return false;
+        }
+        let Some(path) = self.path(func) else { return false };
+        let krate = module.krate(self.db);
+        if let Some(shared) = self.shared_paths.borrow().get(&krate) {
+            return shared.contains(&path);
+        }
+        let shared = self.paths_shared_in(krate);
+        let shares = shared.contains(&path);
+        self.shared_paths.borrow_mut().insert(krate, shared);
+        shares
+    }
+
+    /// The paths that more than one of the functions written in the bodies of a crate have.
+    fn paths_shared_in(&self, krate: Crate) -> FxHashSet<String> {
+        let mut seen = FxHashSet::default();
+        let mut shared = FxHashSet::default();
+        // Asked for without listing the crate as one that is built.
+        let listed = self.listed.functions.lock().unwrap().get(&krate).cloned();
+        let functions = match &listed {
+            Some(listed) => listed.functions.clone(),
+            None => functions_of(self.db, krate),
+        };
+        for func in functions {
+            if !is_in_body(self.db, hir::Function::from(func).module(self.db)) {
+                continue;
+            }
+            let Some(path) = self.path(func) else { continue };
+            if !seen.insert(path.clone()) {
+                shared.insert(path);
+            }
+        }
+        shared
+    }
+
+    /// rustc's `StableCrateId` of a crate it built something of. A crate of the checkout is
+    /// one rustc built when a file of the link is its own: the standard library has private
+    /// copies of crates (memchr, hashbrown) whose names a dependency at a path has too.
     fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let ours = !krate.data(self.db).origin.is_lang();
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+        let root = self.crate_root(krate)?;
+        if ours && !self.table.links(name.crate_name().as_str(), &root) {
+            return None;
+        }
+        self.table.stable_crate_id(name.crate_name().as_str(), &root)
+    }
+
+    /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
+    /// of is spelled with its own id, so that no symbol of another crate of its name (the
+    /// standard library's memchr) is taken for one of its items.
+    fn crate_path(&self, krate: Crate) -> Option<String> {
+        let name = krate.display_name(self.db)?;
+        match self.own_crate_id(krate.into()) {
+            Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
+            None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
+        }
     }
 
     /// What stands for a crate of the checkout that rustc built nothing of, the same after
     /// every edit: its name and where in the checkout its source starts.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+        if krate.data(self.db).origin.is_lang() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
         let name = Crate::from(krate).display_name(self.db)?;
         let root = self.crate_root(krate.into())?;
         let root = self.inside(&root).unwrap_or(&root);
         let named = format!("rustd crate {} {}", name.crate_name(), root.display());
-        let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
-        Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
+        Some(short_hash(&named))
     }
 
     /// The file the crate's source starts at.
@@ -407,11 +473,7 @@ impl Resolver<'_> {
     /// function, closure, constant or static the block is in, which only the syntax knows.
     fn scope_path(&self, module: Module) -> Option<String> {
         if module.nearest_non_block_module(self.db) == module {
-            let krate = module.krate(self.db);
-            let krate_name = krate.display_name(self.db)?;
-            let mut path = self
-                .table
-                .crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
+            let mut path = self.crate_path(module.krate(self.db))?;
             for segment in module.path_segments(self.db) {
                 path.push_str("::");
                 path.push_str(segment.as_str());
@@ -568,7 +630,8 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
         .map(str::to_owned)
         .collect();
     let toolchain = vfs.iter().find_map(|(_, path)| {
-        let (toolchain, _) = path.as_path()?.as_str().split_once("lib/rustlib/src/rust/")?;
+        let path = path.as_path()?.as_str().replace('\\', "/");
+        let (toolchain, _) = path.split_once("lib/rustlib/src/rust/")?;
         Some(toolchain.to_owned())
     });
     if let Some(toolchain) = &toolchain {
@@ -608,6 +671,7 @@ impl SymbolResolver for Resolver<'_> {
                         contents,
                         debug,
                         listed,
+                        shared_paths: Default::default(),
                     };
                     hir::attach_db(&db, || {
                         loop {
@@ -627,9 +691,13 @@ impl SymbolResolver for Resolver<'_> {
         let source_root = self.db.file_source_root(file).source_root_id(self.db);
         let source_root = self.db.source_root(source_root).source_root(self.db);
         let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-        if let Some((toolchain, file)) = path.split_once("lib/rustlib/src/rust/")
+        // Whichever way this system writes a path; what follows the commit stays as it is.
+        const SOURCES: &str = "lib/rustlib/src/rust/";
+        let slashed = path.replace('\\', "/");
+        if let Some((toolchain, _)) = slashed.split_once(SOURCES)
             && let Some(commit) = self.rustc_commit.get_or_init(|| rustc_commit(toolchain))
         {
+            let file = &path[toolchain.len() + SOURCES.len()..];
             return Some(format!("/rustc/{commit}/{file}"));
         }
         let relative = self.inside(Path::new(&path));
@@ -650,6 +718,11 @@ impl SymbolResolver for Resolver<'_> {
         if self.is_generic(func) {
             return None;
         }
+        // The symbol of a path is the one rustc gave a function it built under it, which is
+        // not known to be this one when a body has two of the path.
+        if self.shares_path(func) {
+            return None;
+        }
         let path = self.path(func)?;
         // A test is the second of its name where it is written: rustc puts the constant
         // that describes it to the harness before it, under the same name.
@@ -662,14 +735,17 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = symbol {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name, unless an
-        // `extern` block declares it, and it is defined elsewhere under the name it links to.
+        // rustc has built nothing of the crate: the function is ours to name, unless it is
+        // declared in an `extern` block, where what it links to names it.
+        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
+            return None;
+        }
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
-        if let Some(symbol) = link_name(self.db, func) {
-            return Some(symbol);
+        match hir_ty::mir::codegen::block_place(self.db, self, func) {
+            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
+            None => Some(format!("rustd.{id:x}.{path}")),
         }
-        Some(format!("rustd.{id:x}.{path}"))
     }
 
     fn defines(&self, symbol: &str) -> bool {
@@ -682,6 +758,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn copies(&self, symbol: &str) -> Vec<(String, u64)> {
         self.table.copies(symbol).map(|(copy, of)| (copy.to_owned(), of)).collect()
+    }
+
+    fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
+        self.own_crate_id(krate).is_none()
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
@@ -841,6 +921,17 @@ impl SymbolResolver for Resolver<'_> {
     }
 }
 
+/// Whether what the module declares is written in a body.
+fn is_in_body(db: &RootDatabase, module: Module) -> bool {
+    module.nearest_non_block_module(db) != module
+}
+
+/// The first eight bytes of the SHA-256 of a text.
+fn short_hash(text: &str) -> u64 {
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes());
+    u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
+}
+
 /// Whether rustc numbers the node as a closure: a closure, or an `async` block.
 fn is_closure(node: &SyntaxNode) -> bool {
     ast::ClosureExpr::can_cast(node.kind())
@@ -933,17 +1024,7 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
-    let is_file = krate.ends_with(".rs");
-    let mut found: Vec<_> = Crate::all(db)
-        .into_iter()
-        .filter(|it| match is_file {
-            // Named from the checkout, or in full.
-            true => crate_root_file(db, *it).is_some_and(|root| {
-                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
-            }),
-            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
-        })
-        .collect();
+    let mut found = crates_called(db, krate, args);
     // A dependency may be another version of the crate being built, and another checkout
     // has a crate of its name too.
     let of_checkout = |krate: &Crate| args.members.contains(&(*krate).into());
@@ -1030,6 +1111,40 @@ fn links_core(command: &str) -> bool {
         let name = it.rsplit(['/', '\\']).next().unwrap_or(it);
         it.starts_with('@') || name.starts_with("libcore-") || name.starts_with("libstd-")
     })
+}
+
+/// Every crate called `krate`, of the checkout or not.
+fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
+    let is_file = krate.ends_with(".rs");
+    Crate::all(db)
+        .into_iter()
+        .filter(|it| match is_file {
+            // Named from the checkout, or in full.
+            true => crate_root_file(db, *it).is_some_and(|root| {
+                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+            }),
+            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        })
+        .collect()
+}
+
+/// The crates called `krate` to build: the ones rustc built into this program, when it built
+/// any, which may be a crate of the checkout and a dependency of the same name both. Otherwise
+/// what `crates_named` finds.
+fn crates_to_build(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    krate: &str,
+    args: &Args,
+) -> anyhow::Result<Vec<Crate>> {
+    let linked = |krate: &Crate| {
+        let name = krate.display_name(db);
+        let root = crate_root_file(db, *krate);
+        name.zip(root).is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+    };
+    let mut called = crates_called(db, krate, args);
+    called.retain(linked);
+    if called.is_empty() { crates_named(db, krate, args) } else { Ok(called) }
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -1781,53 +1896,17 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     // The first thing asked of a crate after an edit: name resolution is redone here.
     hir_def::nameres::crate_def_map(db, krate.into());
     let resolved = start.elapsed();
-    let mut modules: Vec<Module> = vec![krate.root_module(db)];
-    let mut functions = Vec::new();
-    // Each scope's functions, and the bodies whose blocks declare more scopes.
-    let mut bodies: Vec<DefWithBodyId> = Vec::new();
-    let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
-        for def in scope.declarations() {
-            match def {
-                // A function declared in an `extern` block has no body to compile.
-                ModuleDefId::FunctionId(id)
-                    if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) =>
-                {
-                    functions.push(id);
-                    bodies.push(id.into());
-                }
-                ModuleDefId::ConstId(id) => bodies.push(id.into()),
-                ModuleDefId::StaticId(id) => bodies.push(id.into()),
-                _ => {}
-            }
-        }
-        bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
-        for imp in scope.impls() {
-            for &(_, item) in imp.impl_items(db).items.iter() {
-                match item {
-                    AssocItemId::FunctionId(id) => {
-                        functions.push(id);
-                        bodies.push(id.into());
-                    }
-                    AssocItemId::ConstId(id) => bodies.push(id.into()),
-                    AssocItemId::TypeAliasId(_) => {}
-                }
-            }
-        }
-    };
-    while let Some(module) = modules.pop() {
-        modules.extend(module.children(db));
-        let id = hir_def::ModuleId::from(module);
-        scope(id.def_map(db).module(db, id).scope(db), &mut bodies);
-    }
+    let mut declared = Declared::default();
+    declared.in_modules(db, krate);
     let scopes = start.elapsed();
-    let count = bodies.len();
+    let count = declared.bodies.len();
     // A body's blocks include those of the blocks in it, but not those of the items in them.
-    while !bodies.is_empty() {
-        let round = lower(db, std::mem::take(&mut bodies));
+    while !declared.bodies.is_empty() {
+        let round = lower(db, std::mem::take(&mut declared.bodies));
         for body in round {
             for (_, def_map) in Body::of(db, body).blocks(db) {
                 for (_, module) in def_map.modules(db) {
-                    scope(module.scope(db), &mut bodies);
+                    declared.in_scope(db, module.scope(db));
                 }
             }
         }
@@ -1839,7 +1918,64 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
             start.elapsed() - scopes
         );
     }
-    functions
+    declared.functions
+}
+
+/// The functions of a crate that no body declares, as its modules are now. The ones listed
+/// for a build are from before the edits since, and the bodies of those may be gone.
+fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+    let mut declared = Declared::default();
+    declared.in_modules(db, krate);
+    declared.functions
+}
+
+/// What scopes declare that has code.
+#[derive(Default)]
+struct Declared {
+    functions: Vec<FunctionId>,
+    /// The bodies whose blocks declare more scopes.
+    bodies: Vec<DefWithBodyId>,
+}
+
+impl Declared {
+    fn in_modules(&mut self, db: &RootDatabase, krate: Crate) {
+        let mut modules: Vec<Module> = vec![krate.root_module(db)];
+        while let Some(module) = modules.pop() {
+            modules.extend(module.children(db));
+            let id = hir_def::ModuleId::from(module);
+            self.in_scope(db, id.def_map(db).module(db, id).scope(db));
+        }
+    }
+
+    fn in_scope(&mut self, db: &RootDatabase, scope: &ItemScope) {
+        for def in scope.declarations() {
+            match def {
+                // A function declared in an `extern` block has no body to compile.
+                ModuleDefId::FunctionId(id)
+                    if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) =>
+                {
+                    self.functions.push(id);
+                    self.bodies.push(id.into());
+                }
+                ModuleDefId::ConstId(id) => self.bodies.push(id.into()),
+                ModuleDefId::StaticId(id) => self.bodies.push(id.into()),
+                _ => {}
+            }
+        }
+        self.bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                match item {
+                    AssocItemId::FunctionId(id) => {
+                        self.functions.push(id);
+                        self.bodies.push(id.into());
+                    }
+                    AssocItemId::ConstId(id) => self.bodies.push(id.into()),
+                    AssocItemId::TypeAliasId(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Lowers the bodies on all threads and hands them back. An edit to a file has every body in
@@ -1903,6 +2039,7 @@ fn build(
         contents,
         debug,
         listed,
+        shared_paths: Default::default(),
     };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
@@ -1911,18 +2048,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     for (at, krate) in args.crates().enumerate() {
-        let mut named = crates_named(db, krate, args)?;
-        // Of the crates of the name, the ones rustc built into this program, when it built any.
-        let linked = |krate: &Crate| {
-            let name = krate.display_name(db);
-            let root = crate_root_file(db, *krate);
-            name.zip(root)
-                .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
-        };
-        if named.iter().any(linked) {
-            named.retain(linked);
-        }
-        for krate in named {
+        for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
             let listed = listed.of(db, krate);
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
@@ -2150,6 +2276,11 @@ fn link(
         };
         match spliced {
             Ok((baseline, Spliced { redirected, appended })) => {
+                if redirected != 0 && baseline.leaves_debug_info() {
+                    eprintln!(
+                        "debug: the PDB is of the code before the splice: the {redirected} functions redirected have no lines in it until the next full link"
+                    );
+                }
                 let read = Executable::Read(Box::new(baseline));
                 LINKED.lock().unwrap().insert(binary.to_owned(), read);
                 eprintln!(
@@ -2525,6 +2656,13 @@ fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
     });
     let (module, why) = broken?;
     Some(format!("{module} has errors, `cargo check` shows them: {why}"))
+}
+
+/// The text of the source file at `path` as the database has it.
+fn source_on_disk(path: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    let rust = path.extension().is_some_and(|it| it == "rs");
+    Ok(if rust { load_cargo::source_text(text) } else { text })
 }
 
 /// A file whose changes the daemon picks up.
@@ -3183,6 +3321,10 @@ fn end_with_input() {
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    #[cfg(windows)]
+    if let Some(script) = cargo::script::stood_in_front_of() {
+        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {
@@ -3890,7 +4032,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
                 if switched.iter().any(|base| file.path.starts_with(base)) {
                     file.mtime = now;
                     let same = match file.file {
-                        Watched::Source(id) => std::fs::read_to_string(&on_disk)
+                        Watched::Source(id) => source_on_disk(&on_disk)
                             .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
                         Watched::Included(ref path) => db.included_is_read(path),
                     };
@@ -3953,7 +4095,8 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
+                    let text = source_on_disk(&db.on_disk(path))?;
+                    change.change_file(*id, Some(text));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),
@@ -4554,10 +4697,15 @@ impl Program {
                 ("resolve", phases.resolve),
                 ("define", phases.define),
                 ("object", phases.object),
+                ("discarded", phases.discarded),
                 (
                     "compile-rest",
                     compile.saturating_sub(
-                        phases.compile + phases.resolve + phases.define + phases.object,
+                        phases.compile
+                            + phases.resolve
+                            + phases.define
+                            + phases.object
+                            + phases.discarded,
                     ),
                 ),
                 ("write", warm.emit),

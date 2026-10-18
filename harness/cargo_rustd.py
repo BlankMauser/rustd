@@ -35,7 +35,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import host
 ROOT = os.path.dirname(HERE)
-RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
+WINDOWS = os.name == "nt"
+EXE = ".exe" if WINDOWS else ""
+RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd" + EXE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 SOURCES = os.environ.get("RUSTD_PROJECTS") or os.path.expanduser("~/rustd-projects")
 WARMUP_SECS = 1800
@@ -149,9 +151,37 @@ def base_env(home):
     return env
 
 
+# A process started with this is the head of a group or tree that `kill_all` ends whole.
+OWN_GROUP = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
+
+
+def kill_all(process):
+    """Ends `process` and what it started, with no chance to clean up."""
+    if WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # it and its group have already ended
+
+
+def kill(pid):
+    """Ends the one process `pid`. Windows has no signals; `SIGTERM` there ends it at once."""
+    os.kill(pid, signal.SIGTERM if WINDOWS else signal.SIGKILL)
+
+
+def alive(pid):
+    """Whether `pid` is a process that still runs."""
+    if not WINDOWS:
+        return os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
+    listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True)
+    return f'"{pid}"' in listed.stdout
+
+
 def timed(argv, cwd, env, timeout=7200):
     began = time.time()
-    ran = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    ran = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     return time.time() - began, ran
 
 
@@ -240,7 +270,7 @@ def fetched(url):
 def served(side, command, ask):
     """What the server `cargo run` starts on `side` answers when `ask` asks it."""
     argv = ["cargo", *(["rustd"] if side.rustd else []), "run", *command]
-    server = subprocess.Popen(argv, cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    server = subprocess.Popen(argv, cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **OWN_GROUP)
     try:
         for _ in range(3000):
             if server.poll() is not None:
@@ -251,7 +281,7 @@ def served(side, command, ask):
                 time.sleep(0.1)
         return "no answer"
     finally:
-        os.killpg(server.pid, signal.SIGKILL)
+        kill_all(server)
         server.wait()
         # The port is free again before the other side's server asks for it.
         for _ in range(100):
@@ -271,6 +301,10 @@ def wait_warm(side, root):
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
         if states and not any(s.startswith("loading") for s in states):
             return time.time() - began, states
+        # No daemon loads what every build so far was left to cargo for.
+        left = re.search(r"^daemon: not running$(?s:.*)^  every build is cargo's: (.*)$", status.stdout, re.M)
+        if left:
+            return time.time() - began, ["left to cargo: " + left[1]]
         time.sleep(0.25)
     return time.time() - began, ["not loaded in time"]
 
@@ -316,8 +350,8 @@ def project(name, spec, work):
         wrong = difference(compare(mine), compare(other))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
-            open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w").write(mine.stdout + mine.stderr)
-            open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w").write(other.stdout + other.stderr)
+            open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
+            open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w", encoding="utf-8").write(other.stdout + other.stderr)
         print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
 
     def runs(label):
@@ -475,7 +509,6 @@ def daemon(work):
         pid = re.search(r"^daemon: pid (\d+)", text, re.M)
         return (int(pid[1]) if pid else None), [int(p) for p in re.findall(r"worker: pid (\d+)", text)], text
 
-    alive = lambda pid: os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
     edit = lambda root, text: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
 
     check("no daemon before the first build", status()[0] is None)
@@ -506,9 +539,9 @@ def daemon(work):
     check("a build in the worktree is the daemon's", how_built(in_tree.stderr) == "daemon" and in_tree.returncode == 0, how_built(in_tree.stderr))
 
     edit(ws, "three")
-    client = subprocess.Popen(["cargo", "rustd", "build"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    client = subprocess.Popen(["cargo", "rustd", "build"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **OWN_GROUP)
     time.sleep(0.01)
-    os.killpg(client.pid, signal.SIGKILL)
+    kill_all(client)
     client.wait()
     edit(ws, "four")
     _, after_kill = here.cargo("run")
@@ -516,7 +549,7 @@ def daemon(work):
 
     other = os.path.join(work, "other-build")
     os.makedirs(other, exist_ok=True)
-    for name in ("rustd", "cargo-rustd"):
+    for name in ("rustd" + EXE, "cargo-rustd" + EXE):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     edit(ws, "five")
@@ -539,7 +572,7 @@ def daemon(work):
     here.cargo("build")
     wait_warm(here, ws)
     pid, workers, _ = status()
-    os.kill(pid, signal.SIGKILL)
+    kill(pid)
     time.sleep(1)
     check("workers exit when the daemon is killed", workers and not any(alive(p) for p in workers), f"workers {workers}")
     edit(ws, "six")
@@ -709,7 +742,8 @@ def table(rows):
 def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
-    work = tempfile.mkdtemp(prefix="rustd-cargo-")
+    # As the daemon names it: with no link and no short name in it.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-"))
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:

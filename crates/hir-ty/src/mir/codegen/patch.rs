@@ -297,6 +297,8 @@ pub(super) struct Base {
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
     left: Vec<Option<Left>>,
+    /// The skipped functions that rustc has a copy of.
+    from_rustc: Vec<FunctionId>,
     their_statics: TheirStatics,
     their_walk: TheirWalk,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
@@ -532,7 +534,8 @@ impl Base {
             .iter()
             .map(|(root, e)| (!matches!(e, CodegenError::NoSymbol)).then(|| Left::of(db, *root)))
             .collect();
-        let (their_statics, walked) = TheirStatics::walk(db, left_to_rustc(skipped));
+        let from_rustc: Vec<FunctionId> = left_to_rustc(db, cg.symbols, skipped).collect();
+        let (their_statics, walked) = TheirStatics::walk(db, from_rustc.iter().copied());
         let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
         let rejected = cg
             .rejected
@@ -553,6 +556,7 @@ impl Base {
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
+            from_rustc,
             their_statics,
             their_walk,
             instances,
@@ -620,7 +624,7 @@ impl Base {
             return;
         }
         let start = stdx::time::Instant::now();
-        let now = probe(|| TheirStatics::walk(db, left_to_rustc(&self.skipped)));
+        let now = probe(|| TheirStatics::walk(db, self.from_rustc.iter().copied()));
         match now {
             Some((now, walked)) if now == self.their_statics => {
                 if changed {

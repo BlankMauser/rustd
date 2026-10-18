@@ -648,6 +648,29 @@ fn expand_doc_macro_call<'db>(
     expansion
 }
 
+/// The string a `#[key = value]` attribute's value is once the macros in it are expanded, as
+/// `#[link_name = concat!(prefix!(), "name")]`.
+pub(crate) fn expand_attr_value<'db>(
+    db: &'db dyn SourceDatabase,
+    krate: Crate,
+    resolver: Resolver<'db>,
+    value: InFile<ast::Expr>,
+) -> Option<String> {
+    let file_id = value.file_id;
+    let recursion_limit = resolver.top_level_def_map().recursion_limit();
+    let mut expander = DocMacroExpander {
+        db,
+        krate,
+        macro_depth: file_id.macro_expansion_depth(db),
+        recursion_limit,
+        resolver,
+        file_id,
+        ast_id_map: file_id.ast_id_map(db),
+        span_map: file_id.span_map(db),
+    };
+    expand_doc_expr_via_macro_pipeline(&mut expander, &mut ThinVec::new(), value.value)
+}
+
 fn extend_with_attrs<'a, 'db>(
     result: &mut Docs,
     db: &'db dyn SourceDatabase,
