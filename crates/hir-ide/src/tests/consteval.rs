@@ -123,7 +123,7 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
     let _tracing = setup_tracing();
     let module_id = db.module_for_file(file_id.file_id(db));
     let def_map = module_id.def_map(db);
-    let scope = &def_map[module_id].scope;
+    let scope = &def_map.module(db, module_id).scope(db);
     let const_id = scope
         .declarations()
         .find_map(|x| match x {
@@ -2461,6 +2461,41 @@ fn statics() {
     const GOAL: i32 = f() + f() + f();
     "#,
         36,
+    );
+}
+
+#[test]
+fn statics_pointing_at_each_other() {
+    check_number(
+        r#"
+    //- minicore: sized
+    struct Site {
+        meta: &'static Meta,
+        id: i32,
+    }
+    struct Meta {
+        site: &'static Site,
+        level: i32,
+    }
+    static SITE: Site = Site { meta: &META, id: 7 };
+    static META: Meta = Meta { site: &SITE, level: 30 };
+    const GOAL: i32 = SITE.meta.level + META.site.id + META.site.meta.level;
+    "#,
+        67,
+    );
+}
+
+#[test]
+fn static_read_through_another() {
+    check_number(
+        r#"
+    //- minicore: sized
+    static BASE: i32 = 5;
+    static POINTER: &i32 = &BASE;
+    static COPY: i32 = *POINTER + 1;
+    const GOAL: i32 = COPY + *POINTER;
+    "#,
+        11,
     );
 }
 

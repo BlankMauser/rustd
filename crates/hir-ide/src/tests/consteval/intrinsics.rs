@@ -164,7 +164,7 @@ fn type_name() {
 
         const GOAL: &str = type_name::<mod1::mod2::Ty>();
         "#,
-        "mod1::mod2::Ty",
+        "ra_test_fixture::mod1::mod2::Ty",
     );
 }
 

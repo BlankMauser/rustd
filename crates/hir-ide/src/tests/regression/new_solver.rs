@@ -38,7 +38,7 @@ fn f<'a, 'b>(x: &'a u8, y: &'b u8) {}
     crate::attach_db(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
-        let scope = &def_map[module_id].scope;
+        let scope = &def_map.module(&db, module_id).scope(&db);
         let func = scope
             .declarations()
             .find_map(
@@ -436,8 +436,9 @@ pub union U {
     crate::attach_db(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
-        let union_id = def_map[module_id]
-            .scope
+        let union_id = def_map
+            .module(&db, module_id)
+            .scope(&db)
             .declarations()
             .find_map(|decl| match decl {
                 ModuleDefId::AdtId(AdtId::UnionId(id)) => Some(id),

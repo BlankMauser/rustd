@@ -516,8 +516,8 @@ pub(crate) fn visit_module(
     module_id: ModuleId,
     cb: &mut dyn FnMut(ModuleDefId),
 ) {
-    visit_scope(db, crate_def_map, &crate_def_map[module_id].scope, cb);
-    for impl_id in crate_def_map[module_id].scope.impls() {
+    visit_scope(db, crate_def_map, crate_def_map.module(db, module_id).scope(db), cb);
+    for impl_id in crate_def_map.module(db, module_id).scope(db).impls() {
         let impl_data = impl_id.impl_items(db);
         for &(_, item) in impl_data.items.iter() {
             match item {
@@ -584,7 +584,7 @@ pub(crate) fn visit_module(
 
     fn visit_body(db: &TestDB, body: &Body, cb: &mut dyn FnMut(ModuleDefId)) {
         for (_, def_map) in body.blocks(db) {
-            for (mod_id, _) in def_map.modules() {
+            for (mod_id, _) in def_map.modules(db) {
                 visit_module(db, def_map, mod_id, cb);
             }
         }

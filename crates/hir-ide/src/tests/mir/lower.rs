@@ -9,7 +9,7 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
-        let scope = &def_map[module_id].scope;
+        let scope = &def_map.module(&db, module_id).scope(&db);
         let funcs = scope.declarations().filter_map(|x| match x {
             hir_def::ModuleDefId::FunctionId(it) => Some(it),
             _ => None,
@@ -64,4 +64,33 @@ fn f<T: Tr>(x: T::A) {
 }
 "#,
     );
+}
+
+#[test]
+fn nested_closure_moves_local_of_enclosing_closure() {
+    let (db, file_id) = TestDB::with_single_file(
+        r#"
+//- minicore: copy, fn
+struct S;
+fn main() {
+    let outer = S;
+    || {
+        let local = outer;
+        || { let moved = local; };
+    };
+}
+"#,
+    );
+    crate::attach_db(db.as_dyn(), || {
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let scope = &module_id.def_map(&db).module(&db, module_id).scope(&db);
+        for decl in scope.declarations() {
+            if let hir_def::ModuleDefId::FunctionId(func) = decl {
+                let mut closures = db.mir_body(func.into()).unwrap().closures.clone();
+                while let Some(closure) = closures.pop() {
+                    closures.extend(&db.mir_body_for_closure(closure).unwrap().closures);
+                }
+            }
+        }
+    })
 }
