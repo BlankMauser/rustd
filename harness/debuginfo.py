@@ -468,7 +468,7 @@ def compare(tally, what, theirs, ours, binary=None):
     if fewer:
         # A frame may only be missing because its function left by a jump: anything else is a
         # frame the debug info lost.
-        left = {name: jumps_away(binary, name) if binary else None for name in sorted(absent)}
+        left = {name: jumps_away(binary, name) if binary and not WINDOWS else None for name in sorted(absent)}
         kept = [name for name, jumps in left.items() if jumps is False]
         if kept:
             return tally.say(what, "FRAMES LOST", f"{more}; {kept[0]} calls and has no frame")

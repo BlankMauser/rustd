@@ -163,7 +163,9 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           status=0
-          python3 cargo_rustd.py || status=$?
+          # The projects a hosted runner has the time and the memory for: the ten after these
+          # take more than its three hours, and it was shut down loading rust-analyzer.
+          python3 cargo_rustd.py ripgrep fd bat hyperfine just axum nushell || status=$?
           cat CARGO-RUSTD.md
           exit $status
 

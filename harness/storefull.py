@@ -17,7 +17,7 @@ of a pack behind, and `rustd cache gc` has to make room.
 
     python3 storefull.py
 """
-import os, shutil, subprocess, sys, time
+import errno, os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -83,8 +83,21 @@ class Disk:
         take = self.free() - room
         if take < 0:
             fail(f"the disk has {self.free()} bytes free, fewer than {room}")
-        with open(self.ballast, "wb") as ballast:
-            ballast.write(bytes(take))
+        # NTFS takes room of its own for a file this long, so the last blocks may not fit.
+        chunk = 1 << 20
+        with open(self.ballast, "wb", buffering=0) as ballast:
+            while take:
+                size = min(chunk, take)
+                try:
+                    ballast.write(bytes(size))
+                except OSError as full:
+                    if full.errno != errno.ENOSPC:
+                        raise
+                    if chunk == 4096:
+                        break
+                    chunk = 4096
+                    continue
+                take -= size
         return self.free()
 
     def unmount(self):
