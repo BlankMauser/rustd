@@ -1,6 +1,7 @@
 // The compiler runs here, off the page's thread: the first build takes seconds.
 
-import { Compiler } from "./compiler.js";
+// Under the page's query, which names the build, so that it is the compiler's own JavaScript.
+const { Compiler } = await import(`./compiler.js${location.search}`);
 
 // `?pack=<url>` names a packed cargo workspace to compile instead of one file over `core`.
 // `?gz` says the files are the gzipped ones `build-site.sh` makes, for a host that does not
