@@ -118,7 +118,12 @@ class Bucket:
         return data
 
     def create(self):
-        status, data = self.request("PUT")
+        """Makes the bucket. A server that has only just started says 503 until it is ready."""
+        for _ in range(100):
+            status, data = self.request("PUT")
+            if status != 503:
+                break
+            time.sleep(0.1)
         if status not in (200, 409):
             raise SystemExit(f"creating the bucket answered {status}: {data[:300]!r}")
 
