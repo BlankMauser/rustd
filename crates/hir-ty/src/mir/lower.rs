@@ -2255,7 +2255,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             return self.is_promotable_unadjusted(base);
         }
         let is_fn = matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
-        match self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it) {
+        let adjustments = self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it);
+        // Unsizing a reference to a constant, `&[1, 2]` to a slice say, leaves it one: rustc's
+        // `promote_consts::Validator::validate_rvalue` lets every cast through that is not of
+        // a pointer to an integer.
+        let adjustments = match adjustments {
+            [rest @ .., Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }] => rest,
+            all => all,
+        };
+        match adjustments {
             [] => self.is_promotable_unadjusted(expr),
             // A function's address is a constant.
             [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }]
@@ -2263,6 +2271,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
+            // rustc's `promote_consts::Validator::validate_rvalue`.
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(mutability)), .. },
+            ] => {
+                let shared = matches!(Mutability::from(*mutability), Mutability::Not);
+                let reference = self.expr_ty_without_adjust(expr).as_reference().is_some();
+                shared && reference && self.is_promotable_unadjusted(expr)
+            }
             _ => false,
         }
     }

@@ -36,7 +36,7 @@ use crate::{
     InferBodyId,
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure},
-    next_solver::{Const, GenericArgs, Region, TermId, Ty, TyKind},
+    next_solver::{Const, ConstKind, GenericArgs, Region, TermId, Ty, TyKind, default_types},
 };
 
 /// rustc's `Fingerprint`, which is also the shape of a `DefPathHash`: the crate, then the item.
@@ -523,13 +523,45 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// A `usize` constant: `ConstKind::Value` of a `ValTreeKind::Leaf`.
     fn usize_const(&mut self, hasher: &mut StableSipHasher128, konst: Const<'db>) -> Option<()> {
         let value = try_const_usize(self.db, konst)?;
+        let word = super::Target::current().word() as u8;
+        self.leaf(hasher, default_types().types.usize, value, word)
+    }
+
+    /// `ConstKind::Value` of a `ValTreeKind::Leaf`: the type, then the `ScalarInt`'s bits
+    /// and its size in bytes.
+    fn leaf(
+        &mut self,
+        hasher: &mut StableSipHasher128,
+        ty: Ty<'db>,
+        bits: u128,
+        size: u8,
+    ) -> Option<()> {
         hasher.write_isize(5);
-        hasher.write_isize(3);
+        self.ty(hasher, ty)?;
         hasher.write_isize(0);
-        hasher.write_isize(0);
-        hasher.write_u128(value);
-        hasher.write_u8(super::Target::current().word() as u8);
+        hasher.write_u128(bits);
+        hasher.write_u8(size);
         Some(())
+    }
+
+    /// A constant that is an argument of a type: a `bool`, a `char` or an integer.
+    fn scalar_const(&mut self, hasher: &mut StableSipHasher128, konst: Const<'db>) -> Option<()> {
+        let ConstKind::Value(value) = konst.kind() else {
+            return self.usize_const(hasher, konst);
+        };
+        let size = match value.ty.kind() {
+            TyKind::Bool => 1,
+            TyKind::Char => 4,
+            TyKind::Int(it) => {
+                it.bit_width().map_or(super::Target::current().word() as u64, |it| it / 8)
+            }
+            TyKind::Uint(it) => {
+                it.bit_width().map_or(super::Target::current().word() as u64, |it| it / 8)
+            }
+            _ => return None,
+        };
+        let bits = value.value.inner().to_leaf().to_bits_unchecked();
+        self.leaf(hasher, value.ty, bits, size as u8)
     }
 
     fn args(&mut self, args: GenericArgs<'db>) -> Option<Fingerprint> {
@@ -547,7 +579,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 }
                 GenericArgKind::Const(konst) => {
                     list.write_isize(2);
-                    self.usize_const(&mut list, konst)?;
+                    self.scalar_const(&mut list, konst)?;
                 }
             }
         }
