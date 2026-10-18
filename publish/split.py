@@ -14,6 +14,7 @@ import os, re, shutil, subprocess, sys
 
 BASE = "dd5ed69d4b5b26fe7f91013b1d02608cd37ae199"
 BRANCH = "rust-analyzer"
+REPO = "https://github.com/DioxusLabs/rustd"
 CODEGEN_AT = "crates/hir-ty-codegen"
 OURS = ["crates/rustd", "crates/rustd-wasm", "harness", "demo"]
 CODEGEN = ["crates/hir-ty/src/mir/codegen.rs", "crates/hir-ty/src/mir/codegen"]
@@ -99,6 +100,10 @@ def main():
     open(f"{out}/Cargo.toml", "w").write(manifest)
     shutil.copy2(f"{src}/Cargo.lock", f"{out}/Cargo.lock")
     open(f"{out}/.gitignore", "w").write("target*/\n__pycache__/\n")
+    # The submodule is a branch of this same repository.
+    open(f"{out}/.gitmodules", "w").write(
+        f'[submodule "vendor/rust-analyzer"]\n\tpath = vendor/rust-analyzer\n\turl = {REPO}.git\n\tbranch = {BRANCH}\n'
+    )
 
     wasm = f"{out}/crates/rustd-wasm/Cargo.toml"
     text = open(wasm).read()
@@ -132,7 +137,7 @@ def fork(src, tree, head, changed, patched):
             there = subprocess.run(["git", "-C", tree, "cat-file", "-e", f"{BASE}:{path}"], capture_output=True).returncode == 0
             git(tree, *(("checkout", BASE, "--", path) if there else ("rm", "-q", "-f", path)))
         git(tree, "commit", "-q", "-m", f"rustd: back to rust-analyzer's own, from {head[:10]}")
-    commits = bool(stale)
+    commits = int(bool(stale))
     for group, paths in sorted(patched.items()):
         for path in paths:
             if changed[path] == "D":
