@@ -150,6 +150,8 @@ class Machine:
         self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "RUSTD_REMOTE", "RUSTD_CACHE"))},
                     "HOME": self.home, "CARGO_HOME": os.environ.get("CARGO_HOME", f"{home}/.cargo"),
                     "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", f"{home}/.rustup"), "RUSTD_CACHE": self.store,
+                    # Most of what is checked here is the transfer, between machines that name no keys.
+                    "RUSTD_REMOTE_UNSIGNED": "1",
                     **({k: os.environ[k] for k in os.environ if k.startswith("AWS_")} if not remote.server else {}),
                     **remote.env}
         self.said = ""
@@ -943,6 +945,134 @@ def spoiled(top, remote):
           and not b.packs() and not b.partials())
 
 
+def guarded(top, remote):
+    """Lists nobody signed, lists that were put back, and objects longer than they are listed as."""
+    print(f"{remote.name}: unsigned lists, old lists, long objects", flush=True)
+    nothing_asked = {"RUSTD_REMOTE_UNSIGNED": ""}
+    address, bucket = remote.fresh()
+    a, b, c, d = (Machine(top, f"u-{remote.name}-{it}", remote) for it in "abcd")
+    first = a.add_pack(filler(f"{remote.name} guarded 1", MIB))
+    out = a.rustd("cache", "push", address, env=nothing_asked)
+    check("a machine with no keys pushes without being asked anything", out.returncode == 0 and "packs/" + first + ".zst" in bucket.objects())
+    for value in ("", "0", "true"):
+        out = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_UNSIGNED": value})
+        check(f"a list nobody signed is not taken with RUSTD_REMOTE_UNSIGNED={value!r}",
+              out.returncode != 0 and "RUSTD_REMOTE_UNSIGNED=1" in out.stderr and not b.packs() and not b.partials(),
+              out.stderr.strip()[-60:])
+    out = b.rustd("cache", "pull", address)
+    check("and is with RUSTD_REMOTE_UNSIGNED=1", out.returncode == 0 and b.packs().get(first) is True, out.stdout.strip())
+
+    # A pack is as long as its list says, as it is sent and as it unpacks: one byte less
+    # listed of either, and it is not what was listed.
+    manifest = bucket.get("manifests/default").decode()
+    pack, size, keys, fmt, zdigest, zsize = manifest.split()
+    b.empty()
+    for what, line in [(f"listed as {listed} unpacked", f"{pack} {listed} {keys} {fmt} {zdigest} {zsize}")
+                       for listed in (0, 1, int(size) - 1)] + \
+                      [(f"listed as {listed} sent", f"{pack} {size} {keys} {fmt} {zdigest} {listed}")
+                       for listed in (0, int(zsize) - 1)]:
+        bucket.put("manifests/default", (line + "\n").encode())
+        out = b.rustd("cache", "pull", address)
+        check(f"a pack of {size} bytes, {zsize} sent, {what}: rejected, nothing kept",
+              out.returncode != 0 and "1 of them rejected" in out.stderr and not b.packs() and not b.partials()
+              and not [it for it in os.listdir(b.store) if it not in ("version", "lock", "turns")],
+              out.stderr.strip().splitlines()[0][-60:])
+    # A pack that is small as sent and unpacks to a great deal, listed as small: stopped there.
+    # rustd itself packs it, so that the harness needs no zstd of its own.
+    bombs, bomb_bucket = remote.fresh()
+    bomber = Machine(top, f"u-{remote.name}-bomb", remote)
+    bomb = bomber.add_pack(pack_of([(hashlib.sha256(b"bomb").digest(), bytes(64 * MIB))]))
+    bomber.rustd("cache", "push", bombs)
+    pack, size, keys, fmt, zdigest, zsize = bomb_bucket.get("manifests/default").decode().split()
+    bomb_bucket.put("manifests/default", f"{pack} {MIB} {keys} {fmt} {zdigest} {zsize}\n".encode())
+    address, sent = bombs, int(zsize)
+    out = b.rustd("cache", "pull", address)
+    most = max([os.path.getsize(os.path.join(b.store, it)) for it in os.listdir(b.store)
+                if os.path.isfile(os.path.join(b.store, it))] + [0])
+    check(f"{sent} bytes that unpack to 64 MiB, listed as 1 MiB: rejected, nothing kept",
+          out.returncode != 0 and "1 of them rejected" in out.stderr and sent < MIB and not b.packs() and not b.partials()
+          and most < MIB,
+          out.stderr.strip().splitlines()[0][-60:])
+    # A list is read to 16 MiB and no further.
+    address, bucket = remote.fresh()
+    a.rustd("cache", "push", address, env=nothing_asked)
+    manifest = bucket.get("manifests/default").decode()
+    bucket.put("manifests/default", manifest.encode() + b"\n" * (16 * MIB - len(manifest)))
+    out = b.rustd("cache", "pull", address)
+    check("a manifest of 16 MiB is read", out.returncode == 0 and b.packs().get(first) is True, out.stdout.strip()[:50])
+    b.empty()
+    bucket.put("manifests/default", manifest.encode() + b"\n" * (16 * MIB - len(manifest) + 1))
+    out = b.rustd("cache", "pull", address)
+    check("one byte more and it is not", out.returncode != 0 and "is longer than" in out.stderr and not b.packs(),
+          out.stderr.strip().splitlines()[0][-70:])
+
+    # Signed lists have a turn, and a machine takes none older than it took before.
+    key_file = os.path.join(remote.keys, "guarded.key")
+    public = a.rustd("cache", "keygen", key_file).stdout.strip()
+    address, bucket = remote.fresh()
+    signing, trusting = {"RUSTD_REMOTE_SIGN": key_file}, {"RUSTD_REMOTE_TRUST": public, "RUSTD_REMOTE_UNSIGNED": ""}
+    turn = lambda listed: int(listed.decode().splitlines()[-1].split()[2])
+    a.rustd("cache", "push", address, env=signing)
+    old = bucket.get("manifests/default")
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("C, trusting A's key, takes A's first list", out.returncode == 0 and set(c.packs()) == {first}, out.stdout.strip()[:40])
+    second = a.add_pack(filler(f"{remote.name} guarded 2", MIB))
+    a.rustd("cache", "push", address, env=signing)
+    new = bucket.get("manifests/default")
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("and the second, which has a later turn", out.returncode == 0 and set(c.packs()) == {first, second}
+          and turn(new) > turn(old) >= int(time.time()) - 3600, f"{turn(old)} then {turn(new)}")
+    bucket.put("manifests/default", old)
+    # Its packs go and what it remembers of the lists stays.
+    for name in c.packs():
+        os.remove(os.path.join(c.store, name))
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("the first list put back: refused as older, nothing fetched",
+          out.returncode != 0 and "an older list is not taken" in out.stderr and not c.packs() and not c.partials(),
+          out.stderr.strip().splitlines()[0][-70:])
+    out = d.rustd("cache", "pull", address, env=trusting)
+    check("a machine that never pulled takes it: it has nothing to tell by", out.returncode == 0 and set(d.packs()) == {first})
+    out = c.rustd("cache", "forget", address)
+    again = c.rustd("cache", "pull", address, env=trusting)
+    check("`cache forget` has C take whatever is there", out.returncode == 0 and "forgotten" in out.stdout
+          and again.returncode == 0 and set(c.packs()) == {first}, out.stdout.strip()[-40:])
+    # The signer, under which the list was put back, signs nothing on top of it.
+    third = a.add_pack(filler(f"{remote.name} guarded 3", MIB))
+    out = a.rustd("cache", "push", address, env=signing)
+    newest = bucket.get("manifests/default")
+    names = {line.split()[0] + ".pack" for line in newest.decode().splitlines()[:-1]}
+    check("A, pushing over the list that was put back, writes a new one with a later turn",
+          out.returncode == 0 and "an older list is not taken" in out.stderr and turn(newest) > turn(new) and third in names,
+          f"turn {turn(newest)}, {len(names)} packs")
+    bucket.put("manifests/default", newest)
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("and C, given the newest, takes it and then not the second again", out.returncode == 0 and third in c.packs())
+    bucket.put("manifests/default", new)
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("the second list put back after the third: refused", out.returncode != 0 and "an older list is not taken" in out.stderr)
+
+    # Collecting the remote is not a way around the signature: a machine with no key takes
+    # no line out of a signed list, and removes nothing the list names.
+    bucket.put("manifests/default", newest)
+    before = bucket.objects()
+    for env in (nothing_asked, {}):
+        out = d.rustd("cache", "gc", "--remote", address, "--older-than", "0s", "--unlisted-after", "2h", env=env)
+        check(f"`gc --remote` by a machine with no key{' told to take unsigned lists' if not env else ''}: the signed list stays",
+              bucket.get("manifests/default") == newest and bucket.objects() == before, (out.stdout + out.stderr).strip()[-70:])
+    d.add_pack(filler(f"{remote.name} guarded by d", MIB))
+    out = d.rustd("cache", "push", address, env=nothing_asked)
+    check("nor does its push write over the signed list", out.returncode != 0 and "is signed" in out.stderr
+          and bucket.get("manifests/default") == newest, out.stderr.strip()[-70:])
+    time.sleep(1.1)
+    out = a.rustd("cache", "gc", "--remote", address, "--older-than", "0s", "--unlisted-after", "2h", env=signing)
+    after = bucket.get("manifests/default")
+    check("the signer collects: the list is signed again, at a later turn",
+          out.returncode == 0 and after != newest and after.decode().splitlines()[-1].startswith(f"signed {public} ")
+          and turn(after) > turn(newest), f"turn {turn(after)}")
+    out = c.rustd("cache", "pull", address, env=trusting)
+    check("and C takes it", out.returncode == 0, out.stdout.strip()[:50])
+
+
 def poisoned(top, remote, a, crates, target, workspace, address, bucket, expected):
     """A remote that holds other code under the keys of A's."""
     print(f"{remote.name}: a remote that lies", flush=True)
@@ -1021,10 +1151,10 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
         log, _ = b.build(crates, env={"RUSTD_REMOTE": address})
         took = forged_name + ".pack" in b.packs()
         same = b.run() == expected
-        print(f"  (without RUSTD_REMOTE_TRUST the forged pack is {'taken' if took else 'not taken'}; "
+        print(f"  (with RUSTD_REMOTE_UNSIGNED=1 and no RUSTD_REMOTE_TRUST the forged pack is {'taken' if took else 'not taken'}; "
               f"the program prints {'the same' if same else 'something else'})")
     except (SystemExit, subprocess.TimeoutExpired) as error:
-        print(f"  (without RUSTD_REMOTE_TRUST the forged pack is taken and the build fails: {str(error)[-200:]!r})")
+        print(f"  (with RUSTD_REMOTE_UNSIGNED=1 and no RUSTD_REMOTE_TRUST the forged pack is taken and the build fails: {str(error)[-200:]!r})")
     bucket.put("manifests/default", manifest.encode())
 
 
@@ -1068,6 +1198,7 @@ def checks():
             if remote.server:
                 over_tls(top, remote)
             stored(top, remote)
+            guarded(top, remote)
             collected(top, remote)
             kept(top, remote, crates, target, workspace)
             spoiled(top, remote)

@@ -105,29 +105,42 @@ impl Plan {
     }
 }
 
+/// Why the tests of `unit` are only right as rustc built them, if they are. rustc's
+/// harness stays in a test executable and calls the tests and their helpers, so each has
+/// to be a symbol the daemon's copy can take the place of, called the way the source says.
+fn harness_alone(unit: &Record) -> Option<String> {
+    let name = &unit.crate_name;
+    if unit.codegen("incremental").is_none() {
+        return Some(format!(
+            "the tests of `{name}` are built without incremental compilation, where rustc \
+             keeps them private to its object"
+        ));
+    }
+    let level = unit.codegen("opt-level").unwrap_or("0");
+    (level != "0").then(|| {
+        format!(
+            "the tests of `{name}` are built with opt-level {level}, where rustc inlines \
+             them into its harness and changes how it calls their helpers"
+        )
+    })
+}
+
 /// Why rustd has no part in a crate that was compiled with these flags, when it has none.
+/// What a profile sets (the level, the checks, the panic strategy) the daemon reads from
+/// cargo itself, and refuses there what it does not build.
 fn unsupported(unit: &Record) -> Option<String> {
     let name = &unit.crate_name;
-    let off = |value: Option<&str>| matches!(value, None | Some("off" | "no" | "n" | "false"));
-    if !matches!(unit.codegen("opt-level"), None | Some("0")) {
-        let level = unit.codegen("opt-level").unwrap_or_default();
-        return Some(format!("`{name}` is built with opt-level={level}"));
-    }
-    if !off(unit.codegen("lto")) || unit.codegen("linker-plugin-lto").is_some() {
-        return Some(format!("`{name}` is built with LTO"));
-    }
-    if unit.codegen("panic") == Some("abort") {
-        return Some(format!("`{name}` is built with panic=abort"));
-    }
-    for flag in
-        ["instrument-coverage", "target-cpu", "target-feature", "profile-generate", "profile-use"]
-    {
-        if unit.codegen(flag).is_some() {
-            return Some(format!("`{name}` is built with -C {flag}"));
-        }
+    let flag = ["instrument-coverage", "profile-generate", "profile-use"]
+        .into_iter()
+        .find(|it| unit.codegen(it).is_some());
+    if let Some(flag) = flag {
+        return Some(format!("`{name}` is built with -C {flag}"));
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
+    }
+    if unit.is_test() {
+        return harness_alone(unit);
     }
     None
 }
@@ -248,6 +261,32 @@ mod tests {
         );
     }
 
+    fn unit(args: &[&str]) -> Record {
+        Record {
+            id: "a-1".to_owned(),
+            crate_name: "a".to_owned(),
+            cwd: PathBuf::from("/ws"),
+            args: args.iter().map(|it| it.to_string()).collect(),
+            source: PathBuf::from("/ws/src/lib.rs"),
+            stamp: 1,
+            copies: Vec::new(),
+            link_line: None,
+            env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tests_the_harness_reaches_by_symbol_only() {
+        let incremental = "incremental=/t/debug/incremental";
+        assert_eq!(unsupported(&unit(&["--test", "-C", incremental])), None);
+        assert_eq!(unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
+        let private = unsupported(&unit(&["--test"]));
+        assert!(private.is_some_and(|why| why.contains("without incremental")));
+        let inlined = unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
+        assert!(inlined.is_some_and(|why| why.contains("opt-level 2")));
+        assert_eq!(unsupported(&unit(&["-C", "opt-level=3"])), None);
+    }
+
     #[test]
     fn link_lines_that_are_not_cc_for_elf() {
         assert!(LinkLine::parse("").is_none());
@@ -276,12 +315,22 @@ mod tests {
         };
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE).unwrap().command(&plan, &response).unwrap();
+<<<<<<< HEAD
         // The file is named as a shell reads it, which a path of Windows is quoted for.
         let named = format!("@{}", response.display());
         assert_eq!(
             command,
             format!("LC_ALL=C PATH=/t/bin:/usr/bin cc {}", shlex::try_quote(&named).unwrap())
         );
+||||||| f191c6e42a
+        assert_eq!(command, format!("LC_ALL=C PATH=/t/bin:/usr/bin cc @{}", response.display()));
+=======
+        let response_arg = format!("@{}", response.display());
+        assert_eq!(
+            shlex::split(&command).unwrap(),
+            ["LC_ALL=C", "PATH=/t/bin:/usr/bin", "cc", response_arg.as_str()]
+        );
+>>>>>>> origin/rustd-collate
         // As the driver reads the file: quoted where a shell would need it.
         let args = shlex::split(&std::fs::read_to_string(&response).unwrap()).unwrap();
         assert_eq!(

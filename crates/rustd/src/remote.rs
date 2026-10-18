@@ -18,6 +18,10 @@
 //! Nothing fetched is used before its bytes hash to the name it was listed under, so a
 //! remote can withhold code and cannot change it. What it could change is the list, which
 //! is what `signed.rs` is for. `RUSTD_REMOTE_READONLY` keeps a machine from writing at all.
+//!
+//! Nor does a remote say how much is taken from it. A list is read to [`LIST_MAX`] bytes,
+//! a pack to the size its list gives it, anything else to `RUSTD_REMOTE_MAX`, and what is
+//! longer is refused with nothing of it kept.
 
 mod collect;
 mod keeper;
@@ -44,9 +48,9 @@ use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;
 
 use s3::{S3, Written};
-use signed::Trust;
-use transfer::{Body, Object, Version};
-pub(crate) use transfer::{Digest, Fetched, Traffic};
+use signed::{NotRewritten, Trust, Turns, Unremembered};
+use transfer::{Body, Object, TooLong, Version};
+pub(crate) use transfer::{Digest, Fetched, Room, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
 const LIST_WRITES: usize = 8;
@@ -55,6 +59,15 @@ const LIST_WRITES: usize = 8;
 /// goes by when an object was written, does not take it from under a push.
 const REUSE_FOR: Duration = Duration::from_secs(60 * 60);
 
+/// The most that is read of a list. A line of one is under 200 bytes, so this is a list
+/// of some hundred thousand packs or units.
+pub(crate) const LIST_MAX: u64 = 16 << 20;
+
+/// The most that is taken of one object that is neither a list nor a pack, unless
+/// `RUSTD_REMOTE_MAX` says: the archive of a unit, and the keys of the packs a daemon
+/// fetches from when asked.
+const OBJECT_MAX: u64 = 512 << 20;
+
 pub(crate) struct Remote {
     place: Place,
     traffic: Arc<Traffic>,
@@ -62,6 +75,9 @@ pub(crate) struct Remote {
     patience: Duration,
     read_only: bool,
     trust: Trust,
+    turns: Turns,
+    /// `RUSTD_REMOTE_MAX`, or [`OBJECT_MAX`].
+    object_max: u64,
 }
 
 enum Place {
@@ -73,8 +89,10 @@ enum Place {
 impl Remote {
     /// The remote `spec` names, as the environment has this machine use it:
     /// `RUSTD_REMOTE_JOBS` requests at a time (8), `RUSTD_REMOTE_TIMEOUT` seconds without
-    /// an answer (30), `RUSTD_REMOTE_READONLY` to never write, and the keys of `signed.rs`.
-    pub(crate) async fn open(spec: &str) -> anyhow::Result<Remote> {
+    /// an answer (30), `RUSTD_REMOTE_READONLY` to never write, `RUSTD_REMOTE_MAX` bytes of
+    /// one object, and the keys of `signed.rs`. The turns of its lists are remembered in
+    /// `kept_in`, the directory that what is fetched goes to.
+    pub(crate) async fn open(spec: &str, kept_in: &Path) -> anyhow::Result<Remote> {
         let number = |name: &str, default: u64| match std::env::var(name) {
             Ok(value) => value.parse().with_context(|| format!("{name} is not a number")),
             Err(_) => Ok(default),
@@ -88,7 +106,26 @@ impl Remote {
             Place::Dir(PathBuf::from(spec))
         };
         let read_only = std::env::var_os("RUSTD_REMOTE_READONLY").is_some_and(|it| it != "0");
-        Ok(Remote { place, traffic, patience, read_only, trust: Trust::from_env()? })
+        let object_max = match std::env::var("RUSTD_REMOTE_MAX") {
+            Ok(text) => parse_size(&text)
+                .with_context(|| format!("RUSTD_REMOTE_MAX=`{text}` is not a size"))?,
+            Err(_) => OBJECT_MAX,
+        };
+        let turns = Turns::of(kept_in, &place.name());
+        Ok(Remote {
+            place,
+            traffic,
+            patience,
+            read_only,
+            trust: Trust::from_env()?,
+            turns,
+            object_max,
+        })
+    }
+
+    /// The most that is taken of one object that says nothing of its size.
+    pub(crate) fn object_max(&self) -> u64 {
+        self.object_max
     }
 
     /// An error when this machine is not to write to the remote, saying why.
@@ -121,26 +158,35 @@ impl Remote {
     }
 
     /// The whole of a small object and the version it was read at, asked for again for as
-    /// long as a pack is.
-    async fn read_small(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
+    /// long as a pack is. One of more than `most` bytes is an error, and no more than a
+    /// read past that many of them is held.
+    async fn read_small(
+        &self,
+        name: &str,
+        most: u64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
         let _permit = self.traffic.permit().await?;
-        self.patiently(|| self.read_small_once(name)).await
+        self.patiently(|| self.read_small_once(name, most)).await
     }
 
-    async fn read_small_once(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
+    async fn read_small_once(
+        &self,
+        name: &str,
+        most: u64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
         match &self.place {
             Place::Dir(dir) => {
                 self.traffic.operations.fetch_add(1, Ordering::Relaxed);
-                match tokio::fs::read(dir.join(name)).await {
-                    Ok(bytes) => {
-                        let version = Version(Some(Digest::of(&bytes).to_string()));
-                        Ok(Some((bytes, version)))
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(e).with_context(|| format!("fetching {name}")),
-                }
+                let file = match tokio::fs::File::open(dir.join(name)).await {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e).with_context(|| format!("fetching {name}")),
+                };
+                let bytes = read_at_most(Body::File(file), most, name).await?;
+                let version = Version(Some(Digest::of(&bytes).to_string()));
+                Ok(Some((bytes, version)))
             }
-            Place::S3(s3) => s3.read_small(name).await,
+            Place::S3(s3) => s3.read_small(name, most).await,
         }
     }
 
@@ -263,14 +309,46 @@ impl Remote {
         }
     }
 
-    /// The lines of the list `name`, for a machine that only reads it. No list is no lines.
+    /// The lines of the list `name`, for a machine that takes what it names. No list is
+    /// no lines. A signed list older than one this machine took before is an error.
     pub(crate) async fn read_list(&self, name: &str) -> anyhow::Result<Option<String>> {
-        let Some((bytes, _)) = self.read_small(name).await? else { return Ok(None) };
+        let Some((bytes, _)) = self.read_small(name, LIST_MAX).await? else { return Ok(None) };
         let text = String::from_utf8(bytes).with_context(|| format!("`{name}` is not text"))?;
-        let opened = self.trust.open(name, &text).inspect_err(|_| {
+        let taken = match self.trust.open(name, &text) {
+            Ok(opened) => self.take_turn(name, opened.turn).await.map(|()| opened.lines),
+            Err(e) => Err(e),
+        };
+        let lines = taken.inspect_err(|_| {
             self.traffic.rejected.fetch_add(1, Ordering::Relaxed);
         });
-        Ok(Some(opened?.to_owned()))
+        Ok(Some(lines?.to_owned()))
+    }
+
+    /// The lines of the list `name`, for a machine that is about to add to it: what it
+    /// would write the list back with. A list it would not sign under is an error.
+    pub(crate) async fn read_list_to_extend(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let Some((bytes, _)) = self.read_small(name, LIST_MAX).await? else { return Ok(None) };
+        let text = String::from_utf8(bytes).with_context(|| format!("`{name}` is not text"))?;
+        Ok(Some(self.trust.open_to_extend(name, &text)?.lines.to_owned()))
+    }
+
+    /// Remembers the turn a signed list was taken at, unless a later one was taken before.
+    async fn take_turn(&self, name: &str, turn: Option<u64>) -> anyhow::Result<()> {
+        let Some(turn) = turn else { return Ok(()) };
+        let (turns, name) = (self.turns.clone(), name.to_owned());
+        tokio::task::spawn_blocking(move || turns.take(&name, turn)).await?
+    }
+
+    /// The highest turn this machine took of the list `name`, or 0.
+    async fn turn_taken(&self, name: &str) -> anyhow::Result<u64> {
+        let (turns, name) = (self.turns.clone(), name.to_owned());
+        let taken = tokio::task::spawn_blocking(move || turns.remembered(&name)).await??;
+        Ok(taken.unwrap_or(0))
+    }
+
+    /// Forgets the turns this machine took of the lists of this remote.
+    pub(crate) fn forget_turns(&self) -> std::io::Result<bool> {
+        self.turns.forget()
     }
 
     /// Replaces the lines of the list `name` by what `extend` makes of them, again if
@@ -296,17 +374,21 @@ impl Remote {
         anew: bool,
     ) -> anyhow::Result<()> {
         for _ in 0..LIST_WRITES {
-            let read = self.read_small(name).await?;
+            let read = self.read_small(name, LIST_MAX).await?;
             let text = match &read {
                 Some((bytes, _)) => std::str::from_utf8(bytes).unwrap_or_default(),
                 None => "",
             };
-            let lines = match self.trust.open_to_extend(name, text) {
+            // Written back without a signature, a signed list is one nobody takes.
+            self.trust.cannot_rewrite(name, text)?;
+            let opened = match self.trust.open_to_extend(name, text) {
+                Ok(opened) => self.take_turn(name, opened.turn).await.map(|()| opened.lines),
+                Err(e) => Err(e),
+            };
+            let lines = match opened {
                 Ok(lines) => lines,
-                Err(e) if read.is_none() => {
-                    drop(e);
-                    ""
-                }
+                Err(e) if e.is::<Unremembered>() => return Err(e),
+                Err(_) if read.is_none() => "",
                 // Signing it would be vouching for it.
                 Err(e) if anew => {
                     eprintln!("remote: {e:#}: it is written anew");
@@ -314,19 +396,26 @@ impl Remote {
                 }
                 Err(e) => return Err(e),
             };
-            let next = self.trust.seal(name, &rewrite(lines)).into_bytes();
+            // The list it replaces was at the turn remembered, or was not taken at all.
+            let after = self.turn_taken(name).await?;
+            let (next, turn) = self.trust.seal(name, &rewrite(lines), after);
             let read_at = read.as_ref().map(|it| &it.1);
-            if let Written::Done = self.write_small(name, next, read_at).await? {
-                return Ok(());
+            if let Written::Done = self.write_small(name, next.into_bytes(), read_at).await? {
+                return self.take_turn(name, turn).await;
             }
         }
         bail!("`{name}` was written by others {LIST_WRITES} times in a row")
     }
 
-    /// The bytes of a small object whose name is their hash. Bytes that hash to anything
-    /// else are counted as rejected.
-    async fn read_named_by_hash(&self, name: &str, want: &Digest) -> anyhow::Result<Vec<u8>> {
-        let Some((bytes, _)) = self.read_small(name).await? else {
+    /// The bytes of a small object whose name is their hash, when they are at most `most`.
+    /// Bytes that hash to anything else are counted as rejected.
+    async fn read_named_by_hash(
+        &self,
+        name: &str,
+        want: &Digest,
+        most: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let Some((bytes, _)) = self.read_small(name, most).await? else {
             return Err(transfer::Missing(name.to_owned()).into());
         };
         let got = Digest::of(&bytes);
@@ -358,6 +447,30 @@ impl Remote {
     pub(crate) fn traffic(&self) -> &Traffic {
         &self.traffic
     }
+}
+
+impl Place {
+    /// What tells this remote from another on this machine: where it is, and not how it
+    /// is reached.
+    fn name(&self) -> String {
+        match self {
+            Place::Dir(dir) => dir.display().to_string(),
+            Place::S3(s3) => s3.place(),
+        }
+    }
+}
+
+/// All the bytes of `body` when they are at most `most`: an error when there are more,
+/// with at most one read past that many of them held.
+async fn read_at_most(mut body: Body, most: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await? {
+        if (bytes.len() + chunk.len()) as u64 > most {
+            return Err(TooLong { name: name.to_owned(), most }.into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// The files of a directory of a directory remote, named as objects are. No directory is
@@ -492,6 +605,13 @@ impl Listed {
     }
 }
 
+impl Listed {
+    /// The most the list of the pack's keys can be: the keys are in the pack too.
+    fn keys_max(&self, remote: &Remote) -> u64 {
+        self.size.min(remote.object_max)
+    }
+}
+
 /// What a project's builds were served from.
 #[derive(Default)]
 struct Manifest(BTreeMap<Digest, Listed>);
@@ -531,6 +651,12 @@ impl Manifest {
 
     async fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Option<Manifest>> {
         let lines = remote.read_list(&Manifest::at(project)).await?;
+        Ok(lines.map(|it| Manifest::parse(&it)))
+    }
+
+    /// The manifest as the machine that adds to it reads it.
+    async fn fetch_to_extend(remote: &Remote, project: &str) -> anyhow::Result<Option<Manifest>> {
+        let lines = remote.read_list_to_extend(&Manifest::at(project)).await?;
         Ok(lines.map(|it| Manifest::parse(&it)))
     }
 
@@ -644,7 +770,7 @@ async fn claim(store: &Path, adopt: bool) -> anyhow::Result<StoreDir> {
 pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     remote.may_write()?;
     let local = local_packs(&claim(store, true).await?)?;
-    let listed = match Manifest::fetch(remote, project).await {
+    let listed = match Manifest::fetch_to_extend(remote, project).await {
         Ok(manifest) => manifest.unwrap_or_default(),
         // A list this machine does not trust is one it does not add to: see `extend_list`.
         Err(_) => Manifest::default(),
@@ -685,9 +811,11 @@ async fn fetch_pack(
     listed: &Listed,
 ) -> anyhow::Result<Fetched> {
     let (object, want) = listed.object(pack);
-    let unpacked = listed.packed.map(|_| *pack);
+    // Both are as long as the list says: the object that is sent, and the pack in it.
+    let unpacked = listed.packed.map(|_| (*pack, listed.size));
+    let most = listed.packed.map_or(listed.size, |(_, size)| size);
     let to = store.join(pack_file(pack));
-    remote.fetch_coded(&object, &want, unpacked, &to, is_pack_of_this_format).await
+    remote.fetch_coded(&object, &want, unpacked, &to, most, is_pack_of_this_format).await
 }
 
 /// The packs of `missing` that fit in a store that may hold `limit` bytes, the first listed
@@ -718,10 +846,17 @@ async fn lacking(
     }
     let here = &here;
     let asked = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
+<<<<<<< HEAD
         let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await;
         if let Err(e) = &keys {
             eprintln!("remote: the keys of {pack}.pack are not known, so it is fetched: {e:#}");
         }
+||||||| f191c6e42a
+        let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await;
+=======
+        let most = listed.keys_max(remote);
+        let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await;
+>>>>>>> origin/rustd-collate
         let all_here = keys.is_ok_and(|keys| {
             !keys.is_empty()
                 && keys
@@ -747,7 +882,7 @@ async fn keep_under(dir: StoreDir, limit: Option<u64>) -> anyhow::Result<String>
 
 /// Fetches the packs of the project's manifest that are not in the local store, as far as
 /// they fit under `RUSTD_CACHE_MAX`. A pack of another format than this build reads is left
-/// where it is.
+/// where it is, and one that is longer than the manifest says is rejected.
 pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     let limit = limit_from_env().map_err(anyhow::Error::msg)?;
     let dir = claim(store, false).await?;
@@ -788,7 +923,8 @@ const USAGE: &str = "usage: rustd cache push|pull REMOTE [PROJECT]\n       \
                      rustd cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
                      [--dry-run]\n       \
                      rustd cache verify\n       \
-                     rustd cache keygen FILE";
+                     rustd cache keygen FILE\n       \
+                     rustd cache forget REMOTE";
 
 /// `rustd cache VERB`, on the store `RUSTD_CACHE` names.
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -806,6 +942,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         "gc" => collect(&store, args),
         "verify" => verify(&store),
         "push" | "pull" => transfer_command(&store, &verb, args),
+        "forget" => forget(&store, args),
         _ => bail!(USAGE),
     }
 }
@@ -819,7 +956,7 @@ fn transfer_command(
     let project = project_name(args.next())?;
     let start = Instant::now();
     let done = runtime()?.block_on(async {
-        let remote = Remote::open(&remote).await?;
+        let remote = Remote::open(&remote, store).await?;
         let done = match verb {
             "push" => push(store, &remote, &project).await,
             _ => pull(store, &remote, &project).await,
@@ -828,6 +965,21 @@ fn transfer_command(
         done
     })?;
     println!("{done} in {:.1?}", start.elapsed());
+    Ok(())
+}
+
+/// `rustd cache forget REMOTE`: forgets the turns taken of the remote's lists, so that
+/// whatever list it has next is taken. For a remote that was started again from nothing
+/// by a machine whose clock is behind, or a memory that was damaged.
+fn forget(store: &Path, mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(remote) = args.next() else { bail!(USAGE) };
+    let forgot = runtime()?
+        .block_on(async { anyhow::Ok(Remote::open(&remote, store).await?.forget_turns()?) })?;
+    if forgot {
+        println!("the turns taken of the lists of {remote} are forgotten");
+    } else {
+        println!("no turn was taken of a list of {remote}");
+    }
     Ok(())
 }
 
@@ -850,8 +1002,14 @@ fn collect_remote(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         }
     }
     let start = Instant::now();
+    // A machine that signs remembers the turns of the lists it writes where it keeps its
+    // store, and without one where the daemon keeps what is its own.
+    let kept_in = match std::env::var_os("RUSTD_CACHE") {
+        Some(store) => PathBuf::from(store),
+        None => crate::cargo::daemon::home()?,
+    };
     let done = runtime()?.block_on(async {
-        let remote = Remote::open(&remote).await?;
+        let remote = Remote::open(&remote, &kept_in).await?;
         let done = collect::collect(&remote, &ages).await;
         eprintln!("remote: {}", remote.traffic);
         done
@@ -980,7 +1138,7 @@ impl Shared {
         let opened = runtime().and_then(|runtime| {
             let project = project_name(std::env::var("RUSTD_PROJECT").ok())?;
             let push_every = keeper::push_every_from_env()?;
-            let remote = Arc::new(runtime.block_on(Remote::open(&remote))?);
+            let remote = Arc::new(runtime.block_on(Remote::open(&remote, &store))?);
             let lazy = std::env::var_os("RUSTD_REMOTE_LAZY").is_some_and(|it| it != "0");
             let (runtime, asked) = (Arc::new(runtime), Arc::default());
             Ok(Shared { store, remote, project, runtime, lazy, push_every, asked })
@@ -1020,7 +1178,7 @@ impl Shared {
     /// What the project's manifest hashes to now: `None` when there is none or it cannot
     /// be read.
     async fn manifest_now(&self) -> Option<Digest> {
-        let read = self.remote.read_small(&Manifest::at(&self.project)).await;
+        let read = self.remote.read_small(&Manifest::at(&self.project), LIST_MAX).await;
         Some(Digest::of(&read.ok()??.0))
     }
 
@@ -1061,9 +1219,19 @@ impl Lazy {
         let local = local_packs(&claim(store, false).await?)?;
         let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
         let (missing, _) = manifest.missing(&local);
+        // A pack the store may not hold is not one to fetch, and the keys of them all are
+        // kept in memory: no more of them than one object may be.
+        let limit = limit_from_env().map_err(anyhow::Error::msg)?.unwrap_or(u64::MAX);
+        let held = &Room::of(Some(remote.object_max));
         let fetched = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
-            let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys).await?;
-            anyhow::Ok((pack, listed, keys))
+            if listed.size > limit {
+                bail!("{pack}.pack is listed as {} bytes, over RUSTD_CACHE_MAX", listed.size);
+            }
+            let most = listed.keys_max(remote);
+            let keys =
+                remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await?;
+            held.take(keys.len() as u64)?;
+            Ok((pack, listed, keys))
         }))
         .buffer_unordered(remote.traffic.jobs())
         .collect::<Vec<_>>()
@@ -1112,5 +1280,448 @@ impl Lazy {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+impl Remote {
+    /// The directory `dir` as a remote, with what is taken of its lists remembered in
+    /// `kept_in`.
+    pub(crate) fn in_dir(dir: &Path, kept_in: &Path, trust: Trust, object_max: u64) -> Remote {
+        let place = Place::Dir(dir.to_owned());
+        let turns = Turns::of(kept_in, &place.name());
+        Remote {
+            place,
+            traffic: Arc::new(Traffic::new(8)),
+            patience: Duration::from_secs(5),
+            read_only: false,
+            trust,
+            turns,
+            object_max,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustd-remote-{name}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Writes an object of a directory remote.
+    pub(crate) fn put(remote: &Path, name: &str, bytes: &[u8]) {
+        let to = remote.join(name);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(to, bytes).unwrap();
+    }
+
+    /// The keys of a machine that names none and was told to take what is there.
+    pub(crate) fn taking_unsigned() -> Trust {
+        Trust::of(None, &[], true)
+    }
+
+    /// A remote in a new directory whose lists nobody signs and this machine takes.
+    pub(crate) fn unsigned(name: &str, object_max: u64) -> (Remote, PathBuf) {
+        let dir = scratch(name);
+        (Remote::in_dir(&dir, &dir.join("kept"), taking_unsigned(), object_max), dir)
+    }
+
+    pub(crate) fn wait<T>(work: impl Future<Output = T>) -> T {
+        runtime().unwrap().block_on(work)
+    }
+
+    /// `seed` and `runs` changes of it, the same ones in every run: bytes cut, flipped,
+    /// put in and taken out.
+    pub(crate) fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound.max(1) as u64) as usize
+        };
+        let seed = seed.to_vec();
+        std::iter::once(seed.clone()).chain((0..runs).map(move |_| {
+            let mut bytes = seed.clone();
+            for _ in 0..=next(4) {
+                let at = next(bytes.len());
+                match next(5) {
+                    0 => bytes.truncate(at),
+                    1 if !bytes.is_empty() => bytes[at] ^= 1 << next(8),
+                    2 => bytes.insert(at, b"\n /.\\\0\xff"[next(7)]),
+                    3 if !bytes.is_empty() => _ = bytes.remove(at),
+                    _ => {
+                        let from = next(bytes.len());
+                        let again = bytes[from..].to_vec();
+                        bytes.splice(at..at, again);
+                    }
+                }
+            }
+            bytes
+        }))
+    }
+
+    /// How many bytes the files below `dir` hold.
+    pub(crate) fn held(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|it| match it.metadata() {
+                Ok(meta) if meta.is_dir() => held(&it.path()),
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn an_object_is_read_to_the_bound_and_not_past_it() {
+        let (remote, dir) = unsigned("bounded", 1 << 20);
+        put(&dir, "keys/long", &[7; 100]);
+        wait(async {
+            for most in [100, 1 << 40] {
+                assert_eq!(
+                    remote.read_small("keys/long", most).await.unwrap().unwrap().0.len(),
+                    100
+                );
+            }
+            for most in [0, 1, 99] {
+                let refused = remote.read_small("keys/long", most).await.err().unwrap();
+                assert!(refused.is::<TooLong>(), "{refused}");
+            }
+            assert!(remote.read_small("keys/none", 0).await.unwrap().is_none());
+        });
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An object with no end is given up on at the bound.
+    #[cfg(unix)]
+    #[test]
+    fn an_object_without_an_end_is_given_up_on() {
+        wait(async {
+            let endless = tokio::fs::File::open("/dev/zero").await.unwrap();
+            let refused = read_at_most(Body::File(endless), 1 << 20, "zero").await.unwrap_err();
+            assert!(refused.is::<TooLong>(), "{refused}");
+        });
+    }
+
+    /// A remote with one thing that starts as a pack does, listed as `listed_size` bytes.
+    fn remote_with_pack(name: &str, len: usize, listed_size: u64) -> (Remote, PathBuf, Digest) {
+        let (remote, dir) = unsigned(name, 1 << 20);
+        let mut pack = [&b"rustdpk"[..], &[STORE_FORMAT as u8]].concat();
+        pack.resize(len, 7);
+        let (named, keys) = (Digest::of(&pack), Digest::of(&[1; 32]));
+        put(&dir, &pack_object(&named), &pack);
+        put(&dir, &keys_object(&keys), &[1; 32]);
+        let listed = Listed { size: listed_size, keys, format: STORE_FORMAT, packed: None };
+        put(&dir, "manifests/default", Manifest([(named, listed)].into()).lines().as_bytes());
+        (remote, dir, named)
+    }
+
+    #[test]
+    fn a_pack_longer_than_its_list_says_is_not_written() {
+        let len = 3 * (1 << 16) + 100;
+        for listed_size in [0, 8, 1 << 16, len as u64 - 1] {
+            let (remote, dir, _) = remote_with_pack("long-pack", len, listed_size);
+            let store = dir.join("store");
+            let refused = wait(pull(&store, &remote, "default")).unwrap_err().to_string();
+            assert!(refused.contains("1 failed, 1 of them rejected"), "{refused}");
+            let left: Vec<_> = std::fs::read_dir(&store).unwrap().flatten().collect();
+            let left: Vec<_> = left.iter().map(|it| it.file_name()).collect();
+            assert!(left.iter().all(|it| it == "version" || it == "lock"), "{left:?}");
+            _ = std::fs::remove_dir_all(&dir);
+        }
+        let (remote, dir, named) = remote_with_pack("exact-pack", len, len as u64);
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(matches!(wait(fetched(&remote, &store, named, len as u64)), Fetched::Whole(_)));
+        assert_eq!(held(&store), len as u64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let pack = std::fs::metadata(store.join(pack_file(&named))).unwrap();
+            assert_eq!(pack.permissions().mode() & 0o777, 0o600, "a fetched pack is the user's");
+        }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn fetched(remote: &Remote, store: &Path, pack: Digest, most: u64) -> Fetched {
+        let (from, to) = (pack_object(&pack), store.join(pack_file(&pack)));
+        remote.fetch_file(&from, &pack, &to, most, is_pack_of_this_format).await.unwrap()
+    }
+
+    /// A remote with one pack of `len` bytes that all are the same, sent compressed and
+    /// listed as `listed_size` bytes unpacked.
+    fn remote_with_packed(name: &str, len: usize, listed_size: u64) -> (Remote, PathBuf, u64) {
+        let (remote, dir) = unsigned(name, 1 << 20);
+        let mut pack = [&b"rustdpk"[..], &[STORE_FORMAT as u8]].concat();
+        pack.resize(len, 7);
+        let sent = zstd::encode_all(&pack[..], 3).unwrap();
+        let (named, keys, packed) = (Digest::of(&pack), Digest::of(&[1; 32]), Digest::of(&sent));
+        put(&dir, &format!("packs/{named}.pack.zst"), &sent);
+        put(&dir, &keys_object(&keys), &[1; 32]);
+        let packed = Some((packed, sent.len() as u64));
+        let listed = Listed { size: listed_size, keys, format: STORE_FORMAT, packed };
+        put(&dir, "manifests/default", Manifest([(named, listed)].into()).lines().as_bytes());
+        (remote, dir, sent.len() as u64)
+    }
+
+    #[test]
+    fn a_pack_that_unpacks_to_more_than_its_list_says_is_not_written() {
+        let len = 64 << 20;
+        for listed_size in [0, 1 << 16, len as u64 - 1] {
+            let (remote, dir, sent) = remote_with_packed("bomb-pack", len, listed_size);
+            assert!(sent < 64 << 10, "{sent} bytes are sent for {len}");
+            let store = dir.join("store");
+            let refused = wait(pull(&store, &remote, "default")).unwrap_err().to_string();
+            assert!(refused.contains("1 failed, 1 of them rejected"), "{refused}");
+            let left: Vec<_> = std::fs::read_dir(&store).unwrap().flatten().collect();
+            let left: Vec<_> = left.iter().map(|it| it.file_name()).collect();
+            assert!(left.iter().all(|it| it == "version" || it == "lock"), "{left:?}");
+            _ = std::fs::remove_dir_all(&dir);
+        }
+        let (remote, dir, _) = remote_with_packed("packed-pack", 1 << 20, 1 << 20);
+        let store = dir.join("store");
+        wait(pull(&store, &remote, "default")).unwrap();
+        let more = held(&store) - (1 << 20);
+        assert!(more < 100, "the pack and the store's two files, and {more} bytes more");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packed_pack_longer_than_its_list_says_is_not_unpacked() {
+        let (remote, dir, sent) = remote_with_packed("long-packed", 1 << 20, 1 << 20);
+        let manifest = std::fs::read_to_string(dir.join("manifests/default")).unwrap();
+        let short = manifest.trim_end().rsplit_once(' ').unwrap().0;
+        put(&dir, "manifests/default", format!("{short} {}\n", sent - 1).as_bytes());
+        let store = dir.join("store");
+        let refused = wait(pull(&store, &remote, "default")).unwrap_err().to_string();
+        assert!(refused.contains("1 failed, 1 of them rejected"), "{refused}");
+        assert!(held(&store) < 100, "{} bytes are in the store", held(&store));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_machine_without_a_key_does_not_write_a_signed_list_back() {
+        let signed = Signed::new("kept-signed");
+        let keyless = |told| {
+            let trust = Trust::of(None, &[], told);
+            Remote::in_dir(&signed.dir.join("remote"), &signed.dir.join("c"), trust, 1 << 20)
+        };
+        wait(async {
+            signed.add("one").await;
+            let list = signed.list();
+            for told in [false, true] {
+                let remote = keyless(told);
+                let add = |lines: &str| format!("{lines}two\n");
+                let refused = remote.extend_list("manifests/default", add).await.unwrap_err();
+                assert!(refused.is::<NotRewritten>(), "{refused}");
+                let none = |_: &str| String::new();
+                let refused = remote.shrink_list("manifests/default", none).await.unwrap_err();
+                assert!(refused.is::<NotRewritten>(), "{refused}");
+                assert_eq!(signed.list(), list, "the list is as it was signed");
+            }
+            // The signer takes lines out and signs what is left, at a later turn.
+            let none = |_: &str| String::new();
+            signed.signer.shrink_list("manifests/default", none).await.unwrap();
+            assert_eq!(signed.read().await.unwrap(), "");
+            // And does not take them out of a list that was put back under it.
+            signed.put_back(&list);
+            assert!(signed.signer.shrink_list("manifests/default", none).await.is_err());
+            assert_eq!(signed.list(), list);
+        });
+        _ = std::fs::remove_dir_all(&signed.dir);
+    }
+
+    #[test]
+    fn what_a_stopped_fetch_left_does_not_count_against_the_bound_twice() {
+        let (remote, dir, named) = remote_with_pack("resumed-pack", 1000, 1000);
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // Longer than the pack may be, and not its start.
+        std::fs::write(store.join(format!("{}.fetch.tmp", pack_file(&named))), [9; 5000]).unwrap();
+        assert!(matches!(wait(fetched(&remote, &store, named, 1000)), Fetched::Whole(1000)));
+        assert_eq!(held(&store), 1000);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manifest_longer_than_is_read_is_refused() {
+        let (remote, dir) = unsigned("long-manifest", 1 << 20);
+        let line = format!("{0} 4096 {0} {STORE_FORMAT}\n", "ab".repeat(32));
+        let mut list = line.repeat(LIST_MAX as usize / line.len());
+        list.push_str(&"\n".repeat(LIST_MAX as usize - list.len()));
+        put(&dir, "manifests/default", list.as_bytes());
+        wait(async {
+            assert_eq!(Manifest::fetch(&remote, "default").await.unwrap().unwrap().0.len(), 1);
+            list.push('\n');
+            put(&dir, "manifests/default", list.as_bytes());
+            let refused = Manifest::fetch(&remote, "default").await.err().unwrap();
+            assert!(refused.is::<TooLong>(), "{refused}");
+            assert!(remote.read_list_to_extend("manifests/default").await.is_err());
+            let written = remote.extend_list("manifests/default", |lines| lines.to_owned()).await;
+            assert!(written.is_err());
+        });
+        assert_eq!(std::fs::read(dir.join("manifests/default")).unwrap().len(), list.len());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_keys_of_a_pack_are_no_longer_than_the_pack() {
+        let (remote, dir) = unsigned("long-keys", 1 << 10);
+        let keys = Digest::of(b"");
+        let listed = |size| Listed { size, keys, format: STORE_FORMAT, packed: None };
+        assert_eq!(listed(100).keys_max(&remote), 100);
+        assert_eq!(listed(u64::MAX).keys_max(&remote), 1 << 10);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_bytes_break_the_reading_of_a_manifest() {
+        let (first, second) = ("ab".repeat(32), "0f".repeat(32));
+        let seed = format!(
+            "{first} 4096 {second} 2\n{second} 18446744073709551615 {first} 2 {first} 512\n"
+        );
+        let mut listed = 0;
+        for bytes in changed(seed.as_bytes(), 20_000) {
+            let Ok(text) = String::from_utf8(bytes) else { continue };
+            let manifest = Manifest::parse(&text);
+            for (pack, it) in &manifest.0 {
+                // What a pack is fetched under and into is a name of digits and nothing else.
+                let name = pack_file(pack);
+                assert!(name.len() == 69 && !name[..64].contains(['/', '\\', '\0', '.']), "{name}");
+                assert_eq!(keys_object(&it.keys).len(), 69);
+                listed += 1;
+            }
+            let (fit, over) = fitting(manifest.0.into_iter().collect(), Some(1 << 20));
+            assert!(
+                fit.iter().map(|it| it.1.size).sum::<u64>() <= 1 << 20 && fit.len() + over <= 4
+            );
+        }
+        assert!(listed > 1000);
+    }
+
+    /// Two machines and a remote between them: one signs, the other trusts its key.
+    struct Signed {
+        dir: PathBuf,
+        signer: Remote,
+        reader: Remote,
+    }
+
+    impl Signed {
+        fn new(name: &str) -> Signed {
+            let dir = scratch(name);
+            let at = dir.join("remote");
+            let signer =
+                Remote::in_dir(&at, &dir.join("a"), Trust::of(Some(1), &[], false), 1 << 20);
+            let reader = Remote::in_dir(&at, &dir.join("b"), Trust::of(None, &[1], false), 1 << 20);
+            Signed { dir, signer, reader }
+        }
+
+        fn list(&self) -> Vec<u8> {
+            std::fs::read(self.dir.join("remote/manifests/default")).unwrap()
+        }
+
+        fn put_back(&self, list: &[u8]) {
+            put(&self.dir.join("remote"), "manifests/default", list);
+        }
+
+        async fn add(&self, line: &'static str) {
+            let add = move |lines: &str| format!("{lines}{line}\n");
+            self.signer.extend_list("manifests/default", add).await.unwrap();
+        }
+
+        async fn read(&self) -> anyhow::Result<String> {
+            Ok(self.reader.read_list("manifests/default").await?.unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn a_list_that_was_put_back_is_not_taken() {
+        let signed = Signed::new("put-back");
+        wait(async {
+            signed.add("one").await;
+            let first = signed.list();
+            assert_eq!(signed.read().await.unwrap(), "one\n");
+            signed.add("two").await;
+            let second = signed.list();
+            assert_eq!(signed.read().await.unwrap(), "one\ntwo\n");
+            // The remote, or whoever writes to it, puts the first list back.
+            signed.put_back(&first);
+            let refused = signed.read().await.unwrap_err().to_string();
+            assert!(refused.contains("an older list is not taken"), "{refused}");
+            assert_eq!(signed.reader.traffic.rejected(), 1);
+            // And is taken at its word again once it has the list it had.
+            signed.put_back(&second);
+            assert_eq!(signed.read().await.unwrap(), "one\ntwo\n");
+            // A machine that has taken nothing takes the old list: it has no way to know.
+            let new = dir_reader(&signed, "c");
+            signed.put_back(&first);
+            assert_eq!(new.read_list("manifests/default").await.unwrap().unwrap(), "one\n");
+            // Forgetting is how a machine is told to take whatever is there.
+            assert!(signed.reader.forget_turns().unwrap());
+            assert_eq!(signed.read().await.unwrap(), "one\n");
+        });
+        _ = std::fs::remove_dir_all(&signed.dir);
+    }
+
+    fn dir_reader(signed: &Signed, name: &str) -> Remote {
+        let trust = Trust::of(None, &[1], false);
+        Remote::in_dir(&signed.dir.join("remote"), &signed.dir.join(name), trust, 1 << 20)
+    }
+
+    #[test]
+    fn a_signer_does_not_add_to_a_list_that_was_put_back() {
+        let signed = Signed::new("put-back-under-a-signer");
+        let turn = |list: &[u8]| -> u64 {
+            let text = std::str::from_utf8(list).unwrap();
+            text.lines().last().unwrap().split(' ').nth(2).unwrap().parse().unwrap()
+        };
+        wait(async {
+            signed.add("one").await;
+            let first = signed.list();
+            signed.add("two").await;
+            let second = signed.list();
+            assert!(turn(&second) > turn(&first));
+            signed.put_back(&first);
+            signed.add("three").await;
+            // What it signs now names what it adds and comes after all it signed before.
+            let third = signed.list();
+            assert!(turn(&third) > turn(&second), "{} after {}", turn(&third), turn(&second));
+            assert_eq!(signed.read().await.unwrap(), "three\n");
+            // A reader that had the second list takes the third and not the second again.
+            signed.put_back(&second);
+            assert!(signed.read().await.is_err());
+        });
+        _ = std::fs::remove_dir_all(&signed.dir);
+    }
+
+    #[test]
+    fn a_memory_that_is_damaged_stops_a_push_and_a_pull() {
+        let signed = Signed::new("damaged-memory");
+        wait(async {
+            signed.add("one").await;
+            assert_eq!(signed.read().await.unwrap(), "one\n");
+            let list = signed.list();
+            for kept in ["a", "b"] {
+                let turns = signed.dir.join(kept).join("turns");
+                let of_remote = std::fs::read_dir(turns).unwrap().next().unwrap().unwrap().path();
+                for file in std::fs::read_dir(of_remote).unwrap().flatten() {
+                    if file.file_name() != "lock" {
+                        std::fs::write(file.path(), "not a turn").unwrap();
+                    }
+                }
+            }
+            let add = |lines: &str| format!("{lines}two\n");
+            let refused = signed.signer.extend_list("manifests/default", add).await.unwrap_err();
+            assert!(refused.is::<Unremembered>(), "{refused}");
+            assert!(signed.read().await.unwrap_err().is::<Unremembered>());
+            assert_eq!(signed.list(), list, "the list is as it was");
+        });
+        _ = std::fs::remove_dir_all(&signed.dir);
     }
 }

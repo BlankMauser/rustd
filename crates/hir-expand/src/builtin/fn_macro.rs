@@ -973,6 +973,7 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
+        db.env_is_unset(arg_id.loc(db).krate, key.as_str());
         // The only variable rust-analyzer ever sets is `OUT_DIR`, so only diagnose that to avoid
         // unnecessary diagnostics for eg. `CARGO_PKG_NAME`.
         if key.as_str() == "OUT_DIR" {
