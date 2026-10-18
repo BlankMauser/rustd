@@ -51,6 +51,16 @@ class Disk:
             self.mount()
         self.store, self.ballast = os.path.join(self.at, "store"), os.path.join(self.at, "ballast")
 
+    def empty_store(self):
+        """The store's directory, empty and the user's alone. A volume just formatted lets
+        every user of a Windows machine write to what is made at its top, and rustd takes
+        no store that others can write to."""
+        shutil.rmtree(self.store, ignore_errors=True)
+        os.mkdir(self.store)
+        if WINDOWS:
+            mine = f'{os.environ["USERNAME"]}:(OI)(CI)F'
+            subprocess.run(["icacls", self.store, "/inheritance:r", "/grant:r", mine], check=True, capture_output=True)
+
     def mount(self):
         options = f"size={SIZE},uid={os.getuid()},gid={os.getgid()},mode=700"
         mounted = subprocess.run(["sudo", "-n", "mount", "-t", "tmpfs", "-o", options, "tmpfs", self.at],
@@ -85,8 +95,7 @@ class Disk:
 
 def cold(checkout, disk):
     """How many bytes a cold build of the workspace writes to a store with room."""
-    shutil.rmtree(disk.store, ignore_errors=True)
-    os.mkdir(disk.store)
+    disk.empty_store()
     if os.path.exists(disk.ballast):
         os.remove(disk.ballast)
     daemon = Daemon(checkout, disk.store, name="cold", env=SEALS)
@@ -97,8 +106,7 @@ def cold(checkout, disk):
 
 def built_without(checkout, disk, room):
     """A daemon on a store with `room` bytes builds, and says what it could not keep."""
-    shutil.rmtree(disk.store, ignore_errors=True)
-    os.mkdir(disk.store)
+    disk.empty_store()
     left = disk.leave(room)
     checkout.set(room % 7)
     daemon = Daemon(checkout, disk.store, name=f"room{room}", env=SEALS)
@@ -125,8 +133,7 @@ def built_without(checkout, disk, room):
 
 def kept_again(checkout, disk):
     """Room is made while a daemon runs; the next build that writes the store keeps what it compiles."""
-    shutil.rmtree(disk.store, ignore_errors=True)
-    os.mkdir(disk.store)
+    disk.empty_store()
     disk.leave(128 << 10)
     checkout.set(11)
     daemon = Daemon(checkout, disk.store, name="again", env=SEALS)
