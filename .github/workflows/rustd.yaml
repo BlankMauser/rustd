@@ -6,6 +6,7 @@ name: rustd
 on:
   push:
     branches: ["main"]
+    paths-ignore: ["site/**", "**.md", ".github/workflows/release.yaml", ".github/workflows/site.yaml"]
   pull_request:
   workflow_dispatch:
 
