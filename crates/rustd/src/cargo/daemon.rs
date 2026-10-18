@@ -318,10 +318,6 @@ impl Worker {
         let _ = std::fs::remove_file(&self.socket);
     }
 
-    fn loading(&self) -> bool {
-        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
-    }
-
     fn set(&self, key: &str, warmth: Warmth) {
         if let Some(loaded) = lock(&self.checkouts).get_mut(key) {
             loaded.warmth = warmth;
@@ -337,8 +333,6 @@ impl Worker {
             Err(why) => Warmth::Failed(format!("{why:#}")),
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
-        // Loaded is when it can first be of use: it is idle from now, not from when it was asked for.
-        *lock(&self.asked) = Instant::now();
         self.set(&checkout.key, warmth);
     }
 
@@ -636,20 +630,6 @@ impl Daemon {
         let Some(idle) = self.idle else { return };
         loop {
             std::thread::sleep(idle.min(Duration::from_secs(1)));
-<<<<<<< HEAD
-            // A worker that is loading was asked for and has not been of use yet: the time
-            // it takes is not time nobody wanted it.
-            let mut workers = lock(&self.workers);
-            workers.retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle || worker.loading();
-||||||| f191c6e42a
-            if lock(&self.asked).elapsed() >= idle {
-                eprintln!("idle for {idle:.0?}");
-                self.end();
-            }
-            lock(&self.workers).retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle;
-=======
             // Loading is what the last build asked for: the idle time starts after it.
             for worker in lock(&self.workers).values().filter(|it| it.loading()) {
                 *lock(&worker.asked) = Instant::now();
@@ -661,17 +641,11 @@ impl Daemon {
             }
             lock(&self.workers).retain(|_, worker| {
                 let keep = lock(&worker.asked).elapsed() < idle;
->>>>>>> origin/rustd-collate
                 if !keep {
                     worker.stop();
                 }
                 keep
             });
-            if workers.is_empty() && lock(&self.asked).elapsed() >= idle {
-                drop(workers);
-                eprintln!("idle for {idle:.0?}");
-                self.end();
-            }
         }
     }
 

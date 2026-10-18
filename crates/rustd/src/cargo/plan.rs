@@ -315,22 +315,11 @@ mod tests {
         };
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE).unwrap().command(&plan, &response).unwrap();
-<<<<<<< HEAD
-        // The file is named as a shell reads it, which a path of Windows is quoted for.
-        let named = format!("@{}", response.display());
-        assert_eq!(
-            command,
-            format!("LC_ALL=C PATH=/t/bin:/usr/bin cc {}", shlex::try_quote(&named).unwrap())
-        );
-||||||| f191c6e42a
-        assert_eq!(command, format!("LC_ALL=C PATH=/t/bin:/usr/bin cc @{}", response.display()));
-=======
         let response_arg = format!("@{}", response.display());
         assert_eq!(
             shlex::split(&command).unwrap(),
             ["LC_ALL=C", "PATH=/t/bin:/usr/bin", "cc", response_arg.as_str()]
         );
->>>>>>> origin/rustd-collate
         // As the driver reads the file: quoted where a shell would need it.
         let args = shlex::split(&std::fs::read_to_string(&response).unwrap()).unwrap();
         assert_eq!(
