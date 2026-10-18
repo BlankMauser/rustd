@@ -44,6 +44,8 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   steps     [{"what": .., "edit": [[file, old, new]], "write": {file: text}, "env": {..},
               "run": [shell commands in the project], "clients": how many ask at once,
               "paused": the clients ask while the daemon is held in the middle of the reload,
+              "stale": the client asks with what cargo linked before the step, as one
+              that leaves the build to the daemon does,
               "expect": "same" | "refused"}]
             After each step cargo builds again and the client names what it linked.
 """
@@ -272,6 +274,7 @@ class Case:
                 if daemon.poll() is not None:
                     return [("the daemon starts", "WRONG", open(log_path).read()[-300:])]
                 time.sleep(0.05)
+            self.last_asked = ["--crate", self.crates[0], *ask]
             return [self.step(step, env, daemon, socket, binary) for step in self.spec["steps"]]
         finally:
             daemon.kill()
@@ -308,7 +311,9 @@ class Case:
             subprocess.run(command, shell=True, cwd=self.ws, check=True, capture_output=True, env=env)
         time.sleep(0.02)
         before = self.behaviour(binary, env) if step.get("paused") else None
-        ask = [RUSTD, "sync", socket, *self.asked(env)]
+        if not step.get("stale"):
+            self.last_asked = self.asked(env)
+        ask = [RUSTD, "sync", socket, *self.last_asked]
         if step.get("paused"):
             return self.mid_reload(step, env, daemon, ask, binary, before)
         # Clients that ask at once race the reload: each is answered from one model.

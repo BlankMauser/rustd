@@ -157,6 +157,29 @@ runs the doctests with `--target aarch64-unknown-linux-gnu` under qemu, with exa
 marked `ignore-aarch64` and `ignore-x86_64` (4 examples, 2 of 2 functions). Both are the
 same as cargo's under both backends.
 
+### Overflow checks and what rustc built before an edit
+
+In a program whose crates differ in `overflow-checks`, rustd reads from rustc's objects
+which crate holds each copy of a function. That is only true of the source rustc built. The
+case `overflow_checks_stale` has a function of a package that checks, called from one that
+does not; an edit makes it small enough for rustc to compile it in its caller, where it
+stops checking. A client that asked the daemon with what cargo had linked before the edit
+got a program that still panicked where cargo's printed 0. Two things were wrong and both
+are fixed:
+
+- The daemon went by the objects of before the edit. It now refuses in such a program when
+  a source that cargo's dep-info lists for a crate is newer than what rustc built of the
+  crate, and says that cargo has to build first. Programs whose crates all check alike are
+  not affected: every copy behaves as every other.
+- After cargo had built again and the client named the new link, the daemon still had the
+  symbols it read when it started. In such a program it now reads them again when the files
+  are newer than its reading, and compiles the program from them.
+
+The case has four steps under each backend: refused, the same once cargo has built, refused
+after the edit back, the same again. The steps that ask with the link of before are marked
+`"stale"` in `case.json`; every other step of the harness has cargo build first, which is
+why this was not seen before.
+
 ## Third round
 
 Starts from `rustd-collate` at 1547078a30 merged in (c41ee3294c).
@@ -525,10 +548,10 @@ Inferred, not measured:
 
 ## Still open
 
-- Overflow checks in a program whose crates differ in the setting are judged by rustc's
-  last build: an edit that adds an instantiation or moves a function across rustc's
-  inlining threshold is seen with the old objects until cargo builds again. Generic code
-  that std ships a copy of was not examined.
+- Overflow checks in a program whose crates differ in the setting: an edit under the
+  daemon is refused until cargo has built again, where a narrower rule (only edits that
+  move a copy) would let most edits through. Generic code that std ships a copy of was not
+  examined.
 - `lto`: a client that links by itself with rustc's LTO link line gets the linker's error;
   rustd only sees a link command it is given. `-C lto` in `RUSTFLAGS` is refused.
 - Doctests: rustdoc prints nothing of the errors of a `compile_fail` example that fails to

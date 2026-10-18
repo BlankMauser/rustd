@@ -1,6 +1,10 @@
 //! Maps Rust paths to the mangled names rustc gave them, read from rlibs and objects.
 
-use std::path::{Path, PathBuf};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
@@ -25,6 +29,10 @@ pub(crate) struct SymbolTable {
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
+    /// The files rustc built that cargo left a dep-info file for, each with its sources.
+    built_from: Vec<(PathBuf, Vec<Source>)>,
+    /// When the files started to be read.
+    read: Option<SystemTime>,
     /// The copies crates made of one instance, by the symbol without the crate that made it.
     copies: FxHashMap<String, Vec<String>>,
     /// The crates that made a copy of an instance of a function, by the function's name
@@ -53,10 +61,47 @@ struct Symbol {
     path: String,
 }
 
+/// A file of the source of a crate rustc built.
+#[derive(Debug)]
+struct Source {
+    path: PathBuf,
+    /// What a file that a build script wrote came to when the symbols were read. cargo runs
+    /// a script again without building the crate again when the script says the same, so
+    /// when such a file was written says nothing.
+    generated: Option<u64>,
+}
+
+impl Source {
+    fn new(path: PathBuf) -> Source {
+        let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
+        let of_script = names.windows(3).any(|it| it[0] == "build" && it[2] == "out");
+        let generated = of_script.then(|| content(&path)).flatten();
+        Source { path, generated }
+    }
+
+    /// Whether the file is another than the one rustc read when it finished at `built`.
+    fn written_since(&self, built: SystemTime) -> bool {
+        match self.generated {
+            Some(generated) => content(&self.path) != Some(generated),
+            None => written(&self.path).is_some_and(|it| it > built),
+        }
+    }
+}
+
+fn written(file: &Path) -> Option<SystemTime> {
+    std::fs::metadata(file).and_then(|it| it.modified()).ok()
+}
+
+fn content(file: &Path) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    std::fs::read(file).ok()?.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
-        let mut table = SymbolTable::default();
+        let mut table = SymbolTable { read: Some(SystemTime::now()), ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
         for file in files {
@@ -71,8 +116,10 @@ impl SymbolTable {
                 }
                 Err(_) => table.add_object(&data, &mut symbols),
             }
-            if let Some((name, source)) = crate_root(file, root) {
-                owners.push((name, source, first..symbols.len()));
+            if let Some((name, sources)) = crate_sources(file, root) {
+                owners.push((name, sources[0].clone(), first..symbols.len()));
+                let sources = sources.into_iter().map(Source::new).collect();
+                table.built_from.push((file.clone(), sources));
             }
         }
         // A crate's symbols mention the crates of its name that it depends on (a binary
@@ -251,6 +298,22 @@ impl SymbolTable {
         self.linked.contains(&(name.to_owned(), root.to_owned()))
     }
 
+    /// A source that was written after rustc built the crate it is of: what rustc built is
+    /// then not what it would build now.
+    pub(crate) fn written_since_built(&self) -> Option<&Path> {
+        self.built_from.iter().find_map(|(built, sources)| {
+            let built = written(built)?;
+            sources.iter().find(|it| it.written_since(built)).map(|it| &*it.path)
+        })
+    }
+
+    /// Whether rustc has built one of the files again since they were read.
+    pub(crate) fn built_since_read(&self) -> bool {
+        self.read.is_some_and(|read| {
+            self.built_from.iter().any(|(built, _)| written(built).is_some_and(|it| it > read))
+        })
+    }
+
     pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
         match *self.crates.get(name)? {
             Some(id) => Some(id),
@@ -342,9 +405,9 @@ fn function_name(path: &str) -> Option<String> {
 }
 
 /// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
-/// built as a test binary, and the file its source starts at, which the dep-info file cargo
-/// leaves next to it lists first.
-fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
+/// built as a test binary, and the files of its source, which the dep-info file cargo leaves
+/// next to it lists, the one the crate starts at first.
+fn crate_sources(rlib: &Path, root: &Path) -> Option<(String, Vec<PathBuf>)> {
     let file = rlib.file_name()?.to_str()?;
     let stem = match file.strip_suffix(".rlib") {
         Some(stem) => stem.strip_prefix("lib")?,
@@ -354,8 +417,8 @@ fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
     let (_, sources) = dep_info.lines().next()?.split_once(": ")?;
     // FIXME: a path with a space in it is escaped.
-    let source = sources.split(' ').next()?;
-    Some((name.to_owned(), root.join(source)))
+    let sources: Vec<PathBuf> = sources.split(' ').map(|it| root.join(it)).collect();
+    (!sources.is_empty()).then(|| (name.to_owned(), sources))
 }
 
 /// A v0 symbol without the crate that instantiated it, which ends the symbol of a generic

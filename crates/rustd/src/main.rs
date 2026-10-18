@@ -918,6 +918,36 @@ fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<V
     Ok(found)
 }
 
+/// Why what rustc built does not say which copy of a function a call reaches any more, in a
+/// program whose crates differ in `-C overflow-checks`: rustc decides by the source which
+/// crate compiles a function, and a source was written after it did.
+fn stale_copies(db: &RootDatabase, table: &SymbolTable, args: &Args) -> Option<String> {
+    let written = table.written_since_built()?;
+    let built = args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten();
+    let built: Vec<Crate> = built.collect();
+    checks_differ(db, &built).then(|| {
+        format!(
+            "the crates of the program differ in `overflow-checks` and {} was written after \
+             rustc built it: which crate's copy of a function a call reaches is read from \
+             what rustc built, so cargo has to build first",
+            args.inside(written).unwrap_or(written).display()
+        )
+    })
+}
+
+/// Whether the crates cargo builds of the program of `built` do not all have
+/// `-C overflow-checks` alike.
+fn checks_differ(db: &RootDatabase, built: &[Crate]) -> bool {
+    let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
+    let program: FxHashSet<ide_db::base_db::Crate> = built
+        .iter()
+        .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
+        .filter(|it| !it.data(db).origin.is_lang())
+        .collect();
+    let mut checks = program.iter().map(|it| it.cfg_options(db).check_atom(&flag));
+    checks.next().is_some_and(|first| checks.any(|it| it != first))
+}
+
 /// Fails when rustc linked none of the libraries rustd builds a program with `lto` from:
 /// rustc then compiled the whole program from bitcode as it linked it, and the functions
 /// rustd leaves to rustc are not there to be linked against by name.
@@ -3290,6 +3320,9 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         let code = doctest::run(&db, asked, krate, &args.out, emits.triple())?;
         std::process::exit(code);
     }
+    if let Some(stale) = stale_copies(&db, &table, &args) {
+        anyhow::bail!(stale);
+    }
     let mut cold = build(&db, &table, &args, &mut known, &listed)?;
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
@@ -4318,6 +4351,26 @@ impl Program {
         None
     }
 
+    /// Reads what rustc built again when it has built since, in a program whose crates
+    /// differ in `-C overflow-checks`: which crate holds a copy of a function decides
+    /// whether a call of it checks, and what was compiled by the copies of before is not
+    /// kept.
+    fn read_copies_again(&mut self, db: &RootDatabase) -> anyhow::Result<()> {
+        let args = &self.args;
+        let built: Vec<Crate> =
+            args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten().collect();
+        if !self.table.built_since_read() || !checks_differ(db, &built) {
+            return Ok(());
+        }
+        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?);
+        let patching = self.known.patching;
+        self.known = Rejections::default();
+        self.known.patching = patching;
+        (self.whole, self.moved) = (None, true);
+        self.unbuilt.stale = true;
+        Ok(())
+    }
+
     /// Whether the last build of this program is one of `other`, which has had none: the two
     /// are of the same crates, as checkouts that share them have it. What `other` is then
     /// asked for is a patch of that build.
@@ -4350,6 +4403,7 @@ impl Program {
         // The crates left to rustc are as edited when a client has named what it built since.
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
+        self.read_copies_again(db)?;
         let Program { args, table, known, unbuilt, wrote, whole, tests, .. } = self;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
@@ -4391,6 +4445,7 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = unnamed.or_else(|| refusal(db, &edited, paths, out_of_date)).or(broken);
+        failed = failed.or_else(|| stale_copies(db, table, args));
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         match tests {
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
