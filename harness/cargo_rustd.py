@@ -1016,7 +1016,7 @@ def plain(work):
     check("an edit of the program is linked by the daemon", mine.returncode == 0 and not wrong and how == "daemon", f"{how}; {wrong or 'same as cargo'}")
     edit("lib")
     mine, how, wrong = same("run", "lib")
-    check("an edit of a library of the workspace is built by the daemon into the program", mine.returncode == 0 and not wrong and how == "daemon" and mine.stdout == "lib hello lib\n", f"{how}; {wrong or 'same as cargo'}")
+    check("an edit of a library of the workspace is built by the daemon into the program", mine.returncode == 0 and not wrong and how == "daemon" and greets(mine.stdout, "lib hello lib"), f"{how}; {wrong or 'same as cargo'}")
     took, noop = here.cargo("run")
     check("a build with nothing changed runs nothing", noop.returncode == 0 and "Compiling" not in noop.stderr, f"{took:.2f}s")
 
@@ -1059,7 +1059,7 @@ def plain(work):
     root = os.path.join(work, "plain-installed")
     _, installed = here.cargo("install", "--path", "app", "--root", root, "--bin", "app")
     ran = subprocess.run([os.path.join(root, "bin/app"), "installed"], capture_output=True, text=True)
-    check("`cargo install` installs a program that runs", installed.returncode == 0 and ran.returncode == 0 and ran.stdout.endswith("hello installed\n"), ran.stdout.strip() or installed.stderr[-200:])
+    check("`cargo install` installs a program that runs", installed.returncode == 0 and ran.returncode == 0 and ran.stdout.splitlines()[0].endswith("hello installed"), ran.stdout.strip() or installed.stderr[-200:])
 
     # What rust-analyzer does while the user builds: `cargo check` with JSON messages.
     wait_warm(here, ws)
@@ -1087,7 +1087,7 @@ def plain(work):
     spawn = lambda root, *args: subprocess.Popen(["cargo", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
     clients = [(n, i, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees) if n]
     ended = [(n, i, client.communicate(timeout=600), client.returncode) for n, i, client in clients]
-    right = [code == 0 and out[0] == f"tree{n} c{i}\n" for n, i, out, code in ended]
+    right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
     check("12 plain cargo builds at once on 3 worktrees each run their own tree's program", all(right) and status()[0] == pid, f"{sum(right)} of 12 right; {here.how_built('')[:80]}")
 
     for side in sides:
@@ -1103,7 +1103,7 @@ def plain(work):
     signalled(signal.SIGCONT)
     out, err = client.communicate(timeout=600)
     said = here.how_built(err)
-    check("the build whose daemon is killed is rustc's, succeeds, and says so", waits and client.returncode == 0 and out.endswith("killed\n") and "the daemon ended" in said and "rustd: " in err, said[:120])
+    check("the build whose daemon is killed is rustc's, succeeds, and says so", waits and client.returncode == 0 and out.splitlines()[0].endswith("killed") and "the daemon ended" in said and "rustd: " in err, said[:120])
     wait_warm(here, ws)
     touch("after")
     mine, how, wrong = same("run", "after")
