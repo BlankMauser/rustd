@@ -17,7 +17,15 @@ $work = Join-Path ([IO.Path]::GetTempPath()) ("rustd-" + [Guid]::NewGuid())
 New-Item -ItemType Directory $work | Out-Null
 try {
     Write-Host "rustd: downloading $from/$archive"
-    Invoke-WebRequest "$from/$archive" -OutFile (Join-Path $work $archive)
+    try {
+        Invoke-WebRequest "$from/$archive" -OutFile (Join-Path $work $archive)
+    } catch {
+        if ($version -ne "latest") { throw }
+        # Before the first numbered release there is only the build of main.
+        $from = "$repo/releases/download/nightly"
+        Write-Host "rustd: there is no numbered release yet; downloading $from/$archive"
+        Invoke-WebRequest "$from/$archive" -OutFile (Join-Path $work $archive)
+    }
     Invoke-WebRequest "$from/SHA256SUMS" -OutFile (Join-Path $work "SHA256SUMS")
     $want = (Select-String -Path (Join-Path $work "SHA256SUMS") -Pattern ([regex]::Escape($archive))).Line.Split(" ")[0]
     $got = (Get-FileHash (Join-Path $work $archive) -Algorithm SHA256).Hash

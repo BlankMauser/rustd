@@ -3,7 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/DioxusLabs/rustd/main/site/install.sh | sh
 #
-# RUSTD_VERSION names the release (`latest` unless set; `nightly` is the newest build of main).
+# RUSTD_VERSION names the release: the latest numbered one unless set, or the newest build
+# of main (`nightly`) while there is none.
 # RUSTD_INSTALL_DIR is where the three binaries go (cargo's bin directory unless set).
 set -eu
 
@@ -33,7 +34,13 @@ trap 'rm -rf "$work"' EXIT
 archive=rustd-$target.tar.gz
 
 say "downloading $from/$archive"
-curl -fsSL "$from/$archive" -o "$work/$archive" || fail "no release \`$version\` with $archive (RUSTD_VERSION=nightly is the newest build of main)"
+if ! curl -fsSL "$from/$archive" -o "$work/$archive" 2> /dev/null; then
+    [ "$version" = latest ] || fail "no release \`$version\` with $archive"
+    # Before the first numbered release there is only the build of main.
+    from=$repo/releases/download/nightly
+    say "there is no numbered release yet; downloading $from/$archive"
+    curl -fsSL "$from/$archive" -o "$work/$archive" || fail "no release with $archive"
+fi
 curl -fsSL "$from/SHA256SUMS" -o "$work/SHA256SUMS" || fail "the release has no SHA256SUMS"
 
 want=$(awk -v name="$archive" '$2 == name || $2 == "*" name { print $1 }' "$work/SHA256SUMS")
