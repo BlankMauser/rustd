@@ -83,6 +83,7 @@ use super::{
 mod asm;
 mod backend;
 pub use backend::Backend;
+use backend::Step;
 mod cached;
 mod debuginfo;
 mod float_pair;
@@ -441,8 +442,16 @@ impl CodegenUnit {
             !roots.on_demand.is_empty(),
         );
         let mut rounds = 0;
+        let mut discarded = std::time::Duration::ZERO;
         loop {
             rounds += 1;
+            let round = stdx::time::Instant::now();
+            let mut start_over = |why: &str| {
+                discarded += round.elapsed();
+                if std::env::var_os("RUSTD_STATS").is_some() {
+                    eprintln!("round {rounds}: {:.1?}, started over: {why}", round.elapsed());
+                }
+            };
             let mut cg = ObjectCodegen::new(
                 db,
                 symbols,
@@ -471,7 +480,9 @@ impl CodegenUnit {
                     .filter(|root| !denied.contains(root) && !left.contains(root))
                     .filter(|&root| symbols.function(root).is_some())
                     .collect();
+                let start = stdx::time::Instant::now();
                 symbols.in_parallel(ours.len(), &|db, _, at| _ = compiled_root(db, ours[at]));
+                cg.phases.compile += start.elapsed();
                 while let Some(&root) = queue.get(next) {
                     next += 1;
                     let result = if denied.contains(&root) {
@@ -507,6 +518,7 @@ impl CodegenUnit {
                 }
             }
             if cg.misfit {
+                start_over("an entry of the store did not fit");
                 rejected.extend(failed);
                 continue;
             }
@@ -524,6 +536,7 @@ impl CodegenUnit {
                 split |= cg.statics.keys().any(|&it| !own_statics.owns(db, it));
             }
             if split {
+                start_over("a static is used by a function left to rustc");
                 rejected.extend(failed);
                 continue;
             }
@@ -547,6 +560,7 @@ impl CodegenUnit {
                     }
                 }));
                 if left.len() != before {
+                    start_over("an `async` block is shared with a function left to rustc");
                     continue;
                 }
             }
@@ -565,14 +579,13 @@ impl CodegenUnit {
                         eprintln!("without a stable name: {misses:?}");
                     }
                 }
-                backend::Tally::global().report();
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
-                    phases: Phases { fallback: fallback_start.elapsed(), ..cg.phases },
+                    phases: Phases { fallback: fallback_start.elapsed(), discarded, ..cg.phases },
                     rounds,
                     patched: None,
                     declined,
@@ -597,6 +610,7 @@ impl CodegenUnit {
                 let start = stdx::time::Instant::now();
                 let object = cg.finish()?;
                 stats.phases.object = start.elapsed();
+                backend::Tally::global().report();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
                 let patch = if patching { Some(patch::empty_object()?) } else { None };
                 return Ok(CodegenUnit {
@@ -607,6 +621,8 @@ impl CodegenUnit {
                     instances,
                 });
             }
+            let first = failed.first().map_or("", |it| it.1.why.as_str());
+            start_over(&format!("{} instances did not compile, the first: {first}", failed.len()));
             cg.poison_callers(&mut failed);
             rejected.extend(failed);
         }
@@ -845,6 +861,8 @@ pub struct Phases {
     pub object: std::time::Duration,
     /// Working out what the functions left to rustc keep the rest from compiling.
     pub fallback: std::time::Duration,
+    /// The rounds before the last, whose object was not kept.
+    pub discarded: std::time::Duration,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.
@@ -1514,19 +1532,23 @@ fn instance_body<'db>(
     static LEAN: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("RUSTD_LEAN").is_none_or(|it| it != "0"));
     let args = instance.args.clone();
+    let tally = backend::Tally::global();
+    let filled = |body, args: &StoredGenericArgs, env: &StoredParamEnvAndCrate| {
+        tally.step(Step::Monomorphize, || monomorphized(db, body, args, env).map(Cow::Owned))
+    };
     let body = match instance.def {
-        InstanceDef::Fn(func) if *LEAN => db
-            .mir_body(func.into())
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::Fn(func) if *LEAN => tally
+            .step(Step::Mir, || db.mir_body(func.into()))
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Closure(id) if *LEAN => db
             .mir_body_for_closure(InternedClosureId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Coroutine(id) if *LEAN => db
             .mir_body_for_coroutine(InternedCoroutineId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::CoroutineByMove(id) if *LEAN => db
             .mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Fn(func) => {
             db.monomorphized_mir_body(func.into(), args, env).map(Cow::Borrowed)
         }
@@ -2046,7 +2068,8 @@ fn compile<'db>(
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
-    let mut ctx = build(&mut cg, env, body, tracked, fill)?;
+    let tally = backend::Tally::global();
+    let mut ctx = tally.step(Step::Translate, || build(&mut cg, env, body, tracked, fill))?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
@@ -2264,7 +2287,9 @@ fn root_body<'db>(
     func: FunctionId,
 ) -> Result<(&'db MirBody<'db>, ParamEnvAndCrate<'db>)> {
     let owner: InferBodyId<'db> = func.into();
-    let body = db.mir_body(owner);
+    let tally = backend::Tally::global();
+    tally.step(Step::Infer, || _ = InferenceResult::of(db, DefWithBodyId::from(func)));
+    let body = tally.step(Step::Mir, || db.mir_body(owner));
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
     let krate = owner.module(db).krate(db);
     // Not the function's own bounds: with nothing generic they are bounds on concrete
@@ -2278,7 +2303,9 @@ fn root_body<'db>(
         )
     });
     let body = if opaque {
-        db.monomorphized_mir_body(owner, GenericArgs::new_from_slice(&[]).store(), env.store())
+        let args = GenericArgs::new_from_slice(&[]).store();
+        tally
+            .step(Step::Monomorphize, || db.monomorphized_mir_body(owner, args, env.store()))
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
     } else {
         body
@@ -2379,7 +2406,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         if let Some(debug) = self.debug {
-            debug.emit(&mut product).map_err(CodegenError::Backend)?;
+            backend::Tally::global()
+                .step(Step::Describe, || debug.emit(&mut product))
+                .map_err(CodegenError::Backend)?;
         }
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
@@ -2636,7 +2665,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             _ => None,
         };
         let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
-        self.keep(instance, compiled, &ids, debug);
+        let tally = backend::Tally::global();
+        tally.step(Step::StoreWrite, || self.keep(instance, compiled, &ids, debug));
         Ok(())
     }
 
@@ -2651,6 +2681,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         declared: Option<FunctionId>,
     ) -> Option<FunctionDebug> {
         self.debug.as_ref()?;
+        let start = stdx::time::Instant::now();
         if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
             debug.declared = Some(debug.place(file, line, column));
         }
@@ -2671,6 +2702,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
+        backend::Tally::global().add(Step::Describe, start.elapsed());
         Some(debug)
     }
 
@@ -2961,7 +2993,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
         if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
-            debug.add_function(id, code.bytes.len() as u32, of);
+            let len = code.bytes.len() as u32;
+            backend::Tally::global().step(Step::Describe, || debug.add_function(id, len, of));
         }
         self.bodies += 1;
         self.kept.found += 1;

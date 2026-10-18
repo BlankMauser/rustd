@@ -526,7 +526,9 @@ def transfers(top, remote):
     out2 = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_JOBS": "3"})
     check("twelve packs with three requests at a time: never more in flight",
           out.returncode == 0 and out2.returncode == 0 and 2 <= most <= 3 and 2 <= proxy.most_flying <= 3 and len(b.packs()) == 12
-          and all(b.packs().values()), f"{most} up, {proxy.most_flying} down")
+          and all(b.packs().values()),
+          f"{most} up, {proxy.most_flying} down, {len(b.packs())} packs, ended {out.returncode} and {out2.returncode}"
+          f"{': ' + out2.stderr.strip().splitlines()[0][-80:] if out2.returncode and out2.stderr.strip() else ''}")
     proxy.hold = 0
 
     a, b, address, bucket, name = pushed("server killed and back")
