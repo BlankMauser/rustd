@@ -21,6 +21,9 @@ correct compilers:
 import contextlib, os, random, sys
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from scenes import Scenes
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 INTS = {"i8": (8, True), "i16": (16, True), "i32": (32, True), "i64": (64, True), "i128": (128, True), "isize": (64, True),
         "u8": (8, False), "u16": (16, False), "u32": (32, False), "u64": (64, False), "u128": (128, False), "usize": (64, False)}
@@ -207,7 +210,7 @@ class Types:
         return all(self.unify(p, t, bound) for p, t in zip(pattern.args, ty.args))
 
 
-class Gen:
+class Gen(Scenes):
     """Generates one case. Methods named `x_KIND` list the ways to make a value of that kind."""
 
     def __init__(self, seed, index):
@@ -1638,6 +1641,7 @@ class Gen:
             (0.8, "drop.move", self.s_move),
             (0.5, "static.mut_write", self.s_static),
             (0.5, "map.btree", self.s_map),
+            (3, "scene", self.s_scene),
         ])
 
     def some_ty(self):
