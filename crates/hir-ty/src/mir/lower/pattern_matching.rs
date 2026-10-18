@@ -80,6 +80,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
             pattern,
             MatchingMode::Check,
         )?;
+        let current = match std::mem::take(&mut self.arm_unreached) {
+            true => self.unreached_block(current, pattern.into()),
+            false => current,
+        };
         // Bindings are dropped in the reverse of the order the pattern names them, whichever
         // alternative of an or-pattern ends up binding them.
         let mut bindings = Vec::new();
@@ -102,6 +106,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
             MatchingMode::Bind,
         )?;
         Ok((current, current_else))
+    }
+
+    /// Goes on from `current` in a block that rustc has no way into: what is moved out there
+    /// is not counted where a drop asks what may be gone.
+    fn unreached_block(&mut self, current: BasicBlockId, span: MirSpan) -> BasicBlockId {
+        let block = self.new_basic_block();
+        self.set_goto(current, block, span);
+        self.result.unreached.push(block);
+        block
     }
 
     /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
