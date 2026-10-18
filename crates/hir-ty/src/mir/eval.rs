@@ -2726,6 +2726,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     ) -> Result<'db, ()> {
         let layout = self.layout(ty)?;
         let my_size = self.size_of_sized(ty, locals, "value to patch address")?;
+        // Nothing is an address in a value without bytes, however many elements it has.
+        if my_size == 0 {
+            return Ok(());
+        }
         use rustc_type_ir::TyKind;
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
@@ -2774,6 +2778,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         if let TyKind::Slice(inner) = t.kind() {
                             let len = from_bytes!(usize, metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
+                            let len = if size == 0 { 0 } else { len };
                             for i in 0..len {
                                 self.patch_addresses(
                                     patch_map,
