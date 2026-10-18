@@ -84,12 +84,14 @@ struct Tree {
 
 impl Tree {
     /// Matches the candidates in order, and says whether none of them matching can happen.
+    /// Or-patterns are expanded before any test, as soon as any candidate starts with one,
+    /// so that the alternatives are sorted by the tests of the arms before them.
     fn run(&mut self, mut start: bool, mut candidates: Vec<Candidate>) -> bool {
         loop {
             let Some(first) = candidates.first() else { return start };
             match first.pairs.first() {
                 None => start = self.matched(start, candidates.remove(0)),
-                Some(Pair { ask: Ask::Or(_), .. }) => {
+                Some(_) if candidates.iter().any(starts_with_or) => {
                     (start, candidates) = self.expand(start, candidates)
                 }
                 Some(_) => (start, candidates) = self.test(start, candidates),
@@ -118,8 +120,6 @@ impl Tree {
     /// alternative. The candidates after one that has more to test after its or-pattern are
     /// left for after.
     fn expand(&mut self, start: bool, mut candidates: Vec<Candidate>) -> (bool, Vec<Candidate>) {
-        let starts_with_or =
-            |it: &Candidate| matches!(it.pairs.first(), Some(Pair { ask: Ask::Or(_), .. }));
         let last = candidates.iter().position(|it| starts_with_or(it) && it.pairs.len() > 1);
         let remaining = candidates.split_off(last.map_or(candidates.len(), |it| it + 1));
         let mut expanded = Vec::new();
@@ -171,6 +171,11 @@ impl Tree {
         }
         (fell, remaining)
     }
+}
+
+/// Whether the first thing left to test for `candidate` is an or-pattern.
+fn starts_with_or(candidate: &Candidate) -> bool {
+    matches!(candidate.pairs.first(), Some(Pair { ask: Ask::Or(_), .. }))
 }
 
 /// The branch of the test `ask` makes of `place` that `candidate` belongs in, if the outcome
