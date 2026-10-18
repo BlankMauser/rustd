@@ -52,7 +52,9 @@ STEPS = [
     ("a function a long jump fits", [(MAIN, "wrapping_mul(31)", "wrapping_mul(33)")], False, "spliced"),
     ("again", [(MAIN, "wrapping_mul(33)", "wrapping_mul(35)")], False, "spliced"),
     ("the caller of one in the executable", [(MAIN, "near() + 1", "near() + 2")], False, "spliced"),
-    ("a function shorter than the long jump", [(MAIN, "fn nothing() {}", 'fn nothing() {\n    println!("something");\n}')], False, SHORT),
+    ("a function shorter than the long jump", [(MAIN, "fn nothing() {}", 'fn nothing() { println!("something"); }')], False, SHORT),
+    # The edit before it kept every line where it was. Had it moved them, the functions below
+    # it would be in the patch too, and `near` is shorter than the long jump under LLVM.
     ("an edit after that", [(MAIN, "wrapping_mul(35)", "wrapping_mul(37)")], False, "spliced"),
 ]
 
