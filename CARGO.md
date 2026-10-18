@@ -84,10 +84,9 @@ rustd falls back to cargo, with the reason on one line, for:
   `lto`, `panic = "abort"`, instrumentation: rustd's code is debug-quality and what rustc
   inlined of a function is not replaced by rustd's copy of it;
 - `RUSTFLAGS` and `-C target-cpu`/`target-feature`: the daemon loads the workspace without
-  them. `target-feature=+crt-static` alone is served: it says how the C runtime is linked,
-  which the link line and the cfg cargo reports already have;
-- a target rustd does not emit for, or links differently from ELF (the link line is rewritten
-  for ELF linkers only so far);
+  them;
+- a target rustd does not emit for, or whose link line is neither an ELF `cc` line nor a
+  `link.exe` line (those are the two the daemon rewrites so far);
 - a change to a manifest, `Cargo.lock`, `.cargo/config.toml`, the toolchain file;
 - a change to anything that runs during the build: a build script, a proc macro, a workspace
   crate one of those depends on, a file or variable a build script said to rerun for. A build
@@ -209,7 +208,7 @@ stderr and a count in `cargo rustd status`:
 
 - The whole invocation: `--release` and any profile but dev, `RUSTFLAGS`, `--all-features`
   and `--no-default-features`, several `-p`, several `--target`, a target that is not ELF,
-  `--message-format`, `-Z` flags, `-q`, a `RUSTC_WORKSPACE_WRAPPER` that is already set.
+  `--message-format`, `-Z` flags, a `RUSTC_WORKSPACE_WRAPPER` that is already set.
   `check` is always `cargo check`.
 - One build: the daemon is still loading; a manifest, lock file, cargo config, toolchain
   file or a build script's input changed; a `#[test]` was added, removed or given other

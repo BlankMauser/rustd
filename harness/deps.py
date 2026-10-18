@@ -52,8 +52,13 @@ class Said:
         self.nothing = all(out.stdout.startswith("0 units") for out in outs)
         self.something = not any(" 0 units" in out.stdout for out in outs)
 
-def rustd(root, verb, remote):
-    return Said([subprocess.run([RUSTD, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True)
+# The remote here is a directory of this user's, whose lists nobody signs: pulling from it
+# has to be asked for.
+UNSIGNED = {**os.environ, "RUSTD_REMOTE_UNSIGNED": "1"}
+ASKED_FOR_NOTHING = {name: value for name, value in os.environ.items() if name != "RUSTD_REMOTE_UNSIGNED"}
+
+def rustd(root, verb, remote, env=UNSIGNED):
+    return Said([subprocess.run([RUSTD, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True, env=env)
                  for directory, name in PROFILES])
 
 right = total = 0
@@ -69,13 +74,17 @@ _, printed = cargo(first)
 shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
 shutil.copytree(first, third, ignore=shutil.ignore_patterns("target"))
 
-out = rustd(first, "push", remote)
+out = rustd(first, "push", remote, ASKED_FOR_NOTHING)
 check("the units are pushed", out.returncode == 0 and out.something, out.stdout.strip() + out.stderr.strip())
 listed = [line for _, name in PROFILES for line in open(f"{remote}/deps/{name}").read().split("\n")]
 check("none of a crate at a path", not any(line.rsplit("-", 1)[0] in LOCAL for line in listed))
 out = rustd(first, "push", remote)
 check("a second push sends nothing", out.nothing, out.stdout.strip())
 
+out = rustd(second, "pull", remote, ASKED_FOR_NOTHING)
+check("a pull from lists nobody signed is refused unless asked for",
+      out.returncode != 0 and "RUSTD_REMOTE_UNSIGNED=1" in out.stderr and not os.path.exists(f"{second}/target/debug/.fingerprint"),
+      out.stderr.strip()[-80:])
 out = rustd(second, "pull", remote)
 check("the units are pulled", out.returncode == 0, out.stdout.strip() + out.stderr.strip())
 said, again = cargo(second)
@@ -88,7 +97,8 @@ check("a second pull fetches nothing", out.nothing, out.stdout.strip())
 unit = sorted(os.listdir(f"{remote}/units"))[0]
 open(f"{remote}/units/{unit}", "ab").write(b"x")
 out = rustd(third, "pull", remote)
-check("an archive that was changed is refused", out.returncode != 0 and f"rejected units/{unit}" in out.stderr, out.stderr.strip()[-80:])
+check("an archive that was changed is refused", out.returncode != 0 and f"rejected units/{unit}" in out.stderr
+      and "1 of them rejected" in out.stderr, out.stderr.strip()[-80:])
 said, again = cargo(third)
 check("and cargo builds what is missing", again == printed, repr(again))
 

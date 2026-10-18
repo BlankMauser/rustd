@@ -219,8 +219,14 @@ impl Kind {
         } else {
             // The first format called these `.partial`.
             let whole = name.strip_suffix(".tmp").or_else(|| name.strip_suffix(".partial"))?;
-            let (to, _) = whole.rsplit_once('.')?;
-            (is_pack(to) || to == VERSION_FILE).then_some(Kind::Temporary)
+            let (to, writer) = whole.rsplit_once('.')?;
+            let numbered =
+                !writer.is_empty() && writer.bytes().all(|it| it.is_ascii_digit() || it == b'-');
+            // A pack on its way from a remote, as it is or compressed, is taken up by the
+            // next process to fetch it; one compressed to be sent is made again.
+            let fetched = matches!(writer, "fetch" | "zst" | "send") && is_pack(to);
+            let of_the_store = numbered && (is_pack(to) || to == VERSION_FILE);
+            (of_the_store || fetched).then_some(Kind::Temporary)
         }
     }
 }
@@ -264,7 +270,9 @@ fn records(pack: &[u8]) -> (Vec<Record>, usize) {
         let len = u32::from_le_bytes(len.try_into().expect("four bytes")) as usize;
         let sum = u32::from_le_bytes(sum.try_into().expect("four bytes"));
         let start = at + HEADER;
-        let Some(value) = pack.get(start..start + len) else { break };
+        let Some(value) = start.checked_add(len).and_then(|end| pack.get(start..end)) else {
+            break;
+        };
         if checksum(key, value) != sum {
             break;
         }
@@ -420,7 +428,9 @@ impl StoreDir {
     /// what is in it is of an older format. A directory of a newer format is an error, and
     /// is left as it is.
     pub fn claim(&self) -> io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        private::create_dir(&self.dir)?;
+        self.private()?;
+        private::close(&self.dir)?;
         if self.format() == Some(FORMAT) {
             return Ok(());
         }
@@ -446,12 +456,48 @@ impl StoreDir {
         self.write_whole(VERSION_FILE, format!("rustd store {FORMAT}\n").as_bytes())
     }
 
+    /// Refuses a directory that is another user's or that others can write to: whoever
+    /// can write a pack into it decides what the programs built from it run.
+    fn private(&self) -> io::Result<()> {
+        let refused = |why: &str| {
+            let said = format!("the store {} {why}", self.dir.display());
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, said))
+        };
+        // A link to a directory is taken for the directory, which is what is checked.
+        let dir = private::open_dir(&self.dir)?;
+        if !dir.metadata()?.is_dir() {
+            return refused("is not a directory");
+        }
+        match private::others_write(&dir) {
+            Some(why) => refused(&format!("{why} ({} if it is yours)", private::MENDED_BY)),
+            None => Ok(()),
+        }
+    }
+
+    /// Opens a file of the store to read, and to write when `write` is set. One that is
+    /// another user's or that others can write to is not the store's.
+    fn open(&self, name: &str, write: bool) -> io::Result<File> {
+        let file = OpenOptions::new().read(true).write(write).open(self.dir.join(name))?;
+        match private::others_write(&file) {
+            Some(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, why)),
+            None => Ok(file),
+        }
+    }
+
+    /// The bytes of a file of the store, as [`Self::open`] takes it for one.
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut self.open(name, false)?, &mut bytes)?;
+        Ok(bytes)
+    }
+
     /// The format the directory says it is of. One with packs and nothing that says is of
     /// the first format, which had no such file. `None` is a directory with nothing of a
     /// store in it.
     fn format(&self) -> Option<u32> {
-        if let Ok(text) = std::fs::read_to_string(self.dir.join(VERSION_FILE)) {
+        if let Ok(text) = self.read(VERSION_FILE) {
             // Text that is no version is of no format this build knows how to read.
+            let text = String::from_utf8_lossy(&text);
             let format = text.trim().strip_prefix("rustd store ").and_then(|it| it.parse().ok());
             return Some(format.unwrap_or(0));
         }
@@ -470,28 +516,25 @@ impl StoreDir {
 
     fn lock_file(&self) -> io::Result<File> {
         let path = self.dir.join(LOCK_FILE);
-        // Another user's file can be locked without being written.
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .or_else(|_| File::open(&path))
+        let mut options = OpenOptions::new();
+        private::file(options.create(true).truncate(false).write(true)).open(&path)
     }
 
     /// Writes a file that readers see all of or not at all, and that is whole after a loss
     /// of power once this returns.
     pub fn write_whole(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        write_whole(&self.dir.join(name), bytes)
+        write_whole(&self.dir.join(name), bytes, true)
     }
 
-    /// The names of the files in the directory. One that is not there has none.
+    /// The names of the files in the directory. One that is not there has none, and one
+    /// that others can write to is refused.
     fn names(&self) -> io::Result<Vec<String>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
+        self.private()?;
         let mut names = Vec::new();
         for entry in entries {
             if let Ok(name) = entry?.file_name().into_string() {
@@ -532,9 +575,7 @@ impl StoreDir {
         let mut adopted = 0;
         for name in names.iter().filter(|it| Kind::of(it) == Some(Kind::Open)) {
             let path = self.dir.join(name);
-            let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
-                continue;
-            };
+            let Ok(file) = self.open(name, true) else { continue };
             // Its daemon holds it for as long as it runs.
             if file.try_lock().is_err() {
                 continue;
@@ -595,9 +636,8 @@ impl StoreDir {
     pub fn verify(&self) -> io::Result<Verified> {
         let mut verified = Verified { format: self.format(), ..Verified::default() };
         for name in self.names()? {
-            let path = self.dir.join(&name);
             if Kind::of(&name) == Some(Kind::Open) {
-                let Ok(pack) = std::fs::read(&path) else { continue };
+                let Ok(pack) = self.read(&name) else { continue };
                 verified.open += 1;
                 verified.torn_bytes += (pack.len() - records(&pack).1) as u64;
                 continue;
@@ -605,8 +645,15 @@ impl StoreDir {
             if !is_pack(&name) {
                 continue;
             }
-            // Evicted since it was listed.
-            let Ok(pack) = std::fs::read(&path) else { continue };
+            let pack = match self.read(&name) {
+                Ok(pack) => pack,
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    verified.corrupt.push((name, e.to_string()));
+                    continue;
+                }
+                // Evicted since it was listed.
+                Err(_) => continue,
+            };
             match Pack::check(&name, &pack) {
                 Ok(records) => {
                     verified.packs += 1;
@@ -704,7 +751,7 @@ impl StoreDir {
         let mut keys = FxHashSet::default();
         let mut taken = Vec::new();
         for listed in &small {
-            let Ok(pack) = std::fs::read(self.dir.join(&listed.name)) else { continue };
+            let Ok(pack) = self.read(&listed.name) else { continue };
             // One that is not what its name says is left for whoever reads it to remove.
             let Ok(records) = Pack::check(&listed.name, &pack) else { continue };
             if merged.len() + pack.len() > (SEAL_AT * ROLL_AFTER) as usize {
@@ -740,11 +787,16 @@ struct Listed {
     used: SystemTime,
 }
 
-fn write_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_whole(to: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let dir = to.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let name = to.file_name().ok_or(io::ErrorKind::InvalidInput)?.to_string_lossy();
     let partial = dir.join(format!("{name}.{}-{}.tmp", std::process::id(), nanos()));
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&partial)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    if private {
+        private::file(&mut options);
+    }
+    let mut file = options.open(&partial)?;
     let written = file
         .lock()
         .and_then(|()| file.write_all(bytes))
@@ -768,7 +820,7 @@ pub fn name_file_whole(file: &File, from: &Path, to: &Path) -> io::Result<()> {
 
 /// Writes a file outside a store the way [`StoreDir::write_whole`] writes one inside.
 pub fn write_file_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_whole(to, bytes)
+    write_whole(to, bytes, false)
 }
 
 pub(super) struct Store {
@@ -972,9 +1024,18 @@ impl Store {
 
     /// The pack and its records, if it is what its name says. One that is not is removed.
     fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Record>)> {
-        let path = self.dir.dir.join(name);
-        // Evicted since it was listed.
-        let mut file = open_pack(&path).ok()?;
+        // To write as well where that is allowed, which is what Windows asks of whoever
+        // sets a file's time of last use.
+        let opened = self.dir.open(name, true).or_else(|_| self.dir.open(name, false));
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                self.discard(name, &e.to_string());
+                return None;
+            }
+            // Evicted since it was listed.
+            Err(_) => return None,
+        };
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes).ok()?;
         match Pack::check(name, &bytes) {
@@ -1195,7 +1256,8 @@ impl New {
         // is locked, and remove it.
         for _ in 0..8 {
             let path = dir.join(format!("{}-{}.open", std::process::id(), nanos()));
-            let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut options = OpenOptions::new();
+            let file = match private::file(options.write(true).create_new(true)).open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -1231,6 +1293,94 @@ impl New {
         self.file.sync_all()?;
         std::fs::rename(&self.path, dir.join(named(&self.hash.finalize())))?;
         sync_dir(dir)
+    }
+}
+
+#[cfg(windows)]
+mod acl;
+
+/// Keeping the store to the user it is of. On Unix that is the owner and the mode of the
+/// directory and of each file. On Windows it is the owner and the access control list,
+/// see [`acl`]: a directory is made with the list it inherits, which under the user's
+/// profile lets in the user alone, and one that lets in others is refused, not mended.
+mod private {
+    use std::{
+        fs::{File, OpenOptions},
+        io,
+        path::Path,
+    };
+
+    /// What makes a directory that was refused one that is taken.
+    #[cfg(not(windows))]
+    pub(super) const MENDED_BY: &str = "`chmod 700` it";
+    #[cfg(windows)]
+    pub(super) const MENDED_BY: &str =
+        "`icacls DIR /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"` it";
+
+    /// Opens a directory for what is asked of it by its handle.
+    pub(super) fn open_dir(dir: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // Windows opens a directory only when told that it may be one.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0200_0000);
+        options.open(dir)
+    }
+
+    /// Makes the directory and the ones above it that are missing, for the user alone.
+    pub(super) fn create_dir(dir: &Path) -> io::Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)
+    }
+
+    /// Takes from other users the reading of a directory that is the user's: what is in a
+    /// store tells what was built from it.
+    pub(super) fn close(dir: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(dir)?.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(permissions.mode() & !0o077);
+                std::fs::set_permissions(dir, permissions)?;
+            }
+        }
+        _ = dir;
+        Ok(())
+    }
+
+    /// Has a file that is created be the user's alone to read and write.
+    pub(super) fn file(options: &mut OpenOptions) -> &mut OpenOptions {
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+        options
+    }
+
+    /// Why what `file` is could have been written by someone other than the user this
+    /// process runs as, if it could.
+    #[cfg(unix)]
+    pub(super) fn others_write(file: &File) -> Option<&'static str> {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = file.metadata() else {
+            return Some("has an owner that could not be read");
+        };
+        // SAFETY: `geteuid` takes nothing and cannot fail.
+        let user = unsafe { libc::geteuid() };
+        if meta.uid() != user {
+            return Some("belongs to another user");
+        }
+        (meta.mode() & 0o022 != 0).then_some("can be written to by other users")
+    }
+
+    #[cfg(windows)]
+    pub(super) use super::acl::others_write;
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn others_write(_: &File) -> Option<&'static str> {
+        None
     }
 }
 
@@ -1649,6 +1799,12 @@ mod tests {
         assert!(Kind::of("12-34.open") == Some(Kind::Open));
         assert!(Kind::of("version.12-34.tmp") == Some(Kind::Temporary));
         assert!(Kind::of(&format!("{}.7.partial", named(&[0; KEY]))) == Some(Kind::Temporary));
+        // A pack that a pull was stopped in the middle of, and nothing else called so.
+        assert!(Kind::of(&format!("{}.fetch.tmp", named(&[0; KEY]))) == Some(Kind::Temporary));
+        assert!(Kind::of(&format!("{}.zst.tmp", named(&[0; KEY]))) == Some(Kind::Temporary));
+        assert!(Kind::of(&format!("{}.send.tmp", named(&[0; KEY]))) == Some(Kind::Temporary));
+        assert!(Kind::of("version.fetch.tmp").is_none());
+        assert!(Kind::of(&format!("{}.fetched.tmp", named(&[0; KEY]))).is_none());
     }
 
     #[test]
@@ -1726,5 +1882,217 @@ mod tests {
         store.flush();
         assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_and_its_files_are_the_users_alone() {
+        let dir = scratch("private");
+        let pack = sealed(&dir);
+        let store = open(&dir, Tuning { seal_at: u64::MAX, limit: None });
+        store.insert(&[3; KEY], b"three");
+        store.flush();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&pack), 0o600);
+        assert_eq!(mode(&dir.join(VERSION_FILE)), 0o600);
+        assert_eq!(mode(&files(&dir, Kind::Open)[0]), 0o600);
+        drop(StoreDir::at(&dir).lock().unwrap());
+        assert_eq!(mode(&dir.join(LOCK_FILE)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_others_could_read_is_closed_to_them() {
+        let dir = scratch("readable");
+        std::fs::create_dir_all(&dir).unwrap();
+        chmod(&dir, 0o755);
+        StoreDir::at(&dir).claim().unwrap();
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_others_can_write_to_is_refused() {
+        for open_to in [0o720, 0o702, 0o777] {
+            let dir = scratch("writable");
+            sealed(&dir);
+            chmod(&dir, open_to);
+            let refused = Store::open(&dir, identity("a toolchain"), EAGER).err().unwrap();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{open_to:o}");
+            assert!(refused.to_string().contains("written to by other users"), "{refused}");
+            assert!(StoreDir::at(&dir).verify().is_err());
+            assert!(StoreDir::at(&dir).stats().is_err());
+            assert!(StoreDir::at(&dir).collect(None).is_err());
+            // Nothing in it was touched.
+            chmod(&dir, 0o700);
+            assert_eq!(files(&dir, Kind::Pack).len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pack_others_can_write_to_is_not_read() {
+        let dir = scratch("writable-pack");
+        let pack = sealed(&dir);
+        chmod(&pack, 0o666);
+        let found = StoreDir::at(&dir).verify().unwrap();
+        assert_eq!(found.corrupt.len(), 1);
+        assert!(found.corrupt[0].1.contains("written to by other users"));
+        let store = open(&dir, EAGER);
+        assert_eq!(store.get(&[1; KEY]), None);
+        assert_eq!(store.corrupt.load(Ordering::Relaxed), 1);
+        assert!(!pack.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_that_is_no_directory_is_refused() {
+        let dir = scratch("no-directory");
+        std::fs::write(&dir, b"").unwrap();
+        assert!(Store::open(&dir, identity("a toolchain"), EAGER).is_err());
+        std::fs::remove_file(&dir).unwrap();
+    }
+
+    /// Lets every user of the machine do `rights` to `path`, as `icacls` writes them.
+    #[cfg(windows)]
+    fn let_everyone(path: &Path, rights: &str) {
+        let grant = format!("*S-1-1-0:{rights}");
+        let done = std::process::Command::new("icacls").arg(path).args(["/grant", &grant]).output();
+        assert!(done.unwrap().status.success(), "icacls {} /grant {grant}", path.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_under_the_users_profile_is_taken() {
+        let dir = scratch("acl-inherited");
+        let pack = sealed(&dir);
+        assert_eq!(StoreDir::at(&dir).verify().unwrap().corrupt, []);
+        assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        // Reading is not writing: a store others can only read is still the user's.
+        let_everyone(&dir, "(OI)(CI)RX");
+        let_everyone(&pack, "R");
+        assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_whose_list_lets_others_write_is_refused() {
+        for rights in ["(OI)(CI)M", "(OI)(CI)F", "(AD)", "(WD)", "(DC)", "(WDAC)", "(WO)"] {
+            let dir = scratch("acl-writable");
+            sealed(&dir);
+            let_everyone(&dir, rights);
+            let refused = Store::open(&dir, identity("a toolchain"), EAGER).err().unwrap();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{rights}");
+            assert!(refused.to_string().contains("written to by other users"), "{refused}");
+            assert!(refused.to_string().contains("icacls"), "{refused}");
+            assert!(StoreDir::at(&dir).verify().is_err(), "{rights}");
+            assert!(StoreDir::at(&dir).stats().is_err(), "{rights}");
+            assert!(StoreDir::at(&dir).collect(None).is_err(), "{rights}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pack_whose_list_lets_others_write_is_not_read() {
+        let dir = scratch("acl-writable-pack");
+        let pack = sealed(&dir);
+        let_everyone(&pack, "M");
+        let found = StoreDir::at(&dir).verify().unwrap();
+        assert_eq!(found.corrupt.len(), 1);
+        assert!(found.corrupt[0].1.contains("written to by other users"));
+        let store = open(&dir, EAGER);
+        assert_eq!(store.get(&[1; KEY]), None);
+        assert_eq!(store.corrupt.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Another user's store is refused: run as root, where a directory can be given away.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_of_another_user_is_refused() {
+        let dir = scratch("another-user");
+        sealed(&dir);
+        let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a string that ends in a zero and lives through the call.
+        if unsafe { libc::chown(path.as_ptr(), 65534, 65534) } != 0 {
+            eprintln!("skipped: this user cannot give a directory away");
+            return;
+        }
+        let refused = Store::open(&dir, identity("a toolchain"), EAGER).err().unwrap();
+        assert!(refused.to_string().contains("belongs to another user"), "{refused}");
+    }
+
+    /// A pack with two records, as it is sealed.
+    fn pack() -> Vec<u8> {
+        let mut pack = MAGIC.to_vec();
+        pack.extend(record(&[1; KEY], b"one", 3));
+        pack.extend(record(&[2; KEY], &[7; 300], 300));
+        pack
+    }
+
+    #[test]
+    fn no_bytes_break_the_reading_of_a_pack() {
+        use super::super::fuzz;
+        let seeds = vec![pack(), MAGIC.to_vec(), Vec::new()];
+        let (mut whole, mut cut) = (0, 0);
+        for bytes in fuzz::inputs("pack", seeds) {
+            let (largest, (found, end)) = fuzz::largest_allocation(|| records(&bytes));
+            assert!(largest <= fuzz::allowed(bytes.len()), "{largest} bytes for {}", bytes.len());
+            assert!(end <= bytes.len());
+            for record in &found {
+                assert_eq!(checksum(&record.key, &bytes[record.value.clone()]), record.checksum);
+            }
+            // Under the name of its bytes, which whoever writes a pack can give it.
+            let name = named(&Sha256::digest(&bytes));
+            match Pack::check(&name, &bytes) {
+                Ok(records) => {
+                    assert_eq!(records.len(), found.len());
+                    whole += 1;
+                }
+                Err(_) => cut += 1,
+            }
+            assert!(Pack::check(&named(&[0; 32]), &bytes).is_err());
+        }
+        eprintln!("pack: {whole} whole, {cut} not");
+        assert!(whole > 3 && cut > 0);
+    }
+
+    #[test]
+    fn no_name_breaks_the_telling_of_what_a_file_is() {
+        use super::super::fuzz;
+        let name = |it: &str| it.as_bytes().to_vec();
+        let seeds = vec![
+            name(&named(&[0xab; 32])),
+            name("4242-1700000000000000000.open"),
+            name(&format!("{}.4242-17.tmp", named(&[0xcd; 32]))),
+            name("version.1-2.tmp"),
+            name(VERSION_FILE),
+            name(LOCK_FILE),
+        ];
+        let mut ours = 0;
+        for bytes in fuzz::inputs("name", seeds) {
+            let name = String::from_utf8_lossy(&bytes);
+            let kind = Kind::of(&name);
+            assert_eq!(kind == Some(Kind::Pack), is_pack(&name));
+            // Nothing that is a path to somewhere else is the store's.
+            assert!(kind.is_none() || !name.contains(['/', '\\', '\0']), "{name}");
+            ours += usize::from(kind.is_some());
+            _ = parse_size(&name);
+        }
+        assert!(ours > 5);
     }
 }

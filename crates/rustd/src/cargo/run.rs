@@ -11,7 +11,7 @@ use anyhow::Context as _;
 use super::{
     cli::Invocation,
     say,
-    state::{Kind, Program, State, cargo_path},
+    state::{Kind, Program, State, as_built, cargo_path},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -35,6 +35,7 @@ pub(crate) fn program(
     say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
     let mut command = Command::new(&program.executable);
     command.args(asked.program_args()).envs(program.env.iter().cloned());
+    as_built(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
     Ok(Some(exit_code(status)))
 }
@@ -51,6 +52,7 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
         let mut command = Command::new(&test.executable);
         command.args(asked.program_args()).envs(test.env.iter().cloned());
         command.current_dir(&test.package_dir);
+        as_built(&mut command)?;
         let status = command.status().with_context(|| format!("could not execute {shown}"))?;
         if !status.success() {
             failed.push(rerun_flags(test));
@@ -81,6 +83,7 @@ pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
         cargo.arg("--no-fail-fast");
     }
     cargo.args(&asked.positional).arg("--").args(&asked.trailing);
+    as_built(&mut cargo)?;
     Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
 }
 

@@ -79,10 +79,20 @@ pub(crate) struct Program {
     pub(crate) package_dir: PathBuf,
     /// Where cargo has the executable.
     pub(crate) executable: PathBuf,
+    /// The other names cargo has for the executable: the file rustc wrote, when
+    /// `executable` is cargo's hard link to it. A cargo that finds the two apart links
+    /// them again, under whoever is running the program.
+    #[serde(default)]
+    names: Vec<PathBuf>,
     /// A hard link to the executable rustc linked, to give cargo back before it builds.
     cargos: PathBuf,
     /// Where it is among the programs of its checkout in `checkouts`.
     pub(crate) asked_as: Option<(usize, usize)>,
+    /// Why the daemon is never asked for it, when it is not.
+    left_to_cargo: Option<String>,
+    /// The source files of the workspace it is compiled from, its libraries' too. While
+    /// none is written, the executable cargo built is the program.
+    inputs: Vec<PathBuf>,
     /// What cargo sets for the program when it runs it.
     pub(crate) env: Vec<(String, String)>,
 }
@@ -202,10 +212,11 @@ fn newer_in(dir: &Path, since: u128) -> Option<PathBuf> {
         let (path, name) = (entry.path(), entry.file_name());
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() {
-            if name != "target" && name != ".git" {
-                if let Some(found) = newer_in(&path, since) {
-                    return Some(found);
-                }
+            if name != "target"
+                && name != ".git"
+                && let Some(found) = newer_in(&path, since)
+            {
+                return Some(found);
             }
         } else if entry.metadata().and_then(|it| it.modified()).is_ok_and(|it| stamp_of(it) > since)
         {
@@ -235,8 +246,7 @@ impl Built {
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
-        cargo.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?);
-        cargo.env(wrapper::ENABLED, "1");
+        as_built(&mut cargo)?;
         cargo.stdout(Stdio::piped());
         let mut cargo = cargo.spawn().context("running cargo")?;
         let said = cargo.stdout.take().context("cargo has no output")?;
@@ -259,12 +269,20 @@ impl State {
         Ok(daemon::home()?.join("states").join(format!("{key}.json")))
     }
 
-    /// The state of the build `key`, when this rustd wrote one and its files are there.
-    pub(crate) fn read(key: &str) -> Option<State> {
-        let text = std::fs::read_to_string(State::path(key).ok()?).ok()?;
-        let state: State = serde_json::from_str(&text).ok()?;
-        let whole = state.programs.iter().all(|it| it.cargos.exists());
-        (state.version == daemon::version() && whole).then_some(state)
+    /// The state of the build `key`. `Err` is why what is there is not read, when there
+    /// is something.
+    pub(crate) fn read(key: &str) -> Result<State, Option<&'static str>> {
+        let path = State::path(key).map_err(|_| None)?;
+        let text = std::fs::read_to_string(path).map_err(|_| None)?;
+        let another = "this build's state was written by another build of rustd";
+        let state = serde_json::from_str::<State>(&text).map_err(|_| another)?;
+        if state.version != daemon::version() {
+            return Err(Some(another));
+        }
+        if !state.programs.iter().all(|it| it.cargos.exists()) {
+            return Err(Some("what cargo built is no longer in the target directory"));
+        }
+        Ok(state)
     }
 
     pub(crate) fn write(&self) -> anyhow::Result<()> {
@@ -273,8 +291,11 @@ impl State {
         let new = path.with_extension(format!("{}.new", std::process::id()));
         std::fs::write(&new, serde_json::to_vec(self)?)?;
         std::fs::rename(&new, &path)?;
-        let kept: Vec<(&Path, &Path)> =
-            self.programs.iter().map(|it| (&*it.executable, &*it.cargos)).collect();
+        let kept: Vec<(&Path, &Path)> = self
+            .programs
+            .iter()
+            .flat_map(|program| program.places().map(|it| (it, &*program.cargos)))
+            .collect();
         Ok(std::fs::write(State::kept_path(&self.key)?, serde_json::to_vec(&kept)?)?)
     }
 
@@ -287,7 +308,7 @@ impl State {
             let key = name.to_str()?.strip_suffix(".json")?;
             (!key.contains('.')).then(|| key.to_owned())
         });
-        keys.filter_map(|it| State::read(&it)).collect()
+        keys.filter_map(|it| State::read(&it).ok()).collect()
     }
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
@@ -323,17 +344,48 @@ impl State {
         }
     }
 
-    /// Puts the executable the daemon built of each program where cargo has the program.
-    pub(crate) fn install(&self) -> anyhow::Result<()> {
+    /// Has every program be where cargo has it: the daemon's executable of one it built,
+    /// and cargo's own of one it did not, which is the program while none of its source is
+    /// written. `answers` is what the daemon said of each program of each checkout. `Ok`
+    /// are the programs that stay cargo's and why; `Err` is why cargo builds, when a
+    /// program the daemon did not build has new source.
+    pub(crate) fn settle(
+        &self,
+        answers: &[Vec<Result<(), String>>],
+    ) -> Result<Vec<(&Program, String)>, String> {
+        let mut cargos = Vec::new();
         for program in &self.programs {
-            let Some((checkout, at)) = program.asked_as else { continue };
-            let built = &self.checkouts[checkout].programs[at].binary;
-            if !same_file::is_same_file(built, &program.executable).unwrap_or(false) {
-                place(built, &program.executable)
-                    .with_context(|| format!("installing {}", program.executable.display()))?;
+            let answer = match program.asked_as {
+                Some((checkout, at)) => answers
+                    .get(checkout)
+                    .and_then(|it| it.get(at))
+                    .cloned()
+                    .unwrap_or_else(|| Err("the daemon said nothing of it".to_owned())),
+                None => Err(program.left_to_cargo.clone().unwrap_or_default()),
+            };
+            let from = match (&answer, program.asked_as) {
+                (Ok(()), Some((checkout, at))) => &self.checkouts[checkout].programs[at].binary,
+                _ => &program.cargos,
+            };
+            if let Err(why) = answer {
+                if let Some(file) = program.newer_input(self.built_at) {
+                    let name = &program.name;
+                    return Err(format!("`{name}`: {why}, and {} changed", file.display()));
+                }
+                cargos.push((program, why));
+            }
+            for to in program.places() {
+                if !same_file::is_same_file(from, to).unwrap_or(false) {
+                    place(from, to).map_err(|it| format!("installing {}: {it}", to.display()))?;
+                }
             }
         }
-        Ok(())
+        Ok(cargos)
+    }
+
+    /// The programs cargo built that the daemon is never asked for, and why.
+    pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
+        self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }
 
     /// The state after cargo built `asked` in `cwd`: what it built, what the daemon can
@@ -359,7 +411,7 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
-            profile: if asked.subcommand == Subcommand::Test { "test" } else { "dev" }.to_owned(),
+            profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),
             checkouts: Vec::new(),
@@ -377,12 +429,24 @@ impl State {
         if state.refusal.is_none() {
             state.refusal = other_toolchain();
         }
+        let env = match units::places_named(&used) {
+            Ok(env) => env,
+            Err(why) => {
+                state.refusal.get_or_insert(why);
+                BTreeMap::new()
+            }
+        };
         let config = |unit_test: bool| WorkerConfig {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
             cfg_test: unit_test,
             dev_deps: asked.subcommand == Subcommand::Test,
             features: asked.flags.features.clone(),
+            no_default_features: asked.flags.no_default_features,
+            all_features: asked.flags.all_features,
+            packages: asked.flags.packages.clone(),
+            workspace: asked.flags.workspace,
+            profile: asked.flags.profile.clone(),
             target: asked.target(),
             env: worker_env(),
         };
@@ -394,6 +458,7 @@ impl State {
             root: root.clone(),
             programs: Vec::new(),
             sources: Vec::new(),
+            env: env.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
         let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
@@ -411,6 +476,11 @@ impl State {
             std::fs::create_dir_all(&files)?;
             let cargos = files.join("cargo");
             place(executable.as_std_path(), &cargos)?;
+            let names = unit.map(|it| it.outputs()).unwrap_or_default().into_iter();
+            let names = names
+                .filter(|it| it != executable.as_std_path())
+                .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
+                .collect();
             let plan = match unit {
                 Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
                 None => Err(format!(
@@ -419,18 +489,21 @@ impl State {
                     package.name
                 )),
             };
-            let asked_as = match plan {
+            let (asked_as, left_to_cargo) = match plan {
                 Ok(plan) => {
                     let checkout = &mut checkouts[usize::from(unit_test)];
                     checkout.generation = checkout.generation.max(plan.stamp);
                     checkout.programs.push(plan);
-                    Some((usize::from(unit_test), checkout.programs.len() - 1))
+                    (Some((usize::from(unit_test), checkout.programs.len() - 1)), None)
                 }
-                Err(why) => {
-                    state.refusal.get_or_insert(why);
-                    None
-                }
+                Err(why) => (None, Some(why)),
             };
+            let compiled = reached_from(unit.into_iter().collect(), &used);
+            let inputs: FxHashSet<PathBuf> = compiled
+                .iter()
+                .flat_map(|it| it.inputs().files)
+                .filter(|it| !it.starts_with(metadata.target_directory.as_std_path()))
+                .collect();
             state.programs.push(Program {
                 name,
                 kind,
@@ -439,8 +512,11 @@ impl State {
                 source: artifact.target.src_path.clone().into_std_path_buf(),
                 package_dir: package_dir(package),
                 executable: executable.clone().into_std_path_buf(),
+                names,
                 cargos,
                 asked_as,
+                left_to_cargo,
+                inputs: inputs.into_iter().collect(),
                 env: run_env(package, &built.scripts),
             });
         }
@@ -479,6 +555,19 @@ impl State {
     }
 }
 
+impl Program {
+    /// Every path cargo has the executable at.
+    fn places(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(&*self.executable).chain(self.names.iter().map(|it| &**it))
+    }
+
+    /// The first of its source files that was written after cargo started.
+    fn newer_input(&self, built_at: u128) -> Option<&Path> {
+        let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
+        self.inputs.iter().find(newer).map(PathBuf::as_path)
+    }
+}
+
 /// Has `to` be the file `from` is, under a second name: what was at `to` stays as it is
 /// for whoever runs it.
 fn place(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -490,6 +579,15 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::copy(from, &new)?;
     }
     std::fs::rename(&new, to)
+}
+
+/// Gives `command` the environment cargo built in, so that a cargo it runs, or is, has the
+/// same units: cargo keys the crates of the workspace by their wrapper, and one run
+/// without it builds each program again and puts its own where this build's is, under a
+/// program that is running.
+pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
+    command.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?).env(wrapper::ENABLED, "1");
+    Ok(())
 }
 
 /// The cargo to run: the one that ran this command, or the one on the path.
@@ -546,11 +644,7 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
             .ok_or(format!("`-p {named}` is not a package of the workspace"));
     }
     if asked.flags.workspace {
-        let virtual_root = metadata.root_package().is_none();
-        return match virtual_root || metadata.workspace_members.len() == 1 {
-            true => Ok(root.to_owned()),
-            false => Err("--workspace of a workspace whose root is a package".to_owned()),
-        };
+        return Ok(root.to_owned());
     }
     let start = match &asked.flags.manifest_path {
         Some(manifest) => cwd.join(manifest).parent().map(Path::to_owned).unwrap_or_default(),
@@ -705,7 +799,11 @@ fn cargo_home_configs() -> Vec<PathBuf> {
 /// The units that run during the build, and the libraries of the workspace they are built
 /// against, and the ones those are.
 fn runs_in_build(used: &[Record]) -> Vec<&Record> {
-    let mut found: Vec<&Record> = used.iter().filter(|it| it.runs_in_build()).collect();
+    reached_from(used.iter().filter(|it| it.runs_in_build()).collect(), used)
+}
+
+/// `found` and the units among `used` they are built against, and the ones those are.
+fn reached_from<'a>(mut found: Vec<&'a Record>, used: &'a [Record]) -> Vec<&'a Record> {
     let mut at = 0;
     while let Some(unit) = found.get(at).copied() {
         at += 1;

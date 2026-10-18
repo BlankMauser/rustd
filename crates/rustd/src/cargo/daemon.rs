@@ -5,7 +5,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::OpenOptions,
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -24,7 +24,7 @@ use std::os::unix::net::UnixStream;
 use uds_windows::UnixStream;
 
 use super::{plan::Plan, units::stamp_of};
-use crate::socket::{NotServed, Served, private_dir, read_request};
+use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
@@ -104,6 +104,13 @@ pub(crate) struct WorkerConfig {
     pub(crate) cfg_test: bool,
     pub(crate) dev_deps: bool,
     pub(crate) features: Vec<String>,
+    pub(crate) no_default_features: bool,
+    pub(crate) all_features: bool,
+    /// The packages named with `-p`.
+    pub(crate) packages: Vec<String>,
+    pub(crate) workspace: bool,
+    /// The profile, when it is not the one cargo has for the command.
+    pub(crate) profile: Option<String>,
     pub(crate) target: Option<String>,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
@@ -112,7 +119,7 @@ pub(crate) struct WorkerConfig {
 impl WorkerConfig {
     fn id(&self) -> String {
         let text = serde_json::to_vec(self).unwrap_or_default();
-        Sha256::digest(text).iter().take(8).map(|it| format!("{it:02x}")).collect()
+        Sha256::digest(text).iter().take(16).map(|it| format!("{it:02x}")).collect()
     }
 }
 
@@ -132,6 +139,10 @@ pub(crate) struct Checkout {
     pub(crate) programs: Vec<Plan>,
     /// The source files rustc read. Only a request to warm names them.
     pub(crate) sources: Vec<PathBuf>,
+    /// The variables `env!` reads in the checkout: the ones cargo set to say where its
+    /// programs are, and in a request under them the ones of the process that asks.
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
 }
 
 impl Checkout {
@@ -202,9 +213,9 @@ struct Worker {
     project: PathBuf,
     socket: PathBuf,
     log: PathBuf,
-    /// The variables the process runs with, as a request says them: the daemon asks for
-    /// builds for the process the worker was loaded for.
-    env: String,
+    /// The variables the process runs with. A request says them with the ones of its
+    /// checkout over them.
+    env: ide_db::base_db::Env,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
@@ -231,6 +242,21 @@ impl Worker {
         if !config.features.is_empty() {
             command.args(["--features", &config.features.join(",")]);
         }
+        if config.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if config.all_features {
+            command.arg("--all-features");
+        }
+        for package in &config.packages {
+            command.args(["--package", package]);
+        }
+        if config.workspace {
+            command.arg("--workspace");
+        }
+        if let Some(profile) = &config.profile {
+            command.args(["--profile", profile]);
+        }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));
         }
@@ -244,7 +270,8 @@ impl Worker {
             first.symbol_files.iter().map(|it| format!("{}\n", it.display())).collect();
         std::fs::write(&symbols, listed)?;
         command.arg("--symbols-in").arg(&symbols);
-        let output = File::create(&log)?;
+        let output =
+            private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
         command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
         let mut env = crate::process::own();
         for (name, value) in &config.env {
@@ -263,7 +290,7 @@ impl Worker {
             project: checkout.project(),
             socket,
             log,
-            env: crate::process::encode(&env),
+            env,
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
@@ -321,7 +348,7 @@ impl Worker {
     }
 
     fn warmed(&self, checkout: &Checkout, started_on: bool) -> anyhow::Result<()> {
-        while UnixStream::connect(&self.socket).is_err() {
+        while socket::connect(&self.socket).is_err() {
             if let Some(how) = self.ended() {
                 anyhow::bail!("the daemon could not load the workspace ({how})");
             }
@@ -334,21 +361,27 @@ impl Worker {
             return Err(stale(file));
         }
         for plan in checkout.programs.iter().skip(usize::from(started_on)) {
-            self.ask(&checkout.sync_line(plan))?.map_err(anyhow::Error::msg)?;
+            self.ask(checkout, plan)?.map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
 
-    /// Sends a request line to the process. The outer error is the worker's failing, the
-    /// inner one its answer that it does not build this.
-    fn ask(&self, line: &str) -> anyhow::Result<Result<String, String>> {
+    /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
+    /// the inner one its answer that it does not build this.
+    fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, String>> {
         let failed = || match self.ended() {
             Some(how) => format!("the daemon's worker ended ({how})"),
             None => "the daemon's worker did not answer".to_owned(),
         };
-        let mut stream = UnixStream::connect(&self.socket).with_context(failed)?;
-        stream.write_all(line.as_bytes()).with_context(failed)?;
-        stream.write_all(format!("{}\n", self.env).as_bytes()).with_context(failed)?;
+        let mut stream = socket::connect(&self.socket).with_context(failed)?;
+        let mut env = self.env.clone();
+        for (name, value) in &checkout.env {
+            env.set(name, value);
+        }
+        stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
+        stream
+            .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
+            .with_context(failed)?;
         let mut reply = String::new();
         BufReader::new(stream).read_line(&mut reply).with_context(failed)?;
         let reply = reply.trim_end();
@@ -367,19 +400,25 @@ impl Worker {
             let asking: Vec<_> = checkout
                 .programs
                 .iter()
-                .map(|plan| scope.spawn(|| self.ask(&checkout.sync_line(plan))))
+                .map(|plan| scope.spawn(|| self.ask(checkout, plan)))
                 .collect();
             let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
             asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
         });
         match asked.into_iter().collect::<anyhow::Result<Vec<_>>>() {
             Ok(programs) => Reply::Synced { programs },
+            // The worker is gone or stuck, which says nothing of the checkout: the next
+            // build that has nothing to compile has it loaded again.
             Err(why) => {
-                let reason = format!("{why:#}");
-                self.set(&checkout.key, Warmth::Failed(reason.clone()));
-                Reply::Cold { reason }
+                lock(&self.checkouts).remove(&checkout.key);
+                Reply::Cold { reason: format!("{why:#}") }
             }
         }
+    }
+
+    /// Whether it is loading a checkout.
+    fn loading(&self) -> bool {
+        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
     }
 
     fn status(&self) -> WorkerStatus {
@@ -472,12 +511,13 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
     }
-    for stream in served.listener.incoming() {
-        let Ok(stream) = stream else { continue };
+    for (stream, open) in served.incoming() {
         let daemon = daemon.clone();
         std::thread::spawn(move || {
-            // A client that went away has no use for the answer.
-            let _ = daemon.answer(stream);
+            let _open = open;
+            if let Err(why) = daemon.answer(stream) {
+                eprintln!("a request is not answered: {why:#}");
+            }
         });
     }
     Ok(())
@@ -549,6 +589,18 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
+        // What a worker could not load once it can't load again, until cargo builds anew.
+        let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
+            Some(Loaded { generation, warmth: Warmth::Failed(why), .. })
+                if *generation == checkout.generation =>
+            {
+                Some(why.clone())
+            }
+            _ => None,
+        });
+        if let Some(why) = failed {
+            anyhow::bail!(why);
+        }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
             let mut checkouts = lock(&worker.checkouts);
@@ -589,6 +641,11 @@ impl Daemon {
         let Some(idle) = self.idle else { return };
         loop {
             std::thread::sleep(idle.min(Duration::from_secs(1)));
+            // Loading is what the last build asked for: the idle time starts after it.
+            for worker in lock(&self.workers).values().filter(|it| it.loading()) {
+                *lock(&worker.asked) = Instant::now();
+                *lock(&self.asked) = Instant::now();
+            }
             if lock(&self.asked).elapsed() >= idle {
                 eprintln!("idle for {idle:.0?}");
                 self.end();

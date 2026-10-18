@@ -3,6 +3,7 @@
 //! both. The command reads them to know what a program is linked from.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +39,10 @@ pub(crate) struct Record {
     pub(crate) copies: Vec<Copied>,
     /// The copy of the line rustc ran the linker with, for a crate that is linked.
     pub(crate) link_line: Option<PathBuf>,
+    /// The variables cargo set for the unit that say where the build puts its programs:
+    /// `CARGO_BIN_EXE_<name>`, which `env!` reads in an integration test.
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
 }
 
 /// A file rustc wrote and the copy the daemon reads in its place.
@@ -103,17 +108,11 @@ impl Record {
 
     /// The value of `-C name=value`, however cargo spelled it.
     pub(crate) fn codegen(&self, name: &str) -> Option<&str> {
-        self.codegen_each(name).next()
-    }
-
-    /// The value of every `-C name=value`, for a flag that adds to what was said before.
-    pub(crate) fn codegen_each(&self, name: &str) -> impl Iterator<Item = &str> + use<'_> {
-        let name = name.to_owned();
         let joined = self.args.iter().filter_map(|it| it.strip_prefix("-C"));
         let split = self.values("-C");
-        joined.chain(split).filter(|it| !it.is_empty()).filter_map(move |it| {
+        joined.chain(split).filter(|it| !it.is_empty()).find_map(|it| {
             let (key, value) = it.split_once('=').unwrap_or((it, ""));
-            (key == name.as_str()).then_some(value)
+            (key == name).then_some(value)
         })
     }
 
@@ -267,6 +266,18 @@ pub(crate) fn collect_garbage(dir: &Path, used: &[PathBuf]) -> anyhow::Result<()
     Ok(())
 }
 
+/// The variables cargo set for the units of `used` to name the places of the build. One
+/// request has one of each, so two units told different places are cargo's to build.
+pub(crate) fn places_named(used: &[Record]) -> Result<BTreeMap<String, String>, String> {
+    let mut env = BTreeMap::new();
+    for (name, value) in used.iter().flat_map(|it| &it.env) {
+        if env.insert(name.clone(), value.clone()).is_some_and(|was| was != *value) {
+            return Err(format!("two packages of the build are given a different {name}"));
+        }
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +307,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_units_told_different_places_are_not_one_request() {
+        let told = |program: &str| Record {
+            env: [("CARGO_BIN_EXE_cli".to_owned(), program.to_owned())].into(),
+            ..record(&[])
+        };
+        let same = [told("/ws/target/debug/cli"), told("/ws/target/debug/cli")];
+        assert_eq!(places_named(&same).map(|it| it.len()), Ok(1));
+        let apart = [told("/ws/target/debug/cli"), told("/ws/target/debug/deps/cli-1")];
+        assert!(places_named(&apart).is_err_and(|why| why.contains("CARGO_BIN_EXE_cli")));
+    }
+
     fn record(args: &[&str]) -> Record {
         Record {
             id: "a-1".to_owned(),
@@ -306,6 +329,7 @@ mod tests {
             stamp: 1,
             copies: Vec::new(),
             link_line: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -324,13 +348,6 @@ mod tests {
         assert_eq!(unit.codegen("extra-filename"), Some("-1"));
         assert_eq!(unit.codegen("debug-assertions"), Some(""));
         assert_eq!(unit.codegen("lto"), None);
-    }
-
-    #[test]
-    fn a_codegen_flag_given_twice() {
-        let unit = record(&["-Ctarget-feature=+crt-static", "-C", "target-feature=+avx"]);
-        let features: Vec<&str> = unit.codegen_each("target-feature").collect();
-        assert_eq!(features, ["+crt-static", "+avx"]);
     }
 
     #[test]
