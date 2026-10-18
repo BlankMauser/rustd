@@ -1069,6 +1069,10 @@ pub struct MirBody<'db> {
     /// never gets to. They run if control gets there, and what is moved out in them does not
     /// count for the order a value is dropped in.
     pub unreached: Vec<BasicBlockId>,
+    /// The locals that scopes hold, in the order the scopes end: the innermost scope first,
+    /// and within a scope the local declared last first. Of two locals that hold a value at
+    /// once, the earlier one here is dropped first, also by a landing pad.
+    pub scope_ends: Vec<LocalId>,
 }
 
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -1713,8 +1717,10 @@ impl MirBody<'_> {
             closures,
             coroutine: _,
             unreached,
+            scope_ends,
         } = self;
         unreached.shrink_to_fit();
+        scope_ends.shrink_to_fit();
         promoted_locals.shrink_to_fit();
         basic_blocks.shrink_to_fit();
         locals.shrink_to_fit();

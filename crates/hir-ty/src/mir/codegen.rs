@@ -11249,8 +11249,8 @@ fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
         .collect()
 }
 
-/// The locals a body drops whole, in the order of the blocks that drop them when each block
-/// comes after the blocks leading to it.
+/// The temporaries that no place of the body holds on to: the ones an expression made for its
+/// operands.
 fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     let mut temps: rustc_hash::FxHashSet<LocalId> = body.locals.iter().map(|(id, _)| id).collect();
     for &local in body.binding_locals.values().chain(&body.param_locals) {
@@ -11401,6 +11401,8 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
     }
 }
 
+/// The locals a body drops whole, in the order their scopes end: of two that hold a value at
+/// once, the first one here is dropped first.
 fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
     let successors = |id| successors(body, id);
     let mut seen = rustc_hash::FxHashSet::default();
@@ -11428,40 +11430,24 @@ fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId
         });
         assigned == Some(place)
     };
-    let mut order: Vec<(LocalId, BasicBlockId)> = Vec::new();
+    let mut order: Vec<LocalId> = Vec::new();
     for replaced in [false, true] {
         for &id in post_order.iter().rev() {
             if let Some(TerminatorKind::Drop { place, target, .. }) =
                 body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
                 && place.projection.as_ref().as_slice().is_empty()
                 && replaces(place, *target) == replaced
-                && !order.iter().any(|&(local, _)| local == place.local)
+                && !order.contains(&place.local)
             {
-                order.push((place.local, id));
+                order.push(place.local);
             }
         }
     }
-    // A drop that another one is reached from, and not the other way around, is of an outer
-    // scope. Reverse post-order alone can put the exit of a loop before its body.
-    let reached: Vec<rustc_hash::FxHashSet<BasicBlockId>> = order
-        .iter()
-        .map(|&(_, from)| {
-            let mut reached = rustc_hash::FxHashSet::default();
-            let mut pending = successors(from);
-            while let Some(id) = pending.pop() {
-                if reachable.contains(&id) && reached.insert(id) {
-                    pending.extend(successors(id));
-                }
-            }
-            reached
-        })
-        .collect();
-    let later = |at: usize| {
-        let after = |a: usize, b: usize| reached[a].contains(&order[b].1);
-        (0..order.len()).filter(|&other| after(at, other) && !after(other, at)).count()
-    };
-    let mut ranked: Vec<(usize, LocalId)> =
-        order.iter().enumerate().map(|(at, &(local, _))| (later(at), local)).collect();
-    ranked.sort_by_key(|&(later, _)| std::cmp::Reverse(later));
-    ranked.into_iter().map(|(_, local)| local).collect()
+    // The scopes say which of two locals is dropped first. Where the blocks come in the body
+    // does not: the exit of a loop can come before its body. A parameter is in no scope and
+    // outlives them all.
+    let ends: rustc_hash::FxHashMap<LocalId, usize> =
+        body.scope_ends.iter().enumerate().map(|(at, &local)| (local, at)).collect();
+    order.sort_by_key(|local| ends.get(local).copied().unwrap_or(ends.len()));
+    order
 }

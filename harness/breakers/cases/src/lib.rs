@@ -57,6 +57,7 @@ cases![
     unwind_operand_tail,
     unwind_tail_after_local,
     unwind_nested_operands,
+    unwind_nested_loops,
     non_exhaustive_capture,
     allocator_static,
     negative_literal_token,
