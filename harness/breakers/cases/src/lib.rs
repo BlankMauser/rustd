@@ -99,4 +99,5 @@ cases![
     promoted_constructor,
     renamed_variant_pattern,
     alias_under_binder,
+    library_panic_location,
 ];

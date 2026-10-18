@@ -164,6 +164,26 @@ pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
     rest.starts_with(['/', '\\']).then(|| format!("{to}{rest}"))
 }
 
+/// The sources of the standard library: rustc names them where they are on this machine, and
+/// what is stored names them where they were when the library was built, as every machine can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibrarySources {
+    /// The directory they are in here.
+    pub here: String,
+    /// The directory they were built in, `/rustc/<commit>`.
+    pub built_in: String,
+}
+
+impl LibrarySources {
+    fn stored(&self, path: &str) -> Option<String> {
+        moved(path, &self.here, &self.built_in)
+    }
+
+    fn local(&self, path: &str) -> Option<String> {
+        moved(path, &self.built_in, &self.here)
+    }
+}
+
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
@@ -194,6 +214,11 @@ pub trait SymbolResolver {
     /// Where cargo keeps the sources it fetched on this machine, when the crates of the
     /// program tell: [`CARGO_HOME`] stands for it in what is stored.
     fn cargo_home(&self) -> Option<String> {
+        None
+    }
+    /// Where the sources of the standard library are, when the toolchain tells where they
+    /// were built.
+    fn library_sources(&self) -> Option<LibrarySources> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -2391,8 +2416,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
                 .map(|store| {
-                    let home = symbols.cargo_home();
-                    std::sync::Arc::new(cached::Entries::new(store, debugged, home))
+                    let (home, library) = (symbols.cargo_home(), symbols.library_sources());
+                    std::sync::Arc::new(cached::Entries::new(store, debugged, home, library))
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
@@ -2746,7 +2771,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed_requests += 1;
             return;
         };
-        if !entry.leave(self.symbols.cargo_home().as_deref()) {
+        let library = self.symbols.library_sources();
+        if !entry.leave(self.symbols.cargo_home().as_deref(), library.as_ref()) {
             let _: Option<()> = self.kept.unkept("a file under what stands for cargo's directory");
             return;
         }
@@ -2844,6 +2870,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let placed =
             self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
         let home = self.symbols.cargo_home();
+        let library = self.symbols.library_sources();
         let mut datas = Vec::with_capacity(ids.datas.len());
         for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
             if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
@@ -2852,6 +2879,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 if home.as_deref().is_some_and(|home| cached::holds(&blob.bytes, home)) {
                     return self.kept.unkept("data with the place of cargo's directory");
+                }
+                if library.as_ref().is_some_and(|it| cached::holds(&blob.bytes, &it.here)) {
+                    return self.kept.unkept("data with the place of the library's sources");
                 }
             }
             datas.push(match request {

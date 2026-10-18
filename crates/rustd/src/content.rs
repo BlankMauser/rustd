@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use hir_ty::mir::codegen::{CARGO_HOME, ContentId, moved};
+use hir_ty::mir::codegen::{CARGO_HOME, ContentId, LibrarySources, moved};
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -26,6 +26,8 @@ pub(crate) struct Contents {
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
     cargo_home: std::sync::OnceLock<Option<String>>,
+    /// Where the sources of the standard library are and were built, once asked.
+    library: std::sync::OnceLock<Option<LibrarySources>>,
 }
 
 impl Contents {
@@ -61,6 +63,23 @@ impl Contents {
             homes.next().filter(|_| homes.next().is_none())
         };
         self.cargo_home.get_or_init(found).clone()
+    }
+
+    /// Where the standard library's sources are installed, and the `/rustc/<commit>` they
+    /// were built in, when the toolchain they are in tells its commit.
+    pub(crate) fn library_sources(&self, db: &RootDatabase) -> Option<LibrarySources> {
+        const INSTALLED: &str = "lib/rustlib/src/rust";
+        let found = || {
+            let crates = ide_db::base_db::all_crates(db);
+            let of_library = crates.iter().filter(|it| it.data(db).origin.is_lang());
+            let mut roots = of_library.filter_map(|&it| crate::crate_root_file(db, it.into()));
+            let toolchain =
+                roots.find_map(|it| Some(it.to_str()?.split_once(INSTALLED)?.0.to_owned()))?;
+            let commit = crate::rustc_commit(&toolchain)?;
+            let here = format!("{toolchain}{INSTALLED}");
+            Some(LibrarySources { here, built_in: format!("/rustc/{commit}") })
+        };
+        self.library.get_or_init(found).clone()
     }
 
     /// Whether data of a crate hashed here has in it where the checkout or the output of a

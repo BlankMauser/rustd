@@ -260,7 +260,6 @@ struct Resolver<'a> {
     root: PathBuf,
     /// The checkout that the packages which are the same in both are read from.
     base: Option<PathBuf>,
-    rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
     /// Whether the code is to say which lines it is of.
     debug: bool,
@@ -596,20 +595,11 @@ impl SymbolResolver for Resolver<'_> {
                 let db = self.db.clone();
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
-                let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
+                let contents = self.contents;
                 let debug = self.debug;
                 let listed = self.listed;
                 scope.spawn(move || {
-                    let resolver = Resolver {
-                        db: &db,
-                        table,
-                        root,
-                        base,
-                        rustc_commit,
-                        contents,
-                        debug,
-                        listed,
-                    };
+                    let resolver = Resolver { db: &db, table, root, base, contents, debug, listed };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -628,11 +618,6 @@ impl SymbolResolver for Resolver<'_> {
         let source_root = self.db.file_source_root(file).source_root_id(self.db);
         let source_root = self.db.source_root(source_root).source_root(self.db);
         let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-        if let Some((toolchain, file)) = path.split_once("lib/rustlib/src/rust/")
-            && let Some(commit) = self.rustc_commit.get_or_init(|| rustc_commit(toolchain))
-        {
-            return Some(format!("/rustc/{commit}/{file}"));
-        }
         let relative = self.inside(Path::new(&path));
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
     }
@@ -709,6 +694,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn cargo_home(&self) -> Option<String> {
         self.contents.cargo_home(self.db)
+    }
+
+    fn library_sources(&self) -> Option<hir_ty::mir::codegen::LibrarySources> {
+        self.contents.library_sources(self.db)
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -1795,16 +1784,7 @@ fn build(
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;
-    let resolver = Resolver {
-        db,
-        table,
-        root,
-        base,
-        rustc_commit: Default::default(),
-        contents,
-        debug,
-        listed,
-    };
+    let resolver = Resolver { db, table, root, base, contents, debug, listed };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates

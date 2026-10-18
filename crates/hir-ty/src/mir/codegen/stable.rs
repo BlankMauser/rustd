@@ -53,6 +53,7 @@ pub(super) struct StableNames<'a, 'db> {
     by_content: bool,
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
+    library: Option<super::LibrarySources>,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
     /// The crates by what a name starts with, and what the ones asked about declare.
     crates: RefCell<Option<FxHashMap<String, Vec<Crate>>>>,
@@ -74,6 +75,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             owned,
             by_content,
             cargo_home: symbols.cargo_home(),
+            library: symbols.library_sources(),
             files: RefCell::default(),
             crates: RefCell::default(),
             listed: RefCell::default(),
@@ -248,10 +250,13 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
-    /// The name of a file as every machine has it: one that cargo fetched is under
-    /// [`super::CARGO_HOME`] whoever fetched it. `None` for a file that is already named so
-    /// and is not one of those.
+    /// The name of a file as every machine has it: one of the standard library is where it
+    /// was built, and one that cargo fetched is under [`super::CARGO_HOME`] whoever fetched
+    /// it. `None` for a file that is already named so and is not one of those.
     fn stored(&self, path: String) -> Option<String> {
+        if let Some(built) = self.library.as_ref().and_then(|it| it.stored(&path)) {
+            return Some(built);
+        }
         let home = self.cargo_home.as_deref();
         if home == Some(super::CARGO_HOME) {
             return Some(path);
