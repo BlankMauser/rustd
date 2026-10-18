@@ -83,6 +83,7 @@ use super::{
 mod asm;
 mod backend;
 pub use backend::Backend;
+use backend::Step;
 mod cached;
 mod debuginfo;
 mod float_pair;
@@ -95,6 +96,7 @@ pub use home::body_file;
 mod llvm;
 mod patch;
 mod stable;
+pub use stable::block_place;
 mod store;
 mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
@@ -182,6 +184,10 @@ pub trait SymbolResolver {
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
         false
+    }
+    /// Whether rustc compiled the crate, so that what is skipped of it is in the program.
+    fn rustc_built(&self, _krate: Crate) -> bool {
+        true
     }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
@@ -441,8 +447,16 @@ impl CodegenUnit {
             !roots.on_demand.is_empty(),
         );
         let mut rounds = 0;
+        let mut discarded = std::time::Duration::ZERO;
         loop {
             rounds += 1;
+            let round = stdx::time::Instant::now();
+            let mut start_over = |why: &str| {
+                discarded += round.elapsed();
+                if std::env::var_os("RUSTD_STATS").is_some() {
+                    eprintln!("round {rounds}: {:.1?}, started over: {why}", round.elapsed());
+                }
+            };
             let mut cg = ObjectCodegen::new(
                 db,
                 symbols,
@@ -471,7 +485,9 @@ impl CodegenUnit {
                     .filter(|root| !denied.contains(root) && !left.contains(root))
                     .filter(|&root| symbols.function(root).is_some())
                     .collect();
+                let start = stdx::time::Instant::now();
                 symbols.in_parallel(ours.len(), &|db, _, at| _ = compiled_root(db, ours[at]));
+                cg.phases.compile += start.elapsed();
                 while let Some(&root) = queue.get(next) {
                     next += 1;
                     let result = if denied.contains(&root) {
@@ -507,15 +523,16 @@ impl CodegenUnit {
                 }
             }
             if cg.misfit {
+                start_over("an entry of the store did not fit");
                 rejected.extend(failed);
                 continue;
             }
             let fallback_start = stdx::time::Instant::now();
-            let from_rustc = skipped.iter().any(|(_, e)| !matches!(e, CodegenError::NoSymbol));
+            let from_rustc: FxHashSet<FunctionId> = left_to_rustc(db, symbols, &skipped).collect();
             // A function left to rustc keeps using rustc's copy of a private static, so we
             // can't bring our own.
             let mut split = false;
-            let found = TheirStatics::of(db, left_to_rustc(&skipped));
+            let found = TheirStatics::of(db, from_rustc.iter().copied());
             split |= found.statics.iter().any(|it| cg.statics.contains_key(it));
             own_statics.theirs.extend(found.statics);
             let before = own_statics.unknown.len();
@@ -524,19 +541,18 @@ impl CodegenUnit {
                 split |= cg.statics.keys().any(|&it| !own_statics.owns(db, it));
             }
             if split {
+                start_over("a static is used by a function left to rustc");
                 rejected.extend(failed);
                 continue;
             }
-            if failed.is_empty() && from_rustc {
+            if failed.is_empty() && !from_rustc.is_empty() {
                 let mut theirs = Some(FxHashSet::default());
-                for (root, e) in &skipped {
-                    if !matches!(e, CodegenError::NoSymbol) {
-                        let blocks = async_blocks(db, *root).clone();
-                        theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
-                            all.extend(blocks);
-                            all
-                        });
-                    }
+                for root in &from_rustc {
+                    let blocks = async_blocks(db, *root).clone();
+                    theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
+                        all.extend(blocks);
+                        all
+                    });
                 }
                 let before = left.len();
                 left.extend(compiled.iter().map(|it| it.0).filter(|&root| {
@@ -547,6 +563,7 @@ impl CodegenUnit {
                     }
                 }));
                 if left.len() != before {
+                    start_over("an `async` block is shared with a function left to rustc");
                     continue;
                 }
             }
@@ -565,14 +582,13 @@ impl CodegenUnit {
                         eprintln!("without a stable name: {misses:?}");
                     }
                 }
-                backend::Tally::global().report();
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
-                    phases: Phases { fallback: fallback_start.elapsed(), ..cg.phases },
+                    phases: Phases { fallback: fallback_start.elapsed(), discarded, ..cg.phases },
                     rounds,
                     patched: None,
                     declined,
@@ -597,6 +613,7 @@ impl CodegenUnit {
                 let start = stdx::time::Instant::now();
                 let object = cg.finish()?;
                 stats.phases.object = start.elapsed();
+                backend::Tally::global().report();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
                 let patch = if patching { Some(patch::empty_object()?) } else { None };
                 return Ok(CodegenUnit {
@@ -607,6 +624,8 @@ impl CodegenUnit {
                     instances,
                 });
             }
+            let first = failed.first().map_or("", |it| it.1.why.as_str());
+            start_over(&format!("{} instances did not compile, the first: {first}", failed.len()));
             cg.poison_callers(&mut failed);
             rejected.extend(failed);
         }
@@ -845,6 +864,8 @@ pub struct Phases {
     pub object: std::time::Duration,
     /// Working out what the functions left to rustc keep the rest from compiling.
     pub fallback: std::time::Duration,
+    /// The rounds before the last, whose object was not kept.
+    pub discarded: std::time::Duration,
 }
 
 /// A function with concrete generic arguments that we compile ourselves.
@@ -1514,19 +1535,23 @@ fn instance_body<'db>(
     static LEAN: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("RUSTD_LEAN").is_none_or(|it| it != "0"));
     let args = instance.args.clone();
+    let tally = backend::Tally::global();
+    let filled = |body, args: &StoredGenericArgs, env: &StoredParamEnvAndCrate| {
+        tally.step(Step::Monomorphize, || monomorphized(db, body, args, env).map(Cow::Owned))
+    };
     let body = match instance.def {
-        InstanceDef::Fn(func) if *LEAN => db
-            .mir_body(func.into())
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+        InstanceDef::Fn(func) if *LEAN => tally
+            .step(Step::Mir, || db.mir_body(func.into()))
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Closure(id) if *LEAN => db
             .mir_body_for_closure(InternedClosureId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Coroutine(id) if *LEAN => db
             .mir_body_for_coroutine(InternedCoroutineId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::CoroutineByMove(id) if *LEAN => db
             .mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
-            .and_then(|it| monomorphized(db, it, &args, &env).map(Cow::Owned)),
+            .and_then(|it| filled(it, &args, &env)),
         InstanceDef::Fn(func) => {
             db.monomorphized_mir_body(func.into(), args, env).map(Cow::Borrowed)
         }
@@ -1698,9 +1723,18 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
     Some(found)
 }
 
-/// The functions skipped that rustc has a copy of.
-fn left_to_rustc(skipped: &[(FunctionId, CodegenError)]) -> impl Iterator<Item = FunctionId> + '_ {
-    skipped.iter().filter(|(_, e)| !matches!(e, CodegenError::NoSymbol)).map(|it| it.0)
+/// The functions skipped that rustc has a copy of. One of a crate rustc built nothing of has
+/// none: it is missing from the program, and no code of rustc's uses a static in its place.
+fn left_to_rustc<'a>(
+    db: &'a dyn HirDatabase,
+    symbols: &'a dyn SymbolResolver,
+    skipped: &'a [(FunctionId, CodegenError)],
+) -> impl Iterator<Item = FunctionId> + 'a {
+    skipped
+        .iter()
+        .filter(|(_, e)| !matches!(e, CodegenError::NoSymbol))
+        .map(|it| it.0)
+        .filter(|&func| symbols.rustc_built(func.krate(db)))
 }
 
 /// The statics that functions left to rustc refer to, themselves or through the instances they
@@ -2035,6 +2069,17 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The symbol a static of an `extern` block links to.
+fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+    let signature = StaticSignature::of(db, id);
+    if !signature.flags.contains(StaticFlags::EXTERN) {
+        return None;
+    }
+    let name =
+        AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone());
+    Some(name.as_str().to_owned())
+}
+
 /// Builds the IR of one function and runs Cranelift on it.
 fn compile<'db>(
     db: &'db dyn HirDatabase,
@@ -2046,7 +2091,8 @@ fn compile<'db>(
 ) -> Result<CompiledFunction> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
-    let mut ctx = build(&mut cg, env, body, tracked, fill)?;
+    let tally = backend::Tally::global();
+    let mut ctx = tally.step(Step::Translate, || build(&mut cg, env, body, tracked, fill))?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
@@ -2264,7 +2310,9 @@ fn root_body<'db>(
     func: FunctionId,
 ) -> Result<(&'db MirBody<'db>, ParamEnvAndCrate<'db>)> {
     let owner: InferBodyId<'db> = func.into();
-    let body = db.mir_body(owner);
+    let tally = backend::Tally::global();
+    tally.step(Step::Infer, || _ = InferenceResult::of(db, DefWithBodyId::from(func)));
+    let body = tally.step(Step::Mir, || db.mir_body(owner));
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
     let krate = owner.module(db).krate(db);
     // Not the function's own bounds: with nothing generic they are bounds on concrete
@@ -2278,7 +2326,9 @@ fn root_body<'db>(
         )
     });
     let body = if opaque {
-        db.monomorphized_mir_body(owner, GenericArgs::new_from_slice(&[]).store(), env.store())
+        let args = GenericArgs::new_from_slice(&[]).store();
+        tally
+            .step(Step::Monomorphize, || db.monomorphized_mir_body(owner, args, env.store()))
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
     } else {
         body
@@ -2379,7 +2429,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         if let Some(debug) = self.debug {
-            debug.emit(&mut product).map_err(CodegenError::Backend)?;
+            backend::Tally::global()
+                .step(Step::Describe, || debug.emit(&mut product))
+                .map_err(CodegenError::Backend)?;
         }
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
@@ -2636,7 +2688,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             _ => None,
         };
         let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
-        self.keep(instance, compiled, &ids, debug);
+        let tally = backend::Tally::global();
+        tally.step(Step::StoreWrite, || self.keep(instance, compiled, &ids, debug));
         Ok(())
     }
 
@@ -2651,6 +2704,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         declared: Option<FunctionId>,
     ) -> Option<FunctionDebug> {
         self.debug.as_ref()?;
+        let start = stdx::time::Instant::now();
         if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
             debug.declared = Some(debug.place(file, line, column));
         }
@@ -2671,6 +2725,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
+        backend::Tally::global().add(Step::Describe, start.elapsed());
         Some(debug)
     }
 
@@ -2961,7 +3016,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
         if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
-            debug.add_function(id, code.bytes.len() as u32, of);
+            let len = code.bytes.len() as u32;
+            backend::Tally::global().step(Step::Describe, || debug.add_function(id, len, of));
         }
         self.bodies += 1;
         self.kept.found += 1;
@@ -3237,6 +3293,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 self.want_requested(&compiled.requests);
             }
+            return Ok(data);
+        }
+        if let Some(symbol) = static_link_name(db, id) {
+            let thread_local = is_thread_local(db, id);
+            let data = self.module.declare_data(&symbol, Linkage::Import, false, thread_local)?;
+            self.imported_statics.insert(id, data);
             return Ok(data);
         }
         let node = patch::Node::Static(id);
@@ -7576,8 +7638,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
-                let bits = self.builder.ins().iconst(r_scalar.ty, i64::from(scalar.ty.bits()));
-                let overflow = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let (r, overflow) = self.shift_amount(r, scalar.ty.bits());
                 let (shift_op, value) = match (op, signed) {
                     (BinOp::Shl, _) => (OverflowOp::Shl, self.builder.ins().ishl(l, r)),
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
@@ -7588,6 +7649,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             BinOp::Offset => unsupported!("pointer offset"),
         })
+    }
+
+    /// The amount to shift a value of `bits` bits by, no wider than a register, and whether
+    /// `amount` is out of range: not less than `bits`, read as unsigned.
+    fn shift_amount(&mut self, amount: Value, bits: u32) -> (Value, Value) {
+        let too_far = IntCC::UnsignedGreaterThanOrEqual;
+        if self.builder.func.dfg.value_type(amount) != types::I128 {
+            let overflow = self.builder.ins().icmp_imm(too_far, amount, i64::from(bits));
+            return (amount, overflow);
+        }
+        let (low, high) = self.builder.ins().isplit(amount);
+        let too_far = self.builder.ins().icmp_imm(too_far, low, i64::from(bits));
+        let wide = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
+        (low, self.builder.ins().bor(too_far, wide))
     }
 
     fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
@@ -8099,17 +8174,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 break;
             }
             by_ref = Some((addr, ty, mutability));
-            if let TyKind::Dynamic(bounds, _) = inner.kind() {
-                // Which method is in the vtable depends on the object's trait, not on the
-                // trait the call was written against.
-                let lang_items = self.interner.lang_items();
-                let principal = bounds.principal_def_id().map(|it| it.0);
-                let method = match principal {
-                    Some(it) if Some(it) == lang_items.Fn => lang_items.Fn_call,
-                    Some(it) if Some(it) == lang_items.FnMut => lang_items.FnMut_call_mut,
-                    _ => None,
-                };
-                let Some(method) = method else {
+            if let TyKind::Dynamic(..) = inner.kind() {
+                let Some(method) = self.fn_method_of_object(inner) else {
                     unsupported!("Fn-trait call on {inner:?}");
                 };
                 return self.call_virtual(method, inner, addr, ty, &values, dst, dst_ty);
@@ -8331,13 +8397,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.emit_call(Callee::Pointer(pointer, ExternAbi::Rust, None), &values, dst, dst_ty)
     }
 
+    /// The method a call through a reference to `dyn_ty` goes to: `Fn::call` where the
+    /// object's trait is `Fn` or has it above it, `FnMut::call_mut` likewise. Which one is in
+    /// the vtable depends on the object's trait, not on the trait the call was written against.
+    fn fn_method_of_object(&self, dyn_ty: Ty<'db>) -> Option<FunctionId> {
+        let lang_items = self.interner.lang_items();
+        let vtable = VtableLayout::of(self.interner, self.principal(dyn_ty, dyn_ty)?);
+        [lang_items.Fn_call, lang_items.FnMut_call_mut]
+            .into_iter()
+            .flatten()
+            .find(|&method| vtable.method(method).is_some())
+    }
+
     /// The principal trait of `dyn_ty`, as implemented by `self_ty`.
     fn principal(&self, dyn_ty: Ty<'db>, self_ty: Ty<'db>) -> Option<TraitRef<'db>> {
         let TyKind::Dynamic(bounds, _) = dyn_ty.kind() else {
             return None;
         };
         let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
-        Some(self.interner.instantiate_bound_regions_with_erased(principal))
+        let principal = self.interner.instantiate_bound_regions_with_erased(principal);
+        // No lifetime tells one vtable from another.
+        Some(rustc_type_ir::fold_regions(self.interner, principal, |_, _| {
+            Region::new_erased(self.interner)
+        }))
     }
 
     /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a
@@ -9676,9 +9758,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             (
-                "simd_and" | "simd_or" | "simd_xor" | "simd_add" | "simd_sub" | "simd_mul"
-                | "simd_shl" | "simd_shr" | "simd_eq" | "simd_ne" | "simd_lt" | "simd_le"
-                | "simd_gt" | "simd_ge",
+                "simd_and"
+                | "simd_or"
+                | "simd_xor"
+                | "simd_add"
+                | "simd_sub"
+                | "simd_mul"
+                | "simd_shl"
+                | "simd_shr"
+                | "simd_eq"
+                | "simd_ne"
+                | "simd_lt"
+                | "simd_le"
+                | "simd_gt"
+                | "simd_ge"
+                | "simd_div"
+                | "simd_saturating_add"
+                | "simd_saturating_sub",
                 [lhs, rhs],
             ) => {
                 let (l, ty) = self.operand(lhs)?;
@@ -9686,6 +9782,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (lane, count) = self.simd_lanes(ty)?;
                 let (out, _) = self.simd_lanes(dst_ty)?;
                 let signed = lane.signed;
+                if lane.ty.is_float() {
+                    self.simd_float_lanes(name, (l, r), dst, lane, out, count)?;
+                    return Ok(Intrinsic::Inline);
+                }
+                if name == "simd_div" {
+                    unsupported!("`simd_div` of integers");
+                }
                 for i in 0..count {
                     let offset = (i * lane.ty.bytes() as u64) as i32;
                     let a = self.builder.ins().load(lane.ty, MEM, l, offset);
@@ -9723,6 +9826,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         (None, "simd_shl") => self.builder.ins().ishl(a, b),
                         (None, "simd_shr") if signed => self.builder.ins().sshr(a, b),
                         (None, "simd_shr") => self.builder.ins().ushr(a, b),
+                        (None, "simd_saturating_add") => self.saturating(true, a, b, lane),
+                        (None, "simd_saturating_sub") => self.saturating(false, a, b, lane),
                         (None, _) => self.builder.ins().imul(a, b),
                     };
                     self.builder.ins().store(MEM, value, dst, (i * out.ty.bytes() as u64) as i32);
@@ -9852,6 +9957,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.int_cast(bits, from, to);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            ("simd_reduce_and" | "simd_reduce_or" | "simd_reduce_xor", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (lane, count) = self.simd_lanes(ty)?;
+                if lane.ty.is_float() {
+                    unsupported!("`{name}` of floats");
+                }
+                let mut acc = self.builder.ins().load(lane.ty, MEM, src, 0);
+                for i in 1..count {
+                    let offset = (i * lane.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(lane.ty, MEM, src, offset);
+                    acc = match name {
+                        "simd_reduce_and" => self.builder.ins().band(acc, value),
+                        "simd_reduce_or" => self.builder.ins().bor(acc, value),
+                        _ => self.builder.ins().bxor(acc, value),
+                    };
+                }
+                self.builder.ins().store(MEM, acc, dst, 0);
+            }
             ("simd_reduce_all" | "simd_reduce_any", [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 let (lane, count) = self.simd_lanes(ty)?;
@@ -9939,6 +10062,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     "fmul_fast" | "fmul_algebraic" => self.builder.ins().fmul(l, r),
                     _ => self.builder.ins().fdiv(l, r),
                 };
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("powif32" | "powif64", [base, power]) => {
+                let (base, float) = self.load_scalar(base)?;
+                let (power, _) = self.load_scalar(power)?;
+                // compiler-builtins multiplies as LLVM's `llvm.powi` is lowered to do.
+                let name = if float.ty == types::F32 { "__powisf2" } else { "__powidf2" };
+                let value =
+                    self.builtin(name, &[float.ty, types::I32], float.ty, &[base, power])?;
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("fmaf32" | "fmaf64" | "fmuladdf32" | "fmuladdf64", [a, b, c]) => {
@@ -10077,6 +10209,63 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Intrinsic::Inline)
     }
 
+    /// The signed `wide` lanes of two vectors, each saturated to half its width, signed or
+    /// not: every 16 bytes of the result are those of `a` and then those of `b`.
+    fn pack_lanes(
+        &mut self,
+        a: &Operand,
+        b: &Operand,
+        dst: Value,
+        wide: Type,
+        signed: bool,
+    ) -> Result<()> {
+        let (a, ty) = self.operand(a)?;
+        let (b, _) = self.operand(b)?;
+        let narrow = wide.half_width().expect("a lane of 16 or 32 bits");
+        let bits = narrow.bits();
+        let (least, most) = if signed {
+            (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+        } else {
+            (0, (1i64 << bits) - 1)
+        };
+        let (wide_bytes, narrow_bytes) = (wide.bytes() as i32, narrow.bytes() as i32);
+        let per_half = 8 / wide_bytes;
+        for half in (0..self.layout(ty)?.size.bytes() as i32).step_by(16) {
+            for (from, src) in [a, b].into_iter().enumerate() {
+                for lane in 0..per_half {
+                    let value = self.builder.ins().load(wide, MEM, src, half + lane * wide_bytes);
+                    let most = self.builder.ins().iconst(wide, most);
+                    let least = self.builder.ins().iconst(wide, least);
+                    let value = self.builder.ins().smin(value, most);
+                    let value = self.builder.ins().smax(value, least);
+                    let value = self.builder.ins().ireduce(narrow, value);
+                    let at = half + (from as i32 * per_half + lane) * narrow_bytes;
+                    self.builder.ins().store(MEM, value, dst, at);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Calls a function of one instruction on two vectors, with where it reads a third
+    /// operand and writes its result.
+    fn vector_assembly(
+        &mut self,
+        text: String,
+        a: &Operand,
+        b: &Operand,
+        dst: Value,
+    ) -> Result<()> {
+        let (a, _) = self.operand(a)?;
+        let (b, _) = self.operand(b)?;
+        let mut sig = self.cg.make_signature();
+        sig.params.extend([AbiParam::new(ptr()); 3]);
+        let callee = self.cg.assembly(text, &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &[a, b, dst]);
+        Ok(())
+    }
+
     /// A function `core::arch` declares as `llvm.{name}`: something LLVM implements, with no
     /// body anywhere.
     fn llvm_intrinsic(
@@ -10108,6 +10297,118 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let value = self.builder.ins().select(cleared, zero, found);
                     self.builder.ins().store(MEM, value, dst, i as i32);
                 }
+            }
+            ("x86.avx2.permd" | "x86.avx2.permps", [table, indices]) => {
+                let (table, _) = self.operand(table)?;
+                let (indices, _) = self.operand(indices)?;
+                // Each of the eight lanes is the lane its index names, by its low three bits.
+                let lanes: Vec<Value> = (0..8)
+                    .map(|lane| {
+                        let index = self.builder.ins().load(types::I32, MEM, indices, lane * 4);
+                        let slot = self.builder.ins().band_imm(index, 7);
+                        let slot = self.builder.ins().uextend(ptr(), slot);
+                        let offset = self.builder.ins().ishl_imm(slot, 2);
+                        let addr = self.builder.ins().iadd(table, offset);
+                        self.builder.ins().load(types::I32, MEM, addr, 0)
+                    })
+                    .collect();
+                for (lane, value) in lanes.into_iter().enumerate() {
+                    self.builder.ins().store(MEM, value, dst, lane as i32 * 4);
+                }
+            }
+            ("x86.sse2.psad.bw" | "x86.avx2.psad.bw" | "x86.avx512.psad.bw.512", [a, b]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 64 bits are the sum of how far apart eight bytes of the two are.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(8) {
+                    let mut sum = self.builder.ins().iconst(types::I64, 0);
+                    for byte in lane..lane + 8 {
+                        let l = self.builder.ins().load(types::I8, MEM, a, byte);
+                        let r = self.builder.ins().load(types::I8, MEM, b, byte);
+                        let more = self.builder.ins().umax(l, r);
+                        let less = self.builder.ins().umin(l, r);
+                        let apart = self.builder.ins().isub(more, less);
+                        let apart = self.builder.ins().uextend(types::I64, apart);
+                        sum = self.builder.ins().iadd(sum, apart);
+                    }
+                    self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            ("x86.sse2.pmadd.wd" | "x86.avx2.pmadd.wd" | "x86.avx512.pmaddw.d.512", [a, b]) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 32 bits are the sum of the products of two pairs of signed words.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(4) {
+                    let mut sum = self.builder.ins().iconst(types::I32, 0);
+                    for word in [lane, lane + 2] {
+                        let l = self.builder.ins().load(types::I16, MEM, a, word);
+                        let r = self.builder.ins().load(types::I16, MEM, b, word);
+                        let l = self.builder.ins().sextend(types::I32, l);
+                        let r = self.builder.ins().sextend(types::I32, r);
+                        let product = self.builder.ins().imul(l, r);
+                        sum = self.builder.ins().iadd(sum, product);
+                    }
+                    self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            (
+                "x86.ssse3.pmadd.ub.sw.128" | "x86.avx2.pmadd.ub.sw" | "x86.avx512.pmaddubs.w.512",
+                [a, b],
+            ) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                // Each 16 bits are the saturated sum of two products: an unsigned byte of
+                // `a` by a signed one of `b`.
+                for lane in (0..self.layout(ty)?.size.bytes() as i32).step_by(2) {
+                    let mut sum = self.builder.ins().iconst(types::I32, 0);
+                    for byte in [lane, lane + 1] {
+                        let l = self.builder.ins().load(types::I8, MEM, a, byte);
+                        let r = self.builder.ins().load(types::I8, MEM, b, byte);
+                        let l = self.builder.ins().uextend(types::I32, l);
+                        let r = self.builder.ins().sextend(types::I32, r);
+                        let product = self.builder.ins().imul(l, r);
+                        sum = self.builder.ins().iadd(sum, product);
+                    }
+                    let most = self.builder.ins().iconst(types::I32, i64::from(i16::MAX));
+                    let least = self.builder.ins().iconst(types::I32, i64::from(i16::MIN));
+                    let sum = self.builder.ins().smin(sum, most);
+                    let sum = self.builder.ins().smax(sum, least);
+                    let sum = self.builder.ins().ireduce(types::I16, sum);
+                    self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            ("x86.sse2.packsswb.128" | "x86.avx2.packsswb" | "x86.avx512.packsswb.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I16, true)?
+            }
+            ("x86.sse2.packuswb.128" | "x86.avx2.packuswb" | "x86.avx512.packuswb.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I16, false)?
+            }
+            ("x86.sse2.packssdw.128" | "x86.avx2.packssdw" | "x86.avx512.packssdw.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I32, true)?
+            }
+            ("x86.sse41.packusdw" | "x86.avx2.packusdw" | "x86.avx512.packusdw.512", [a, b]) => {
+                self.pack_lanes(a, b, dst, types::I32, false)?
+            }
+            (
+                "x86.sha1msg1" | "x86.sha1msg2" | "x86.sha1nexte" | "x86.sha256msg1"
+                | "x86.sha256msg2",
+                [a, b],
+            ) => {
+                let instruction = format!("{} xmm0, xmm1", name.trim_start_matches("x86."));
+                self.vector_assembly(asm::vector_instruction(&instruction, "xmm0"), a, b, dst)?;
+            }
+            ("x86.sha256rnds2", [a, b, k]) => {
+                let (k, ty) = self.operand(k)?;
+                let size = self.layout(ty)?.size;
+                self.copy(dst, k, size);
+                // The instruction takes its third vector in `xmm0`.
+                let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
+                self.vector_assembly(asm::vector_instruction(rounds, "xmm3"), a, b, dst)?;
+            }
+            ("x86.sha1rnds4", [a, b, function]) => {
+                let (function, _) = self.load_scalar(function)?;
+                self.builder.ins().store(MEM, function, dst, 0);
+                self.vector_assembly(asm::sha1rnds4(), a, b, dst)?;
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
@@ -10174,6 +10475,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, high, dst, lane + 8);
                 }
             }
+            // A hint to the cache, which the program behaves the same without.
+            ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
             _ => unsupported!("LLVM intrinsic `{name}`"),
         }
         Ok(())
@@ -10264,6 +10567,48 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let memcmp = self.cg.declare_func_in_func(memcmp, self.builder.func);
         let call = self.builder.ins().call(memcmp, &[a, b, len]);
         Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// A vector operation of two operands on lanes that are floats, one lane at a time. A
+    /// comparison is all ones in the lanes where it holds, in integers as wide as the floats.
+    fn simd_float_lanes(
+        &mut self,
+        name: &str,
+        (l, r): (Value, Value),
+        dst: Value,
+        lane: AbiScalar,
+        out: AbiScalar,
+        count: u64,
+    ) -> Result<()> {
+        let cc = match name {
+            "simd_eq" => Some(FloatCC::Equal),
+            "simd_ne" => Some(FloatCC::NotEqual),
+            "simd_lt" => Some(FloatCC::LessThan),
+            "simd_le" => Some(FloatCC::LessThanOrEqual),
+            "simd_gt" => Some(FloatCC::GreaterThan),
+            "simd_ge" => Some(FloatCC::GreaterThanOrEqual),
+            _ => None,
+        };
+        for i in 0..count {
+            let offset = (i * lane.ty.bytes() as u64) as i32;
+            let a = self.builder.ins().load(lane.ty, MEM, l, offset);
+            let b = self.builder.ins().load(lane.ty, MEM, r, offset);
+            let value = match (cc, name) {
+                (Some(cc), _) => {
+                    let flag = self.builder.ins().fcmp(cc, a, b);
+                    let flag = self.builder.ins().uextend(types::I64, flag);
+                    let mask = self.builder.ins().ineg(flag);
+                    if out.ty.bits() < 64 { self.builder.ins().ireduce(out.ty, mask) } else { mask }
+                }
+                (None, "simd_add") => self.builder.ins().fadd(a, b),
+                (None, "simd_sub") => self.builder.ins().fsub(a, b),
+                (None, "simd_mul") => self.builder.ins().fmul(a, b),
+                (None, "simd_div") => self.builder.ins().fdiv(a, b),
+                (None, _) => unsupported!("`{name}` of floats"),
+            };
+            self.builder.ins().store(MEM, value, dst, (i * out.ty.bytes() as u64) as i32);
+        }
+        Ok(())
     }
 
     fn saturating(&mut self, add: bool, l: Value, r: Value, scalar: AbiScalar) -> Value {
@@ -10911,6 +11256,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                 }
             }
+            // `NonNull` holds its pointer as a pattern type.
+            TyKind::Pat(base, _) => self.branch_unless_equal(l, r, metas, base, differ),
+            // A pointer to something unsized is equal in its address and its metadata.
+            TyKind::RawPtr(pointee, _) if self.is_unsized(pointee) => {
+                for offset in [0, meta_at()] {
+                    let l = self.builder.ins().load(ptr(), MEM, l, offset);
+                    let r = self.builder.ins().load(ptr(), MEM, r, offset);
+                    let same = self.builder.ins().icmp(IntCC::Equal, l, r);
+                    self.branch_unless(same, differ);
+                }
+                Ok(())
+            }
             _ => {
                 let scalar = self.scalar_of(ty)?;
                 let l = self.builder.ins().load(scalar.ty, MEM, l, 0);
@@ -11332,8 +11689,8 @@ fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
         .collect()
 }
 
-/// The locals a body drops whole, in the order of the blocks that drop them when each block
-/// comes after the blocks leading to it.
+/// The temporaries that no place of the body holds on to: the ones an expression made for its
+/// operands.
 fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
     let mut temps: rustc_hash::FxHashSet<LocalId> = body.locals.iter().map(|(id, _)| id).collect();
     for &local in body.binding_locals.values().chain(&body.param_locals) {
@@ -11484,6 +11841,8 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
     }
 }
 
+/// The locals a body drops whole, in the order their scopes end: of two that hold a value at
+/// once, the first one here is dropped first.
 fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
     let successors = |id| successors(body, id);
     let mut seen = rustc_hash::FxHashSet::default();
@@ -11511,40 +11870,24 @@ fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId
         });
         assigned == Some(place)
     };
-    let mut order: Vec<(LocalId, BasicBlockId)> = Vec::new();
+    let mut order: Vec<LocalId> = Vec::new();
     for replaced in [false, true] {
         for &id in post_order.iter().rev() {
             if let Some(TerminatorKind::Drop { place, target, .. }) =
                 body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
                 && place.projection.as_ref().as_slice().is_empty()
                 && replaces(place, *target) == replaced
-                && !order.iter().any(|&(local, _)| local == place.local)
+                && !order.contains(&place.local)
             {
-                order.push((place.local, id));
+                order.push(place.local);
             }
         }
     }
-    // A drop that another one is reached from, and not the other way around, is of an outer
-    // scope. Reverse post-order alone can put the exit of a loop before its body.
-    let reached: Vec<rustc_hash::FxHashSet<BasicBlockId>> = order
-        .iter()
-        .map(|&(_, from)| {
-            let mut reached = rustc_hash::FxHashSet::default();
-            let mut pending = successors(from);
-            while let Some(id) = pending.pop() {
-                if reachable.contains(&id) && reached.insert(id) {
-                    pending.extend(successors(id));
-                }
-            }
-            reached
-        })
-        .collect();
-    let later = |at: usize| {
-        let after = |a: usize, b: usize| reached[a].contains(&order[b].1);
-        (0..order.len()).filter(|&other| after(at, other) && !after(other, at)).count()
-    };
-    let mut ranked: Vec<(usize, LocalId)> =
-        order.iter().enumerate().map(|(at, &(local, _))| (later(at), local)).collect();
-    ranked.sort_by_key(|&(later, _)| std::cmp::Reverse(later));
-    ranked.into_iter().map(|(_, local)| local).collect()
+    // The scopes say which of two locals is dropped first. Where the blocks come in the body
+    // does not: the exit of a loop can come before its body. A parameter is in no scope and
+    // outlives them all.
+    let ends: rustc_hash::FxHashMap<LocalId, usize> =
+        body.scope_ends.iter().enumerate().map(|(at, &local)| (local, at)).collect();
+    order.sort_by_key(|local| ends.get(local).copied().unwrap_or(ends.len()));
+    order
 }

@@ -168,7 +168,8 @@ Always cargo's, in both modes:
   passes them to cargo, and under plain cargo the wrapper records and runs rustc.
 - A toolchain other than 1.99.0, or one without the `rust-src` component (the daemon
   compiles the standard library's generic code from source).
-- A target that is not ELF, or several `--target` in one build.
+- A target whose link line is neither an ELF `cc` line nor a `link.exe` line, or several
+  `--target` in one build.
 
 A whole `cargo rustd` invocation is cargo's when it has `--message-format`, `--build-plan`,
 `--unit-graph`, a `-Z` flag or `--exclude`, when `RUSTC_WORKSPACE_WRAPPER` names another
@@ -637,11 +638,13 @@ request said eight; the file numbers nine, and all nine are answered).
 6. `private_dir` checks only the last component. Fixed: every directory above is checked
    (the user's or root's, not world-writable unless sticky). Test:
    `a_directory_others_can_swap_is_refused`.
-7. Windows. Not fixed in code, and said here: on Windows `private_dir`, the peer check
-   and `private_file`'s mode do nothing, which is only right under the user's profile. A
-   `RUSTD_HOME` or `--socket` outside it is not refused. What has to be done is in "macOS
-   and Windows" below; until then `cargo rustd` on Windows is not to be used with either
-   pointing outside `%LOCALAPPDATA%`.
+7. Windows. Fixed by the Windows session (`socket/windows.rs`, merged from
+   `rustd-collate`), not by me and not run by me: the daemon's directory is refused unless
+   the user owns it and its access control list admits nobody but the user, SYSTEM and
+   Administrators (`GetNamedSecurityInfoW` in place of the mode check); a directory the
+   daemon creates gets such a list, protected from inheritance, and so does the socket.
+   AF_UNIX on Windows has no `SO_PEERCRED`; the peer's process is found with
+   `SIO_AF_UNIX_GETPEERPID` and the user of its token compared with the daemon's.
 8. The status reply lists project roots, checkout roots and log paths. Does not apply as a
    leak: it is given to the daemon's own user only (the peer check, tested with the second
    user, who gets no answer), and that user can read the same from the directory. Nothing
@@ -652,28 +655,34 @@ request said eight; the file numbers nine, and all nine are answered).
 
 ## macOS and Windows
 
-What works today on both: the commands exist, `rustd enable`, `disable` and `status` edit
-cargo's configuration the same way, and every build is cargo's with its reason, so nothing
-breaks and nothing is faster. None of this has been run on either system from this branch;
-the unit tests of `cargo/` and `socket.rs` run in CI on both.
+Windows x86-64 MSVC: the Windows session made `cargo rustd` serve builds there
+(`link.exe` lines, the daemon's directory and socket, build scripts, CRLF sources), and
+that work is merged here. I have not run it. Its harness runs were of `cargo rustd`; plain
+cargo after `rustd enable` has not been run on Windows by anyone, and the list under
+"Windows" below is what I wrote before that work, kept for what it says about the pieces
+the transparent mode adds (`place`, `give_back`, the `.pdb`).
 
-To check it natively, a platform session can run, from `harness/` with `RUSTD_BIN` set to
-its release `rustd`:
+macOS: the commands exist, `rustd enable`, `disable` and `status` edit cargo's
+configuration the same way, and every build is cargo's with its reason, so nothing breaks
+and nothing is faster. Nothing has been run there from this branch.
+
+To check either natively, a platform session can run, from `harness/` with `RUSTD_BIN`
+set to its release `rustd`:
 
     python3 cargo_rustd.py --small
 
 It clones ripgrep, fd and hyperfine at pinned commits and runs them in three ways (cargo,
 `cargo rustd`, plain cargo after `rustd enable`), then the flags, the daemon's lifecycle
-and the `enable`/`disable` round trips. On macOS and Windows the expected result today is
-that every step is the same as cargo and every build is marked as cargo's; a step that
-differs, or a build that fails, is a bug in the fallback. The second-user checks need
-`sudo useradd`; where there is no sudo, `RUSTD_NO_SUDO=1` leaves them out.
+and the `enable`/`disable` round trips. On macOS the expected result today is that every
+step is the same as cargo and every build is marked as cargo's; on Windows, that every
+step is the same as cargo. A step that differs, or a build that fails, is a bug. The
+second-user checks need `sudo useradd`; where there is no sudo, `RUSTD_NO_SUDO=1` leaves
+them out.
 
-What has to change for the daemon to serve builds there: `only_cargo`
-(`cargo/cli.rs`, `unsupported_target`) sends every build to cargo with "programs for
-<triple> are not linked through `cargo rustd` yet", because the link plan only takes an
-ELF line. The worker, the wrapper, the recording of units and the daemon are not specific
-to ELF. What is, and has to change:
+What has to change for the daemon to serve builds on macOS: `only_cargo` (`cargo/cli.rs`,
+`unsupported_target`) sends every build to cargo with "programs for <triple> are not
+linked through `cargo rustd` yet", because the link plan does not take a Mach-O line. The
+worker, the wrapper, the recording of units and the daemon are not specific to a format.
 
 macOS (Mach-O, `cc` driving `ld`):
 
@@ -702,7 +711,7 @@ macOS (Mach-O, `cc` driving `ld`):
    `~/Library/Caches/rustd` would be the native place.
 7. `linked_in_deps` and `written_now` (the nested cargo case) use nothing Linux has alone.
 
-Windows (COFF/PE, `link.exe` or `lld-link`):
+Windows (COFF/PE, `link.exe` or `lld-link`), as listed before the Windows session's work:
 
 1. `LinkLine::parse` refuses a line with `/NOLOGO` or `-flavor`. An MSVC line has no `-o`:
    the output is `/OUT:path`, the arguments are in rustc's own response file when long,
@@ -808,8 +817,9 @@ And in the third round, with the transparent mode and the store on by default:
   than SUN_LEN" in the reason. `~/.cache/rustd` and `$XDG_RUNTIME_DIR/rustd` are well
   inside it for ordinary user names; a deep `RUSTD_HOME` is not. Binding by a shorter
   name (a relative path from the directory) would remove the limit.
-- macOS and Windows: every build is cargo's, and nothing has been run there from this
-  branch. Windows socket hardening (finding 7) is not implemented.
+- macOS: every build is cargo's, and nothing has been run there. Windows x86-64 MSVC is
+  served since the Windows session's work was merged (see "macOS and Windows"); the
+  transparent mode has not been run there.
 - A function rustc emitted no symbol for is assumed dead. The test naming bug was one way
   for that assumption to be wrong; I know of no other and have not proved there is none.
 - `rust-analyzer` running `cargo check` at the same time as a build is checked on a small

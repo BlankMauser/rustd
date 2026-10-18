@@ -664,6 +664,13 @@ mod ok {
         run_and_expect_no_errors("test_data/parser/inline/ok/trait_alias_where_clause.rs");
     }
     #[test]
+    fn trait_fn_unnamed_params() {
+        run_and_expect_no_errors_with_edition(
+            "test_data/parser/inline/ok/trait_fn_unnamed_params.rs",
+            crate::Edition::Edition2015,
+        );
+    }
+    #[test]
     fn trait_item() { run_and_expect_no_errors("test_data/parser/inline/ok/trait_item.rs"); }
     #[test]
     fn trait_item_bounds() {

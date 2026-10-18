@@ -7,7 +7,7 @@ use hir_def::{
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
-    BindingMode, ByRef,
+    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef,
     mir::{
         FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, Projection,
         lower::{
@@ -571,7 +571,14 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     mode == MatchingMode::Assign,
                     "Pat::Expr can only come in destructuring assignments"
                 );
-                let Some((lhs_place, current)) = self.lower_expr_as_place(current, expr, false)?
+                // Inference records on the assignee how the value is coerced to its type; the
+                // assignee itself is a place, as rustc's desugaring to `let lhs = value;
+                // assignee = lhs;` has it.
+                if !self.assigned_value_is_copied(expr) {
+                    not_supported!("a coercion in a destructuring assignment");
+                }
+                let Some((lhs_place, current)) =
+                    self.lower_expr_as_place_without_adjust(current, expr, false)?
                 else {
                     return Ok((current, current_else));
                 };
@@ -591,6 +598,19 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Pat::Deref { .. } => not_supported!("deref pattern"),
         })
+    }
+
+    /// Whether the value a destructuring assignment gives to `assignee` is stored as it is:
+    /// it is not coerced, or is a reference that is reborrowed.
+    fn assigned_value_is_copied(&self, assignee: ExprId) -> bool {
+        match self.infer.expr_adjustments.get(&assignee).map_or(&[][..], |it| &**it) {
+            [] => true,
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_)), target },
+            ] => target.as_ref() == self.expr_ty_without_adjust(assignee),
+            _ => false,
+        }
     }
 
     fn pattern_match_binding(

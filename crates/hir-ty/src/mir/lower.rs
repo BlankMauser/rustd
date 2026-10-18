@@ -105,6 +105,8 @@ struct MirLowerCtx<'a, 'db> {
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
     ends_temporaries: FxHashSet<ExprId>,
+    /// The locals that hold an operand of an aggregate or a call lowered so far.
+    operand_locals: FxHashSet<LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
     /// way into.
     arm_unreached: bool,
@@ -241,6 +243,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             closures: vec![],
             coroutine: None,
             unreached: vec![],
+            scope_ends: vec![],
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -265,6 +268,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             extended_temporaries: FxHashMap::default(),
             super_let: None,
             ends_temporaries: FxHashSet::default(),
+            operand_locals: FxHashSet::default(),
             arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
@@ -2158,17 +2162,22 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if self.ends_temporaries.contains(&owner) {
             return;
         }
-        let Some(scope) = self.drop_scopes.last_mut() else { return };
         for operand in operands {
-            let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
-                continue;
-            };
-            let found = scope.locals.iter().skip(declared).position(|&it| it == place.local);
-            if let Some(at) = found.filter(|_| place.projection.as_slice().is_empty()) {
-                let local = scope.locals.remove(declared + at);
-                scope.locals.push(local);
+            if let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind
+                && place.projection.as_slice().is_empty()
+            {
+                self.operand_locals.insert(place.local);
             }
         }
+        let Some(scope) = self.drop_scopes.last_mut() else { return };
+        let Some(since) = scope.locals.get(declared..) else { return };
+        // The operands of an expression inside this one stay behind its own, in the order
+        // they were made: they were made later and are dropped earlier.
+        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
+            since.iter().partition(|it| self.operand_locals.contains(it));
+        scope.locals.truncate(declared);
+        scope.locals.extend(temporaries);
+        scope.locals.extend(operands);
     }
 
     fn lower_call_and_args(
@@ -2246,7 +2255,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             return self.is_promotable_unadjusted(base);
         }
         let is_fn = matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
-        match self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it) {
+        let adjustments = self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it);
+        // Unsizing a reference to a constant, `&[1, 2]` to a slice say, leaves it one: rustc's
+        // `promote_consts::Validator::validate_rvalue` lets every cast through that is not of
+        // a pointer to an integer.
+        let adjustments = match adjustments {
+            [rest @ .., Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }] => rest,
+            all => all,
+        };
+        match adjustments {
             [] => self.is_promotable_unadjusted(expr),
             // A function's address is a constant.
             [Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. }]
@@ -2254,6 +2271,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
+            // rustc's `promote_consts::Validator::validate_rvalue`.
+            [
+                Adjustment { kind: Adjust::Deref(None), .. },
+                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(mutability)), .. },
+            ] => {
+                let shared = matches!(Mutability::from(*mutability), Mutability::Not);
+                let reference = self.expr_ty_without_adjust(expr).as_reference().is_some();
+                shared && reference && self.is_promotable_unadjusted(expr)
+            }
             _ => false,
         }
     }
@@ -2742,21 +2769,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 return Ok(None);
             };
             current = c;
-            if !edition.at_least_2024()
-                && let [.., outer, scope] = &mut self.drop_scopes[..]
-                && declared <= scope.locals.len()
-            {
-                outer.locals.extend(scope.locals.drain(declared..));
-            } else if !edition.at_least_2024()
-                && let Some(scope) = self.drop_scopes.last_mut()
-                && declared <= scope.locals.len()
-            {
-                let temporaries = scope.locals.len() - declared;
-                scope.locals.rotate_right(temporaries);
+            if !edition.at_least_2024() {
+                self.outlive_block(declared);
             }
         }
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
+    }
+
+    /// Hands the temporaries of a block's tail, the locals of the block from `declared` on, to
+    /// the scope the block is in, or puts them before the block's own locals when it is in
+    /// none. The operands of the tail stay where they are: when a later operand panics they
+    /// are dropped before the locals of the block.
+    fn outlive_block(&mut self, declared: usize) {
+        let Some((scope, outer)) = self.drop_scopes.split_last_mut() else { return };
+        if declared > scope.locals.len() {
+            return;
+        }
+        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
+            scope.locals.drain(declared..).partition(|it| self.operand_locals.contains(it));
+        match outer.last_mut() {
+            Some(outer) => outer.locals.extend(temporaries),
+            None => {
+                scope.locals.splice(0..0, temporaries);
+            }
+        }
+        scope.locals.extend(operands);
     }
 
     /// Lowers the `else` of a `let`, which runs when the pattern did not match. The temporaries
@@ -3140,7 +3178,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// Don't call directly
     fn pop_drop_scope_assume_dropped_internal(&mut self) {
-        self.drop_scopes.pop();
+        if let Some(scope) = self.drop_scopes.pop() {
+            self.result.scope_ends.extend(scope.locals.iter().rev());
+        }
     }
 
     /// Don't call directly
@@ -3150,6 +3190,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
+        self.result.scope_ends.extend(scope.locals.iter().rev());
         self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }

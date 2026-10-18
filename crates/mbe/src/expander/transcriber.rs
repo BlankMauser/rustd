@@ -447,22 +447,25 @@ fn expand_var(
                     // it is one token: the `0` of an expression is not the `0` of a rule.
                     let is_leaf =
                         matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
-                    let delimiter = if is_leaf {
-                        Some(tt::DelimiterKind::Invisible)
-                    } else if (is_negative_literal && follower != Follower::Postfix)
+                    // The fragment is a group without delimiters whatever it is; inside it,
+                    // parentheses keep an expression of several tokens together where it is
+                    // parsed again.
+                    let whole = (is_negative_literal && follower != Follower::Postfix)
                         || sub.try_into_subtree().is_some_and(|it| {
                             it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
-                        })
-                    {
-                        None
-                    } else {
-                        Some(tt::DelimiterKind::Parenthesis)
-                    };
-                    if let Some(delimiter) = delimiter {
-                        builder.open(delimiter, span);
+                        });
+                    let parenthesized = !(is_leaf || is_macro_call(sub) || whole);
+                    if !whole {
+                        builder.open(tt::DelimiterKind::Invisible, span);
+                    }
+                    if parenthesized {
+                        builder.open(tt::DelimiterKind::Parenthesis, span);
                     }
                     builder.extend_with_tt_alone(sub);
-                    if delimiter.is_some() {
+                    if parenthesized {
+                        builder.close(span);
+                    }
+                    if !whole {
                         builder.close(span);
                     }
                 }
@@ -604,6 +607,30 @@ fn expand_repeat(
         err = Some(ExpandError::new(ctx.call_site, ExpandErrorKind::UnexpectedToken));
     }
     ExpandResult { value: (), err }
+}
+
+/// Whether the tokens of an expression are one macro call, `path!(..)`.
+///
+/// Such a fragment is not put in parentheses: it binds as tightly as they would make it, and
+/// rustc expands `$e;` of one as a macro in statement position, which may expand to several
+/// statements (`is_mac_call` of `InvocationCollectorNode for ast::Stmt` in
+/// `compiler/rustc_expand/src/expand.rs` takes a `StmtKind::Semi` of a macro call for one).
+fn is_macro_call(tokens: tt::TokenTreesView<'_>) -> bool {
+    let mut elements = tokens.iter().peekable();
+    let mut bang = false;
+    while let Some(element) = elements.next() {
+        let last = elements.peek().is_none();
+        match element {
+            tt::TtElement::Subtree(..) => return bang && last,
+            tt::TtElement::Leaf(tt::Leaf::Punct(punct)) if punct.char == '!' && !bang => {
+                bang = true
+            }
+            tt::TtElement::Leaf(tt::Leaf::Punct(punct)) if punct.char == ':' && !bang => {}
+            tt::TtElement::Leaf(tt::Leaf::Ident(_)) if !bang => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Inserts the path separator `::` between an identifier and its following generic

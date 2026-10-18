@@ -619,3 +619,50 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(())
     }
 }
+
+/// A file by its path, or for what a macro wrote by the call that wrote it.
+fn file_name(
+    db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    out: &mut String,
+    file: HirFileId,
+) -> Option<()> {
+    let mut written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
+        file_name(db, symbols, out, file)?;
+        write!(out, "#{}", id.into_raw()).ok()
+    };
+    match file {
+        HirFileId::FileId(file) => out.push_str(&symbols.source_path(file.file_id(db))?),
+        HirFileId::MacroFile(call) => match &call.loc(db).kind {
+            MacroCallKind::FnLike { ast_id, .. } => {
+                written_at(out, ast_id.file_id, ast_id.value.erase())?;
+                out.push('!');
+            }
+            MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } => {
+                written_at(out, ast_id.file_id, ast_id.value.erase())?;
+                write!(out, "!derive {derive_attr_index:?} {derive_index}").ok()?;
+            }
+            MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
+                written_at(out, ast_id.file_id, ast_id.value.erase())?;
+                write!(out, "!attr {censored_attr_ids:?}").ok()?;
+            }
+        },
+    }
+    Some(())
+}
+
+/// Where a function inside a block is written, which its path does not say: two blocks of
+/// one function, or two `const _` of one module, can each hold an item of the same name.
+/// `None` for a function outside of any block.
+pub fn block_place(
+    db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    func: FunctionId,
+) -> Option<String> {
+    func.module(db).block(db)?;
+    let id = func.lookup(db).id;
+    let mut out = String::new();
+    file_name(db, symbols, &mut out, id.file_id)?;
+    write!(out, "#{}", id.value.erase().into_raw()).ok()?;
+    Some(out)
+}

@@ -35,7 +35,7 @@ pub(super) fn trait_(p: &mut Parser<'_>, m: Marker) {
     generic_params::opt_where_clause(p);
 
     if p.at(T!['{']) {
-        assoc_item_list(p);
+        trait_item_list(p);
     } else {
         p.error("expected `{`");
     }
@@ -82,6 +82,15 @@ pub(super) fn impl_(p: &mut Parser<'_>, m: Marker) {
 //     fn bar(&self) {}
 // }
 pub(crate) fn assoc_item_list(p: &mut Parser<'_>) {
+    assoc_items(p, false);
+}
+
+/// The items of a trait, whose methods may leave parameters unnamed before the 2018 edition.
+pub(crate) fn trait_item_list(p: &mut Parser<'_>) {
+    assoc_items(p, true);
+}
+
+fn assoc_items(p: &mut Parser<'_>, is_in_trait: bool) {
     assert!(p.at(T!['{']));
 
     let m = p.start();
@@ -95,7 +104,7 @@ pub(crate) fn assoc_item_list(p: &mut Parser<'_>) {
             error_block(p, "expected an item");
             continue;
         }
-        item_or_macro(p, true, false);
+        item_or_macro(p, true, false, is_in_trait);
     }
     p.expect(T!['}']);
     m.complete(p, ASSOC_ITEM_LIST);

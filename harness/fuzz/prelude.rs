@@ -11,6 +11,14 @@ use std::mem::MaybeUninit;
 use std::num::{NonZeroI64, NonZeroU8, NonZeroU32};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::hint::black_box;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 static SUM: AtomicU64 = AtomicU64::new(0);
 
@@ -310,6 +318,138 @@ pub fn payload(caught: Box<dyn std::any::Any + Send>) {
     } else {
         feed(0xdead);
     }
+}
+
+/// A value whose drop is in the checksum.
+#[derive(Debug)]
+pub struct Noisy(pub u32);
+
+impl Drop for Noisy {
+    fn drop(&mut self) {
+        feed(0xd000 + self.0 as u64);
+    }
+}
+
+impl Mix for Noisy {
+    fn mix(&self) {
+        feed(self.0 as u64);
+    }
+}
+
+/// A value whose drop panics, unless a panic is already on its way.
+#[derive(Debug)]
+pub struct Bomb(pub u32);
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        feed(0xb000 + self.0 as u64);
+        if !std::thread::panicking() {
+            std::panic::panic_any(self.0);
+        }
+    }
+}
+
+/// Two fields, for values that are taken apart.
+pub struct Duo<A, B> {
+    pub a: A,
+    pub b: B,
+}
+
+/// Panics when `armed`, and gives `value` back when not.
+#[inline(never)]
+pub fn trip<T>(armed: bool, value: T) -> T {
+    if armed {
+        std::panic::panic_any(0x7419u32);
+    }
+    value
+}
+
+#[inline(never)]
+pub fn take3<A, B, C>(_a: A, _b: B, _c: C) {}
+
+#[inline(never)]
+pub fn first_of<'a, T>(a: &'a T, _b: &T) -> &'a T {
+    a
+}
+
+/// Runs `f` and feeds whether it panicked, and with what.
+pub fn caught(f: impl FnOnce()) {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(()) => feed(0xc0de),
+        Err(caught) => match caught.downcast_ref::<u32>() {
+            Some(code) => feed(0xe000 + *code as u64),
+            None => payload(caught),
+        },
+    }
+}
+
+/// A future that is pending a number of times and then gives its value.
+pub struct Later<T>(u32, Option<T>);
+
+pub fn later<T: Unpin>(times: u32, value: T) -> Later<T> {
+    Later(times, Some(value))
+}
+
+impl<T: Unpin> Future for Later<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        if self.0 == 0 {
+            return Poll::Ready(self.1.take().expect("polled after it was ready"));
+        }
+        self.0 -= 1;
+        feed(0xa000 + self.0 as u64);
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+/// Polls a future to its end. Each time it was not ready is in the checksum.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => feed(0xa5a5),
+        }
+    }
+}
+
+/// Polls a future at most `times` times and drops it where it is then.
+pub fn poll_some<F: Future>(future: F, times: u32) -> Option<F::Output> {
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..times {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return Some(value);
+        }
+    }
+    feed(0xa7a7);
+    None
+}
+
+/// Two futures polled in turn until both are done.
+pub async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
+    let (mut left, mut right) = (None, None);
+    std::future::poll_fn(move |cx| {
+        if left.is_none() {
+            if let Poll::Ready(value) = a.as_mut().poll(cx) {
+                left = Some(value);
+            }
+        }
+        if right.is_none() {
+            if let Poll::Ready(value) = b.as_mut().poll(cx) {
+                right = Some(value);
+            }
+        }
+        match (left.is_some(), right.is_some()) {
+            (true, true) => Poll::Ready((left.take().unwrap(), right.take().unwrap())),
+            _ => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// Runs one case from a clean checksum and prints what it added up to.

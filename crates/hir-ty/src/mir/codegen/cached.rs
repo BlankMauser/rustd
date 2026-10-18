@@ -493,11 +493,13 @@ impl Entries {
             return known.clone();
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
+        let read = || {
+            let key = Entry::key(name, self.debug)?;
+            Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
+        };
+        let tally = super::backend::Tally::global();
         let entry = (!banned)
-            .then(|| {
-                let key = Entry::key(name, self.debug)?;
-                Entry::decode(&self.store.get(&key)?)?.arrived(self.cargo_home.as_deref())
-            })
+            .then(|| tally.step(super::backend::Step::StoreRead, read))
             .flatten()
             .map(Arc::new);
         self.known().entries.insert(Arc::from(name), entry.clone());

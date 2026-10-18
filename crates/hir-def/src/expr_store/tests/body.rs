@@ -496,6 +496,32 @@ const fn f(x: i32) -> i32 {
 }
 
 #[test]
+fn three_dot_range_pattern_is_inclusive() {
+    let (db, body) = lower(
+        r#"
+fn f(x: char) -> bool {
+    match x {
+        'a'...'z' => true,
+        _ => false,
+    }
+}"#,
+    );
+
+    let body = Body::of(&db, body);
+    let ranges = body.assert_expr_only().pats.iter().filter(|(_, pat)| {
+        matches!(
+            pat,
+            Pat::Range {
+                start: Some(_),
+                end: Some(_),
+                range_type: syntax::ast::RangeOp::Inclusive
+            }
+        )
+    });
+    assert_eq!(ranges.count(), 1);
+}
+
+#[test]
 fn print_hir_precedences() {
     pretty_print(
         r#"

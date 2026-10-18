@@ -86,6 +86,50 @@ pub(crate) fn gone(socket: &Path) {
     }
 }
 
+/// Starts `daemon` in a process group and a console of its own, and until the result is
+/// dropped lets it inherit no handle of this process but those it is given. A process is
+/// started with every handle of its parent that can be inherited, and those of a pipe this
+/// command writes to are among them, under their own numbers and under those the commands
+/// above this one had: whoever reads the pipe would wait for the daemon to end.
+#[cfg(windows)]
+fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::{
+        Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
+        System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW},
+    };
+
+    /// Handles are multiples of four, and a command as short as this one has few.
+    const HANDLES: std::ops::RangeInclusive<usize> = 4..=0x1_0000;
+
+    struct Inherited(Vec<HANDLE>);
+    impl Drop for Inherited {
+        fn drop(&mut self) {
+            for &handle in &self.0 {
+                // SAFETY: the handle was open and inheritable when it was listed, and
+                // nothing closed one of this command's since.
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+            }
+        }
+    }
+
+    daemon.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let mut inherited = Vec::new();
+    for handle in HANDLES.step_by(4).map(|it| it as HANDLE) {
+        let mut flags = 0;
+        // SAFETY: a number that is no open handle is refused, and `flags` is only written.
+        let held = unsafe {
+            GetHandleInformation(handle, &mut flags) != 0
+                && flags & HANDLE_FLAG_INHERIT != 0
+                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+        };
+        if held {
+            inherited.push(handle);
+        }
+    }
+    Inherited(inherited)
+}
+
 /// Why no daemon answered: there is none, or one ended without taking its socket with it.
 pub(crate) fn why_none() -> String {
     let left = home().map(|it| (socket_in(&it), it.join("daemon.log")));
@@ -123,7 +167,11 @@ fn started(home: &Path) -> anyhow::Result<UnixStream> {
     daemon.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
+    #[cfg(windows)]
+    let kept = on_its_own(&mut daemon);
     daemon.spawn().context("starting the daemon")?;
+    #[cfg(windows)]
+    drop(kept);
     let socket = socket_in(home);
     let asked = Instant::now();
     loop {

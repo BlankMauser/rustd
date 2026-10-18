@@ -285,6 +285,9 @@ impl Loaded {
             if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change
                 && let Ok(text) = String::from_utf8(v)
             {
+                let rust = vfs.file_path(file.file_id).name_and_extension();
+                let rust = matches!(rust, Some((_, Some("rs"))));
+                let text = if rust { source_text(text) } else { text };
                 change.change_file(file.file_id, Some(text))
             }
         }
@@ -891,6 +894,13 @@ fn resolve_sub_span(
         ctx: SyntaxContext::root(editioned_file_id.edition()),
     };
     hir_expand::resolve_span(db, span)
+}
+
+/// The text of a Rust source file as rustc reads it: a line that ends in CR LF ends in LF.
+/// Otherwise a string that runs over lines has other bytes than rustc gives it, and one
+/// that leaves a line with a backslash does not lex.
+pub fn source_text(text: String) -> String {
+    if text.contains("\r\n") { text.replace("\r\n", "\n") } else { text }
 }
 
 #[cfg(test)]
