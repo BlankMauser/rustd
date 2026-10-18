@@ -1870,6 +1870,12 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
             crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
         }
     }
+    resolve_all(db, &crates);
+    Ok(crates.len())
+}
+
+/// Resolves the names and finds the impls of `crates`, on every core.
+fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     // A crate comes after its dependencies in the list: a thread that starts on one whose
     // dependencies are not resolved resolves them itself, one after the other.
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1877,7 +1883,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let db = db.clone();
-            let (crates, next) = (&crates, &next);
+            let next = &next;
             scope.spawn(move || {
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -1913,7 +1919,6 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
             });
         }
     });
-    Ok(crates.len())
 }
 
 /// The functions of the crates being built, listed once and again for the crates an edit can
@@ -3558,7 +3563,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         shared
     });
 
-    let start = Instant::now();
+    let mut start = Instant::now();
     // The library is read as the toolchain that built the program has it: one the directory
     // would pick now may be another, whose library has names the built one does not.
     let built_with = args.symbol_files.iter().find_map(|file| {
@@ -3607,7 +3612,24 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
     hir_ty::mir::codegen::identify_ahead();
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
-    let (mut db, vfs, mut checkouts) = load(&projects, &cargo_config, load_config, selection)?;
+    let (mut db, vfs, mut checkouts) = match std::env::var_os("RUSTD_PREWARM") {
+        Some(tiny) => {
+            let tiny = PathBuf::from(tiny);
+            let (mut db, mut vfs, mut checkouts) =
+                load(&[tiny.as_path()], &cargo_config, load_config, selection)?;
+            let at = Instant::now();
+            let all: Vec<ide_db::base_db::Crate> =
+                Crate::all(&db).into_iter().map(Into::into).collect();
+            resolve_all(&db, &all);
+            eprintln!("prewarm: {} crates in {:.1?}", all.len(), at.elapsed());
+            let at = Instant::now();
+            checkouts.add(&projects, &mut db, &mut vfs)?;
+            eprintln!("prewarm: added in {:.1?}", at.elapsed());
+            start = Instant::now();
+            (db, vfs, checkouts)
+        }
+        None => load(&projects, &cargo_config, load_config, selection)?,
+    };
     ide_db::base_db::set_process_env(&mut db, process::own());
     match toolchain_identity(&vfs, &args.symbol_files) {
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
@@ -3733,7 +3755,11 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
             }
         },
         None if args.watch => None,
-        None => return Ok(()),
+        None => {
+            // The process is ending: what these hold is not freed one allocation at a time.
+            std::mem::forget((db, table, known, cold, as_compiled));
+            return Ok(());
+        }
     };
 
     // The first change after a build of everything waits for what that build left behind.
