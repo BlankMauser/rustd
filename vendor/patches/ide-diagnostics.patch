@@ -1,0 +1,89 @@
+diff --git a/crates/ide-diagnostics/src/handlers/type_mismatch.rs b/crates/ide-diagnostics/src/handlers/type_mismatch.rs
+index 39bff661eef8f8f716bd77117dbcd28b7441dd96..5bf3b911fc45d644d0c85774989d626e5b81133d 100644
+--- a/crates/ide-diagnostics/src/handlers/type_mismatch.rs
++++ b/crates/ide-diagnostics/src/handlers/type_mismatch.rs
+@@ -2109,4 +2109,20 @@ impl<const F: fn() -> ()> Wrapper<{
+         "#,
+         );
+     }
++
++    #[test]
++    fn format_args_is_not_a_trait_new_in_scope() {
++        check_diagnostics(
++            r#"
++//- minicore: fmt
++trait Paint {
++    fn new(self) -> Option<Self> where Self: Sized { loop {} }
++}
++impl<T: ?Sized> Paint for T {}
++fn f(left: &str) {
++    let _ = format_args!("{left}");
++}
++"#,
++        );
++    }
+ }
+diff --git a/crates/ide-diagnostics/src/handlers/type_must_be_known.rs b/crates/ide-diagnostics/src/handlers/type_must_be_known.rs
+index 5a338de5260cc0464f64a85f366a69eada0cabb0..5c1090ca6df7cdc320cfbb8841ba7e1c6eb307f4 100644
+--- a/crates/ide-diagnostics/src/handlers/type_must_be_known.rs
++++ b/crates/ide-diagnostics/src/handlers/type_must_be_known.rs
+@@ -163,10 +163,12 @@ fn bar() {
+         check_diagnostics(
+             r#"
+ //- minicore: include_bytes
+-
++//- /main.rs
++mod bytes;
+ fn foo() {
+-    include_bytes!("./foo.txt");
++    include_bytes!("./bytes.rs");
+ }
++//- /bytes.rs
+         "#,
+         );
+     }
+diff --git a/crates/ide-diagnostics/src/handlers/unlinked_file.rs b/crates/ide-diagnostics/src/handlers/unlinked_file.rs
+index 376fc4fbdf78d1976302e121f99bdf4d4cb6dac9..13349f91f05c1e45614108651aa27fe06cfa6d02 100644
+--- a/crates/ide-diagnostics/src/handlers/unlinked_file.rs
++++ b/crates/ide-diagnostics/src/handlers/unlinked_file.rs
+@@ -108,7 +108,7 @@ fn fixes(
+         // FIXME: This shouldnt need to access the crate def map directly
+         let crate_def_map = crate_def_map(ctx.sema.db, krate);
+ 
+-        let root_module = &crate_def_map[crate_def_map.root_module_id()];
++        let root_module = crate_def_map.module(ctx.sema.db, crate_def_map.root_module_id());
+         let Some(root_file_id) = root_module.origin.file_id() else { continue };
+         let Some(crate_root_path) = source_root.path_for_file(&root_file_id.file_id(ctx.sema.db))
+         else {
+@@ -125,8 +125,8 @@ fn fixes(
+                 // shouldn't occur
+                 _ => continue 'crates,
+             };
+-            match current.children.iter().find(|(name, _)| name.as_str() == seg) {
+-                Some((_, &child)) => current = &crate_def_map[child],
++            match current.children(ctx.sema.db).iter().find(|(name, _)| name.as_str() == seg) {
++                Some((_, &child)) => current = crate_def_map.module(ctx.sema.db, child),
+                 None => continue 'crates,
+             }
+             if !current.origin.is_inline() {
+@@ -163,7 +163,7 @@ fn fixes(
+     let relevant_crates = base_db::relevant_crates(db, parent_id);
+     'crates: for &krate in relevant_crates.iter() {
+         let crate_def_map = crate_def_map(ctx.sema.db, krate);
+-        let Some((_, module)) = crate_def_map.modules().find(|(_, module)| {
++        let Some((_, module)) = crate_def_map.modules(db).find(|(_, module)| {
+             module.origin.file_id().map(|file_id| file_id.file_id(ctx.sema.db)) == Some(parent_id)
+                 && !module.origin.is_inline()
+         }) else {
+@@ -183,9 +183,9 @@ fn fixes(
+             // try finding a parent that has an inline tree from here on
+             let mut current = module;
+             for s in stack.iter().rev() {
+-                match module.children.iter().find(|(name, _)| name.as_str() == s) {
++                match module.children(ctx.sema.db).iter().find(|(name, _)| name.as_str() == s) {
+                     Some((_, child)) => {
+-                        current = &crate_def_map[*child];
++                        current = crate_def_map.module(ctx.sema.db, *child);
+                     }
+                     None => continue 'crates,
+                 }

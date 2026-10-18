@@ -1,0 +1,553 @@
+diff --git a/crates/project-model/src/build_dependencies.rs b/crates/project-model/src/build_dependencies.rs
+index 40cf975e4522b958802ba237b49f6f78f6c82e9a..17992e0239877f055920919b7722b23a4441c72a 100644
+--- a/crates/project-model/src/build_dependencies.rs
++++ b/crates/project-model/src/build_dependencies.rs
+@@ -175,6 +175,11 @@ impl WorkspaceBuildScripts {
+         self.error.as_deref()
+     }
+ 
++    /// Where the build script of `package` wrote, when it ran.
++    pub fn out_dir(&self, package: Package) -> Option<&AbsPath> {
++        self.outputs.get(package)?.out_dir.as_deref()
++    }
++
+     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
+         self.outputs.get(idx)
+     }
+@@ -451,7 +456,10 @@ impl WorkspaceBuildScripts {
+                 let mut requires_unstable_options = false;
+                 let mut cmd = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
+ 
+-                cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
++                cmd.args(["check", "--quiet", "--message-format=json"]);
++                if !config.only_manifest_package {
++                    cmd.arg("--workspace");
++                }
+                 cmd.args(&config.extra_args);
+                 if let Some(config_path) = &config.config_path {
+                     cmd.arg("--config").arg(config_path);
+@@ -537,9 +545,12 @@ impl WorkspaceBuildScripts {
+                 if cargo_comp_time_deps_available {
+                     requires_unstable_options = true;
+                     cmd.arg("--compile-time-deps");
+-                    // we can pass this unconditionally, because we won't actually build the
+-                    // binaries, and as such, this will succeed even on targets without libtest
+-                    cmd.arg("--all-targets");
++                    // The binaries are not built, so this succeeds even on targets without
++                    // libtest. It also runs the build scripts and builds the proc macros of
++                    // dev-dependencies, which a build that has no tests in it does not.
++                    if config.all_targets {
++                        cmd.arg("--all-targets");
++                    }
+                 } else {
+                     // --all-targets includes tests, benches and examples in addition to the
+                     // default lib and bins. This is an independent concept from the --target
+diff --git a/crates/project-model/src/cargo_workspace.rs b/crates/project-model/src/cargo_workspace.rs
+index 9d2588380c22ccf492b8cb84ebbd0149f755ac70..9477bf4f59e0ba62a44b9b5489b8b5dbf3567b10 100644
+--- a/crates/project-model/src/cargo_workspace.rs
++++ b/crates/project-model/src/cargo_workspace.rs
+@@ -138,6 +138,8 @@ pub struct CargoConfig {
+     pub config_path: Option<AbsPathBuf>,
+     /// Extra env vars to set when invoking the cargo command
+     pub extra_env: FxHashMap<String, Option<String>>,
++    /// Whether `extra_env` is only what cargo and rustc are run with, and no crate is told it.
++    pub extra_env_for_commands_only: bool,
+     pub invocation_strategy: InvocationStrategy,
+     /// Optional path to use instead of `target` when building
+     pub target_dir_config: TargetDirectoryConfig,
+@@ -145,6 +147,9 @@ pub struct CargoConfig {
+     pub set_test: bool,
+     /// Load the project without any dependencies
+     pub no_deps: bool,
++    /// Run the build scripts as a build of the manifest's package has them, not as a build of
++    /// every member of its workspace does: the features of the two differ.
++    pub only_manifest_package: bool,
+ }
+ 
+ pub type Package = Idx<PackageData>;
+@@ -176,6 +181,12 @@ pub struct PackageData {
+     pub features: FxHashMap<String, Vec<String>>,
+     /// List of features enabled on this package
+     pub active_features: Vec<String>,
++    /// What the profile cargo builds the package with changes of the toolchain's cfg, when the
++    /// build is known.
++    pub profile_cfg: Option<cfg::CfgDiff>,
++    /// Whether the package is one the build was asked for, which cargo tells its crates with
++    /// `CARGO_PRIMARY_PACKAGE`.
++    pub primary: bool,
+     /// Package id
+     pub id: Arc<PackageId>,
+     /// Authors as given in the `Cargo.toml`
+@@ -427,6 +438,8 @@ impl CargoWorkspace {
+                 dependencies: Vec::new(),
+                 features: features.into_iter().collect(),
+                 active_features: Vec::new(),
++                profile_cfg: None,
++                primary: false,
+                 metadata: meta.rust_analyzer.unwrap_or_default(),
+                 all_member_deps: None,
+             });
+@@ -528,6 +541,59 @@ impl CargoWorkspace {
+         }
+     }
+ 
++    /// Replaces the features `cargo metadata` resolved for a package, which are those of a
++    /// build of the whole workspace.
++    pub fn set_active_features(&mut self, package: Package, features: Vec<String>) {
++        self.packages[package].active_features = features;
++    }
++
++    /// Sets what the profile the package is built with changes of the toolchain's cfg.
++    pub fn set_profile_cfg(&mut self, package: Package, cfg: cfg::CfgDiff) {
++        self.packages[package].profile_cfg = Some(cfg);
++    }
++
++    /// Sets whether the package is one the build was asked for.
++    pub fn set_primary(&mut self, package: Package, primary: bool) {
++        self.packages[package].primary = primary;
++    }
++
++    /// Leaves out what only tests, examples and benchmarks depend on.
++    pub fn drop_dev_dependencies(&mut self) {
++        for (_, package) in self.packages.iter_mut() {
++            package.dependencies.retain(|it| it.kind != DepKind::Dev);
++        }
++    }
++
++    /// The workspace with each member package `moved` picks, by its directory, at the place
++    /// under `to` that it has under `from`. The workspace is told to be where it was.
++    pub fn placed(
++        &self,
++        from: &AbsPath,
++        to: &AbsPath,
++        moved: &dyn Fn(&AbsPath) -> bool,
++    ) -> CargoWorkspace {
++        let place = |path: &AbsPath| match path.strip_prefix(from) {
++            Some(inside) => to.join(inside),
++            None => path.to_path_buf(),
++        };
++        let mut placed = self.clone();
++        let mut targets = Vec::new();
++        for (_, package) in placed.packages.iter_mut() {
++            if !package.is_member || !moved(package.manifest.parent()) {
++                continue;
++            }
++            let manifest: &AbsPath = package.manifest.as_ref();
++            package.manifest =
++                ManifestPath::try_from(place(manifest)).expect("a manifest is in a directory");
++            targets.extend(package.targets.iter().copied());
++        }
++        for target in targets {
++            let root = place(&placed.targets[target].root);
++            placed.targets[target].root = root;
++        }
++        placed
++    }
++
+     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
+         self.packages.iter().map(|(id, _pkg)| id)
+     }
+@@ -852,3 +918,31 @@ impl FetchMetadata {
+         res
+     }
+ }
++
++impl PackageData {
++    /// `rust-version` as the manifest has it, which is what cargo hands to `env!`: cargo's
++    /// metadata, and so `rust_version`, has `1.70` as `1.70.0`.
++    pub(crate) fn rust_version_as_written(&self) -> Option<String> {
++        let parsed = self.rust_version.as_ref()?.to_string();
++        let written = |manifest: &Utf8Path, tables: &[&str]| {
++            let manifest: toml::Table = std::fs::read_to_string(manifest).ok()?.parse().ok()?;
++            let table = tables.iter().try_fold(&manifest, |table, key| table.get(*key)?.as_table());
++            table?.get("rust-version")?.as_str().map(str::to_owned)
++        };
++        let manifest: &Utf8Path = self.manifest.as_ref();
++        let of_workspace = || {
++            manifest
++                .ancestors()
++                .skip(2)
++                .find_map(|dir| written(&dir.join("Cargo.toml"), &["workspace", "package"]))
++        };
++        let written = written(manifest, &["package"]).or_else(of_workspace);
++        // Only what parses to the version cargo reports is the manifest's.
++        let same = |it: &String| match it.matches('.').count() {
++            0 => format!("{it}.0.0") == parsed,
++            1 => format!("{it}.0") == parsed,
++            _ => *it == parsed,
++        };
++        Some(written.filter(same).unwrap_or(parsed))
++    }
++}
+diff --git a/crates/project-model/src/env.rs b/crates/project-model/src/env.rs
+index 37cfcd554524ab143875574bd464ed4718e112a2..2ce1413309fdc1c74ec8739f2924389aeb2a5d9a 100644
+--- a/crates/project-model/src/env.rs
++++ b/crates/project-model/src/env.rs
+@@ -13,7 +13,7 @@ use crate::{PackageData, TargetKind, cargo_config_file::CargoConfigFile};
+ /// FIXME: ask Cargo to provide this data instead of re-deriving.
+ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
+     // FIXME: Missing variables:
+-    // CARGO_BIN_NAME, CARGO_BIN_EXE_<name>
++    // CARGO_BIN_EXE_<name>
+ 
+     let manifest_dir = package.manifest.parent();
+     env.set("CARGO_MANIFEST_DIR", manifest_dir.as_str());
+@@ -41,10 +41,10 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
+         package.readme.as_ref().map(ToString::to_string).unwrap_or_default(),
+     );
+ 
+-    env.set(
+-        "CARGO_PKG_RUST_VERSION",
+-        package.rust_version.as_ref().map(ToString::to_string).unwrap_or_default(),
+-    );
++    env.set("CARGO_PKG_RUST_VERSION", package.rust_version_as_written().unwrap_or_default());
++    if package.primary {
++        env.set("CARGO_PRIMARY_PACKAGE", "1");
++    }
+ }
+ 
+ pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {
+@@ -52,22 +52,31 @@ pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {
+ }
+ 
+ pub(crate) fn inject_rustc_tool_env(env: &mut Env, cargo_name: &str, kind: TargetKind) {
+-    _ = kind;
+-    // FIXME
+-    // if kind.is_executable() {
+-    //     env.set("CARGO_BIN_NAME", cargo_name);
+-    // }
++    if matches!(kind, TargetKind::Bin | TargetKind::Example) {
++        env.set("CARGO_BIN_NAME", cargo_name);
++    }
+     env.set("CARGO_CRATE_NAME", cargo_name.replace('-', "_"));
+ }
+ 
++/// The variables cargo's configuration has for the crates of a build whose process has
++/// `extra_env` over the variables of this one. Those are among them when `told`.
+ pub(crate) fn cargo_config_env(
+     config: &Option<CargoConfigFile>,
+     extra_env: &FxHashMap<String, Option<String>>,
++    told: bool,
+ ) -> Env {
+     use toml::de::*;
+ 
+     let mut env = Env::default();
+-    env.extend(extra_env.iter().filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))));
++    if told {
++        env.extend(
++            extra_env.iter().filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
++        );
++    }
++    let of_process = |key: &str| match extra_env.get(key) {
++        Some(value) => value.clone(),
++        None => std::env::var(key).ok(),
++    };
+ 
+     let Some(config_reader) = config.as_ref().and_then(|c| c.read()) else {
+         return env;
+@@ -82,10 +91,7 @@ pub(crate) fn cargo_config_env(
+             DeValue::String(s) => {
+                 // Plain string entries have no `force` option, so they should not
+                 // override existing environment variables (matching Cargo behavior).
+-                if extra_env.get(key).is_some_and(Option::is_some) {
+-                    continue;
+-                }
+-                if let Ok(val) = std::env::var(key) { val } else { String::from(s.clone()) }
++                of_process(key).unwrap_or_else(|| String::from(s.clone()))
+             }
+             DeValue::Table(entry) => {
+                 // Each entry MUST have a `value` key.
+@@ -96,14 +102,9 @@ pub(crate) fn cargo_config_env(
+                     entry.get("force").and_then(|v| v.as_ref().as_bool()).unwrap_or(false);
+                 // If the entry already exists in the environment AND the `force` key is not set
+                 // to true, use the existing value instead of the config value.
+-                if !is_forced {
+-                    if extra_env.get(key).is_some_and(Option::is_some) {
+-                        continue;
+-                    }
+-                    if let Ok(val) = std::env::var(key) {
+-                        env.insert(key, val);
+-                        continue;
+-                    }
++                if !is_forced && let Some(val) = of_process(key) {
++                    env.insert(key, val);
++                    continue;
+                 }
+ 
+                 if let Some(base) = entry.get("relative").and_then(|v| {
+@@ -162,7 +163,7 @@ env.RA_TEST_NOT_AN_OBJECT = "value"
+     .iter()
+     .map(|(k, v)| (k.to_string(), v.map(str::to_owned)))
+     .collect();
+-    let env = cargo_config_env(&Some(config), &extra_env);
++    let env = cargo_config_env(&Some(config), &extra_env, true);
+     assert_eq!(env.get("RA_TEST_WORKSPACE_DIR").as_deref(), Some(cwd.join("").as_str()));
+     assert_eq!(env.get("RA_TEST_RELATIVE").as_deref(), Some(cwd.join("../relative").as_str()));
+     assert_eq!(env.get("RA_TEST_INVALID").as_deref(), Some("../relative"));
+@@ -199,7 +200,7 @@ env.RA_TEST_PROCESS_ENV_FORCED.force = true
+     let raw = raw.lines().map(|l| format!("{l} # {config_path}")).join("\n");
+     let config = CargoConfigFile::from_string_for_test(raw);
+     let extra_env = FxHashMap::default();
+-    let env = cargo_config_env(&Some(config), &extra_env);
++    let env = cargo_config_env(&Some(config), &extra_env, true);
+ 
+     // Plain string form should use process env value, not config value
+     assert_eq!(env.get("RA_TEST_PROCESS_ENV_STRING").as_deref(), Some("from_process"));
+diff --git a/crates/project-model/src/lib.rs b/crates/project-model/src/lib.rs
+index 3414b52d4514f90a02edab6451ab3373c56df111..533a55cafaf1d07e27d3ecd24f6f972db9198254 100644
+--- a/crates/project-model/src/lib.rs
++++ b/crates/project-model/src/lib.rs
+@@ -74,7 +74,9 @@ pub use crate::{
+     manifest_path::ManifestPath,
+     project_json::{ProjectJson, ProjectJsonData},
+     sysroot::Sysroot,
+-    workspace::{FileLoader, PackageRoot, ProjectWorkspace, ProjectWorkspaceKind},
++    workspace::{
++        FileLoader, PackageRoot, ProjectWorkspace, ProjectWorkspaceKind, SYSROOT_AS_BUILT,
++    },
+ };
+ pub use cargo_metadata::Metadata;
+ 
+diff --git a/crates/project-model/src/workspace.rs b/crates/project-model/src/workspace.rs
+index 0b2a023ba2a521c40e97772d799bb4cc86dea046..54b9d0753685e70f5d7d36cb4c0a03312ea19fb1 100644
+--- a/crates/project-model/src/workspace.rs
++++ b/crates/project-model/src/workspace.rs
+@@ -414,7 +414,10 @@ impl ProjectWorkspace {
+                 .expect("failed to spawn thread");
+             let cargo_env = Builder::new()
+                 .name("ProjectWorkspace::cargo_env".to_owned())
+-                .spawn_scoped(s, move || cargo_config_env(&config_file, &config.extra_env))
++                .spawn_scoped(s, move || {
++                    let told = !config.extra_env_for_commands_only;
++                    cargo_config_env(&config_file, &config.extra_env, told)
++                })
+                 .expect("failed to spawn thread");
+             thread::Result::Ok((
+                 rustc_cfg.join()?,
+@@ -432,9 +435,11 @@ impl ProjectWorkspace {
+                 Err(e) => std::panic::resume_unwind(e),
+             };
+ 
+-        for (key, value) in config.extra_env.iter() {
+-            if let Some(value) = value {
+-                cargo_env.insert(key.clone(), value.clone());
++        if !config.extra_env_for_commands_only {
++            for (key, value) in config.extra_env.iter() {
++                if let Some(value) = value {
++                    cargo_env.insert(key.clone(), value.clone());
++                }
+             }
+         }
+ 
+@@ -608,7 +613,8 @@ impl ProjectWorkspace {
+             config.no_deps,
+         );
+         let cargo_script = fetch_metadata.exec(false, &|_| ()).ok().map(|(ws, error)| {
+-            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env);
++            let told = !config.extra_env_for_commands_only;
++            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env, told);
+             (
+                 CargoWorkspace::new(ws, detached_file.clone(), cargo_config_extra_env, false),
+                 WorkspaceBuildScripts::default(),
+@@ -1299,7 +1305,18 @@ fn cargo_to_crate_graph(
+                     // Add test cfg for local crates
+                     cfg_options.insert_atom(sym::test);
+                 }
+-                cfg_options.insert_atom(sym::rust_analyzer);
++                if !sysroot_as_built() {
++                    cfg_options.insert_atom(sym::rust_analyzer);
++                }
++            }
++            match &cargo[pkg].profile_cfg {
++                Some(profile) => cfg_options.apply_diff(profile.clone()),
++                // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
++                None if sysroot_as_built() && !cargo.is_sysroot() => {
++                    cfg_options.insert_atom(sym::debug_assertions);
++                    cfg_options.insert_atom(sym::overflow_checks);
++                }
++                None => {}
+             }
+ 
+             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
+@@ -1330,7 +1347,14 @@ fn cargo_to_crate_graph(
+                 cargo,
+                 pkg_data,
+                 build_data.zip(Some(build_scripts.error().is_some())),
+-                cfg_options.clone(),
++                {
++                    // Cargo builds a test target, and nothing else of the package, as a test.
++                    let mut cfg_options = cfg_options.clone();
++                    if sysroot_as_built() && matches!(kind, TargetKind::Test) {
++                        cfg_options.insert_atom(sym::test);
++                    }
++                    cfg_options
++                },
+                 file_id,
+                 name,
+                 kind,
+@@ -1804,6 +1828,18 @@ fn extend_crate_graph_with_sysroot(
+     (SysrootPublicDeps { deps: pub_deps }, libproc_macro)
+ }
+ 
++/// The sysroot is analyzed with `cfg(miri)` and `cfg(debug_assertions)` by default, which
++/// picks the simplest code paths. A consumer that links against the prebuilt standard library
++/// needs the configuration that library was built with instead.
++/// Likewise the crates cargo builds: its dev profile has `cfg(debug_assertions)`, and nothing
++/// it builds has `cfg(rust_analyzer)`.
++pub static SYSROOT_AS_BUILT: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++fn sysroot_as_built() -> bool {
++    SYSROOT_AS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
++}
++
+ fn sysroot_to_crate_graph(
+     crate_graph: &mut CrateGraphBuilder,
+     sysroot: &Sysroot,
+@@ -1812,6 +1848,27 @@ fn sysroot_to_crate_graph(
+     crate_ws_data: Arc<CrateWorkspaceData>,
+ ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
+     let _p = tracing::info_span!("sysroot_to_crate_graph").entered();
++    let arch = rustc_cfg.iter().find_map(|atom| match atom {
++        CfgAtom::KeyValue { key, value } if key.as_str() == "target_arch" => Some(value.clone()),
++        _ => None,
++    });
++    let (public_deps, proc_macro) =
++        sysroot_crates_to_crate_graph(crate_graph, sysroot, rustc_cfg, load, crate_ws_data);
++    // The build script of `std` is not run: what it says of the target is said here.
++    let std = public_deps.deps.iter().find(|(name, ..)| name.as_str() == "std");
++    if let (Some(&(_, std, _)), Some(arch)) = (std, arch) {
++        crate_graph.set_env(std, "STD_ENV_ARCH", arch.as_str());
++    }
++    (public_deps, proc_macro)
++}
++
++fn sysroot_crates_to_crate_graph(
++    crate_graph: &mut CrateGraphBuilder,
++    sysroot: &Sysroot,
++    rustc_cfg: Vec<CfgAtom>,
++    load: FileLoader<'_>,
++    crate_ws_data: Arc<CrateWorkspaceData>,
++) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
+     match sysroot.workspace() {
+         RustLibSrcWorkspace::Workspace { ws: cargo, .. } => {
+             let (sysroot_cg, sysroot_pm) = cargo_to_crate_graph(
+@@ -1821,14 +1878,18 @@ fn sysroot_to_crate_graph(
+                 &Sysroot::empty(),
+                 rustc_cfg,
+                 &CfgOverrides {
+-                    global: CfgDiff::new(
+-                        vec![
+-                            CfgAtom::Flag(sym::debug_assertions),
+-                            CfgAtom::Flag(sym::miri),
+-                            CfgAtom::Flag(sym::bootstrap),
+-                        ],
+-                        vec![CfgAtom::Flag(sym::test)],
+-                    ),
++                    global: if sysroot_as_built() {
++                        CfgDiff::new(vec![], vec![CfgAtom::Flag(sym::test)])
++                    } else {
++                        CfgDiff::new(
++                            vec![
++                                CfgAtom::Flag(sym::debug_assertions),
++                                CfgAtom::Flag(sym::miri),
++                                CfgAtom::Flag(sym::bootstrap),
++                            ],
++                            vec![CfgAtom::Flag(sym::test)],
++                        )
++                    },
+                     ..Default::default()
+                 },
+                 &WorkspaceBuildScripts::default(),
+@@ -1846,10 +1907,14 @@ fn sysroot_to_crate_graph(
+                 &Sysroot::empty(),
+                 &FxHashMap::default(),
+                 &CfgOverrides {
+-                    global: CfgDiff::new(
+-                        vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
+-                        vec![],
+-                    ),
++                    global: if sysroot_as_built() {
++                        CfgDiff::new(vec![], vec![])
++                    } else {
++                        CfgDiff::new(
++                            vec![CfgAtom::Flag(sym::debug_assertions), CfgAtom::Flag(sym::miri)],
++                            vec![],
++                        )
++                    },
+                     ..Default::default()
+                 },
+                 false,
+@@ -1863,8 +1928,10 @@ fn sysroot_to_crate_graph(
+             let cfg_options = {
+                 let mut cfg_options = CfgOptions::default();
+                 cfg_options.extend(rustc_cfg);
+-                cfg_options.insert_atom(sym::debug_assertions);
+-                cfg_options.insert_atom(sym::miri);
++                if !sysroot_as_built() {
++                    cfg_options.insert_atom(sym::debug_assertions);
++                    cfg_options.insert_atom(sym::miri);
++                }
+                 cfg_options
+             };
+             let sysroot_crates: FxHashMap<
+diff --git a/crates/project-model/test_data/output/cargo_hello_world_project_model.txt b/crates/project-model/test_data/output/cargo_hello_world_project_model.txt
+index a895ef53afa06551d50612f07b3fbdc51ba77bf4..b3cf3b74fe48cc9a6915d094dd2a1f63a20af163 100644
+--- a/crates/project-model/test_data/output/cargo_hello_world_project_model.txt
++++ b/crates/project-model/test_data/output/cargo_hello_world_project_model.txt
+@@ -137,6 +137,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "hello-world",
+                 "CARGO_CRATE_NAME": "hello_world",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
+@@ -223,6 +224,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "an-example",
+                 "CARGO_CRATE_NAME": "an_example",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
+diff --git a/crates/project-model/test_data/output/cargo_hello_world_project_model_with_selective_overrides.txt b/crates/project-model/test_data/output/cargo_hello_world_project_model_with_selective_overrides.txt
+index a895ef53afa06551d50612f07b3fbdc51ba77bf4..b3cf3b74fe48cc9a6915d094dd2a1f63a20af163 100644
+--- a/crates/project-model/test_data/output/cargo_hello_world_project_model_with_selective_overrides.txt
++++ b/crates/project-model/test_data/output/cargo_hello_world_project_model_with_selective_overrides.txt
+@@ -137,6 +137,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "hello-world",
+                 "CARGO_CRATE_NAME": "hello_world",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
+@@ -223,6 +224,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "an-example",
+                 "CARGO_CRATE_NAME": "an_example",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
+diff --git a/crates/project-model/test_data/output/cargo_hello_world_project_model_with_wildcard_overrides.txt b/crates/project-model/test_data/output/cargo_hello_world_project_model_with_wildcard_overrides.txt
+index 9eb47947b6fd5a9e9d6e13047f73031279002652..793686c352e6c52acb03268117bfbe3b9e11a892 100644
+--- a/crates/project-model/test_data/output/cargo_hello_world_project_model_with_wildcard_overrides.txt
++++ b/crates/project-model/test_data/output/cargo_hello_world_project_model_with_wildcard_overrides.txt
+@@ -135,6 +135,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "hello-world",
+                 "CARGO_CRATE_NAME": "hello_world",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",
+@@ -220,6 +221,7 @@
+         env: Env {
+             entries: {
+                 "CARGO": "$CARGO$",
++                "CARGO_BIN_NAME": "an-example",
+                 "CARGO_CRATE_NAME": "an_example",
+                 "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                 "CARGO_MANIFEST_PATH": "$ROOT$hello-world/Cargo.toml",

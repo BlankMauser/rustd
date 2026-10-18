@@ -1,0 +1,12 @@
+diff --git a/crates/test-utils/src/minicore.rs b/crates/test-utils/src/minicore.rs
+index b978464a4908a21622729d13a3853ae164b94e30..c1496b1130b4c60769fa01e17f0ca156d2d45b3f 100644
+--- a/crates/test-utils/src/minicore.rs
++++ b/crates/test-utils/src/minicore.rs
+@@ -1489,6 +1489,7 @@ pub mod fmt {
+         message: Option<&'a str>,
+     }
+ 
++    #[unstable(feature = "fmt_internals", issue = "none")]
+     impl<'a> Arguments<'a> {
+         pub unsafe fn new<const N: usize, const M: usize>(
+             _template: &'a [u8; N],

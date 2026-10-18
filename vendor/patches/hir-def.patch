@@ -1,0 +1,3320 @@
+diff --git a/crates/hir-def/src/attrs.rs b/crates/hir-def/src/attrs.rs
+index 84559b46cc5b71a6eb4899f9697ac15915a524cc..df3f2b9454a8c6407a4375150da9657a7dabb2be 100644
+--- a/crates/hir-def/src/attrs.rs
++++ b/crates/hir-def/src/attrs.rs
+@@ -23,6 +23,7 @@ use either::Either;
+ use hir_expand::{
+     InFile, Lookup,
+     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
++    mod_path::{ModPath, PathKind},
+     name::Name,
+ };
+ use intern::Symbol;
+@@ -32,7 +33,7 @@ use rustc_abi::ReprOptions;
+ use rustc_hash::FxHashSet;
+ use smallvec::SmallVec;
+ use syntax::{
+-    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, T,
++    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
+     ast::{self, HasAttrs, TokenTreeChildren},
+ };
+ use tt::TextSize;
+@@ -160,6 +161,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
+             match second_segment {
+                 None => match &*first_segment {
+                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
++                    "inline" if !tt.syntax().text().contains_char('n') => {
++                        attr_flags.insert(AttrFlags::IS_INLINE)
++                    }
+                     "doc" => extract_doc_tt_attr(attr_flags, tt),
+                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
+                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
+@@ -189,6 +193,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
+                     "rust_analyzer" => match &*second_segment {
+                         "completions" => extract_ra_completions(attr_flags, tt),
+                         "macro_style" => extract_ra_macro_style(attr_flags, tt),
++                        "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
+                         _ => {}
+                     },
+                     _ => {}
+@@ -229,11 +234,21 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
+                     "rustc_paren_sugar" => attr_flags.insert(AttrFlags::RUSTC_PAREN_SUGAR),
+                     "rustc_coinductive" => attr_flags.insert(AttrFlags::RUSTC_COINDUCTIVE),
+                     "rustc_force_inline" => attr_flags.insert(AttrFlags::RUSTC_FORCE_INLINE),
++                    "rustc_promotable" => attr_flags.insert(AttrFlags::RUSTC_PROMOTABLE),
++                    "rustc_pass_indirectly_in_non_rustic_abis" => {
++                        attr_flags.insert(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
++                    }
+                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
+                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
+                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
+                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
+                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
++                    "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
++                    "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
++                    "rustc_inherit_overflow_checks" => {
++                        attr_flags.insert(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
++                    }
++                    "thread_local" => attr_flags.insert(AttrFlags::THREAD_LOCAL),
+                     "pointee" => attr_flags.insert(AttrFlags::IS_POINTEE),
+                     "non_exhaustive" => attr_flags.insert(AttrFlags::NON_EXHAUSTIVE),
+                     "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
+@@ -353,6 +368,15 @@ bitflags::bitflags! {
+         const DIAGNOSTIC_DO_NOT_RECOMMEND = 1 << 51;
+ 
+         const HAS_RUSTC_MUST_IMPLEMENT_ONE_OF = 1 << 52;
++
++        const TRACK_CALLER = 1 << 53;
++        const THREAD_LOCAL = 1 << 54;
++        const RUSTC_PROMOTABLE = 1 << 55;
++        const HAS_DEFINE_OPAQUE = 1 << 56;
++        const RUSTC_INHERIT_OVERFLOW_CHECKS = 1 << 57;
++        const RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 58;
++        /// `#[inline]` or `#[inline(always)]`: the crates that use the function compile it.
++        const IS_INLINE = 1 << 59;
+     }
+ }
+ 
+@@ -417,7 +441,7 @@ fn attrs_source(
+         AttrDefId::ModuleId(id) => {
+             let def_map = id.def_map(db);
+             let krate = def_map.krate();
+-            let (definition, declaration, extra_crate_attrs) = match def_map[id].origin {
++            let (definition, declaration, extra_crate_attrs) = match def_map.module(db, id).origin {
+                 ModuleOrigin::CrateRoot { definition } => {
+                     let definition_source = definition.parse(db).tree();
+                     let definition = InFile::new(definition.into(), definition_source.into());
+@@ -737,6 +761,36 @@ impl AttrFlags {
+         AttrFlags::query(db, owner).lang_item_with_attrs(db, owner)
+     }
+ 
++    /// The symbol a foreign item is declared to link against, if it is not its own name.
++    #[salsa::tracked(returns(clone))]
++    pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
++        collect_attrs(db, owner, |attr| {
++            if let ast::Meta::KeyValueMeta(attr) = attr
++                && attr.path().is1("link_name")
++                && let Some(value) = attr.value_string()
++            {
++                ControlFlow::Break(Symbol::intern(&value))
++            } else {
++                ControlFlow::Continue(())
++            }
++        })
++    }
++
++    /// The symbol `#[export_name]` gives an item.
++    #[salsa::tracked(returns(clone))]
++    pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
++        collect_attrs(db, owner, |attr| {
++            if let ast::Meta::KeyValueMeta(attr) = attr
++                && attr.path().is1("export_name")
++                && let Some(value) = attr.value_string()
++            {
++                ControlFlow::Break(Symbol::intern(&value))
++            } else {
++                ControlFlow::Continue(())
++            }
++        })
++    }
++
+     #[inline]
+     pub fn lang_item_with_attrs(self, db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+         if !self.contains(AttrFlags::LANG_ITEM) {
+@@ -1222,6 +1276,57 @@ impl AttrFlags {
+         }
+     }
+ 
++    /// The type aliases a function names in `#[define_opaque(..)]`, which has expanded to
++    /// `#[rust_analyzer::define_opaque(..)]` by now.
++    pub fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> &[ModPath] {
++        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_DEFINE_OPAQUE) {
++            return &[];
++        }
++        return define_opaque(db, owner);
++
++        #[salsa::tracked(returns(deref))]
++        fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> Box<[ModPath]> {
++            let mut result = Vec::new();
++            collect_attrs::<Infallible>(db, owner.into(), |attr| {
++                if let ast::Meta::TokenTreeMeta(attr) = attr
++                    && attr
++                        .path()
++                        .as_up_to_two_segment()
++                        .is_some_and(|(_, tool)| tool.is_some_and(|it| it == "define_opaque"))
++                    && let Some(tt) = attr.token_tree()
++                {
++                    let tokens = TokenTreeChildren::new(&tt)
++                        .filter_map(NodeOrToken::into_token)
++                        .collect_vec();
++                    for path in tokens.split(|it| it.kind() == T![,]) {
++                        let mut kind = PathKind::Plain;
++                        let mut segments = Vec::new();
++                        for token in path {
++                            match token.kind() {
++                                T![crate] => kind = PathKind::Crate,
++                                T![self] => kind = PathKind::SELF,
++                                T![super] => {
++                                    kind = match kind {
++                                        PathKind::Super(n) => PathKind::Super(n + 1),
++                                        _ => PathKind::Super(1),
++                                    }
++                                }
++                                SyntaxKind::IDENT => segments
++                                    .push(Name::new_symbol_root(Symbol::intern(token.text()))),
++                                _ => {}
++                            }
++                        }
++                        if !segments.is_empty() {
++                            result.push(ModPath::from_segments(kind, segments));
++                        }
++                    }
++                }
++                ControlFlow::Continue(())
++            });
++            result.into_boxed_slice()
++        }
++    }
++
+     pub fn must_implement_one_of(db: &dyn SourceDatabase, owner: TraitId) -> Option<&[Name]> {
+         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_RUSTC_MUST_IMPLEMENT_ONE_OF)
+         {
+@@ -1283,7 +1388,7 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
+         if !ident.kind().is_any_identifier() {
+             continue;
+         }
+-        let repr = match ident.text() {
++        let repr = match ident.text().trim_start_matches("r#") {
+             "packed" => {
+                 let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
+                     let tt = tt.clone();
+diff --git a/crates/hir-def/src/expr_store.rs b/crates/hir-def/src/expr_store.rs
+index 7d01a7c436e28ff63d7509b74caf8976fa8ac0b5..27cdb689a7abf69c733dc695bfaffadaed1729bb 100644
+--- a/crates/hir-def/src/expr_store.rs
++++ b/crates/hir-def/src/expr_store.rs
+@@ -129,6 +129,10 @@ struct ExpressionOnlyStore {
+     /// to variables and have hygiene (some refer to items, we don't know at this stage).
+     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+ 
++    /// The edition of each block that a macro wrote: it is the macro's, not the one of the crate
++    /// that uses the macro.
++    block_editions: FxHashMap<ExprId, Edition>,
++
+     /// Maps expression roots to their origin.
+     ///
+     /// Note: while every root expr is an inference root (aka. an `AnonConst`), there could be other roots that do not appear here.
+@@ -268,6 +272,7 @@ pub struct ExpressionStoreBuilder {
+     pub types: Arena<TypeRef>,
+     block_scopes: Vec<BlockId>,
+     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
++    block_editions: FxHashMap<ExprId, Edition>,
+     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
+ 
+     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
+@@ -352,6 +357,7 @@ impl ExpressionStoreBuilder {
+             mut bindings,
+             mut binding_owners,
+             mut ident_hygiene,
++            mut block_editions,
+             inference_roots: mut expr_roots,
+             mut types,
+             mut lifetimes,
+@@ -379,6 +385,7 @@ impl ExpressionStoreBuilder {
+         bindings.shrink_to_fit();
+         binding_owners.shrink_to_fit();
+         ident_hygiene.shrink_to_fit();
++        block_editions.shrink_to_fit();
+         types.shrink_to_fit();
+         lifetimes.shrink_to_fit();
+ 
+@@ -423,6 +430,7 @@ impl ExpressionStoreBuilder {
+                     binding_owners,
+                     block_scopes: block_scopes.into_boxed_slice(),
+                     ident_hygiene,
++                    block_editions,
+                     expr_roots: expr_roots
+                         .expect("should always finish with a `Some(_)` expr_roots"),
+                 }))
+@@ -675,7 +683,7 @@ impl ExpressionStore {
+             Expr::OffsetOf(OffsetOf { container, fields: _ }) => visitor.on_type(*container),
+             Expr::Path(path) => visitor.on_path(path),
+             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
+-            Expr::InlineAsm(InlineAsm { operands, options: _, kind: _ }) => {
++            Expr::InlineAsm(InlineAsm { operands, .. }) => {
+                 operands.iter().for_each(|(_, op)| match op {
+                     AsmOperand::In { expr, reg: _ }
+                     | AsmOperand::Out { expr: Some(expr), late: _, reg: _ }
+@@ -701,7 +709,7 @@ impl ExpressionStore {
+             Expr::Block { statements, tail, id: _, label: _, unsafe_: _ } => {
+                 for stmt in statements {
+                     match stmt {
+-                        Statement::Let { initializer, else_branch, pat, type_ref } => {
++                        Statement::Let { initializer, else_branch, pat, type_ref, is_super: _ } => {
+                             visitor.on_expr_opt(*initializer);
+                             visitor.on_expr_opt(*else_branch);
+                             visitor.on_pat(*pat);
+@@ -881,6 +889,11 @@ impl ExpressionStore {
+         self.assert_expr_only().bindings[binding].hygiene
+     }
+ 
++    /// The edition a block was written in, when a macro wrote it.
++    pub fn block_edition(&self, block: ExprId) -> Option<Edition> {
++        self.assert_expr_only().block_editions.get(&block).copied()
++    }
++
+     pub fn expr_path_hygiene(&self, expr: ExprId) -> HygieneId {
+         self.assert_expr_only().ident_hygiene.get(&expr.into()).copied().unwrap_or(HygieneId::ROOT)
+     }
+diff --git a/crates/hir-def/src/expr_store/lower.rs b/crates/hir-def/src/expr_store/lower.rs
+index 5bd865ec6cc6294972cbcac9f25728e836d5a8ea..f73ccf72c975f430bb4f0401af9f6100b0d2ec44 100644
+--- a/crates/hir-def/src/expr_store/lower.rs
++++ b/crates/hir-def/src/expr_store/lower.rs
+@@ -784,6 +784,9 @@ impl<'db> ExprCollector<'db> {
+             }
+             ast::Type::InferType(_inner) => TypeRef::Placeholder,
+             ast::Type::FnPtrType(inner) => {
++                // Taken before the parameters are lowered: a function pointer among them
++                // is not what the `for` is written on.
++                let binder = self.for_type_binder.take().map(|b| b.into());
+                 let ret_ty = inner
+                     .ret_type()
+                     .and_then(|rt| rt.ty())
+@@ -820,7 +823,6 @@ impl<'db> ExprCollector<'db> {
+                 let abi = inner.abi().map(lower_abi).unwrap_or(ExternAbi::Rust);
+                 params.push((None, ret_ty));
+ 
+-                let binder = self.for_type_binder.take().map(|b| b.into());
+                 TypeRef::Fn(Box::new(FnType {
+                     is_varargs,
+                     is_unsafe: inner.unsafe_token().is_some(),
+@@ -1147,6 +1149,7 @@ impl<'db> ExprCollector<'db> {
+                 type_ref: None,
+                 initializer: Some(expr),
+                 else_branch: None,
++                is_super: false,
+             });
+             self_param.user_written = child_binding_id;
+         }
+@@ -1191,6 +1194,7 @@ impl<'db> ExprCollector<'db> {
+                     type_ref: None,
+                     initializer: Some(expr),
+                     else_branch: None,
++                    is_super: false,
+                 });
+             }
+             let expr = self.alloc_expr_desugared(Expr::Path(name.clone().into()));
+@@ -1202,6 +1206,7 @@ impl<'db> ExprCollector<'db> {
+                 type_ref: None,
+                 initializer: Some(expr),
+                 else_branch: None,
++                is_super: false,
+             });
+ 
+             let parent_binding_id = self.alloc_binding(name, BindingAnnotation::Mutable, hygiene);
+@@ -1628,7 +1633,12 @@ impl<'db> ExprCollector<'db> {
+                 self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
+             }
+             ast::Expr::ParenExpr(e) => {
+-                let inner = self.collect_expr_opt(e.expr());
++                // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
++                // those go with it.
++                let inner = match e.expr() {
++                    Some(inner) => self.maybe_collect_expr(inner)?,
++                    None => self.missing_expr(),
++                };
+                 // make the paren expr point to the inner expression as well for IDE resolution
+                 let src = self.expander.in_file(syntax_ptr);
+                 self.store.expr_map.insert(src, inner.into());
+@@ -1891,7 +1901,10 @@ impl<'db> ExprCollector<'db> {
+                 }
+             }
+ 
+-            ast::Expr::Literal(e) => self.alloc_expr(Expr::Literal(e.kind().into()), syntax_ptr),
++            ast::Expr::Literal(e) => {
++                let literal = self.module_path_literal().unwrap_or_else(|| e.kind().into());
++                self.alloc_expr(Expr::Literal(literal), syntax_ptr)
++            }
+             ast::Expr::IndexExpr(e) => {
+                 let base = self.collect_expr_opt(e.base());
+                 let index = self.collect_expr_opt(e.index());
+@@ -1921,7 +1934,19 @@ impl<'db> ExprCollector<'db> {
+             ast::Expr::AsmExpr(e) => self.lower_inline_asm(e, syntax_ptr),
+             ast::Expr::OffsetOfExpr(e) => {
+                 let container = self.lower_type_ref_opt_disallow_impl_trait(e.ty());
+-                let fields = e.fields().map(|it| it.as_name()).collect();
++                // A float token is two tuple indices: `0.1`.
++                let fields = e
++                    .fields()
++                    .flat_map(|it| match it.syntax().first_token() {
++                        Some(token) if token.kind() == syntax::SyntaxKind::FLOAT_NUMBER => token
++                            .text()
++                            .split('.')
++                            .filter_map(|index| index.parse().ok())
++                            .map(Name::new_tuple_field)
++                            .collect(),
++                        _ => vec![it.as_name()],
++                    })
++                    .collect();
+                 self.alloc_expr(Expr::OffsetOf(OffsetOf { container, fields }), syntax_ptr)
+             }
+             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
+@@ -2357,6 +2382,7 @@ impl<'db> ExprCollector<'db> {
+                             type_ref: Some(type_ref),
+                             initializer: Some(expr_id),
+                             else_branch: None,
++                            is_super: false,
+                         }]),
+                         tail: Some(tail_expr),
+                         label: None,
+@@ -2607,6 +2633,32 @@ impl<'db> ExprCollector<'db> {
+         self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
+     }
+ 
++    /// The path of the module being lowered when the literal being lowered is what
++    /// `module_path!()` expanded to, which is a placeholder: the expander doesn't know modules.
++    fn module_path_literal(&self) -> Option<Literal> {
++        let call = self.expander.current_file_id().macro_file()?;
++        let hir_expand::MacroDefKind::BuiltIn(
++            _,
++            hir_expand::builtin::BuiltinFnLikeExpander::ModulePath,
++        ) = call.loc(self.db).def.kind
++        else {
++            return None;
++        };
++        let mut module = self.module;
++        let mut segments = Vec::new();
++        while let Some(parent) = module.containing_module(self.db) {
++            if !module.is_block_module(self.db) {
++                segments.push(module.name(self.db)?.symbol().as_str().to_owned());
++            }
++            // SAFETY: the module is of this database.
++            module = unsafe { parent.to_static() };
++        }
++        let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
++        segments.push(krate.crate_name().symbol().as_str().to_owned());
++        segments.reverse();
++        Some(Literal::String(Symbol::intern(&segments.join("::"))))
++    }
++
+     fn collect_macro_call<T, U>(
+         &mut self,
+         mcall: ast::MacroCall,
+@@ -2619,14 +2671,27 @@ impl<'db> ExprCollector<'db> {
+     {
+         let macro_call_ptr = self.expander.in_file(syntax_ptr);
+ 
+-        let block_call = self.def_map.modules[self.module].scope.macro_invoc(
++        let block_call = self.def_map.module(self.db, self.module).scope(self.db).macro_invoc(
+             self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
+         );
+         let res = match block_call {
+             // fast path, macro call is in a block module
+             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
+             None => {
+-                let resolver = |path: &_| {
++                let resolver = |path: &ModPath| {
++                    // The latest `macro_rules!` of that name before the call, which is not
++                    // the last one of the block when a later statement defines it again.
++                    let shadowing = path.as_ident().and_then(|name| {
++                        let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
++                        let defs = self
++                            .def_map
++                            .module(self.db, self.def_map.root)
++                            .legacy_macro_in_scope(self.db, name)?;
++                        defs.get(seen.checked_sub(1)?).copied()
++                    });
++                    if shadowing.is_some() {
++                        return shadowing;
++                    }
+                     self.def_map
+                         .resolve_path(
+                             self.local_def_map,
+@@ -2705,7 +2770,9 @@ impl<'db> ExprCollector<'db> {
+                         expr => this.maybe_collect_expr(expr),
+                     })
+                 }
+-                None => None,
++                // What does not expand is not nothing: a block that ends in it has its type,
++                // not `()`.
++                None => Some(this.alloc_expr(Expr::Missing, syntax_ptr)),
+             },
+         );
+         expansion.inspect(|&tail| {
+@@ -2729,7 +2796,14 @@ impl<'db> ExprCollector<'db> {
+                     .let_else()
+                     .and_then(|let_else| let_else.block_expr())
+                     .map(|block| self.collect_block(block));
+-                statements.push(Statement::Let { pat, type_ref, initializer, else_branch });
++                let is_super = stmt.super_token().is_some();
++                statements.push(Statement::Let {
++                    pat,
++                    type_ref,
++                    initializer,
++                    else_branch,
++                    is_super,
++                });
+             }
+             ast::Stmt::ExprStmt(stmt) => {
+                 let expr = stmt.expr();
+@@ -2752,8 +2826,11 @@ impl<'db> ExprCollector<'db> {
+                     return;
+                 };
+                 let name = name.as_name();
+-                let macro_id =
+-                    self.def_map.modules[self.def_map.root].scope.get(&name).take_macros();
++                let macro_id = self
++                    .def_map
++                    .module(self.db, self.def_map.root)
++                    .name_in_scope(self.db, &name)
++                    .take_macros();
+                 self.collect_macro_def(statements, macro_id);
+             }
+             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
+@@ -2767,9 +2844,10 @@ impl<'db> ExprCollector<'db> {
+                 let name = name.as_name();
+                 let macro_defs_count =
+                     self.current_block_legacy_macro_defs_count.entry(name.clone()).or_insert(0);
+-                let macro_id = self.def_map.modules[self.def_map.root]
+-                    .scope
+-                    .get_legacy_macro(&name)
++                let macro_id = self
++                    .def_map
++                    .module(self.db, self.def_map.root)
++                    .legacy_macro_in_scope(self.db, &name)
+                     .and_then(|it| it.get(*macro_defs_count))
+                     .copied();
+                 *macro_defs_count += 1;
+@@ -2822,7 +2900,11 @@ impl<'db> ExprCollector<'db> {
+             };
+         let prev_def_map = mem::replace(&mut self.def_map, def_map);
+         let prev_local_module = mem::replace(&mut self.module, module);
+-        let prev_legacy_macros_count = mem::take(&mut self.current_block_legacy_macro_defs_count);
++        // A block without items of its own is still in the scope the count is of.
++        let prev_legacy_macros_count = match block_id {
++            Some(_) => mem::take(&mut self.current_block_legacy_macro_defs_count),
++            None => self.current_block_legacy_macro_defs_count.clone(),
++        };
+ 
+         let mut statements = Vec::new();
+         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));
+@@ -2839,9 +2921,17 @@ impl<'db> ExprCollector<'db> {
+             None
+         });
+ 
++        let written_in = block
++            .stmt_list()
++            .and_then(|it| it.l_curly_token())
++            .map(|it| self.expander.ctx_for_range(it.text_range()))
++            .filter(|it| !it.is_root());
+         let syntax_node_ptr = AstPtr::new(&block.into());
+         let expr = mk_block(self, block_id, statements.into_boxed_slice(), tail);
+         let expr_id = self.alloc_expr(expr, syntax_node_ptr);
++        if let Some(written_in) = written_in {
++            self.store.block_editions.insert(expr_id, written_in.edition(self.db));
++        }
+ 
+         self.def_map = prev_def_map;
+         self.module = prev_local_module;
+diff --git a/crates/hir-def/src/expr_store/lower/asm.rs b/crates/hir-def/src/expr_store/lower/asm.rs
+index fb0a5b0bf7a71b7f026aa8ad98d643bea9599b19..96ac22331de88a12f0a63edfd62af7df4558033c 100644
+--- a/crates/hir-def/src/expr_store/lower/asm.rs
++++ b/crates/hir-def/src/expr_store/lower/asm.rs
+@@ -10,7 +10,10 @@ use tt::TextRange;
+ 
+ use crate::{
+     expr_store::lower::{ExprCollector, FxIndexSet},
+-    hir::{AsmOperand, AsmOptions, Expr, ExprId, InlineAsm, InlineAsmKind, InlineAsmRegOrRegClass},
++    hir::{
++        AsmOperand, AsmOptions, AsmPiece, Expr, ExprId, InlineAsm, InlineAsmKind,
++        InlineAsmRegOrRegClass,
++    },
+ };
+ 
+ impl ExprCollector<'_> {
+@@ -110,8 +113,13 @@ impl ExprCollector<'_> {
+                                     let in_expr = self.collect_expr_opt(op_expr.in_expr());
+                                     match op_expr.fat_arrow_token().is_some() {
+                                         true => {
++                                            // `out_expr` of the generated AST is the first
++                                            // expression, which is the one going in.
+                                             let out_expr = op_expr
+-                                                .out_expr()
++                                                .syntax()
++                                                .children()
++                                                .filter_map(ast::Expr::cast)
++                                                .nth(1)
+                                                 .filter(|it| {
+                                                     !matches!(it, ast::Expr::UnderscoreExpr(_))
+                                                 })
+@@ -133,8 +141,13 @@ impl ExprCollector<'_> {
+                                     let in_expr = self.collect_expr_opt(op_expr.in_expr());
+                                     match op_expr.fat_arrow_token().is_some() {
+                                         true => {
++                                            // `out_expr` of the generated AST is the first
++                                            // expression, which is the one going in.
+                                             let out_expr = op_expr
+-                                                .out_expr()
++                                                .syntax()
++                                                .children()
++                                                .filter_map(ast::Expr::cast)
++                                                .nth(1)
+                                                 .filter(|it| {
+                                                     !matches!(it, ast::Expr::UnderscoreExpr(_))
+                                                 })
+@@ -181,16 +194,47 @@ impl ExprCollector<'_> {
+ 
+         let mut mappings = vec![];
+         let mut curarg = 0;
++        let mut template = Some(Vec::new());
++        if options.contains(AsmOptions::RAW) {
++            for it in asm.template() {
++                if !self.check_cfg(&it) {
++                    continue;
++                }
++                let text = self
++                    .expand_macros_to_string(it)
++                    .and_then(|(s, _)| s.value().ok().map(|it| it.into_owned()));
++                match (&mut template, text) {
++                    (Some(pieces), Some(text)) => {
++                        pieces.push(AsmPiece::Lit(format!("{text}\n").into()))
++                    }
++                    _ => template = None,
++                }
++            }
++        }
++        let mut comment_only = !options.contains(AsmOptions::RAW);
+         if !options.contains(AsmOptions::RAW) {
+             // Don't treat raw asm as a format string.
+             asm.template()
+                 .enumerate()
+-                .filter_map(|(idx, it)| Some((idx, it.clone(), self.expand_macros_to_string(it)?)))
++                .filter_map(|(idx, it)| {
++                    if !self.check_cfg(&it) {
++                        return None;
++                    }
++                    Some((idx, it.clone(), self.expand_macros_to_string(it)?))
++                })
+                 .for_each(|(idx, expr, (s, is_direct_literal))| {
+                     mappings.resize_with(idx + 1, Vec::default);
+                     let Ok(text) = s.value() else {
++                        comment_only = false;
++                        template = None;
+                         return;
+                     };
++                    let line = text.trim();
++                    comment_only &= line.is_empty()
++                        || line
++                            .strip_prefix("/*")
++                            .and_then(|it| it.strip_suffix("*/"))
++                            .is_some_and(|it| !it.contains("*/"));
+                     let mappings = &mut mappings[idx];
+                     let template_snippet = match expr {
+                         ast::Expr::Literal(literal) => match literal.kind() {
+@@ -225,6 +269,9 @@ impl ExprCollector<'_> {
+                             unverified_pieces.push(piece);
+                         }
+                     }
++                    if !parser.errors.is_empty() {
++                        template = None;
++                    }
+ 
+                     curarg = parser.curarg;
+ 
+@@ -238,7 +285,11 @@ impl ExprCollector<'_> {
+                     };
+                     for piece in unverified_pieces {
+                         match piece {
+-                            rustc_parse_format::Piece::Lit(_) => {}
++                            rustc_parse_format::Piece::Lit(lit) => {
++                                if let Some(pieces) = &mut template {
++                                    pieces.push(AsmPiece::Lit(lit.into()));
++                                }
++                            }
+                             rustc_parse_format::Piece::NextArgument(arg) => {
+                                 // let span = arg_spans.next();
+ 
+@@ -263,6 +314,13 @@ impl ExprCollector<'_> {
+                                     }
+                                 };
+ 
++                                match (&mut template, operand_idx) {
++                                    (Some(pieces), Some(index)) => pieces.push(AsmPiece::Operand {
++                                        index,
++                                        modifier: arg.format.ty.chars().next(),
++                                    }),
++                                    _ => template = None,
++                                }
+                                 if let Some(operand_idx) = operand_idx
+                                     && let Some(position_span) = to_span(arg.position_span)
+                                 {
+@@ -271,6 +329,9 @@ impl ExprCollector<'_> {
+                             }
+                         }
+                     }
++                    if let Some(pieces) = &mut template {
++                        pieces.push(AsmPiece::Lit("\n".into()));
++                    }
+                 })
+         };
+ 
+@@ -283,7 +344,13 @@ impl ExprCollector<'_> {
+         };
+ 
+         let idx = self.alloc_expr(
+-            Expr::InlineAsm(InlineAsm { operands: operands.into_boxed_slice(), options, kind }),
++            Expr::InlineAsm(InlineAsm {
++                operands: operands.into_boxed_slice(),
++                template: template.map(Vec::into_boxed_slice),
++                options,
++                kind,
++                comment_only,
++            }),
+             syntax_ptr,
+         );
+         self.store
+diff --git a/crates/hir-def/src/expr_store/lower/format_args.rs b/crates/hir-def/src/expr_store/lower/format_args.rs
+index d6f0aa60978af742d4c064912c460e1048ee22a6..f06d071dc1a136dacafa685067a3fb801fa61283 100644
+--- a/crates/hir-def/src/expr_store/lower/format_args.rs
++++ b/crates/hir-def/src/expr_store/lower/format_args.rs
+@@ -323,6 +323,7 @@ impl<'db> ExprCollector<'db> {
+                 type_ref: None,
+                 initializer: Some(args_tuple),
+                 else_branch: None,
++                is_super: false,
+             };
+ 
+             // Generate:
+@@ -356,6 +357,7 @@ impl<'db> ExprCollector<'db> {
+                 type_ref: None,
+                 initializer: Some(args),
+                 else_branch: None,
++                is_super: false,
+             };
+             (
+                 vec![let_statement_1, let_statement_2],
+diff --git a/crates/hir-def/src/expr_store/pretty.rs b/crates/hir-def/src/expr_store/pretty.rs
+index 1d01605695a74682372c5fa1f6db6f75ea64f04b..ac7044964a9da5ee0b92cf084f7369d473614917 100644
+--- a/crates/hir-def/src/expr_store/pretty.rs
++++ b/crates/hir-def/src/expr_store/pretty.rs
+@@ -1041,7 +1041,7 @@ impl Printer<'_> {
+ 
+     fn print_stmt(&mut self, stmt: &Statement) {
+         match stmt {
+-            Statement::Let { pat, type_ref, initializer, else_branch } => {
++            Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
+                 w!(self, "let ");
+                 self.print_pat(*pat);
+                 if let Some(ty) = type_ref {
+diff --git a/crates/hir-def/src/expr_store/scope.rs b/crates/hir-def/src/expr_store/scope.rs
+index a7403a0e555b99f812b95813fbee95448b287e3e..e63e16c5f014f09e5b7c9f50ce0bd1c0adb58b86 100644
+--- a/crates/hir-def/src/expr_store/scope.rs
++++ b/crates/hir-def/src/expr_store/scope.rs
+@@ -311,7 +311,7 @@ impl ExprScopeVisitor<'_> {
+ 
+             for stmt in statements {
+                 match stmt {
+-                    Statement::Let { pat, initializer, else_branch, type_ref } => {
++                    Statement::Let { pat, initializer, else_branch, type_ref, .. } => {
+                         this.on_type_opt(*type_ref);
+                         this.on_expr_opt(*initializer);
+                         this.on_expr_opt(*else_branch);
+@@ -419,7 +419,7 @@ mod tests {
+         let crate_def_map = crate_def_map(db, krate);
+ 
+         let module = crate_def_map.modules_for_file(db, file_id).next().unwrap();
+-        let (_, def) = crate_def_map[module].scope.entries().next().unwrap();
++        let (_, def) = crate_def_map.module(db, module).scope(db).entries().next().unwrap();
+         match def.take_values().unwrap() {
+             ModuleDefId::FunctionId(it) => it,
+             _ => panic!(),
+diff --git a/crates/hir-def/src/expr_store/tests/body.rs b/crates/hir-def/src/expr_store/tests/body.rs
+index aa3165670be35a7aba47f11331f537c1aee89a54..40c91ac06fbdba70553498547c4ea1480b364b81 100644
+--- a/crates/hir-def/src/expr_store/tests/body.rs
++++ b/crates/hir-def/src/expr_store/tests/body.rs
+@@ -13,8 +13,8 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
+     let krate = db.fetch_test_crate();
+     let def_map = crate_def_map(&db, krate);
+     let mut fn_def = None;
+-    'outer: for (_, module) in def_map.modules() {
+-        for decl in module.scope.declarations() {
++    'outer: for (_, module) in def_map.modules(&db) {
++        for decl in module.scope(&db).declarations() {
+             if let ModuleDefId::FunctionId(it) = decl {
+                 fn_def = Some(it);
+                 break 'outer;
+@@ -33,8 +33,8 @@ fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
+     let krate = db.fetch_test_crate();
+     let def_map = crate_def_map(&db, krate);
+     let mut fn_def = None;
+-    'outer: for (_, module) in def_map.modules() {
+-        for decl in module.scope.declarations() {
++    'outer: for (_, module) in def_map.modules(&db) {
++        for decl in module.scope(&db).declarations() {
+             if let ModuleDefId::FunctionId(it) = decl {
+                 fn_def = Some(it);
+                 break 'outer;
+@@ -160,6 +160,21 @@ mod m {
+     );
+ }
+ 
++#[test]
++fn unresolved_macro_at_the_end_of_a_block_is_missing() {
++    pretty_print(
++        r#"
++fn main() -> u8 {
++    nothing_of_this_name!()
++}
++"#,
++        expect![[r#"
++            fn main() {
++                �
++            }"#]],
++    );
++}
++
+ #[test]
+ fn desugar_for_loop() {
+     pretty_print(
+diff --git a/crates/hir-def/src/expr_store/tests/body/block.rs b/crates/hir-def/src/expr_store/tests/body/block.rs
+index 850919e8e732f5562c897755cc34a0d6b19320cd..3a4b0b788d762450b64429ceb69a260e84fbabaa 100644
+--- a/crates/hir-def/src/expr_store/tests/body/block.rs
++++ b/crates/hir-def/src/expr_store/tests/body/block.rs
+@@ -196,7 +196,7 @@ fn f() {
+                 ),
+                 block: Some(
+                     BlockId(
+-                        Id(781),
++                        Id(881),
+                     ),
+                 ),
+                 containing_module_inside_def_map: None,
+diff --git a/crates/hir-def/src/expr_store/tests/signatures.rs b/crates/hir-def/src/expr_store/tests/signatures.rs
+index 460ab6418d92d42618a7f61bfd28d7cd5aea4fa8..a8d030093e76ed292bc3db4612974b25eb1a9312 100644
+--- a/crates/hir-def/src/expr_store/tests/signatures.rs
++++ b/crates/hir-def/src/expr_store/tests/signatures.rs
+@@ -16,8 +16,8 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
+     let krate = db.fetch_test_crate();
+     let def_map = crate_def_map(&db, krate);
+     let mut defs = vec![];
+-    for (_, module) in def_map.modules() {
+-        for decl in module.scope.declarations() {
++    for (_, module) in def_map.modules(&db) {
++        for decl in module.scope(&db).declarations() {
+             let def: GenericDefId = match decl {
+                 ModuleDefId::ModuleId(_) => continue,
+                 ModuleDefId::FunctionId(id) => id.into(),
+diff --git a/crates/hir-def/src/find_path.rs b/crates/hir-def/src/find_path.rs
+index daece7fc5d5664736b26090dbb449fd23712c10c..9a718b5e54643d914ccfd91a22362431715dd7a5 100644
+--- a/crates/hir-def/src/find_path.rs
++++ b/crates/hir-def/src/find_path.rs
+@@ -207,8 +207,9 @@ fn find_path_for_module<'db>(
+             let name_already_occupied_in_type_ns = ctx
+                 .from_def_map
+                 .with_ancestor_maps(ctx.db, ctx.from, &mut |def_map, local_id| {
+-                    def_map[local_id]
+-                        .scope
++                    def_map
++                        .module(ctx.db, local_id)
++                        .scope(ctx.db)
+                         .type_(name)
+                         .filter(|&(id, _)| id != ModuleDefId::ModuleId(def_id))
+                 })
+@@ -278,7 +279,7 @@ fn find_in_scope<'db>(
+ ) -> Option<Name> {
+     // FIXME: We could have multiple applicable names here, but we currently only return the first
+     def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
+-        def_map[local_id].scope.names_of(item, |name, _, declared| {
++        def_map.module(db, local_id).scope(db).names_of(item, |name, _, declared| {
+             (declared || !ignore_local_imports).then(|| name.clone())
+         })
+     })
+@@ -294,7 +295,7 @@ fn find_in_prelude(
+ ) -> Option<Choice> {
+     let (prelude_module, _) = local_def_map.prelude()?;
+     let prelude_def_map = prelude_module.def_map(db);
+-    let prelude_scope = &prelude_def_map[prelude_module].scope;
++    let prelude_scope = &prelude_def_map.module(db, prelude_module).scope(db);
+     let (name, vis, _declared) = prelude_scope.name_of(item)?;
+     if !vis.is_visible_from(db, from) {
+         return None;
+@@ -303,7 +304,7 @@ fn find_in_prelude(
+     // Check if the name is in current scope and it points to the same def.
+     let found_and_same_def =
+         local_def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
+-            let per_ns = def_map[local_id].scope.get(name);
++            let per_ns = def_map.module(db, local_id).scope(db).get(name);
+             let same_def = match item {
+                 ItemInNs::Types(it) => per_ns.take_types()? == it,
+                 ItemInNs::Values(it) => per_ns.take_values()? == it,
+@@ -331,7 +332,7 @@ fn is_kw_kind_relative_to_from(
+     if item == from {
+         // - if the item is the module we're in, use `self`
+         Some(PathKind::SELF)
+-    } else if let Some(parent_id) = def_map[from].parent {
++    } else if let Some(parent_id) = def_map.module(db, from).parent {
+         if item == parent_id {
+             // - if the item is the parent module, use `super` (this is not used recursively, since `super::super` is ugly)
+             Some(if parent_id == def_map.root { PathKind::Crate } else { PathKind::Super(1) })
+@@ -589,8 +590,10 @@ fn find_local_import_locations<'db>(
+ 
+     // Compute the initial worklist. We start with all direct child modules of `from` as well as all
+     // of its (recursive) parent modules.
+-    let mut worklist = ctx.from_def_map[ctx.from]
+-        .children
++    let mut worklist = ctx
++        .from_def_map
++        .module(db, ctx.from)
++        .children(db)
+         .values()
+         .copied()
+         .chain(iter::successors(ctx.from.containing_module(db), |m| m.containing_module(db)))
+@@ -612,13 +615,13 @@ fn find_local_import_locations<'db>(
+         let data = if module.block(db).is_some() {
+             // Re-query the block's DefMap
+             block_def_map = module.def_map(db);
+-            &block_def_map[module]
++            &block_def_map.module(db, module)
+         } else {
+             // Reuse the root DefMap
+-            &def_map[module]
++            &def_map.module(db, module)
+         };
+ 
+-        if let Some((name, vis, declared)) = data.scope.name_of(item)
++        if let Some((name, vis, declared)) = data.scope(db).name_of(item)
+             && vis.is_visible_from(db, ctx.from)
+         {
+             let is_pub_or_explicit = match vis {
+@@ -645,7 +648,7 @@ fn find_local_import_locations<'db>(
+         }
+ 
+         // Descend into all modules visible from `from`.
+-        for (module, vis) in data.scope.modules_in_scope() {
++        for (module, vis) in data.scope(db).modules_in_scope() {
+             if module.krate(db) != ctx.from.krate(db) {
+                 // We don't need to look at modules from other crates as our item has to be in the
+                 // current crate
+diff --git a/crates/hir-def/src/hir.rs b/crates/hir-def/src/hir.rs
+index 85a41c6495159b8644e5f8dd4fc27fb3289ab8f1..502c88b0e3d40defeadd5cf61099af5e9dc61235 100644
+--- a/crates/hir-def/src/hir.rs
++++ b/crates/hir-def/src/hir.rs
+@@ -480,8 +480,24 @@ pub struct OffsetOf {
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct InlineAsm {
+     pub operands: Box<[(Option<Name>, AsmOperand)]>,
++    /// What to assemble, the template strings joined by newlines. `None` when a string could
++    /// not be read or names an operand that is not there.
++    pub template: Option<Box<[AsmPiece]>>,
+     pub options: AsmOptions,
+     pub kind: InlineAsmKind,
++    /// The template is nothing but assembler comments, so the block emits no instructions.
++    /// Crates use this as an optimization barrier.
++    pub comment_only: bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++pub enum AsmPiece {
++    Lit(Box<str>),
++    /// The operand at `index`, written as its `modifier` says: `{0:e}`.
++    Operand {
++        index: usize,
++        modifier: Option<char>,
++    },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -678,6 +694,8 @@ pub enum Statement {
+         type_ref: Option<TypeRefId>,
+         initializer: Option<ExprId>,
+         else_branch: Option<ExprId>,
++        /// `super let`: the binding lives as long as the value of the block it is in.
++        is_super: bool,
+     },
+     Expr {
+         expr: ExprId,
+diff --git a/crates/hir-def/src/import_map.rs b/crates/hir-def/src/import_map.rs
+index 669b21c03a46fe91e2b3ef266d4ea86c32a468fc..2bb081ce9982bc98a1b54fdcd4d19dcc25fcdd13 100644
+--- a/crates/hir-def/src/import_map.rs
++++ b/crates/hir-def/src/import_map.rs
+@@ -149,13 +149,13 @@ impl ImportMap {
+                 continue;
+             }
+             let mod_data = if module.krate(db) == krate {
+-                &def_map[module]
++                &def_map.module(db, module)
+             } else {
+                 // The crate might reexport a module defined in another crate.
+-                &module.def_map(db)[module]
++                &module.def_map(db).module(db, module)
+             };
+ 
+-            let visible_items = mod_data.scope.entries().filter_map(|(name, per_ns)| {
++            let visible_items = mod_data.scope(db).entries().filter_map(|(name, per_ns)| {
+                 let per_ns = per_ns.filter_visibility(|vis| vis == Visibility::Public);
+                 if per_ns.is_none() { None } else { Some((name, per_ns)) }
+             });
+@@ -672,8 +672,8 @@ mod tests {
+         assert!(def_map.block_id().is_none(), "block local items should not be in `ImportMap`");
+ 
+         while let Some(parent) = module.containing_module(db) {
+-            let parent_data = &def_map[parent];
+-            let (name, _) = parent_data.children.iter().find(|(_, id)| **id == module).unwrap();
++            let parent_data = &def_map.module(db, parent);
++            let (name, _) = parent_data.children(db).iter().find(|(_, id)| **id == module).unwrap();
+             segments.push(name);
+             module = parent;
+         }
+diff --git a/crates/hir-def/src/item_scope.rs b/crates/hir-def/src/item_scope.rs
+index b136f5ede984c4002e74b359f468423e726df28f..39a4441776f3dc4debcb40cb89b3c26d0c6cff8d 100644
+--- a/crates/hir-def/src/item_scope.rs
++++ b/crates/hir-def/src/item_scope.rs
+@@ -121,7 +121,7 @@ impl PerNsGlobImports {
+     }
+ }
+ 
+-#[derive(Debug, Default, PartialEq, Eq)]
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
+ pub struct ItemScope {
+     /// Defs visible in this scope. This includes `declarations`, but also
+     /// imports. The imports belong to this module and can be resolved by using them on
+@@ -171,7 +171,7 @@ pub struct ItemScope {
+     derive_macros: FxHashMap<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
+ }
+ 
+-#[derive(Debug, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ struct DeriveMacroInvocation {
+     attr_id: AttrId,
+     /// The `#[derive]` call
+@@ -244,7 +244,7 @@ impl ItemScope {
+             match m {
+                 ImportOrDef::Import(i) => {
+                     let module_id = i.use_.lookup(db).container;
+-                    scope = &module_id.def_map(db)[module_id].scope;
++                    scope = module_id.def_map(db).module(db, module_id).scope(db);
+                     import = i;
+                 }
+                 ImportOrDef::Def(ModuleDefId::MacroId(def)) => {
+@@ -259,7 +259,7 @@ impl ItemScope {
+             match m {
+                 ImportOrDef::Import(i) => {
+                     let module_id = i.use_.lookup(db).container;
+-                    scope = &module_id.def_map(db)[module_id].scope;
++                    scope = module_id.def_map(db).module(db, module_id).scope(db);
+                     import = i;
+                 }
+                 ImportOrDef::Def(def) => {
+@@ -274,7 +274,7 @@ impl ItemScope {
+             match m {
+                 ImportOrDef::Import(i) => {
+                     let module_id = i.use_.lookup(db).container;
+-                    scope = &module_id.def_map(db)[module_id].scope;
++                    scope = module_id.def_map(db).module(db, module_id).scope(db);
+                     import = i;
+                 }
+                 ImportOrDef::Def(def) => {
+@@ -340,6 +340,16 @@ impl ItemScope {
+         self.unnamed_consts.iter().copied()
+     }
+ 
++    /// Every const of the module, named or not. An impl in the block of any of them is an impl
++    /// of the crate.
++    pub fn consts(&self) -> impl Iterator<Item = ConstId> + '_ {
++        let named = self.declarations.iter().filter_map(|&def| match def {
++            ModuleDefId::ConstId(konst) => Some(konst),
++            _ => None,
++        });
++        self.unnamed_consts().chain(named)
++    }
++
+     /// Iterate over all legacy textual scoped macros visible at the end of the module
+     pub fn legacy_macros(&self) -> impl Iterator<Item = (&Name, &[MacroId])> + '_ {
+         self.legacy_macros.iter().map(|(name, def)| (name, &**def))
+diff --git a/crates/hir-def/src/lang_item.rs b/crates/hir-def/src/lang_item.rs
+index 8aeb54b509cacf335894a0348911743d18fa7ad4..eca38b330dc80e7fd796200f9f0d66477be24004 100644
+--- a/crates/hir-def/src/lang_item.rs
++++ b/crates/hir-def/src/lang_item.rs
+@@ -46,8 +46,8 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
+         return None;
+     }
+ 
+-    for (_, module_data) in crate_def_map.modules() {
+-        for impl_def in module_data.scope.inherent_impls() {
++    for (_, module_data) in crate_def_map.modules(db) {
++        for impl_def in module_data.scope(db).inherent_impls() {
+             lang_items.collect_lang_item(db, impl_def);
+             for &(_, assoc) in impl_def.impl_items(db).items.iter() {
+                 match assoc {
+@@ -58,7 +58,7 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
+             }
+         }
+ 
+-        for def in module_data.scope.declarations() {
++        for def in module_data.scope(db).declarations() {
+             match def {
+                 ModuleDefId::TraitId(trait_) => {
+                     lang_items.collect_lang_item(db, trait_);
+@@ -155,19 +155,20 @@ fn resolve_core_trait(
+     modules: &[Symbol],
+     name: Symbol,
+ ) -> Option<TraitId> {
+-    let mut current = &core_def_map[core_def_map.root];
++    let mut current = core_def_map.module(db, core_def_map.root);
+     for module in modules {
+         let Some((ModuleDefId::ModuleId(cur), _)) =
+-            current.scope.type_(&Name::new_symbol_root(module.clone()))
++            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+         else {
+             return None;
+         };
+         if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
+             return None;
+         }
+-        current = &core_def_map[cur];
++        current = core_def_map.module(db, cur);
+     }
+-    let Some((ModuleDefId::TraitId(trait_), _)) = current.scope.type_(&Name::new_symbol_root(name))
++    let Some((ModuleDefId::TraitId(trait_), _)) =
++        current.scope(db).type_(&Name::new_symbol_root(name))
+     else {
+         return None;
+     };
+@@ -180,19 +181,19 @@ fn resolve_core_macro(
+     modules: &[Symbol],
+     name: Symbol,
+ ) -> Option<MacroId> {
+-    let mut current = &core_def_map[core_def_map.root];
++    let mut current = core_def_map.module(db, core_def_map.root);
+     for module in modules {
+         let Some((ModuleDefId::ModuleId(cur), _)) =
+-            current.scope.type_(&Name::new_symbol_root(module.clone()))
++            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+         else {
+             return None;
+         };
+         if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
+             return None;
+         }
+-        current = &core_def_map[cur];
++        current = core_def_map.module(db, cur);
+     }
+-    current.scope.makro(&Name::new_symbol_root(name))
++    current.scope(db).makro(&Name::new_symbol_root(name))
+ }
+ 
+ impl LangItems {
+@@ -323,8 +324,8 @@ pub fn crate_notable_traits(db: &dyn SourceDatabase, krate: Crate) -> Option<Box
+ 
+     let crate_def_map = crate_def_map(db, krate);
+ 
+-    for (_, module_data) in crate_def_map.modules() {
+-        for def in module_data.scope.declarations() {
++    for (_, module_data) in crate_def_map.modules(db) {
++        for def in module_data.scope(db).declarations() {
+             if let ModuleDefId::TraitId(trait_) = def
+                 && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
+             {
+@@ -578,6 +579,7 @@ language_item_table! { LangItems =>
+     ExchangeMalloc,          sym::exchange_malloc,     FunctionId;
+     BoxFree,                 sym::box_free,            FunctionId;
+     DropInPlace,             sym::drop_in_place,       FunctionId;
++    DropGlue,                sym::drop_glue,           FunctionId;
+     AllocLayout,             sym::alloc_layout,        StructId;
+ 
+     Start,                   sym::start,               FunctionId;
+diff --git a/crates/hir-def/src/lib.rs b/crates/hir-def/src/lib.rs
+index c436d7385d63a22794a34ab475562a50310829c3..caed31be700417d1ba6b7cf67827265f9706c68e 100644
+--- a/crates/hir-def/src/lib.rs
++++ b/crates/hir-def/src/lib.rs
+@@ -1559,9 +1559,8 @@ pub fn include_macro_invoc(
+     krate: Crate,
+ ) -> Box<[(MacroCallId, EditionedFileId)]> {
+     crate_def_map(db, krate)
+-        .modules
+-        .values()
+-        .flat_map(|m| m.scope.iter_macro_invoc())
++        .modules(db)
++        .flat_map(|(_, m)| m.scope(db).iter_macro_invoc())
+         .filter_map(|(_, &invoc)| invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x)))
+         .collect()
+ }
+diff --git a/crates/hir-def/src/macro_expansion_tests/builtin_derive_macro.rs b/crates/hir-def/src/macro_expansion_tests/builtin_derive_macro.rs
+index 8517f17385437c8b381c8d57f3436b2735eb18b2..f4a77a4156a466fea839654bc7ebf32a6b00ebcb 100644
+--- a/crates/hir-def/src/macro_expansion_tests/builtin_derive_macro.rs
++++ b/crates/hir-def/src/macro_expansion_tests/builtin_derive_macro.rs
+@@ -104,9 +104,9 @@ impl <A: $crate::clone::Clone, B: $crate::clone::Clone, > $crate::clone::Clone f
+                 x: x, y: y,
+             }
+             =>Command::Move {
+-                x: x.clone(), y: y.clone(),
++                x: $crate::clone::Clone::clone(x), y: $crate::clone::Clone::clone(y),
+             }
+-            , Command::Do(f0, )=>Command::Do(f0.clone(), ), Command::Jump=>Command::Jump,
++            , Command::Do(f0, )=>Command::Do($crate::clone::Clone::clone(f0), ), Command::Jump=>Command::Jump,
+         }
+     }
+ }"#]],
+@@ -164,7 +164,7 @@ impl <T: $crate::clone::Clone, > $crate::clone::Clone for Foo<T, > where <T as T
+                 qualified: qualified, shorthand: shorthand, generic: generic,
+             }
+             =>Foo {
+-                qualified: qualified.clone(), shorthand: shorthand.clone(), generic: generic.clone(),
++                qualified: $crate::clone::Clone::clone(qualified), shorthand: $crate::clone::Clone::clone(shorthand), generic: $crate::clone::Clone::clone(generic),
+             }
+             ,
+         }
+@@ -188,7 +188,7 @@ struct Foo<const X: usize, T>(u32);
+ impl <const X: usize, T: $crate::clone::Clone, > $crate::clone::Clone for Foo<X, T, > where {
+     fn clone(&self ) -> Self {
+         match self {
+-            Foo(f0, )=>Foo(f0.clone(), ),
++            Foo(f0, )=>Foo($crate::clone::Clone::clone(f0), ),
+         }
+     }
+ }"#]],
+@@ -346,9 +346,9 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
+                     , Command::Move {
+                         x: x_other, y: y_other,
+                     }
+-                    )=>match x_self.partial_cmp(&x_other) {
++                    )=>match x_self.partial_cmp(x_other) {
+                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+-                            match y_self.partial_cmp(&y_other) {
++                            match y_self.partial_cmp(y_other) {
+                                 $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                                     $crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                                 }
+@@ -357,7 +357,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
+                         }
+                         c=>return c,
+                     }
+-                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.partial_cmp(&f0_other) {
++                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.partial_cmp(f0_other) {
+                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                             $crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                         }
+@@ -522,7 +522,18 @@ impl <> $crate::fmt::Debug for Command< > where {
+             Command::Move {
+                 x: x, y: y,
+             }
+-            =>f.debug_struct("Move").field("x", &x).field("y", &y).finish(), Command::Do(f0, )=>f.debug_tuple("Do").field(&f0).finish(), Command::Jump=>f.write_str("Jump"),
++            => {
++                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "Move");
++                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "x", &x);
++                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "y", &y);
++                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
++            }
++            , Command::Do(f0, )=> {
++                let mut ra_expand_builder = $crate::fmt::Formatter::debug_tuple(f, "Do");
++                $crate::fmt::DebugTuple::field(&mut ra_expand_builder, &f0);
++                $crate::fmt::DebugTuple::finish(&mut ra_expand_builder)
++            }
++            , Command::Jump=>$crate::fmt::Formatter::write_str(f, "Jump"),
+         }
+     }
+ }"#]],
+@@ -584,7 +595,11 @@ impl <> $crate::fmt::Debug for HideAndShow< > where {
+             HideAndShow {
+                 always_show: always_show,
+             }
+-            =>f.debug_struct("HideAndShow").field("always_show", &always_show).finish()
++            => {
++                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "HideAndShow");
++                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show);
++                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
++            }
+         }
+     }
+ }
+@@ -594,7 +609,12 @@ impl <> $crate::fmt::Debug for HideAndShowEnum< > where {
+             HideAndShowEnum::AlwaysShow {
+                 always_show: always_show,
+             }
+-            =>f.debug_struct("AlwaysShow").field("always_show", &always_show).finish(),
++            => {
++                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "AlwaysShow");
++                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show);
++                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
++            }
++            ,
+         }
+     }
+ }"#]],
+diff --git a/crates/hir-def/src/macro_expansion_tests/builtin_fn_macro.rs b/crates/hir-def/src/macro_expansion_tests/builtin_fn_macro.rs
+index 1ba636ee901c513b619ffcb195c5b6b208c172b8..cfa1d3d787f5bc752a92ff1325924353e9c66c49 100644
+--- a/crates/hir-def/src/macro_expansion_tests/builtin_fn_macro.rs
++++ b/crates/hir-def/src/macro_expansion_tests/builtin_fn_macro.rs
+@@ -125,6 +125,34 @@ fn main() {
+     );
+ }
+ 
++#[test]
++fn test_stringify_spacing() {
++    check(
++        r#"
++#[rustc_builtin_macro]
++macro_rules! stringify {() => {}}
++
++fn main() {
++    stringify!(0 as int! {...} != 0);
++    stringify!(1 + 'a: loop { break 'a 1 } == 1);
++    stringify!(E::U::<>>E::U::<u8>);
++    stringify!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1);
++}
++"#,
++        expect![[r##"
++#[rustc_builtin_macro]
++macro_rules! stringify {() => {}}
++
++fn main() {
++    "0 as int! {...} != 0";
++    "1 + \'a: loop { break \'a 1 } == 1";
++    "E::U::<>>E::U::<u8>";
++    "a +-b; x<<=y; &&z; {} {} {a} { a } {a} { a }; f::<\'a>(); |&\'a x| 1";
++}
++"##]],
++    );
++}
++
+ #[test]
+ fn test_env_expand() {
+     check(
+diff --git a/crates/hir-def/src/macro_expansion_tests/mbe.rs b/crates/hir-def/src/macro_expansion_tests/mbe.rs
+index 0a2d0bf12e7d4e5d7938c0337441385bc776b727..cf0b9038f00ce17f9d060ce669c14d51c5223687 100644
+--- a/crates/hir-def/src/macro_expansion_tests/mbe.rs
++++ b/crates/hir-def/src/macro_expansion_tests/mbe.rs
+@@ -871,7 +871,7 @@ fn foo() {
+ }
+ 
+ fn foo() {
+-    let a = bar::<u8>::baz::<u8> ;
++    let a = bar::<u8>::baz::<u8>;
+ }
+ "#]],
+     );
+@@ -938,12 +938,12 @@ macro_rules! m {
+ }
+ fn test() {
+     let S;
+-    let S:: <i32> ;
+-    let S:: <S:: <i32>> ;
++    let S:: <i32>;
++    let S:: <S:: <i32>>;
+     let S:: < {
+         module::CONST<42
+     }
+-    > ;
++    >;
+ }
+ "#]],
+     );
+diff --git a/crates/hir-def/src/macro_expansion_tests/mbe/matching.rs b/crates/hir-def/src/macro_expansion_tests/mbe/matching.rs
+index bbadcf8794bf0e9f930b3101e119a49045ddab3c..0c0bc3f5a50d979f3d1e7518e0e59cf09de4b98b 100644
+--- a/crates/hir-def/src/macro_expansion_tests/mbe/matching.rs
++++ b/crates/hir-def/src/macro_expansion_tests/mbe/matching.rs
+@@ -24,6 +24,22 @@ literal!();
+     )
+ }
+ 
++#[test]
++fn negative_literal_stays_one_operand() {
++    check(
++        r#"
++macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
++fn f() { m!(-4); }
++"#,
++        expect![[r#"
++macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
++fn f() { (-4).pow(2);
++-4..-4;
++--4;; }
++"#]],
++    );
++}
++
+ #[test]
+ fn test_expand_bad_literal() {
+     check(
+@@ -257,3 +273,43 @@ macro_rules! m {
+     "#]],
+     );
+ }
++
++#[test]
++fn metavariables_of_one_name_from_two_expansions_are_two() {
++    // `nest` names an argument `$arg` each time it expands; the macro it writes has two.
++    check(
++        r#"
++macro_rules! nest {
++    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+)) => {
++        macro_rules! $name { ($($dol $arg:expr),*) => { $($body)+ } }
++    };
++    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+) $p1:ident $($p2:ident)*) => {
++        nest! { $name ($dol) => ([arg $($arg)*] match $dol arg { $p1 => $($body)+ }) $($p2)* }
++    };
++}
++nest! { pair ($) => ([] (a, b)) b a }
++fn f() { pair!(1, 2); }
++"#,
++        expect![[r#"
++macro_rules! nest {
++    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+)) => {
++        macro_rules! $name { ($($dol $arg:expr),*) => { $($body)+ } }
++    };
++    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+) $p1:ident $($p2:ident)*) => {
++        nest! { $name ($dol) => ([arg $($arg)*] match $dol arg { $p1 => $($body)+ }) $($p2)* }
++    };
++}
++nest! {
++    pair($) = >([arg] match $arg {
++        b = >(a, b)
++    }
++    )a
++}
++fn f() { match 1 {
++    a=>match 2 {
++        b=>(a, b)
++    }
++}; }
++"#]],
++    );
++}
+diff --git a/crates/hir-def/src/macro_expansion_tests/mbe/regression.rs b/crates/hir-def/src/macro_expansion_tests/mbe/regression.rs
+index cac248f47fff92d54555af512b36201928fb138b..b570b3d325f9e3b8d52eddb629c7e72c808fab28 100644
+--- a/crates/hir-def/src/macro_expansion_tests/mbe/regression.rs
++++ b/crates/hir-def/src/macro_expansion_tests/mbe/regression.rs
+@@ -618,8 +618,8 @@ macro_rules! arbitrary {
+ }
+ 
+ impl <A: Arbitrary> $crate::arbitrary::Arbitrary for Vec<A> {
+-    type Parameters = RangedParams1<A::Parameters> ;
+-    type Strategy = VecStrategy<A::Strategy> ;
++    type Parameters = RangedParams1<A::Parameters>;
++    type Strategy = VecStrategy<A::Strategy>;
+     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy { {
+             let product_unpack![range, a] = args;
+             vec(any_with::<A>(a), range)
+@@ -898,8 +898,8 @@ ok!(b0 b1);
+ 
+ #[test]
+ fn test_issue_3861() {
+-    // This is should (and does) produce a parse error. It used to infinite loop
+-    // instead.
++    // The type is one thing, and `<<` after it a shift. It used to infinite loop, and then
++    // to read `u32 <<` as the start of generic arguments.
+     check(
+         r#"
+ macro_rules! rgb_color {
+@@ -909,7 +909,7 @@ macro_rules! rgb_color {
+         }
+     };
+ }
+-// +tree +errors
++// +tree
+ rgb_color!(8 + 8, u32);
+ "#,
+         expect![[r#"
+@@ -920,19 +920,11 @@ macro_rules! rgb_color {
+         }
+     };
+ }
+-/* parse error: expected type */
+-/* parse error: expected R_PAREN */
+-/* parse error: expected R_ANGLE */
+-/* parse error: expected `::` */
+-/* parse error: expected COMMA */
+-/* parse error: expected R_ANGLE */
+-/* parse error: expected SEMICOLON */
+-/* parse error: expected expression, item or let statement */
+ pub fn new() {
+-    let _ = 0 as u32<<(8+8);
++    let _ = 0 as (u32)<<(8+8);
+ }
+-// MACRO_ITEMS@0..31
+-//   FN@0..31
++// MACRO_ITEMS@0..33
++//   FN@0..33
+ //     VISIBILITY@0..3
+ //       PUB_KW@0..3 "pub"
+ //     FN_KW@3..5 "fn"
+@@ -941,46 +933,39 @@ pub fn new() {
+ //     PARAM_LIST@8..10
+ //       L_PAREN@8..9 "("
+ //       R_PAREN@9..10 ")"
+-//     BLOCK_EXPR@10..31
+-//       STMT_LIST@10..31
++//     BLOCK_EXPR@10..33
++//       STMT_LIST@10..33
+ //         L_CURLY@10..11 "{"
+-//         LET_STMT@11..28
++//         LET_STMT@11..32
+ //           LET_KW@11..14 "let"
+ //           WILDCARD_PAT@14..15
+ //             UNDERSCORE@14..15 "_"
+ //           EQ@15..16 "="
+-//           CAST_EXPR@16..28
+-//             LITERAL@16..17
+-//               INT_NUMBER@16..17 "0"
+-//             AS_KW@17..19 "as"
+-//             PATH_TYPE@19..28
+-//               PATH@19..28
+-//                 PATH_SEGMENT@19..28
+-//                   NAME_REF@19..22
+-//                     IDENT@19..22 "u32"
+-//                   GENERIC_ARG_LIST@22..28
+-//                     L_ANGLE@22..23 "<"
+-//                     TYPE_ARG@23..27
+-//                       DYN_TRAIT_TYPE@23..27
+-//                         TYPE_BOUND_LIST@23..27
+-//                           TYPE_BOUND@23..26
+-//                             PATH_TYPE@23..26
+-//                               PATH@23..26
+-//                                 PATH_SEGMENT@23..26
+-//                                   TYPE_ANCHOR@23..26
+-//                                     L_ANGLE@23..24 "<"
+-//                                     PAREN_TYPE@24..26
+-//                                       L_PAREN@24..25 "("
+-//                                       ERROR@25..26
+-//                                         INT_NUMBER@25..26 "8"
+-//                           PLUS@26..27 "+"
+-//                     CONST_ARG@27..28
+-//                       LITERAL@27..28
+-//                         INT_NUMBER@27..28 "8"
+-//         ERROR@28..29
+-//           R_PAREN@28..29 ")"
+-//         SEMICOLON@29..30 ";"
+-//         R_CURLY@30..31 "}"
++//           BIN_EXPR@16..31
++//             CAST_EXPR@16..24
++//               LITERAL@16..17
++//                 INT_NUMBER@16..17 "0"
++//               AS_KW@17..19 "as"
++//               PAREN_TYPE@19..24
++//                 L_PAREN@19..20 "("
++//                 PATH_TYPE@20..23
++//                   PATH@20..23
++//                     PATH_SEGMENT@20..23
++//                       NAME_REF@20..23
++//                         IDENT@20..23 "u32"
++//                 R_PAREN@23..24 ")"
++//             SHL@24..26 "<<"
++//             PAREN_EXPR@26..31
++//               L_PAREN@26..27 "("
++//               BIN_EXPR@27..30
++//                 LITERAL@27..28
++//                   INT_NUMBER@27..28 "8"
++//                 PLUS@28..29 "+"
++//                 LITERAL@29..30
++//                   INT_NUMBER@29..30 "8"
++//               R_PAREN@30..31 ")"
++//           SEMICOLON@31..32 ";"
++//         R_CURLY@32..33 "}"
+ 
+ "#]],
+     );
+diff --git a/crates/hir-def/src/macro_expansion_tests/mod.rs b/crates/hir-def/src/macro_expansion_tests/mod.rs
+index 188f57f7dda7c5d2cc1cb1c869ccf799dc08185e..227750e8d5e1cf76319635eb6e0cbd3adbf984c1 100644
+--- a/crates/hir-def/src/macro_expansion_tests/mod.rs
++++ b/crates/hir-def/src/macro_expansion_tests/mod.rs
+@@ -58,8 +58,8 @@ fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
+     let krate = db.fetch_test_crate();
+     let def_map = crate_def_map(&db, krate);
+     let errors = def_map
+-        .modules()
+-        .flat_map(|module| module.1.scope.all_macro_calls())
++        .modules(&db)
++        .flat_map(|module| module.1.scope(&db).all_macro_calls())
+         .filter_map(|macro_call| {
+             let errors = macro_call.parse_macro_expansion_error(&db)?;
+             let errors = errors.err.as_ref()?.render_to_string(&db);
+@@ -109,7 +109,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
+     let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
+     let krate = db.fetch_test_crate();
+     let def_map = crate_def_map(&db, krate);
+-    let source = def_map[def_map.root].definition_source(&db);
++    let source = def_map.module(&db, def_map.root).definition_source(&db);
+     let source_file = match source.value {
+         ModuleSource::SourceFile(it) => it,
+         ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),
+@@ -186,7 +186,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
+         expanded_text.replace_range(range, &text);
+     }
+ 
+-    for decl_id in def_map[def_map.root].scope.declarations() {
++    for decl_id in def_map.module(&db, def_map.root).scope(&db).declarations() {
+         // FIXME: I'm sure there's already better way to do this
+         let src = match decl_id {
+             ModuleDefId::AdtId(AdtId::StructId(struct_id)) => {
+@@ -222,7 +222,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
+         }
+     }
+ 
+-    for (_, module) in def_map.modules() {
++    for (_, module) in def_map.modules(&db) {
+         let Some(src) = module.declaration_source(&db) else {
+             continue;
+         };
+@@ -237,7 +237,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
+         }
+     }
+ 
+-    for impl_id in def_map[def_map.root].scope.impls() {
++    for impl_id in def_map.module(&db, def_map.root).scope(&db).impls() {
+         let src = impl_id.lookup(&db).source(&db);
+         if let Some(macro_file) = src.file_id.macro_file()
+             && let MacroKind::DeriveBuiltIn | MacroKind::Derive = macro_file.kind(&db)
+@@ -264,9 +264,12 @@ fn resolve_macro_call_id(
+     ast_id: AstId<ast::MacroCall>,
+     ast_ptr: InFile<AstPtr<ast::MacroCall>>,
+ ) -> Option<MacroCallId> {
+-    def_map.modules().find_map(|module| {
+-        for decl in
+-            module.1.scope.declarations().chain(module.1.scope.unnamed_consts().map(Into::into))
++    def_map.modules(db).find_map(|module| {
++        for decl in module
++            .1
++            .scope(db)
++            .declarations()
++            .chain(module.1.scope(db).unnamed_consts().map(Into::into))
+         {
+             let body = match decl {
+                 ModuleDefId::FunctionId(it) => it.into(),
+@@ -286,7 +289,7 @@ fn resolve_macro_call_id(
+                 return Some(res);
+             }
+         }
+-        module.1.scope.macro_invoc(ast_id)
++        module.1.scope(db).macro_invoc(ast_id)
+     })
+ }
+ 
+@@ -459,7 +462,7 @@ m!(g);
+     let (db, file_id) = TestDB::with_single_file(fixture);
+     let krate = db.test_crate();
+     let def_map = crate_def_map(&db, krate);
+-    let source = def_map[def_map.root].definition_source(&db);
++    let source = def_map.module(&db, def_map.root).definition_source(&db);
+     let source_file = match source.value {
+         ModuleSource::SourceFile(it) => it,
+         ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),
+diff --git a/crates/hir-def/src/nameres.rs b/crates/hir-def/src/nameres.rs
+index c1daad5b3f6a2d3ffa5e2728918db8cb2147e5ee..8ea8647c8899b615f158e86978b74f1fec8c44a4 100644
+--- a/crates/hir-def/src/nameres.rs
++++ b/crates/hir-def/src/nameres.rs
+@@ -58,7 +58,10 @@ pub mod proc_macro;
+ #[cfg(test)]
+ mod tests;
+ 
+-use std::ops::{Deref, DerefMut, Index, IndexMut};
++use std::{
++    hash::Hash,
++    ops::{Deref, DerefMut, Index, IndexMut},
++};
+ 
+ use base_db::{Crate, SourceDatabase};
+ use either::Either;
+@@ -69,9 +72,10 @@ use hir_expand::{
+ use intern::{Symbol, sym};
+ use itertools::Itertools;
+ use rustc_hash::FxHashMap;
++use smallvec::SmallVec;
+ use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
+ use stdx::format_to;
+-use syntax::{AstNode, SmolStr, SyntaxNode, ToSmolStr, ast};
++use syntax::{AstNode, SmolStr, SyntaxNode, TextSize, ToSmolStr, ast};
+ use triomphe::Arc;
+ use tt::TextRange;
+ 
+@@ -101,10 +105,16 @@ fn enable_builtin_derive_fast_path() -> bool {
+     ENABLE_BUILTIN_DERIVE_FAST_PATH.get()
+ }
+ 
+-#[inline(always)]
++/// Whether builtin derives are recorded instead of expanded. A code generator needs the bodies
++/// of the derived methods, so it turns this off before anything is analysed.
++#[cfg(not(test))]
++pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++#[inline]
+ #[cfg(not(test))]
+ fn enable_builtin_derive_fast_path() -> bool {
+-    true
++    !EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
+ const PREDEFINED_TOOLS: &[SmolStr] = &[
+@@ -177,7 +187,7 @@ pub struct DefMap {
+     block: Option<BlockInfo>,
+     pub root: ModuleId,
+     /// The modules and their data declared in this crate.
+-    pub modules: ModulesMap,
++    modules: ModulesSlot,
+     /// The prelude module for this crate. This either comes from an import
+     /// marked with the `prelude_import` attribute, or (in the normal case) from
+     /// a dependency (`std` or `core`).
+@@ -195,8 +205,6 @@ pub struct DefMap {
+     // FIXME: Figure out a better way for the IDE layer to resolve these?
+     derive_helpers_in_scope:
+         FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,
+-    /// A mapping from [`hir_expand::MacroDefId`] to [`crate::MacroId`].
+-    pub macro_def_to_macro_id: FxHashMap<ErasedAstId, MacroId>,
+ 
+     /// The diagnostics that need to be emitted for this crate.
+     diagnostics: Vec<DefDiagnostic>,
+@@ -272,22 +280,6 @@ struct BlockInfo {
+     parent: ModuleId,
+ }
+ 
+-impl std::ops::Index<ModuleIdLt<'_>> for DefMap {
+-    type Output = ModuleData;
+-
+-    fn index(&self, id: ModuleIdLt<'_>) -> &ModuleData {
+-        self.modules
+-            .get(&unsafe { id.to_static() })
+-            .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
+-    }
+-}
+-
+-impl std::ops::IndexMut<ModuleId> for DefMap {
+-    fn index_mut(&mut self, id: ModuleId) -> &mut ModuleData {
+-        &mut self.modules[id]
+-    }
+-}
+-
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ pub enum ModuleOrigin {
+     CrateRoot {
+@@ -362,7 +354,7 @@ impl ModuleOrigin {
+     }
+ }
+ 
+-#[derive(Debug, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct ModuleData {
+     /// Where does this module come from?
+     pub origin: ModuleOrigin,
+@@ -372,8 +364,89 @@ pub struct ModuleData {
+     ///
+     /// [`None`] for block modules because they are always its `DefMap`'s root.
+     pub parent: Option<ModuleId>,
+-    pub children: FxIndexMap<Name, ModuleId>,
+-    pub scope: ItemScope,
++    scope: ScopeSlot,
++}
++
++/// The modules of a `DefMap`, held by the database on their own: a `DefMap` stays what it was
++/// when a module is added to it, and so does everything that was resolved through it.
++#[salsa::tracked]
++struct Modules<'db> {
++    root: ModuleIdLt<'db>,
++    #[tracked]
++    #[returns(ref)]
++    table: ModulesMap,
++}
++
++#[salsa::tracked]
++impl<'db> Modules<'db> {
++    /// One module of a collected `DefMap`. Depends on the modules there are, and is the same
++    /// for as long as the module is.
++    #[salsa::tracked(returns(ref))]
++    fn module(self, db: &'db dyn SourceDatabase, module: ModuleId) -> Option<ModuleData> {
++        self.table(db).get(&module).cloned()
++    }
++}
++
++impl ModulesSlot {
++    /// The modules of a `DefMap` that is being collected.
++    fn building(&mut self) -> &mut ModulesMap {
++        match self {
++            ModulesSlot::Building(modules) => modules,
++            ModulesSlot::Collected(_) => {
++                panic!("the modules of a collected `DefMap` are read-only")
++            }
++        }
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum ModulesSlot {
++    /// While the `DefMap` is being collected.
++    Building(ModulesMap),
++    /// A `Modules`, once it is.
++    Collected(salsa::Id),
++}
++
++/// The items of one module, held by the database on their own. A query that reads the scope of
++/// a module then depends on that scope and not on the whole `DefMap`, so adding an item to one
++/// module leaves what was resolved through the others alone.
++#[salsa::tracked]
++struct ModuleScope<'db> {
++    module: ModuleIdLt<'db>,
++    #[tracked]
++    #[returns(ref)]
++    scope: ItemScope,
++    #[tracked]
++    #[returns(ref)]
++    children: FxIndexMap<Name, ModuleId>,
++}
++
++#[salsa::tracked]
++impl<'db> ModuleScope<'db> {
++    /// What one name means in the module. Adding or removing another item leaves this equal,
++    /// so a query that only looked names up is not re-run.
++    #[salsa::tracked]
++    fn name(self, db: &'db dyn SourceDatabase, name: Name) -> PerNs {
++        self.scope(db).get(&name)
++    }
++
++    #[salsa::tracked(returns(ref))]
++    fn legacy_macro(self, db: &'db dyn SourceDatabase, name: Name) -> Option<Box<[MacroId]>> {
++        self.scope(db).get_legacy_macro(&name).map(Box::from)
++    }
++
++    #[salsa::tracked(returns(ref))]
++    fn traits(self, db: &'db dyn SourceDatabase) -> Box<[crate::TraitId]> {
++        self.scope(db).traits().collect()
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum ScopeSlot {
++    /// While the `DefMap` is being collected.
++    Building { scope: Box<ItemScope>, children: FxIndexMap<Name, ModuleId> },
++    /// A `ModuleScope`, once it is.
++    Collected(salsa::Id),
+ }
+ 
+ #[inline]
+@@ -418,8 +491,9 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
+         module_data,
+         None,
+     );
+-    let (def_map, local_def_map) =
++    let (mut def_map, local_def_map) =
+         collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
++    def_map.hand_over_scopes(db);
+ 
+     DefMapPair::new(db, def_map, local_def_map)
+ }
+@@ -444,12 +518,13 @@ pub fn block_def_map<'db>(db: &'db dyn SourceDatabase, block_id: BlockIdLt<'db>)
+         Some(BlockInfo { block: block_id, parent: module }),
+     );
+ 
+-    let (def_map, _) = collector::collect_defs(
++    let (mut def_map, _) = collector::collect_defs(
+         db,
+         def_map,
+         TreeId::new(ast_id.file_id, Some(block_id)),
+         Some(local_def_map.local(db)),
+     );
++    def_map.hand_over_scopes(db);
+     def_map
+ }
+ 
+@@ -481,14 +556,13 @@ impl DefMap {
+         DefMap {
+             block,
+             root,
+-            modules,
++            modules: ModulesSlot::Building(modules),
+             krate,
+             prelude: None,
+             macro_use_prelude: FxHashMap::default(),
+             derive_helpers_in_scope: FxHashMap::default(),
+             diagnostics: Vec::new(),
+             data: crate_data,
+-            macro_def_to_macro_id: FxHashMap::default(),
+         }
+     }
+     fn shrink_to_fit(&mut self) {
+@@ -503,17 +577,58 @@ impl DefMap {
+             krate: _,
+             prelude: _,
+             data: _,
+-            macro_def_to_macro_id,
+         } = self;
+ 
+-        macro_def_to_macro_id.shrink_to_fit();
+         macro_use_prelude.shrink_to_fit();
+         diagnostics.shrink_to_fit();
+-        modules.shrink_to_fit();
+         derive_helpers_in_scope.shrink_to_fit();
+-        for (_, module) in modules.iter_mut() {
+-            module.children.shrink_to_fit();
+-            module.scope.shrink_to_fit();
++        if let ModulesSlot::Building(modules) = modules {
++            modules.shrink_to_fit();
++            for (_, module) in modules.iter_mut() {
++                module.children_mut().shrink_to_fit();
++                module.scope_mut().shrink_to_fit();
++            }
++        }
++    }
++
++    /// Hands the scope of every module to the database. Called once, when collection is done.
++    fn hand_over_scopes(&mut self, db: &dyn SourceDatabase) {
++        let ModulesSlot::Building(modules) = &mut self.modules else { return };
++        for (id, module) in modules.iter_mut() {
++            if let ScopeSlot::Building { scope, children } = &mut module.scope {
++                let scope = ModuleScope::new(
++                    db,
++                    id,
++                    std::mem::take(&mut **scope),
++                    std::mem::take(children),
++                );
++                module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
++            }
++        }
++        let modules = Modules::new(db, self.root, std::mem::replace(modules, ModulesMap::new()));
++        self.modules = ModulesSlot::Collected(salsa::plumbing::AsId::as_id(&modules));
++    }
++
++    /// One module of the `DefMap`; depends on that module only.
++    pub fn module<'a>(&'a self, db: &'a dyn SourceDatabase, id: ModuleIdLt<'_>) -> &'a ModuleData {
++        let id = unsafe { id.to_static() };
++        let found = match &self.modules {
++            ModulesSlot::Building(modules) => modules.get(&id),
++            ModulesSlot::Collected(modules) => {
++                <Modules<'a> as salsa::plumbing::FromId>::from_id(*modules).module(db, id).as_ref()
++            }
++        };
++        found
++            .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
++    }
++
++    /// Every module of the `DefMap`; depends on which there are.
++    fn table<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ModulesMap {
++        match &self.modules {
++            ModulesSlot::Building(modules) => modules,
++            ModulesSlot::Collected(id) => {
++                <Modules<'a> as salsa::plumbing::FromId>::from_id(*id).table(db)
++            }
+         }
+     }
+ }
+@@ -525,7 +640,7 @@ impl DefMap {
+         db: &'a dyn SourceDatabase,
+         file_id: FileId,
+     ) -> impl Iterator<Item = ModuleId> + 'a {
+-        self.modules
++        self.table(db)
+             .iter()
+             .filter(move |(_, data)| {
+                 data.origin.file_id().map(|file_id| file_id.file_id(db)) == Some(file_id)
+@@ -533,16 +648,20 @@ impl DefMap {
+             .map(|(id, _)| id)
+     }
+ 
+-    pub fn modules(&self) -> impl Iterator<Item = (ModuleId, &ModuleData)> + '_ {
+-        self.modules.iter()
++    pub fn modules<'a>(
++        &'a self,
++        db: &'a dyn SourceDatabase,
++    ) -> impl Iterator<Item = (ModuleId, &'a ModuleData)> + 'a {
++        self.table(db).iter()
+     }
+ 
+     /// Returns all inline modules (mod name { ... }) in the crate that are associated with the given macro expansion.
+-    pub fn inline_modules_for_macro_file(
+-        &self,
++    pub fn inline_modules_for_macro_file<'a>(
++        &'a self,
++        db: &'a dyn SourceDatabase,
+         file_id: MacroCallId,
+-    ) -> impl Iterator<Item = ModuleId> + '_ {
+-        self.modules
++    ) -> impl Iterator<Item = ModuleId> + 'a {
++        self.table(db)
+             .iter()
+             .filter(move |(_, data)| {
+                 matches!(
+@@ -616,8 +735,12 @@ impl DefMap {
+ 
+     /// Returns the module containing `local_mod`, either the parent `mod`, or the module (or block) containing
+     /// the block, if `self` corresponds to a block expression.
+-    pub fn containing_module(&self, local_mod: ModuleIdLt<'_>) -> Option<ModuleId> {
+-        match self[local_mod].parent {
++    pub fn containing_module(
++        &self,
++        db: &dyn SourceDatabase,
++        local_mod: ModuleIdLt<'_>,
++    ) -> Option<ModuleId> {
++        match self.module(db, local_mod).parent {
+             Some(parent) => Some(parent),
+             None => self.block.map(|BlockInfo { parent, .. }| parent),
+         }
+@@ -655,9 +778,10 @@ impl DefMap {
+         ) {
+             format_to!(buf, "{}\n", path);
+ 
+-            map[module].scope.dump(db, buf);
++            map.module(db, module).scope(db).dump(db, buf);
+ 
+-            for (name, child) in map[module].children.iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
++            for (name, child) in
++                map.module(db, module).children(db).iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
+             {
+                 let path = format!("{path}::{}", name.display(db, Edition::LATEST));
+                 buf.push('\n');
+@@ -749,6 +873,99 @@ impl DefMap {
+     }
+ }
+ 
++impl DefMap {
++    /// The `macro_rules!` that `name` is in the textual scope of `module`: the latest one of
++    /// this map, or the latest one an enclosing block defines before the block inside it.
++    pub(crate) fn legacy_macro_in_textual_scope<'db>(
++        &self,
++        db: &'db dyn SourceDatabase,
++        module: ModuleIdLt<'db>,
++        name: &Name,
++    ) -> Option<MacroId> {
++        if let Some(&latest) =
++            self.module(db, module).legacy_macro_in_scope(db, name).and_then(<[_]>::last)
++        {
++            return Some(latest);
++        }
++        let mut inner = self.block;
++        while let Some(BlockInfo { block, parent }) = inner {
++            let map = parent.def_map(db);
++            let defined =
++                map.module(db, parent).legacy_macro_in_scope(db, name).unwrap_or_default();
++            let visible = SourcePosition::latest_before(db, defined, block.ast_id(db).erase());
++            if visible.is_some() {
++                return visible;
++            }
++            inner = map.block;
++        }
++        None
++    }
++
++    /// The `macro_rules!` of `module` that a call at `call` names by `name`, when the module
++    /// defines one before the call. Items of a trait or an impl are collected after the
++    /// module is, when a later `macro_rules!` of the same name has joined the scope.
++    pub(crate) fn legacy_macro_before<'db>(
++        &self,
++        db: &'db dyn SourceDatabase,
++        module: ModuleIdLt<'db>,
++        name: &Name,
++        call: ErasedAstId,
++    ) -> Option<MacroId> {
++        let defined = self.module(db, module).legacy_macro_in_scope(db, name)?;
++        SourcePosition::latest_before(db, defined, call)
++    }
++}
++
++/// Where a node starts in its file and, inside a macro expansion, where each call that led
++/// to that expansion starts.
++struct SourcePosition(SmallVec<[(HirFileId, TextSize); 2]>);
++
++impl SourcePosition {
++    fn new(db: &dyn SourceDatabase, mut file: HirFileId, range: TextRange) -> Self {
++        let mut calls = SmallVec::from_iter([(file, range.start())]);
++        while let Some(call) = file.macro_file() {
++            let node = call.call_node(db);
++            file = node.file_id;
++            calls.push((file, node.value.text_range().start()));
++        }
++        SourcePosition(calls)
++    }
++
++    /// The last of `macros`, which are in definition order, that is defined before `node`.
++    fn latest_before(
++        db: &dyn SourceDatabase,
++        macros: &[MacroId],
++        node: ErasedAstId,
++    ) -> Option<MacroId> {
++        match macros {
++            [] => None,
++            [only] => Some(*only),
++            _ => {
++                let node = Self::new(db, node.file_id, node.to_range(db));
++                macros
++                    .iter()
++                    .rev()
++                    .copied()
++                    .find(|&it| Self::of_macro(db, it).is_none_or(|it| it.precedes(&node)))
++            }
++        }
++    }
++
++    fn of_macro(db: &dyn SourceDatabase, id: MacroId) -> Option<Self> {
++        let MacroId::MacroRulesId(id) = id else { return None };
++        let ast_id = id.lookup(db).id;
++        Some(Self::new(db, ast_id.file_id, ast_id.to_range(db)))
++    }
++
++    /// Whether this is before `other` in the innermost file both are in.
++    fn precedes(&self, other: &Self) -> bool {
++        let shared = self.0.iter().find_map(|(file, offset)| {
++            other.0.iter().find(|it| it.0 == *file).map(|it| *offset < it.1)
++        });
++        shared.unwrap_or(true)
++    }
++}
++
+ impl ModuleData {
+     pub(crate) fn new(
+         origin: ModuleOrigin,
+@@ -759,8 +976,84 @@ impl ModuleData {
+             origin,
+             visibility,
+             parent,
+-            children: Default::default(),
+-            scope: ItemScope::default(),
++            scope: ScopeSlot::Building { scope: Box::default(), children: FxIndexMap::default() },
++        }
++    }
++
++    pub fn scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
++        match &self.scope {
++            ScopeSlot::Building { scope, .. } => scope,
++            ScopeSlot::Collected(id) => {
++                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
++            }
++        }
++    }
++
++    /// What `name` means in this module; depends on that name only.
++    pub fn name_in_scope(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
++        match &self.scope {
++            ScopeSlot::Building { scope, .. } => scope.get(name),
++            ScopeSlot::Collected(id) => {
++                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*id).name(db, name.clone())
++            }
++        }
++    }
++
++    pub(crate) fn legacy_macro_in_scope<'a>(
++        &'a self,
++        db: &'a dyn SourceDatabase,
++        name: &Name,
++    ) -> Option<&'a [MacroId]> {
++        match &self.scope {
++            ScopeSlot::Building { scope, .. } => scope.get_legacy_macro(name),
++            ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
++                .legacy_macro(db, name.clone())
++                .as_deref(),
++        }
++    }
++
++    /// The traits in scope in this module; depends on those only.
++    pub fn traits_in_scope<'a>(
++        &'a self,
++        db: &'a dyn SourceDatabase,
++    ) -> impl Iterator<Item = crate::TraitId> + 'a {
++        let (building, collected) = match &self.scope {
++            ScopeSlot::Building { scope, .. } => (Some(scope.traits()), None),
++            ScopeSlot::Collected(id) => (
++                None,
++                Some(
++                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
++                        .traits(db)
++                        .iter()
++                        .copied(),
++                ),
++            ),
++        };
++        building.into_iter().flatten().chain(collected.into_iter().flatten())
++    }
++
++    /// The modules declared in this one, by name.
++    pub fn children<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a FxIndexMap<Name, ModuleId> {
++        match &self.scope {
++            ScopeSlot::Building { children, .. } => children,
++            ScopeSlot::Collected(id) => {
++                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).children(db)
++            }
++        }
++    }
++
++    pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
++        match &mut self.scope {
++            ScopeSlot::Building { children, .. } => children,
++            ScopeSlot::Collected(_) => panic!("the children of a collected module are read-only"),
++        }
++    }
++
++    /// The scope of a module of the `DefMap` being collected.
++    pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
++        match &mut self.scope {
++            ScopeSlot::Building { scope, .. } => scope,
++            ScopeSlot::Collected(_) => panic!("the scope of a collected module is read-only"),
+         }
+     }
+ 
+@@ -886,7 +1179,7 @@ fn sub_namespace_match(
+ 
+ /// A newtype wrapper around `FxHashMap<ModuleId, ModuleData>` that implements `IndexMut`.
+ #[derive(Debug, PartialEq, Eq)]
+-pub struct ModulesMap {
++pub(crate) struct ModulesMap {
+     inner: FxIndexMap<ModuleId, ModuleData>,
+ }
+ 
+diff --git a/crates/hir-def/src/nameres/assoc.rs b/crates/hir-def/src/nameres/assoc.rs
+index 0e27d745160076f95d1a197610a1789a1e32541e..efab1b1dfee3b0af263cc05ae7a21bf7f36e63f1 100644
+--- a/crates/hir-def/src/nameres/assoc.rs
++++ b/crates/hir-def/src/nameres/assoc.rs
+@@ -301,7 +301,14 @@ impl<'db> AssocItemCollector<'db> {
+                 let path = Interned::new(path);
+                 let ctxt = self.span_map.span_for_range(range).ctx;
+ 
+-                let resolver = |path: &_| {
++                let resolver = |path: &ModPath| {
++                    let before = path.as_ident().and_then(|name| {
++                        let call = ast_id.erase();
++                        self.def_map.legacy_macro_before(self.db, self.module_id, name, call)
++                    });
++                    if let Some(before) = before {
++                        return Some(before.definition(self.db));
++                    }
+                     self.def_map
+                         .resolve_path(
+                             self.local_def_map,
+diff --git a/crates/hir-def/src/nameres/attr_resolution.rs b/crates/hir-def/src/nameres/attr_resolution.rs
+index 411b80fb6a03a0656e68f819372dee95bab72062..7907df6a6d6200d946c10cf369f84020db3b4010 100644
+--- a/crates/hir-def/src/nameres/attr_resolution.rs
++++ b/crates/hir-def/src/nameres/attr_resolution.rs
+@@ -95,7 +95,13 @@ impl DefMap {
+                 return true;
+             }
+ 
+-            if segments.len() == 1 && find_builtin_attr_idx(name).is_some() {
++            // rustc keeps every name that starts with `rustc_` to itself, and gives the standard
++            // library new ones faster than a list of them keeps up with. One taken for a macro
++            // that never resolves holds its item back until all else is collected, which for
++            // a `macro_rules!` is after the calls it is in scope of.
++            if segments.len() == 1
++                && (find_builtin_attr_idx(name).is_some() || name.as_str().starts_with("rustc_"))
++            {
+                 return true;
+             }
+         }
+diff --git a/crates/hir-def/src/nameres/collector.rs b/crates/hir-def/src/nameres/collector.rs
+index e40e4d99bdbd005854f2ad134cc699f986162d08..aa8860c12a1d5fe1e62dd71abc7778d0a81b7689 100644
+--- a/crates/hir-def/src/nameres/collector.rs
++++ b/crates/hir-def/src/nameres/collector.rs
+@@ -472,8 +472,8 @@ impl<'db> DefCollector<'db> {
+             // exported in type/value namespace. This function reduces the visibility of all items
+             // in the crate root that aren't proc macros.
+             let module_id = self.def_map.root_module_id();
+-            let root = &mut self.def_map.modules[module_id];
+-            root.scope.censor_non_proc_macros(self.def_map.krate);
++            let root = &mut self.def_map.modules.building()[module_id];
++            root.scope_mut().censor_non_proc_macros(self.def_map.krate);
+         }
+     }
+ 
+@@ -638,8 +638,6 @@ impl<'db> DefCollector<'db> {
+             edition: self.def_map.data.edition,
+         }
+         .intern(self.db);
+-
+-        self.def_map.macro_def_to_macro_id.insert(ast_id.erase(), proc_macro_id.into());
+         self.define_proc_macro(def.name.clone(), proc_macro_id);
+         let crate_data = Arc::get_mut(&mut self.def_map.data).unwrap();
+         if let ProcMacroKind::Derive { helpers } = def.kind {
+@@ -689,7 +687,7 @@ impl<'db> DefCollector<'db> {
+         // crate root, even if the parent modules is **not** visible.
+         if export {
+             let module_id = self.def_map.root;
+-            self.def_map.modules[module_id].scope.declare(macro_.into());
++            self.def_map.modules.building()[module_id].scope_mut().declare(macro_.into());
+             self.update(
+                 module_id,
+                 &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
+@@ -708,7 +706,7 @@ impl<'db> DefCollector<'db> {
+     /// current legacy scope, with possible shadowing.
+     fn define_legacy_macro(&mut self, module_id: ModuleId, name: Name, mac: MacroId) {
+         // Always shadowing
+-        self.def_map.modules[module_id].scope.define_legacy_macro(name, mac);
++        self.def_map.modules.building()[module_id].scope_mut().define_legacy_macro(name, mac);
+     }
+ 
+     /// Define a macro 2.0 macro
+@@ -731,7 +729,7 @@ impl<'db> DefCollector<'db> {
+                 false,
+             )
+             .unwrap_or(Visibility::Public);
+-        self.def_map.modules[module_id].scope.declare(macro_.into());
++        self.def_map.modules.building()[module_id].scope_mut().declare(macro_.into());
+         self.update(
+             module_id,
+             &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
+@@ -746,7 +744,7 @@ impl<'db> DefCollector<'db> {
+     /// And unconditionally exported.
+     fn define_proc_macro(&mut self, name: Name, macro_: ProcMacroId) {
+         let module_id = self.def_map.root;
+-        self.def_map.modules[module_id].scope.declare(macro_.into());
++        self.def_map.modules.building()[module_id].scope_mut().declare(macro_.into());
+         self.update(
+             module_id,
+             &[(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))],
+@@ -770,7 +768,7 @@ impl<'db> DefCollector<'db> {
+         let def_map = crate_def_map(self.db, krate);
+         // `#[macro_use]` brings macros into macro_use prelude. Yes, even non-`macro_rules!`
+         // macros.
+-        let root_scope = &def_map[def_map.root].scope;
++        let root_scope = def_map.module(self.db, def_map.root).scope(self.db);
+         match names {
+             Some(names) => {
+                 for name in names {
+@@ -959,7 +957,7 @@ impl<'db> DefCollector<'db> {
+                         } else if m.krate(self.db) != self.def_map.krate {
+                             cov_mark::hit!(glob_across_crates);
+                             // glob import from other crate => we can just import everything once
+-                            let scope = &m.def_map(self.db)[m].scope;
++                            let scope = &m.def_map(self.db).module(self.db, m).scope(self.db);
+ 
+                             // Module scoped macros is included
+                             let items = scope
+@@ -982,9 +980,9 @@ impl<'db> DefCollector<'db> {
+                             // import, and then need to propagate any further
+                             // additions
+                             let scope = if m.block(self.db) == self.def_map.block_id() {
+-                                &self.def_map[m].scope
++                                self.def_map.module(self.db, m).scope(self.db)
+                             } else {
+-                                &m.def_map(self.db)[m].scope
++                                m.def_map(self.db).module(self.db, m).scope(self.db)
+                             };
+ 
+                             // Module scoped macros is included
+@@ -1142,7 +1140,9 @@ impl<'db> DefCollector<'db> {
+                         }
+                         None => continue,
+                     };
+-                    let old_vis = self.def_map.modules[module_id].scope.unnamed_trait_vis(tr);
++                    let old_vis = self.def_map.modules.building()[module_id]
++                        .scope(self.db)
++                        .unnamed_trait_vis(tr);
+                     let should_update = match old_vis {
+                         None => true,
+                         Some(old_vis) => {
+@@ -1161,7 +1161,7 @@ impl<'db> DefCollector<'db> {
+ 
+                     if should_update {
+                         changed = true;
+-                        self.def_map.modules[module_id].scope.push_unnamed_trait(
++                        self.def_map.modules.building()[module_id].scope_mut().push_unnamed_trait(
+                             tr,
+                             vis,
+                             import.and_then(ImportOrExternCrate::import),
+@@ -1174,6 +1174,23 @@ impl<'db> DefCollector<'db> {
+         if !changed {
+             return;
+         }
++        // A name this module already had in one namespace kept its own item there, so only
++        // what the module now holds reaches the modules that glob-import it.
++        let scope = self.def_map.modules.building()[module_id].scope(self.db);
++        let held = resolutions
++            .iter()
++            .map(|(name, res)| {
++                let Some(name) = name else { return (None, *res) };
++                let now = scope.get(name);
++                let res = PerNs {
++                    types: res.types.filter(|it| now.types.is_some_and(|now| now.def == it.def)),
++                    values: res.values.filter(|it| now.values.is_some_and(|now| now.def == it.def)),
++                    macros: res.macros.filter(|it| now.macros.is_some_and(|now| now.def == it.def)),
++                };
++                (Some(name.clone()), res)
++            })
++            .collect::<Vec<_>>();
++        let resolutions = &held[..];
+         let glob_imports = self
+             .glob_imports
+             .get(&module_id)
+@@ -1220,7 +1237,7 @@ impl<'db> DefCollector<'db> {
+         let mut changed = false;
+ 
+         if let Some(ImportOrExternCrate::Glob(_)) = def_import_type {
+-            let prev_defs = self.def_map[module_id].scope.get(name);
++            let prev_defs = self.def_map.modules.building()[module_id].scope(self.db).get(name);
+ 
+             // Multiple globs may import the same item and they may override visibility from
+             // previously resolved globs. Handle overrides here and leave the rest to
+@@ -1237,7 +1254,9 @@ impl<'db> DefCollector<'db> {
+                     // This import is being handled here, don't pass it down to
+                     // `ItemScope::push_res_with_import()`.
+                     defs.types = None;
+-                    self.def_map.modules[module_id].scope.update_visibility_types(name, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_visibility_types(name, def.vis);
+                 }
+                 // When the source module's definition changed (e.g., due to an explicit import
+                 // shadowing a glob), propagate the new definition to modules that glob-import from it.
+@@ -1250,7 +1269,9 @@ impl<'db> DefCollector<'db> {
+                 else if def.def != prev_def.def && prev_def.import == def_import_type {
+                     changed = true;
+                     defs.types = None;
+-                    self.def_map.modules[module_id].scope.update_def_types(name, def.def, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_def_types(name, def.def, def.vis);
+                 }
+             }
+ 
+@@ -1264,13 +1285,17 @@ impl<'db> DefCollector<'db> {
+                 {
+                     changed = true;
+                     defs.values = None;
+-                    self.def_map.modules[module_id].scope.update_visibility_values(name, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_visibility_values(name, def.vis);
+                 } else if def.def != prev_def.def
+                     && prev_def.import.map(ImportOrExternCrate::from) == def_import_type
+                 {
+                     changed = true;
+                     defs.values = None;
+-                    self.def_map.modules[module_id].scope.update_def_values(name, def.def, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_def_values(name, def.def, def.vis);
+                 }
+             }
+ 
+@@ -1284,16 +1309,20 @@ impl<'db> DefCollector<'db> {
+                 {
+                     changed = true;
+                     defs.macros = None;
+-                    self.def_map.modules[module_id].scope.update_visibility_macros(name, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_visibility_macros(name, def.vis);
+                 } else if def.def != prev_def.def && prev_def.import == def_import_type {
+                     changed = true;
+                     defs.macros = None;
+-                    self.def_map.modules[module_id].scope.update_def_macros(name, def.def, def.vis);
++                    self.def_map.modules.building()[module_id]
++                        .scope_mut()
++                        .update_def_macros(name, def.def, def.vis);
+                 }
+             }
+         }
+ 
+-        changed |= self.def_map.modules[module_id].scope.push_res_with_import(
++        changed |= self.def_map.modules.building()[module_id].scope_mut().push_res_with_import(
+             &mut self.from_glob_import,
+             (module_id, name.clone()),
+             defs,
+@@ -1369,8 +1398,8 @@ impl<'db> DefCollector<'db> {
+                     if let Ok(call_id) = call_id {
+                         // FIXME: Expansion error
+                         if let Some(call_id) = call_id.value {
+-                            self.def_map.modules[directive.module_id]
+-                                .scope
++                            self.def_map.modules.building()[directive.module_id]
++                                .scope_mut()
+                                 .add_macro_invoc(ast_id.ast_id, call_id);
+ 
+                             push_resolved(&mut resolved, directive, call_id);
+@@ -1401,12 +1430,14 @@ impl<'db> DefCollector<'db> {
+                     );
+ 
+                     if let Ok((macro_id, def_id, call_id)) = id {
+-                        self.def_map.modules[directive.module_id].scope.set_derive_macro_invoc(
+-                            ast_id.ast_id,
+-                            Either::Left(call_id),
+-                            *derive_attr,
+-                            *derive_pos,
+-                        );
++                        self.def_map.modules.building()[directive.module_id]
++                            .scope_mut()
++                            .set_derive_macro_invoc(
++                                ast_id.ast_id,
++                                Either::Left(call_id),
++                                *derive_attr,
++                                *derive_pos,
++                            );
+                         // Record its helper attributes.
+                         if def_id.krate != self.def_map.krate {
+                             let def_map = crate_def_map(self.db, def_id.krate);
+@@ -1630,8 +1661,8 @@ impl<'db> DefCollector<'db> {
+                                 // This is just a trick to be able to resolve the input to derives
+                                 // as proper paths in `Semantics`.
+                                 // Check the comment in [`builtin_attr_macro`].
+-                                self.def_map.modules[directive.module_id]
+-                                    .scope
++                                self.def_map.modules.building()[directive.module_id]
++                                    .scope_mut()
+                                     .init_derive_attribute(
+                                         ast_id,
+                                         *attr_id,
+@@ -1682,8 +1713,8 @@ impl<'db> DefCollector<'db> {
+                     }
+ 
+                     let call_id = call_id();
+-                    self.def_map.modules[directive.module_id]
+-                        .scope
++                    self.def_map.modules.building()[directive.module_id]
++                        .scope_mut()
+                         .add_attr_macro_invoc(ast_id, call_id);
+ 
+                     push_resolved(&mut resolved, directive, call_id);
+@@ -1700,7 +1731,9 @@ impl<'db> DefCollector<'db> {
+         self.unresolved_macros = macros;
+ 
+         for (module_id, ptr, call_id) in eager_callback_buffer {
+-            self.def_map.modules[module_id].scope.add_macro_invoc(ptr.map(|(_, it)| it), call_id);
++            self.def_map.modules.building()[module_id]
++                .scope_mut()
++                .add_macro_invoc(ptr.map(|(_, it)| it), call_id);
+         }
+ 
+         for (module_id, depth, container, macro_call_id, attr_macro_item) in resolved {
+@@ -1915,7 +1948,7 @@ impl ModCollector<'_, '_> {
+                 let Some(deferred_derives) = deferred_derives.remove(&ast_id.upcast()) else {
+                     return;
+                 };
+-                let module = &mut def_map.modules[module_id];
++                let module = &mut def_map.modules.building()[module_id];
+                 for deferred_derive in deferred_derives {
+                     crate::builtin_derive::with_derive_traits(deferred_derive.derive, |trait_| {
+                         let impl_id = BuiltinDeriveImplId::new(
+@@ -1927,8 +1960,8 @@ impl ModCollector<'_, '_> {
+                                 derive_index: deferred_derive.derive_index,
+                             },
+                         );
+-                        module.scope.define_builtin_derive_impl(impl_id);
+-                        module.scope.set_derive_macro_invoc(
++                        module.scope_mut().define_builtin_derive_impl(impl_id);
++                        module.scope_mut().set_derive_macro_invoc(
+                             ast_id,
+                             Either::Right(impl_id),
+                             deferred_derive.derive_attr_id,
+@@ -1949,7 +1982,7 @@ impl ModCollector<'_, '_> {
+             };
+         let update_def =
+             |def_collector: &mut DefCollector<'_>, id, name: &Name, vis, value_ns_ctor_vis| {
+-                def_collector.def_map.modules[module_id].scope.declare(id);
++                def_collector.def_map.modules.building()[module_id].scope_mut().declare(id);
+                 def_collector.update(
+                     module_id,
+                     &[(Some(name.clone()), PerNs::from_def(id, vis, value_ns_ctor_vis, None))],
+@@ -2009,7 +2042,9 @@ impl ModCollector<'_, '_> {
+                         id: InFile::new(self.tree_id.file_id(), ast_id),
+                     }
+                     .intern(db);
+-                    def_map.modules[self.module_id].scope.define_extern_crate_decl(id);
++                    def_map.modules.building()[self.module_id]
++                        .scope_mut()
++                        .define_extern_crate_decl(id);
+ 
+                     let is_self = *name == sym::self_;
+                     let resolved = if is_self {
+@@ -2080,8 +2115,8 @@ impl ModCollector<'_, '_> {
+                         id: InFile::new(self.file_id(), ast_id),
+                     }
+                     .intern(db);
+-                    self.def_collector.def_map.modules[self.module_id]
+-                        .scope
++                    self.def_collector.def_map.modules.building()[self.module_id]
++                        .scope_mut()
+                         .define_extern_block(extern_block_id);
+                     self.collect(&block.children, ItemContainerId::ExternBlockId(extern_block_id))
+                 }
+@@ -2098,8 +2133,8 @@ impl ModCollector<'_, '_> {
+                     let impl_id =
+                         ImplLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
+                             .intern(db);
+-                    self.def_collector.def_map.modules[self.module_id]
+-                        .scope
++                    self.def_collector.def_map.modules.building()[self.module_id]
++                        .scope_mut()
+                         .define_impl(impl_id, imp.is_trait_impl)
+                 }
+                 ModItemKind::Function(ast_id, it) => {
+@@ -2125,8 +2160,8 @@ impl ModCollector<'_, '_> {
+                         // A proc macro is implemented as a function, but it's treated as a macro, not a function.
+                         // You cannot call it like a function, for example, except in its defining crate.
+                         // So we keep the function definition, but remove it from the scope, leaving only the macro.
+-                        self.def_collector.def_map[module_id]
+-                            .scope
++                        self.def_collector.def_map.modules.building()[module_id]
++                            .scope_mut()
+                             .remove_from_value_ns(&it.name, fn_id.into());
+                     }
+                 }
+@@ -2208,8 +2243,8 @@ impl ModCollector<'_, '_> {
+                         }
+                         None => {
+                             // const _: T = ...;
+-                            self.def_collector.def_map.modules[self.module_id]
+-                                .scope
++                            self.def_collector.def_map.modules.building()[self.module_id]
++                                .scope_mut()
+                                 .define_unnamed_const(const_id);
+                         }
+                     }
+@@ -2443,19 +2478,19 @@ impl ModCollector<'_, '_> {
+             .to_static()
+         };
+         let def_map = &mut self.def_collector.def_map;
+-        let modules = &mut def_map.modules;
++        let modules = def_map.modules.building();
+         let mut data = ModuleData::new(origin, vis, Some(self.module_id));
+-        for (name, macs) in modules[self.module_id].scope.legacy_macros() {
++        for (name, macs) in modules[self.module_id].scope(self.def_collector.db).legacy_macros() {
+             for &mac in macs {
+-                data.scope.define_legacy_macro(name.clone(), mac);
++                data.scope_mut().define_legacy_macro(name.clone(), mac);
+             }
+         }
+-        modules[self.module_id].children.insert(name.clone(), module);
++        modules[self.module_id].children_mut().insert(name.clone(), module);
+         modules.insert(module, data);
+ 
+         let def = ModuleDefId::from(module);
+ 
+-        def_map.modules[self.module_id].scope.declare(def);
++        def_map.modules.building()[self.module_id].scope_mut().declare(def);
+         self.def_collector.update(
+             self.module_id,
+             &[(Some(name), PerNs::from_def(def, vis, None, None))],
+@@ -2587,7 +2622,6 @@ impl ModCollector<'_, '_> {
+             edition: self.def_collector.def_map.data.edition,
+         }
+         .intern(self.def_collector.db);
+-        self.def_collector.def_map.macro_def_to_macro_id.insert(f_ast_id.erase(), macro_id.into());
+         self.def_collector.define_macro_rules(
+             self.module_id,
+             mac.name.clone(),
+@@ -2659,7 +2693,6 @@ impl ModCollector<'_, '_> {
+             edition: self.def_collector.def_map.data.edition,
+         }
+         .intern(self.def_collector.db);
+-        self.def_collector.def_map.macro_def_to_macro_id.insert(f_ast_id.erase(), macro_id.into());
+         self.def_collector.define_macro_def(
+             self.module_id,
+             mac.name.clone(),
+@@ -2705,10 +2738,14 @@ impl ModCollector<'_, '_> {
+                 path.as_ident().and_then(|name| {
+                     let def_map = &self.def_collector.def_map;
+                     def_map
+-                        .with_ancestor_maps(db, self.module_id, &mut |map, module| {
+-                            map[module].scope.get_legacy_macro(name)?.last().copied()
++                        .legacy_macro_in_textual_scope(db, self.module_id, name)
++                        .or_else(|| {
++                            def_map
++                                .module(db, self.module_id)
++                                .scope(self.def_collector.db)
++                                .get(name)
++                                .take_macros()
+                         })
+-                        .or_else(|| def_map[self.module_id].scope.get(name).take_macros())
+                         .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
+                         .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                         .map(|it| it.definition(self.def_collector.db))
+@@ -2717,8 +2754,8 @@ impl ModCollector<'_, '_> {
+             &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
+         ) {
+             for (ptr, call_id) in eager_callback_buffer {
+-                self.def_collector.def_map.modules[self.module_id]
+-                    .scope
++                self.def_collector.def_map.modules.building()[self.module_id]
++                    .scope_mut()
+                     .add_macro_invoc(ptr.map(|(_, it)| it), call_id);
+             }
+             // FIXME: if there were errors, this might've been in the eager expansion from an
+@@ -2727,8 +2764,8 @@ impl ModCollector<'_, '_> {
+                 // Legacy macros need to be expanded immediately, so that any macros they produce
+                 // are in scope.
+                 if let Some(call_id) = res.value {
+-                    self.def_collector.def_map.modules[self.module_id]
+-                        .scope
++                    self.def_collector.def_map.modules.building()[self.module_id]
++                        .scope_mut()
+                         .add_macro_invoc(ast_id.ast_id, call_id);
+                     self.def_collector.collect_macro_expansion(
+                         self.module_id,
+@@ -2753,15 +2790,19 @@ impl ModCollector<'_, '_> {
+     }
+ 
+     fn import_all_legacy_macros(&mut self, module_id: ModuleId) {
+-        let [Some(source), Some(target)] =
+-            self.def_collector.def_map.modules.get_disjoint_mut([&module_id, &self.module_id])
++        let [Some(source), Some(target)] = self
++            .def_collector
++            .def_map
++            .modules
++            .building()
++            .get_disjoint_mut([&module_id, &self.module_id])
+         else {
+             return;
+         };
+ 
+-        for (name, macs) in source.scope.legacy_macros() {
++        for (name, macs) in source.scope(self.def_collector.db).legacy_macros() {
+             if let Some(&mac) = macs.last() {
+-                target.scope.define_legacy_macro(name.clone(), mac);
++                target.scope_mut().define_legacy_macro(name.clone(), mac);
+             }
+         }
+     }
+diff --git a/crates/hir-def/src/nameres/path_resolution.rs b/crates/hir-def/src/nameres/path_resolution.rs
+index 1c4bbc5bfa494664a9a7d5353e1b538252dbc5d3..a58b8253f946ff232b25142fa7026d44ef24f999 100644
+--- a/crates/hir-def/src/nameres/path_resolution.rs
++++ b/crates/hir-def/src/nameres/path_resolution.rs
+@@ -20,7 +20,7 @@ use span::Edition;
+ use stdx::TupleExt;
+ 
+ use crate::{
+-    AdtId, ModuleDefId, ModuleId,
++    AdtId, EnumId, Lookup, ModuleDefId, ModuleId,
+     item_scope::{BUILTIN_SCOPE, ImportOrExternCrate},
+     nameres::{
+         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, assoc::TraitItems,
+@@ -318,7 +318,7 @@ impl DefMap {
+                 for _ in 0..lvl {
+                     // Loop invariant: at the beginning of each loop, `local_id` must refer to a
+                     // non-block module.
+-                    if let Some(parent) = def_map.modules[local_id].parent {
++                    if let Some(parent) = def_map.module(db, local_id).parent {
+                         (def_map, local_id) =
+                             adjust_to_nearest_non_block_module(db, def_map, parent);
+                     } else {
+@@ -445,6 +445,23 @@ impl DefMap {
+         }
+     }
+ 
++    /// The visibility `e` is declared with. Its variants are that visible, even when the
++    /// path reached the enum through a more private import.
++    fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
++        let module = e.lookup(db).container;
++        let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
++            &self.module(db, module)
++        } else {
++            &module.def_map(db).module(db, module)
++        };
++        let def = ModuleDefId::from(e);
++        module_data
++            .scope(db)
++            .types()
++            .find(|(_, item)| item.def == def && item.import.is_none())
++            .map(|(_, item)| item.vis)
++    }
++
+     fn resolve_remaining_segments<'a>(
+         &self,
+         db: &dyn SourceDatabase,
+@@ -504,23 +521,24 @@ impl DefMap {
+                     }
+ 
+                     let module_data = if module.block(db) == self.block_id() {
+-                        &self[module]
++                        &self.module(db, module)
+                     } else {
+-                        &module.def_map(db)[module]
++                        &module.def_map(db).module(db, module)
+                     };
+ 
+                     // Since it is a qualified path here, it should not contains legacy macros
+-                    module_data.scope.get(segment)
++                    module_data.name_in_scope(db, segment)
+                 }
+                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
+                     // enum variant
+                     cov_mark::hit!(can_import_enum_variant);
+ 
++                    let vis = self.declared_enum_visibility(db, e).unwrap_or(curr.vis);
+                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
+                         if shape.has_value_ns_ctor() {
+-                            PerNs::both(variant.into(), variant.into(), curr.vis, None)
++                            PerNs::both(variant.into(), variant.into(), vis, None)
+                         } else {
+-                            PerNs::types(variant.into(), curr.vis, None)
++                            PerNs::types(variant.into(), vis, None)
+                         }
+                     });
+                     // FIXME: Need to filter visibility here and below? Not sure.
+@@ -634,15 +652,16 @@ impl DefMap {
+         //  - current module / scope
+         //  - extern prelude / macro_use prelude
+         //  - std prelude
+-        let from_legacy_macro = self[module]
+-            .scope
+-            .get_legacy_macro(name)
++        let from_legacy_macro = self
++            .module(db, module)
++            .legacy_macro_in_scope(db, name)
+             // FIXME: shadowing
+             .and_then(|it| it.last())
+             .copied()
+             .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
+             .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None));
+-        let from_scope = self[module].scope.get(name).filter_macro(db, expected_macro_subns);
++        let from_scope =
++            self.module(db, module).name_in_scope(db, name).filter_macro(db, expected_macro_subns);
+         let from_builtin = match self.block {
+             Some(_) => {
+                 // Only resolve to builtins in the root `DefMap`.
+@@ -727,9 +746,9 @@ impl DefMap {
+         let from_crate_root = match self.block {
+             Some(_) => {
+                 let def_map = self.crate_root(db).def_map(db);
+-                def_map[def_map.root].scope.get(name)
++                def_map.module(db, def_map.root).name_in_scope(db, name)
+             }
+-            None => self[self.root].scope.get(name),
++            None => self.module(db, self.root).name_in_scope(db, name),
+         };
+         let from_extern_prelude = || {
+             if self.block.is_some() && module == self.root {
+@@ -745,7 +764,7 @@ impl DefMap {
+     fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
+         if let Some((prelude, _use)) = self.prelude {
+             let def_map = if prelude.krate(db) == self.krate { self } else { prelude.def_map(db) };
+-            def_map[prelude].scope.get(name)
++            def_map.module(db, prelude).name_in_scope(db, name)
+         } else {
+             PerNs::none()
+         }
+diff --git a/crates/hir-def/src/nameres/tests.rs b/crates/hir-def/src/nameres/tests.rs
+index 08d98dff33d3cef9b99a0d5b3001a8905d30818c..a7c58333d3036a0af805fb42ad55ab9a5b94d5ed 100644
+--- a/crates/hir-def/src/nameres/tests.rs
++++ b/crates/hir-def/src/nameres/tests.rs
+@@ -14,11 +14,11 @@ use crate::{
+ 
+ fn compute_crate_def_map(
+     #[rust_analyzer::rust_fixture] ra_fixture: &str,
+-    cb: impl FnOnce(&DefMap),
++    cb: impl FnOnce(&TestDB, &DefMap),
+ ) {
+     let db = TestDB::with_files(ra_fixture);
+     let krate = db.fetch_test_crate();
+-    cb(crate_def_map(&db, krate));
++    cb(&db, crate_def_map(&db, krate));
+ }
+ 
+ fn render_crate_def_map(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
+diff --git a/crates/hir-def/src/nameres/tests/globs.rs b/crates/hir-def/src/nameres/tests/globs.rs
+index 62887e29410f6faae05971586c23eb3076fd563e..9ab0d3c4673aff5e8f9720b66088b1053d9d368b 100644
+--- a/crates/hir-def/src/nameres/tests/globs.rs
++++ b/crates/hir-def/src/nameres/tests/globs.rs
+@@ -490,3 +490,37 @@ use reexport_2::*;
+         "#]],
+     );
+ }
++
++#[test]
++fn variant_reexported_through_private_enum_import() {
++    check(
++        r#"
++mod minusplus {
++    pub enum Index { Minus, Plus }
++}
++mod sides {
++    use super::minusplus::Index;
++    pub use Index::Minus as Left;
++}
++mod numbers {
++    use super::sides::Left;
++}
++"#,
++        expect![[r#"
++            crate
++            - minusplus : type
++            - numbers : type
++            - sides : type
++
++            crate::minusplus
++            - Index : type
++
++            crate::numbers
++            - Left : type (import) value (import)
++
++            crate::sides
++            - Index : type (import)
++            - Left : type (import) value (import)
++        "#]],
++    );
++}
+diff --git a/crates/hir-def/src/nameres/tests/incremental.rs b/crates/hir-def/src/nameres/tests/incremental.rs
+index 5cd70955ab3e6b2368d3fae8fcbdeb92c0ec69f5..a28986992bac32ace755430eecc1baa735c01bcb 100644
+--- a/crates/hir-def/src/nameres/tests/incremental.rs
++++ b/crates/hir-def/src/nameres/tests/incremental.rs
+@@ -299,6 +299,8 @@ fn f() { foo }
+                 "HirFileId::ast_id_map_",
+                 "EditionedFileId::parse_",
+                 "real_span_map",
++                "Modules < 'db >::module_",
++                "ModuleScope < 'db >::name_",
+                 "MacroId::definition_",
+                 "file_item_tree_query",
+                 "HirFileId::ast_id_map_",
+@@ -435,6 +437,8 @@ pub struct S {}
+                 "HirFileId::ast_id_map_",
+                 "MacroCallId::parse_macro_expansion_",
+                 "MacroCallId::macro_arg_",
++                "Modules < 'db >::module_",
++                "ModuleScope < 'db >::name_",
+                 "MacroId::definition_",
+                 "file_item_tree_query",
+                 "HirFileId::ast_id_map_",
+@@ -514,9 +518,11 @@ m!(Z);
+         &db,
+         || {
+             let crate_def_map = crate_def_map(&db, krate);
+-            let module_data = &crate_def_map
+-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
+-            assert_eq!(module_data.scope.resolutions().count(), 4);
++            let module_data = &crate_def_map.module(
++                &db,
++                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
++            );
++            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
+         },
+         &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
+         expect![[r#"
+@@ -548,6 +554,7 @@ m!(Z);
+                 "HirFileId::ast_id_map_",
+                 "MacroCallId::parse_macro_expansion_",
+                 "MacroCallId::macro_arg_",
++                "Modules < 'db >::module_",
+             ]
+         "#]],
+     );
+@@ -564,9 +571,11 @@ m!(Z);
+         &db,
+         || {
+             let crate_def_map = crate_def_map(&db, krate);
+-            let module_data = &crate_def_map
+-                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
+-            assert_eq!(module_data.scope.resolutions().count(), 4);
++            let module_data = &crate_def_map.module(
++                &db,
++                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
++            );
++            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
+         },
+         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
+         expect![[r#"
+@@ -651,3 +660,30 @@ fn execute_assert_events(
+     }
+     expect.assert_debug_eq(&events);
+ }
++
++#[test]
++fn item_after_impl_is_its_own_span_anchor() {
++    use hir_expand::HirFileId;
++    use syntax::{
++        AstNode,
++        ast::{self, HasModuleItem},
++    };
++
++    let (db, pos) = TestDB::with_position(
++        r#"
++struct S;
++impl S {
++    fn first(&self) {}
++    fn last(&self) {$0}
++}
++struct AfterImpl;
++"#,
++    );
++    let file_id = HirFileId::from(pos.file_id);
++    let after_impl = pos.file_id.parse(&db).tree().items().last().unwrap();
++    assert!(matches!(after_impl, ast::Item::Struct(_)));
++    let span = file_id.span_map(&db).span_for_range(after_impl.syntax().text_range());
++
++    assert_eq!(span.anchor.ast_id, file_id.ast_id_map(&db).ast_id(&after_impl).erase());
++    assert_eq!(u32::from(span.range.start()), 0);
++}
+diff --git a/crates/hir-def/src/nameres/tests/macros.rs b/crates/hir-def/src/nameres/tests/macros.rs
+index 75ec72801131abe75d5b4a2be4b765ae8148bb61..66ecf77280e21cb2bb2581d821b9e6366a7d9ab8 100644
+--- a/crates/hir-def/src/nameres/tests/macros.rs
++++ b/crates/hir-def/src/nameres/tests/macros.rs
+@@ -761,7 +761,7 @@ macro_rules! foo {
+ 
+ pub use core::clone::Clone;
+ "#,
+-        |map| assert_eq!(map.modules[map.root].scope.builtin_derive_impls().len(), 1),
++        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
+     );
+ }
+ 
+@@ -783,7 +783,7 @@ pub macro Copy {}
+ #[rustc_builtin_macro]
+ pub macro Clone {}
+ "#,
+-        |map| assert_eq!(map.modules[map.root].scope.builtin_derive_impls().len(), 2),
++        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 2),
+     );
+ }
+ 
+@@ -826,7 +826,7 @@ pub macro derive($item:item) {}
+ #[rustc_builtin_macro]
+ pub macro Clone {}
+ "#,
+-        |map| assert_eq!(map.modules[map.root].scope.builtin_derive_impls().len(), 1),
++        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
+     );
+ }
+ 
+@@ -1477,7 +1477,7 @@ fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
+     let krate = *all_crates(&db).last().expect("no crate graph present");
+     let def_map = crate_def_map(&db, krate);
+ 
+-    let root_module = &def_map[def_map.root].scope;
++    let root_module = &def_map.module(&db, def_map.root).scope(&db);
+     assert!(
+         root_module.legacy_macros().count() == 0,
+         "`#[macro_use]` shouldn't bring macros into textual macro scope",
+@@ -1584,7 +1584,7 @@ macro_rules! derive { () => {} }
+ #[derive(Clone)]
+ struct S;
+     "#,
+-        |map| assert_eq!(map.modules[map.root].scope.builtin_derive_impls().len(), 1),
++        |db, map| assert_eq!(map.module(db, map.root).scope(db).builtin_derive_impls().len(), 1),
+     );
+ }
+ 
+@@ -1767,6 +1767,6 @@ fn foo() {}
+ #[proc_macro]
+ fn foo() {}
+     "#,
+-        |_| (),
++        |_, _| (),
+     )
+ }
+diff --git a/crates/hir-def/src/nameres/tests/mod_resolution.rs b/crates/hir-def/src/nameres/tests/mod_resolution.rs
+index e54bcc28d27fae8c62ac6c986510e8f711c7a20c..621d087d2e13d3857b8083b0c5189d8399e297da 100644
+--- a/crates/hir-def/src/nameres/tests/mod_resolution.rs
++++ b/crates/hir-def/src/nameres/tests/mod_resolution.rs
+@@ -839,7 +839,7 @@ mod foo;
+ #[path = "./foo.rs"]
+ mod foo;
+ "#,
+-        |_| (),
++        |_, _| (),
+     );
+ 
+     compute_crate_def_map(
+@@ -853,7 +853,7 @@ mod bar;
+ #[path = "./foo.rs"]
+ mod foo;
+ "#,
+-        |_| (),
++        |_, _| (),
+     );
+ }
+ 
+diff --git a/crates/hir-def/src/resolver.rs b/crates/hir-def/src/resolver.rs
+index 9d5d80a73ef6a79628a34bc90394dcb108b1f3d8..34f98bc2a32d14f4e5923b5f21d10d90a0baeee0 100644
+--- a/crates/hir-def/src/resolver.rs
++++ b/crates/hir-def/src/resolver.rs
+@@ -407,6 +407,7 @@ impl<'db> Resolver<'db> {
+         if skip_to_mod {
+             return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path));
+         }
++        let path_hygiene = hygiene_id;
+ 
+         if n_segments <= 1 {
+             let mut hygiene_info = hygiene_info(db, hygiene_id);
+@@ -500,6 +501,12 @@ impl<'db> Resolver<'db> {
+             return Some(res);
+         }
+ 
++        if let Some(res) = macro_def_site(db, path_hygiene)
++            .and_then(|module| module.resolver(db).module_scope.resolve_path_in_value_ns(db, path))
++        {
++            return Some(res);
++        }
++
+         // If a path of the shape `u16::from_le_bytes` failed to resolve at all, then we fall back
+         // to resolving to the primitive type, to allow this to still work in the presence of
+         // `use core::u16;`.
+@@ -629,11 +636,11 @@ impl<'db> Resolver<'db> {
+         //         def: m.module.into(),
+         //     }),
+         // );
+-        def_map[module_id].scope.entries().for_each(|(name, def)| {
++        def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
+             res.add_per_ns(name, def);
+         });
+ 
+-        def_map[module_id].scope.legacy_macros().for_each(|(name, macs)| {
++        def_map.module(db, module_id).scope(db).legacy_macros().for_each(|(name, macs)| {
+             macs.iter().for_each(|&mac| {
+                 res.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
+             })
+@@ -651,7 +658,7 @@ impl<'db> Resolver<'db> {
+         });
+         if let Some((prelude, _use)) = def_map.prelude() {
+             let prelude_def_map = prelude.def_map(db);
+-            for (name, def) in prelude_def_map[prelude].scope.entries() {
++            for (name, def) in prelude_def_map.module(db, prelude).scope(db).entries() {
+                 res.add_per_ns(name, def)
+             }
+         }
+@@ -663,8 +670,10 @@ impl<'db> Resolver<'db> {
+         &'a self,
+         db: &'a dyn SourceDatabase,
+     ) -> impl Iterator<Item = Name> + 'a {
+-        self.module_scope.def_map[self.module_scope.module_id]
+-            .scope
++        self.module_scope
++            .def_map
++            .module(db, self.module_scope.module_id)
++            .scope(db)
+             .extern_crate_decls()
+             .filter_map(|id| {
+                 let loc = id.lookup(db);
+@@ -693,7 +702,9 @@ impl<'db> Resolver<'db> {
+ 
+         for scope in self.scopes() {
+             match scope {
+-                Scope::BlockScope(m) => traits.extend(m.def_map[m.module_id].scope.traits()),
++                Scope::BlockScope(m) => {
++                    traits.extend(m.def_map.module(db, m.module_id).traits_in_scope(db))
++                }
+                 &Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
+                     let impl_data = ImplSignature::of(db, impl_);
+                     if let Some(target_trait) = impl_data.target_trait
+@@ -710,17 +721,22 @@ impl<'db> Resolver<'db> {
+         // Fill in the prelude traits
+         if let Some((prelude, _use)) = self.module_scope.def_map.prelude() {
+             let prelude_def_map = prelude.def_map(db);
+-            traits.extend(prelude_def_map[prelude].scope.traits());
++            traits.extend(prelude_def_map.module(db, prelude).traits_in_scope(db));
+         }
+         // Fill in module visible traits
+-        traits.extend(self.module_scope.def_map[self.module_scope.module_id].scope.traits());
++        traits.extend(
++            self.module_scope.def_map.module(db, self.module_scope.module_id).traits_in_scope(db),
++        );
+         traits
+     }
+ 
+-    pub fn traits_in_scope_from_block_scopes(&self) -> impl Iterator<Item = TraitId> + '_ {
++    pub fn traits_in_scope_from_block_scopes<'a>(
++        &'a self,
++        db: &'a dyn SourceDatabase,
++    ) -> impl Iterator<Item = TraitId> + 'a {
+         self.scopes()
+             .filter_map(|scope| match scope {
+-                Scope::BlockScope(m) => Some(m.def_map[m.module_id].scope.traits()),
++                Scope::BlockScope(m) => Some(m.def_map.module(db, m.module_id).traits_in_scope(db)),
+                 _ => None,
+             })
+             .flatten()
+@@ -730,9 +746,9 @@ impl<'db> Resolver<'db> {
+         self.item_scope_().2
+     }
+ 
+-    pub fn item_scope(&self) -> &ItemScope {
++    pub fn item_scope<'a>(&'a self, db: &'a dyn SourceDatabase) -> &'a ItemScope {
+         let (def_map, _, local_id) = self.item_scope_();
+-        &def_map[local_id].scope
++        def_map.module(db, local_id).scope(db)
+     }
+ 
+     pub fn krate(&self) -> Crate {
+@@ -984,6 +1000,19 @@ fn handle_macro_def_scope(
+     }
+ }
+ 
++/// The module of the `macro` whose expansion produced a name. Items named in such a macro are
++/// the ones in scope where the macro is defined.
++// FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
++fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
++    let (_, def) = hygiene_info(db, hygiene_id)?;
++    crate::crate_def_map(db, def.krate).modules(db).find_map(|(_, data)| {
++        data.scope(db).macros().find_map(|(_, it)| match it.def {
++            MacroId::Macro2Id(id) if it.def.definition(db) == def => Some(id.lookup(db).container),
++            _ => None,
++        })
++    })
++}
++
+ #[inline]
+ fn hygiene_info(
+     db: &dyn SourceDatabase,
+@@ -1053,14 +1082,16 @@ impl<'db> Scope<'db> {
+     fn process_names(&self, acc: &mut ScopeNames, db: &'db dyn SourceDatabase) {
+         match self {
+             Scope::BlockScope(m) => {
+-                m.def_map[m.module_id].scope.entries().for_each(|(name, def)| {
++                m.def_map.module(db, m.module_id).scope(db).entries().for_each(|(name, def)| {
+                     acc.add_per_ns(name, def);
+                 });
+-                m.def_map[m.module_id].scope.legacy_macros().for_each(|(name, macs)| {
+-                    macs.iter().for_each(|&mac| {
+-                        acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
+-                    })
+-                });
++                m.def_map.module(db, m.module_id).scope(db).legacy_macros().for_each(
++                    |(name, macs)| {
++                        macs.iter().for_each(|&mac| {
++                            acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
++                        })
++                    },
++                );
+             }
+             &Scope::GenericParams { params, def: parent } => {
+                 if let GenericDefId::ImplId(impl_) = parent {
+diff --git a/crates/hir-def/src/signatures.rs b/crates/hir-def/src/signatures.rs
+index c61cffd56467ecdf53a200585128ef610d34ef23..72708de27121cc5e1f3f531084c670e6a6dc430a 100644
+--- a/crates/hir-def/src/signatures.rs
++++ b/crates/hir-def/src/signatures.rs
+@@ -1054,11 +1054,22 @@ pub struct InactiveEnumVariantCode {
+     pub ast_id: span::FileAstId<ast::Variant>,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Debug, Clone)]
+ pub struct EnumVariants {
+     pub variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
+ }
+ 
++// The order of the variants is part of the enum: discriminants and layout follow it. Two
++// `IndexMap`s with the same entries are equal whatever their order.
++impl PartialEq for EnumVariants {
++    fn eq(&self, other: &Self) -> bool {
++        self.variants.len() == other.variants.len()
++            && self.variants.iter().eq(other.variants.iter())
++    }
++}
++
++impl Eq for EnumVariants {}
++
+ #[salsa::tracked]
+ impl EnumVariants {
+     #[salsa::tracked(returns(ref))]
+diff --git a/crates/hir-def/src/test_db.rs b/crates/hir-def/src/test_db.rs
+index 4433522c1832f796441c63c7ec5174c2fbe76a91..3572e339786c66653c44936e458caf27cd1aba22 100644
+--- a/crates/hir-def/src/test_db.rs
++++ b/crates/hir-def/src/test_db.rs
+@@ -163,7 +163,7 @@ impl TestDB {
+     pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
+         for &krate in relevant_crates(self, file_id).iter() {
+             let crate_def_map = crate_def_map(self, krate);
+-            for (local_id, data) in crate_def_map.modules() {
++            for (local_id, data) in crate_def_map.modules(self) {
+                 if data.origin.file_id().map(|file_id| file_id.file_id(self)) == Some(file_id) {
+                     return local_id;
+                 }
+@@ -199,7 +199,7 @@ impl TestDB {
+     fn mod_at_position(&self, def_map: &DefMap, position: FilePosition) -> ModuleId {
+         let mut size = None;
+         let mut res = def_map.root;
+-        for (module, data) in def_map.modules() {
++        for (module, data) in def_map.modules(self) {
+             let src = data.definition_source(self);
+             // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
+             // `position.file_id` is created before the def map, causing it to have to wrong crate
+@@ -247,7 +247,7 @@ impl TestDB {
+         // Find the smallest (innermost) function in `def_map` containing the cursor.
+         let mut size = None;
+         let mut fn_def = None;
+-        for (_, module) in def_map.modules() {
++        for (_, module) in def_map.modules(self) {
+             let file_id = module.definition_source(self).file_id;
+             // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
+             // `position.file_id` is created before the def map, causing it to have to wrong crate
+@@ -260,7 +260,7 @@ impl TestDB {
+             if file_id.file_id(self) != position.file_id.file_id(self) {
+                 continue;
+             }
+-            for decl in module.scope.declarations() {
++            for decl in module.scope(self).declarations() {
+                 if let ModuleDefId::FunctionId(it) = decl {
+                     let range = it.lookup(self).source(self).value.syntax().text_range();
+ 
+diff --git a/crates/hir-def/src/upvars.rs b/crates/hir-def/src/upvars.rs
+index d1b039c230deb6f134d87b8985f21dd7eef15c5c..0f1e34f739ab838b2d9b4b1dd544251c15a852c6 100644
+--- a/crates/hir-def/src/upvars.rs
++++ b/crates/hir-def/src/upvars.rs
+@@ -240,19 +240,21 @@ mod tests {
+         let db = TestDB::with_files(ra_fixture);
+         let def_map = crate_def_map(&db, db.test_crate());
+         let func = def_map
+-            .modules()
+-            .flat_map(|(_, module)| module.scope.declarations())
++            .modules(&db)
++            .flat_map(|(_, module)| module.scope(&db).declarations())
+             .filter_map(|decl| match decl {
+                 ModuleDefId::FunctionId(func) => Some(func),
+                 _ => None,
+             })
+-            .chain(def_map.modules().flat_map(|(_, module)| {
+-                module.scope.impls().flat_map(|impl_| &*impl_.impl_items(&db).items).filter_map(
+-                    |&(_, item)| match item {
++            .chain(def_map.modules(&db).flat_map(|(_, module)| {
++                module
++                    .scope(&db)
++                    .impls()
++                    .flat_map(|impl_| &*impl_.impl_items(&db).items)
++                    .filter_map(|&(_, item)| match item {
+                         AssocItemId::FunctionId(it) => Some(it),
+                         _ => None,
+-                    },
+-                )
++                    })
+             }))
+             .exactly_one()
+             .unwrap_or_else(|_| panic!("expected one function"));
+diff --git a/crates/hir-def/src/visibility.rs b/crates/hir-def/src/visibility.rs
+index 2a406cf01fad074de0d3d29ac00989d2cdc28381..35541b6b24a5ca528b386080e84e2e39ca70551d 100644
+--- a/crates/hir-def/src/visibility.rs
++++ b/crates/hir-def/src/visibility.rs
+@@ -69,7 +69,7 @@ impl Visibility {
+         from_module: ModuleIdLt<'db>,
+     ) -> bool {
+         if cfg!(debug_assertions) {
+-            _ = def_map.modules[from_module];
++            _ = def_map.module(db, from_module);
+         }
+         let to_module = match self {
+             Visibility::Module(m, _) => m,
+@@ -130,7 +130,7 @@ impl Visibility {
+             if from_module == to_module {
+                 return true;
+             }
+-            match def_map[from_module].parent {
++            match def_map.module(db, from_module).parent {
+                 Some(parent) => from_module = parent,
+                 None => {
+                     match def_map.parent() {
+@@ -195,14 +195,16 @@ impl Visibility {
+                     return None;
+                 }
+ 
+-                let mut a_ancestors = iter::successors(Some(mod_a), |&m| def_map[m].parent);
++                let mut a_ancestors =
++                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
+ 
+                 if a_ancestors.any(|m| m == mod_b) {
+                     // B is above A
+                     return Some(Visibility::Module(mod_b, expl_b));
+                 }
+ 
+-                let mut b_ancestors = iter::successors(Some(mod_b), |&m| def_map[m].parent);
++                let mut b_ancestors =
++                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
+                 if b_ancestors.any(|m| m == mod_a) {
+                     // A is above B
+                     return Some(Visibility::Module(mod_a, expl_a));
+@@ -261,14 +263,16 @@ impl Visibility {
+                     return None;
+                 }
+ 
+-                let mut a_ancestors = iter::successors(Some(mod_a), |&m| def_map[m].parent);
++                let mut a_ancestors =
++                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
+ 
+                 if a_ancestors.any(|m| m == mod_b) {
+                     // B is above A
+                     return Some(Visibility::Module(mod_a, expl_a));
+                 }
+ 
+-                let mut b_ancestors = iter::successors(Some(mod_b), |&m| def_map[m].parent);
++                let mut b_ancestors =
++                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
+                 if b_ancestors.any(|m| m == mod_a) {
+                     // A is above B
+                     return Some(Visibility::Module(mod_b, expl_b));
