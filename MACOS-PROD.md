@@ -7,6 +7,55 @@ natively on an Apple Silicon Mac (`uname -m` is
 x86_64-apple-darwin attempt ran under Rosetta 2 and is described separately. Nothing here
 ran on Linux locally.
 
+## State at the last push (read this first)
+
+The session was stopped in the middle of gating a merge. What follows is the state of the head
+that is pushed; the sections further down describe the last fully gated state and say which
+commit their numbers are from.
+
+Done:
+
+- `rustd-collate` 14ee89181b is merged (37b4344b24), and on top of it `rustd-collate-next`
+  1b022ff6f2 (3a11c3924b). Both are plain merges.
+- The merged tree builds with `--features llvm`, `cargo fmt --all -- --check` is clean and
+  `cargo test -p rustd` passes 73 tests. That is all that was run of the Rust tests.
+- In the merge of 1b022ff6f2 the conflicts were resolved like this. `debuginfo.rs` keeps the
+  collated `DebugContext` (DWARF or CodeView) and has `Dwarf` take Mach-O as well as ELF;
+  `settle_macho` is now `Dwarf::settle_macho`. `llvm/lower.rs` marks lines for ELF, Mach-O and
+  COFF. `cargo/plan.rs` keeps the collated `Flavor` and adds `Flavor::Apple` (a `cc` line
+  with `-arch`), which weakens the copied rustc objects and pads the header for the splice.
+  `codegen.rs` uses the collated `argument_slot` and no longer has `ArgumentCopies`. The four
+  harnesses (`buildmodel.py`, `cargo_rustd.py`, `debuginfo.py`, `storefull.py`) keep the
+  macOS and the Windows branches side by side.
+- Harness fixes for macOS: scratch directories that hold a socket are under `/tmp`
+  (`storelib.py`, `remote.py`, `buildmodel.py`, `cargo_rustd.py`), `selects.py` writes each
+  marker line in one write, and `buildmodel.py` names its scratch copy by its real path.
+
+Half done: the gate on the merge of 1b022ff6f2. Measured on 3a11c3924b, native arm64,
+Cranelift only, exit code 0 for each: corpus with `--layouts`, `programs.py`, `stress.py`,
+`breakers.py`, `unwinds.py`, `splices.py`, `asmedits.py`, `includes.py`, `worktrees.py` in
+its three modes, `keys.py`, `debuginfo.py`, `storekills.py --kills 100`,
+`storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py`, `storeguards.py`,
+`selects.py`. `buildmodel.py` failed with 180 of 188 and 8 WRONG: `dep_not_named`,
+`dep_registry_member`, `reload_git_checkout` and `target_specific_deps`, under both backends,
+each a link with undefined symbols of a dependency. The cause was the harness's scratch copy
+being under `/var`, a link to `/private/var`: the daemon reads the dep-info under the real
+path and the crate's root under the other, so `SymbolTable::links` did not find the
+dependency and rustd named its functions as its own. With the scratch copy named by its real
+path those four cases pass (8 of 8, run alone); the whole of `buildmodel.py` was not rerun.
+
+Not run on the merge of 1b022ff6f2: `remote.py` and `cargo_rustd.py` under Cranelift (the run
+was stopped during `remote.py`), and nothing at all under LLVM. `cargo_rustd.py` has not
+passed on this machine since the merge of 14ee89181b: there its `tonic` project's server
+exited with 101 for want of `protoc`, which is installed now, and it was not run to the end
+again. The new `apps.py`, `appsedits.py`, `appstests.py` and `editbench.py` have never run
+on a Mac.
+
+Next, in order: rerun the whole gate under both backends on this head; decide whether a
+workspace reached through a symbolic link should work in rustd itself (compare real paths in
+`SymbolTable::links`) and not only in the harness; run `cargo_rustd.py` to the end; add
+`storeguards.py` and `selects.py` to the macOS CI job; run the apps harnesses.
+
 ## Debug info on Mach-O
 
 ### What changed

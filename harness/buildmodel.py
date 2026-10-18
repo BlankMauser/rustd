@@ -111,7 +111,8 @@ class Case:
         self.verb = self.spec.get("verb", "build")
 
     def prepare(self):
-        self.ws = tempfile.mkdtemp(prefix=f"rustd-bm-{self.name}-")
+        # As the daemon names it: the temporary directory of macOS is a link.
+        self.ws = os.path.realpath(tempfile.mkdtemp(prefix=f"rustd-bm-{self.name}-"))
         shutil.copytree(self.source, self.ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target*", "case.json"))
         self.work = os.path.join(self.ws, "target-rustd-out")
         os.makedirs(self.work)
