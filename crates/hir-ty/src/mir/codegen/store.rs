@@ -405,6 +405,14 @@ pub struct Collected {
     pub kept_bytes: u64,
 }
 
+/// Whether a file was refused for being another user's or open to others, which
+/// [`StoreDir::open`] says in words of its own. The system refuses with the same kind and no
+/// words: on Windows a pack that was evicted while a daemon still reads it can't be opened
+/// until that daemon lets go of it, and is gone then, not wrong.
+fn not_the_users(refused: &io::Error) -> bool {
+    refused.kind() == io::ErrorKind::PermissionDenied && refused.get_ref().is_some()
+}
+
 /// What [`StoreDir::verify`] read.
 #[derive(Debug, Default)]
 pub struct Verified {
@@ -647,7 +655,7 @@ impl StoreDir {
             }
             let pack = match self.read(&name) {
                 Ok(pack) => pack,
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(e) if not_the_users(&e) => {
                     verified.corrupt.push((name, e.to_string()));
                     continue;
                 }
@@ -1029,7 +1037,7 @@ impl Store {
         let opened = self.dir.open(name, true).or_else(|_| self.dir.open(name, false));
         let mut file = match opened {
             Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Err(e) if not_the_users(&e) => {
                 self.discard(name, &e.to_string());
                 return None;
             }
