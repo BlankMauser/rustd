@@ -105,6 +105,8 @@ struct MirLowerCtx<'a, 'db> {
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
     ends_temporaries: FxHashSet<ExprId>,
+    /// The locals that hold an operand of an aggregate or a call lowered so far.
+    operand_locals: FxHashSet<LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
     /// way into.
     arm_unreached: bool,
@@ -265,6 +267,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             extended_temporaries: FxHashMap::default(),
             super_let: None,
             ends_temporaries: FxHashSet::default(),
+            operand_locals: FxHashSet::default(),
             arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
@@ -2158,17 +2161,22 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if self.ends_temporaries.contains(&owner) {
             return;
         }
-        let Some(scope) = self.drop_scopes.last_mut() else { return };
         for operand in operands {
-            let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
-                continue;
-            };
-            let found = scope.locals.iter().skip(declared).position(|&it| it == place.local);
-            if let Some(at) = found.filter(|_| place.projection.as_slice().is_empty()) {
-                let local = scope.locals.remove(declared + at);
-                scope.locals.push(local);
+            if let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind
+                && place.projection.as_slice().is_empty()
+            {
+                self.operand_locals.insert(place.local);
             }
         }
+        let Some(scope) = self.drop_scopes.last_mut() else { return };
+        let Some(since) = scope.locals.get(declared..) else { return };
+        // The operands of an expression inside this one stay behind its own, in the order
+        // they were made: they were made later and are dropped earlier.
+        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
+            since.iter().partition(|it| self.operand_locals.contains(it));
+        scope.locals.truncate(declared);
+        scope.locals.extend(temporaries);
+        scope.locals.extend(operands);
     }
 
     fn lower_call_and_args(
