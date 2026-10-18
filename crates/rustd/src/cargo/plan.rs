@@ -442,7 +442,7 @@ mod tests {
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap();
         assert_eq!(link.flavor, Flavor::Msvc);
-        let command = link.command(&plan, &response).unwrap();
+        let command = link.command(&[&plan.patch, &plan.object], &plan.binary, &response).unwrap();
         assert_eq!(command, format!(r#""C:\v c\link.exe" "@{}""#, response.display()));
         let args = std::fs::read_to_string(&response).unwrap();
         let args: Vec<&str> = args
