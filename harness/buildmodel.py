@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """buildmodel.py: which parts of cargo's build model rustd honours.
 
-usage: buildmodel.py [case ...] [--backend cranelift|llvm] [--table FILE] [--keep]
+usage: buildmodel.py [case ...] [--backend cranelift|llvm] [--table FILE] [--keep] [--short]
 
 Each directory under `harness/buildmodel/` is a small cargo project that depends on one feature
 of the build model, with a `case.json` that says how cargo is asked to build it and which
@@ -95,8 +95,8 @@ def reason_of(stderr):
 
 
 class Case:
-    def __init__(self, name, backend, keep):
-        self.name, self.backend, self.keep = name, backend, keep
+    def __init__(self, name, backend, keep, short=False):
+        self.name, self.backend, self.keep, self.short = name, backend, keep, short
         self.source = os.path.join(CASES, name)
         self.spec = json.load(open(os.path.join(self.source, "case.json")))
         self.target = self.spec.get("target")
@@ -117,8 +117,9 @@ class Case:
         self.verb = self.spec.get("verb", "build")
 
     def prepare(self):
-        # By its long name: the temporary directory of a Windows runner is named by a short one.
-        self.ws = os.path.realpath(tempfile.mkdtemp(prefix=f"rustd-bm-{self.name}-"))
+        self.ws = tempfile.mkdtemp(prefix=f"rustd-bm-{self.name}-")
+        if self.short:
+            self.ws = short_name(self.ws)
         shutil.copytree(self.source, self.ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target*", "case.json"))
         self.work = os.path.join(self.ws, "target-rustd-out")
         os.makedirs(self.work)
@@ -501,19 +502,33 @@ def said(why):
     return re.sub(r"/tmp/rustd-bm-[^/ ]*/", "", why).replace("|", "/")[:240]
 
 
+def short_name(path):
+    """The 8.3 name Windows keeps for each part of `path`: another name of the same files, which
+    is how the temporary directory of a hosted runner is named."""
+    if os.name != "nt":
+        sys.exit("--short: only Windows has short names")
+    import ctypes
+    long = os.path.realpath(path)
+    short = ctypes.create_unicode_buffer(1024)
+    if not ctypes.windll.kernel32.GetShortPathNameW(long, short, len(short)) or short.value == long:
+        sys.exit(f"--short: the volume keeps no short name for {long}")
+    return short.value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cases", nargs="*")
     ap.add_argument("--backend", action="append", choices=["cranelift", "llvm"])
     ap.add_argument("--table", help="write the table as Markdown")
     ap.add_argument("--keep", action="store_true", help="keep the scratch copies")
+    ap.add_argument("--short", action="store_true", help="build each case in its scratch copy by the copy's short name (Windows)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 4), help="cases built at once")
     a = ap.parse_args()
     names = a.cases or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
     backends = a.backend or ["cranelift", "llvm"]
     table, bad = [], 0
     here = host().split("-")[0]
-    cases = [Case(name, backend, a.keep) for name in names for backend in backends]
+    cases = [Case(name, backend, a.keep, a.short) for name in names for backend in backends]
     for case in cases:
         if case.spec.get("on", here) != here:
             print(f"{case.name:34} {case.backend:9} not run   the case is of {case.spec['on']} hosts", flush=True)

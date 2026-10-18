@@ -258,8 +258,10 @@ jobs:
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
-          # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # The two Linux cross targets of buildmodel.py are skipped here, and it says so. Each
+          # case is built by the short name of its directory, which is another name of the
+          # same checkout than the one the file system gives rustd.
+          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py --short; fi
           # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4

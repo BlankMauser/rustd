@@ -103,8 +103,14 @@ fn content(file: &Path) -> Option<u64> {
 }
 
 impl SymbolTable {
-    /// `root` is what the paths in cargo's dep-info files are relative to.
-    pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
+    /// `root` is what the paths in cargo's dep-info files are relative to. `loaded_as` is the
+    /// other name a file cargo named may have been loaded by: cargo names a file outside the
+    /// package through the directory it was run in.
+    pub(crate) fn load(
+        files: &[PathBuf],
+        root: &Path,
+        loaded_as: fn(&Path) -> Option<PathBuf>,
+    ) -> anyhow::Result<SymbolTable> {
         let mut table = SymbolTable { read: Some(SystemTime::now()), ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
@@ -132,6 +138,7 @@ impl SymbolTable {
         // several files, when it is linked from its objects.
         let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
+            table.linked.extend(loaded_as(&source).map(|it| (name.clone(), it)));
             table.linked.insert((name.clone(), source.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
@@ -144,6 +151,9 @@ impl SymbolTable {
             }
         }
         table.place(unplaced);
+        let renamed: Vec<_> =
+            table.by_root.iter().filter_map(|(root, id)| Some((loaded_as(root)?, *id))).collect();
+        table.by_root.extend(renamed);
         table.index(symbols);
         Ok(table)
     }
