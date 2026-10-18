@@ -132,20 +132,116 @@ the threads spent: MIR 2.9 s, translation 3.8 s, Cranelift 6.2 s, store writes 2
 info 1.2 s, monomorphization 0.5 s, types 0.3 s, store reads 0.07 s. The same for cargo and
 nushell, and the profiles, are not in this file yet.
 
+## Cargo's cold build, taken apart
+
+All of this is cargo 0.92.0 under Cranelift, built by `rustd DIR --crate … --out … --link-cmd …`
+as `harness/remote.py` does it (one process, no daemon, so that nothing but rustd is timed),
+with cargo's own artifacts built beforehand. Seconds are rustd's alone.
+
+### The store and debug info, each on and off
+
+| | this head | before format 2 and debug info (27315323cb) |
+| --- | --- | --- |
+| store, debug info | 102.7 s (compiling 92.3 s) | 81.2 s (71.1 s), no debug info yet |
+| store, `RUSTD_DEBUGINFO=0` | 88.2 s (77.7 s) | |
+| no store, debug info | 74.6 s (64.7 s) | |
+| no store, `RUSTD_DEBUGINFO=0` | 61.0 s (51.2 s) | 65.0 s (54.9 s) |
+
+One run each after a run that is thrown away. The same four in the opposite order gave 109.9,
+97.2, 77.6 and 65.0 s, and the old binary gave 81.2 and 89.7 s for the same thing twice, so a
+difference under about 8 s between two rows is not one.
+
+What it says: debug info costs 13 to 14 s with or without the store, and the store costs 27
+to 28 s with or without debug info; the two add up. With neither, this head is not slower
+than the old one (61.0 s against 65.0 s). The old store cost 16 s (81.2 against 65.0). So the
+6 s that REMOTE.md could not place are the store: writing to it costs about 11 s more than
+it did in format 1, and compiling itself got a few seconds faster, which hid part of it.
+
+### The profile
+
+`perf record -F 499 --call-graph fp` on a binary built with frame pointers and line tables,
+of the first two rows of the table (128.0 s with the store, 84.4 s without, under perf; the
+binary is of the head before the last merge, the code profiled is the same). 237.8 s of
+processor time with the store, 167.3 s without.
+
+**The build is one thread for most of its time.** Measured in 5 s windows, the process uses
+more than two cores for 15 to 20 s of the 108 s of compiling and one core for the rest. The
+thread that runs `CodegenUnit::compile` is on a processor for 84 s of those 108 s (54 s of
+66 s without the store). Three things keep it there:
+
+1. *Functions found on the way are compiled one at a time.* Each pass compiles the functions
+   it knows of on every core (`in_parallel` over `compiled_root`) and then defines them one
+   by one; a function that one of them asks for is appended to the same queue and reached by
+   the same loop, which by then is past the parallel step. In the profile that is 18 s at the
+   start of the build with one thread in `define_function`, 7.9 s of it lowering MIR and
+   8.4 s compiling.
+2. *Putting instances into the object is serial*: after the instances are compiled on every
+   core (`compile_ahead`, the 15 to 20 s above), each one is stitched (relocations resolved
+   to names: 3.5 s a round), described for the debugger (3.5 to 4.8 s a round) and kept in
+   the store (14.6 s in the first round, 2.9 s after) on the one thread.
+3. *The pass is made three times.* The first is thrown away after 60 s because 7 instances
+   did not compile (`TypeId` of a type with a `char` const argument), the second after 18 s
+   because a static turned out to be used by a function left to rustc. A later pass compiles
+   nothing again but stitches, describes and keeps everything again: 11 to 12 s each on the
+   one thread, 16 to 20 s by the clock.
+
+**Debug info** is `ObjectCodegen::describe` on that one thread, 12 to 14 s over the three
+passes: collecting the variables of each function (6 s), finding the line of each
+instruction (3 s; the compiling threads spend another 7 s on source locations), and handing
+the function to gimli (1.7 s). Writing the sections at the end is under a second. So it is
+neither the line program nor the relocations nor the bytes in the store (the store grows by
+140 MB, but the table above shows the cost is the same without a store); it is the work of
+describing 180,000 instances, done three times, on one thread.
+
+**The store** is, by processor time:
+
+- SHA-256, 23.3 s, none of it without the store: the key of an entry is a hash of its name,
+  and the names of instances are long (9.1 s, half of it on the one thread, since the key is
+  computed when a compiling thread looks the entry up and again when the entry is kept);
+  Cranelift's own cache of compiled functions, which rustd also points at the store, hashes
+  every function's IR (7.4 s with what is hashed besides); a sealed pack is hashed for its
+  name (3.1 s) and read back and checked (2.9 s).
+- Finding which function of the program an entry's names stand for
+  (`StableNames::functions_named`, 10.1 s on the one thread in the first pass). 6.8 s of
+  that is listing every function of every crate once, and 3.9 s is asking for the same
+  crate's id and root file again for every name.
+- Writing the entries, 3.8 s, and copying them, about 4 s.
+
+The checksums of the records do not show (0.3 s).
+
+**Elsewhere:** Cranelift's verifier is 9.6 s of processor time (4%). It is what turns IR
+that rustd got wrong into a function left to rustc instead of a crash or wrong code, so it
+stays. Register allocation is 27 s, types 37 s, MIR 21 s; those are the work.
+
+### What follows from it
+
+Small, and not made at this head: compile the functions found on the way on every core
+too; keep a crate's part of a name instead of asking for it again.
+
+Larger, not started:
+
+- *Do not start over.* A pass that finds instances it cannot compile, or a static it must
+  leave to rustc, throws away a whole object to take out a handful of functions. On cargo
+  the second and third pass are about 32 s of the 92 s. Taking the affected functions out of the object being built
+  (or finding both conditions before anything is stitched: both are known from the compiled
+  instances' requests, which the parallel step has already produced) would make the build
+  one pass. Cargo's generic edit (31 to 37 s, the whole object written again) has not been
+  profiled; that it is the same restarts is a guess from its log showing several rounds.
+- *Stitch, describe and keep on every core.* These are per-function and independent until
+  the bytes go into the object; today they wait for one thread. With the restarts gone this
+  is the next 30 s on cargo.
+- *One hash per entry.* The key computed at the lookup can be kept with the entry, and
+  Cranelift's cache under the store's one could go: a build that finds an entry by name never
+  asks Cranelift's, and one that does not has changed IR.
+
 ## Open at this head
 
 Not done yet from the list this file is for:
 
-- Profiles (perf) of cargo's cold build, of debug info, and of the slowest edit of each kind.
-- The 6 s that REMOTE.md calls unexplained. One thing is already clear from its own table:
-  the "store costs 14 s" there subtracts a run with debug info from a run without. With debug
-  info on in both, the store costs 28.8 s on cargo (101.9 s against 73.1 s). The run that
-  tells whether the 6 s are in the store or in compiling (no store and no debug info) has not
-  been made.
-- No fix has been made. The candidates, from the measurements above, none of them small:
-  a refusal costing a whole reload; the first edit after a start with a full store compiling
-  half the program; cargo's generic edit writing the whole object again (why is not measured yet; the
-  cold build's log shows builds of four rounds, so discarded rounds are the first suspect).
+- Profiles of the slowest edit of each kind, and of LLVM's cold build. Only cargo's cold
+  build under Cranelift has been profiled.
+- No fix has been made. Besides what the profile section lists: a refusal costs a whole
+  reload, and the first edit after a start with a full store compiles half the program.
 - The frontend errors behind the refused edits (`publish` in cargo after a signature edit is
   taken back, `MatchPattern::eq` in nushell from the start) have not been reduced to cases.
 - The CI job has not run, and its baseline is from another machine than the runner.
