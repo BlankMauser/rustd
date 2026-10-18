@@ -280,8 +280,15 @@ struct Resolver<'a> {
     apart: Option<PathBuf>,
     listed: &'a Listed,
     /// For each crate asked about, the paths that functions written in its bodies share.
-    shared_paths: std::cell::RefCell<FxHashMap<Crate, FxHashSet<String>>>,
+    /// Every thread of the build asks about the same crates, and one of them looks.
+    shared_paths: SharedPaths,
+    /// The symbols of the functions asked about, for every thread of the build: the threads
+    /// that compile find them ahead of the one that puts the functions in the object.
+    named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
 }
+
+type SharedPaths =
+    Arc<std::sync::Mutex<FxHashMap<Crate, Arc<std::sync::OnceLock<FxHashSet<String>>>>>>;
 
 impl Resolver<'_> {
     /// What `path` is called in the checkout, when it is a file of it.
@@ -336,6 +343,47 @@ impl Resolver<'_> {
         }
     }
 
+    /// The symbol of `func`, when it has one.
+    fn function_named(&self, func: FunctionId) -> Option<String> {
+        if let Some(symbol) = exported_symbol(self.db, func) {
+            return Some(symbol);
+        }
+        // Not a function until it or the `impl<T>` it is in is given its types: there is
+        // nothing to name, the more so in a crate of such alone, which rustc builds nothing
+        // of. One of a name that another in the same function has is not to be taken for it.
+        if self.is_generic(func) {
+            return None;
+        }
+        // The symbol of a path is the one rustc gave a function it built under it, which is
+        // not known to be this one when a body has two of the path.
+        if self.shares_path(func) {
+            return None;
+        }
+        let path = self.path(func)?;
+        // A test is the second of its name where it is written: rustc puts the constant
+        // that describes it to the harness before it, under the same name.
+        let function = hir::Function::from(func);
+        let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
+            self.table.get_at(&path, 1)
+        } else {
+            self.table.get(&path)
+        };
+        if let Some(symbol) = symbol {
+            return Some(symbol.to_owned());
+        }
+        // rustc has built nothing of the crate: the function is ours to name, unless it is
+        // declared in an `extern` block, where what it links to names it.
+        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
+            return None;
+        }
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        let id = self.own_crate_id(krate)?;
+        match hir_ty::mir::codegen::block_place(self.db, self, func) {
+            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
+            None => Some(format!("rustd.{id:x}.{path}")),
+        }
+    }
+
     /// Whether the function, or the `impl` it is in, takes types or constants.
     fn is_generic(&self, func: FunctionId) -> bool {
         let generic = |def: hir::GenericDef| !def.type_or_const_params(self.db).is_empty();
@@ -356,13 +404,11 @@ impl Resolver<'_> {
         }
         let Some(path) = self.path(func) else { return false };
         let krate = module.krate(self.db);
-        if let Some(shared) = self.shared_paths.borrow().get(&krate) {
-            return shared.contains(&path);
-        }
-        let shared = self.paths_shared_in(krate);
-        let shares = shared.contains(&path);
-        self.shared_paths.borrow_mut().insert(krate, shared);
-        shares
+        let shared = {
+            let mut crates = self.shared_paths.lock().unwrap_or_else(|e| e.into_inner());
+            crates.entry(krate).or_default().clone()
+        };
+        shared.get_or_init(|| self.paths_shared_in(krate)).contains(&path)
     }
 
     /// The paths that more than one of the functions written in the bodies of a crate have.
@@ -447,14 +493,11 @@ impl Resolver<'_> {
         scope: Module,
         func: &ast::Fn,
     ) -> Option<hir::Function> {
-        use hir::HasSource;
         let db = self.db;
         let file = sema.hir_file_for(func.syntax());
-        let range = func.syntax().text_range();
+        let written = hir::InFile::new(file, file.ast_id_map(db).ast_id(func));
         let is_it = |it: &hir::Function| {
-            it.source(db).is_some_and(|source| {
-                source.file_id == file && source.value.syntax().text_range() == range
-            })
+            FunctionId::try_from(*it).is_ok_and(|it| it.lookup(db).id == written)
         };
         let among = |items: Vec<hir::AssocItem>| {
             items.into_iter().filter_map(hir::AssocItem::as_function).find(is_it)
@@ -656,10 +699,11 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
 }
 
 impl SymbolResolver for Resolver<'_> {
-    fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
+    fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
+        // One alone is as soon done by whoever asks for what it computes.
         if threads < 2 {
-            return;
+            return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -669,7 +713,8 @@ impl SymbolResolver for Resolver<'_> {
                 let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
                 let (debug, apart) = (self.debug, self.apart.clone());
-                let listed = self.listed;
+                let (listed, named) = (self.listed, self.named.clone());
+                let shared_paths = self.shared_paths.clone();
                 scope.spawn(move || {
                     let resolver = Resolver {
                         db: &db,
@@ -681,7 +726,8 @@ impl SymbolResolver for Resolver<'_> {
                         debug,
                         apart,
                         listed,
-                        shared_paths: Default::default(),
+                        shared_paths,
+                        named,
                     };
                     hir::attach_db(&db, || {
                         loop {
@@ -694,6 +740,7 @@ impl SymbolResolver for Resolver<'_> {
                     })
                 });
             }
+            beside();
         });
     }
 
@@ -727,43 +774,12 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
-        if let Some(symbol) = exported_symbol(self.db, func) {
-            return Some(symbol);
+        if let Some(named) = self.named.lock().unwrap_or_else(|e| e.into_inner()).get(&func) {
+            return named.clone();
         }
-        // Not a function until it or the `impl<T>` it is in is given its types: there is
-        // nothing to name, the more so in a crate of such alone, which rustc builds nothing
-        // of. One of a name that another in the same function has is not to be taken for it.
-        if self.is_generic(func) {
-            return None;
-        }
-        // The symbol of a path is the one rustc gave a function it built under it, which is
-        // not known to be this one when a body has two of the path.
-        if self.shares_path(func) {
-            return None;
-        }
-        let path = self.path(func)?;
-        // A test is the second of its name where it is written: rustc puts the constant
-        // that describes it to the harness before it, under the same name.
-        let function = hir::Function::from(func);
-        let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
-            self.table.get_at(&path, 1)
-        } else {
-            self.table.get(&path)
-        };
-        if let Some(symbol) = symbol {
-            return Some(symbol.to_owned());
-        }
-        // rustc has built nothing of the crate: the function is ours to name, unless it is
-        // declared in an `extern` block, where what it links to names it.
-        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
-            return None;
-        }
-        let krate = hir_def::HasModule::krate(&func, self.db);
-        let id = self.own_crate_id(krate)?;
-        match hir_ty::mir::codegen::block_place(self.db, self, func) {
-            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
-            None => Some(format!("rustd.{id:x}.{path}")),
-        }
+        let named = self.function_named(func);
+        self.named.lock().unwrap_or_else(|e| e.into_inner()).insert(func, named.clone());
+        named
     }
 
     fn private(&self, func: FunctionId) -> bool {
@@ -1854,9 +1870,8 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
             crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
         }
     }
-    // A crate comes before its dependencies in the list, and a thread that starts on one
-    // waits for the threads working on what it depends on.
-    crates.reverse();
+    // A crate comes after its dependencies in the list: a thread that starts on one whose
+    // dependencies are not resolved resolves them itself, one after the other.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
@@ -1873,6 +1888,12 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                         _ = hir::crate_def_map(&db, krate);
                         let names = start.elapsed();
                         _ = hir::TraitImpls::for_crate(&db, krate);
+                        // A build asks which functions written in the bodies of the standard
+                        // library share a path, which every body of the crate is lowered for:
+                        // threads are idle here, waiting for the crates that come next.
+                        if krate.data(&db).origin.is_lang() {
+                            _ = functions_of(&db, krate.into());
+                        }
                         if std::env::var_os("RUSTD_STATS").is_some() {
                             let name = krate.extra_data(&db).display_name.as_ref();
                             let name = name.map(|it| it.to_string()).unwrap_or_default();
@@ -2127,6 +2148,7 @@ fn build(
         apart,
         listed,
         shared_paths: Default::default(),
+        named: Default::default(),
     };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();

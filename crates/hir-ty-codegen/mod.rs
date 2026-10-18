@@ -264,7 +264,12 @@ pub trait SymbolResolver {
     /// database of its own and this resolver over it. What `work` computes is kept by the
     /// queries it asks.
     fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
+        self.in_parallel_beside(count, work, &mut || ());
+    }
+    /// [`Self::in_parallel`], with `beside` run on this thread while the others work.
+    fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         _ = (count, work);
+        beside();
     }
 }
 
@@ -1884,12 +1889,74 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
+/// What the threads that compile ahead have to do and have done.
+struct Ahead {
+    queue: Vec<(Instance, StoredParamEnvAndCrate)>,
+    seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
+    done: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
+    /// Those of `done` that [`Ready::take`] has not seen yet.
+    fresh: Vec<(Instance, StoredParamEnvAndCrate)>,
+    working: usize,
+    /// A thread was stopped in the middle of an instance, as a write to the database
+    /// does: the others are not to wait for what it would have found.
+    stopped: bool,
+}
+
+/// What the threads that compile ahead are through with, for the one that puts the
+/// instances in the object: it would wait for one of them on each it asked for too early.
+struct Ready<'a> {
+    ahead: &'a std::sync::Mutex<Ahead>,
+    idle: &'a std::sync::Condvar,
+    /// The instances to put in the object that a thread is still to compile.
+    waiting: FxHashMap<(Instance, StoredParamEnvAndCrate), Vec<FuncId>>,
+}
+
+impl Ready<'_> {
+    /// Takes from `pending` and from what waited the instances no thread is still to
+    /// compile, waiting until there is one. Nothing is left when it gives none.
+    fn take(
+        &mut self,
+        pending: &mut Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
+    ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
+        let mut ready = Vec::new();
+        let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        for (instance, env, id) in pending.drain(..) {
+            let it = (instance, env);
+            if state.done.contains(&it) || !state.seen.contains(&it) {
+                ready.push((it.0, it.1, id));
+            } else {
+                self.waiting.entry(it).or_default().push(id);
+            }
+        }
+        loop {
+            let ended = state.stopped || (state.queue.is_empty() && state.working == 0);
+            let done: Vec<_> = if ended {
+                state.fresh.clear();
+                self.waiting.drain().collect()
+            } else {
+                let fresh = std::mem::take(&mut state.fresh);
+                fresh.into_iter().filter_map(|it| self.waiting.remove_entry(&it)).collect()
+            };
+            for ((instance, env), ids) in done {
+                ready.extend(ids.into_iter().map(|id| (instance.clone(), env.clone(), id)));
+            }
+            if !ready.is_empty() || self.waiting.is_empty() {
+                return ready;
+            }
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// What the types of variables are told as, for every thread: the threads that compile
 /// find it ahead of the one that puts the functions in the object, which has it to wait
 /// for otherwise.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ToldTypes(
-    std::sync::Mutex<FxHashMap<(StoredParamEnvAndCrate, StoredTy), Option<debuginfo::TypeSet>>>,
+    #[allow(clippy::type_complexity)]
+    std::sync::Arc<
+        std::sync::Mutex<FxHashMap<(StoredParamEnvAndCrate, StoredTy), Option<debuginfo::TypeSet>>>,
+    >,
 );
 
 /// The types a thread tells of itself, by the environment they are in.
@@ -2832,22 +2899,37 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
     fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
-        let start = stdx::time::Instant::now();
-        self.compile_ahead();
-        self.phases.compile += start.elapsed();
-        while !self.pending.is_empty() || !self.found_pending.is_empty() {
-            // Each wave is compiled on every core, and then put in the object one by one.
-            let wave = std::mem::take(&mut self.pending);
-            let start = stdx::time::Instant::now();
-            let told = self.debug.is_some().then_some(&self.told);
-            self.symbols.in_parallel(wave.len(), &|db, _, at| {
-                let (instance, env, _) = &wave[at];
-                let compiled = compiled_instance(db, instance.clone(), env.clone());
-                if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
-                    told.ahead(db, &mut FxHashMap::default(), compiled);
+        self.compile_ahead(&mut |cg, ahead| failed.extend(cg.define_waves(ahead)));
+        failed
+    }
+
+    /// Puts what is pending in the object, and what that calls. With `ahead`, the other
+    /// threads are compiling all of it, and an instance is put in the object once they have
+    /// it. Without, each wave is compiled on every core before it is put in the object.
+    fn define_waves(&mut self, mut ahead: Option<&mut Ready<'_>>) -> Vec<(Instance, Rejected)> {
+        let mut failed = Vec::new();
+        loop {
+            let wave = match &mut ahead {
+                Some(ahead) => ahead.take(&mut self.pending),
+                None if self.pending.is_empty() => Vec::new(),
+                None => {
+                    let wave = std::mem::take(&mut self.pending);
+                    let start = stdx::time::Instant::now();
+                    let told = self.debug.is_some().then_some(&self.told);
+                    self.symbols.in_parallel(wave.len(), &|db, _, at| {
+                        let (instance, env, _) = &wave[at];
+                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
+                            told.ahead(db, &mut FxHashMap::default(), compiled);
+                        }
+                    });
+                    self.phases.compile += start.elapsed();
+                    wave
                 }
-            });
-            self.phases.compile += start.elapsed();
+            };
+            if wave.is_empty() && self.found_pending.is_empty() {
+                break;
+            }
             for (instance, env, id) in wave {
                 if let Err(e) = self.define_instance(&instance, &env, id) {
                     if self.forward_to_rustc(&instance, id).is_some() {
@@ -2873,19 +2955,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Compiles what is pending and everything it calls, on every core. A thread goes on to
     /// what an instance calls as soon as that instance is compiled, where the waves of
     /// [`Self::define_instances`] each wait for their slowest function. What this compiles
-    /// that the object has no use for is only wasted.
-    fn compile_ahead(&mut self) {
+    /// that the object has no use for is only wasted. `beside` runs on this thread meanwhile,
+    /// and is told whether anything is compiled ahead of it.
+    fn compile_ahead(&mut self, beside: &mut dyn FnMut(&mut Self, Option<&mut Ready<'_>>)) {
         // A patch calls the base's copy of most of what it reaches.
         if self.base.is_some() || self.pending.is_empty() {
-            return;
-        }
-        struct Ahead {
-            queue: Vec<(Instance, StoredParamEnvAndCrate)>,
-            seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
-            working: usize,
-            /// A thread was stopped in the middle of an instance, as a write to the database
-            /// does: the others are not to wait for what it would have found.
-            stopped: bool,
+            return beside(self, None);
         }
         /// Tells the threads that wait when the one compiling is stopped.
         struct Working<'a>(&'a std::sync::Mutex<Ahead>, &'a std::sync::Condvar);
@@ -2904,13 +2979,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map(|(instance, env, _)| (instance.clone(), env.clone()))
             .filter(|it| seen.insert(it.clone()))
             .collect();
-        let ahead = std::sync::Mutex::new(Ahead { queue, seen, working: 0, stopped: false });
+        let ahead = std::sync::Mutex::new(Ahead {
+            queue,
+            seen,
+            done: FxHashSet::default(),
+            fresh: Vec::new(),
+            working: 0,
+            stopped: false,
+        });
         let idle = std::sync::Condvar::new();
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let (entries, owned) = (self.entries.as_deref(), &self.own_statics.crates);
-        let told = self.debug.is_some().then_some(&self.told);
-        self.symbols.in_parallel(threads, &|db, symbols, _| {
+        let (entries, owned) = (self.entries.clone(), &self.own_statics.crates.clone());
+        let entries = entries.as_deref();
+        let told = self.debug.is_some().then(|| self.told.clone());
+        let told = told.as_ref();
+        let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
             let mut types = OwnTypes::default();
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
             // What the store has is not compiled, nor looked into for what it calls.
@@ -2938,6 +3022,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 drop(state);
                 let working = Working(&ahead, &idle);
                 let mut found = Vec::new();
+                let it = (instance.clone(), env.clone());
                 if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
                     if let Some(told) = told {
                         told.ahead(db, &mut types, compiled);
@@ -2946,9 +3031,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         let FuncTarget::Instance(callee, asked) = &request.target else {
                             continue;
                         };
-                        // A function without generic arguments is a root, called by its symbol.
-                        let root = matches!(callee.def, InstanceDef::Fn(_))
-                            && callee.args.as_ref().is_empty();
+                        // A function without generic arguments is a root, called by its
+                        // symbol when rustc compiled it. The thread that puts the caller in
+                        // the object asks for the symbol, and finds it here.
+                        let root = match callee.def {
+                            InstanceDef::Fn(func)
+                                if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
+                            {
+                                symbols.function(func).is_some()
+                            }
+                            _ => false,
+                        };
                         if !root && !rejected.contains_key(callee) && !in_store(callee) {
                             found.push((callee.clone(), homes.home(db, callee, asked)));
                         }
@@ -2957,6 +3050,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 drop(working);
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
+                state.done.insert(it.clone());
+                state.fresh.push(it);
                 for it in found {
                     if state.seen.insert(it.clone()) {
                         state.queue.push(it);
@@ -2964,7 +3059,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 idle.notify_all();
             }
-        });
+        };
+        let mut ready = Ready { ahead: &ahead, idle: &idle, waiting: FxHashMap::default() };
+        self.symbols.in_parallel_beside(threads, &work, &mut || beside(self, Some(&mut ready)));
         self.ahead = ahead.into_inner().unwrap_or_else(|e| e.into_inner()).seen;
     }
 
