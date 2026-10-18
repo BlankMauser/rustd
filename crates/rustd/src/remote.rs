@@ -1487,6 +1487,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_packed_pack_is_all_written_before_it_is_unpacked() {
+        // Bytes zstd makes nothing smaller of, so what is sent ends in a chunk of its own.
+        let mut pack = [&b"rustdpk"[..], &[STORE_FORMAT as u8]].concat();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        while pack.len() < (64 << 10) + 9 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            pack.extend_from_slice(&seed.to_le_bytes());
+        }
+        let sent = zstd::encode_all(&pack[..], 3).unwrap();
+        let (named, keys) = (Digest::of(&pack), Digest::of(&[1; 32]));
+        let packed = Some((Digest::of(&sent), sent.len() as u64));
+        let listed = Listed { size: pack.len() as u64, keys, format: STORE_FORMAT, packed };
+        for round in 0..500 {
+            let (remote, dir) = unsigned("flushed-pack", 1 << 20);
+            put(&dir, &format!("packs/{named}.pack.zst"), &sent);
+            put(&dir, &keys_object(&keys), &[1; 32]);
+            put(&dir, "manifests/default", Manifest([(named, listed)].into()).lines().as_bytes());
+            let pulled = wait(pull(&dir.join("store"), &remote, "default"));
+            _ = std::fs::remove_dir_all(&dir);
+            pulled.unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+        }
+    }
+
+    #[test]
     fn a_packed_pack_longer_than_its_list_says_is_not_unpacked() {
         let (remote, dir, sent) = remote_with_packed("long-packed", 1 << 20, 1 << 20);
         let manifest = std::fs::read_to_string(dir.join("manifests/default")).unwrap();
