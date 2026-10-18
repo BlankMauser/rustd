@@ -2745,21 +2745,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 return Ok(None);
             };
             current = c;
-            if !edition.at_least_2024()
-                && let [.., outer, scope] = &mut self.drop_scopes[..]
-                && declared <= scope.locals.len()
-            {
-                outer.locals.extend(scope.locals.drain(declared..));
-            } else if !edition.at_least_2024()
-                && let Some(scope) = self.drop_scopes.last_mut()
-                && declared <= scope.locals.len()
-            {
-                let temporaries = scope.locals.len() - declared;
-                scope.locals.rotate_right(temporaries);
+            if !edition.at_least_2024() {
+                self.outlive_block(declared);
             }
         }
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))
+    }
+
+    /// Hands the temporaries of a block's tail, the locals of the block from `declared` on, to
+    /// the scope the block is in, or puts them before the block's own locals when it is in
+    /// none. The operands of the tail stay where they are: when a later operand panics they
+    /// are dropped before the locals of the block.
+    fn outlive_block(&mut self, declared: usize) {
+        let Some((scope, outer)) = self.drop_scopes.split_last_mut() else { return };
+        if declared > scope.locals.len() {
+            return;
+        }
+        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
+            scope.locals.drain(declared..).partition(|it| self.operand_locals.contains(it));
+        match outer.last_mut() {
+            Some(outer) => outer.locals.extend(temporaries),
+            None => {
+                scope.locals.splice(0..0, temporaries);
+            }
+        }
+        scope.locals.extend(operands);
     }
 
     /// Lowers the `else` of a `let`, which runs when the pattern did not match. The temporaries
