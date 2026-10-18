@@ -20,7 +20,8 @@ commit. Do not append a second row for the same measurement.
 ## 1. Checked for these documents
 
 Run on Linux x86-64 (8 CPUs, 31 GB) with Rust 1.99.0 at f191c6e42a, the commit these
-documents were written against. rustd was built with `cargo build -p rustd --release`.
+documents were written against. rustd was built with `cargo build -p rustd --release`, and
+for the LLVM column with `--features llvm` against LLVM 20.1.8.
 Source trees and scratch directories were on tmpfs.
 
 The gate, from `harness/` with `RUSTD_BIN` set and `TMPDIR` on tmpfs:
@@ -29,19 +30,19 @@ The gate, from `harness/` with `RUSTD_BIN` set and `TMPDIR` on tmpfs:
 
 | Harness | Cranelift | LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`) |
 |---|---|---|
-| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from rustd, 0 of 893 layouts differ | LLVM-CORPUS |
-| `programs.py` | 22 of 22 | LLVM-PROGRAMS |
-| `stress.py` | 99 of 99, 0 restarts | LLVM-STRESS |
-| `breakers.py` | 58 of 58, 7 open, 0 functions skipped | LLVM-BREAKERS |
-| `unwinds.py` | 8 of 8 | LLVM-UNWINDS |
-| `splices.py` | 71 of 71 | LLVM-SPLICES |
-| `asmedits.py` | 10 of 10 | LLVM-ASMEDITS |
-| `includes.py` | 9 of 9 | LLVM-INCLUDES |
-| `worktrees.py` | 62 of 62 | LLVM-WORKTREES |
-| `keys.py` | 46 of 46, 0 open | LLVM-KEYS |
-| `fuzz/fuzz.py smoke` | 2 programs, 505 functions compiled, 0 differences, 0 crashes, 0 left to rustc | LLVM-FUZZ |
-| `debuginfo.py` | all right | LLVM-DEBUGINFO |
-| `backends.py corpus runner cases --bin runner --levels 2f` | does not apply | LLVM-BACKENDS |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from rustd, 0 of 893 layouts differ | MATCH, 822 of 822, 0 of 893 layouts differ |
+| `programs.py` | 22 of 22 | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
+| `breakers.py` | 58 of 58, 7 open, 0 functions skipped | 58 of 58, 7 open, 0 functions skipped |
+| `unwinds.py` | 8 of 8 | 8 of 8 |
+| `splices.py` | 71 of 71 | 71 of 71 |
+| `asmedits.py` | 10 of 10 | 10 of 10 |
+| `includes.py` | 9 of 9 | 9 of 9 |
+| `worktrees.py` | 62 of 62 | 62 of 62 |
+| `keys.py` | 46 of 46, 0 open | 46 of 46, 0 open |
+| `fuzz/fuzz.py smoke` | 2 programs, 505 functions compiled, 0 differences, 0 crashes, 0 left to rustc | 2 programs, 505 functions compiled, 0 differences, 0 crashes, 0 left to rustc |
+| `debuginfo.py` | all right | all right |
+| `backends.py corpus runner cases --bin runner --levels 2f` | does not apply | 11,801 of 11,801 functions compiled by LLVM, none left to Cranelift; the program prints the same as cargo's |
 
 The seven "open" breakers are the five known differences and the two known refusals
 listed in [support.md](support.md). Not run here: `buildmodel.py`, `farsplices.py`, the

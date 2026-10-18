@@ -3,8 +3,8 @@
 Every cell here points at a report or a harness run. "CI" is GitHub Actions run
 39057174862 on commit 888e87df74, the last run recorded in the reports that covered all
 four native platforms under both backends ([reports/PLAT-ABI2.md](reports/PLAT-ABI2.md)).
-"Local" is a run on Linux x86-64 at f191c6e42a, the commit these docs were written
-against, with the Cranelift backend (see [results.md](results.md)). "Unverified" means
+"Local" is a run of the gate on Linux x86-64 at f191c6e42a, the commit these docs were
+written against, under both backends (see [results.md](results.md)). "Unverified" means
 nobody recorded running it; it does not mean it is known to fail.
 
 "Yes" has a narrow meaning: the named harness passes there. It does not mean your project
@@ -37,7 +37,7 @@ to stable; those are marked where they are used.
    native AArch64, 830 of 830 on Windows, 828 of 828 on macOS, with 0 type layouts
    differing. `programs`, `stress`, `breakers`, `unwinds`, `splices`, `asmedits`,
    `includes`, `worktrees` and `keys` ran on every leg. Under LLVM, `backends.py` reports no
-   corpus function left to Cranelift on any of the four. Local: 822 of 822, Cranelift.
+   corpus function left to Cranelift on any of the four. Local: 822 of 822 under both.
 2. wasm32 uses its own lowering from Cranelift IR, not Cranelift's or LLVM's code
    generation. [reports/WASM32.md](reports/WASM32.md) measured `wasm32-wasip1` under
    wasmtime on the `rustd-wasm32-target` branch with `nightly-2026-05-10`: corpus MATCH with
