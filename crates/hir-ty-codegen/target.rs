@@ -291,6 +291,9 @@ impl Target {
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
         flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+        // Cranelift checks the IR of every function it is given unless told not to.
+        let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+        flags.set("enable_verifier", verify).map_err(|e| e.to_string())?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
         flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
         // Cranelift has no ISA for WebAssembly: its code is written from the IR, and the
