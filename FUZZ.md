@@ -32,7 +32,8 @@ in every run ("The long runs"), scenes in the generator ("Scenes"), generated ed
 
 The fuzzer found twenty-one distinct problems in whole builds. Eighteen are fixed in rustd, two
 are worked around (6 and 20, which I believe are bugs in LLVM, not in rustd), and one is open.
-The generated edits found four more, in the daemon's incremental path, all fixed; they are
+The generated edits found four more, in the daemon's incremental path, all fixed, and a fifth
+in the last run (E5) that is open and not looked into; they are
 in their own section. Each has a reduced case in `harness/breakers/`.
 
 | # | What | Backends | Status | Breaker case |
