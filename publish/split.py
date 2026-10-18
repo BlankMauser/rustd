@@ -95,7 +95,7 @@ def main():
     manifest = manifest.replace("https://github.com/rust-lang/rust-analyzer", "https://github.com/DioxusLabs/rustd")
     open(f"{out}/Cargo.toml", "w").write(manifest)
     shutil.copy2(f"{src}/Cargo.lock", f"{out}/Cargo.lock")
-    open(f"{out}/.gitignore", "w").write("/target*/\n__pycache__/\n/vendor/.applied\n")
+    open(f"{out}/.gitignore", "w").write("target*/\n__pycache__/\n/vendor/.applied\n")
 
     wasm = f"{out}/crates/rustd-wasm/Cargo.toml"
     text = open(wasm).read()

@@ -62,6 +62,7 @@ use crate::{
 use super::{OperandKind, Place};
 
 mod as_place;
+mod match_tree;
 mod pattern_matching;
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,9 @@ struct MirLowerCtx<'a, 'db> {
     ends_temporaries: FxHashSet<ExprId>,
     /// The locals that hold an operand of an aggregate or a call lowered so far.
     operand_locals: FxHashSet<LocalId>,
+    /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
+    /// way into.
+    arm_unreached: bool,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
     or_choices: FxHashMap<PatId, usize>,
@@ -245,6 +249,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 _ => false,
             },
+            unreached: vec![],
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -270,6 +275,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             super_let: None,
             ends_temporaries: FxHashSet::default(),
             operand_locals: FxHashSet::default(),
+            arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             env,
@@ -986,7 +992,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let mut end = None;
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
-                for MatchArm { pat, guard, expr } in arms.iter() {
+                let reached = self.reached_arms(arms);
+                for (MatchArm { pat, guard, expr }, reached) in arms.iter().zip(reached) {
                     // When the guard fails, rustc goes on to the next way the or-patterns of
                     // the arm can match, and runs the guard again for it.
                     let expansions = match guard {
@@ -1002,6 +1009,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         for choice in expansions {
                             self.or_choices = choice.into_iter().collect();
                             let outer = self.guarded_moves.replace(Vec::new());
+                            self.arm_unreached = !reached;
                             let matched = self.pattern_match(current, None, cond_place, *pat);
                             let moves = std::mem::replace(&mut self.guarded_moves, outer);
                             self.or_choices.clear();
@@ -1041,6 +1049,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Some(_) => self.guarded_moves.replace(Vec::new()),
                         None => self.guarded_moves.take(),
                     };
+                    self.arm_unreached = !reached;
                     let matched = self.pattern_match(current, None, cond_place, *pat);
                     let moves = std::mem::replace(&mut self.guarded_moves, outer);
                     let (then, mut otherwise) = matched?;
