@@ -10029,6 +10029,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            ("powif32" | "powif64", [base, power]) => {
+                let (base, scalar) = self.load_scalar(base)?;
+                let (power, _) = self.load_scalar(power)?;
+                let builtin = if scalar.ty == types::F32 { "__powisf2" } else { "__powidf2" };
+                let value =
+                    self.builtin(builtin, &[scalar.ty, types::I32], scalar.ty, &[base, power])?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             (
                 "copysignf32" | "copysignf64" | "minnumf32" | "minnumf64" | "maxnumf32"
                 | "maxnumf64" | "powf32" | "powf64" | "fadd_fast" | "fsub_fast" | "fmul_fast"

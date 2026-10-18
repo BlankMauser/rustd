@@ -8,14 +8,33 @@ rustc, or a rustd crash is a finding; the driver reduces it and writes it to
 `harness/fuzz/found/` with the seed that makes it again.
 
 Branch `rustd-fuzz`, from `rustd-collate` at 6d12f21c86, with `rustd-collate` at ce52276cf5
-merged in at the end (27920a4f69, see "The merge"). Everything below was measured on Linux
-x86-64 with Rust 1.99.0 and LLVM 20.1.8, with a release rustd built with `--features llvm`.
-macOS, Windows, aarch64 and wasm were not run.
+merged in at the end of the first round (27920a4f69, see "The merge") and again at 3d47ed59bf
+in the second (60bc3d6cfa). Everything below was measured on The four-backend runs of the second round are not the long run that was asked for. L11
+(360 programs) ran before findings 17 and 19 were fixed and found them. L12 was stopped at 57
+programs when it showed finding 21, and L13, on the binary with that fixed, was stopped at 60
+programs when this work was wound down: 60 programs, 1,800 cases, 17,619 functions generated,
+22,004 compiled under each of the four backends, no difference, no crash, nothing left to
+rustc. So the head has 60 clean programs behind it under the four configurations, not 360,
+and going by the earlier runs a problem shows about once in a few hundred programs. The
+next thing to do is `fuzz.py run --seed L13 --first 60 --rounds 300 --cases 30 --backends
+cranelift,llvm,llvm-O0,llvm-full`.
+
+Linux x86-64 with Rust 1.99.0 and
+LLVM 20.1.8, with a release rustd built with `--features llvm`, except the section "AArch64
+under qemu", which is the same machine building for `aarch64-unknown-linux-gnu` and running
+the binaries with `qemu-aarch64`. macOS, Windows and wasm were not run.
+
+The second round added four things, each with its own section: two more LLVM configurations
+in every run ("The long runs"), scenes in the generator ("Scenes"), generated edits
+("Generated edits") and AArch64 ("AArch64 under qemu").
 
 ## Result
 
-The fuzzer found eighteen distinct problems. Sixteen are fixed in rustd, one is worked around (it is a
-bug in LLVM, not in rustd), and one is open. Each has a reduced case in `harness/breakers/`.
+The fuzzer found twenty-one distinct problems in whole builds. Eighteen are fixed in rustd, two
+are worked around (6 and 20, which I believe are bugs in LLVM, not in rustd), and one is open.
+The generated edits found four more, in the daemon's incremental path, all fixed, and a fifth
+in the last run (E5) that is open and not looked into; they are
+in their own section. Each has a reduced case in `harness/breakers/`.
 
 | # | What | Backends | Status | Breaker case |
 |---|---|---|---|---|
@@ -36,16 +55,23 @@ bug in LLVM, not in rustd), and one is open. Each has a reduced case in `harness
 | 15 | An array matched by an arm that would move elements out, where rustc can tell from the arms before it that no value reaches that arm, is dropped from the back instead of front to back | both | fixed, 20d97d4d73 | `unreachable_arm_move` |
 | 16 | When an operand of an aggregate or call panicked and the expression was the tail of a block, the operands already made were dropped in the wrong order relative to the temporaries (finding 4 again, outside a statement) | both | fixed, 27a94f2770 | `unwind_operand_tail`, `unwind_operand_order` |
 | 17 | When an operand of an aggregate that is itself an operand of another aggregate panicked, the outer aggregate's finished operands were dropped before the inner one's | both | fixed, 5fba09c841 | `unwind_nested_operands` |
-| 18 | Before the 2024 edition, when an operand of the tail of a block panicked, the block's locals were dropped before the tail's finished operands | both | fixed in this commit | `unwind_tail_after_local` |
+| 18 | Before the 2024 edition, when an operand of the tail of a block panicked, the block's locals were dropped before the tail's finished operands | both | fixed, 2368d6be98 | `unwind_tail_after_local` |
+| 19 | When the body of a loop inside another loop panicked, what the inner loop iterates over was dropped before what its body held | all four | fixed, cb41f78a52 | `unwind_nested_loops` |
+| 20 | On AArch64, a closure with many conditionally dropped values died in `free` while unwinding after a caught panic | llvm `-O2` fast emit, AArch64 only | worked around, 4602a6909f | `unwind_many_flags` |
+| 21 | Finding 15 again: an arm that is only an or-pattern, behind an arm whose test also decides a later arm, hid that the later arm is never reached, and the array was dropped from the back | all four | fixed, e45ffdff69 | `unreachable_arm_move` |
 
-Numbers 4, 6, 7 and 9 to 18 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
+Numbers 4, 6, 7 and 9 to 21 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
 are wrong panic text. Numbers 5 and 8 are functions rustd refused, with the reason stated, so the
 program was still right.
 
 ## The long runs
 
 All with `python3 fuzz/fuzz.py run --seed S --rounds N --cases 30 --jobs 8 --reduce 600 --out DIR`,
-both backends, counts from `fuzz.py report DIR`. "Generated" counts the functions the generator
+counts from `fuzz.py report DIR`. L1 to L10 ran two backends, Cranelift and LLVM at `-O2` with
+fast emit. From L11 on a run has four (`--backends cranelift,llvm,llvm-O0,llvm-full`): those
+two, `llvm-O0` (`RUSTD_OPT=0`, fast emit) and `llvm-full` (`RUSTD_OPT=2 RUSTD_EMIT=optimized`,
+LLVM's own instruction selection at `-O2`). Every backend builds the same programs, so the
+number compiled is the same for each; the two "Compiled" columns are then the first two. "Generated" counts the functions the generator
 wrote; "compiled" is the number of functions rustd's own report says it compiled, which also
 has the prelude's functions and leaves out generic functions nobody calls. Each run used the
 rustd of the time, so the earlier ones show the bugs that were then fixed.
@@ -62,6 +88,9 @@ rustd of the time, so the earlier ones show the bugs that were then fixed.
 | L8 | `L8`, 360 | 49c4fddd1f | 360 | 105,649 | 102,081 | 102,081 | 1 per backend, checksum (finding 16) | 0 | 0 |
 | L9 | `L9`, 360 | 27a94f2770 | 360 | 106,116 | 101,848 | 101,848 | 0 | 0 | 0 |
 | L10 | `L10`, 60 | 27920a4f69 (merged) | 60 | 17,297 | 16,734 | 16,734 | 0 | 0 | 0 |
+| L11 | `L11`, 360, four backends | 8f21942505 (merged) | 360 | 106,339 | 102,475 | 102,475 | 2 under each of the four, checksum (findings 17, 19) | 0 | 0 |
+| L12 | `L12`, 57 (stopped), four backends | 4602a6909f | 57 | 16,727 | 21,388 | 21,388 | 1 under each of the four, checksum (finding 21) | 0 | 3 under each of the four: 2 `intrinsic powif32`, 1 `shares an async block with a function left to rustc` (the same function) |
+| L13 | `L13`, 60 (stopped), four backends | e45ffdff69 | 60 | 17,619 | 22,004 | 22,004 | 0 | 0 | 0 |
 
 L9 is the run on the last binary before the merge described below: 360 programs, none rejected,
 10,800 cases, 106,116 functions generated and 101,848 compiled by rustd under each backend, no
@@ -204,10 +233,41 @@ programs (5,827 functions): `i8` 8,321, `i16` 5,661, `i32` 5,669, `i64` 6,059, `
 `isize` 5,388, `u8` 9,049, `u16` 5,682, `u32` 6,463, `u64` 5,774, `u128` 14,686, `usize` 6,566,
 `f32` 17,524, `f64` 17,115.
 
-What the generator does not make: `async`, threads, macros of its own, inline assembly, SIMD
-intrinsics, `dyn Any`, trait objects with generic methods, specialization-like overlap, and
-any I/O other than the checksum lines. Float pairs returned in two SSE registers are generated
+What the generator does not make: threads, macros of its own, SIMD intrinsics, trait objects
+with generic methods, specialization-like overlap, and any I/O other than the checksum lines.
+`async`, `dyn Any` and inline assembly come only from the scenes below. Float pairs returned in two SSE registers are generated
 least of the ABI classes (see the table).
+
+### Scenes
+
+The second round added `harness/fuzz/scenes.py`: 25 statements that are each a small program
+of their own. A scene is one block that declares what it needs inside itself, takes its
+numbers, shapes and order from the seed, and feeds what it computes and what it drops to the
+checksum. They are for what the free-form statements reach rarely or not at all, in the order
+the task gave:
+
+| Scenes | What they do |
+|---|---|
+| `unwind.drop_panics`, `unwind.partial_move`, `unwind.operands`, `unwind.loop`, `unwind.closure`, `unwind.replace` | A `Drop` that panics while its neighbours are dropped; a struct, tuple or array with some fields moved out when the panic comes; operands of nested aggregates and calls; a panic in the body of a loop that holds values; in a closure that owns its captures; between `mem::replace`/`take` and the write back |
+| `async.across_await`, `async.dropped_pending`, `async.nested`, `async.panic_in_poll`, `async.boxed_futures` | `async fn`s with locals of several sizes held across awaits, polled by hand with a no-op waker; a future dropped after zero, one or more polls, with what it holds dropped in order; futures awaiting futures; a panic inside `poll`, caught, and the future dropped after; `Pin<Box<dyn Future>>` in a vector |
+| `dyn.upcast`, `dyn.any`, `dyn.unsized_generic` | `&dyn Sub` to `&dyn Super`, in `Box` and `Rc` too, through three traits; `dyn Any` downcasts that succeed and fail; generic code over `T: ?Sized` given slices, `str` and trait objects |
+| `closure.made_in_loop`, `closure.fields` | Closures made on each turn of a loop, by reference, by mutable reference and by `move`, kept and called afterwards; closures that capture single fields of a struct |
+| `float.casts`, `float.operations` | Every float to every integer and back at the edges (NaN, infinities, the two zeros, the bounds of each width, subnormals, 2^24 and 2^53 plus one); arithmetic, rounding, `mul_add`, `powi`, comparisons, classification and formatting on those |
+| `wide.operations`, `wide.arguments` | 128-bit arithmetic of every kind with operands around 2^64 and 2^127, shifts by 0 to 127, division and remainder; 128-bit values as the second to ninth argument and in structs |
+| `niche.enums` | `Option` of references, boxes, `NonZero`, `char`, `bool`, fieldless and nested enums; their sizes, and reading each back after writing each variant |
+| `match.arms_in_the_way` | The matches of finding 15: arms that move out behind arms no value passes |
+| `static.pointers` | Statics that hold references to other statics, to their fields and to slices of them, and function pointers |
+| `repr.variety` | `repr(C)`, `repr(u8)` to `repr(i64)`, `repr(C, u8)`, `repr(align(N))`, `repr(packed(N))`, `repr(transparent)`: sizes, alignments, field offsets, and values through them |
+| `asm` | A few instructions of register arithmetic through `asm!`, one form for x86-64 and one for AArch64 |
+
+A function has a scene with a probability the program draws once, so some programs are full
+of them and some have none.
+
+The first sixteen programs with scenes (`--seed S1 --rounds 16`, rustd at 20d97d4d73) had 14
+differences under each backend, no crash and nothing left to rustc. All were findings 17 and
+18, both in unwinding with operands in flight; after those two fixes the same sixteen
+programs are clean. Coroutines other than `async` are not in stable Rust and are not
+generated.
 
 ## The driver
 
@@ -440,9 +500,184 @@ stay in the block. I checked rustc's order with this program under both editions
 `58, 57` in both, and rustd was already right in 2024. Reduction:
 `differs-checksum-S1-2-c7.rs`.
 
-`fuzz.py check fuzz/found/*.rs` with the binary of this commit: all 33 files give the same
+**19. Nested loops.** `L11-165`, under all four backends, with the generator as it was before
+the scenes. In
+
+    for round in 0..2 {
+        for item in vec![Loud(1), Loud(2), Loud(3)] {
+            let held = Loud(40);
+            trip(&item);
+        }
+    }
+
+when `trip` panics rustc drops `held`, then `item`, then the rest of the vector: the scopes
+end from the inside out. To order the drops of a landing pad rustd ranked the locals by which
+blocks could reach which, and inside a loop that says nothing, because the body of the inner
+loop and its exit each lead to the other through the outer loop; the iterator came out first.
+The lowering now writes down the order in which scopes end as it closes them
+(`MirBody::scope_ends`) and the drops are sorted by that; the ranking by reachability is
+deleted. Reduction: `differs-checksum-L11-165-c0.rs`.
+
+**20. AArch64, LLVM `-O2` with fast emit.** Three of the 24 programs of the first AArch64 run
+(`A1-17`, `A1-21`, `A1-23`) died with SIGSEGV under `llvm`, and under no other backend; the
+same programs are right on x86-64. The reduction of the first is 24 lines: a closure given to
+`catch_unwind` that makes many vectors, each dropped on some paths only, and an `assert!`
+that fails. The binary dies in `free` in the landing pad. What I measured: with
+`-aarch64-enable-global-isel-at-O=-1` (or `-global-isel=0`) passed to LLVM the three programs
+and the reduction are right, and `-fast-isel=0` changes nothing. What I infer from the
+assembly, and did not confirm with LLVM's developers or a newer LLVM: fast emit selects
+instructions at `-O0`, which on AArch64 means the global instruction selector and the fast
+register allocator; after the `-O2` passes several drop flags are live in registers across
+the call that unwinds, the selector's copy of the exception selector register is dead and
+deleted while the register stays a live-in of the landing pad, and the allocator hands that
+register to a drop flag without reloading it. The landing pad then reads the selector value
+as a flag and frees a vector that was never made. rustd now turns the global selector off for
+AArch64, so fast emit uses SelectionDAG's fast path there, as it does on x86-64. This is a
+workaround, and what it costs in compile time on AArch64 was not measured. Reduction:
+`differs-died-A1-17-c23.rs`.
+
+**21. Finding 15 again, past an or-pattern.** `L12-18`, under all four backends. The match
+was
+
+    [Loud::C('A'..='Z', _), ..] => 1,
+    [Loud::C('b', _) | Loud::I(..3, _), ..] => 2,
+    [Loud::C('A'..='Z', _), m @ .., _] => 3,
+
+and the third arm, which would move the middle out, can never be reached. rustc's tree has
+no edge to it and drops the array front to back; rustd dropped it from the back. The
+simulation of finding 15 took the first arm's range test, and sorted the first and third arm
+into its branch, but the second arm starts with an or-pattern, which no test sorts, so the
+third arm was held back behind it and tested again later, by itself. rustc does not do that:
+`match_candidates_inner` in `rustc_mir_build/src/builder/matches/mod.rs` expands or-patterns
+before it makes any test whenever any remaining candidate starts with one, not only the
+first, so the second arm is two plain candidates by the time the range test is made and
+the third arm goes with the first. The simulation's loop now has that order; the change is
+four lines. The breaker case has three more functions, checked against rustc's MIR as
+before: the match above, the same with the or-pattern arm first (not reached either), and
+one where the arm in between has two or-patterns, which rustc expands only after the arms
+before it are done, so there the third arm is reached and the array goes from the back.
+Reduction: `differs-checksum-L12-18-c0.rs`.
+
+`fuzz.py check fuzz/found/*.rs` with the binary of e45ffdff69: all 38 files give the same
 output as rustc under both backends, with no function left to rustc
-(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`, 66 lines of `same`).
+(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`, 76 lines of `same`).
+
+## Generated edits
+
+`harness/fuzz/edits.py` is the second mode. A round is one generated program under a daemon
+that keeps its binary up to date, the way `splices.py` runs one. Each step changes the source,
+asks the daemon for the binary, which it splices, patches or links in full as it sees fit,
+and builds the same source with cargo from nothing in another directory. A finding is a step
+whose binary prints something else than cargo's, a step the daemon refused, a daemon that
+died, or one that panicked and carried on. An edit that rustc turns down is not shown to the
+daemon. The source of a case depends only on the seed, the case and the place the generator's
+random stream is cut, so an edit can generate part of a case anew and leave the rest as it
+was. The edits:
+
+| Edit | What changes |
+|---|---|
+| `regen.run` | The body of a case's `run`, generated anew |
+| `regen.fn` | The functions of a case from one on: bodies, signatures, more or fewer functions |
+| `regen.constants` | The constants of a case and what uses them |
+| `regen.adts` | The types of a case and everything after them |
+| `const.value` | The value of one constant or static |
+| `layout.fields` | The fields of a struct or the variants of an enum, in another order |
+| `layout.repr` | `#[repr(C)]` put on a type or taken off |
+| `body.literal` | One number in one function |
+| `fn.add`, `fn.signature`, `fn.remove` | A function of the edit's own and its call, then its signature, then gone |
+| `undo` | The source of an earlier step again |
+
+`edits.py smoke` (2 programs, 8 steps each, both backends) is in the Linux CI job after the
+fuzz smoke. `edits.py check` runs the sequences under `found/edits/` again.
+
+The runs, each with `python3 fuzz/edits.py run --seed S --rounds N --cases 6 --steps 12
+--backends cranelift,llvm`, counts per backend from `edits.py report DIR`:
+
+| Run | rustd | Programs | Edits shown | Wrong output | Refused | Died | Spliced | Linked in full | No link needed |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| E1, 12 rounds of 16 steps | before the fixes | 12 | not kept | 0 | several | 1 | | | |
+| E2, 16 rounds | ea6387473d less the third fix | 16 | 144 | 0 | 3 | 0 | 75 | 66 | 3 |
+| E3, 24 rounds | 4602a6909f | 24 | 218 | 0 | 7 | 0 | 125 | 86 | 7 |
+| E5, 24 rounds | e45ffdff69 | 24 | 235 | 4 (one cause, open, below) | 0 | 0 | 154 | 81 | 0 |
+
+Up to E3 no run had a step whose binary printed the wrong thing: every finding was the daemon
+saying no, or dying. Four causes, all fixed, each with a sequence under `found/edits/`:
+
+- **The daemon died** (`listed-function-gone.rs`, `block-gone.rs`). After an edit that
+  removed a function nested in a body, the daemon panicked with `Can't find ast id` in
+  `span/src/ast_id.rs`: an outline of the file went through the functions listed before the
+  edit, and one of them was no longer in the source. An outline now asks for the functions
+  the file has now.
+- **A refusal with `Duplicate definition of identifier`** (`block-namesake.rs`). An edit made
+  a second block in a function with a nested function of the same name as the first block's.
+  rustc tells them apart by a number rustd cannot know without rustc, and rustd gave both
+  the first one's symbol.
+- **The same through a type** (`derived-namesake.rs`). Two blocks of one function each with a
+  type of the same name and a method or derive on it, three times in E2. Both are fixed by
+  one rule: a path that two functions of a body share has no rustc symbol, and such
+  functions get rustd's own.
+- **A refusal with `unsupported: intrinsic powif32`** (`intrinsic-new.rs`), all seven refusals
+  of E3. rustd did not know `powi`. A whole build seldom shows it, because rustd calls the copy of
+  `f64::powi` that rustc's build of the crate has when there is one; an edit that brings the
+  first `powi` into the program has no such copy to call. Whole builds showed it twice in
+  the 57 programs of L12 (`L12-20`, `L12-46`), as a function left to rustc with that reason, so the program
+  was still right; I take it rustc had inlined `powi` there and left no copy, and did not
+  check; reduction `left-intrinsic-powif32-L12-20-c25.rs`. rustd now compiles the intrinsic (a call
+  to compiler-builtins' `__powisf2`/`__powidf2`, which is what rustc's is on these targets).
+  The same can be true of anything else in `std` that rustd cannot compile and takes from
+  rustc's object, and only an edit shows it; whole-build runs count such a function as
+  compiled.
+
+E5, on the binary with `powi`, had no refusal and four steps per backend whose output
+differed, in two programs (`E5-15` steps 9 and 10, `E5-21` steps 9 and 10), the same under
+Cranelift and LLVM. This is **open and not looked into**; the work was stopped here. What
+the output shows: the checksums are equal, and the difference is the file name in the
+location of a panic raised inside `core` ("attempt to exponentiate with overflow" in
+`core/src/num/mod.rs`). cargo's binary prints the path of the installed `rust-src`
+(`~/.rustup/toolchains/.../library/core/src/num/mod.rs:1290:5`) and the daemon's binary
+after the edit prints `/rustc/<commit>/library/core/src/num/mod.rs:1290:5`. My guess, not
+checked: after the edit rustd compiled an instance of the integer `pow` itself and named
+the file the way `core`'s metadata does, where rustc maps that path to the local sources
+when they are installed. If so it is a difference in panic text only, it should also show
+in a whole build on a machine with `rust-src` whenever rustd compiles a `core` function
+with a location itself, and the fix is to apply rustc's mapping of `/rustc/<commit>` to the
+sysroot's sources. The first sequence is kept as `found/edits-open/std-panic-path.rs` (294
+lines, not reduced further; it is outside `found/edits/` so that `edits.py check` stays
+green).
+
+The refusals were correct behaviour in the sense of the rules (stated reason, the build falls
+back to cargo), but each stood for an edit a user would have had to rebuild for. Why the
+daemon linked in full instead of splicing, in E3 under Cranelift: 55 times the whole object
+was written again, 6 times the patch had thread-local data, 5 times a function already
+patched went back to what it first was, 11 times a symbol of libm or compiler-builtins was
+not in the executable (`floor`, `fma`, `__rust_i128_mulo` and others), 6 times a function was
+too short to jump from, and 3 times a static grew. None of those is wrong; they are what an edit costs.
+
+## AArch64 under qemu
+
+`RUSTD_TARGET=aarch64-unknown-linux-gnu python3 fuzz/fuzz.py ...` builds both sides for
+AArch64 with the `aarch64-linux-gnu-gcc` linker and runs the binaries with `qemu-aarch64`, as
+`buildmodel.py` does; rustd itself runs on x86-64 and cross-compiles. The smoke run there
+(2 programs, 477 functions generated, 676 compiled under each backend) found nothing.
+
+| Run | rustd | Programs | Functions generated | Compiled per backend | Cranelift | LLVM `-O2` fast | LLVM `-O0` | LLVM `-O2` full |
+|---|---|---:|---:|---:|---|---|---|---|
+| A1, 24 rounds | ea6387473d | 24 | 7,049 | 8,515 | 0 | 3 died (finding 20) | 0 | 0 |
+| A2, 20 of 24 rounds (stopped) | 4602a6909f | 20 | 5,694 | 7,355 | 0 | 0 | 0 | 0 |
+
+So the generator does find target-specific differences: three programs in 24 died on AArch64
+under one LLVM configuration and are right on x86-64 under all four. All three are finding
+20, and all three are right with the workaround (`fuzz.py repro A1-17`, `A1-21`, `A1-23`
+with `--backends llvm`). Cranelift on AArch64 had no finding in these 24 programs, which at
+7,000 functions is a small sample next to the x86-64 runs.
+
+A2 ran on the binary with the workaround and without `powi`, and was stopped at 20
+programs: no difference and no crash under any of the four, and under each of them three
+functions left to rustc in two programs, all from `powi` (`A2-10`: `intrinsic powif32`;
+`A2-17`: a `thread_local!` in a function left to rustc for `powi`, reported as `writable
+static without a rustc symbol`, and the `async` block that shares it). The reduction of
+`A2-17` is right for AArch64 with the `powi` binary; `A2-10` was not run again. So the
+only target-specific finding in 44 AArch64 programs is finding 20.
 
 ## The merge
 
@@ -485,21 +720,22 @@ results were the same under both:
 | `python3 difftest.py corpus --bin runner --crate cases --layouts` | exit 0, 0 of 893 layouts differ |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
-| `python3 breakers.py` | 59 of 59 right, 6 open, 0 functions skipped |
+| `python3 breakers.py` | 67 of 67 right, 6 open, 0 functions skipped |
 | `python3 unwinds.py` | 8 of 8 right |
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
 | `python3 includes.py` | 9 of 9 right |
 | `python3 worktrees.py` | 62 of 62 right |
 
-The table is as of 20d97d4d73 (finding 15 fixed), run again under both backends; on the
-merge commit itself the breakers were 58 of 58 right with 7 open, the rest the same. The 6
+The table is as of e45ffdff69 (finding 21 fixed, `rustd-collate` 3d47ed59bf merged), run
+again under both backends; on the first merge commit the breakers were 58 of 58 right with
+7 open, the rest the same. The 6
 open of `breakers.py` are finding 3 of this report, three that
 `rustd-collate` lists as open and two it lists as left to rustc. Before the merge, on
 27a94f2770, the same nine passed under both backends with 40 of 40 breakers right and 2 open.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser -p
-syntax -p rustd` on the merged head: 512, 24, 330, 33 and 56 tests passed in the test binaries
+syntax -p rustd` on e45ffdff69: 513, 40, 330, 71 and 56 tests passed in the test binaries
 that have tests, 0 failed, 1 ignored.
 
 The other harnesses `rustd-collate` has in CI now (`keys.py`, `backends.py`, `debuginfo.py`,
@@ -508,13 +744,30 @@ not run them on the merged head.
 
 ## Open, and not done
 
+Stopped mid-way when the work was wound down; in order of what I would do next:
+
+- The difference E5 found in generated edits (the path in a panic location inside `core`,
+  see "Generated edits") is open and its cause is a guess.
+- The four-backend long run on the head is 60 programs (L13), not 360.
+- `rustd-collate-next` is not merged into this branch; `rustd-collate` at 3d47ed59bf is.
+  The gate was last run on e45ffdff69 and passed under both backends.
+- A2 was not run again on the head, and no AArch64 run has the `powi` fix.
+- There is no table of how often each scene was generated in a run; `fuzz.py run
+  --coverage` prints it.
+
 - Finding 3, the `assert!` message, is open for the reason above.
 - Finding 6 is a workaround. The honest fix is in LLVM; the cost of running without the SLP
   vectorizer was not measured.
-- The fuzzer only tests a whole build. It does not edit a program and splice the change in, so
-  the daemon's incremental path is not fuzzed.
-- Only Linux x86-64 was run. The ABI classes the generator aims at are the System V ones.
+- Finding 20 is a workaround too, and its diagnosis is mine from the assembly; nobody who
+  knows LLVM's fast register allocator has looked at it. Its cost on AArch64 was not measured.
+- macOS and Windows were not run. The ABI classes the generator aims at are the System V and
+  AAPCS64 ones.
+- The scenes are templates with random values and order, not free-form generation: a scene
+  finds what its template can show. Coroutines other than `async` are not stable and are not
+  generated. Inline assembly is one x86-64 scene and one AArch64 scene of register arithmetic.
+- The generated edits change one file of one crate. They do not add or remove files, change
+  `Cargo.toml`, or edit a dependency.
 - The generator's programs are single-crate and use only `std`.
 - A reduction is bounded by time (`--reduce`, 600 s in the long runs), so a reduced file is
   small but not always minimal. The breaker cases were written by hand from them.
-- The CI jobs for Windows, macOS and AArch64 that came with the merge do not run the fuzzer.
+- The CI jobs for Windows, macOS and AArch64 do not run the fuzzer; the AArch64 runs here were by hand.

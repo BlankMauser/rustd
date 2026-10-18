@@ -33,6 +33,10 @@ fn items(log: &Log, last: char) -> [Loud<'_>; 3] {
     black_box([Loud::Int(1, log), Loud::Char('q', log), Loud::Char(last, log)])
 }
 
+fn starting(log: &Log, first: char) -> [Loud<'_>; 3] {
+    black_box([Loud::Char(first, log), Loud::Char('q', log), Loud::Int(2, log)])
+}
+
 fn covered_by_binding(log: &Log, last: char) -> u8 {
     match items(log, last) {
         [.., Loud::Char(_, _)] => 1,
@@ -98,6 +102,44 @@ fn still_behind_a_range(log: &Log, last: char) -> u8 {
     }
 }
 
+/// Finding 21 (`fuzz/found/differs-checksum-L12-18-c0.rs`): an arm that is only an
+/// or-pattern is expanded into its alternatives before the test of the arm in front of it is
+/// made, and the alternatives are sorted by that test like any other arm. So the range test
+/// of the first arm sends the third arm with it, and the third is never reached. rustd
+/// expanded the or-pattern only when its arm came first, and the third arm was tested on
+/// its own after the second.
+fn covered_past_an_alternative(log: &Log, first: char) -> u8 {
+    match starting(log, first) {
+        [Loud::Char('A'..='Z', _), ..] => 1,
+        [Loud::Char('b', _) | Loud::Int(..3, _), ..] => 2,
+        [Loud::Char('A'..='Z', _), _middle @ .., _] => 3,
+        _ => 4,
+    }
+}
+
+/// The same with the or-pattern first: its alternatives make the tests, and the range test
+/// that the first alternative fails sends the other two arms along, so the third is still
+/// never reached.
+fn covered_after_an_alternative(log: &Log, first: char) -> u8 {
+    match starting(log, first) {
+        [Loud::Char('b', _) | Loud::Int(..3, _), ..] => 1,
+        [Loud::Char('A'..='Z', _), ..] => 2,
+        [Loud::Char('A'..='Z', _), _middle @ .., _] => 3,
+        _ => 4,
+    }
+}
+
+/// An arm with two or-patterns is expanded too, but the arms after it wait until it is
+/// done, so here the third arm is reached.
+fn still_past_two_alternatives(log: &Log, first: char) -> u8 {
+    match starting(log, first) {
+        [Loud::Char('A'..='Z', _), ..] => 1,
+        [Loud::Char('b', _) | Loud::Int(..3, _), Loud::Char('x', _) | Loud::Int(1, _), _] => 2,
+        [Loud::Char('A'..='Z', _), _middle @ .., _] => 3,
+        _ => 4,
+    }
+}
+
 fn reached_through_a_guard(log: &Log, last: char) -> u8 {
     match items(log, last) {
         [.., Loud::Char(_, _)] if black_box(last) == 'a' => 1,
@@ -118,8 +160,11 @@ pub fn run() -> Vec<String> {
         still_after_every_variant,
         still_behind_a_range,
         reached_through_a_guard,
+        covered_past_an_alternative,
+        covered_after_an_alternative,
+        still_past_two_alternatives,
     ];
-    for last in ['a', 'Z'] {
+    for last in ['a', 'Z', 'b'] {
         for case in cases {
             let arm = case(&log, last);
             log.borrow_mut().push(format!("arm {arm}"));
