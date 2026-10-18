@@ -19,10 +19,10 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup update --no-self-update stable
-          rustup default stable
-          rustup component add --toolchain stable rust-src rustc-dev rustfmt
-          rustup toolchain install stable --component llvm-tools-preview
+          rustup update --no-self-update 1.99.0
+          rustup default 1.99.0
+          rustup component add --toolchain 1.99.0 rust-src rustfmt
+          rustup toolchain install 1.99.0 --component llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
