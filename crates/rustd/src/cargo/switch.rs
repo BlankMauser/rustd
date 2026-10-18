@@ -336,3 +336,65 @@ fn without_wrapper(text: &str, line: Option<&str>) -> Option<String> {
     };
     (parsed(&written).ok()? == expected).then_some(written)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{with_wrapper, without_wrapper, wrapper_line};
+
+    const OURS: &str = "/opt/rustd/rustd-rustc";
+
+    #[test]
+    fn the_key_goes_under_the_table_that_is_there() {
+        let text = "# mine\n[net]\noffline = false\n\n[build] # all\njobs = 4\n";
+        let written = with_wrapper(text, OURS).unwrap();
+        assert_eq!(
+            written,
+            "# mine\n[net]\noffline = false\n\n[build] # all\nrustc-workspace-wrapper = \"/opt/rustd/rustd-rustc\"\njobs = 4\n"
+        );
+        assert_eq!(without_wrapper(&written, None).unwrap(), text);
+    }
+
+    #[test]
+    fn a_file_without_the_table_gets_one() {
+        assert_eq!(
+            with_wrapper("", OURS).unwrap(),
+            "[build]\nrustc-workspace-wrapper = \"/opt/rustd/rustd-rustc\"\n"
+        );
+        let written = with_wrapper("[net]\noffline = true", OURS).unwrap();
+        assert!(written.starts_with("[net]\noffline = true\n\n[build]\n"), "{written}");
+    }
+
+    #[test]
+    fn a_dotted_table_stays_dotted() {
+        let text = "build.rustc-wrapper = \"sccache\"\n[net]\noffline = true\n";
+        let written = with_wrapper(text, OURS).unwrap();
+        assert!(written.starts_with("build.rustc-workspace-wrapper = "), "{written}");
+        assert_eq!(without_wrapper(&written, None).unwrap(), text);
+    }
+
+    #[test]
+    fn the_wrapper_that_was_there_comes_back() {
+        let text = "[build]\r\nrustc-workspace-wrapper = 'mine' # kept\r\n";
+        let (_, line) = wrapper_line(text).unwrap();
+        let written = with_wrapper(text, OURS).unwrap();
+        assert!(!written.contains("mine") && written.contains("\r\n"), "{written}");
+        assert_eq!(without_wrapper(&written, Some(&line)).unwrap(), text);
+    }
+
+    #[test]
+    fn a_table_that_is_not_lines_is_left_alone() {
+        assert_eq!(with_wrapper("build = { jobs = 2 }\n", OURS), None);
+        assert_eq!(with_wrapper("[build\n", OURS), None);
+    }
+
+    #[test]
+    fn the_same_key_of_another_table_is_not_the_key() {
+        let text = "[target.x86_64-unknown-linux-gnu]\nrustc-workspace-wrapper = \"other\"\n";
+        assert_eq!(wrapper_line(text), None);
+        assert!(
+            with_wrapper(text, OURS)
+                .unwrap()
+                .ends_with("[build]\nrustc-workspace-wrapper = \"/opt/rustd/rustd-rustc\"\n")
+        );
+    }
+}

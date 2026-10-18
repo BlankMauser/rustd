@@ -40,6 +40,8 @@ const SCRATCH: &str = "CARGO_TARGET_TMPDIR";
 /// The file in the daemon's directory that has a line for every program plain cargo asked
 /// for: who linked it, and why when it was rustc.
 const TALLY: &str = "plain-cargo.log";
+/// Why rustc links a program the daemon was not asked for: the first build of it.
+const NOT_LOADED: &str = "the daemon had not loaded the build yet";
 /// The directory there with a file for every cargo whose build is being loaded.
 const SETTLING: &str = "settling";
 
@@ -61,23 +63,19 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::process::exit(compiler.status()?.code().unwrap_or(1));
     };
     let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
-    if plain {
-        let dir = unit.records.join(&unit.id);
-        let known = State::of_unit(&dir);
-        if !known.is_empty() {
-            match unit.by_daemon(&dir, &known, &rustc) {
-                Ok(()) => {
-                    tally("daemon", &unit.crate_name);
-                    std::process::exit(0);
-                }
-                Err(why) => unit.left_to_rustc(&why),
+    let dir = unit.records.join(&unit.id);
+    let known = if plain { State::of_unit(&dir) } else { Vec::new() };
+    if !known.is_empty() {
+        match unit.by_daemon(&dir, &known, &rustc) {
+            Ok(()) => {
+                tally("daemon", &unit.crate_name);
+                std::process::exit(0);
             }
-            State::forget(&known);
-            let _ = std::fs::remove_file(dir.join(State::STATES));
+            Err(why) => unit.left_to_rustc(&why),
         }
     }
     let stamp = stamp_now();
-    let copies = unit.records.join(&unit.id).join(stamp.to_string());
+    let copies = dir.join(stamp.to_string());
     let line = copies.join("link.line");
     if unit.linked {
         std::fs::create_dir_all(&copies)?;
@@ -91,11 +89,16 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         // The build is good; the daemon has no part in this crate until it is built again.
         eprintln!("warning: rustd did not record `{}`: {error:#}", unit.id);
     }
-    if plain
-        && status.success()
-        && let Err(why) = loaded_later()
-    {
-        unit.left_to_rustc(&why);
+    if plain && status.success() {
+        // The program is rustc's now: the builds that had it are loaded again from this one.
+        if known.is_empty() {
+            tally("rustc", NOT_LOADED);
+        }
+        State::forget(&known);
+        let _ = std::fs::remove_file(dir.join(State::STATES));
+        if let Err(why) = loaded_later() {
+            unit.left_to_rustc(&why);
+        }
     }
     std::process::exit(status.code().unwrap_or(1));
 }

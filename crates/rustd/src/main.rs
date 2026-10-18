@@ -1205,7 +1205,10 @@ impl Checkouts {
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-                && !matches!(self.cargo_config.target_dir_config, TargetDirectoryConfig::Directory(_))
+                && !matches!(
+                    self.cargo_config.target_dir_config,
+                    TargetDirectoryConfig::Directory(_)
+                )
             {
                 let target: &paths::Utf8Path = cargo.target_directory().as_ref();
                 let scripts = self.cargo_config.target_dir_config.target_dir(Some(target));
