@@ -194,6 +194,12 @@ impl Args {
                 "--crate" => krate = Some(value()?),
                 "--out" => out = Some(PathBuf::from(value()?)),
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
+                "--symbols-in" => {
+                    let listed = value()?;
+                    let listed = std::fs::read_to_string(&listed)
+                        .with_context(|| format!("reading the symbol files in {listed}"))?;
+                    symbol_files.extend(listed.lines().map(PathBuf::from));
+                }
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
                 "--binary" | "--splice" => splice = Some(PathBuf::from(value()?)),
@@ -569,7 +575,8 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
         .map(str::to_owned)
         .collect();
     let toolchain = vfs.iter().find_map(|(_, path)| {
-        let (toolchain, _) = path.as_path()?.as_str().split_once("lib/rustlib/src/rust/")?;
+        let path = path.as_path()?.as_str().replace('\\', "/");
+        let (toolchain, _) = path.split_once("lib/rustlib/src/rust/")?;
         Some(toolchain.to_owned())
     });
     if let Some(toolchain) = &toolchain {
@@ -628,9 +635,13 @@ impl SymbolResolver for Resolver<'_> {
         let source_root = self.db.file_source_root(file).source_root_id(self.db);
         let source_root = self.db.source_root(source_root).source_root(self.db);
         let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-        if let Some((toolchain, file)) = path.split_once("lib/rustlib/src/rust/")
+        // Whichever way this system writes a path; what follows the commit stays as it is.
+        const SOURCES: &str = "lib/rustlib/src/rust/";
+        let slashed = path.replace('\\', "/");
+        if let Some((toolchain, _)) = slashed.split_once(SOURCES)
             && let Some(commit) = self.rustc_commit.get_or_init(|| rustc_commit(toolchain))
         {
+            let file = &path[toolchain.len() + SOURCES.len()..];
             return Some(format!("/rustc/{commit}/{file}"));
         }
         let relative = self.inside(Path::new(&path));
@@ -2051,6 +2062,11 @@ fn link(
         };
         match spliced {
             Ok((baseline, Spliced { redirected, appended })) => {
+                if redirected != 0 && baseline.leaves_debug_info() {
+                    eprintln!(
+                        "debug: the PDB is of the code before the splice: the {redirected} functions redirected have no lines in it until the next full link"
+                    );
+                }
                 let read = Executable::Read(Box::new(baseline));
                 LINKED.lock().unwrap().insert(binary.to_owned(), read);
                 eprintln!(
@@ -2442,6 +2458,13 @@ fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
     });
     let (module, why) = broken?;
     Some(format!("{module} has errors, `cargo check` shows them: {why}"))
+}
+
+/// The text of the source file at `path` as the database has it.
+fn source_on_disk(path: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    let rust = path.extension().is_some_and(|it| it == "rs");
+    Ok(if rust { load_cargo::source_text(text) } else { text })
 }
 
 /// A file whose changes the daemon picks up.
@@ -3105,6 +3128,10 @@ fn end_with_input() {
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("cache") {
         return remote::command(std::env::args().skip(2));
+    }
+    #[cfg(windows)]
+    if let Some(script) = cargo::script::stood_in_front_of() {
+        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {
@@ -3793,7 +3820,7 @@ fn main() -> anyhow::Result<()> {
                 if switched.iter().any(|base| file.path.starts_with(base)) {
                     file.mtime = now;
                     let same = match file.file {
-                        Watched::Source(id) => std::fs::read_to_string(&on_disk)
+                        Watched::Source(id) => source_on_disk(&on_disk)
                             .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
                         Watched::Included(ref path) => db.included_is_read(path),
                     };
@@ -3856,7 +3883,8 @@ fn main() -> anyhow::Result<()> {
             match file {
                 Watched::Source(id) => {
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
+                    let text = source_on_disk(&db.on_disk(path))?;
+                    change.change_file(*id, Some(text));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),

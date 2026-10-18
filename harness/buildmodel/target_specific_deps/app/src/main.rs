@@ -4,6 +4,8 @@ use on_gnu as only;
 use on_musl as only;
 #[cfg(target_arch = "aarch64")]
 use on_arm as only;
+#[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+use on_msvc as only;
 fn main() {
     println!("arch {} os {} env {:?} family {} pointer {} endian {}", std::env::consts::ARCH, std::env::consts::OS,
         option_env!("CARGO_CFG_TARGET_ENV"), std::env::consts::FAMILY, std::mem::size_of::<usize>(), cfg!(target_endian = "little"));

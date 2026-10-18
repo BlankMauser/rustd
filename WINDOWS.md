@@ -400,3 +400,158 @@ process read by `option_env!`, and the release profile, each "again" and "elsewh
 1. `sym` in `asm!` that is not naked, and `sym` of a generic function.
 2. A variadic function with no named parameter.
 3. `naked_asm!` with `sym` on Mach-O, and a check on Linux that rustd compiles the ELF case.
+
+## The production round: debug info, the build model, the disk store
+
+Measured on `rustd-windows-prod`, which is `rustd-windows-abi2` with `rustd-collate`
+`0151c01218` merged in, on the same machine (Windows Server 2022, x86-64, MSVC 14.44, stable
+1.99.0, LLVM 20.1.8). Where this section disagrees with the ones above, this one is current.
+Everything was run natively. Nothing in the `sym`, variadic or stacked-argument code was
+changed in this round; what the branch has there is what `rustd-windows-abi2` had.
+
+### Debug info
+
+rustd now writes CodeView for its functions on COFF, under both backends: a `.debug$S`
+section in the C13 format with one `S_GPROC32` procedure per function, its lines, the file
+names and their checksums. `link.exe /DEBUG` puts them in the PDB next to rustc's. The
+writer is `crates/hir-ty/src/mir/codegen/debuginfo/codeview.rs`; it takes the same
+per-function line rows the DWARF writer takes, so both backends feed it the same way (LLVM's
+lines are read back from its object as on ELF).
+
+`harness/debuginfo.py` runs on Windows. It reads the PDB with `llvm-pdbutil`, takes
+backtraces from the program itself with `RUST_BACKTRACE=1`, and drives `cdb`. Results, the
+same under Cranelift and LLVM unless said:
+
+- Backtraces. Every panic of the corpus (85 panics, 448 frames under Cranelift, 447 under
+  LLVM where the optimizer leaves one frame out) has the file and line the cargo build has.
+  The same holds for the stress program and rung2. Function names are compared by their last
+  part, because rustc's CodeView spells a path differently from the mangled name.
+- The PDB. `llvm-pdbutil` reads it without complaint, and every function of rustd's that has
+  a `.pdata` entry has a procedure that covers the same range (under LLVM 11689 in the
+  corpus, 1720 in stress, 3011 in rung2).
+- cdb. A breakpoint by file and line in rustd's code stops there, the stack above it is
+  named, and stepping moves through the following lines (for example `lib.rs:1962` in the
+  corpus, then 1945 to 1948 in the function it calls).
+- The splice. A PDB is a file only the linker writes, so a splice leaves it as it was. The
+  daemon says so on every splice that redirects a function ("the PDB is of the code before
+  the splice"), and the harness holds it to that: a frame in spliced code has no line, and
+  none has a wrong one. In the edit sequence all 7 or 8 frames of the panic lose their line
+  after the first edit, since the edit moves every function. Such a frame still gets a name
+  from `dbghelp`, the nearest symbol below it, which is not the function's. The next full
+  link writes a PDB that is right again.
+- Cost on the corpus under LLVM: 17.9 s to compile and link against 14.8 s without, and an
+  object 7.3% larger.
+
+What is missing, exactly:
+
+1. `.debug$T`. No types are written, so a procedure has no signature and cdb shows no
+   parameters or locals (the harness counts 0 and says so). `S_LOCAL`, `S_REGREL32` and
+   the like are not written either.
+2. Inlined frames. There are no `S_INLINESITE` records, so a callee LLVM inlined is not a
+   frame of its own in a backtrace (the harness reports one such panic in the corpus and
+   allows it).
+3. Debug info for spliced code. Rewriting the PDB after a splice is not done; the PDB stays
+   stale until a full link.
+4. Visual Studio and WinDbg were not tried, only `cdb` (the same engine as WinDbg).
+
+Two things found on the way. rustup's Windows toolchain manifest has no commit hash, so the
+`/rustc/<hash>` prefix of std's paths is taken from the installed `libstd` instead. And on
+Windows a pack that was only read never had its time of last use set, because the handle
+it was read through had no right to set it; the collector then took packs in use to be the
+oldest. The pack is opened with that right now.
+
+### The harnesses that had not run here
+
+`keys.py`: 36 of 36, 0 open, under both backends.
+
+`buildmodel.py`: 176 rows as expected, 0 wrong, 4 skipped, in one run that covers both backends. The two Linux cross targets are skipped off Linux, and the
+table prints them as `skipped` with the reason, apart from `WRONG`. What had to change was
+in the harness and its cases, not in rustd: `file://` URLs made by `setup.sh` from a
+Windows path, the daemon's socket path going past the length limit, and five cases that
+only built with Unix tools (`no_std_no_main`, `script_link_lib`, `target_specific_deps`,
+`crate_cdylib`, `crate_staticlib`).
+
+The last two deserve a warning. Their `run.sh` called `cc`; on a machine without it both
+the cargo build and rustd's failed alike and the row read "supported", which is how I first
+reported 176 of 176 when four of those rows compared nothing. They now link with `cl`, and
+both builds print 42. For the DLL, rustd's link keeps the `symbols.o` that carries the
+export directives (the `.def` file rustc writes is empty) and writes its own import
+library rather than over cargo's. A row where both builds fail the same way still counts
+as the same; the harness does not tell that apart, on any platform.
+
+`storekills.py`: 100 kills pass under each backend (300 in a separate run). It found one
+real fault, in shared code: a daemon killed while writing the store's version file left only
+`version.<pid>-<nanos>.tmp`, the store was then taken for format 1, and `cache verify`
+refused it. A store with nothing but that temporary file is now a store of no format yet.
+
+`storecorrupts.py --rounds 4`: 4 damaged stores detected, discarded and rebuilt under each backend. The check that a store of another format was
+discarded compared pack names, and a pack recompiled from the same code is sealed under the
+name it had; it now checks the count the daemon says it discarded. That it failed once on
+GitHub for this reason is my reading of the log; I did not reproduce it.
+
+`storeshared.py`: 180 builds on a shared store pass under each backend, with 394 packs
+evicted under Cranelift and 246 under LLVM in the run with the tight limit.
+
+`storefull.py`: 6 full disks pass under each backend. It runs on a 64 MB NTFS volume in a VHD that `diskpart` makes and
+attaches, which needs an administrator. The last case used to leave 1 MB of room, which
+LLVM's store fits in (about 830 KB), so the disk never filled; the room is now two thirds
+of what a cold build writes.
+
+Evicting a pack another process has open needed no fix beyond the one for the time of last
+use. std opens files with `FILE_SHARE_DELETE` and removes them with POSIX semantics on
+NTFS, so the name goes at once and the reader keeps its data. `DISKCACHE.md` said otherwise
+and is corrected. A file system without POSIX delete was not tried.
+
+### CI
+
+The Windows harness job also runs `keys.py`, `debuginfo.py`, `storekills.py --kills 100`,
+`storecorrupts.py --rounds 4`, `storefull.py` and `storeshared.py` under both backends, and
+`buildmodel.py` once, in the Cranelift job, since it runs both backends itself.
+On `c7774bc1cc` both Windows harness jobs and both `fmt and tests` jobs pass on GitHub. The
+two Linux harness jobs and `coverage` fail there exactly as they do on the base
+`0151c01218`: `debuginfo.py` under LLVM ends with "wrong: 4", `buildmodel.py` in the
+Cranelift job ends with "179 of 180 as expected, 0 WRONG", and `coverage` is rust-analyzer's
+own workflow. I compared the closing lines of those jobs on both commits and did not look
+further into them.
+
+### Harness results (measured)
+
+One binary built with `--features llvm`; the Cranelift column is that binary with the
+default backend.
+
+| Harness | LLVM | Cranelift |
+|---|---|---|
+| `difftest.py corpus --layouts` | MATCH, 827/827, 0 of 898 layouts differ | MATCH, 827/827, 0 of 898 |
+| `scoreboard.py` | 6 targets match | 6 targets match |
+| `programs.py` | 22 of 22 | 22 of 22 |
+| `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
+| `breakers.py` | 25 of 25, 0 open | 25 of 25, 0 open |
+| `unwinds.py` | 8 of 8 | 8 of 8 |
+| `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
+| `asmedits.py` | 10 of 10 | 10 of 10 |
+| `deps.py` | 10 of 10 | 10 of 10 |
+| `includes.py` | 9 of 9 | 9 of 9 |
+| `RUSTD_SPLICE=1 worktrees.py` | 58 of 58 | 58 of 58 |
+| `worktrees.py --join --together` | 58 of 58 | 58 of 58 |
+| `worktrees.py --overlay` | 67 of 67 | 67 of 67 |
+| `keys.py` | 36 of 36, 0 open | 36 of 36, 0 open |
+| `debuginfo.py` | all right | all right |
+| `storekills.py --kills 100` | pass | pass |
+| `storecorrupts.py --rounds 4` | pass | pass |
+| `storefull.py` | pass | pass |
+| `storeshared.py` | pass, 180 builds | pass, 180 builds |
+| `buildmodel.py` (both backends in one run) | 176 of 176 as expected, 0 wrong, 4 skipped | |
+
+The rows down to `storekills.py` and `storeshared.py` were run on `541779b51b`;
+`storecorrupts.py`, `storefull.py` and `buildmodel.py` were run again after their harness
+changes in `c7774bc1cc`. No Rust code differs between the two.
+
+### To recheck on Linux
+
+- `store.rs`: the format of a store that holds only a temporary version file.
+- `harness/buildmodel.py`: a `skipped` verdict, the socket in a short temporary directory,
+  `BM_HERE` for `setup.sh`, and the `run.sh` of the two library cases, which take the old
+  path when `rustc -vV` does not say `msvc`.
+- `harness/storefull.py` and `harness/storecorrupts.py`: the measured room and the
+  discarded count apply on every platform.
+- `harness/linkline.py`: `/IMPLIB:` follows `/OUT:`, on MSVC lines only.

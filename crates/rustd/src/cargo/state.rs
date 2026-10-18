@@ -681,9 +681,12 @@ fn other_toolchain() -> Option<String> {
 /// `.git` in the first checkout and is named by the `.git` file of a worktree. A directory
 /// that is no checkout is its own.
 fn repository(root: &Path) -> PathBuf {
+    // git names the directory its own way, on Windows with other separators than the
+    // checkout's path has: both are spelled as the file system spells them.
+    let spelled = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
     let git = root.join(".git");
     if git.is_dir() {
-        return git;
+        return spelled(&git);
     }
     let named = std::fs::read_to_string(&git).ok();
     let common = named.as_deref().and_then(|it| {
@@ -691,7 +694,7 @@ fn repository(root: &Path) -> PathBuf {
         let dir = Path::new(it.strip_prefix("gitdir:")?.trim());
         dir.ancestors().find(|it| it.file_name().is_some_and(|it| it == "worktrees"))?.parent()
     });
-    common.map_or_else(|| root.to_owned(), Path::to_owned)
+    common.map_or_else(|| root.to_owned(), spelled)
 }
 
 /// The variables cargo sets for a program of `package` when it runs it.

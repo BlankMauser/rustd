@@ -326,6 +326,28 @@ fn nanos() -> u128 {
     SystemTime::UNIX_EPOCH.elapsed().map_or(0, |it| it.as_nanos())
 }
 
+/// Opens a sealed pack to read it and to say when it was last used. It can still be renamed
+/// and removed by others while it is open, on Windows too: std shares a file for all three.
+fn open_pack(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        // The right to read does not bring the right to set a time there, and without it
+        // a pack that is read from looks unused to a collection. Another user's pack may
+        // not grant it: that one stays as old as it was.
+        OpenOptions::new()
+            .access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+            .open(path)
+            .or_else(|_| File::open(path))
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -479,7 +501,10 @@ impl StoreDir {
             let format = text.trim().strip_prefix("rustd store ").and_then(|it| it.parse().ok());
             return Some(format.unwrap_or(0));
         }
-        self.names().ok()?.iter().any(|it| Kind::of(it).is_some()).then_some(1)
+        // A daemon that ended while it was saying which format the store is of left only
+        // the start of that file, which the first format never had.
+        let said = |name: &str| name.starts_with(VERSION_FILE);
+        self.names().ok()?.iter().any(|it| Kind::of(it).is_some() && !said(it)).then_some(1)
     }
 
     /// Waits for the directory to be this process's to empty or collect.
@@ -1490,6 +1515,20 @@ mod tests {
         store.insert(&[1; KEY], b"one");
         store.flush();
         assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_store_whose_format_was_never_all_said_is_of_none() {
+        let dir = scratch("unsaid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let begun = dir.join(format!("{VERSION_FILE}.1-2.tmp"));
+        std::fs::write(&begun, b"rustd st").unwrap();
+        assert_eq!(StoreDir::at(&dir).format(), None);
+        let store = open(&dir, EAGER);
+        assert_eq!(StoreDir::at(&dir).format(), Some(FORMAT));
+        assert!(!begun.exists());
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
