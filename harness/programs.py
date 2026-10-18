@@ -9,7 +9,8 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -53,6 +54,11 @@ STEPS = [
 ]
 
 
+def splice(program):
+    """Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full."""
+    return ["--binary", program["bin"]]
+
+
 def main():
     ws = tempfile.mkdtemp(prefix="rustd-programs-")
     shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
@@ -72,16 +78,14 @@ def main():
         fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-        link[link.index("-o") + 1] = binary
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link), "symbols": symbols}
+        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link), "symbols": symbols}
     first = programs["sapp"]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"]], stderr=out, stdout=out)
+        [RUSTD, ws, *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -89,7 +93,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -107,10 +111,10 @@ def main():
             began = time.time()
             reply = subprocess.run(
                 [RUSTD, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
-                 "--link-cmd", program["link"], *program["symbols"]], capture_output=True, text=True, timeout=120)
+                 "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", name], cwd=ws, capture_output=True, text=True,
+            cargo = subprocess.run(["cargo", "build", "-q", "-p", name, *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                    env={**os.environ, "CARGO_TARGET_DIR": reference})
             assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
             if daemon.poll() is not None:
@@ -120,7 +124,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                verdict = "same" if run(program["bin"]) == run(os.path.join(reference, "debug", name)) else "DIFFERENT OUTPUT"
+                verdict = "same" if run(program["bin"]) == run(built(reference, name)) else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)

@@ -197,6 +197,9 @@ impl ExprCollector<'_> {
         let mut template = Some(Vec::new());
         if options.contains(AsmOptions::RAW) {
             for it in asm.template() {
+                if !self.check_cfg(&it) {
+                    continue;
+                }
                 let text = self
                     .expand_macros_to_string(it)
                     .and_then(|(s, _)| s.value().ok().map(|it| it.into_owned()));
@@ -213,7 +216,12 @@ impl ExprCollector<'_> {
             // Don't treat raw asm as a format string.
             asm.template()
                 .enumerate()
-                .filter_map(|(idx, it)| Some((idx, it.clone(), self.expand_macros_to_string(it)?)))
+                .filter_map(|(idx, it)| {
+                    if !self.check_cfg(&it) {
+                        return None;
+                    }
+                    Some((idx, it.clone(), self.expand_macros_to_string(it)?))
+                })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
                     mappings.resize_with(idx + 1, Vec::default);
                     let Ok(text) = s.value() else {

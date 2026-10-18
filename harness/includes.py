@@ -5,11 +5,12 @@ The file is not a `.rs` file, so nothing loads it until the macro is expanded. E
 it or the file that includes it, asks the daemon for the program and compares what it prints
 with what `cargo build` of the same source prints.
 """
-import os, shlex, subprocess, sys, tempfile, time
+import os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOML = """[package]
 name = "sinc"
@@ -68,13 +69,13 @@ def follow(files, steps):
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-    link[link.index("-o") + 1] = binary
+    link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", shlex.join(link), *symbols]
+    # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
+    splice = ["--binary", binary]
+    ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([RUSTD, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -82,13 +83,23 @@ def follow(files, steps):
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
+    def linked(seen):
+        """How the daemon made the binary since the log was `seen` long."""
+        links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
+        if not links:
+            return "no link"
+        return "spliced" if links[-1].startswith("spliced") else \
+            "full: " + (re.search(r"not spliced: (.*)", links[-1]) or [None, "not asked to splice"])[1]
+
     wrong = 0
-    for what, edits, broken in steps:
+    # A step may say after `broken` what the way the binary was made has to contain.
+    for what, edits, broken, *how in steps:
+        seen = len(open(log_path).read())
         for path, old, new in edits:
             text = open(os.path.join(ws, path)).read()
             assert old in text, (what, old)
@@ -98,7 +109,7 @@ def follow(files, steps):
         reply = subprocess.run([RUSTD, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
         took = (time.time() - began) * 1000
         reply = (reply.stdout + reply.stderr).strip()
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
         if daemon.poll() is not None:
@@ -108,8 +119,11 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(os.path.join(reference, "debug", "sinc")) else "DIFFERENT OUTPUT"
-        wrong += verdict.isupper()
+            verdict = "same" if run(binary) == run(built(reference, "sinc")) else "DIFFERENT OUTPUT"
+        made, failed = linked(seen), verdict.isupper()
+        if how and not failed and how[0] not in made:
+            verdict, failed = f"NOT {how[0]}: {made}"[:60], True
+        wrong += failed
         print(f"{what:40} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
     daemon.kill()
     print(f"{len(steps) - wrong} of {len(steps)} right; log {log_path}")

@@ -13,7 +13,8 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -22,6 +23,10 @@ SUM = "items.iter().sum()"
 # Not the same in any two checkouts from the start.
 NOTE = "app/src/note.txt"
 MORE = "app/src/more.rs"
+# Of the workspace and of no package.
+SHARED = "shared.txt"
+# Not the same in any two runs either: with `RUSTD_CACHE` a run has what the last one compiled.
+RUN = os.getpid()
 # (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
@@ -53,6 +58,11 @@ STEPS = [
        "pub fn here() -> &'static str {\n    env!(\"CARGO_MANIFEST_DIR\")\n}\n\npub fn seeded() -> u32 {"),
       (1, APP, 'println!("{}", HERE);', 'println!("{} {}", HERE, smid::here());')],
      [1, 0, 2, 1], []),
+    ("that file edited in one", [(2, SHARED, f"shared of 2 in {RUN}", "shared anew")], [0, 2, 1], []),
+    ("and made what another has", [(2, SHARED, "shared anew", f"shared of 0 in {RUN}")], [2, 1, 0], []),
+    # The checkout is loaded again, and the others are left as they are.
+    ("the manifest of one changed in what no crate reads",
+     [(0, "app/Cargo.toml", "[package]", "[package.metadata]\nnote = 1\n\n[package]")], [1, 2, 0, 1], []),
 ]
 # Cargo may build that checkout another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
@@ -67,41 +77,62 @@ if "--overlay" in sys.argv:
 
 # With `--overlay` the others are not loaded at all: each is read as the first with other files.
 OVERLAY = "--overlay" in sys.argv
+# With `--split` the others join the first and share the packages that are the same in both.
+SPLIT = "--split" in sys.argv
+# With `--thin` the checkouts start out with the same included file, so that the others are
+# read as the first with other files from their first build on.
+THIN = "--thin" in sys.argv
+# With `--slow` every build of a checkout read as another counts as a long one, so that the
+# daemon gives up on reading them so and loads them.
+if "--slow" in sys.argv:
+    os.environ["RUSTD_SLOW_SWITCH_MS"] = "0"
+JOIN = "--join" in sys.argv or SPLIT or THIN
+
+
+def splice(program):
+    """Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full."""
+    return ["--binary", program["bin"]]
 
 
 def main():
-    work = tempfile.mkdtemp(prefix="rustd-worktrees-")
+    # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-worktrees-"))
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
     crates = ["sapp", "sbase", "smid"]
     checkouts = []
     for at in range(COUNT):
         ws = os.path.join(work, f"checkout{at}")
         shutil.copytree(os.path.join(HERE, "stress"), ws, ignore=shutil.ignore_patterns("target"))
-        open(os.path.join(ws, NOTE), "w").write(f"note of {at}\n")
+        open(os.path.join(ws, NOTE), "w").write(f"note of {1 if THIN else at}\n")
         main_rs = os.path.join(ws, APP)
         text = open(main_rs).read()
         assert "fn main() {" in text
         text += '\nconst HERE: &str = env!("CARGO_MANIFEST_DIR");\n'
-        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);', 1))
+        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);\n    println!("shared {}", smid::shared());', 1))
+        # A crate no step edits includes a file of the workspace that is outside its package.
+        open(os.path.join(ws, SHARED), "w").write(f"shared of {at} in {RUN}")
+        mid_rs = os.path.join(ws, MID)
+        text = open(mid_rs).read()
+        assert "pub fn seeded() -> u32 {" in text
+        open(mid_rs, "w").write(text.replace("pub fn seeded() -> u32 {", "pub fn shared() -> &'static str {\n    include_str!(\"../../shared.txt\")\n}\n\npub fn seeded() -> u32 {", 1))
         # A checkout read as the first one links what rustc built of the first.
         if not (OVERLAY and checkouts):
             fx = Fixture(ws, crates, ["-p", "sapp"])
             fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-        link[link.index("-o") + 1] = binary
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": shlex.join(link),
+        checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link),
                           "symbols": symbols, "reference": os.path.join(work, f"reference{at}")})
     first = checkouts[0]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RUSTD, first["ws"], *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *first["symbols"],
-         *[x for other in checkouts[1:] if "--join" not in sys.argv and not OVERLAY for x in ("--also", other["ws"])]],
-        stderr=out, stdout=out, env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {})})
+        [RUSTD, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
+         *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
+        stderr=out, stdout=out,
+        env={**os.environ, **({"RUSTD_OVERLAY": "1"} if OVERLAY else {}), "RUSTD_SPLIT": "1" if SPLIT else "0"})
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -109,7 +140,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -135,7 +166,7 @@ def main():
             checkout = checkouts[at]
             return time.time(), subprocess.Popen(
                 [RUSTD, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
-                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *checkout["symbols"]],
+                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *splice(checkout), *checkout["symbols"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         # A program asked for twice in a step is asked for the second time after the others.
@@ -145,7 +176,7 @@ def main():
             began, reply = asking.pop(at, None) or ask(at)
             reply = reply.communicate(timeout=120)[0].strip()
             took = (time.time() - began) * 1000
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=checkout["ws"], capture_output=True,
+            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
             if daemon.poll() is not None:
@@ -155,7 +186,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(os.path.join(checkout["reference"], "debug", "sapp"))
+                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
                 verdict = "same" if same else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()

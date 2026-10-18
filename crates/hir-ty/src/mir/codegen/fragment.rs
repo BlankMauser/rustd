@@ -11,7 +11,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId};
+use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId, hir::BindingId};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, unwind::FunctionUnwind,
+    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
+    debuginfo::LineRow, unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -84,7 +85,15 @@ pub(super) struct Code {
     pub(super) bytes: Vec<u8>,
     pub(super) align: u64,
     pub(super) relocs: Vec<ModuleReloc>,
+    /// The relocations of `relocs`, by where they are, that Cranelift has no kind for, with
+    /// the type ELF has for each: the low bits of an address in an AArch64 load or store,
+    /// which go in in units of what it moves, and whatever the assembly of a function
+    /// names a symbol with. The kind in `relocs` stands in for it, and the object is given
+    /// the relocation when it is finished.
+    pub(super) elf_types: Vec<(u32, u32)>,
     pub(super) unwind: Option<FunctionUnwind>,
+    /// Which statement the code is of, from each offset where that changes.
+    pub(super) lines: Vec<LineRow>,
 }
 
 impl PartialEq for Code {
@@ -106,6 +115,8 @@ impl PartialEq for Code {
             && self.align == other.align
             && self.signature == other.signature
             && self.unwind == other.unwind
+            && self.lines == other.lines
+            && self.elf_types == other.elf_types
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
                 a.offset == b.offset
@@ -122,8 +133,24 @@ impl PartialEq for Code {
 pub struct CompiledFunction {
     pub(super) requests: Requests,
     pub(super) code: Code,
+    /// The body the function was compiled from and the statements of it that
+    /// [`Code::lines`] index. Looked up when stitching, like a [`DataRequest::Location`].
+    pub(super) source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    /// The named locals of the body a debugger can be told of, whose types are of `.0`.
+    pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
+}
+
+/// A local written with a name that is kept in one slot of the frame for as long as the
+/// function runs.
+#[derive(PartialEq)]
+pub(super) struct Variable {
+    pub(super) binding: BindingId,
+    pub(super) param: bool,
+    pub(super) ty: StoredTy,
+    /// Where the slot is from the frame pointer.
+    pub(super) offset: i64,
 }
 
 /// The value of a static rustc exports no symbol for.
@@ -134,10 +161,22 @@ pub struct CompiledStatic {
     pub(super) writable: bool,
 }
 
+/// How many requests a [`Recorder`] had at some point, to tell the ones made since.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+pub(super) struct Mark {
+    pub(super) funcs: usize,
+    pub(super) datas: usize,
+}
+
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
+    /// What `isa` generates code for.
+    pub(super) target: &'static Target,
+    /// Whether the crate compiling the function has `-C overflow-checks`.
+    pub(super) checked: bool,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -145,13 +184,29 @@ pub(super) struct Recorder<'db> {
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
+    /// The assembly of the function, when it is a `#[naked]` one, and what each operand of
+    /// it that is a `sym` names.
+    pub(super) naked: Option<(String, Vec<Option<ModuleRelocTarget>>)>,
+    /// The statements instructions were built for, which their source locations index.
+    spans: Vec<MirSpan>,
+    span_ids: FxHashMap<MirSpan, u32>,
+    /// The locals written with a name that have a stack slot of their own, and whether each
+    /// is a parameter.
+    pub(super) named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
 }
 
 impl<'db> Recorder<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, isa: &'static dyn TargetIsa) -> Self {
+    pub(super) fn new(
+        db: &'db dyn HirDatabase,
+        isa: &'static dyn TargetIsa,
+        target: &'static Target,
+        checked: bool,
+    ) -> Self {
         Recorder {
             db,
             isa,
+            target,
+            checked,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -159,7 +214,29 @@ impl<'db> Recorder<'db> {
             statics: FxHashMap::default(),
             layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             builder_ctx: FunctionBuilderContext::new(),
+            naked: None,
+            spans: Vec::new(),
+            span_ids: FxHashMap::default(),
+            named: Vec::new(),
         }
+    }
+
+    /// What marks an instruction as built for the statement at `span`.
+    pub(super) fn source_loc(&mut self, span: MirSpan) -> ir::SourceLoc {
+        if span == MirSpan::Unknown {
+            return ir::SourceLoc::default();
+        }
+        let next = self.spans.len() as u32;
+        let id = *self.span_ids.entry(span).or_insert(next);
+        if id == next {
+            self.spans.push(span);
+        }
+        LineRow::source_loc(id)
+    }
+
+    /// The statements that [`Self::source_loc`] gave marks for, in the order of the marks.
+    pub(super) fn take_spans(&mut self) -> Vec<MirSpan> {
+        std::mem::take(&mut self.spans)
     }
 
     pub(super) fn finish(self) -> (Requests, Vec<(String, u64, u64)>) {
@@ -171,6 +248,17 @@ impl<'db> Recorder<'db> {
                 .collect()
         });
         (self.requests, layouts)
+    }
+
+    #[cfg(feature = "llvm")]
+    pub(super) fn mark(&self) -> Mark {
+        Mark { funcs: self.requests.funcs.len(), datas: self.requests.datas.len() }
+    }
+
+    /// The requests made since `mark`.
+    #[cfg(feature = "llvm")]
+    pub(super) fn since(&self, mark: Mark) -> (&[FuncRequest], &[DataRequest]) {
+        (&self.requests.funcs[mark.funcs..], &self.requests.datas[mark.datas..])
     }
 
     fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
@@ -205,7 +293,8 @@ impl<'db> Recorder<'db> {
             rustc_type_ir::RegionKind::ReBound(..) => region,
             _ => Region::new_erased(interner),
         });
-        let instance = Instance { def, args: args.store() };
+        let checked = super::compiled_checked(self.db, def, args, self.checked);
+        let instance = Instance { def, args: args.store(), checked };
         Ok(self.func(FuncTarget::Instance(instance, env.store()), sig))
     }
 
@@ -286,7 +375,20 @@ impl<'db> Recorder<'db> {
     }
 
     pub(super) fn target_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
-        self.isa.frontend_config()
+        let config = self.isa.frontend_config();
+        // The ISA is only there for its calling convention: WebAssembly's pointers are 32 bits.
+        #[cfg(feature = "wasm")]
+        let config = cranelift_codegen::isa::TargetFrontendConfig {
+            pointer_width: target_lexicon::PointerWidth::U32,
+            ..config
+        };
+        config
+    }
+
+    /// Whether what another object defines is reached as what this one does: the linker of
+    /// a PE image puts a stub where an import is called, and there is no other way.
+    fn within_image(&self) -> bool {
+        self.isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
     }
 
     /// Names a requested function in `func`. Whether the function ends up in this object is
@@ -301,7 +403,7 @@ impl<'db> Recorder<'db> {
         func.import_function(ir::ExtFuncData {
             name: ir::ExternalName::user(name),
             signature,
-            colocated: false,
+            colocated: self.within_image(),
             patchable: false,
         })
     }
@@ -324,7 +426,7 @@ impl<'db> Recorder<'db> {
             name: ir::ExternalName::user(name),
             offset: ir::immediates::Imm64::new(0),
             // Only a static can be another object's.
-            colocated: !matches!(request, DataRequest::Static(_)),
+            colocated: self.within_image() || !matches!(request, DataRequest::Static(_)),
             tls,
         })
     }

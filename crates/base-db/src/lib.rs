@@ -85,6 +85,8 @@ pub struct Files {
     views: Arc<std::sync::RwLock<Vec<View>>>,
     /// The variables `env!` and `option_env!` have asked for, by the crate asking.
     env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
+    /// The variables `env!` has found unset, by the crate asking.
+    env_unset: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
 }
 
 #[derive(Debug)]
@@ -102,6 +104,11 @@ impl Files {
                 panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
             }
         }
+    }
+
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.contains_key(&file_id)
     }
 
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
@@ -204,6 +211,14 @@ impl Files {
 
     pub fn env_read(&self) -> Vec<(Crate, String)> {
         self.env_read.iter().map(|it| it.key().clone()).collect()
+    }
+
+    pub fn env_is_unset(&self, krate: Crate, key: &str) {
+        self.env_unset.insert((krate, key.to_owned()), ());
+    }
+
+    pub fn env_unset(&self) -> Vec<(Crate, String)> {
+        self.env_unset.iter().map(|it| it.key().clone()).collect()
     }
 
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
@@ -332,6 +347,32 @@ pub struct LocalRoots {
     pub roots: FxHashSet<SourceRootId>,
 }
 
+/// The variables of the process a build is for, which `env!` and `option_env!` read where
+/// the crate's own have nothing: those of whoever asked for the build.
+#[salsa::input(singleton, debug)]
+pub struct ProcessEnv {
+    #[returns(ref)]
+    pub vars: Env,
+}
+
+/// The variable `key` of the process the build is for.
+pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+    ProcessEnv::try_get(db)?.vars(db).get(key)
+}
+
+/// Has builds from here on be for a process with the variables `vars`.
+pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
+    use salsa::Setter as _;
+    match ProcessEnv::try_get(db) {
+        Some(env) => {
+            env.set_vars(db).to(vars);
+        }
+        None => {
+            ProcessEnv::new(db, vars);
+        }
+    }
+}
+
 #[salsa::input(debug, persist(serialize = FileText::save, deserialize = FileText::load))]
 pub struct FileText {
     #[returns(ref)]
@@ -427,6 +468,10 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
 
     /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
     fn env_is_read(&self, _krate: Crate, _key: &str) {}
+
+    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
+    /// crate down for.
+    fn env_is_unset(&self, _krate: Crate, _key: &str) {}
 
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;

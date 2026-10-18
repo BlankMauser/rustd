@@ -147,6 +147,7 @@ fn check_licenses(sh: &Shell) {
         "CDLA-Permissive-2.0",
         "BSD-2-Clause OR Apache-2.0 OR MIT",
         "CC0-1.0",
+        "CC0-1.0 OR MIT-0 OR Apache-2.0",
         "ISC",
         "MIT / Apache-2.0",
         "MIT OR Apache-2.0 OR LGPL-2.1-or-later",

@@ -6,6 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use hir_ty::mir::codegen::{CARGO_HOME, ContentId, moved};
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -20,9 +21,11 @@ type Hash = [u8; 32];
 /// crate of the checkout that depends on it.
 #[derive(Default)]
 pub(crate) struct Contents {
-    crates: Mutex<FxHashMap<Crate, Option<u64>>>,
+    crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
+    /// Where cargo keeps the sources it fetched, once the crates were asked.
+    cargo_home: std::sync::OnceLock<Option<String>>,
 }
 
 impl Contents {
@@ -31,25 +34,43 @@ impl Contents {
     pub(crate) fn id(
         &self,
         db: &RootDatabase,
-        checkout: &Path,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-    ) -> Option<u64> {
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+    ) -> Option<ContentId> {
         if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return known;
         }
-        let id = self.hash(db, checkout, krate, stable_crate_id);
+        let id = self.hash(db, checkouts, krate, stable_crate_id, process_reads);
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
         id
+    }
+
+    /// Where cargo keeps the sources it fetched, when the crates that are not of the
+    /// checkout are under one such directory: what is stored names it the same on every
+    /// machine. With none, or with more than one, nothing is renamed.
+    pub(crate) fn cargo_home(&self, db: &RootDatabase) -> Option<String> {
+        let found = || {
+            let crates = ide_db::base_db::all_crates(db);
+            let outside = crates.iter().filter(|it| !it.data(db).origin.is_local());
+            let roots = outside.filter_map(|&it| crate::crate_root_file(db, it.into()));
+            let homes: FxHashSet<String> =
+                roots.filter_map(|it| Some(cargo_home_of(&it)?.to_str()?.to_owned())).collect();
+            let mut homes = homes.into_iter();
+            homes.next().filter(|_| homes.next().is_none())
+        };
+        self.cargo_home.get_or_init(found).clone()
     }
 
     /// Whether data of a crate hashed here has in it where the checkout or the output of a
     /// build script is, as `env!("CARGO_MANIFEST_DIR")` puts it there: code with such data is
     /// of this checkout alone, whatever the crate is named by.
-    pub(crate) fn names_place(&self, checkout: &Path, bytes: &[u8]) -> bool {
+    pub(crate) fn names_place(&self, checkouts: (&Path, Option<&Path>), bytes: &[u8]) -> bool {
         let within =
             |place: &[u8]| !place.is_empty() && bytes.windows(place.len()).any(|it| it == place);
-        within(checkout.as_os_str().as_encoded_bytes())
+        within(checkouts.0.as_os_str().as_encoded_bytes())
+            || checkouts.1.is_some_and(|it| within(it.as_os_str().as_encoded_bytes()))
             || self
                 .places
                 .lock()
@@ -61,17 +82,18 @@ impl Contents {
     fn hash(
         &self,
         db: &RootDatabase,
-        checkout: &Path,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-    ) -> Option<u64> {
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+    ) -> Option<ContentId> {
         let data = krate.data(db);
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd crate 1");
+        field(b"rustd crate 3");
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.is_proc_macro).as_bytes());
@@ -119,8 +141,10 @@ impl Contents {
         // The longer path first: the others are often what it starts with.
         let mut places = vec![(manifest.as_str(), "$PACKAGE")];
         places.extend(out.as_deref().map(|out| (out, "$OUT")));
-        let checkout_path = checkout.to_string_lossy();
-        places.push((&*checkout_path, "$CHECKOUT"));
+        let (checkout, base) =
+            (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
+        places.push((&*checkout, "$CHECKOUT"));
+        places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
         places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
         for (path, stands_for) in places {
             env = env.replace(path, stands_for);
@@ -129,31 +153,100 @@ impl Contents {
             self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
         }
         field(env.as_bytes());
+        // What `env!` and `option_env!` in it read of the process the build is for.
+        field(format!("{:?}", process_reads(krate)).as_bytes());
 
         // In the order of their names: the order they are listed in is the build's.
         let mut dependencies: Vec<_> = data.dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
             let on = dependency.crate_id;
-            let id = match on.data(db).origin.is_local() {
-                true => self.id(db, checkout, on, stable_crate_id)?,
-                false => stable_crate_id(on).unwrap_or_else(|| Self::library(db, on)),
-            };
             field(dependency.name.as_str().as_bytes());
-            field(&id.to_le_bytes());
+            match on.data(db).origin.is_local() {
+                true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
+                false => field(&Self::outside(db, on, stable_crate_id(on))),
+            }
         }
-        Some(u64::from_le_bytes(hasher.finalize()[..8].try_into().ok()?))
+        Some(ContentId(hasher.finalize().into()))
     }
 
-    /// A crate rustc's build of the program has nothing of, a proc macro for one, which a
-    /// version of is the same wherever it is.
-    fn library(db: &RootDatabase, krate: Crate) -> u64 {
+    /// What stands for a crate from outside the checkout that rustc's build of the program
+    /// has no id for, one that only exports others' items or a proc macro: where its source is,
+    /// what it is configured with and what it is built on. `known` gives rustc's id of a crate,
+    /// if there is one, and where its source starts.
+    pub(crate) fn library(
+        &self,
+        db: &RootDatabase,
+        krate: Crate,
+        root: &Path,
+        known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+    ) -> ContentId {
+        if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+            return id;
+        }
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(b"rustd library 4");
+        field(Self::version(db, krate).as_bytes());
+        // Where cargo fetched it to is under another directory on another machine.
+        let root = root.to_string_lossy();
+        let home = self.cargo_home(db);
+        let there = home.and_then(|home| moved(&root, &home, CARGO_HOME));
+        field(there.as_deref().unwrap_or(&root).as_bytes());
+        let mut cfgs: Vec<String> =
+            krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
+        cfgs.sort_unstable();
+        field(cfgs.join("\n").as_bytes());
+        field(format!("{:?}", process_reads(krate)).as_bytes());
+        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
+        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        for dependency in dependencies {
+            let on = dependency.crate_id;
+            field(dependency.name.as_str().as_bytes());
+            match known(on) {
+                Some((None, root)) => field(&self.library(db, on, &root, known, process_reads).0),
+                Some((id, _)) => field(&Self::outside(db, on, id)),
+                None => field(&Self::outside(db, on, None)),
+            }
+        }
+        let id = ContentId(hasher.finalize().into());
+        self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, Some(id));
+        id
+    }
+
+    /// What stands for a crate from outside the checkout in the hash of one that is built on
+    /// it: its name and version, and rustc's id of it when rustc built something of it. The
+    /// id is 64 bits and rustc's to choose, so it is never all that tells two crates apart.
+    fn outside(db: &RootDatabase, krate: Crate, rustc_id: Option<u64>) -> Hash {
+        let mut hasher = Sha256::new();
+        let named = Self::version(db, krate);
+        hasher.update((named.len() as u64).to_le_bytes());
+        hasher.update(named.as_bytes());
+        match rustc_id {
+            Some(id) => hasher.update([&[1][..], &id.to_le_bytes()].concat()),
+            None => hasher.update([0]),
+        }
+        hasher.finalize().into()
+    }
+
+    /// The name and version of a crate, which one from a registry is the same by wherever
+    /// it is.
+    fn version(db: &RootDatabase, krate: Crate) -> String {
         let extra = krate.extra_data(db);
         let name = extra.display_name.as_ref().map(|it| it.to_string());
-        let named = format!("{name:?} {:?}", extra.version);
-        let hash = Sha256::digest(named.as_bytes());
-        u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
+        format!("{name:?} {:?}", extra.version)
     }
+}
+
+/// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry
+/// are in its `registry/src`, those of git in its `git/checkouts`.
+fn cargo_home_of(path: &Path) -> Option<&Path> {
+    let fetched = |dir: &&Path| dir.ends_with("registry/src") || dir.ends_with("git/checkouts");
+    path.ancestors().filter(fetched).last()?.parent()?.parent()
 }
 
 /// Where a file of a crate is, by what its path is hashed from.
@@ -184,5 +277,24 @@ impl FileHashes {
         let hash: Hash = Sha256::digest(text.as_bytes()).into();
         hashes.files.insert(file, (text.clone(), hash));
         hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cargo_home_is_told_from_a_file_cargo_fetched() {
+        fn home(path: &str) -> Option<&str> {
+            cargo_home_of(Path::new(path))?.to_str()
+        }
+        let registry = "/home/one/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
+        assert_eq!(home(&format!("{registry}/dep-0.1.0/src/lib.rs")), Some("/home/one/.cargo"));
+        assert_eq!(home("/srv/c/git/checkouts/dep-1a2b/3c4d/src/lib.rs"), Some("/srv/c"));
+        // A crate that vendors another has the outermost such directory as cargo's.
+        let nested = format!("{registry}/dep-0.1.0/registry/src/inner/lib.rs");
+        assert_eq!(home(&nested), Some("/home/one/.cargo"));
+        assert_eq!(home("/home/one/checkout/src/lib.rs"), None);
     }
 }

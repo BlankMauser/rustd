@@ -175,6 +175,11 @@ impl WorkspaceBuildScripts {
         self.error.as_deref()
     }
 
+    /// Where the build script of `package` wrote, when it ran.
+    pub fn out_dir(&self, package: Package) -> Option<&AbsPath> {
+        self.outputs.get(package)?.out_dir.as_deref()
+    }
+
     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
         self.outputs.get(idx)
     }
@@ -451,7 +456,10 @@ impl WorkspaceBuildScripts {
                 let mut requires_unstable_options = false;
                 let mut cmd = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
 
-                cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
+                cmd.args(["check", "--quiet", "--message-format=json"]);
+                if !config.only_manifest_package {
+                    cmd.arg("--workspace");
+                }
                 cmd.args(&config.extra_args);
                 if let Some(config_path) = &config.config_path {
                     cmd.arg("--config").arg(config_path);
@@ -537,9 +545,12 @@ impl WorkspaceBuildScripts {
                 if cargo_comp_time_deps_available {
                     requires_unstable_options = true;
                     cmd.arg("--compile-time-deps");
-                    // we can pass this unconditionally, because we won't actually build the
-                    // binaries, and as such, this will succeed even on targets without libtest
-                    cmd.arg("--all-targets");
+                    // The binaries are not built, so this succeeds even on targets without
+                    // libtest. It also runs the build scripts and builds the proc macros of
+                    // dev-dependencies, which a build that has no tests in it does not.
+                    if config.all_targets {
+                        cmd.arg("--all-targets");
+                    }
                 } else {
                     // --all-targets includes tests, benches and examples in addition to the
                     // default lib and bins. This is an independent concept from the --target

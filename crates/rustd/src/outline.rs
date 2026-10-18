@@ -246,11 +246,52 @@ fn is_inert(item: &SyntaxNode) -> bool {
 }
 
 impl Listed {
+    /// Whether the file is a module of a crate that is built, or of one that such a crate uses.
+    /// Any file may be one before a crate is listed.
+    pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
+        // Copied out: a query that is cancelled unwinds, and would poison the lock.
+        let built = self.built.lock().unwrap().clone();
+        // Before the first build there is no telling.
+        built.is_empty()
+            || relevant_crates(db, file).iter().any(|&krate| {
+                let read = built.iter().any(|&built| {
+                    let built = ide_db::base_db::Crate::from(built);
+                    built == krate || built.transitive_deps(db).contains(&krate)
+                });
+                read && hir_def::nameres::crate_def_map(db, krate)
+                    .modules_for_file(db, file)
+                    .next()
+                    .is_some()
+            })
+    }
+
+    /// The crate the file is a module of, when that is one the crates being built use and
+    /// none of them: rustc compiled it, and what it compiled is all there is of it.
+    pub(crate) fn left_to_rustc(
+        &self,
+        db: &RootDatabase,
+        file: FileId,
+    ) -> Option<ide_db::base_db::Crate> {
+        let built: Vec<_> =
+            self.built.lock().unwrap().iter().map(|&it| ide_db::base_db::Crate::from(it)).collect();
+        let crates = relevant_crates(db, file);
+        if built.is_empty() || crates.iter().any(|it| built.contains(it)) {
+            return None;
+        }
+        crates.iter().copied().find(|&krate| {
+            built.iter().any(|built| built.transitive_deps(db).contains(&krate))
+                && hir_def::nameres::crate_def_map(db, krate)
+                    .modules_for_file(db, file)
+                    .next()
+                    .is_some()
+        })
+    }
+
     /// The functions written in the file, or `None` when it has some that are not listed: it
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
-        let listed = self.functions.lock().unwrap();
+        let listed = self.functions.lock().unwrap().clone();
         for &krate in relevant_crates(db, file).iter() {
             match listed.get(&krate.into()) {
                 Some(listed) => functions.extend(

@@ -6,12 +6,12 @@
 //! What runs during the build is told from the rest by `--target`, which cargo passes for
 //! the program's crates alone when it is given one itself.
 
-use std::{ffi::OsString, os::unix::process::CommandExt as _, path::Path, process::Command};
+use std::{ffi::OsString, path::Path, process::Command};
 
 use anyhow::Context as _;
 
 /// The flags of rustc that cargo passes with their value as the next argument.
-const VALUED: &[&str] = &[
+pub(crate) const VALUED: &[&str] = &[
     "-C",
     "-L",
     "-Z",
@@ -37,6 +37,14 @@ const VALUED: &[&str] = &[
     "--remap-path-prefix",
 ];
 
+/// A `main` for cargo's link of a stand-in program to find. It is weak and of no code: the
+/// link of what runs has rustd's.
+const WEAK_MAIN: &str = r#"#[cfg(not(target_vendor = "apple"))]
+core::arch::global_asm!(".weak main", "main:");
+#[cfg(target_vendor = "apple")]
+core::arch::global_asm!(".globl _main", ".weak_definition _main", "_main:");
+"#;
+
 /// Runs rustc as cargo asked, or on what stands in for a crate of the workspace.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
@@ -53,7 +61,21 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         args[source] = path.into();
     }
-    Err(Command::new(rustc).args(args).exec().into())
+    run(Command::new(rustc).args(args))
+}
+
+/// Becomes rustc.
+#[cfg(unix)]
+fn run(rustc: &mut Command) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    Err(rustc.exec().into())
+}
+
+/// Windows has no process become another: rustc runs below this one, which ends as it did.
+#[cfg(windows)]
+fn run(rustc: &mut Command) -> anyhow::Result<()> {
+    let status = rustc.status()?;
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 fn valued<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
@@ -91,10 +113,7 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
         }
     }
     if program {
-        // Not what runs: rustd's `main` is linked ahead of it.
-        text.push_str(
-            "#[unsafe(no_mangle)]\npub extern \"C\" fn main(_: i32, _: *const *const u8) -> i32 {\n    0\n}\n",
-        );
+        text.push_str(WEAK_MAIN);
     }
     Some((source, text))
 }

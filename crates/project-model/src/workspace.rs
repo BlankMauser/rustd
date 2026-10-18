@@ -414,7 +414,10 @@ impl ProjectWorkspace {
                 .expect("failed to spawn thread");
             let cargo_env = Builder::new()
                 .name("ProjectWorkspace::cargo_env".to_owned())
-                .spawn_scoped(s, move || cargo_config_env(&config_file, &config.extra_env))
+                .spawn_scoped(s, move || {
+                    let told = !config.extra_env_for_commands_only;
+                    cargo_config_env(&config_file, &config.extra_env, told)
+                })
                 .expect("failed to spawn thread");
             thread::Result::Ok((
                 rustc_cfg.join()?,
@@ -432,9 +435,11 @@ impl ProjectWorkspace {
                 Err(e) => std::panic::resume_unwind(e),
             };
 
-        for (key, value) in config.extra_env.iter() {
-            if let Some(value) = value {
-                cargo_env.insert(key.clone(), value.clone());
+        if !config.extra_env_for_commands_only {
+            for (key, value) in config.extra_env.iter() {
+                if let Some(value) = value {
+                    cargo_env.insert(key.clone(), value.clone());
+                }
             }
         }
 
@@ -608,7 +613,8 @@ impl ProjectWorkspace {
             config.no_deps,
         );
         let cargo_script = fetch_metadata.exec(false, &|_| ()).ok().map(|(ws, error)| {
-            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env);
+            let told = !config.extra_env_for_commands_only;
+            let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env, told);
             (
                 CargoWorkspace::new(ws, detached_file.clone(), cargo_config_extra_env, false),
                 WorkspaceBuildScripts::default(),
@@ -1303,9 +1309,14 @@ fn cargo_to_crate_graph(
                     cfg_options.insert_atom(sym::rust_analyzer);
                 }
             }
-            // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
-            if sysroot_as_built() && !cargo.is_sysroot() {
-                cfg_options.insert_atom(sym::debug_assertions);
+            match &cargo[pkg].profile_cfg {
+                Some(profile) => cfg_options.apply_diff(profile.clone()),
+                // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
+                None if sysroot_as_built() && !cargo.is_sysroot() => {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::overflow_checks);
+                }
+                None => {}
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
@@ -1837,6 +1848,27 @@ fn sysroot_to_crate_graph(
     crate_ws_data: Arc<CrateWorkspaceData>,
 ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     let _p = tracing::info_span!("sysroot_to_crate_graph").entered();
+    let arch = rustc_cfg.iter().find_map(|atom| match atom {
+        CfgAtom::KeyValue { key, value } if key.as_str() == "target_arch" => Some(value.clone()),
+        _ => None,
+    });
+    let (public_deps, proc_macro) =
+        sysroot_crates_to_crate_graph(crate_graph, sysroot, rustc_cfg, load, crate_ws_data);
+    // The build script of `std` is not run: what it says of the target is said here.
+    let std = public_deps.deps.iter().find(|(name, ..)| name.as_str() == "std");
+    if let (Some(&(_, std, _)), Some(arch)) = (std, arch) {
+        crate_graph.set_env(std, "STD_ENV_ARCH", arch.as_str());
+    }
+    (public_deps, proc_macro)
+}
+
+fn sysroot_crates_to_crate_graph(
+    crate_graph: &mut CrateGraphBuilder,
+    sysroot: &Sysroot,
+    rustc_cfg: Vec<CfgAtom>,
+    load: FileLoader<'_>,
+    crate_ws_data: Arc<CrateWorkspaceData>,
+) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     match sysroot.workspace() {
         RustLibSrcWorkspace::Workspace { ws: cargo, .. } => {
             let (sysroot_cg, sysroot_pm) = cargo_to_crate_graph(

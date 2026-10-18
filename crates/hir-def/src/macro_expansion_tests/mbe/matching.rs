@@ -25,6 +25,22 @@ literal!();
 }
 
 #[test]
+fn negative_literal_stays_one_operand() {
+    check(
+        r#"
+macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
+fn f() { m!(-4); }
+"#,
+        expect![[r#"
+macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
+fn f() { (-4).pow(2);
+-4..-4;
+--4;; }
+"#]],
+    );
+}
+
+#[test]
 fn test_expand_bad_literal() {
     check(
         r#"
@@ -255,5 +271,45 @@ macro_rules! m {
 
 
     "#]],
+    );
+}
+
+#[test]
+fn metavariables_of_one_name_from_two_expansions_are_two() {
+    // `nest` names an argument `$arg` each time it expands; the macro it writes has two.
+    check(
+        r#"
+macro_rules! nest {
+    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+)) => {
+        macro_rules! $name { ($($dol $arg:expr),*) => { $($body)+ } }
+    };
+    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+) $p1:ident $($p2:ident)*) => {
+        nest! { $name ($dol) => ([arg $($arg)*] match $dol arg { $p1 => $($body)+ }) $($p2)* }
+    };
+}
+nest! { pair ($) => ([] (a, b)) b a }
+fn f() { pair!(1, 2); }
+"#,
+        expect![[r#"
+macro_rules! nest {
+    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+)) => {
+        macro_rules! $name { ($($dol $arg:expr),*) => { $($body)+ } }
+    };
+    ($name:ident ($dol:tt) => ([$($arg:ident)*] $($body:tt)+) $p1:ident $($p2:ident)*) => {
+        nest! { $name ($dol) => ([arg $($arg)*] match $dol arg { $p1 => $($body)+ }) $($p2)* }
+    };
+}
+nest! {
+    pair($) = >([arg] match $arg {
+        b = >(a, b)
+    }
+    )a
+}
+fn f() { match 1 {
+    a=>match 2 {
+        b=>(a, b)
+    }
+}; }
+"#]],
     );
 }

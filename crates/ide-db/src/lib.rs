@@ -121,6 +121,11 @@ impl fmt::Debug for RootDatabase {
 }
 
 impl RootDatabase {
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.has_text(file_id)
+    }
+
     /// The files outside the VFS that an `include_bytes!` or `include_str!` has read.
     pub fn included_files(&self) -> Vec<vfs::AbsPathBuf> {
         self.files.included_files()
@@ -145,6 +150,11 @@ impl RootDatabase {
     /// The variables `env!` and `option_env!` have asked for, by the crate asking.
     pub fn env_read(&self) -> Vec<(base_db::Crate, String)> {
         self.files.env_read()
+    }
+
+    /// The variables `env!` has found unset, by the crate asking.
+    pub fn env_unset(&self) -> Vec<(base_db::Crate, String)> {
+        self.files.env_unset()
     }
 
     /// Has `krate` be compiled with `env`.
@@ -217,6 +227,10 @@ impl SourceDatabase for RootDatabase {
 
     fn env_is_read(&self, krate: base_db::Crate, key: &str) {
         self.files.env_is_read(krate, key);
+    }
+
+    fn env_is_unset(&self, krate: base_db::Crate, key: &str) {
+        self.files.env_is_unset(krate, key);
     }
 
     fn include_source(&self, path: base_db::AnchoredPath<'_>) {

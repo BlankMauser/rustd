@@ -5,7 +5,10 @@ use std::cmp::{self, Ordering};
 
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
+use rustc_type_ir::{
+    TypeVisitableExt,
+    inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
+};
 use stdx::never;
 
 use crate::{
@@ -753,11 +756,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((size, _)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(size))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (size, _) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(size))
                 }
             }
             "align_of_val" => {
@@ -772,12 +775,28 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((_, align)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(align))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (_, align) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(align))
                 }
+            }
+            "type_id" => {
+                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "type_id generic arg is not provided".into(),
+                    ));
+                };
+                // Two spellings of one type may differ in their lifetimes.
+                if ty.has_free_regions() || ty.has_bound_regions() {
+                    not_supported!("`type_id` of a type with lifetimes");
+                }
+                let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
+                    self.type_ids.push(ty);
+                    self.type_ids.len() - 1
+                });
+                destination.write_from_bytes(self, &(id as u128 + 1).to_le_bytes())
             }
             "type_name" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -793,7 +812,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes())?;
                 destination
                     .slice(self.ptr_size()..2 * self.ptr_size())
-                    .write_from_bytes(self, &len.to_le_bytes())
+                    .write_from_bytes(self, &super::word_bytes(len))
             }
             "needs_drop" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -1157,6 +1176,27 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
+            "bswap" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError("bswap arg is not provided".into()));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                destination.write_from_bytes(self, &result)
+            }
+            "bitreverse" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "bitreverse arg is not provided".into(),
+                    ));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                for byte in &mut result {
+                    *byte = byte.reverse_bits();
+                }
+                destination.write_from_bytes(self, &result)
+            }
             "ctlz" | "ctlz_nonzero" => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctlz arg is not provided".into()));
@@ -1435,53 +1475,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             }
             "const_deallocate" => Ok(()),
             "caller_location" => {
-                let Some(location_adt) = self.lang_items().PanicLocation else {
-                    not_supported!("`caller_location` requires the `panic_location` lang item");
-                };
-                let location_ty = self.db.ty(location_adt.into()).skip_binder();
-                let TyKind::Adt(_, subst) = location_ty.kind() else {
-                    return Err(MirEvalError::InternalError(
-                        "`panic_location` lang item is not an ADT".into(),
-                    ));
-                };
-                let layout = self.layout(location_ty)?;
-                let (file, line, col) = self.caller_location_fields(locals.body.owner, span);
-                let file_len = file.len();
-                let file_addr = self.heap_allocate(file_len + 1, 1)?;
-                self.write_memory(file_addr, file.as_bytes())?;
-                let ptr_size = self.ptr_size();
-                let field_types = self.db.field_types(location_adt.into());
-                let mut line_col = [line, col].into_iter();
-                let mut fields = Vec::with_capacity(field_types.iter().count());
-                for (_, field) in field_types.iter() {
-                    let field_ty = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
-                    let bytes =
-                        if matches!(field_ty.kind(), TyKind::Uint(rustc_type_ir::UintTy::U32)) {
-                            line_col.next().unwrap_or(0).to_le_bytes().to_vec()
-                        } else {
-                            let size =
-                                self.size_of_sized(field_ty, locals, "caller_location field")?;
-                            if size == ptr_size * 2 {
-                                // The string slice pointing at the file name: (data pointer, length).
-                                let mut bytes = file_addr.to_bytes()[..ptr_size].to_vec();
-                                bytes.extend_from_slice(&file_len.to_le_bytes()[..ptr_size]);
-                                bytes
-                            } else {
-                                vec![0; size]
-                            }
-                        };
-                    fields.push(IntervalOrOwned::Owned(bytes));
-                }
-                let location = self.construct_with_layout(
-                    layout.size.bytes_usize(),
-                    &layout,
-                    None,
-                    fields.into_iter(),
-                )?;
-                let location_addr =
-                    self.heap_allocate(layout.size.bytes_usize(), layout.align.bytes() as usize)?;
-                self.write_memory(location_addr, &location)?;
-                destination.write_from_bytes(self, &location_addr.to_bytes()[..ptr_size])
+                // A constant holds what rustc would name the file, which is known to whoever
+                // builds the program and not here.
+                not_supported!("the caller's location in a constant")
             }
             "box_new" => {
                 let ty = generic_args.type_at(0);

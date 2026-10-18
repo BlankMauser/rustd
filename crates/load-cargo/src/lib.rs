@@ -17,9 +17,9 @@ use hir_expand::proc_macro::{
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, FxHashSet, RootDatabase,
     base_db::{
-        CrateGraphBuilder, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError, SourceDatabase,
-        SourceRoot, SourceRootId,
-        salsa::{Durability, Setter},
+        Crate, CrateGraphBuilder, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError,
+        SourceDatabase, SourceRoot, SourceRootId,
+        salsa::{Database as _, Durability, Setter},
     },
     prime_caches,
 };
@@ -133,12 +133,24 @@ pub struct Loaded {
     /// The path prefixes of each source root and whether it is local. A source root keeps
     /// its place here, and so its id, when workspaces are added.
     file_sets: Vec<(Vec<VfsPath>, bool)>,
+    /// The crates of each workspace. One that is the same in two of them is of both.
+    crates: Vec<Vec<Crate>>,
     proc_macro_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
 }
 
 impl Loaded {
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
         &self.workspaces
+    }
+
+    /// The crates of the workspace at `index` of [`Self::workspaces`].
+    pub fn crates(&self, index: usize) -> &[Crate] {
+        &self.crates[index]
+    }
+
+    /// Puts `workspace` where the one at `index` is. It is loaded by the next [`Self::add`].
+    pub fn replace(&mut self, index: usize, workspace: ProjectWorkspace) {
+        self.workspaces[index] = workspace;
     }
 
     /// Adds `workspaces` to those of `db`, whose files `vfs` holds. What the database has of
@@ -152,6 +164,7 @@ impl Loaded {
         db: &mut RootDatabase,
     ) -> anyhow::Result<()> {
         self.workspaces.extend(workspaces);
+        let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
         if self.proc_macro_server.is_none() {
             self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
@@ -162,6 +175,7 @@ impl Loaded {
         // The graph of all of them: the database keeps the crates it has that are in it.
         let mut crate_graph = CrateGraphBuilder::default();
         let mut proc_macros = FxHashMap::default();
+        let mut members = Vec::new();
         for ws in &self.workspaces {
             let (other, mut paths) = ws.to_crate_graph(
                 &mut |path: &AbsPath| {
@@ -177,7 +191,8 @@ impl Loaded {
                 },
                 extra_env,
             );
-            crate_graph.extend(other, &mut paths);
+            let ids = crate_graph.extend(other, &mut paths);
+            members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
         let proc_macros = {
@@ -246,9 +261,11 @@ impl Loaded {
             let is_local = self.file_sets.get(idx).is_none_or(|it| it.1);
             let root_id = SourceRootId(idx as u32);
             if is_local { &mut local_roots } else { &mut library_roots }.insert(root_id);
-            // The roots there were have the files they had. The one of the files no root had
-            // was where the first new one is now.
+            // The roots there were have the files they had, and those of them that are new
+            // to the database: what a workspace loaded again names that was not source
+            // before. The one of the files no root had was where the first new one is now.
             if was != 0 && idx < was {
+                join_root(db, root_id, file_set, &known);
                 continue;
             }
             let (root, durability) = match is_local {
@@ -278,9 +295,42 @@ impl Loaded {
         }
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
-        db.apply_change(change);
+        db.trigger_cancellation();
+        let ids = change.apply(db).expect("the crate graph is set");
+        self.crates = members.into_iter().map(|it| it.iter().map(|id| ids[id]).collect()).collect();
         Ok(())
     }
+}
+
+/// Puts the files of `files` that are not among `known`, and so in no source root yet, in
+/// the root `root_id`.
+fn join_root(
+    db: &mut RootDatabase,
+    root_id: SourceRootId,
+    files: vfs::file_set::FileSet,
+    known: &FxHashSet<vfs::FileId>,
+) {
+    let was = db.source_root(root_id).source_root(db);
+    let new: Vec<_> = files.iter().filter(|it| !known.contains(it)).collect();
+    if new.is_empty() {
+        return;
+    }
+    let mut joined = vfs::file_set::FileSet::default();
+    let of_both = was.iter().map(|it| (it, was.path_for_file(&it)));
+    let of_both = of_both.chain(new.iter().map(|&it| (it, files.path_for_file(&it))));
+    for (file, path) in of_both {
+        if let Some(path) = path {
+            joined.insert(file, path.clone());
+        }
+    }
+    let (root, durability) = match was.is_library {
+        true => (SourceRoot::new_library(joined), Durability::MEDIUM),
+        false => (SourceRoot::new_local(joined), Durability::LOW),
+    };
+    for file in new {
+        db.set_file_source_root_with_durability(file, root_id, durability);
+    }
+    db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
 }
 
 fn spawn_proc_macro_server(

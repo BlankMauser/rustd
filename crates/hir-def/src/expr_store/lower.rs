@@ -784,6 +784,9 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Type::InferType(_inner) => TypeRef::Placeholder,
             ast::Type::FnPtrType(inner) => {
+                // Taken before the parameters are lowered: a function pointer among them
+                // is not what the `for` is written on.
+                let binder = self.for_type_binder.take().map(|b| b.into());
                 let ret_ty = inner
                     .ret_type()
                     .and_then(|rt| rt.ty())
@@ -820,7 +823,6 @@ impl<'db> ExprCollector<'db> {
                 let abi = inner.abi().map(lower_abi).unwrap_or(ExternAbi::Rust);
                 params.push((None, ret_ty));
 
-                let binder = self.for_type_binder.take().map(|b| b.into());
                 TypeRef::Fn(Box::new(FnType {
                     is_varargs,
                     is_unsafe: inner.unsafe_token().is_some(),
@@ -2768,7 +2770,9 @@ impl<'db> ExprCollector<'db> {
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
-                None => None,
+                // What does not expand is not nothing: a block that ends in it has its type,
+                // not `()`.
+                None => Some(this.alloc_expr(Expr::Missing, syntax_ptr)),
             },
         );
         expansion.inspect(|&tail| {

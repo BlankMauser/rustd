@@ -951,7 +951,8 @@ fn include_str_expand(
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
     db.env_is_read(krate, key.as_str());
-    krate.env(db).get(key.as_str())
+    // As rustc reads them: what cargo set for the crate, then the process the build is for.
+    krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
 }
 
 fn env_expand(
@@ -972,6 +973,7 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
+        db.env_is_unset(arg_id.loc(db).krate, key.as_str());
         // The only variable rust-analyzer ever sets is `OUT_DIR`, so only diagnose that to avoid
         // unnecessary diagnostics for eg. `CARGO_PKG_NAME`.
         if key.as_str() == "OUT_DIR" {
