@@ -106,16 +106,70 @@ pub(crate) struct Profile {
     pub(crate) debug_assertions: bool,
     pub(crate) overflow_checks: bool,
     pub(crate) panic: PanicStrategy,
-    debuginfo: DebugInfo,
+    debuginfo: DebugLevel,
+    split_debuginfo: Option<String>,
+    strip: Strip,
 }
 
-/// How much a profile has rustc say of where code is from, as cargo's unit graph has it.
+/// A `debug` setting as cargo passes it on: a level by its number or by its name.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
-enum DebugInfo {
-    Level(u8),
-    /// `line-tables-only` and `line-directives-only`.
+enum DebugLevel {
+    Number(u8),
     Named(String),
+}
+
+/// A `strip` setting. One cargo deferred is its own choice for a build without debug info,
+/// which has nothing the setting would take out.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Strip {
+    Resolved(Stripped),
+    Deferred(Stripped),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+enum Stripped {
+    None,
+    Named(String),
+}
+
+/// What a build tells a debugger of its code, and where that is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Described {
+    pub(crate) level: Level,
+    pub(crate) kept: Kept,
+}
+
+impl Described {
+    pub(crate) const NOTHING: Described = Described { level: Level::Nothing, kept: Kept::Linked };
+
+    /// The most either tells, kept the furthest from the program either keeps it.
+    fn or(self, other: Described) -> Described {
+        Described { level: self.level.max(other.level), kept: self.kept.max(other.kept) }
+    }
+}
+
+/// How much a build tells a debugger of its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Level {
+    Nothing,
+    /// Which line each instruction is of, and the functions.
+    Lines,
+    /// The variables and their types as well.
+    Full,
+}
+
+/// Where what a debugger reads of the code is kept (`split-debuginfo`). The lines are with
+/// the program always.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Kept {
+    /// In the program, which the linker copies it into.
+    Linked,
+    /// In the objects the program was linked from, which the program names.
+    Objects,
+    /// In one package next to the program.
+    Package,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -152,21 +206,59 @@ impl Profile {
             overflow_checks: flags.overflow_checks.or(named_overflow).unwrap_or(debug_assertions),
             panic: flags.panic.unwrap_or(self.panic),
             debuginfo: flags.debuginfo.clone().unwrap_or_else(|| self.debuginfo.clone()),
+            split_debuginfo: flags.split_debuginfo.clone().or_else(|| self.split_debuginfo.clone()),
+            strip: flags.strip.clone().map_or_else(
+                || self.strip.clone(),
+                |named| Strip::Resolved(Stripped::Named(named)),
+            ),
             ..self.clone()
         }
+    }
+
+    /// What the profile has a debugger told. Where the profile asks for it to be kept apart
+    /// from the program, which rustd does not do, that is the reason not to build.
+    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+        let level = match &self.debuginfo {
+            DebugLevel::Number(0) => Level::Nothing,
+            DebugLevel::Number(1) => Level::Lines,
+            DebugLevel::Number(2) => Level::Full,
+            DebugLevel::Named(name) => match name.as_str() {
+                "none" => Level::Nothing,
+                "line-directives-only" | "line-tables-only" | "limited" => Level::Lines,
+                "full" => Level::Full,
+                _ => anyhow::bail!("`debug = \"{name}\"`: rustd does not know the level"),
+            },
+            DebugLevel::Number(level) => {
+                anyhow::bail!("`debug = {level}`: rustd does not know the level")
+            }
+        };
+        // Stripping the symbols is the linker's to do; of what rustd writes, what a debugger
+        // reads is all either setting takes out.
+        let stripped = match &self.strip {
+            Strip::Resolved(Stripped::Named(what)) => match what.as_str() {
+                "none" => false,
+                "debuginfo" | "symbols" => true,
+                _ => anyhow::bail!("`strip = \"{what}\"`: rustd does not know the setting"),
+            },
+            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
+        };
+        if stripped || level == Level::Nothing {
+            return Ok(Described::NOTHING);
+        }
+        let kept = match self.split_debuginfo.as_deref() {
+            None | Some("off") => Kept::Linked,
+            Some("unpacked") => Kept::Objects,
+            Some("packed") => Kept::Package,
+            Some(split) => {
+                anyhow::bail!("`split-debuginfo = \"{split}\"`: rustd does not know the setting")
+            }
+        };
+        Ok(Described { level, kept })
     }
 
     /// Whether rustc compiles the whole program again when it links it.
     fn links_from_bitcode(&self) -> bool {
         matches!(self.lto.as_str(), "fat" | "thin" | "true")
-    }
-
-    /// Whether the code is to say which lines it is of.
-    pub(crate) fn debug(&self) -> bool {
-        match &self.debuginfo {
-            DebugInfo::Level(level) => *level != 0,
-            DebugInfo::Named(name) => name != "none",
-        }
     }
 
     /// What the profile changes of the cfg `rustc --print cfg -O` reports.
@@ -196,8 +288,10 @@ struct Flags {
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
     panic: Option<PanicStrategy>,
-    debuginfo: Option<DebugInfo>,
     lto: bool,
+    debuginfo: Option<DebugLevel>,
+    split_debuginfo: Option<String>,
+    strip: Option<String>,
 }
 
 impl Flags {
@@ -259,16 +353,18 @@ impl Flags {
                 "opt-level" => flags.opt_level = Some(value.to_owned()),
                 "debug-assertions" => flags.debug_assertions = on,
                 "overflow-checks" => flags.overflow_checks = on,
-                "debuginfo" => {
-                    flags.debuginfo = Some(match value.parse() {
-                        Ok(level) => DebugInfo::Level(level),
-                        Err(_) => DebugInfo::Named(value.to_owned()),
-                    })
-                }
                 "panic" if value == "abort" => flags.panic = Some(PanicStrategy::Abort),
                 "panic" if value == "unwind" => flags.panic = Some(PanicStrategy::Unwind),
                 "lto" => flags.lto = on != Some(false),
                 "linker-plugin-lto" => flags.lto = on != Some(false),
+                "debuginfo" => {
+                    flags.debuginfo = Some(match value.parse() {
+                        Ok(level) => DebugLevel::Number(level),
+                        Err(_) => DebugLevel::Named(value.to_owned()),
+                    });
+                }
+                "split-debuginfo" => flags.split_debuginfo = Some(value.to_owned()),
+                "strip" => flags.strip = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -358,9 +454,14 @@ impl Plan {
         graph.plan(&Flags::of(dir, asked)?)
     }
 
-    /// Whether the packages cargo was asked to build are to say which lines their code is of.
-    pub(crate) fn debug(&self) -> bool {
-        self.packages.values().any(|it| it.primary && it.profile.debug())
+    /// What the build has a debugger told of the packages cargo was asked to build: the
+    /// most any of them asks for, which is one answer for all the code rustd writes.
+    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+        let mut described = Described::NOTHING;
+        for built in self.packages.values().filter(|it| it.primary) {
+            described = described.or(built.profile.described()?);
+        }
+        Ok(described)
     }
 
     /// How the package cargo calls `id` is built, when the build has it.

@@ -7,6 +7,7 @@ pub(crate) mod wrapper;
 mod ancestor;
 mod cli;
 mod client;
+mod package;
 mod plan;
 mod run;
 mod say;

@@ -7,15 +7,16 @@ use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ItemContainerId,
     Lookup, ModuleDefId, ModuleIdLt,
     expr_store::{Body, BodySourceMap},
-    hir::{Expr, ExprId},
+    hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId},
     signatures::{
-        EnumSignature, FunctionSignature, StructSignature, TraitSignature, UnionSignature,
+        EnumSignature, FunctionSignature, StructSignature, TraitSignature, TypeAliasSignature,
+        UnionSignature,
     },
 };
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{
-    BoundExistentialPredicates as _, GenericArgs as _, IntoKind, Safety as _,
+    BoundExistentialPredicates as _, GenericArgs as _, IntoKind, Safety as _, Term as _,
 };
 
 use crate::{
@@ -52,7 +53,19 @@ pub(crate) fn rustc_closure_name<'db>(
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
-    write_closure(db, &mut out, func, args, expr)?;
+    write_closure(db, &mut out, func, args, expr, Named::Code)?;
+    Some(out.text)
+}
+
+/// The path rustc tells a debugger the code of that closure or `async` block by.
+pub(crate) fn rustc_debug_closure<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+    expr: ExprId,
+) -> Option<String> {
+    let mut out = Spelled::new(Spelling::Debug);
+    write_closure(db, &mut out, func, args, expr, Named::Code)?;
     Some(out.text)
 }
 
@@ -63,13 +76,71 @@ pub(crate) fn rustc_symbol_type<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> O
     Some(out.text)
 }
 
-/// Which of rustc's two ways to write a name is wanted.
+/// What rustc calls a type where it tells a debugger of it: every generic argument that is
+/// not a lifetime, a closure `{closure_env#0}` and an `async fn` `{async_fn_env#0}` after
+/// what they are written in.
+pub(crate) fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+    let mut out = Spelled::new(Spelling::Debug);
+    write_ty(db, &mut out, ty)?;
+    Some(out.text)
+}
+
+/// The path rustc tells a debugger a function by: the modules it is written in, then the
+/// type an `impl` of its own is of, `{impl#0}` for any other `impl` by its place in the
+/// module, or the trait, and last the name with what the function and the `impl` are
+/// generic over.
+pub(crate) fn rustc_debug_function<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<String> {
+    let mut out = Spelled::new(Spelling::Debug);
+    write_container(db, &mut out, func, args)?;
+    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+    write_args(db, &mut out, args)?;
+    Some(out.text)
+}
+
+/// What a function is written in, as a debugger is told of it.
+fn write_container<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut Spelled,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<()> {
+    match func.lookup(db).container {
+        ItemContainerId::ModuleId(module) => write_module(db, out, module),
+        ItemContainerId::ImplId(impl_) => {
+            let parent_args = args.get(..generics(db, func.into()).len_parent())?;
+            let interner = DbInterner::new_no_crate(db);
+            let self_ty = db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
+            if db.impl_trait(impl_).is_none() && matches!(self_ty.kind(), TyKind::Adt(..)) {
+                return write_ty(db, out, self_ty);
+            }
+            let module = impl_.lookup(db).container;
+            let scope = module.def_map(db).module(db, module).scope(db);
+            let place = scope.impls().position(|it| it == impl_)?;
+            write_module(db, out, module)?;
+            write!(out, "::{{impl#{place}}}").ok()
+        }
+        ItemContainerId::TraitId(trait_) => {
+            write_module(db, out, trait_.module(db))?;
+            write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()
+        }
+        ItemContainerId::ExternBlockId(_) => None,
+    }
+}
+
+/// Which of rustc's ways to write a name is wanted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Spelling {
     /// `core::any::type_name`: no lifetimes but `'_`, every closure `{{closure}}`.
     TypeName,
     /// A demangled symbol: no lifetimes, closures numbered.
     Symbol,
+    /// The name of a type in debug info: no lifetimes, defaults written out, closures
+    /// numbered and called after what they are.
+    Debug,
 }
 
 /// A name being written.
@@ -93,15 +164,45 @@ impl Spelled {
 
     /// The closures something is written in, outermost first, by their places among the
     /// closures of what they are written in.
-    fn closures(&mut self, places: &[usize]) {
-        for place in places {
+    fn closures(&mut self, places: &[(usize, ClosureKind)]) {
+        for (place, kind) in places {
             match self.spelling {
                 Spelling::TypeName => self.text.push_str("::{{closure}}"),
                 Spelling::Symbol => {
                     let _ = write!(self.text, "::{{closure#{place}}}");
                 }
+                Spelling::Debug => {
+                    let _ = write!(self.text, "::{{{}#{place}}}", kind_label(*kind));
+                }
             }
         }
+    }
+
+    /// The same where the last of them is what is named, which a debugger is told of as
+    /// what the closure keeps: its environment.
+    fn closure_env(&mut self, places: &[(usize, ClosureKind)]) -> Option<()> {
+        let ((place, kind), around) = places.split_last()?;
+        self.closures(around);
+        write!(self.text, "::{{{}_env#{place}}}", kind_label(*kind)).ok()
+    }
+}
+
+/// What rustc calls a closure of a kind in debug info.
+fn kind_label(kind: ClosureKind) -> &'static str {
+    use CoroutineKind::{Async, AsyncGen, Gen};
+    use CoroutineSource::{Block, Closure, Fn};
+    match kind {
+        ClosureKind::Closure | ClosureKind::CoroutineClosure(_) => "closure",
+        ClosureKind::OldCoroutine(_) => "coroutine",
+        ClosureKind::Coroutine { kind: Async, source: Block } => "async_block",
+        ClosureKind::Coroutine { kind: Async, source: Closure } => "async_closure",
+        ClosureKind::Coroutine { kind: Async, source: Fn } => "async_fn",
+        ClosureKind::Coroutine { kind: Gen, source: Block } => "gen_block",
+        ClosureKind::Coroutine { kind: Gen, source: Closure } => "gen_closure",
+        ClosureKind::Coroutine { kind: Gen, source: Fn } => "gen_fn",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Block } => "async_gen_block",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Closure } => "async_gen_closure",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Fn } => "async_gen_fn",
     }
 }
 
@@ -221,11 +322,21 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             };
             write_module(db, out, adt.module(db))?;
             write!(out, "::{}", name.as_str()).ok()?;
-            write_args(db, out, without_defaults(db, adt.into(), args.as_slice()))?;
+            let args = match out.spelling {
+                Spelling::Debug => args.as_slice(),
+                _ => without_defaults(db, adt.into(), args.as_slice()),
+            };
+            write_args(db, out, args)?;
+        }
+        TyKind::Dynamic(bounds, _) if out.spelling == Spelling::Debug => {
+            write_dyn_debug(db, out, bounds)?;
         }
         TyKind::Dynamic(bounds, _) => {
             let principal = bounds.principal()?.skip_binder();
-            if bounds.projection_bounds().into_iter().count() != 0 {
+            // The order rustc has more than one in is not one that is known here.
+            let mut projections = bounds.projection_bounds().into_iter();
+            let (projection, more) = (projections.next(), projections.next());
+            if more.is_some() || (projection.is_some() && out.spelling == Spelling::TypeName) {
                 return None;
             }
             if !principal.args.is_empty() && out.spelling == Spelling::TypeName {
@@ -235,7 +346,25 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             let trait_ = principal.def_id.0;
             write_module(db, out, trait_.module(db))?;
             write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
-            write_args(db, out, principal.args.as_slice())?;
+            let mut written = Spelled::new(out.spelling);
+            write_args(db, &mut written, principal.args.as_slice())?;
+            match projection {
+                Some(bound) => {
+                    let bound = bound.skip_binder();
+                    let crate::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
+                        return None;
+                    };
+                    let given = written.text.strip_prefix('<').and_then(|it| it.strip_suffix('>'));
+                    out.push('<');
+                    if let Some(given) = given {
+                        write!(out, "{given}, ").ok()?;
+                    }
+                    write!(out, "{} = ", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
+                    write_ty(db, out, bound.term.as_type()?)?;
+                    out.push('>');
+                }
+                None => out.push_str(&written.text),
+            }
             for auto in bounds.auto_traits() {
                 out.push_str(" + ");
                 write_module(db, out, auto.0.module(db))?;
@@ -248,17 +377,24 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
         }
         TyKind::Closure(id, args) => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_closure().parent_args(), func.1)?;
+            write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
         }
-        TyKind::Coroutine(id, args) if out.spelling == Spelling::Symbol => {
+        TyKind::Coroutine(id, args) if out.spelling != Spelling::TypeName => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1)?;
+            write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1, Named::Kept)?;
         }
-        TyKind::CoroutineClosure(id, args) if out.spelling == Spelling::Symbol => {
+        TyKind::CoroutineClosure(id, args) if out.spelling != Spelling::TypeName => {
             let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_coroutine_closure().parent_args(), func.1)?;
+            write_closure(
+                db,
+                out,
+                func.0,
+                args.as_coroutine_closure().parent_args(),
+                func.1,
+                Named::Kept,
+            )?;
         }
-        TyKind::FnPtr(sig, header) if out.spelling == Spelling::Symbol => {
+        TyKind::FnPtr(sig, header) if out.spelling != Spelling::TypeName => {
             let sig = sig.skip_binder();
             if !header.safety().is_safe() {
                 out.push_str("unsafe ");
@@ -297,7 +433,7 @@ fn write_args<'db>(
 ) -> Option<()> {
     let mut written = 0;
     for arg in args {
-        if out.spelling == Spelling::Symbol && arg.region().is_some() {
+        if out.spelling != Spelling::TypeName && arg.region().is_some() {
             continue;
         }
         out.push_str(if written == 0 { "<" } else { ", " });
@@ -321,9 +457,99 @@ fn write_closure<'db>(
     func: FunctionId,
     args: &[GenericArg<'db>],
     expr: ExprId,
+    named: Named,
 ) -> Option<()> {
-    write_function(db, out, func, args)?;
-    out.closures(&closures_around(db, func.into(), expr)?);
+    let around = closures_around(db, func.into(), expr)?;
+    if out.spelling != Spelling::Debug {
+        write_function(db, out, func, args)?;
+        out.closures(&around);
+        return Some(());
+    }
+    // A debugger is told of what the function is written in by its place there, then of the
+    // closure, and last of what the function is generic over.
+    match func.lookup(db).container {
+        ItemContainerId::ModuleId(module) => write_module(db, out, module)?,
+        ItemContainerId::ImplId(impl_) => {
+            let module = impl_.lookup(db).container;
+            let scope = module.def_map(db).module(db, module).scope(db);
+            let place = scope.impls().position(|it| it == impl_)?;
+            write_module(db, out, module)?;
+            write!(out, "::{{impl#{place}}}").ok()?;
+        }
+        ItemContainerId::TraitId(trait_) => {
+            write_module(db, out, trait_.module(db))?;
+            write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
+        }
+        ItemContainerId::ExternBlockId(_) => return None,
+    }
+    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+    match named {
+        Named::Code => out.closures(&around),
+        Named::Kept => out.closure_env(&around)?,
+    }
+    write_args(db, out, args)
+}
+
+/// Which of the two things a closure is to a debugger is being named.
+#[derive(Clone, Copy)]
+enum Named {
+    /// The function its body is.
+    Code,
+    /// The type of what it keeps.
+    Kept,
+}
+
+/// `dyn Trait<A, Item=B> + Auto` as a debugger is told of it, in brackets after `dyn` when
+/// there is more than the trait.
+fn write_dyn_debug<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut Spelled,
+    bounds: crate::next_solver::BoundExistentialPredicates<'db>,
+) -> Option<()> {
+    let mut autos = Vec::new();
+    for auto in bounds.auto_traits() {
+        let mut name = Spelled::new(Spelling::Debug);
+        write_module(db, &mut name, auto.0.module(db))?;
+        write!(name, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
+        autos.push(name.text);
+    }
+    autos.sort_unstable();
+    let principal = bounds.principal();
+    let bracketed = principal.is_some() && !autos.is_empty();
+    out.push_str(if bracketed { "dyn (" } else { "dyn " });
+    if let Some(principal) = principal {
+        let principal = principal.skip_binder();
+        let trait_ = principal.def_id.0;
+        write_module(db, out, trait_.module(db))?;
+        write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
+        let mut written = Spelled::new(Spelling::Debug);
+        write_args(db, &mut written, principal.args.as_slice())?;
+        let mut inner =
+            written.text.strip_prefix('<').and_then(|it| it.strip_suffix('>')).map(str::to_owned);
+        for bound in bounds.projection_bounds() {
+            let bound = bound.skip_binder();
+            let crate::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
+                return None;
+            };
+            let mut part = Spelled::new(Spelling::Debug);
+            write!(part, "{}=", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
+            write_ty(db, &mut part, bound.term.as_type()?)?;
+            inner = Some(match inner {
+                Some(inner) => format!("{inner}, {}", part.text),
+                None => part.text,
+            });
+        }
+        if let Some(inner) = inner {
+            write!(out, "<{inner}>").ok()?;
+        }
+        if !autos.is_empty() {
+            out.push_str(" + ");
+        }
+    }
+    out.push_str(&autos.join(" + "));
+    if bracketed {
+        out.push(')');
+    }
     Some(())
 }
 
@@ -465,7 +691,7 @@ fn closures_around(
     db: &dyn HirDatabase,
     owner: DefWithBodyId,
     target: ExprId,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<(usize, ClosureKind)>> {
     let (body, source_map) = Body::with_source_map(db, owner);
     let mut around = Vec::new();
     if !find_closures(body, body.root_expr(), target, &mut around) {
@@ -481,7 +707,8 @@ fn closures_around(
         }
         // Stable, so those of one expansion stay in the order they are written in.
         beside.sort_by_cached_key(|&it| order(it));
-        beside.iter().position(|&it| it == closure)
+        let Expr::Closure { closure_kind, .. } = body[closure] else { return None };
+        Some((beside.iter().position(|&it| it == closure)?, closure_kind))
     });
     places.collect()
 }

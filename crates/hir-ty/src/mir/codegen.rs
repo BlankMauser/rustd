@@ -25,7 +25,10 @@ use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, TraitId,
     VariantId,
     attrs::AttrFlags,
-    expr_store::Body,
+    expr_store::{
+        Body,
+        scope::{ExprScopes, ScopeId},
+    },
     hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
@@ -66,9 +69,9 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
-use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow, SlotPlaces, VariableDebug};
 use self::fragment::{
-    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
+    Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Named, Recorder,
     Requests, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
@@ -86,6 +89,7 @@ pub use backend::Backend;
 use backend::Step;
 mod cached;
 mod debuginfo;
+pub use debuginfo::Sidecar;
 mod float_pair;
 mod fragment;
 #[cfg(test)]
@@ -180,6 +184,17 @@ pub trait SymbolResolver {
     /// to tell a debugger where its code comes from.
     fn debug_directory(&self) -> Option<String> {
         None
+    }
+    /// The file a debugger reads the entries of the code from, when the build keeps them
+    /// apart from what it links: the object itself, which has them in sections a linker
+    /// leaves out.
+    fn debug_apart(&self) -> Option<String> {
+        None
+    }
+    /// Whether a debugger is told of the variables of the code too, and not of its lines
+    /// alone.
+    fn describes_variables(&self) -> bool {
+        true
     }
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
@@ -340,6 +355,8 @@ pub struct CodegenUnit {
     /// With [`Rejections::patching`], an object to link ahead of the last `object`: its
     /// definitions replace those of the same name there.
     pub patch: Option<Vec<u8>>,
+    /// The files that go with `object`: what a debugger reads that is kept apart from it.
+    pub apart: Vec<Sidecar>,
     /// Roots that were compiled, with their exported symbol.
     pub compiled: Vec<(FunctionId, String)>,
     /// Roots that have to come from rustc.
@@ -416,6 +433,7 @@ impl CodegenUnit {
                 let unit = CodegenUnit {
                     object: None,
                     patch: Some(patch.object),
+                    apart: Vec::new(),
                     compiled: base.compiled.clone(),
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
@@ -611,7 +629,7 @@ impl CodegenUnit {
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
                 let start = stdx::time::Instant::now();
-                let object = cg.finish()?;
+                let (object, apart) = cg.finish()?;
                 stats.phases.object = start.elapsed();
                 backend::Tally::global().report();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
@@ -619,6 +637,7 @@ impl CodegenUnit {
                 return Ok(CodegenUnit {
                     object: Some(object),
                     patch,
+                    apart,
                     compiled,
                     skipped,
                     instances,
@@ -922,6 +941,8 @@ struct ObjectCodegen<'a, 'db> {
     unwind: UnwindContext,
     /// What a debugger is told about the functions, when the build tells one anything.
     debug: Option<DebugContext>,
+    /// The types of the variables a debugger is told of, by the environment they are in.
+    types: FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1312,12 +1333,20 @@ fn compiled_instance<'db>(
         }
     };
     let args = instance.args.clone();
-    compile(db, env, Some(body), tracked, instance.checked, |fx| {
+    let closure = match instance.def {
+        InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db).expr),
+        InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+            Some(InternedCoroutineId::from_id(id).loc(db).expr)
+        }
+        _ => None,
+    };
+    let compiled = compile(db, env, Some(body), tracked, instance.checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
         fx.codegen()
-    })
+    })?;
+    Ok(CompiledFunction { closure, ..compiled })
 }
 
 /// How many of the argument registers of a C convention the named parameters of a variadic
@@ -1828,36 +1857,136 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
-/// What a debugger is told of `variables`, which are of the body of `owner`. A name the body
-/// gives to more than one local is left out: nothing says yet from where to where each of
-/// them is the one meant. So is a variable of a type that is not told of.
-fn described_variables(
+/// What a debugger is told of `variables`, which are of the body of `owner` and are where
+/// `debug` has the places of, each in the scope `scopes` has for its binding. A variable of
+/// a type that is not told of is left out.
+fn describe_variables<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    types: &mut debuginfo::Types<'db>,
+    variables: &[Variable],
+    places: &SlotPlaces,
+    scopes: &FxHashMap<BindingId, u32>,
+    debug: &mut FunctionDebug,
+) {
+    let body = Body::of(db, owner);
+    // Where the type of each variable told of is among the types of the function.
+    let mut firsts = FxHashMap::default();
+    for variable in variables {
+        let name = &body[variable.binding].name;
+        // A name a macro of the compiler's made up is no name of the source.
+        if name.as_str().starts_with('<') {
+            continue;
+        }
+        let Some(place) = places.of(variable.slot) else { continue };
+        let place = match variable.pointer {
+            Some(offset) => place.pointee(offset),
+            None => place.clone(),
+        };
+        let ty = variable.ty.as_ref();
+        let ty = match firsts.get(&ty) {
+            Some(&first) => first,
+            None => {
+                let Some(described) = types.describe(ty) else { continue };
+                let first = debuginfo::add_types(&mut debug.types, &described);
+                firsts.insert(ty, first);
+                first
+            }
+        };
+        debug.variables.push(VariableDebug {
+            name: name.as_str().to_owned(),
+            param: variable.param,
+            ty,
+            place,
+            scope: scopes.get(&variable.binding).copied(),
+        });
+    }
+    debug.frame_base = places.frame_base.clone();
+}
+
+/// The scopes of the body of `owner` that `variables` are bound in, added to `debug`, and
+/// which of them each binding is of. The code of a scope is the code of the expressions
+/// that names are looked up from it or from a scope inside it for: `rows` has, in the order
+/// of the code, where the code of each expression starts, and `len` is where the last ends.
+/// A binding of the outermost scope, which a parameter is, is known in all of the function
+/// and is not among what is returned.
+fn describe_scopes(
     db: &dyn HirDatabase,
     owner: DefWithBodyId,
-    env: &StoredParamEnvAndCrate,
     variables: &[Variable],
-) -> Vec<VariableDebug> {
+    rows: &[(u32, MirSpan)],
+    len: u32,
+    debug: &mut FunctionDebug,
+) -> FxHashMap<BindingId, u32> {
+    let scopes = ExprScopes::of(db, owner);
     let body = Body::of(db, owner);
-    let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
-    for (_, binding) in body.bindings() {
-        *uses.entry(&binding.name).or_default() += 1;
+    let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
+    // The scope each binding is an entry of.
+    let mut bound = FxHashMap::default();
+    let mut seen = FxHashSet::default();
+    for (_, &scope) in scopes.scope_by_expr().iter() {
+        for scope in scopes.scope_chain(Some(scope)).take_while(|&it| seen.insert(it)) {
+            bound.extend(scopes.entries(scope).iter().map(|entry| (entry.binding(), scope)));
+        }
     }
-    let types = debuginfo::Types::new(db, env.as_ref(db));
-    variables
-        .iter()
-        .filter_map(|variable| {
-            let name = &body[variable.binding].name;
-            if uses.get(name) != Some(&1) {
-                return None;
+    // The scopes told of, outer ones first, and where each is among them.
+    let mut told: FxHashMap<ScopeId, u32> = FxHashMap::default();
+    let mut of_binding = FxHashMap::default();
+    for variable in variables {
+        let Some(&scope) = bound.get(&variable.binding).filter(|&&it| Some(it) != outermost) else {
+            continue;
+        };
+        let mut chain: Vec<ScopeId> = scopes
+            .scope_chain(Some(scope))
+            .take_while(|it| Some(*it) != outermost && !told.contains_key(it))
+            .filter(|&it| it == scope || !scopes.entries(it).is_empty())
+            .collect();
+        chain.reverse();
+        for scope in chain {
+            let parent =
+                scopes.scope_chain(Some(scope)).skip(1).find_map(|it| told.get(&it).copied());
+            told.insert(scope, debug.scopes.len() as u32);
+            debug.scopes.push(debuginfo::Scope { parent, ranges: Vec::new() });
+        }
+        of_binding.insert(variable.binding, told[&scope]);
+    }
+    if told.is_empty() {
+        return of_binding;
+    }
+    // The code that tries the pattern of an arm is of the scope its `match` is in.
+    let mut tried = FxHashMap::default();
+    for (expr, it) in body.exprs() {
+        if let hir_def::hir::Expr::Match { arms, .. } = it {
+            for arm in arms.iter() {
+                body.walk_pats(arm.pat, &mut |pat| drop(tried.insert(pat, expr)));
             }
-            Some(VariableDebug {
-                name: name.as_str().to_owned(),
-                param: variable.param,
-                ty: types.describe(variable.ty.as_ref())?,
-                offset: variable.offset,
-            })
-        })
-        .collect()
+        }
+    }
+    // Other code that is of no expression is of the scope of the code before it.
+    let mut scope = None;
+    let ends = rows.iter().skip(1).map(|row| row.0).chain([len]);
+    for (&(from, span), to) in rows.iter().zip(ends) {
+        match span {
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => scope = scopes.scope_for(expr),
+            MirSpan::PatId(pat) => {
+                if let Some(&of) = tried.get(&pat) {
+                    scope = scopes.scope_for(of);
+                }
+            }
+            _ => {}
+        }
+        if from >= to {
+            continue;
+        }
+        for index in scopes.scope_chain(scope).filter_map(|it| told.get(&it)) {
+            let ranges = &mut debug.scopes[*index as usize].ranges;
+            match ranges.last_mut() {
+                Some(last) if last.1 == from => last.1 = to,
+                _ => ranges.push((from, to)),
+            }
+        }
+    }
+    of_binding
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
@@ -1867,6 +1996,58 @@ fn source_location<'db>(
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
+    let (file_id, range) = source_range(db, owner, span)?;
+    location_of(db, file_id, range)
+}
+
+/// File, line and column of a place in a body for a debugger, as rustc gives code its lines.
+/// They are those of [`source_location`] but for what a macro writes: that is of where the
+/// macro is called only if the macro is another crate's or the compiler's, and of where the
+/// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
+/// the body when there is none, where that is itself what the macro writes.
+#[salsa::tracked]
+fn row_location<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    closure: Option<ExprId>,
+    span: MirSpan,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file_id, range) = source_range(db, owner, span)?;
+    if file_id.macro_file().is_none() {
+        return *source_location(db, owner, span);
+    }
+    let source_map = &Body::with_source_map(db, owner).1;
+    let code = closure.unwrap_or_else(|| Body::of(db, owner).root_expr());
+    let within = match source_map.expr_syntax(code) {
+        Ok(body) => {
+            let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
+            body.file_id.span_map(db).span_for_range(start).ctx
+        }
+        Err(_) => return *source_location(db, owner, span),
+    };
+    let mut at = file_id.span_map(db).span_for_range(TextRange::empty(range.start()));
+    let mut kept = at;
+    while !at.ctx.is_root() && at.ctx != within {
+        let Some(call) = at.ctx.outer_expn(db) else { break };
+        let call = hir_expand::MacroCallId::from(call).loc(db);
+        let written = call.to_node(db);
+        let range = TextRange::empty(written_range(&written.value).start());
+        at = written.file_id.span_map(db).span_for_range(range);
+        let own = call.def.krate == call.krate && call.def.kind.is_declarative();
+        if !own {
+            kept = at;
+        }
+    }
+    line_and_column(db, hir_expand::resolve_span(db, kept))
+}
+
+/// The file a place in a body is written in, which may be what a macro expands to, and
+/// where in it rustc has the place begin.
+fn source_range<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(HirFileId, TextRange)> {
     let source_map = &Body::with_source_map(db, owner).1;
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
@@ -1888,7 +2069,7 @@ fn source_location<'db>(
         // The brace that closes a block, which is where rustc has a scope left.
         let range = source.value.syntax_node_ptr().text_range();
         let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
-        return location_of(db, source.file_id, TextRange::new(last?, range.end()));
+        return Some((source.file_id, TextRange::new(last?, range.end())));
     }
     let range = match span {
         MirSpan::ExprId(expr) => {
@@ -1898,7 +2079,7 @@ fn source_location<'db>(
         }
         _ => source.value.syntax_node_ptr().text_range(),
     };
-    location_of(db, source.file_id, range)
+    Some((source.file_id, range))
 }
 
 /// The part of an expression that rustc's span of it covers where it panics: a method call
@@ -1949,6 +2130,26 @@ fn declaration_location<'db>(
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
     location_of(db, source.file_id, written_range(source.value.syntax()))
+}
+
+/// File, line and column of where the struct or the variant `def` constructs is written,
+/// which is where rustc has the code of a constructor from. `None` for a function.
+fn constructor_location(
+    db: &dyn HirDatabase,
+    def: CallableDefId,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file, node) = match def {
+        CallableDefId::FunctionId(_) => return None,
+        CallableDefId::StructId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+        CallableDefId::EnumVariantId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+    };
+    location_of(db, file, written_range(&node))
 }
 
 /// The range of an item or a macro call without the attributes and comments on top of it,
@@ -2019,13 +2220,29 @@ fn location_of(
             .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
+    line_and_column(db, FileRange { file_id, range })
+}
+
+/// File, line and column of where a range of a file begins.
+fn line_and_column(
+    db: &dyn HirDatabase,
+    FileRange { file_id, range }: FileRange,
+) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = file_id.file_id(db);
-    let text = db.file_text(file_id).text(db);
-    let before = text.get(..usize::from(range.start()))?;
-    let line_start = before.rfind('\n').map_or(0, |it| it + 1);
-    let line = before.bytes().filter(|&it| it == b'\n').count() + 1;
-    let col = before[line_start..].chars().map(column_width).sum::<usize>() + 1;
-    Some((file_id, line as u32, col as u32))
+    let text = db.file_text(file_id);
+    let starts = line_starts(db, text);
+    let at = u32::from(range.start());
+    let line = starts.partition_point(|&start| start <= at);
+    let line_start = *starts.get(line.checked_sub(1)?)?;
+    let written = text.text(db).get(line_start as usize..at as usize)?;
+    Some((file_id, line as u32, written.chars().map(column_width).sum::<usize>() as u32 + 1))
+}
+
+/// Where each line of a file begins, the first of them at 0.
+#[salsa::tracked(returns(ref))]
+fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> {
+    let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
+    std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
 }
 
 /// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
@@ -2122,6 +2339,7 @@ fn compile<'db>(
                     .collect(),
                 unwind: None,
                 lines: Vec::new(),
+                slots: SlotPlaces::default(),
             }
         }
         None => Backend::emit(&mut cg, &mut ctx)?,
@@ -2130,30 +2348,20 @@ fn compile<'db>(
         Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
         _ => None,
     };
-    let variables = variables(&ctx, std::mem::take(&mut cg.named));
+    let variables = std::mem::take(&mut cg.named)
+        .into_iter()
+        .map(|Named { binding, param, ty, slot, pointer }| Variable {
+            binding,
+            param,
+            ty,
+            slot: slot.as_u32(),
+            pointer,
+        })
+        .collect::<Vec<_>>();
     let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, source, variables, layouts })
-}
-
-/// Where the slots of named locals ended up in the frame Cranelift laid out. None of them
-/// is known when the code is another backend's, which keeps locals where it likes.
-fn variables(
-    ctx: &cranelift_codegen::Context,
-    named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
-) -> Vec<Variable> {
-    let Some(frame) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) else {
-        return Vec::new();
-    };
-    let to_fp = i64::from(frame.frame_to_fp_offset);
-    named
-        .into_iter()
-        .filter_map(|(binding, param, ty, slot)| {
-            let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
-            Some(Variable { binding, param, ty, offset })
-        })
-        .collect()
+    Ok(CompiledFunction { requests, code, source, closure: None, variables, layouts })
 }
 
 fn build<'db>(
@@ -2192,6 +2400,7 @@ fn build<'db>(
         free_argument_slots: Vec::new(),
         index_spans: Default::default(),
         in_cleanup: false,
+        drops_all: false,
         guarded: false,
         deferred_clears: Vec::new(),
         ret_mode: PassMode::Ignore,
@@ -2204,6 +2413,7 @@ fn build<'db>(
         args: None,
         suspended: None,
         suspended_drop: None,
+        held_at: Vec::new(),
     };
     fill(&mut fx)?;
     fx.note_variables();
@@ -2268,6 +2478,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
             lines: LineRow::of_ranges(
                 compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
             ),
+            slots: SlotPlaces::default(),
         })
     }));
     match outcome {
@@ -2300,6 +2511,7 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
         elf_types: Vec::new(),
         unwind: None,
         lines: Vec::new(),
+        slots: SlotPlaces::default(),
     })
 }
 
@@ -2349,9 +2561,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
-        let debug = symbols
-            .debug_directory()
-            .and_then(|directory| DebugContext::new(module.isa(), &directory));
+        // A patch is added to a program that is linked already, and is read with it.
+        let apart = symbols.debug_apart().filter(|_| base.is_none());
+        let debug = symbols.debug_directory().and_then(|directory| {
+            DebugContext::new(module.isa(), &directory, symbols.describes_variables(), apart)
+        });
         let debugged = debug.is_some();
         Ok(ObjectCodegen {
             db,
@@ -2359,6 +2573,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             module,
             unwind,
             debug,
+            types: FxHashMap::default(),
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -2418,9 +2633,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         })
     }
 
-    fn finish(mut self) -> Result<Vec<u8>> {
+    /// The object, and the files of what a debugger reads that is kept apart from it.
+    fn finish(mut self) -> Result<(Vec<u8>, Vec<Sidecar>)> {
         if Target::current().writes_wasm_objects() {
-            return self.finish_wasm();
+            return Ok((self.finish_wasm()?, Vec::new()));
         }
         self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
@@ -2428,12 +2644,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             reloc.add(&mut product).map_err(CodegenError::Backend)?;
         }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
-        if let Some(debug) = self.debug {
-            backend::Tally::global()
+        let apart = match self.debug {
+            Some(debug) => backend::Tally::global()
                 .step(Step::Describe, || debug.emit(&mut product))
-                .map_err(CodegenError::Backend)?;
-        }
-        product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
+                .map_err(CodegenError::Backend)?,
+            None => Vec::new(),
+        };
+        let object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        Ok((object, apart))
     }
 
     /// The object as a relocatable wasm object. Nothing unwinds there, so there are no
@@ -2510,8 +2728,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
-        let name = FunctionSignature::of(db, func).name.as_str().to_owned();
-        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), Some(func));
+        let name = super::type_name::rustc_debug_function(db, func, &[])
+            .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned());
+        let declared = self.declaration_at(func);
+        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), declared);
         Ok(symbol)
     }
 
@@ -2683,14 +2903,75 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let ids = self.stitch(id, compiled)?;
         let name = self.backtrace_name(instance);
-        let declared = match instance.def {
-            InstanceDef::Fn(func) => Some(func),
+        let declared = self.written_at(instance, env.krate);
+        let known = match instance.def {
+            InstanceDef::Fn(func) => super::type_name::rustc_debug_function(
+                self.db,
+                func,
+                instance.args.as_ref().as_slice(),
+            ),
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(self.db);
+                self.debug_closure(instance, at.owner, at.expr)
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(self.db);
+                self.debug_closure(instance, at.owner, at.expr)
+            }
             _ => None,
         };
-        let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
+        let known = known.unwrap_or_else(|| name.clone());
+        let debug = self.describe(id, compiled, FunctionDebug::new(known, name), declared);
         let tally = backend::Tally::global();
         tally.step(Step::StoreWrite, || self.keep(instance, compiled, &ids, debug));
         Ok(())
+    }
+
+    /// Where what `instance` is the code of is written, which is the line of whatever of its
+    /// code is of no statement: a function where it is declared, a closure or an `async`
+    /// block where it stands, and a shim where the function it stands in for is declared, as
+    /// rustc has it.
+    fn written_at(&mut self, instance: &Instance, krate: Crate) -> Option<(String, u32, u32)> {
+        self.debug.as_ref()?;
+        let db = self.db;
+        let lang_items = DbInterner::new_with(db, krate).lang_items();
+        let ty = || instance.args.as_ref().as_slice().first().and_then(|arg| arg.ty());
+        let of_expr = |owner: InferBodyId<'db>, expr| match owner {
+            InferBodyId::DefWithBodyId(owner) => Some((owner, MirSpan::ExprId(expr))),
+            _ => None,
+        };
+        let func = match instance.def {
+            InstanceDef::Fn(func) => Some(func),
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(db);
+                return self.location_at(of_expr(at.owner, at.expr));
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(db);
+                return self.location_at(of_expr(at.owner, at.expr));
+            }
+            InstanceDef::DropGlue => lang_items.DropInPlace.or(lang_items.DropGlue),
+            InstanceDef::CallOnceShim => lang_items.FnOnce_call_once,
+            InstanceDef::FnPointerShim => match ty()?.kind() {
+                TyKind::Closure(id, _) => {
+                    let at = id.0.loc(db);
+                    return self.location_at(of_expr(at.owner, at.expr));
+                }
+                _ => None,
+            },
+            InstanceDef::ReifyShim { .. } => match ty()?.kind() {
+                TyKind::FnDef(def, _) => match def.0 {
+                    CallableDefId::FunctionId(func) => Some(func),
+                    constructor => {
+                        return constructor_location(db, constructor).and_then(
+                            |(file, line, col)| Some((self.source_path(file)?, line, col)),
+                        );
+                    }
+                },
+                _ => lang_items.FnOnce_call_once,
+            },
+        };
+        self.declaration_at(func?)
     }
 
     /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
@@ -2701,27 +2982,53 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         id: FuncId,
         compiled: &CompiledFunction,
         mut debug: FunctionDebug,
-        declared: Option<FunctionId>,
+        declared: Option<(String, u32, u32)>,
     ) -> Option<FunctionDebug> {
         self.debug.as_ref()?;
         let start = stdx::time::Instant::now();
-        if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
+        if let Some((file, line, column)) = declared {
             debug.declared = Some(debug.place(file, line, column));
         }
         if let Some((owner, spans)) = &compiled.source {
             for row in &compiled.code.lines {
                 let Some(&span) = spans.get(row.span as usize) else { continue };
-                let Some((file, line, column)) = self.location_at(Some((*owner, span))) else {
+                let Some((file, line, column)) =
+                    *row_location(self.db, *owner, compiled.closure, span)
+                else {
                     continue;
                 };
+                let Some(file) = self.source_path(file) else { continue };
                 let place = debug.place(file, line, column);
                 debug.row(row.offset, place);
             }
         }
+        // Compiled code of no statement with a place is of where the function is written
+        // throughout. A function that is its assembly has no lines, as rustc gives it none.
+        if let Some(declared) = debug.declared
+            && debug.rows.is_empty()
+            && compiled.code.unwind.is_some()
+        {
+            debug.row(0, declared);
+        }
         if let Some((owner, _)) = &compiled.source
             && let Some((env, variables)) = &compiled.variables
         {
-            debug.variables = described_variables(self.db, *owner, env, variables);
+            let places = &compiled.code.slots;
+            let db = self.db;
+            let len = compiled.code.bytes.len() as u32;
+            let mut rows: Vec<(u32, MirSpan)> = match &compiled.source {
+                Some((_, spans)) => (compiled.code.lines.iter())
+                    .filter_map(|row| Some((row.offset, *spans.get(row.span as usize)?)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            rows.sort_by_key(|row| row.0);
+            let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
+            let types = self
+                .types
+                .entry(env.clone())
+                .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
+            describe_variables(db, *owner, types, variables, places, &scopes, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
         self.debug.as_mut()?.add_function(id, len, &debug);
@@ -3567,6 +3874,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(id)
     }
 
+    /// What a debugger of a rustc build calls the code of a closure of `instance`.
+    fn debug_closure(
+        &self,
+        instance: &Instance,
+        owner: InferBodyId<'db>,
+        expr: ExprId,
+    ) -> Option<String> {
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
+            return None;
+        };
+        let args = instance.args.as_ref();
+        super::type_name::rustc_debug_closure(self.db, func, args.as_slice(), expr)
+    }
+
     /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
     /// the last name of it otherwise.
     fn backtrace_name(&self, instance: &Instance) -> String {
@@ -4026,6 +4347,17 @@ struct ConstBlob {
 }
 
 impl ConstBlob {
+    /// Whether the bytes are all there is to it, with no address among them.
+    #[cfg(feature = "llvm")]
+    fn points_nowhere(&self) -> bool {
+        self.relocs.is_empty() && self.fn_relocs.is_empty()
+    }
+
+    #[cfg(feature = "llvm")]
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Whether every pointer in the blob is whole inside it and to one of the first `funcs`
     /// functions or the first `datas` data objects, which a blob read from the store is
     /// not known to be.
@@ -4178,6 +4510,8 @@ struct FunctionCx<'cx, 'db> {
     /// The index expression each local that holds an index was made for.
     index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
+    /// Whether what is being built drops every local, as a landing pad does.
+    drops_all: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
     deferred_clears: Vec<(ir::Block, StoredPlace, ir::Block)>,
@@ -4200,6 +4534,8 @@ struct FunctionCx<'cx, 'db> {
     suspended: Option<SuspendedState>,
     /// Where a suspended future is dropped, and where that carries on.
     suspended_drop: Option<(ir::Block, ir::Block)>,
+    /// The locals an `async` body keeps in its future, and how far into it each is.
+    held_at: Vec<(LocalId, u32)>,
 }
 
 /// Where an `async` body says where it left off, and what that says of its locals.
@@ -5345,6 +5681,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             self.receive(mode, &mut incoming, addr, layout);
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
+            if matches!(mode, PassMode::Indirect | PassMode::OnStack { .. }) {
+                self.note_passed_in_memory(body, local, addr);
+            }
         }
         if self.tracked {
             self.location = incoming.next();
@@ -5485,6 +5824,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let addr = self.builder.ins().iadd_imm(*frame_addr, offset.bytes() as i64);
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
+                self.held_at.push((local, offset.bytes() as u32));
                 continue;
             }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
@@ -5834,6 +6174,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Some(bit)
     }
 
+    /// A new block, which is laid out behind the body's if what is being built is what drops
+    /// every local, so that no line of the body starts in code that runs only once the body
+    /// is unwound or dropped.
+    fn dropping_block(&mut self) -> ir::Block {
+        let block = self.builder.create_block();
+        if self.drops_all {
+            self.builder.set_cold_block(block);
+        }
+        block
+    }
+
     /// Drops what is left of a place, which is nothing if its local holds no value.
     fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
         let flag = self.drop_flags.get(place.local).copied();
@@ -5845,7 +6196,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let state = flag.load(&mut self.builder);
         let live = self.builder.ins().band_imm(state, 1);
-        let drop = self.builder.create_block();
+        let drop = self.dropping_block();
         self.builder.ins().brif(live, drop, &[], target, &[]);
         self.builder.switch_to_block(drop);
         if path.is_empty() {
@@ -5876,10 +6227,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if exact.is_none() && !nested {
             return self.drop_value(addr, meta, ty);
         }
-        let done = self.builder.create_block();
+        let done = self.dropping_block();
         if let Some(bit) = exact {
             let moved = self.builder.ins().band_imm(state, 1i64 << bit);
-            let present = self.builder.create_block();
+            let present = self.dropping_block();
             self.builder.ins().brif(moved, done, &[], present, &[]);
             self.builder.switch_to_block(present);
         }
@@ -6256,9 +6607,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // An index out of bounds is reported at the index expression, which may be
                     // an operand of the statement that reads it.
                     let statement = self.span;
-                    self.span = self.index_spans.get(local).copied().unwrap_or(statement);
+                    self.at(self.index_spans.get(local).copied().unwrap_or(statement));
                     addr = self.element(addr, meta, prev.ty, index)?;
-                    self.span = statement;
+                    self.at(statement);
                     meta = None;
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -7878,28 +8229,64 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Notes the locals a debugger can be told of: the ones written with a name whose value
-    /// is in a stack slot of its own. A closure's are left out, where a name may be of what
-    /// the closure captured.
+    /// is in a stack slot of its own, or in the future of an `async` body. What a closure
+    /// captured is no local of its body, and is told of by the type of the closure alone.
     fn note_variables(&mut self) {
-        let Some(body) = self.body else { return };
-        if !matches!(body.owner, InferBodyId::DefWithBodyId(_)) || !body.upvar_locals.is_empty() {
-            return;
-        }
+        let Some(body) = self.body.filter(|body| Self::names_are_written(body)) else { return };
+        // The slot an `async` body has the address of its future in.
+        let future = match (body.coroutine.is_some(), body.param_locals.first()) {
+            (true, Some(&receiver)) => self.slot_of(receiver),
+            _ => None,
+        };
         for (binding, &local) in body.binding_locals.iter() {
-            let Some(&LocalSlot { addr, borrowed: false }) = self.locals.get(local) else {
-                continue;
-            };
-            let dfg = &self.builder.func.dfg;
-            let ir::ValueDef::Result(inst, 0) = dfg.value_def(addr) else { continue };
-            let ir::InstructionData::StackAddr { stack_slot, offset, .. } = dfg.insts[inst] else {
-                continue;
-            };
-            if i32::from(offset) == 0 {
-                let param = body.param_locals.contains(&local);
-                let ty = body.locals[local].ty.clone();
-                self.cg.named.push((binding, param, ty, stack_slot));
+            let param = body.param_locals.contains(&local);
+            let ty = body.locals[local].ty.clone();
+            let held = self.held_at.iter().find(|it| it.0 == local).map(|it| it.1);
+            if let (Some(slot), Some(offset)) = (future, held) {
+                self.cg.named.push(Named { binding, param, ty, slot, pointer: Some(offset) });
+            } else if let Some(slot) = self.slot_of(local) {
+                self.cg.named.push(Named { binding, param, ty, slot, pointer: None });
             }
         }
+    }
+
+    /// The stack slot a local is the whole of, when it is kept in one.
+    fn slot_of(&self, local: LocalId) -> Option<ir::StackSlot> {
+        let &LocalSlot { addr, borrowed: false } = self.locals.get(local)? else { return None };
+        let dfg = &self.builder.func.dfg;
+        let ir::ValueDef::Result(inst, 0) = dfg.value_def(addr) else { return None };
+        match dfg.insts[inst] {
+            ir::InstructionData::StackAddr { stack_slot, offset, .. } if i32::from(offset) == 0 => {
+                Some(stack_slot)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the locals of a body are of names its source has.
+    fn names_are_written(body: &MirBody) -> bool {
+        matches!(body.owner, InferBodyId::DefWithBodyId(_))
+    }
+
+    /// Keeps where a parameter passed in memory is in a slot of the frame, when it is
+    /// written with a name, for a debugger to find it by: the register it comes in is soon
+    /// used for something else.
+    fn note_passed_in_memory(&mut self, body: &MirBody, local: LocalId, addr: Value) {
+        if !Self::names_are_written(body) {
+            return;
+        }
+        let Some((binding, _)) = body.binding_locals.iter().find(|it| *it.1 == local) else {
+            return;
+        };
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            ptr().bytes(),
+            3,
+        ));
+        let kept = self.builder.ins().stack_addr(ptr(), slot, 0);
+        self.builder.ins().store(MEM, addr, kept, 0);
+        let ty = body.locals[local].ty.clone();
+        self.cg.named.push(Named { binding, param: true, ty, slot, pointer: Some(0) });
     }
 
     /// Has what is built from here on be of the statement at `span`.
@@ -10775,6 +11162,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Drops every local that holds a value. Each is dropped at where `ends` has it, if that is
     /// given, and where the code being generated is otherwise.
     fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
+        self.drops_all = true;
         for local in self.unwinding_order() {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
@@ -10785,6 +11173,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
+        self.drops_all = false;
         Ok(())
     }
 
@@ -10926,6 +11315,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.create_block(),
             self.builder.create_block(),
         );
+        // Dropping is laid out behind the body, so that the code a function begins with is
+        // that of its first statement and not of the drops of a future given up half-way.
+        for block in [drop, resumed, unresumed, suspended] {
+            self.builder.set_cold_block(block);
+        }
         self.builder.switch_to_block(drop);
         self.store_state(state.addr, state.ty, RETURNED);
         self.builder.ins().brif(at, resumed, &[], unresumed, &[]);

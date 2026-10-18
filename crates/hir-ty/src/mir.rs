@@ -1597,6 +1597,20 @@ impl MirBody<'_> {
         successors
     }
 
+    /// The future the body of an `async` block waits for at `point`: going on from there
+    /// starts by borrowing it, to poll it again.
+    pub fn awaited(&self, point: &YieldPoint) -> Option<LocalId> {
+        let assigned =
+            self.basic_blocks[point.resume].statements.iter().find_map(|it| match &it.kind {
+                StatementKind::Assign(_, rvalue) => Some(rvalue),
+                _ => None,
+            })?;
+        match assigned {
+            Rvalue::Ref(_, future) => Some(future.local),
+            _ => None,
+        }
+    }
+
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }

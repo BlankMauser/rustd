@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConstBlob, DataIdentity,
-    debuginfo::{FunctionDebug, LineRow},
+    debuginfo::{FunctionDebug, LineRow, SlotPlaces},
     fragment::Code,
     store::{KEY, Store},
     unwind::FunctionUnwind,
@@ -103,6 +103,7 @@ pub(super) struct CachedCode {
     elf_types: Vec<(u32, u32)>,
     unwind: Option<FunctionUnwind>,
     lines: Vec<LineRow>,
+    slots: SlotPlaces,
 }
 
 impl PartialEq for CachedCode {
@@ -131,6 +132,7 @@ impl From<&Code> for CachedCode {
             elf_types: code.elf_types.clone(),
             unwind: code.unwind.clone(),
             lines: code.lines.clone(),
+            slots: code.slots.clone(),
         }
     }
 }
@@ -174,6 +176,7 @@ impl CachedCode {
             elf_types: self.elf_types.clone(),
             unwind: self.unwind.clone(),
             lines: self.lines.clone(),
+            slots: self.slots.clone(),
         }
     }
 }
@@ -199,14 +202,16 @@ impl StoredCode {
 
     /// The key for `func` compiled at `optimization`. Cranelift's key of the IR leaves out
     /// which requests the IR's names stand for, which LLVM's code has in it.
-    pub(super) fn key(
+    pub(super) fn key<'a>(
         optimization: super::backend::Optimization,
         func: &cranelift_codegen::ir::Function,
+        named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
+        constants: impl Iterator<Item = (u32, &'a [u8])>,
     ) -> Option<[u8; KEY]> {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd llvm 2");
+        hasher.update(b"rustd llvm 5");
         hasher.update(super::Backend::Llvm(optimization).to_string());
         hasher.update(ir.to_string());
         // Nor does it tell which statement an instruction is of, which the code's lines do.
@@ -215,9 +220,22 @@ impl StoredCode {
                 hasher.update(func.srcloc(inst).bits().to_le_bytes());
             }
         }
+        // Nor which slots hold a local with a name, which the code says the places of.
+        for slot in named {
+            hasher.update(slot.as_u32().to_le_bytes());
+        }
+        hasher.update(u32::MAX.to_le_bytes());
         for (_, name) in func.params.user_named_funcs().iter() {
             hasher.update(name.namespace.to_le_bytes());
             hasher.update(name.index.to_le_bytes());
+        }
+        hasher.update(u32::MAX.to_le_bytes());
+        // Nor what the data a name stands for holds, which the code has in place of a load
+        // where that is known.
+        for (index, bytes) in constants {
+            hasher.update(index.to_le_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
         }
         Some(hasher.finalize().into())
     }
@@ -588,8 +606,11 @@ mod tests {
 
     use super::{
         super::{
-            Resolved,
-            debuginfo::{DebugType, Field, Place, VariableDebug},
+            Resolved, Target,
+            debuginfo::{
+                Aggregate, DebugContext, DebugType, Field, Place, Scope, VariableDebug,
+                VariablePlace,
+            },
             fuzz,
         },
         *,
@@ -616,6 +637,7 @@ mod tests {
             relocs,
             unwind: None,
             lines,
+            slots: SlotPlaces::default(),
             elf_types: Vec::new(),
         }
     }
@@ -624,28 +646,41 @@ mod tests {
         ConstBlob { bytes: vec![0; 24], relocs, fn_relocs, align: 8 }
     }
 
-    /// A type `depth` deep, by way of each kind of type that has one inside.
-    fn nested(depth: u32) -> DebugType {
-        let inner = |depth| Box::new(nested(depth));
-        let name = format!("T{depth}");
-        match depth {
-            0 | 1 => DebugType::Base { name, size: 4, encoding: 7 },
-            _ if depth % 3 == 0 => DebugType::Pointer { name, to: Some(inner(depth - 1)) },
-            _ if depth % 3 == 1 => DebugType::Array { of: inner(depth - 1), len: 2 },
-            _ => {
-                let field = Field { name: "inside".to_owned(), offset: 0, ty: nested(depth - 1) };
-                DebugType::Struct { name, size: 8, fields: vec![field] }
+    /// Types each inside the one before, `depth` of them, by way of each kind of type that
+    /// has one inside. The first is the outermost.
+    fn nested(depth: u32) -> Vec<DebugType> {
+        let ty = |at: u32| {
+            let name = format!("T{at}");
+            match depth - at {
+                1 => DebugType::Base { name, size: 4, encoding: 7 },
+                left if left % 3 == 0 => DebugType::Pointer { name, to: Some(at + 1) },
+                left if left % 3 == 1 => DebugType::Array { of: at + 1, len: 2 },
+                _ => {
+                    let field = Field { name: "inside".to_owned(), offset: 0, ty: at + 1 };
+                    let (fields, parameters) = (vec![field], Vec::new());
+                    DebugType::Struct(Aggregate { name, size: 8, fields, parameters })
+                }
             }
-        }
+        };
+        (0..depth).map(ty).collect()
     }
 
-    fn debug(ty: DebugType) -> FunctionDebug {
+    fn debug(types: Vec<DebugType>) -> FunctionDebug {
         let mut debug =
             FunctionDebug::new("run".to_owned(), "_ZN4case3run17h0123456789abcdefE".to_owned());
         debug.files.push("src/lib.rs".to_owned());
         debug.declared = Some(Place { file: 0, line: 3, column: 1 });
         debug.rows.push((4, Place { file: 0, line: 4, column: 5 }));
-        debug.variables.push(VariableDebug { name: "it".to_owned(), param: true, ty, offset: -16 });
+        debug.types = types;
+        debug.scopes.push(Scope { parent: None, ranges: vec![(0, 8)] });
+        debug.frame_base = vec![cranelift_codegen::gimli::DW_OP_reg6.0];
+        debug.variables.push(VariableDebug {
+            name: "it".to_owned(),
+            param: true,
+            ty: 0,
+            place: VariablePlace::Frame(-16),
+            scope: Some(0),
+        });
         debug
     }
 
@@ -808,21 +843,27 @@ mod tests {
         }
     }
 
+    /// The types of an entry are a list that names its own places, so reading one takes no
+    /// more of the stack however many are inside each other. Telling a debugger of them
+    /// does, and stops at [`DebugType::DEEPEST`]; a type or a scope inside itself, which no
+    /// compiler writes and a store may hold, ends as well.
     #[test]
-    fn a_type_inside_too_many_others_is_not_read_and_not_kept() {
-        let deepest = DebugType::DEEPEST;
-        let kept = Entry { debug: Some(debug(nested(deepest))), ..entry() };
-        assert_eq!(Entry::decode(&kept.encode().unwrap()).unwrap(), kept);
-        assert!(nested(deepest).kept().is_some());
-        assert!(nested(deepest + 1).kept().is_none());
-        // Deep enough to take all of a thread's stack, were it read.
-        let thread = std::thread::Builder::new().stack_size(64 << 20);
-        let deep =
-            thread.spawn(|| Entry { debug: Some(debug(nested(40_000))), ..entry() }.encode());
-        let deep = deep.unwrap().join().unwrap().unwrap();
-        assert!(Entry::decode(&deep).is_none());
-        // What was refused does not count against the next.
-        assert!(Entry::decode(&kept.encode().unwrap()).is_some());
+    fn types_and_scopes_inside_too_many_others_are_read_and_end() {
+        let deep = Entry { debug: Some(debug(nested(40_000))), ..entry() };
+        assert_eq!(Entry::decode(&deep.encode().unwrap()).unwrap(), deep);
+        let mut ring = debug(vec![DebugType::Array { of: 0, len: 2 }]);
+        ring.scopes[0].parent = Some(0);
+        let mut chain = debug(nested(6));
+        chain.scopes = (0..40_000u32)
+            .map(|at| Scope { parent: at.checked_sub(1), ranges: vec![(0, 8)] })
+            .collect();
+        chain.variables[0].scope = Some(39_999);
+        let isa = Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        // Only ELF has the tables.
+        let Some(mut context) = DebugContext::new(&*isa, "/", true, None) else { return };
+        for (at, debug) in [deep.debug.unwrap(), ring, chain].iter().enumerate() {
+            context.add_function(FuncId::from_u32(at as u32), 8, debug);
+        }
     }
 
     #[test]

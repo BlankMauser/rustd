@@ -24,8 +24,8 @@ use super::{
     compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    instance_serial, is_thread_local, left_to_rustc, root_serial, source_location, static_serial,
-    target,
+    instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
+    static_serial, target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -65,7 +65,8 @@ impl Mark {
         if debug && let Some((owner, spans)) = &compiled.source {
             for row in &compiled.code.lines {
                 let span = spans.get(row.span as usize);
-                span.map(|span| source_location(db, *owner, *span)).hash(&mut hasher);
+                span.map(|span| row_location(db, *owner, compiled.closure, *span))
+                    .hash(&mut hasher);
             }
         }
         Mark { lines: hasher.finish(), ..Mark::new(db, serial, &compiled.requests) }
@@ -976,7 +977,7 @@ impl Base {
         }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
         let start = stdx::time::Instant::now();
-        let object = cg.finish()?;
+        let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
         Ok(Ok(Patch { object, bodies, phases }))
     }

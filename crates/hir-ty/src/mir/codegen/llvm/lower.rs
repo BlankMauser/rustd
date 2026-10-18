@@ -24,8 +24,8 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     debug_info::{
-        AsDIScope, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind, DWARFSourceLanguage,
-        DebugInfoBuilder, debug_metadata_version,
+        AsDIScope, DIFile, DIFlags, DIFlagsConstants, DISubprogram, DWARFEmissionKind,
+        DWARFSourceLanguage, DebugInfoBuilder, debug_metadata_version,
     },
     intrinsics::Intrinsic,
     module::{FlagBehavior, Linkage, Module},
@@ -95,6 +95,9 @@ pub(super) struct Lowering<'ctx, 'f> {
     slots: FxHashMap<ir::StackSlot, PointerValue<'ctx>>,
     callees: FxHashMap<ir::FuncRef, FunctionValue<'ctx>>,
     globals: FxHashMap<ir::GlobalValue, PointerValue<'ctx>>,
+    /// The bytes of the data objects that a load from is known to give, by the number in
+    /// their names.
+    constants: &'f FxHashMap<u32, &'f [u8]>,
     pads: FxHashMap<Pad, BasicBlock<'ctx>>,
     /// The block the allocas are in.
     frame: Option<BasicBlock<'ctx>>,
@@ -105,10 +108,15 @@ pub(super) struct Lowering<'ctx, 'f> {
 }
 
 /// The source locations of the IR as lines of a file that is not there, for LLVM to say
-/// in its line table which instructions became which code. `emitted` reads the table back.
+/// in its line table which instructions became which code, and the stack slots of named
+/// locals as variables, for it to say where it kept them. `emitted` reads both back.
+/// `DW_ATE_unsigned`: the bytes of a slot are told to LLVM as one number.
+const DW_ATE_UNSIGNED: u32 = 0x07;
+
 struct Marks<'ctx> {
     builder: DebugInfoBuilder<'ctx>,
     function: DISubprogram<'ctx>,
+    file: DIFile<'ctx>,
 }
 
 impl<'ctx> Marks<'ctx> {
@@ -116,6 +124,9 @@ impl<'ctx> Marks<'ctx> {
         let context = module.get_context();
         let version = context.i32_type().const_int(debug_metadata_version().into(), false);
         module.add_basic_value_flag("Debug Info Version", FlagBehavior::Warning, version);
+        // The places are written into a unit of this version (see `debuginfo`).
+        let dwarf = context.i32_type().const_int(4, false);
+        module.add_basic_value_flag("Dwarf Version", FlagBehavior::Warning, dwarf);
         let (builder, unit) = module.create_debug_info_builder(
             false,
             DWARFSourceLanguage::Rust,
@@ -126,7 +137,7 @@ impl<'ctx> Marks<'ctx> {
             "",
             0,
             "",
-            DWARFEmissionKind::LineTablesOnly,
+            DWARFEmissionKind::Full,
             0,
             false,
             false,
@@ -149,7 +160,7 @@ impl<'ctx> Marks<'ctx> {
             false,
         );
         function.set_subprogram(subprogram);
-        Marks { builder, function: subprogram }
+        Marks { builder, function: subprogram, file }
     }
 }
 
@@ -159,6 +170,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         context: &'ctx Context,
         module: &'f Module<'ctx>,
         func: &'f ir::Function,
+        named: &[ir::StackSlot],
+        constants: &'f FxHashMap<u32, &'f [u8]>,
     ) -> Lowered<()> {
         let ty = Self::function_type(context, &func.signature)?;
         let function = module.add_function(OWN, ty, Some(Linkage::External));
@@ -188,6 +201,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             slots: FxHashMap::default(),
             callees: FxHashMap::default(),
             globals: FxHashMap::default(),
+            constants,
             pads: FxHashMap::default(),
             frame: None,
             arrival: None,
@@ -195,7 +209,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             marks: matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff)
                 .then(|| Marks::new(module, function)),
         };
-        lowering.body()?;
+        lowering.body(named)?;
         if let Some(marks) = &lowering.marks {
             marks.builder.finalize();
         }
@@ -211,10 +225,41 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         self.builder.set_current_debug_location(location);
     }
 
+    /// Tells LLVM that `alloca` is a variable of `size` bytes named by the number of `slot`,
+    /// so that it says where the bytes of the slot are kept once it is done with them.
+    fn declare(
+        &self,
+        slot: ir::StackSlot,
+        alloca: PointerValue<'ctx>,
+        size: u32,
+        block: BasicBlock<'ctx>,
+    ) -> Lowered<()> {
+        let Some(marks) = &self.marks else { return Ok(()) };
+        let name = slot.as_u32().to_string();
+        let ty = marks
+            .builder
+            .create_basic_type(&name, u64::from(size) * 8, DW_ATE_UNSIGNED, DIFlags::ZERO)
+            .map_err(|e| Unhandled::Llvm(e.to_string()))?;
+        let scope = marks.function.as_debug_info_scope();
+        let variable = marks.builder.create_auto_variable(
+            scope,
+            &name,
+            marks.file,
+            0,
+            ty.as_type(),
+            true,
+            DIFlags::ZERO,
+            0,
+        );
+        let location = marks.builder.create_debug_location(self.context, 0, 0, scope, None);
+        marks.builder.insert_declare_at_end(alloca, Some(variable), None, location, block);
+        Ok(())
+    }
+
     /// 1. Allocas for the stack slots, in a block ahead of the entry block.
     /// 2. A block and its phis for every reachable block.
     /// 3. The instructions, in an order that has every value defined before it is used.
-    fn body(&mut self) -> Lowered<()> {
+    fn body(&mut self, named: &[ir::StackSlot]) -> Lowered<()> {
         let Some(entry) = self.func.layout.entry_block() else {
             return Err(Unhandled::Shape("function without blocks"));
         };
@@ -231,6 +276,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 .set_alignment(align)
                 .map_err(|e| Unhandled::Llvm(e.to_string()))?;
             self.slots.insert(slot, alloca);
+            if named.contains(&slot) {
+                self.declare(slot, alloca, data.size, frame)?;
+            }
         }
 
         let order = self.reverse_post_order(entry);
@@ -606,8 +654,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 _ => return Err(Unhandled::Opcode(opcode)),
             },
             InstructionData::Load { arg, offset, flags, .. } => {
-                let address = self.address(arg, offset.into())?;
-                self.load(inst, opcode, address, dfg.mem_flags[flags].aligned())?;
+                self.load(inst, opcode, arg, offset.into(), dfg.mem_flags[flags].aligned())?;
             }
             InstructionData::Store { args: [value, address], offset, flags, .. } => {
                 let address = self.address(address, offset.into())?;
@@ -1123,7 +1170,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         &mut self,
         inst: Inst,
         opcode: Opcode,
-        address: PointerValue<'ctx>,
+        base: Value,
+        offset: i32,
         aligned: bool,
     ) -> Lowered<()> {
         let result = self.func.dfg.value_type(self.func.dfg.first_result(inst));
@@ -1138,8 +1186,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             _ => return Err(Unhandled::Opcode(opcode)),
         };
         let ty = self.ty(narrow)?;
-        let loaded = self.builder.build_load(ty, address, "")?;
-        Self::set_access_alignment(loaded.as_instruction_value().expect("a load"), aligned)?;
+        let loaded = match self.known(base, offset, narrow) {
+            Some(known) => known,
+            None => {
+                let address = self.address(base, offset)?;
+                let loaded = self.builder.build_load(ty, address, "")?;
+                Self::set_access_alignment(
+                    loaded.as_instruction_value().expect("a load"),
+                    aligned,
+                )?;
+                loaded
+            }
+        };
         if narrow == result {
             self.set(inst, loaded);
             return Ok(());
@@ -1250,6 +1308,36 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let pointer = data.as_pointer_value();
         self.globals.insert(global, pointer);
         Ok(pointer)
+    }
+
+    /// What a load of `ty` at `offset` from `base` gives, where `base` is a data object
+    /// whose bytes are known and do not change. LLVM is given the value and not the load:
+    /// a load that feeds only a variable's slot is dropped with the slot, and a debugger
+    /// then has nothing to show for the variable, while a constant stays told.
+    fn known(&self, base: Value, offset: i32, ty: Type) -> Option<BasicValueEnum<'ctx>> {
+        let ir::ValueDef::Result(inst, _) = self.func.dfg.value_def(base) else { return None };
+        let InstructionData::UnaryGlobalValue { global_value, .. } = self.func.dfg.insts[inst]
+        else {
+            return None;
+        };
+        let GlobalValueData::Symbol { name, .. } = &self.func.global_values[global_value] else {
+            return None;
+        };
+        let name = self.external_name(name).ok()?;
+        let Some(super::Symbol::Data(index)) = super::Symbol::parse(&name) else { return None };
+        let from = usize::try_from(offset).ok()?;
+        let bytes = self.constants.get(&index)?.get(from..from + ty.bytes() as usize)?;
+        let words: Vec<u64> = bytes
+            .chunks(8)
+            .map(|word| word.iter().rev().fold(0, |all, &byte| all << 8 | u64::from(byte)))
+            .collect();
+        let bits = self.context.custom_width_int_type(std::num::NonZero::new(ty.bits())?).ok()?;
+        let value = bits.const_int_arbitrary_precision(&words);
+        match self.ty(ty).ok()? {
+            BasicTypeEnum::IntType(_) => Some(value.into()),
+            BasicTypeEnum::FloatType(float) => self.builder.build_bit_cast(value, float, "").ok(),
+            _ => None,
+        }
     }
 
     fn arguments(

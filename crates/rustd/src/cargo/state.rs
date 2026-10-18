@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     cli::{Invocation, Subcommand, worker_env},
     daemon::{self, Checkout, WorkerConfig},
+    package,
     plan::Plan,
     script, switch,
     units::{self, Record, stamp_now, stamp_of},
@@ -426,6 +427,14 @@ impl State {
                 (Ok(()), Some((checkout, at))) => &self.checkouts[checkout].programs[at].binary,
                 _ => &program.cargos,
             };
+            let package = match (&answer, program.asked_as) {
+                (Ok(()), Some((checkout, at))) => {
+                    let plan = &self.checkouts[checkout].programs[at];
+                    let rustcs = plan.package.as_deref();
+                    rustcs.map(|it| packed(&plan.binary, &plan.object, it)).transpose()?
+                }
+                _ => None,
+            };
             if let Err(why) = answer {
                 if let Some(file) = program.newer_input(self.built_at) {
                     let name = &program.name;
@@ -434,8 +443,9 @@ impl State {
                 cargos.push((program, why));
             }
             for to in program.places() {
-                if !same_file::is_same_file(from, to).unwrap_or(false) {
-                    place(from, to).map_err(|it| format!("installing {}: {it}", to.display()))?;
+                install(from, to)?;
+                if let Some(package) = &package {
+                    install(package, &package::beside(to))?;
                 }
             }
         }
@@ -640,6 +650,25 @@ impl Program {
         let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
         self.inputs.iter().find(newer).map(PathBuf::as_path)
     }
+}
+
+/// Has `to` be the file `from` is, when it is not.
+fn install(from: &Path, to: &Path) -> Result<(), String> {
+    if same_file::is_same_file(from, to).unwrap_or(false) {
+        return Ok(());
+    }
+    place(from, to).map_err(|it| format!("installing {}: {it}", to.display()))
+}
+
+/// The package of what a debugger reads of the executable at `binary`, linked from `object`
+/// and what rustc compiled, whose package is `rustcs`: written again when either is newer.
+fn packed(binary: &Path, object: &Path, rustcs: &Path) -> Result<PathBuf, String> {
+    let package = package::beside(binary);
+    if !package::is_current(&package, &[object, rustcs]) {
+        package::pack(binary, rustcs, &package)
+            .map_err(|it| format!("packing {}: {it:#}", package.display()))?;
+    }
+    Ok(package)
 }
 
 /// Has `to` be the file `from` is, under a second name: what was at `to` stays as it is

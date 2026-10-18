@@ -11,7 +11,10 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId, hir::BindingId};
+use hir_def::{
+    DefWithBodyId, FunctionId, StaticId, TraitId,
+    hir::{BindingId, ExprId},
+};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -25,7 +28,8 @@ use crate::{
 
 use super::{
     CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
-    debuginfo::LineRow, unwind::FunctionUnwind,
+    debuginfo::{LineRow, SlotPlaces},
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -94,6 +98,8 @@ pub(super) struct Code {
     pub(super) unwind: Option<FunctionUnwind>,
     /// Which statement the code is of, from each offset where that changes.
     pub(super) lines: Vec<LineRow>,
+    /// Where the slots of named locals are, for a debugger.
+    pub(super) slots: SlotPlaces,
 }
 
 impl PartialEq for Code {
@@ -116,6 +122,7 @@ impl PartialEq for Code {
             && self.signature == other.signature
             && self.unwind == other.unwind
             && self.lines == other.lines
+            && self.slots == other.slots
             && self.elf_types == other.elf_types
             && self.relocs.len() == other.relocs.len()
             && iter::zip(&self.relocs, &other.relocs).all(|(a, b)| {
@@ -136,6 +143,8 @@ pub struct CompiledFunction {
     /// The body the function was compiled from and the statements of it that
     /// [`Code::lines`] index. Looked up when stitching, like a [`DataRequest::Location`].
     pub(super) source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    /// The closure or `async` block of that body the code is of, when it is of one.
+    pub(super) closure: Option<ExprId>,
     /// The named locals of the body a debugger can be told of, whose types are of `.0`.
     pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `RUSTD_LAYOUTS` is set.
@@ -149,8 +158,20 @@ pub(super) struct Variable {
     pub(super) binding: BindingId,
     pub(super) param: bool,
     pub(super) ty: StoredTy,
-    /// Where the slot is from the frame pointer.
-    pub(super) offset: i64,
+    /// The number of the stack slot it is kept in.
+    pub(super) slot: u32,
+    /// The slot holds an address rather than the local, which is this far from it.
+    pub(super) pointer: Option<u32>,
+}
+
+/// A local written with a name, as the function that is being built keeps it.
+pub(super) struct Named {
+    pub(super) binding: BindingId,
+    pub(super) param: bool,
+    pub(super) ty: StoredTy,
+    pub(super) slot: ir::StackSlot,
+    /// The slot holds an address rather than the local, which is this far from it.
+    pub(super) pointer: Option<u32>,
 }
 
 /// The value of a static rustc exports no symbol for.
@@ -190,12 +211,16 @@ pub(super) struct Recorder<'db> {
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
     span_ids: FxHashMap<MirSpan, u32>,
-    /// The locals written with a name that have a stack slot of their own, and whether each
-    /// is a parameter.
-    pub(super) named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
+    /// The locals written with a name that a stack slot of their own tells where they are.
+    pub(super) named: Vec<Named>,
 }
 
 impl<'db> Recorder<'db> {
+    /// The stack slots that hold a local written with a name.
+    pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
+        self.named.iter().map(|it| it.slot)
+    }
+
     pub(super) fn new(
         db: &'db dyn HirDatabase,
         isa: &'static dyn TargetIsa,
@@ -248,6 +273,20 @@ impl<'db> Recorder<'db> {
                 .collect()
         });
         (self.requests, layouts)
+    }
+
+    /// The bytes of each data object asked for so far that is read-only and points nowhere,
+    /// by its place among the requests: what a load from it is known to give.
+    #[cfg(feature = "llvm")]
+    pub(super) fn constants(&self) -> impl Iterator<Item = (u32, &[u8])> + '_ {
+        self.requests.datas.iter().enumerate().filter_map(|(index, data)| match data {
+            DataRequest::Blob { blob, identity }
+                if blob.points_nowhere() && *identity != DataIdentity::Writable =>
+            {
+                Some((index as u32, blob.bytes()))
+            }
+            _ => None,
+        })
     }
 
     #[cfg(feature = "llvm")]

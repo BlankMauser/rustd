@@ -127,8 +127,8 @@ struct Args {
     /// The triple to emit code for, when it is not the host: the workspace is loaded as
     /// cargo builds it for that target, and the objects are of its format and architecture.
     target: Option<String>,
-    /// Whether the code is to say which lines it is of: what `profile` asks for.
-    debug: bool,
+    /// What the code has a debugger told: what `profile` asks for.
+    debug: plan::Described,
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
@@ -257,7 +257,7 @@ impl Args {
             profile: profile.unwrap_or_else(|| "dev".to_owned()),
             also,
             target,
-            debug: false,
+            debug: plan::Described::NOTHING,
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
@@ -274,8 +274,11 @@ struct Resolver<'a> {
     base: Option<PathBuf>,
     rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
-    /// Whether the code is to say which lines it is of.
-    debug: bool,
+    /// What the code has a debugger told.
+    debug: plan::Described,
+    /// The object the entries a debugger reads are kept in, when they are kept apart from
+    /// the program.
+    apart: Option<PathBuf>,
     listed: &'a Listed,
     /// For each crate asked about, the paths that functions written in its bodies share.
     shared_paths: std::cell::RefCell<FxHashMap<Crate, FxHashSet<String>>>,
@@ -666,7 +669,7 @@ impl SymbolResolver for Resolver<'_> {
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
                 let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
-                let debug = self.debug;
+                let (debug, apart) = (self.debug, self.apart.clone());
                 let listed = self.listed;
                 scope.spawn(move || {
                     let resolver = Resolver {
@@ -677,6 +680,7 @@ impl SymbolResolver for Resolver<'_> {
                         rustc_commit,
                         contents,
                         debug,
+                        apart,
                         listed,
                         shared_paths: Default::default(),
                     };
@@ -712,7 +716,15 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        self.debug.then(|| self.root.to_string_lossy().into_owned())
+        (self.debug.level != plan::Level::Nothing).then(|| self.root.to_string_lossy().into_owned())
+    }
+
+    fn describes_variables(&self) -> bool {
+        self.debug.level == plan::Level::Full
+    }
+
+    fn debug_apart(&self) -> Option<String> {
+        self.apart.as_ref().map(|it| it.to_string_lossy().into_owned())
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {
@@ -1121,8 +1133,8 @@ struct Checkouts {
     inputs: inputs::Inputs,
     /// Which build of each project is loaded.
     selection: plan::Selection,
-    /// For each of `roots`, whether its profile has the code say which lines it is of.
-    debug: Vec<bool>,
+    /// For each of `roots`, what its profile has a debugger told of the code.
+    debug: Vec<plan::Described>,
 }
 
 impl Checkouts {
@@ -1139,10 +1151,13 @@ impl Checkouts {
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
         // An override for measuring one against the other.
-        let debug = match std::env::var("RUSTD_DEBUGINFO") {
-            Ok(forced) => forced != "0",
-            Err(_) => self.debug[at],
+        let level = match std::env::var("RUSTD_DEBUGINFO").ok().as_deref() {
+            Some("0") => plan::Level::Nothing,
+            Some("lines") => plan::Level::Lines,
+            Some(_) => plan::Level::Full,
+            None => self.debug[at].level,
         };
+        let debug = plan::Described { level, ..self.debug[at] };
         Ok(Parts { root, base, members, debug })
     }
 
@@ -1349,9 +1364,9 @@ impl Checkouts {
                 continue;
             }
             splits.push(None);
-            let (workspace, says_lines) =
+            let (workspace, told) =
                 workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
-            debug.push(says_lines);
+            debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
@@ -1459,12 +1474,12 @@ impl Checkouts {
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
-    /// variables `env`, whether its code says which lines it is of, and how it was loaded.
+    /// variables `env`, what a build of it has a debugger told, and how it was loaded.
     fn loaded_again(
         &self,
         at: usize,
         env: &ide_db::base_db::Env,
-    ) -> anyhow::Result<(ProjectWorkspace, bool, CargoConfig)> {
+    ) -> anyhow::Result<(ProjectWorkspace, plan::Described, CargoConfig)> {
         let (project, root) = &self.roots[at];
         let mut config = self.cargo_config.clone();
         config.extra_env.extend(self.inputs.variables(root, env));
@@ -1474,7 +1489,13 @@ impl Checkouts {
     }
 
     /// Has the checkout at `at` be `workspace`, loaded in full with `config`.
-    fn place(&mut self, at: usize, workspace: ProjectWorkspace, debug: bool, config: &CargoConfig) {
+    fn place(
+        &mut self,
+        at: usize,
+        workspace: ProjectWorkspace,
+        debug: plan::Described,
+        config: &CargoConfig,
+    ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
         self.inputs.watch(&root, &workspace, config);
         self.loaded.replace(at, workspace);
@@ -1489,8 +1510,8 @@ struct Parts {
     root: PathBuf,
     base: Option<PathBuf>,
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
-    /// Whether the code is to say which lines it is of.
-    debug: bool,
+    /// What the build has a debugger told.
+    debug: plan::Described,
 }
 
 /// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
@@ -1625,11 +1646,11 @@ fn workspace_at(
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
-) -> anyhow::Result<(ProjectWorkspace, bool)> {
+) -> anyhow::Result<(ProjectWorkspace, plan::Described)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
-    let mut debug = false;
+    let mut debug = plan::Described::NOTHING;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1645,7 +1666,7 @@ fn workspace_at(
         let triple = triple.first().context("no target to build for")?;
         let asked = plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
         let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
-        debug = plan.debug();
+        debug = plan.described()?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
@@ -1942,6 +1963,7 @@ fn build(
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;
+    let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
     let resolver = Resolver {
         db,
         table,
@@ -1950,6 +1972,7 @@ fn build(
         rustc_commit: Default::default(),
         contents,
         debug,
+        apart,
         listed,
         shared_paths: Default::default(),
     };
@@ -2046,6 +2069,10 @@ fn build(
         // A patch defines again what the object does, and the linker of Mach-O takes two
         // definitions of a name only when one of them gives way.
         weaken::definitions(object);
+        // The files a debugger is sent to are there before the object that sends it.
+        for file in &unit.apart {
+            replace(Path::new(&file.name), &file.bytes)?;
+        }
         replace(&args.out, object)?;
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
