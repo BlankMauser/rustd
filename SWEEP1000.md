@@ -1,9 +1,9 @@
 # The test suites of 1100 crates.io crates through rustd
 
-Branch `rustd-sweep-2`: `rustd-collate` at `ce52276cf5` with `rustd-apps-merged` (`14fad54fcd`)
-and `rustd-sweep-1000` (`f4fca15318`) merged in. Measured on one 8-core, 31 GB Linux x86-64 VM
-with rustc 1.99.0. This file is updated with each push; a section that says "in progress" has
-numbers from a sweep that is still running.
+Branch `rustd-sweep-2`: `rustd-collate` at `f191c6e42a` (which has the fuzzer of `rustd-fuzz`)
+with `rustd-apps-merged` (`14fad54fcd`) and `rustd-sweep-1000` (`f4fca15318`) merged in.
+Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is updated with each
+push; a section that says "in progress" has numbers from a sweep that is still running.
 
 ## The list
 
@@ -16,14 +16,16 @@ this one in versions and in order.
 ## The gate at the merge
 
 Every harness below was run under Cranelift and then under LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`)
-on the merge commit, one backend at a time.
+on the merge with `rustd-collate` at `8f21942505`, one backend at a time. The one commit of
+`rustd-collate` after that, `f191c6e42a`, adds `publish/` and changes nothing that is built or
+tested, so the gate was not run again for it.
 
 | harness | Cranelift | LLVM |
 |---|---|---|
 | `difftest.py corpus --bin runner --crate cases --layouts` | match, 0 of 893 layouts differ | match, 0 of 893 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 109 of 109, 6 open, 0 skipped | 109 of 109, 6 open, 0 skipped |
+| `breakers.py` | 124 of 124, 8 open, 0 skipped | 124 of 124, 8 open, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
@@ -36,6 +38,7 @@ on the merge commit, one backend at a time.
 | `storecorrupts.py --rounds 4` | pass | pass |
 | `storefull.py` | pass | pass |
 | `storeshared.py` | pass, 180 builds | pass, 180 builds |
+| `fuzz/fuzz.py smoke` | 2 programs, 505 functions, 0 differences | 2 programs, 505 functions, 0 differences |
 
 `cargo fmt --all -- --check` is clean and `cargo test --release -p hir-ty -p hir-def -p parser
 -p syntax -p rustd` passes. `cargo clippy -p rustd --all-targets -- --cap-lints warn` prints
@@ -43,11 +46,25 @@ on the merge commit, one backend at a time.
 `rustd-collate`, so "no new warnings" is not established.
 
 The merge made one breaker that was listed as open pass: `backtrace_line`. It is now in the
-passing set.
+passing set. The open breakers are the union of both sides' lists: `raw_write_then_match`,
+`future_unwind_flags`, `fragment_edition_through_macro`, `assert_long_expression`,
+`assert_message` and `unreachable_arm_move` (`harness/breakers.py` counts 8 open cases over
+them).
 
 ## Totals
 
-In progress. The Cranelift sweep is running; the LLVM pass follows it.
+In progress, and not yet a result for this head. The sweep was restarted from the first crate
+with the binary of this head once its gate was green; the LLVM pass follows the Cranelift one.
+
+A partial Cranelift run on the binary of the previous push (`ba877c6c8c`) reached 175 of the
+1100 crates before it was stopped: 140 match, 29 untested (no test binary, or no function of
+the crate reached by a test; the `windows_*` crates are ten of them), 6 stopped by the
+harness and not by rustd, 22,419 tests, 43,985 of 44,009 functions from rustd. The 24 left to
+rustc were in two crates: generic-array (15: `UnresolvedMethod` and layouts of `GenericArray`,
+the next-solver cause `harness/BREAKERS.md` lists as open) and ring (9:
+`MissingFunctionDefinition` and `NotSupported`). Mismatches seen in that run were thrown away
+unexamined, because a second sweep was by mistake running over the same build directories at
+the time, so it says nothing about how many crates differ.
 
 ## How to rerun
 
