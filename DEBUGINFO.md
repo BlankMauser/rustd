@@ -3,7 +3,7 @@
 Branch `rustd-debuginfo`. Everything here is Linux x86-64 ELF. Mach-O and Windows are design
 notes at the end. Rounds one and two (line tables, backtraces, the splice path, variables and
 types under both backends, profile settings) are in `rustd-collate`. Round three is on top of
-`rustd-collate` at f191c6e42a and is described in "Round three" below; the sections marked
+`rustd-collate` at 14ee89181b and is described in "Round three" below; the sections marked
 "round two" are kept as written then, and where they say something else about scopes,
 closures, split debug info, the LLVM counts or cost, "Round three" is right.
 
@@ -53,7 +53,7 @@ Debug info follows the profile; see "Profile settings" below.
 ### At this head
 
 `debuginfo.py` and the whole regression gate pass under both backends on this head (which
-has `rustd-collate` f191c6e42a merged in). What `debuginfo.py` printed:
+has `rustd-collate` 14ee89181b merged in). What `debuginfo.py` printed:
 
 | part | Cranelift | LLVM -O2 |
 |---|---|---|
@@ -71,9 +71,51 @@ has `rustd-collate` f191c6e42a merged in). What `debuginfo.py` printed:
 | last line | `all right (cranelift)` | `all right, 2 open (llvm)` |
 
 The gate: difftest MATCH with 0 of 893 layouts differing, programs 22 of 22, stress 99 of 99,
-breakers 58 of 58 with 7 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 10, includes
+breakers 62 of 62 with 7 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 10, includes
 9 of 9, worktrees 62 of 62, keys 46 of 46 with 0 open, buildmodel 194 of 194 as expected, the
-four store harnesses pass; `cargo fmt` clean, `cargo test` 955 passed, 0 failed, 1 ignored.
+five store harnesses (`storekills`, `storecorrupts`, `storefull`, `storeshared`,
+`storeguards`) pass, `selects.py` 3 of 3, `fuzz/fuzz.py smoke` 0 differences, `backends.py`
+under LLVM 822 of 931 functions compiled, `cargo_rustd.py --small` PASS under both; `cargo
+fmt` clean, `cargo test` 1010 passed, 0 failed, 1 ignored.
+
+Three rows did not pass where the gate first ran them and passed when run again, each for a
+reason of this machine and not of the code. Cranelift's `difftest.py` said `no linker line`
+because both backends' gates began on the one corpus target directory at once; alone it is
+MATCH. `buildmodel.py` had 4 of 194 wrong with `Error: listening on ...`, the two cases with
+the longest names under a scratch `TMPDIR` long enough to put the daemon's socket past the
+length a socket path may have; under `/tmp` it is 194 of 194. `cargo_rustd.py` wants
+`cargo-rustd` beside `rustd`, and the copy of the binary the gate ran had none.
+
+### What the merge of 14ee89181b needed
+
+`rustd-collate` had come to guard the reading of a stored entry against debug types nested
+deeper than a stack can follow, on the types as round two had them, each holding the ones
+inside it. Round three keeps a function's types in one list and names them by index, so
+reading them cannot recurse and that guard is not needed there; the depth is checked
+instead where the entries are written (`DebugContext::ty`, at most `DebugType::DEEPEST`
+inside each other, the rest left out), and the lexical blocks of a function are now built
+without recursion and a scope that is inside itself is left out. The test in `cached.rs`
+reads back an entry with types 40,000 deep, and writes the tables for it, for a scope that
+is its own parent and for scopes 40,000 deep, and sees each end. In `cargo/state.rs` the
+packed debug info (`.dwp`) is installed beside the program where `rustd-collate`'s new code
+installs the program; no harness builds `packed` through `cargo rustd`, so that path is
+compiled and not measured.
+
+### The AArch64 runner's `wrong: 1`
+
+In CI on `rustd-collate` 14ee89181b (run 39086041463, `harness (cranelift, aarch64)`),
+`debuginfo.py` failed on one row: `corpus: .eh_frame and the ranges  DISAGREE  11735
+functions, 1 without an entry, ... 5 of assembly alone`. It is the harness and not the debug
+info, and it is the miscount this branch had already fixed for x86-64: a `#[naked]`
+function has no unwinding entry and no line, and the script took the row that ends the line
+sequence of the function before it, which is at the address the naked one begins at, for a
+line of the naked one. `rustd-collate` has the script from before that fix. Measured here by
+building the corpus for `aarch64-unknown-linux-gnu` with Cranelift on the x86-64 host
+(`RUSTD_TARGET=aarch64-unknown-linux-gnu python3 debuginfo.py --only corpus`) and running
+this branch's script on it: `11735 functions, 0 without an entry, ... 6 of assembly alone`,
+the same 11,735 functions and the same six. It was not run on the runner itself; the rows of
+that cross run that execute the program (panics, gdb) do not apply under qemu and are not
+counted.
 
 Refused, with a reason, when the build is planned: a `debug`, `strip` or `split-debuginfo`
 value rustd does not know. A splice into an executable with compressed debug sections is
@@ -248,20 +290,23 @@ with `RUSTD_DEBUGINFO=0` and without.
 
 | | Cranelift | LLVM -O2 |
 |---|---:|---:|
-| Compile + link, no debug | 6.12 s | 6.53 s |
-| Compile + link, debug | 6.92 s (+13.1%) | 7.43 s (+13.8%) |
-| Object, no debug | 41,500,256 | 37,074,800 |
-| Object, debug | 50,533,168 (+21.8%) | 47,080,264 (+27.0%) |
-| Sections a debugger reads | 4,716,874 | 4,886,745 |
-| Their relocations | 4,316,038 | 5,118,719 |
-| Binary, no debug | 86,998,848 | 83,614,040 |
-| Binary, debug | 91,715,720 | 88,500,784 |
+| Compile + link, no debug | 7.74 s | 7.71 s |
+| Compile + link, debug | 9.00 s (+16.3%) | 8.59 s (+11.4%) |
+| Object, no debug | 41,497,184 | 37,074,488 |
+| Object, debug | 50,463,088 (+21.6%) | 47,015,240 (+26.8%) |
+| Sections a debugger reads | 4,649,872 | 4,821,124 |
+| Their relocations | 4,316,032 | 5,119,628 |
+| Binary, no debug | 86,995,944 | 83,613,408 |
+| Binary, debug | 91,645,816 | 88,434,528 |
 
-Measured at this head with nothing else running. The sizes are exact; the time is not: over
-five runs of this and the previous head Cranelift gave +13.1%, +16.7%, +16.8%, +18.3% and
-+19.2%, and LLVM +13.8% and +15.4% (and +25.3% once with 8.46 s and 10.61 s, a run I take
-for disturbed since the same binary gave 6.53 s and 7.43 s an hour later). Read the time as
-"about 13 to 19 percent".
+Measured at this head. The sizes are exact; the time is not. Each backend was measured
+twice here, once inside the whole `debuginfo.py` run and once alone: Cranelift gave 9.32 s
+and 12.13 s (+30.1%) and then the row above; LLVM gave the row above and then 9.39 s and
+9.66 s (+2.8%). Before the merge of 14ee89181b the same measure gave 6.12 s and 6.92 s
+(+13.1%) for Cranelift and 6.53 s and 7.43 s (+13.8%) for LLVM, and over five earlier runs
+between +13% and +19%. So the build without debug info takes a second or more longer on
+this machine than it did a day ago, with or without the merge I cannot say, and the share
+debug info adds is somewhere between a tenth and a fifth; these runs do not narrow it.
 
 Round two had +13.4% and +10.4% in time and +16.0% and +20.4% in object size. The growth
 since is the lexical blocks, the captures and coroutine variants, the namespaces, and the
