@@ -144,7 +144,7 @@ impl<'a> SymbolCollector<'a> {
         let canonical_name = display_name.canonical_name();
 
         let def_map = crate_def_map(self.db, krate.into());
-        let module_data = &def_map[def_map.crate_root(self.db)];
+        let module_data = &def_map.module(self.db, def_map.crate_root(self.db));
 
         let definition = module_data.origin.definition_source(self.db);
         let hir_file_id = definition.file_id;
@@ -344,7 +344,7 @@ impl<'a> SymbolCollector<'a> {
             };
 
         let def_map = module_id.def_map(self.db);
-        let scope = &def_map[module_id].scope;
+        let scope = def_map.module(self.db, module_id).scope(self.db);
 
         for impl_id in scope.impls() {
             self.collect_from_impl(impl_id);
@@ -417,7 +417,7 @@ impl<'a> SymbolCollector<'a> {
 
         // Descend into the blocks and enqueue collection of all modules within.
         for (_, def_map) in body.blocks(self.db) {
-            for (id, _) in def_map.modules() {
+            for (id, _) in def_map.modules(self.db) {
                 self.work.push(SymbolCollectorWork { module_id: id, parent: name.clone() });
             }
         }
@@ -539,7 +539,7 @@ impl<'a> SymbolCollector<'a> {
 
     fn push_module(&mut self, module_id: ModuleId, name: &Name) {
         let def_map = module_id.def_map(self.db);
-        let module_data = &def_map[module_id];
+        let module_data = &def_map.module(self.db, module_id);
         let Some(declaration) = module_data.origin.declaration() else { return };
         let module = declaration.to_node(self.db);
         let Some(name_node) = module.name() else { return };

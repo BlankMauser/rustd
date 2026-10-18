@@ -515,7 +515,7 @@ impl<'db> SemanticsImpl<'db> {
             HirFileId::FileId(file_id) => {
                 let module = self.file_to_module_defs(file_id.file_id(self.db)).next()?;
                 let def_map = crate_def_map(self.db, module.krate(self.db).id);
-                match def_map[module.id].origin {
+                match def_map.module(self.db, module.id).origin {
                     ModuleOrigin::CrateRoot { .. } => None,
                     ModuleOrigin::File { declaration, declaration_tree_id, .. } => {
                         let file_id = declaration_tree_id.file_id();
@@ -541,7 +541,7 @@ impl<'db> SemanticsImpl<'db> {
     /// the `SyntaxNode` of the *definition* file, not of the *declaration*.
     pub fn module_definition_node(&self, module: Module) -> InFile<SyntaxNode> {
         let def_map = module.id.def_map(self.db);
-        let definition = def_map[module.id].origin.definition_source(self.db);
+        let definition = def_map.module(self.db, module.id).origin.definition_source(self.db);
         let definition = definition.map(|it| it.node());
         let root_node = definition.value.tree_top();
         self.cache(root_node, definition.file_id);

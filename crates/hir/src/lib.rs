@@ -301,7 +301,7 @@ impl Crate {
 
     pub fn modules(self, db: &dyn HirDatabase) -> Vec<Module> {
         let def_map = crate_def_map(db, self.id);
-        def_map.modules().map(|(id, _)| id.into()).collect()
+        def_map.modules(db).map(|(id, _)| id.into()).collect()
     }
 
     pub fn root_file(self, db: &dyn HirDatabase) -> FileId {
@@ -592,8 +592,9 @@ impl Module {
     /// Iterates over all child modules.
     pub fn children(self, db: &dyn HirDatabase) -> impl Iterator<Item = Module> {
         let def_map = self.id.def_map(db);
-        let children = def_map[self.id]
-            .children
+        let children = def_map
+            .module(db, self.id)
+            .children(db)
             .values()
             .map(|module_id| Module { id: *module_id })
             .collect::<Vec<_>>();
@@ -603,7 +604,7 @@ impl Module {
     /// Finds a parent module.
     pub fn parent(self, db: &dyn HirDatabase) -> Option<Module> {
         let def_map = self.id.def_map(db);
-        let parent_id = def_map.containing_module(self.id)?;
+        let parent_id = def_map.containing_module(db, self.id)?;
         Some(Module { id: parent_id })
     }
 
@@ -642,7 +643,7 @@ impl Module {
 
     pub fn modules_in_scope(&self, db: &dyn HirDatabase, pub_only: bool) -> Vec<(Name, Module)> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map.module(db, self.id).scope(db);
 
         let mut res = Vec::new();
 
@@ -663,8 +664,10 @@ impl Module {
         db: &dyn HirDatabase,
         visible_from: Option<Module>,
     ) -> Vec<(Name, ScopeDef<'_>)> {
-        self.id.def_map(db)[self.id]
-            .scope
+        self.id
+            .def_map(db)
+            .module(db, self.id)
+            .scope(db)
             .entries()
             .filter_map(|(name, def)| {
                 if let Some(m) = visible_from {
@@ -704,7 +707,7 @@ impl Module {
 
     pub fn declarations(self, db: &dyn HirDatabase) -> Vec<ModuleDef> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map.module(db, self.id).scope(db);
         scope
             .declarations()
             .map(ModuleDef::from)
@@ -714,13 +717,13 @@ impl Module {
 
     pub fn legacy_macros(self, db: &dyn HirDatabase) -> Vec<Macro> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map.module(db, self.id).scope(db);
         scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into()).collect()
     }
 
     pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
         let def_map = self.id.def_map(db);
-        let scope = &def_map[self.id].scope;
+        let scope = def_map.module(db, self.id).scope(db);
         scope.impls().map(Impl::from).chain(scope.builtin_derive_impls().map(Impl::from)).collect()
     }
 
@@ -776,7 +779,7 @@ impl Module {
 impl HasVisibility for Module {
     fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
         let def_map = self.id.def_map(db);
-        let module_data = &def_map[self.id];
+        let module_data = &def_map.module(db, self.id);
         module_data.visibility
     }
 }
@@ -1132,11 +1135,11 @@ impl EnumVariant {
         let parent_enum = self.parent_enum(db);
         let parent_layout = parent_enum.layout(db)?;
         Ok(match &parent_layout.0.variants {
-            layout::Variants::Multiple { variants, .. } => Layout(
+            layout::Variants::Multiple { .. } => Layout(
                 {
                     let lookup = self.id.lookup(db);
                     let rustc_enum_variant_idx = RustcEnumVariantIdx(lookup.index(db));
-                    Arc::new(variants[rustc_enum_variant_idx].clone())
+                    Arc::new(TyLayout::for_variant(&parent_layout.0, rustc_enum_variant_idx))
                 },
                 db.target_data_layout(parent_enum.krate(db).into()).unwrap(),
             ),
@@ -3794,11 +3797,11 @@ impl Impl {
         return result;
 
         fn extend_with_def_map(db: &dyn HirDatabase, def_map: &DefMap, result: &mut Vec<Impl>) {
-            for (_, module) in def_map.modules() {
-                result.extend(module.scope.impls().map(Impl::from));
-                result.extend(module.scope.builtin_derive_impls().map(Impl::from));
+            for (_, module) in def_map.modules(db) {
+                result.extend(module.scope(db).impls().map(Impl::from));
+                result.extend(module.scope(db).builtin_derive_impls().map(Impl::from));
 
-                for unnamed_const in module.scope.unnamed_consts() {
+                for unnamed_const in module.scope(db).unnamed_consts() {
                     for (_, block_def_map) in Body::of(db, unnamed_const.into()).blocks(db) {
                         extend_with_def_map(db, block_def_map, result);
                     }
@@ -3856,7 +3859,8 @@ impl Impl {
                     .for_self_ty(&simplified_ty, &mut extend_with_impls);
             }
         }
-        result
+        // An impl in a block is one of its crate as well as of the block.
+        result.into_iter().unique().collect()
     }
 
     pub fn all_for_trait(db: &dyn HirDatabase, trait_: Trait) -> Vec<Impl> {
@@ -3876,7 +3880,8 @@ impl Impl {
         {
             handle_impls(impls);
         }
-        all
+        // An impl in a block is one of its crate as well as of the block.
+        all.into_iter().unique().collect()
     }
 
     pub fn trait_(self, db: &dyn HirDatabase) -> Option<Trait> {
@@ -6286,7 +6291,7 @@ impl HasContainer for Module {
     fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
         // FIXME: handle block expressions as modules (their parent is in a different DefMap)
         let def_map = self.id.def_map(db);
-        match def_map[self.id].parent {
+        match def_map.module(db, self.id).parent {
             Some(parent_id) => ItemContainer::Module(Module { id: parent_id }),
             None => ItemContainer::Crate(def_map.krate().into()),
         }
@@ -6514,13 +6519,13 @@ pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
                 .filter_map(|&krate| {
                     let segments = segments.clone();
                     let mut def_map = crate_def_map(db, krate);
-                    let mut module = &def_map[def_map.root_module_id()];
+                    let mut module = def_map.module(db, def_map.root_module_id());
                     let mut segments = segments.with_position().peekable();
                     while let Some((_, segment)) =
                         segments.next_if(|&(position, _)| !position.is_last)
                     {
                         let res = module
-                            .scope
+                            .scope(db)
                             .get(&Name::new_symbol_root(segment))
                             .take_types()
                             .and_then(|res| match res {
@@ -6528,10 +6533,10 @@ pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
                                 _ => None,
                             })?;
                         def_map = res.def_map(db);
-                        module = &def_map[res];
+                        module = def_map.module(db, res);
                     }
                     let (_, item_name) = segments.next()?;
-                    let res = module.scope.get(&Name::new_symbol_root(item_name));
+                    let res = module.scope(db).get(&Name::new_symbol_root(item_name));
                     Some(res.iter_items().map(|(item, _)| item.into()))
                 })
                 .collect::<Vec<_>>()
