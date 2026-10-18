@@ -546,6 +546,11 @@ def daemon(work):
     return checks
 
 
+def greets(out, greeting):
+    """Whether the program of the workspace said `greeting` before what it says of its build."""
+    return out.splitlines()[:1] == [greeting]
+
+
 def abuse(work, ws, tree, env, check, status, alive):
     """The daemon under what it is not asked for politely: many clients at once, a client
     and a daemon killed while a build is asked for, and a client that is another user."""
@@ -566,7 +571,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     spawn = lambda root, *args: subprocess.Popen(["cargo", "rustd", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
     clients = [(n, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees)]
     ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
-    right = [code == 0 and out[0] == f"tree{n} c{i}\n" for n, i, out, code in ended]
+    right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
     by_daemon = sum(how_built(out[1]) == "daemon" for _, _, out, _ in ended)
     check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker")
 
@@ -583,7 +588,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     client.wait()
     freed()
     _, after = here.cargo("run", "again")
-    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and after.stdout == "tree0 again\n" and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and greets(after.stdout, "tree0 again") and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
 
     edit("held two")
     held()
@@ -594,13 +599,13 @@ def abuse(work, ws, tree, env, check, status, alive):
     freed()
     out, err = client.communicate(timeout=600)
     said = how_built(err)
-    check("the build whose daemon is killed is cargo's, is right, and says so", waits and client.returncode == 0 and out == "tree0 killed\n" and "the daemon ended before it answered" in said, said)
+    check("the build whose daemon is killed is cargo's, is right, and says so", waits and client.returncode == 0 and greets(out, "tree0 killed") and "the daemon ended before it answered" in said, said)
     time.sleep(1)
     check("the workers of the killed daemon are gone", not any(alive(p) for p in workers), f"{workers}")
     wait_warm(here, ws)
     edit("after")
     _, after = here.cargo("run", "after")
-    check("the build after that is a new daemon's", after.returncode == 0 and after.stdout == "tree0 after\n" and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
 
     other = os.path.join(work, "other-build")
     older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
@@ -610,11 +615,11 @@ def abuse(work, ws, tree, env, check, status, alive):
     edit("skew")
     _, skewed = older.cargo("run", "skew")
     said = how_built(skewed.stderr)
-    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and skewed.stdout == "tree0 skew\n" and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
     wait_warm(older, ws)
     edit("back")
     _, back = here.cargo("run", "back")
-    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and back.stdout == "tree0 back\n" and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
     wait_warm(here, ws)
 
     stranger(env["RUSTD_HOME"], check)

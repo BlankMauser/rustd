@@ -3188,7 +3188,11 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("build-script") {
         return cargo::script::command(std::env::args_os().skip(2));
     }
-    if std::env::var_os(cargo::wrapper::ENABLED).is_some() {
+    // cargo names rustc first to the wrapper, and gives rustdoc its flags alone: a cargo
+    // that runs the doc tests is told of both.
+    let flags_alone = std::env::args().nth(1).is_some_and(|it| it.starts_with('-'));
+    let for_rustdoc = flags_alone && std::env::var_os(doctest::ENABLED).is_some();
+    if !for_rustdoc && std::env::var_os(cargo::wrapper::ENABLED).is_some() {
         return cargo::wrapper::command(std::env::args_os().skip(1));
     }
     match std::env::args().nth(1).as_deref() {
