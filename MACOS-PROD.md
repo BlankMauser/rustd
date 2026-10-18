@@ -146,7 +146,7 @@ It does not run `cross_musl` and `rustflags_target_cpu` (cases of x86-64 hosts) 
 each port once: it gave the same port to two services before, and SeaweedFS failed to
 start on it.
 
-`breakers.py` reports seven lines as open (`assert_message`, `unreachable_arm_move`,
+`breakers.py` says 7 open in its total, and its log names five cases as open (`assert_message`, `unreachable_arm_move`,
 `raw_write_then_match`, `future_unwind_flags`, `fragment_edition_through_macro`), known wrong and not counted against the run. They
 came with the merges; I did not check whether the same five are open on Linux.
 
