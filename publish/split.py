@@ -31,7 +31,7 @@ def main():
     head = git(src, "rev-parse", "HEAD").strip()
 
     for name in os.listdir(out):
-        if name in (".git", ".gitmodules", "vendor"):
+        if name in (".git", ".gitmodules", "vendor") or name.startswith("target"):
             continue
         path = os.path.join(out, name)
         shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.remove(path)
