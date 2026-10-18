@@ -231,10 +231,15 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 scope(module.scope(db), &mut bodies);
             }
         }
-        while let Some(body) = bodies.pop() {
-            for (_, def_map) in Body::of(db, body).blocks(db) {
-                for (_, module) in def_map.modules(db) {
-                    scope(module.scope(db), &mut bodies);
+        while !bodies.is_empty() {
+            let round = std::mem::take(&mut bodies);
+            // Lowering a body is most of the listing, and the bodies do not wait on each other.
+            self.symbols.in_parallel(round.len(), &|db, _, at| _ = Body::of(db, round[at]));
+            for body in round {
+                for (_, def_map) in Body::of(db, body).blocks(db) {
+                    for (_, module) in def_map.modules(db) {
+                        scope(module.scope(db), &mut bodies);
+                    }
                 }
             }
         }
