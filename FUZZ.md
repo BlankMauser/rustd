@@ -9,7 +9,17 @@ rustc, or a rustd crash is a finding; the driver reduces it and writes it to
 
 Branch `rustd-fuzz`, from `rustd-collate` at 6d12f21c86, with `rustd-collate` at ce52276cf5
 merged in at the end of the first round (27920a4f69, see "The merge") and again at 3d47ed59bf
-in the second (60bc3d6cfa). Everything below was measured on Linux x86-64 with Rust 1.99.0 and
+in the second (60bc3d6cfa). Everything below was measured on The four-backend runs of the second round are not the long run that was asked for. L11
+(360 programs) ran before findings 17 and 19 were fixed and found them. L12 was stopped at 57
+programs when it showed finding 21, and L13, on the binary with that fixed, was stopped at 60
+programs when this work was wound down: 60 programs, 1,800 cases, 17,619 functions generated,
+22,004 compiled under each of the four backends, no difference, no crash, nothing left to
+rustc. So the head has 60 clean programs behind it under the four configurations, not 360,
+and going by the earlier runs a problem shows about once in a few hundred programs. The
+next thing to do is `fuzz.py run --seed L13 --first 60 --rounds 300 --cases 30 --backends
+cranelift,llvm,llvm-O0,llvm-full`.
+
+Linux x86-64 with Rust 1.99.0 and
 LLVM 20.1.8, with a release rustd built with `--features llvm`, except the section "AArch64
 under qemu", which is the same machine building for `aarch64-unknown-linux-gnu` and running
 the binaries with `qemu-aarch64`. macOS, Windows and wasm were not run.
@@ -79,6 +89,7 @@ rustd of the time, so the earlier ones show the bugs that were then fixed.
 | L10 | `L10`, 60 | 27920a4f69 (merged) | 60 | 17,297 | 16,734 | 16,734 | 0 | 0 | 0 |
 | L11 | `L11`, 360, four backends | 8f21942505 (merged) | 360 | 106,339 | 102,475 | 102,475 | 2 under each of the four, checksum (findings 17, 19) | 0 | 0 |
 | L12 | `L12`, 57 (stopped), four backends | 4602a6909f | 57 | 16,727 | 21,388 | 21,388 | 1 under each of the four, checksum (finding 21) | 0 | 3 under each of the four: 2 `intrinsic powif32`, 1 `shares an async block with a function left to rustc` (the same function) |
+| L13 | `L13`, 60 (stopped), four backends | e45ffdff69 | 60 | 17,619 | 22,004 | 22,004 | 0 | 0 | 0 |
 
 L9 is the run on the last binary before the merge described below: 360 programs, none rejected,
 10,800 cases, 106,116 functions generated and 101,848 compiled by rustd under each backend, no
@@ -586,9 +597,10 @@ The runs, each with `python3 fuzz/edits.py run --seed S --rounds N --cases 6 --s
 | E1, 12 rounds of 16 steps | before the fixes | 12 | not kept | 0 | several | 1 | | | |
 | E2, 16 rounds | ea6387473d less the third fix | 16 | 144 | 0 | 3 | 0 | 75 | 66 | 3 |
 | E3, 24 rounds | 4602a6909f | 24 | 218 | 0 | 7 | 0 | 125 | 86 | 7 |
+| E5, 24 rounds | e45ffdff69 | 24 | 235 | 4 (one cause, open, below) | 0 | 0 | 154 | 81 | 0 |
 
-No run had a step whose binary printed the wrong thing: every finding was the daemon saying
-no, or dying. Four causes, all fixed, each with a sequence under `found/edits/`:
+Up to E3 no run had a step whose binary printed the wrong thing: every finding was the daemon
+saying no, or dying. Four causes, all fixed, each with a sequence under `found/edits/`:
 
 - **The daemon died** (`listed-function-gone.rs`, `block-gone.rs`). After an edit that
   removed a function nested in a body, the daemon panicked with `Can't find ast id` in
@@ -615,6 +627,23 @@ no, or dying. Four causes, all fixed, each with a sequence under `found/edits/`:
   rustc's object, and only an edit shows it; whole-build runs count such a function as
   compiled.
 
+E5, on the binary with `powi`, had no refusal and four steps per backend whose output
+differed, in two programs (`E5-15` steps 9 and 10, `E5-21` steps 9 and 10), the same under
+Cranelift and LLVM. This is **open and not looked into**; the work was stopped here. What
+the output shows: the checksums are equal, and the difference is the file name in the
+location of a panic raised inside `core` ("attempt to exponentiate with overflow" in
+`core/src/num/mod.rs`). cargo's binary prints the path of the installed `rust-src`
+(`~/.rustup/toolchains/.../library/core/src/num/mod.rs:1290:5`) and the daemon's binary
+after the edit prints `/rustc/<commit>/library/core/src/num/mod.rs:1290:5`. My guess, not
+checked: after the edit rustd compiled an instance of the integer `pow` itself and named
+the file the way `core`'s metadata does, where rustc maps that path to the local sources
+when they are installed. If so it is a difference in panic text only, it should also show
+in a whole build on a machine with `rust-src` whenever rustd compiles a `core` function
+with a location itself, and the fix is to apply rustc's mapping of `/rustc/<commit>` to the
+sysroot's sources. The first sequence is kept as `found/edits-open/std-panic-path.rs` (294
+lines, not reduced further; it is outside `found/edits/` so that `edits.py check` stays
+green).
+
 The refusals were correct behaviour in the sense of the rules (stated reason, the build falls
 back to cargo), but each stood for an edit a user would have had to rebuild for. Why the
 daemon linked in full instead of splicing, in E3 under Cranelift: 55 times the whole object
@@ -633,12 +662,21 @@ AArch64 with the `aarch64-linux-gnu-gcc` linker and runs the binaries with `qemu
 | Run | rustd | Programs | Functions generated | Compiled per backend | Cranelift | LLVM `-O2` fast | LLVM `-O0` | LLVM `-O2` full |
 |---|---|---:|---:|---:|---|---|---|---|
 | A1, 24 rounds | ea6387473d | 24 | 7,049 | 8,515 | 0 | 3 died (finding 20) | 0 | 0 |
+| A2, 20 of 24 rounds (stopped) | 4602a6909f | 20 | 5,694 | 7,355 | 0 | 0 | 0 | 0 |
 
 So the generator does find target-specific differences: three programs in 24 died on AArch64
 under one LLVM configuration and are right on x86-64 under all four. All three are finding
 20, and all three are right with the workaround (`fuzz.py repro A1-17`, `A1-21`, `A1-23`
 with `--backends llvm`). Cranelift on AArch64 had no finding in these 24 programs, which at
 7,000 functions is a small sample next to the x86-64 runs.
+
+A2 ran on the binary with the workaround and without `powi`, and was stopped at 20
+programs: no difference and no crash under any of the four, and under each of them three
+functions left to rustc in two programs, all from `powi` (`A2-10`: `intrinsic powif32`;
+`A2-17`: a `thread_local!` in a function left to rustc for `powi`, reported as `writable
+static without a rustc symbol`, and the `async` block that shares it). The reduction of
+`A2-17` is right for AArch64 with the `powi` binary; `A2-10` was not run again. So the
+only target-specific finding in 44 AArch64 programs is finding 20.
 
 ## The merge
 
@@ -704,6 +742,17 @@ The other harnesses `rustd-collate` has in CI now (`keys.py`, `backends.py`, `de
 not run them on the merged head.
 
 ## Open, and not done
+
+Stopped mid-way when the work was wound down; in order of what I would do next:
+
+- The difference E5 found in generated edits (the path in a panic location inside `core`,
+  see "Generated edits") is open and its cause is a guess.
+- The four-backend long run on the head is 60 programs (L13), not 360.
+- `rustd-collate-next` is not merged into this branch; `rustd-collate` at 3d47ed59bf is.
+  The gate was last run on e45ffdff69 and passed under both backends.
+- A2 was not run again on the head, and no AArch64 run has the `powi` fix.
+- There is no table of how often each scene was generated in a run; `fuzz.py run
+  --coverage` prints it.
 
 - Finding 3, the `assert!` message, is open for the reason above.
 - Finding 6 is a workaround. The honest fix is in LLVM; the cost of running without the SLP
