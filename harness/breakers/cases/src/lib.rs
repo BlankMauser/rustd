@@ -133,6 +133,7 @@ cases![
     static_enum_slice,
     const_none_niche,
     late_import_macro,
+    late_import_in_body,
     line_continuation,
     static_in_static,
     type_id_of_fn,

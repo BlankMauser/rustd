@@ -6649,6 +6649,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
+        // The evaluator has the placeholders rust-analyzer expands these to.
+        if !location_macros(db, id.into()).is_empty() || !located_concats(db, id.into()).is_empty()
+        {
+            unsupported!("a static with `line!()`, `column!()` or `file!()` in its value");
+        }
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;

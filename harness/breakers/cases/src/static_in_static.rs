@@ -40,6 +40,19 @@ fn plain() -> [&'static str; 2] {
     [first.meta.name, second.meta.name]
 }
 
-pub fn run() -> (String, [&'static str; 2]) {
-    (sites::<u8>(), plain())
+/// A site in a closure in a closure, after those of the outer closure: its statics are
+/// told from the others by the places of both.
+fn nested() -> Vec<&'static str> {
+    let outer = || {
+        let first = site!("first");
+        let second = site!("second");
+        let third = site!("third");
+        let inner = || site!("inner");
+        vec![first, second, third, inner()]
+    };
+    outer().iter().map(|it| it.meta.site.meta.name).collect()
+}
+
+pub fn run() -> (String, [&'static str; 2], Vec<&'static str>) {
+    (sites::<u8>(), plain(), nested())
 }

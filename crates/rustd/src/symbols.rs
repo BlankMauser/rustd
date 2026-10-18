@@ -31,6 +31,7 @@ struct NestedSymbol {
     name: String,
     closures: Vec<u32>,
     place: Option<u64>,
+    around: Vec<u64>,
 }
 
 struct Placed {
@@ -38,12 +39,15 @@ struct Placed {
     /// The place of the item among those of its name in what it is written in, which rustc
     /// mangles into the symbol and no path says. `None` for a symbol we can't read it from.
     place: Option<u64>,
+    /// The places of the items it is written in, the outermost first.
+    around: Vec<u64>,
 }
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
 struct Symbol {
     name: String,
     place: Option<u64>,
+    around: Vec<u64>,
     with_ids: String,
     path: String,
 }
@@ -107,7 +111,7 @@ impl SymbolTable {
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
         let table = self;
-        for Symbol { name, place, with_ids, path } in symbols {
+        for Symbol { name, place, around, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
@@ -124,7 +128,8 @@ impl SymbolTable {
                     .collect();
                 let symbols = table.nested.entry(named.join("::")).or_default();
                 if symbols.iter().all(|it| it.name != name) {
-                    symbols.push(NestedSymbol { name: name.clone(), closures, place });
+                    let around = around.clone();
+                    symbols.push(NestedSymbol { name: name.clone(), closures, place, around });
                 }
             }
             let known = table.by_path.entry(path).or_default();
@@ -132,7 +137,7 @@ impl SymbolTable {
                 without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
             };
             if !known.iter().any(same) {
-                known.push(Placed { name, place });
+                known.push(Placed { name, place, around });
             }
         }
     }
@@ -192,6 +197,7 @@ impl SymbolTable {
         symbols.push(Symbol {
             name: name.to_owned(),
             place: V0::place(name),
+            around: V0::places_around(name).unwrap_or_default(),
             with_ids,
             path: format!("{demangled:#}"),
         });
@@ -260,15 +266,18 @@ impl SymbolTable {
     }
 
     /// The symbol of the item at `path` that is the `place`th of its name in what it is
-    /// written in.
-    pub(crate) fn get_at(&self, path: &str, place: u64) -> Option<&str> {
+    /// written in. `around` are the places of the innermost items it is written in, as far
+    /// out as they tell it apart: a static in the value of the second static of a name.
+    pub(crate) fn get_at(&self, path: &str, place: u64, around: &[u64]) -> Option<&str> {
         let mut symbols = match &**self.by_path.get(path)? {
             [only] => {
                 return Some(only)
                     .filter(|it| it.place.is_none_or(|it| it == place))
                     .map(|it| &*it.name);
             }
-            symbols => symbols.iter().filter(|it| it.place == Some(place)),
+            symbols => {
+                symbols.iter().filter(|it| it.place == Some(place) && it.around.ends_with(around))
+            }
         };
         let symbol = symbols.next()?;
         symbols.next().is_none().then_some(&*symbol.name)
@@ -277,10 +286,16 @@ impl SymbolTable {
     /// The symbol of an item whose path has unnamed segments between the named ones given.
     ///
     /// `closures` are the numbers rustc gives the closures around the item, outermost first,
-    /// which tell apart the items that only differ in those, and `place` is as in `get_at`.
-    /// Anonymous constants are not numbered, so two items that differ in one of those have
-    /// no symbol here.
-    pub(crate) fn get_nested(&self, named: &str, closures: &[u32], place: u64) -> Option<&str> {
+    /// which tell apart the items that only differ in those, and `place` and `around` are as
+    /// in `get_at`. Anonymous constants are not numbered, so two items that differ in one of
+    /// those have no symbol here.
+    pub(crate) fn get_nested(
+        &self,
+        named: &str,
+        closures: &[u32],
+        place: u64,
+        around: &[u64],
+    ) -> Option<&str> {
         let here = |it: &&NestedSymbol| it.place.is_none_or(|known| known == place);
         let mut symbols = match &**self.nested.get(named)? {
             // Its closures may be numbered otherwise than here, but are as many.
@@ -290,7 +305,10 @@ impl SymbolTable {
                     .filter(|it| it.closures.len() == closures.len())
                     .map(|it| &*it.name);
             }
-            symbols => symbols.iter().filter(here).filter(|it| it.closures == closures),
+            symbols => symbols
+                .iter()
+                .filter(here)
+                .filter(|it| it.closures == closures && it.around.ends_with(around)),
         };
         let symbol = symbols.next()?;
         symbols.next().is_none().then_some(&*symbol.name)
@@ -395,6 +413,27 @@ impl V0<'_> {
     /// that name in what it is written in, `1` for the next.
     fn place(symbol: &str) -> Option<u64> {
         V0 { rest: symbol.strip_prefix("_R")?.as_bytes() }.path()
+    }
+
+    /// The disambiguators of the names in the path of a symbol before the last, outermost
+    /// first: those of what an item is written in. A closure has no name.
+    fn places_around(symbol: &str) -> Option<Vec<u64>> {
+        let mut symbol = V0 { rest: symbol.strip_prefix("_R")?.as_bytes() };
+        let mut namespaces = Vec::new();
+        while symbol.eat(b'N') {
+            namespaces.push(symbol.next()?);
+        }
+        symbol.path()?;
+        let mut places = Vec::new();
+        for namespace in namespaces.into_iter().rev() {
+            let place = symbol.disambiguator()?;
+            symbol.identifier()?;
+            if namespace.is_ascii_lowercase() {
+                places.push(place);
+            }
+        }
+        places.pop();
+        Some(places)
     }
 
     fn next(&mut self) -> Option<u8> {
@@ -622,5 +661,9 @@ mod tests {
         assert_eq!(V0::place(first), Some(0));
         assert_eq!(V0::place(second), Some(1));
         assert_eq!(V0::place(third), Some(2));
+        let inner = "_RNvNvNCNCNvCs3XX9e4g8R7s_8filtereds_14trace_filtered00s_10___CALLSITE4META";
+        assert_eq!(V0::place(inner), Some(0));
+        assert_eq!(V0::places_around(inner), Some(vec![1, 1]));
+        assert_eq!(V0::places_around(third), Some(vec![0]));
     }
 }

@@ -669,7 +669,7 @@ impl SymbolResolver for Resolver<'_> {
         // that describes it to the harness before it, under the same name.
         let function = hir::Function::from(func);
         let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
-            self.table.get_at(&path, 1)
+            self.table.get_at(&path, 1, &[])
         } else {
             self.table.get(&path)
         };
@@ -797,6 +797,7 @@ impl SymbolResolver for Resolver<'_> {
         let source = sema.source(it)?;
         let mut names = vec![name.as_str().to_owned()];
         let mut closures = Vec::new();
+        let mut around = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
             if is_closure(&node) {
@@ -818,11 +819,25 @@ impl SymbolResolver for Resolver<'_> {
                     _ => None,
                 }
             };
-            names.extend(name.map(|it| it.text().to_string()));
+            if let Some(name) = name {
+                let named = |other: &SyntaxNode| {
+                    let other = match_ast! {
+                        match other {
+                            ast::Const(it) => it.name(),
+                            ast::Static(it) => it.name(),
+                            _ => None,
+                        }
+                    };
+                    other.is_some_and(|it| it.text() == name.text())
+                };
+                around.push(place_in_definition(&sema, &node, &named)?.into());
+                names.push(name.text().to_string());
+            }
         }
         let owner = match owner {
             Some(owner) => owner,
             None => {
+                around.pop();
                 let outer = names.pop()?;
                 self.item_path(module.nearest_non_block_module(self.db), &outer)?
             }
@@ -830,6 +845,7 @@ impl SymbolResolver for Resolver<'_> {
         names.push(owner);
         names.reverse();
         closures.reverse();
+        around.reverse();
         let path = names.join("::");
         // Only a path through a closure or an anonymous constant has segments left out of it.
         let named = |node: &SyntaxNode| {
@@ -839,8 +855,8 @@ impl SymbolResolver for Resolver<'_> {
         let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
         let symbol = self
             .table
-            .get_nested(&path, &closures, place)
-            .or_else(|| self.table.get_at(&path, place));
+            .get_nested(&path, &closures, place, &around)
+            .or_else(|| self.table.get_at(&path, place, &around));
         symbol.map(str::to_owned)
     }
 
@@ -915,18 +931,39 @@ impl LateImports {
     fn around(sema: &hir::Semantics<'_, RootDatabase>, owner: &SyntaxNode) -> LateImports {
         let mut late = LateImports::default();
         let module_expanded = module_is_expanded(sema, owner);
+        let expanded = |node: &SyntaxNode| {
+            module_expanded
+                || sema.hir_file_for(node).is_macro()
+                || sema
+                    .ancestors_with_macros(node.clone())
+                    .filter_map(ast::Item::cast)
+                    .any(|item| has_attribute_macro(sema, &item))
+        };
+        if expanded(owner) {
+            late.add_written_in(owner);
+        }
         for scope in sema.ancestors_with_macros(owner.clone()) {
-            let expanded = module_expanded || sema.hir_file_for(&scope).is_macro();
-            for import in scope.children().filter_map(ast::Use::cast) {
-                if let (true, Some(tree)) = (expanded, import.use_tree()) {
-                    late.add(&tree, None);
-                }
+            if expanded(&scope) {
+                let imports = scope.children().filter_map(ast::Use::cast);
+                imports.filter_map(|it| it.use_tree()).for_each(|tree| late.add(&tree, None));
             }
             if ast::Module::can_cast(scope.kind()) {
                 break;
             }
         }
         late
+    }
+
+    /// Adds the imports written in the blocks of a definition, those of the definitions in
+    /// it apart.
+    fn add_written_in(&mut self, node: &SyntaxNode) {
+        for child in node.children() {
+            if let Some(tree) = ast::Use::cast(child.clone()).and_then(|it| it.use_tree()) {
+                self.add(&tree, None);
+            } else if !is_definition(&child) {
+                self.add_written_in(&child);
+            }
+        }
     }
 
     /// Adds the names the tree brings in, `prefix` being the last name of the path before it.
@@ -943,6 +980,18 @@ impl LateImports {
             self.names.extend(own);
         }
     }
+}
+
+/// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
+/// is one, though it leaves the item as it is written.
+fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item) -> bool {
+    sema.resolve_attr_macro_call(item).is_some()
+        || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
+            matches!(
+                sema.resolve_path(&path),
+                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if found.is_attr(sema.db)
+            )
+        })
 }
 
 /// Whether a macro expanded to the module the node is in, or to one around it.
@@ -1076,27 +1125,56 @@ impl Count<'_, '_> {
 
     /// Whether the macro is a `macro_rules!` one found by where it is written, which is
     /// before an import of the name is looked for: one written earlier, beside something
-    /// the use is in. None when one in scope by `#[macro_use]` may be, which is not known.
+    /// the use is in, or in a `#[macro_use]` module that is. None when that is not known:
+    /// a macro expanded to it or to a module around it.
     fn in_textual_scope(&self, call: &ast::MacroCall) -> Option<bool> {
         let sema = self.sema;
-        let Some(source) = sema.resolve_macro_call(call).and_then(|it| sema.source(it)) else {
-            return Some(false);
-        };
+        let Some(found) = sema.resolve_macro_call(call) else { return Some(false) };
+        let Some(source) = sema.source(found) else { return Some(false) };
         let Some(ast::Macro::MacroRules(rules)) = source.value.left() else {
             return Some(false);
         };
         let named = rules.name().map(|it| it.text().to_string());
         let used = call.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
-        if named != used {
+        // Another crate's are in scope by `#[macro_use]`, which is looked in after imports.
+        let home = found.module(sema.db).krate(sema.db);
+        if named != used || Some(home) != sema.scope(call.syntax()).map(|it| it.krate()) {
             return Some(false);
         }
-        let rules = rules.syntax();
-        let beside = sema.ancestors_with_macros(call.syntax().clone()).any(|around| {
-            around.parent() == rules.parent()
-                && sema.hir_file_for(&around) == source.file_id
-                && rules.text_range().end() <= around.text_range().start()
-        });
-        beside.then_some(true)
+        let mut module = found.module(sema.db);
+        let mut written = hir::InFile::new(source.file_id, rules.syntax().clone());
+        loop {
+            if written.file_id.is_macro() {
+                return None;
+            }
+            let beside = sema.ancestors_with_macros(call.syntax().clone()).any(|around| {
+                around.parent() == written.value.parent()
+                    && sema.hir_file_for(&around) == written.file_id
+                    && written.value.text_range().end() <= around.text_range().start()
+            });
+            if beside {
+                return Some(true);
+            }
+            // The scope goes on after a module that is `#[macro_use]`.
+            let inline = written.value.ancestors().skip(1).find_map(ast::Module::cast);
+            let around = match inline {
+                Some(inline) => written.with_value(inline),
+                None => match module.declaration_source(sema.db) {
+                    Some(declared) => declared,
+                    None => return Some(false),
+                },
+            };
+            let goes_on = ast::HasAttrs::attrs(&around.value)
+                .any(|it| it.simple_name().is_some_and(|name| name == "macro_use"));
+            if !goes_on {
+                return Some(false);
+            }
+            module = match module.parent(sema.db) {
+                Some(parent) => parent,
+                None => return Some(false),
+            };
+            written = around.map(|it| it.syntax().clone());
+        }
     }
 }
 
