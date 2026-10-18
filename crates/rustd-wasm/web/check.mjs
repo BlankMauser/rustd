@@ -2,11 +2,19 @@
 // twice, and checks that what it draws follows the edits while its balls stay.
 
 import assert from "node:assert";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { Compiler } from "./compiler.js";
 import { Program } from "./program.js";
 
-const read = (name) => readFileSync(new URL(name, import.meta.url));
+// `node check.mjs <directory>` checks what `build-site.sh` put there, gzipped, instead.
+const root = process.argv[2] ? pathToFileURL(`${resolve(process.argv[2])}/`) : new URL(".", import.meta.url);
+const read = (name) => {
+  const plain = new URL(name, root);
+  return existsSync(plain) ? readFileSync(plain) : gunzipSync(readFileSync(new URL(`${name}.gz`, root)));
+};
 const compiler = await Compiler.load(read("pkg/rustd_wasm.wasm"), read("pkg/core.bundle"));
 let calls = [];
 const program = new Program({

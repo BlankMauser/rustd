@@ -173,8 +173,8 @@ There are two layers, and they support different things.
 
 The daemon itself, driven by the harness, follows most of cargo's build model.
 `harness/buildmodel.py` has a small project per feature and compares against cargo under
-both backends. The latest recorded result is 180 of 180 on Linux x86-64 and 176 of 176 on
-native AArch64, where four rows that need an x86-64 host are not run (PLAT-ABI2.md).
+both backends. The latest recorded result is 208 of 208 on Linux x86-64 and 204 of 204 on
+native AArch64, where four rows that need an x86-64 host are not run (CI on `51339e5`).
 [reports/BUILDMODEL.md](reports/BUILDMODEL.md) has the table at 97 cases per backend, of
 which 92 were supported and 5 refused.
 

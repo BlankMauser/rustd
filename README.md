@@ -43,6 +43,26 @@ Read this section before relying on it.
   problems, most of them miscompiles. Four known differences from rustc are open and listed in
   [docs/support.md](docs/support.md).
 
+## Install
+
+On macOS arm64, Linux x86-64 and Linux AArch64:
+
+    curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh
+
+On Windows x86-64, in PowerShell:
+
+    irm https://dioxuslabs.github.io/rustd/install.ps1 | iex
+
+The script downloads the latest [release](https://github.com/DioxusLabs/rustd/releases),
+checks it against the release's SHA-256 sums and puts `rustd`, `cargo-rustd` and
+`rustd-rustc` in `~/.cargo/bin`. `RUSTD_VERSION=nightly` takes the newest build of `main`
+instead. You still need Rust 1.99.0 with `rust-src`:
+
+    rustup toolchain install 1.99.0 --component rust-src
+
+The released binaries have the Cranelift backend only. The LLVM backend links LLVM 20 from
+the machine it runs on, so it is built from source.
+
 ## Build from source
 
 You need Rust 1.99.0 with the `rust-src` component. LLVM 20 is optional and adds the LLVM
@@ -60,10 +80,10 @@ Ubuntu, `llvm-20-dev` and `libpolly-20-dev` from apt.llvm.org):
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.0 build -p rustd --release --features llvm
 
-The build leaves `rustd` and `cargo-rustd` in `target/release`. Put both in one directory on
-your `PATH`; `cargo-rustd` runs the `rustd` next to it.
+The build leaves `rustd`, `cargo-rustd` and `rustd-rustc` in `target/release`. Put all three
+in one directory on your `PATH`; each runs the others from next to itself.
 
-    cp target/release/rustd target/release/cargo-rustd ~/.cargo/bin/
+    cp target/release/{rustd,cargo-rustd,rustd-rustc} ~/.cargo/bin/
 
 ## Quick start
 
