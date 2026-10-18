@@ -1,7 +1,7 @@
 # macOS arm64: debug info, the build model and the store
 
-Branch `rustd-macos-prod`, cut from `rustd-macos-abi2`, with `rustd-collate` merged in three
-times: 0151c01218, 526f2963ba and last ce52276cf5. Everything under "Measured" ran
+Branch `rustd-macos-prod`, cut from `rustd-macos-abi2`, with `rustd-collate` merged in several
+times, last at f191c6e42a. Everything under "Measured" ran
 natively on an Apple Silicon Mac (`uname -m` is
 `arm64`, macOS 26.5.2, stable 1.99.0-aarch64-apple-darwin, LLVM 20.1.8 from Homebrew). The
 x86_64-apple-darwin attempt ran under Rosetta 2 and is described separately. Nothing here
@@ -111,22 +111,24 @@ numbers say little about a real drive, where `F_FULLFSYNC` is known to cost far 
 
 ## The gate, measured
 
-Native arm64, on the merge of `rustd-collate` ce52276cf5 into this branch, the binary built
+Native arm64, on the merge of `rustd-collate` 8f21942505 into this branch, the binary built
 with `--features llvm`. Each column is one whole run, one harness after another, nothing
-else running beside it.
+else running beside it. The head also has f191c6e42a merged, which adds two files under
+`publish/` and no code, so the gate was not run again for it. The merge of ce52276cf5
+before it passed the same gate with the same counts, but for `breakers.py` at 43 of 43.
 
 | harness | Cranelift | LLVM `-O2` fast emit |
 |---|---|---|
 | `difftest.py corpus --layouts` | MATCH, 828 of 828 from rustd; layouts 0 of 914 differ | MATCH, 828 of 828; 0 of 914 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 43 of 43, 5 open, 0 skipped | 43 of 43, 5 open, 0 skipped |
+| `breakers.py` | 58 of 58, 7 open, 0 skipped | 58 of 58, 7 open, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
 | `splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` / `includes.py` | 10 of 10, 9 of 9 | 10 of 10, 9 of 9 |
 | `worktrees.py` plain / `--join --together` / `--overlay` | 62 of 62, 62 of 62, 71 of 71 | 62 of 62, 62 of 62, 71 of 71 |
 | `keys.py` | 46 of 46, 0 open | 46 of 46, 0 open |
-| `backends.py corpus --levels 2f` | not run | LLVM compiled 11879 of 11879 functions, none left to Cranelift; prints the same as cargo |
+| `backends.py corpus --levels 2f` | not run | LLVM compiled 11893 of 11893 functions, none left to Cranelift; prints the same as cargo |
 | `debuginfo.py` | all right | all right |
 | `buildmodel.py` | 188 of 188 as expected, 0 wrong | 188 of 188, 0 wrong |
 | `storekills.py --kills 100` | pass | pass |
@@ -144,7 +146,8 @@ It does not run `cross_musl` and `rustflags_target_cpu` (cases of x86-64 hosts) 
 each port once: it gave the same port to two services before, and SeaweedFS failed to
 start on it.
 
-`breakers.py` counts five cases as open, known wrong and not counted against the run. They
+`breakers.py` reports seven lines as open (`assert_message`, `unreachable_arm_move`,
+`raw_write_then_match`, `future_unwind_flags`, `fragment_edition_through_macro`), known wrong and not counted against the run. They
 came with the merges; I did not check whether the same five are open on Linux.
 
 ### `cargo rustd` on Mach-O
