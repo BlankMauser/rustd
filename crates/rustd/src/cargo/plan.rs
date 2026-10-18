@@ -436,6 +436,7 @@ mod tests {
             left_to_rustc: Vec::new(),
             copies: Vec::new(),
             stamp: 0,
+            package: None,
         };
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap();
