@@ -14,7 +14,7 @@ macOS, Windows, aarch64 and wasm were not run.
 
 ## Result
 
-The fuzzer found sixteen distinct problems. Fourteen are fixed in rustd, one is worked around (it is a
+The fuzzer found eighteen distinct problems. Sixteen are fixed in rustd, one is worked around (it is a
 bug in LLVM, not in rustd), and one is open. Each has a reduced case in `harness/breakers/`.
 
 | # | What | Backends | Status | Breaker case |
@@ -35,8 +35,10 @@ bug in LLVM, not in rustd), and one is open. Each has a reduced case in `harness
 | 14 | When an arm bound part of an array by value (`[_, middle @ .., _] if guard`) and its guard was false, the elements put back into the array were never dropped | both | fixed, 49c4fddd1f | `guard_subslice_restored` |
 | 15 | An array matched by an arm that would move elements out, where rustc can tell from the arms before it that no value reaches that arm, is dropped from the back instead of front to back | both | fixed, 20d97d4d73 | `unreachable_arm_move` |
 | 16 | When an operand of an aggregate or call panicked and the expression was the tail of a block, the operands already made were dropped in the wrong order relative to the temporaries (finding 4 again, outside a statement) | both | fixed, 27a94f2770 | `unwind_operand_tail`, `unwind_operand_order` |
+| 17 | When an operand of an aggregate that is itself an operand of another aggregate panicked, the outer aggregate's finished operands were dropped before the inner one's | both | fixed, 5fba09c841 | `unwind_nested_operands` |
+| 18 | Before the 2024 edition, when an operand of the tail of a block panicked, the block's locals were dropped before the tail's finished operands | both | fixed in this commit | `unwind_tail_after_local` |
 
-Numbers 4, 6, 7 and 9 to 16 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
+Numbers 4, 6, 7 and 9 to 18 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
 are wrong panic text. Numbers 5 and 8 are functions rustd refused, with the reason stated, so the
 program was still right.
 
@@ -414,9 +416,33 @@ braces and, from the 2024 edition, the tail of a block; there everything is in o
 (`3, 50, 30, 20, 1`). rustd now keeps the set of those expressions and applies the fix of
 finding 4 to every other aggregate or call. Reduction: `differs-checksum-L8-231-c11.rs`.
 
-`fuzz.py check fuzz/found/*.rs` with the binary of 20d97d4d73: all 30 files give the same
+**17. Operands of an aggregate inside an aggregate.** Found by the first run of the widened
+generator (`S1-1`, and `L11-133` under all four backends). In
+
+    (Noisy(27), Duo { a: Noisy(39), b: trip(armed, Noisy(15)) })
+
+when `trip` panics rustc drops `39` and then `27`: the inner literal's operands are newer.
+rustd dropped `27` first. The lowering that puts operands in front of temporaries (findings 4
+and 16) ran once for the inner literal and again for the outer one, and the second pass
+counted the inner operands as temporaries of the outer and moved them. It now remembers
+which locals are operands and keeps them in the order they were made. Reductions:
+`differs-checksum-S1-1-c22.rs`, `differs-checksum-L11-133-c4.rs`.
+
+**18. The tail of a block and the block's locals.** Also from the widened generator
+(`S1-2`, `S1-4`, `S1-6`, `S1-11`, `S1-13` were all this). In a 2021 program
+
+    let _v = { let _local = Noisy(57); (Noisy(58), trip(armed, Noisy(47))) };
+
+when `trip` panics rustc drops `58`, then `57`. Before 2024 the temporaries of a block's tail
+outlive the block's locals, and rustd handed everything the tail made to the enclosing scope,
+its operands too, so `57` went first. Only the temporaries are handed over now; the operands
+stay in the block. I checked rustc's order with this program under both editions: it is
+`58, 57` in both, and rustd was already right in 2024. Reduction:
+`differs-checksum-S1-2-c7.rs`.
+
+`fuzz.py check fuzz/found/*.rs` with the binary of this commit: all 33 files give the same
 output as rustc under both backends, with no function left to rustc
-(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`, 60 lines of `same`).
+(`RUSTD_BIN=rustd python3 fuzz/fuzz.py check fuzz/found/*.rs`, 66 lines of `same`).
 
 ## The merge
 
