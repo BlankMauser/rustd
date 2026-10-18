@@ -844,6 +844,9 @@ class Soak:
         os.makedirs(where, exist_ok=True)
         with open(os.path.join(where, "requests.json"), "w") as out:
             json.dump(odd, out, indent=1)
+        self.keep_logs(where)
+
+    def keep_logs(self, where):
         home = self.env["RUSTD_HOME"]
         for log in [os.path.join(home, "daemon.log"), *glob.glob(os.path.join(home, "workers", "*", "log"))]:
             if os.path.exists(log):
@@ -859,7 +862,11 @@ class Soak:
             open(os.path.join(where, "status.txt"), "w").write(self.status())
         except (subprocess.TimeoutExpired, OSError):
             pass
+        self.keep_logs(where)
         for tree in self.touched:
+            # What the daemon linked of the tree that differs.
+            for at, built in enumerate(glob.glob(os.path.join(tree.root, "target", "rustd", "*", "programs", "*", "rustd.o"))):
+                shutil.copy(built, os.path.join(where, f"{self.name(tree).replace('/', '-')}-{at}-{os.path.basename(os.path.dirname(built))}.o"))
             diff = tree.git("diff", "HEAD", check=False).stdout if os.path.isdir(tree.root) else ""
             open(os.path.join(where, self.name(tree).replace("/", "-") + ".diff"), "w").write(diff)
         self.state["failures"].append(dict(step=step, why=why[:2000]))

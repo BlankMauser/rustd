@@ -54,7 +54,7 @@ use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource, TargetDirectoryConfig, TargetKind,
+    RustLibSource, TargetKind,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -1233,16 +1233,6 @@ impl Checkouts {
             let (workspace, says_lines) =
                 workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
             debug.push(says_lines);
-            // The checkouts after the first run their build scripts where the first did. A
-            // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
-            // crate for all.
-            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-                && self.cargo_config.target_dir_config == TargetDirectoryConfig::None
-            {
-                let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-                self.cargo_config.target_dir_config =
-                    TargetDirectoryConfig::Directory(target.to_owned());
-            }
             let root = PathBuf::from(workspace.workspace_root().to_string());
             self.inputs.watch(&root, &workspace, &self.cargo_config);
             roots.push((dunce::canonicalize(project)?, root));

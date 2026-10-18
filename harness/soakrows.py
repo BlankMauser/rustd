@@ -329,6 +329,29 @@ def worktrees_built_apart(row):
     asked_after_the_other("the first", tree, os.path.join(tree, "core/src/lib.rs"))
 
 
+def worktrees_that_run_other_code(row):
+    """Two worktrees whose proc macro and build script data differ, in one daemon: cargo
+    names what each builds of them alike, so neither may be built where the other was. The
+    files of the one asked second are the older ones, which is when cargo would take what
+    the first built as fresh."""
+    row.git("branch", "-M", "master")
+    tree = os.path.join(row.dir, "tree")
+    row.git("worktree", "add", "-q", tree, "-b", "one")
+    time.sleep(1.1)
+    gen, data = row.path("gen/src/lib.rs"), row.path("core/data.txt")
+    in_place(gen, open(gen).read().replace("const SALT: u64 = 7;", "const SALT: u64 = 5;"))
+    in_place(data, re.sub(r"^alpha \d+", "alpha 2", open(data).read(), flags=re.M))
+    row.git("commit", "-qam", "another salt and other data")
+    row.warm()
+    row.both("the first, with a salt and data of its own", want="Reading/5")
+    row.both("the worktree asked second", ws=tree, want="Reading/7")
+    row.warm(ws=tree)
+    for ws, salt in ((tree, 7), (row.ws, 5), (tree, 7)):
+        row.edit(os.path.join(ws, "core/src/lib.rs"))
+        how, _ = row.both(f"salt {salt}, edited", ws=ws, want=f"Reading/{salt}")
+        row.warm(ws=ws)
+
+
 def non_utf8_names(row):
     src = row.path("core/src").encode()
     with open(os.path.join(src, b"caf\xe9.rs"), "wb") as file:
@@ -569,6 +592,60 @@ def proc_macro_tests(row):
     row.both("the proc macro alone", command="test", args=("-p", "soak-gen"))
 
 
+def another_under_test(row):
+    """A function that is one thing in the program and another in its tests, where it reads
+    a thread local a test has set: built and tested in turn, with the profile of the package
+    changed between."""
+    main = row.path("app/src/main.rs")
+    text = open(main).read().replace("fn main() {", 'fn main() {\n    println!("now {} {}", now(), mark());', 1)
+    text += """
+#[cfg(not(test))]
+fn now() -> String {
+    "one".to_owned()
+}
+
+#[cfg(test)]
+thread_local! {
+    static SET: std::cell::RefCell<Option<String>> = None.into();
+}
+
+#[cfg(test)]
+fn now() -> String {
+    SET.with_borrow(|set| set.as_ref().cloned().unwrap_or_else(|| "two".to_owned()))
+}
+
+pub fn mark() -> u64 { 0 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_is_what_was_set() {
+        assert_eq!(now(), "two");
+        SET.with_borrow_mut(|set| *set = Some("three".to_owned()));
+        assert_eq!(now(), "three");
+        assert!(mark() < 100);
+    }
+}
+"""
+    open(main, "w").write(text)
+    row.both("cold", want="now one")
+    row.both("cold tests", command="test")
+    row.warm()
+    for turn in range(3):
+        row.edit(main)
+        row.both("edited", want="now one")
+        how, _ = row.both("edited, tests", command="test")
+        if how != "daemon":
+            raise Wrong(f"the tests were not built by the daemon: {how}")
+        if turn == 0:
+            with open(row.path("Cargo.toml"), "a") as manifest:
+                manifest.write("\n[profile.dev.package.soak-app]\ndebug = false\n")
+            row.both("another profile, tests", command="test")
+            row.warm()
+
+
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 
 ROWS = {
@@ -582,6 +659,7 @@ ROWS = {
     "case-only rename": (case_only_rename, {}),
     "worktree deleted and recreated": (worktree_recreated, {}),
     "worktrees whose libraries were built apart": (worktrees_built_apart, {}),
+    "worktrees built by other code": (worktrees_that_run_other_code, {}),
     "names and text that are not UTF-8": (non_utf8_names, {}),
     "workspace under a name that is not UTF-8": (non_utf8_root, {}),
     "store on another filesystem": (other_filesystem, {}),
@@ -591,6 +669,7 @@ ROWS = {
     "memory ceiling": (memory_ceiling, {"RUSTD_MEMORY_MAX": "1M"}),
     "no memory ceiling": (no_ceiling, {"RUSTD_MEMORY_MAX": "off"}),
     "tests of a proc macro": (proc_macro_tests, {}),
+    "a function that is another under test": (another_under_test, {}),
 }
 
 
