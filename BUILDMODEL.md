@@ -1,7 +1,8 @@
 # Cargo's build model in rustd
 
-Branch `rustd-build-model`. The third round starts from `rustd-collate` at 1547078a30
-merged in (the second from 0151c01218). Linux x86-64, Rust 1.99.0, LLVM 20.
+Branch `rustd-build-model`. The fourth round has `rustd-collate` at f191c6e42a
+merged in (the third from 1547078a30, the second from 0151c01218). Linux x86-64, Rust 1.99.0,
+LLVM 20.
 
 This is a survey of which parts of cargo's build model rustd follows, with a small project
 for each part under `harness/buildmodel/` and a script, `harness/buildmodel.py`, that builds
@@ -22,7 +23,8 @@ Result: 100 of 100 as expected under Cranelift and 100 of 100 under LLVM, 0 WRON
 tables are the same but for the backend column: 96 supported and 4 refused. Of the 4, 2 are
 projects cargo itself turns down and 2 are `lto` with rustc's own LTO link line. The cases
 have 36 invalidation steps between them and all 36 come out the same as cargo's rebuild;
-none is refused.
+none is refused. That is unchanged from the third round; the fourth adds the doctests of 30
+crates from crates.io, 30 of 30 the same as `cargo test --doc` under each backend.
 
 The second round ended at 97 cases per backend, 92 supported and 5 refused, with 31 steps of
 which 2 were refused. The first ended at 90 cases, 82 supported and 8 refused, with 16 steps
@@ -34,6 +36,112 @@ it does not build this and nothing ran differently; that includes a function it 
 rustc with a reason. "WRONG": a different output, a crash, or a refusal without a reason. The
 script fails on a WRONG row and on any row that is not what its `case.json` expects, so a
 feature that stops working, or a refusal that starts to pass, is seen.
+
+## Fourth round
+
+### The merge
+
+`rustd-collate` is merged in four steps, as it moved: 2da3d6a792 (890d2ee757, conflicts in
+`Cargo.lock` and `crates/rustd/src/main.rs`), then ce52276cf5 with the platform ABI
+unification and the third S3 round (a6b6b5ede8, one conflict in
+`crates/hir-ty/src/mir/codegen.rs`, where each side had added a field to `ObjectCodegen`;
+both are kept), then 8f21942505 with the fuzzer (9cf4286511, no conflict), then f191c6e42a, which only adds
+the two files under `publish/` (34d3333c9d, no conflict; the gate was not run again for it). In `main.rs` the
+third round's widening is kept over the second round's refusal as it had been resolved in
+`rustd-collate`; `Cargo.lock` is `rustd-collate`'s, which has the dependencies of the remote
+store. A unit test of `cargo/cli.rs` that still expected `--release`, a custom profile and
+feature flags to be left to cargo was brought up to the one plan.
+
+### Doctests of 30 crates
+
+`harness/doctests.py` now runs `cargo test --doc` and `cargo rustd test --doc` on 30 crates
+from crates.io and compares the exit status and everything printed (test lines, failure
+blocks with the compiler's errors, the result line), with only the order of tests, the
+times and thread numbers taken out:
+
+    cd harness
+    RUSTD_BIN=... RUSTD_BACKEND=cranelift python3 doctests.py
+    RUSTD_BIN=... RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast python3 doctests.py
+
+Result on the head of the branch: 30 of 30 the same under Cranelift and 30 of 30 under LLVM,
+none left to rustdoc, 0 WRONG. Together they have 3095 doctests, and rustd compiled 1739 of
+the 14292 functions of the libraries; the rest are generic or inlined and are rustc's code
+in the example, as said in the third round.
+
+| crate | doctests | functions of the library from rustd |
+|---|---|---|
+| semver 1.0.28 | 4 | 43 of 107 |
+| either 1.19.0 | 61 | 2 of 172 |
+| smallvec 1.16.3 | 14 | 2 of 170 |
+| serde_core 1.0.229 | 68 | 109 of 2217 |
+| regex 1.13.1 | 247 | 134 of 363 |
+| itertools 0.15.0 | 210 | 11 of 910 |
+| chrono 0.4.45 | 280 | 374 of 982 |
+| anyhow 1.0.104 | 26 | 27 of 117 |
+| bytes 1.12.1 | 248 | 128 of 563 |
+| thiserror 2.0.21 | 10 | 2 of 9 |
+| log 0.4.34 | 26 | 31 of 113 |
+| bitflags 2.13.2 | 21 | 14 of 53 |
+| indexmap 2.14.2 | 41 | 4 of 793 |
+| once_cell 1.21.4 | 43 | 3 of 112 |
+| hashbrown 0.17.1 | 275 | 5 of 692 |
+| memchr 2.8.3 | 25 | 73 of 513 |
+| url 2.5.8 | 67 | 122 of 235 |
+| uuid 1.28.0 | 70 | 122 of 275 |
+| time 0.3.55 | 410 | 11 of 878 |
+| rand 0.10.3 | 61 | 27 of 408 |
+| arrayvec 0.7.8 | 43 | 1 of 154 |
+| base64 0.23.1 | 26 | 60 of 149 |
+| byteorder 1.5.0 | 122 | 2 of 73 |
+| num-traits 0.2.19 | 184 | 3 of 2150 |
+| strum 0.28.0 | 4 | 2 of 6 |
+| nom 8.0.0 | 324 | 69 of 720 |
+| textwrap 0.16.4 | 59 | 43 of 79 |
+| unicode-segmentation 1.13.3 | 23 | 21 of 161 |
+| httparse 1.10.1 | 6 | 26 of 116 |
+| serde_json 1.0.154 | 97 | 268 of 1002 |
+
+The numbers are the same under both backends.
+
+`serde` itself has no doctests since its code moved to `serde_core`, so that is what is
+run. In `serde_core`, `chrono` and `strum` some doctests fail under cargo too when the
+crate is tested alone out of its workspace (18, 3 and 4 of them); rustd's run fails the
+same ones with the same compiler errors.
+
+The first run of the list had many of them different. What was wrong, all of it in how the
+examples are found and named and none of it in the code rustd compiled:
+
+- rustdoc's own lint flags (`--allow`, `--warn`, ..) made rustd leave the crate to rustdoc.
+  They say nothing of how an example is built and are now passed over.
+- An example that does not name the library is not linked with it. rustd put its object of
+  the library on that link all the same, and its undefined references failed the link
+  (`anyhow`, `memchr`). rustd's object now goes only on a link that has the library.
+- The line of an example is counted from the first comment or attribute of the
+  documentation, also for `/*! */`, for a `doc` in a `cfg_attr`, and for what a macro
+  wrote, where rustdoc has the line of the macro's use.
+- Documentation that is only there with `cfg(doc)` or `cfg(doctest)` was not seen. The
+  crate is now read again with both set after its code is built without them.
+- A `macro_rules!` macro is named by the module it is written in (`macros::bail`), not by
+  the root it is exported to.
+- The type of an `impl` is named as the compiler prints it: `&'_mutDeserializer<R>`.
+- Documentation on an `extern` block is read.
+- In a crate of edition 2024 rustdoc has the examples of a file read with `include_str!`
+  be in that file, by its lines (`src/../README.md - ReadmeDoctests (line 52)`); before 2024 they
+  are in the file of the attribute. With a comment beside the `include_str!` it is the
+  comment's line that is counted from. All of that was taken from rustdoc on a small crate
+  and is what rustd does now.
+- In edition 2024 rustdoc names a `should_panic` example ` - should panic`.
+
+The harness had a fault of its own: the last failure block was compared together with the
+list of failures after it, so two runs with the same failures in another order differed.
+
+### `lto` and a link command
+
+A daemon that is given a link command for a program with `lto` in its profile now looks in
+it for `core` as a library (`libcore-*.rlib`, or std's shared library). rustc's LTO link has
+neither, also for a program of one crate, and rustd refuses with the sentence. What is left
+is the client that links by itself (`--out` only, as `buildmodel.py` does for its rows):
+rustd never sees that link and cannot say anything of it.
 
 ## Third round
 
@@ -407,10 +515,13 @@ Inferred, not measured:
   last build: an edit that adds an instantiation or moves a function across rustc's
   inlining threshold is seen with the old objects until cargo builds again. Generic code
   that std ships a copy of was not examined.
-- `lto` in a single-crate program handed to rustd with rustc's LTO link line ends in the
-  linker's error, not in rustd's sentence. `-C lto` in `RUSTFLAGS` is refused.
-- Doctests: the text of a `compile_fail` example's errors is not compared; where rustd
-  cannot build the library the examples are left to rustdoc with the reason printed.
+- `lto`: a client that links a single-crate program by itself with rustc's LTO link line
+  gets the linker's error; rustd only sees a link command it is given. `-C lto` in
+  `RUSTFLAGS` is refused.
+- Doctests: rustdoc prints nothing of the errors of a `compile_fail` example that fails to
+  compile as it should, so those are not compared; where rustd cannot build the library the
+  examples are left to rustdoc with the reason printed (none of the 30 crates). Doctests of
+  a workspace with several members, and with `--target`, were not run.
 - `cargo/units.rs` still keeps its own records of what rustc was run with (it does not read
   the unit graph), and `cargo/plan.rs` plans the link from them.
 - `Flags::of` in `plan.rs` asks `cargo config get` for the configuration, which is how
@@ -419,16 +530,19 @@ Inferred, not measured:
 ## Regression gate
 
 Run from `harness/` with `RUSTD_BIN` set to the release binary built with `--features llvm`
-from the head of the branch, once with `RUSTD_BACKEND=cranelift` and once with
-`RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`, one after the other. The numbers were the
-same under both.
+from 9cf4286511 (the merge of `rustd-collate` 8f21942505), once with
+`RUSTD_BACKEND=cranelift` and once with `RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast`, one
+after the other. The numbers were the same under both. The head of the branch differs from
+that binary only by a later merge of `rustd-collate` that adds the files under `publish/`
+and by this report.
 
 | command | result |
 |---|---|
-| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 803/803 functions from rustd, 0 of 893 layouts differ |
+| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822/822 functions from rustd, 0 of 893 layouts differ |
+| `python3 backends.py corpus runner cases --bin runner --levels 2f` (LLVM leg) | the program prints the same as cargo's; LLVM produced 11801 of 11801 functions (100%) |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
-| `python3 breakers.py` | 43 of 43 right, 5 open, 0 functions skipped |
+| `python3 breakers.py` | 58 of 58 right, 7 open, 0 functions skipped |
 | `python3 unwinds.py` | 8 of 8 right |
 | `python3 splices.py` | 71 of 71 right |
 | `python3 asmedits.py` | 10 of 10 right |
@@ -437,27 +551,20 @@ same under both.
 | `python3 keys.py` | 52 of 52 right, 0 open, 8 functions refused |
 | `python3 debuginfo.py` | all right |
 | `python3 buildmodel.py --backend <backend> --jobs 6` | 100 of 100 as expected, 0 WRONG |
-| `python3 doctests.py` | 3 crates the same as `cargo test --doc`, 0 WRONG |
+| `python3 doctests.py` | 30 crates the same as `cargo test --doc`, 0 left to rustdoc, 0 WRONG |
 | `python3 storecorrupts.py` | PASS, 40 damaged stores detected, discarded and rebuilt |
 | `python3 storefull.py` | PASS, 6 full disks |
 | `python3 storekills.py` | PASS, 300 kills |
 | `python3 storeshared.py` | PASS, 180 builds on a shared store |
-| `python3 cargo_rustd.py --only-checks` | PASS: 84 commands and 11 daemon checks the same as cargo |
+| `python3 remote.py` (MinIO in `~/s3tools/minio`) | 91 of 91 right |
+| `python3 fuzz/fuzz.py smoke --backends <backend>` | 2 programs, 505 functions compiled by rustd, 0 differences, 0 crashes |
+| `python3 cargo_rustd.py --only-checks` | PASS |
 | `cargo fmt --all -- --check` | clean |
-| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 955 passed, 0 failed |
+| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd` | 966 passed, 0 failed |
 
-The 5 open cases of `breakers.py` came with `rustd-collate` and are not of this work.
-`cargo_rustd.py` was run once (it picks its own backend), without its timings of real
-projects: the timings in `harness/CARGO-RUSTD.md` are the earlier ones, only its table of
-flags is new.
-
-The first pass of this gate found two things. A check for an LTO link line ran for every
-program and turned down ordinary ones (`programs.py`, one case of `breakers.py`); it now
-runs only when the unit graph says the profile has `lto`. And `release_package_checks` was
-refused where it had been supported: a closure of std's `Iterator::count` has no name to
-find copies by, and was treated as if any crate could have compiled it. A closure is now
-looked for under the name of the function it is written in. The gate was run again from the
-start after each.
+The open cases of `breakers.py` came with `rustd-collate` and are not of this work.
+`cargo_rustd.py` picks its own backend and was run without its timings of real projects.
+Clippy on `rustd` and `hir` has no warning in the lines this round touched.
 
 ## The table
 
