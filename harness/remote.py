@@ -138,6 +138,18 @@ class Remote:
         return f"s3://{self.bucket_name}/{prefix}" + ("?" + query if query else ""), bucket
 
 
+# How a daemon is told to end, and how it ends then. On Windows that is Ctrl-Break, which
+# reaches one process group, and the status of a process ended by its console.
+if os.name == "nt":
+    OWN_GROUP = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    TOLD_TO_END = 0xC000013A
+    tell_to_end = lambda process: process.send_signal(signal.CTRL_BREAK_EVENT)
+else:
+    OWN_GROUP = {}
+    TOLD_TO_END = -signal.SIGTERM
+    tell_to_end = lambda process: process.terminate()
+
+
 class Machine:
     """A HOME, a store and a checkout of its own. The toolchain is the one this machine has:
     what a fresh machine downloads of it is not what is measured here."""
@@ -231,8 +243,8 @@ class Machine:
         socket, self.log = os.path.join(self.out, f"socket{self.count}"), os.path.join(self.out, f"daemon{self.count}.log")
         daemon = subprocess.Popen(
             [RUSTD, self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj, "--socket", socket,
-             "--link-cmd", shlex.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
-            env={**self.env, **env})
+             "--link-cmd", linkline.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
+            env={**self.env, **env}, **OWN_GROUP)
         while "watching" not in self.heard():
             if daemon.poll() is not None:
                 raise SystemExit(f"the daemon did not start: {self.log}")
@@ -811,11 +823,11 @@ def kept(top, remote, crates, target, workspace):
             remote.proxy.hold = 0
             check("no build waits for the remote", took is not None and took < 3, f"{took and round(took, 2)}s with every request held 3s")
     finally:
-        daemon.terminate()
+        tell_to_end(daemon)
         ended = daemon.wait(timeout=90)
     ok, counted, _ = a.cache("stats")
     out = a.rustd("cache", "push", address)
-    check("told to end, the daemon ends as it was told, with nothing left to send", ended == -signal.SIGTERM and ok
+    check("told to end, the daemon ends as it was told, with nothing left to send", ended == TOLD_TO_END and ok
           and counted.get("open packs") == 0 and out.returncode == 0 and out.stdout.startswith("0 packs added"),
           f"exit {ended}; {out.stdout.strip()[:40]}")
 
@@ -827,10 +839,10 @@ def kept(top, remote, crates, target, workspace):
         time.sleep(4)
         unsent = listed()
     finally:
-        daemon.terminate()
+        tell_to_end(daemon)
         ended = daemon.wait(timeout=90)
     check("with the schedule off an edit is sent when the daemon ends and not before",
-          took is not None and unsent == before and ended == -signal.SIGTERM and listed() == before + 1,
+          took is not None and unsent == before and ended == TOLD_TO_END and listed() == before + 1,
           f"{before}, {unsent}, then {listed()} packs listed")
     c = Machine(top, f"d-{remote.name}-c", remote)
     c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
