@@ -191,8 +191,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             pads: FxHashMap::default(),
             frame: None,
             arrival: None,
-            marks: matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO)
-                .then(|| Marks::new(module, function)),
+            // Without a flag that asks for CodeView, the table is DWARF in a COFF object too.
+            marks: matches!(
+                target.object_format,
+                ObjectFormat::Elf | ObjectFormat::MachO | ObjectFormat::Coff
+            )
+            .then(|| Marks::new(module, function)),
         };
         lowering.body()?;
         if let Some(marks) = &lowering.marks {

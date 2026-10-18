@@ -253,10 +253,11 @@ harness including the four for the store, under both backends.
 
 ## Still open
 
-- Linux x86-64 only. The store code is std-only (`File::lock`, rename, `sync_all`), but
-  the harnesses were not run on macOS or Windows, and Windows cannot unlink a pack that
-  another process has open, so eviction there would fail for packs in use (the failure
-  is ignored and the pack kept; unmeasured).
+- Linux x86-64 and Windows x86-64 only; the harnesses were not run on macOS. On Windows
+  a pack that another daemon has open is evicted like any other: std opens files shared
+  for delete and removes them the POSIX way, so the name goes at once and the daemon
+  that has it open reads on (NTFS; a file system without that keeps the name until the
+  last handle closes). See WINDOWS.md for what the Windows run found.
 - No power-loss testing. SIGKILL does not lose page cache, so the syncs before renames
   are by construction, not by measurement.
 - Advisory locks over NFS, as said above.

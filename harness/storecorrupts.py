@@ -15,7 +15,7 @@ Then the same for a store that says it is of an older format, of none, and of a 
 
     python3 storecorrupts.py [--rounds N] [--seed N]
 """
-import os, random, shutil, sys, time
+import os, random, re, shutil, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -187,10 +187,12 @@ def formats(checkout, store):
         daemon = Daemon(checkout, store, env=SEALS)
         checkout.check(daemon, name)
         daemon.kill()
-        if "of another format discarded" not in daemon.log():
+        said = re.search(r"store: (\d+) files of another format discarded", daemon.log())
+        if not said:
             fail(f"{name}: the daemon does not say it discarded the store: {daemon.log_path}")
-        if before & set(files(store, ".pack")):
-            fail(f"{name}: packs of it are still there")
+        # The same code compiled again is sealed under the same name, so the names say nothing.
+        if int(said[1]) < len(before):
+            fail(f"{name}: {said[1]} files discarded of a store of {len(before)} packs: {daemon.log_path}")
         if open(version).read() != current or not os.path.exists(os.path.join(store, "notes.txt")):
             fail(f"{name}: the version is not this one's, or a file that is not the store's is gone")
         clean(store, name)

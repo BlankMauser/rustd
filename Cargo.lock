@@ -1913,6 +1913,7 @@ dependencies = [
  "ra-ap-rustc_index",
  "ra-ap-rustc_next_trait_solver",
  "ra-ap-rustc_type_ir",
+ "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustc-stable-hash",
  "rustc_apfloat",
@@ -3739,6 +3740,7 @@ dependencies = [
  "cfg",
  "dunce",
  "ed25519-dalek",
+ "find-msvc-tools",
  "futures-util",
  "getrandom 0.3.4",
  "hir",
@@ -3776,6 +3778,7 @@ dependencies = [
  "vfs",
  "wasm-encoder",
  "wasmparser 0.236.1",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

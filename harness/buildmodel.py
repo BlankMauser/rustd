@@ -14,7 +14,8 @@ A row is one of
   supported  the same output, every function of the named crates compiled by rustd
   refused    rustd said why it does not build this, and built nothing that runs differently
   WRONG      different output, a crash, or a refusal without a reason
-  skipped    the case is not one of this host (`hosts` in its `case.json`), and nothing was built
+  skipped    the case is of another host (`hosts` in its `case.json`, or a Linux cross target, which
+             has its linker and runner there), and nothing was built
 and the run fails on any WRONG row and on any row that is not what its `case.json` expects.
 
 `case.json`:
@@ -115,6 +116,9 @@ class Case:
         self.work = os.path.join(self.ws, "target-rustd-out")
         os.makedirs(self.work)
         if os.path.exists(os.path.join(self.ws, "setup.sh")):
+            # Where the copy is as a `file://` URL has it, which on Windows is not what `sh` calls it.
+            here = self.ws.replace(os.sep, "/")
+            self.env["BM_HERE"] = here if here.startswith("/") else "/" + here
             setup = subprocess.run(["sh", "setup.sh"], cwd=self.ws, capture_output=True, text=True, env=self.env)
             if setup.returncode != 0:
                 raise Wrong("the case's setup.sh failed: " + (setup.stderr + setup.stdout)[-400:])
@@ -182,14 +186,16 @@ class Case:
             raise Wrong("cargo failed with what rustd needs of it: " + run.stderr[-600:])
         printed = run.stdout + run.stderr
         if whole:
-            printed = "\n".join(l for l in printed.splitlines() if f"/{self.artifact_name()}-" in l)
+            printed = "\n".join(l for l in printed.splitlines() if re.search(rf"[/\\]{re.escape(self.artifact_name())}-", l))
         try:
             # rustc's `symbols.o` asks for what the libraries need of one another, which a linker
             # that reads archives in order finds no other way: `-C save-temps` keeps the file.
             line = [a for a in linker_line(printed) if not a.endswith("symbols.o") or os.path.exists(a)]
         except SystemExit:
             return None
-        return line
+        # A DLL of MSVC exports what the directives of `symbols.o` name: its `.def` is empty.
+        exports = linkline.msvc(line) and any(a.upper() == "/DLL" for a in line)
+        return [a for a in line if exports or not a.endswith("symbols.o")]
 
     def archive(self, env):
         """cargo's archive of the package with every symbol kept, in place of a link line."""
@@ -247,9 +253,10 @@ class Case:
         """Runs the steps of the case against one daemon: (what, verdict, detail) of each."""
         link = self.link
         obj, patch, binary = (os.path.join(self.work, f"daemon.{n}") for n in ("o", "patch.o", "bin"))
-        # Not in the scratch copy: the path of a socket is at most 104 bytes on macOS.
-        short = tempfile.mkdtemp(prefix="bm-", dir="/tmp")
-        socket, log_path = os.path.join(short, "rustd.sock"), os.path.join(self.work, "daemon.log")
+        # Not in the scratch copy: the path of a socket has a limit that the name of a case
+        # can take the copy past, and on macOS the temporary directory alone nearly does.
+        short = tempfile.mkdtemp(prefix="bm-", dir="/tmp" if sys.platform == "darwin" else None)
+        socket, log_path = os.path.join(short, "s"), os.path.join(self.work, "daemon.log")
         self.daemon_files = (obj, patch, binary)
         ask = self.ask(link, env)
         log = open(log_path, "a")
@@ -329,6 +336,8 @@ class Case:
             return ("skipped", f"a case of hosts with `{self.spec['hosts']}` in their triple, and this is {host()}", steps)
         if "unbuilt" in self.spec:
             return ("refused", self.spec["unbuilt"], steps)
+        if self.target in CROSS and "linux" not in host():
+            return ("skipped", f"{self.target} is built and run from a Linux host: its linker and runner are not of {host()}", steps)
         env = dict(self.env)
         try:
             self.prepare()

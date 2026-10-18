@@ -606,13 +606,19 @@ impl MacroCallId {
                 } else {
                     DocCommentDesugarMode::Mbe
                 };
+                // A procedural macro is handed a fragment as one group without delimiters, as a
+                // `macro_rules` macro matches it as one token tree (rustc's transcriber wraps
+                // it in `Delimiter::Invisible`, `transcribe_pnr` in
+                // `compiler/rustc_expand/src/mbe/transcribe.rs`).
                 let mut tt = match loc.def.kind {
-                    MacroDefKind::Declarative(..) => syntax_bridge::syntax_node_to_token_tree(
-                        tt.syntax(),
-                        MacroRulesArgs(map),
-                        span,
-                        mode,
-                    ),
+                    MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
+                        syntax_bridge::syntax_node_to_token_tree(
+                            tt.syntax(),
+                            MacroRulesArgs(map),
+                            span,
+                            mode,
+                        )
+                    }
                     _ => syntax_bridge::syntax_node_to_token_tree(tt.syntax(), map, span, mode),
                 };
                 if loc.def.is_proc_macro() {

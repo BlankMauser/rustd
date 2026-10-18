@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use hir_ty::mir::codegen::ObjectFormat;
 use serde::{Deserialize, Serialize};
 
 use super::units::Record;
@@ -16,6 +15,26 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 
 /// What Apple's linker is told so that a splice has room in the header for its two segments.
 const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
+
+/// The same for `link.exe`, which warns of every name it does so for unless told not to.
+const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
+
+/// What a build script says to have `link.exe` fail on a warning. It warns of every image
+/// it writes with `/FORCE` and can't be told not to, so the daemon's link leaves this out.
+const WARNINGS_FAIL: &str = "/WX";
+
+/// How `link.exe` is told where to write.
+const OUT: &str = "/OUT:";
+
+/// The stack of the first thread, when the line asks for none. `link.exe` gives it 1 MiB,
+/// an eighth of what it has elsewhere, and a function compiled here can have a frame twice
+/// that of rustc's: one of clap's that rustc gives 480 KiB overflows it at once.
+const STACK: &str = "/STACK:";
+const STACK_OF_MAIN: &str = "/STACK:8388608";
+
+/// rustc has the executable name its symbols by file name alone, which finds them next
+/// to it. The daemon's are not next to where the executable is installed.
+const SYMBOLS_BY_NAME: &str = "/PDBALTPATH:%_PDB%";
 
 /// The crates of the standard library whose symbols the daemon reads.
 const LIBRARY: [&str; 3] = ["core", "alloc", "std"];
@@ -63,9 +82,8 @@ impl Plan {
         let line =
             std::fs::read_to_string(line).with_context(|| format!("reading {}", line.display()))?;
         let Some(mut link) = LinkLine::parse(&line) else {
-            return Ok(Err(
-                "the link line is not one of an ELF or Mach-O linker driven by `cc`".to_owned()
-            ));
+            let why = "the link line is not one of a linker driven by `cc` or of `link.exe`";
+            return Ok(Err(why.to_owned()));
         };
         let mut plan = Plan {
             crates: vec![unit.source.clone()],
@@ -159,12 +177,36 @@ struct LinkLine {
     env: Vec<(String, String)>,
     linker: String,
     args: Vec<String>,
-    /// What the linker links: Apple's is told its architecture.
-    format: ObjectFormat,
+    flavor: Flavor,
+}
+
+/// The kinds of linker the daemon can put its objects ahead of rustc's for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Flavor {
+    /// An ELF linker driven by `cc`.
+    Cc,
+    /// Apple's linker driven by `cc`, which tells it its architecture.
+    Apple,
+    /// `link.exe`, or one that takes its arguments.
+    Msvc,
+}
+
+impl Flavor {
+    fn of(args: &[String]) -> Option<Flavor> {
+        if args.iter().any(|it| it == "/NOLOGO") {
+            return args.iter().any(|it| it.starts_with(OUT)).then_some(Flavor::Msvc);
+        }
+        let of_cc = args.iter().any(|it| it == "-o") && !args.iter().any(|it| it == "-flavor");
+        let flavor = match args.iter().any(|it| it == "-arch") {
+            true => Flavor::Apple,
+            false => Flavor::Cc,
+        };
+        of_cc.then_some(flavor)
+    }
 }
 
 impl LinkLine {
-    /// `None` for a line that is not `cc`'s for an ELF or a Mach-O linker.
+    /// `None` for a line that is of no linker the daemon knows.
     fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
         let unsets = match words.first().map(String::as_str) {
@@ -184,14 +226,9 @@ impl LinkLine {
             .filter(|it| !it.ends_with("symbols.o"))
             .cloned()
             .collect();
-        let of_cc = args.iter().any(|it| it == "-o")
-            && !args.iter().any(|it| it == "/NOLOGO" || it == "-flavor");
-        let format = match args.iter().any(|it| it == "-arch") {
-            true => ObjectFormat::MachO,
-            false => ObjectFormat::Elf,
-        };
+        let flavor = Flavor::of(&args)?;
         let (without, linker) = (without.to_vec(), words[first].clone());
-        of_cc.then(|| LinkLine { without, env, linker, args, format })
+        Some(LinkLine { without, env, linker, args, flavor })
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
@@ -219,14 +256,30 @@ impl LinkLine {
     /// The command that links the plan's executable, with its arguments in the file at
     /// `response`: a line with all of them is longer than a process may be given.
     fn command(mut self, plan: &Plan, response: &Path) -> anyhow::Result<String> {
+        if self.flavor == Flavor::Msvc {
+            self.args.retain(|it| !it.eq_ignore_ascii_case(WARNINGS_FAIL));
+        }
         let first = self
             .args
             .iter()
             .position(|it| is_rustc_file(it))
             .context("nothing of rustc's is linked")?;
         let ours = [&plan.patch, &plan.object].map(|it| it.display().to_string());
-        let flag = match self.format {
-            ObjectFormat::MachO => {
+        match self.flavor {
+            Flavor::Cc | Flavor::Apple => self.command_of_cc(ours, first, plan, response),
+            Flavor::Msvc => self.command_of_msvc(ours, first, plan, response),
+        }
+    }
+
+    fn command_of_cc(
+        mut self,
+        ours: [String; 2],
+        first: usize,
+        plan: &Plan,
+        response: &Path,
+    ) -> anyhow::Result<String> {
+        let flag = match self.flavor {
+            Flavor::Apple => {
                 // Apple's linker has no flag for the first definition staying: what rustc
                 // built of the workspace gives way to the daemon's by being weak.
                 for arg in &mut self.args {
@@ -258,6 +311,59 @@ impl LinkLine {
         command.push(shlex::try_quote(&format!("@{}", response.display()))?.into_owned());
         Ok(command.join(" "))
     }
+
+    /// rustc tells `link.exe` where the libraries of the system are through `LIB`, which
+    /// is not in the line; here the line says it.
+    fn command_of_msvc(
+        mut self,
+        ours: [String; 2],
+        first: usize,
+        plan: &Plan,
+        response: &Path,
+    ) -> anyhow::Result<String> {
+        let stays = FIRST_DEFINITION_STAYS_MSVC.map(str::to_owned);
+        self.args.splice(first..first, ours.into_iter().chain(stays));
+        let binary = plan.binary.display();
+        for arg in &mut self.args {
+            if arg.starts_with(OUT) {
+                *arg = format!("{OUT}{binary}");
+            } else if arg == SYMBOLS_BY_NAME {
+                *arg = format!("/PDBALTPATH:{binary}.pdb");
+            }
+        }
+        if !self.args.iter().any(|it| it.starts_with(STACK)) {
+            self.args.push(STACK_OF_MAIN.to_owned());
+        }
+        self.args.extend(system_libraries().iter().map(|it| format!("/LIBPATH:{}", it.display())));
+        if self.args.iter().any(|it| it.contains('"')) {
+            anyhow::bail!("an argument of the link can't be quoted");
+        }
+        // A backslash before the quote that closes an argument would make it part of it.
+        let quoted = |arg: &String| {
+            let closing = arg.len() - arg.trim_end_matches('\\').len();
+            format!("\"{arg}{}\"", "\\".repeat(closing))
+        };
+        let quoted: Vec<String> = self.args.iter().map(quoted).collect();
+        std::fs::write(response, quoted.join("\n"))?;
+        Ok(format!("\"{}\" \"@{}\"", self.linker, response.display()))
+    }
+}
+
+/// The directories `link.exe` finds the libraries of the compiler and of the system in.
+#[cfg(windows)]
+fn system_libraries() -> Vec<PathBuf> {
+    let Some(linker) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
+        return Vec::new();
+    };
+    let listed = linker.env().into_iter().find(|(name, _)| name == "LIB");
+    let Some((_, dirs)) = listed else { return Vec::new() };
+    // A list that ends in its separator has an empty last entry.
+    std::env::split_paths(dirs).filter(|it| !it.as_os_str().is_empty()).collect()
+}
+
+#[cfg(not(windows))]
+fn system_libraries() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Whether a word of the link line sets a variable for the linker's driver.
@@ -325,7 +431,7 @@ mod tests {
     fn link_lines_that_are_not_cc_for_elf() {
         assert!(LinkLine::parse("").is_none());
         assert!(LinkLine::parse("no quotes here").is_none());
-        assert!(LinkLine::parse(r#""link.exe" "/NOLOGO" "/OUT:a.exe" "-o""#).is_none());
+        assert!(LinkLine::parse(r#""link.exe" "/NOLOGO" "-o""#).is_none());
         assert!(LinkLine::parse(r#""rust-lld" "-flavor" "wasm" "-o" "a.wasm""#).is_none());
         assert!(LinkLine::parse(r#"A="1" "cc" "unterminated"#).is_none());
     }
@@ -340,8 +446,56 @@ mod tests {
         );
         assert_eq!(link.env, [("LC_ALL".to_owned(), "C".to_owned())]);
         assert_eq!(link.linker, "cc");
-        assert_eq!(link.format, ObjectFormat::MachO);
-        assert_eq!(LinkLine::parse(LINE).unwrap().format, ObjectFormat::Elf);
+        assert_eq!(link.flavor, Flavor::Apple);
+        assert_eq!(LinkLine::parse(LINE).unwrap().flavor, Flavor::Cc);
+    }
+
+    #[test]
+    fn ours_go_ahead_of_rustcs_for_link_exe() {
+        const LINE: &str = r#""C:\\v c\\link.exe" "/NOLOGO" "C:\\t\\rustc1\\symbols.o" "C:\\t\\a.1.rcgu.o" "C:\\t\\libb-2.rlib" "kernel32.lib" "/WX" "/LIBPATH:C:\\l\\" "/OUT:C:\\t\\a.exe" "/DEBUG" "/PDBALTPATH:%_PDB%""#;
+        let dir = std::env::temp_dir().join(format!("rustd-plan-msvc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = Plan {
+            crates: Vec::new(),
+            object: PathBuf::from("P:/rustd.o"),
+            patch: PathBuf::from("P:/patch.o"),
+            binary: PathBuf::from("P:/bin"),
+            link_cmd: String::new(),
+            symbol_files: Vec::new(),
+            unit_test: false,
+            left_to_rustc: Vec::new(),
+            copies: Vec::new(),
+            stamp: 0,
+        };
+        let response = dir.join("link.args");
+        let link = LinkLine::parse(LINE).unwrap();
+        assert_eq!(link.flavor, Flavor::Msvc);
+        let command = link.command(&plan, &response).unwrap();
+        assert_eq!(command, format!(r#""C:\v c\link.exe" "@{}""#, response.display()));
+        let args = std::fs::read_to_string(&response).unwrap();
+        let args: Vec<&str> = args
+            .lines()
+            .filter(|it| !it.starts_with("\"/LIBPATH:") || it.contains(r"C:\l"))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                r#""/NOLOGO""#,
+                r#""P:/patch.o""#,
+                r#""P:/rustd.o""#,
+                r#""/FORCE:MULTIPLE""#,
+                r#""/IGNORE:4006""#,
+                r#""C:\t\a.1.rcgu.o""#,
+                r#""C:\t\libb-2.rlib""#,
+                r#""kernel32.lib""#,
+                r#""/LIBPATH:C:\l\\""#,
+                r#""/OUT:P:/bin""#,
+                r#""/DEBUG""#,
+                r#""/PDBALTPATH:P:/bin.pdb""#,
+                r#""/STACK:8388608""#,
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

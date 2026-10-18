@@ -1027,7 +1027,7 @@ impl RangeItem for ast::RangePat {
     fn start(&self) -> Option<ast::Pat> {
         self.syntax()
             .children_with_tokens()
-            .take_while(|it| !(it.kind() == T![..] || it.kind() == T![..=]))
+            .take_while(|it| !matches!(it.kind(), T![..] | T![..=] | T![...]))
             .filter_map(|it| it.into_node())
             .find_map(ast::Pat::cast)
     }
@@ -1035,7 +1035,7 @@ impl RangeItem for ast::RangePat {
     fn end(&self) -> Option<ast::Pat> {
         self.syntax()
             .children_with_tokens()
-            .skip_while(|it| !(it.kind() == T![..] || it.kind() == T![..=]))
+            .skip_while(|it| !matches!(it.kind(), T![..] | T![..=] | T![...]))
             .filter_map(|it| it.into_node())
             .find_map(ast::Pat::cast)
     }
@@ -1045,8 +1045,7 @@ impl RangeItem for ast::RangePat {
             let token = it.into_token()?;
 
             match token.kind() {
-                T![..] => Some(token),
-                T![..=] => Some(token),
+                T![..] | T![..=] | T![...] => Some(token),
                 _ => None,
             }
         })
@@ -1058,7 +1057,8 @@ impl RangeItem for ast::RangePat {
 
             match token.kind() {
                 T![..] => Some(RangeOp::Exclusive),
-                T![..=] => Some(RangeOp::Inclusive),
+                // `...` is how an inclusive range pattern was written before `..=`.
+                T![..=] | T![...] => Some(RangeOp::Inclusive),
                 _ => None,
             }
         })
