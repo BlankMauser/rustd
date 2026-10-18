@@ -319,7 +319,7 @@ impl SymbolTable {
 }
 
 /// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
-/// built as a test binary, and the file its source starts at, which the dep-info file cargo
+/// built as a program, and the file its source starts at, which the dep-info file cargo
 /// leaves next to it lists first.
 fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     let file = rlib.file_name()?.to_str()?;
@@ -327,7 +327,9 @@ fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
         Some(stem) => stem.strip_prefix("lib")?,
         None => file.strip_suffix(".rcgu.o")?.split_once('.')?.0,
     };
-    let (name, _) = stem.rsplit_once('-')?;
+    // A crate's name has no `-`. cargo gives the program of an MSVC or Apple target no hash:
+    // the file of its symbols is named after it.
+    let name = stem.rsplit_once('-').map_or(stem, |(name, _)| name);
     let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
     let (_, sources) = dep_info.lines().next()?.split_once(": ")?;
     // FIXME: a path with a space in it is escaped.

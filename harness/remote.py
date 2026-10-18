@@ -138,6 +138,18 @@ class Remote:
         return f"s3://{self.bucket_name}/{prefix}" + ("?" + query if query else ""), bucket
 
 
+# How a daemon is told to end, and how it ends then. On Windows that is Ctrl-Break, which
+# reaches one process group, and the status of a process ended by its console.
+if os.name == "nt":
+    OWN_GROUP = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    TOLD_TO_END = 0xC000013A
+    tell_to_end = lambda process: process.send_signal(signal.CTRL_BREAK_EVENT)
+else:
+    OWN_GROUP = {}
+    TOLD_TO_END = -signal.SIGTERM
+    tell_to_end = lambda process: process.terminate()
+
+
 class Machine:
     """A HOME, a store and a checkout of its own. The toolchain is the one this machine has:
     what a fresh machine downloads of it is not what is measured here."""
@@ -218,7 +230,7 @@ class Machine:
         link = linkline.with_output(linkline.ahead(list(self.link_args), [obj], RUSTD), self.program)
         start = time.time()
         out = self.rustd(self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj,
-                         "--link-cmd", shlex.join(link), *symbols, env=env, timeout=3600)
+                         "--link-cmd", linkline.join(link), *symbols, env=env, timeout=3600)
         if out.returncode != 0:
             raise SystemExit(f"rustd failed:\n{out.stderr[-3000:]}")
         return out.stderr, time.time() - start
@@ -233,8 +245,8 @@ class Machine:
         socket, self.log = os.path.join(self.out, f"socket{self.count}"), os.path.join(self.out, f"daemon{self.count}.log")
         daemon = subprocess.Popen(
             [RUSTD, self.ws, *TARGET_ARGS, *(x for c in crates for x in ("--crate", c)), "--out", obj, "--socket", socket,
-             "--link-cmd", shlex.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
-            env={**self.env, **env})
+             "--link-cmd", linkline.join(link), *symbols], stdout=open(self.log, "w"), stderr=subprocess.STDOUT,
+            env={**self.env, **env}, **OWN_GROUP)
         while "watching" not in self.heard():
             if daemon.poll() is not None:
                 raise SystemExit(f"the daemon did not start: {self.log}")
@@ -339,7 +351,10 @@ def configuration(top, remote, a, address, bucket):
     c.empty()
     out = c.rustd("cache", "pull", address + "&region=eu-west-1&path-style=true")
     check("another region and addressing by path asked for", out.returncode == 0 and c.packs(), out.stderr.strip()[-80:])
-    if remote.server.kind == "minio":
+    if remote.server.kind == "minio" and os.name == "nt":
+        # glibc and macOS answer for every name under `localhost`; Windows asks the network.
+        print("  the bucket in the name of the host: left out, Windows resolves no name under `localhost`", flush=True)
+    elif remote.server.kind == "minio":
         c.empty()
         remote.proxy.clear()
         by_host = address.replace("127.0.0.1", "localhost") + "&path-style=false"
@@ -460,7 +475,7 @@ def transfers(top, remote):
     proxy.rate = 4 * MIB
     process = subprocess.Popen([RUSTD, "cache", "pull", address], env=b.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
-    process.send_signal(signal.SIGKILL)
+    process.kill()
     process.wait()
     left = b.partials()
     size = os.path.getsize(os.path.join(b.store, left[0])) if left else 0
@@ -511,7 +526,9 @@ def transfers(top, remote):
     out2 = b.rustd("cache", "pull", address, env={"RUSTD_REMOTE_JOBS": "3"})
     check("twelve packs with three requests at a time: never more in flight",
           out.returncode == 0 and out2.returncode == 0 and 2 <= most <= 3 and 2 <= proxy.most_flying <= 3 and len(b.packs()) == 12
-          and all(b.packs().values()), f"{most} up, {proxy.most_flying} down")
+          and all(b.packs().values()),
+          f"{most} up, {proxy.most_flying} down, {len(b.packs())} packs, ended {out.returncode} and {out2.returncode}"
+          f"{': ' + out2.stderr.strip().splitlines()[0][-80:] if out2.returncode and out2.stderr.strip() else ''}")
     proxy.hold = 0
 
     a, b, address, bucket, name = pushed("server killed and back")
@@ -812,11 +829,11 @@ def kept(top, remote, crates, target, workspace):
             remote.proxy.hold = 0
             check("no build waits for the remote", took is not None and took < 3, f"{took and round(took, 2)}s with every request held 3s")
     finally:
-        daemon.terminate()
+        tell_to_end(daemon)
         ended = daemon.wait(timeout=90)
     ok, counted, _ = a.cache("stats")
     out = a.rustd("cache", "push", address)
-    check("told to end, the daemon ends as it was told, with nothing left to send", ended == -signal.SIGTERM and ok
+    check("told to end, the daemon ends as it was told, with nothing left to send", ended == TOLD_TO_END and ok
           and counted.get("open packs") == 0 and out.returncode == 0 and out.stdout.startswith("0 packs added"),
           f"exit {ended}; {out.stdout.strip()[:40]}")
 
@@ -828,10 +845,10 @@ def kept(top, remote, crates, target, workspace):
         time.sleep(4)
         unsent = listed()
     finally:
-        daemon.terminate()
+        tell_to_end(daemon)
         ended = daemon.wait(timeout=90)
     check("with the schedule off an edit is sent when the daemon ends and not before",
-          took is not None and unsent == before and ended == -signal.SIGTERM and listed() == before + 1,
+          took is not None and unsent == before and ended == TOLD_TO_END and listed() == before + 1,
           f"{before}, {unsent}, then {listed()} packs listed")
     c = Machine(top, f"d-{remote.name}-c", remote)
     c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
@@ -863,6 +880,8 @@ def over_tls(top, remote):
     open(at("leaf.ext"), "w").write("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n")
     certificate = at("authority.crt")
     for command in (["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=rustd harness",
+                     # Python from 3.13 takes no authority that does not say it may sign.
+                     "-addext", "keyUsage=critical,keyCertSign,cRLSign",
                      "-keyout", at("authority.key"), "-out", certificate],
                     ["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", at("private.key"),
                      "-out", at("leaf.csr")],

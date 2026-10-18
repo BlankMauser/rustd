@@ -11,9 +11,12 @@
 //! A variable is told of when it is kept in one slot of the frame for as long as the function
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
+mod codeview;
 mod types;
 
 pub(super) use types::Types;
+
+use codeview::CodeView;
 
 use cranelift_codegen::{
     binemit::CodeOffset,
@@ -215,8 +218,49 @@ impl FunctionDebug {
     }
 }
 
+/// What a debugger is told of the functions of an object, in the tables its format has.
+pub(super) enum DebugContext {
+    Dwarf(Box<Dwarf>),
+    CodeView(CodeView),
+}
+
+impl DebugContext {
+    /// The tables of an object for `isa` whose files are named from `directory`, or `None`
+    /// where they are not written yet: ELF has DWARF and COFF has CodeView.
+    pub(super) fn new(isa: &dyn TargetIsa, directory: &str) -> Option<Self> {
+        if super::Target::current().is_wasm() {
+            return None;
+        }
+        match isa.triple().binary_format {
+            target_lexicon::BinaryFormat::Elf => {
+                Some(DebugContext::Dwarf(Box::new(Dwarf::new(isa, directory))))
+            }
+            target_lexicon::BinaryFormat::Coff => {
+                Some(DebugContext::CodeView(CodeView::new(directory)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Describes the function `func` of the module, which is `len` bytes of code.
+    pub(super) fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
+        match self {
+            DebugContext::Dwarf(dwarf) => dwarf.add_function(func, len, debug),
+            DebugContext::CodeView(codeview) => codeview.add_function(func, len, debug),
+        }
+    }
+
+    /// Writes the sections into the object, when it has a function to describe.
+    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<(), String> {
+        match self {
+            DebugContext::Dwarf(dwarf) => dwarf.emit(product),
+            DebugContext::CodeView(codeview) => codeview.emit(product),
+        }
+    }
+}
+
 /// The compilation unit of an object, which every function of the object is described in.
-pub(super) struct DebugContext {
+pub(super) struct Dwarf {
     dwarf: DwarfUnit,
     files: FxHashMap<String, FileId>,
     ranges: Vec<Range>,
@@ -225,15 +269,9 @@ pub(super) struct DebugContext {
     frame: Option<Register>,
 }
 
-impl DebugContext {
-    /// The unit of an object for `isa` whose files are named from `directory`, or `None`
-    /// where the tables are not written yet: only ELF has them.
-    pub(super) fn new(isa: &dyn TargetIsa, directory: &str) -> Option<Self> {
-        if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf
-            || super::Target::current().is_wasm()
-        {
-            return None;
-        }
+impl Dwarf {
+    /// The unit of an object for `isa` whose files are named from `directory`.
+    fn new(isa: &dyn TargetIsa, directory: &str) -> Self {
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
         let mut dwarf = DwarfUnit::new(encoding);
@@ -263,13 +301,13 @@ impl DebugContext {
             target_lexicon::Architecture::Aarch64(_) => Some(gimli::AArch64::X29),
             _ => None,
         };
-        Some(DebugContext {
+        Dwarf {
             dwarf,
             files: FxHashMap::default(),
             ranges: Vec::new(),
             types: FxHashMap::default(),
             frame,
-        })
+        }
     }
 
     fn file(&mut self, name: &str) -> FileId {
@@ -356,8 +394,7 @@ impl DebugContext {
         }
     }
 
-    /// Describes the function `func` of the module, which is `len` bytes of code.
-    pub(super) fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
+    fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
         if len == 0 {
             return;
         }
@@ -409,8 +446,7 @@ impl DebugContext {
         }
     }
 
-    /// Writes the sections into the object, when it has a function to describe.
-    pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<(), String> {
+    fn emit(mut self, product: &mut ObjectProduct) -> Result<(), String> {
         if self.ranges.is_empty() || product.object.format() != BinaryFormat::Elf {
             return Ok(());
         }

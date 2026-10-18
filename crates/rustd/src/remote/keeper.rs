@@ -220,12 +220,30 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
     _ = steps.send(Step::End(by));
 }
 
-#[cfg(not(unix))]
+/// On Windows a process is told to end by an event of its console: Ctrl-C, Ctrl-Break, which
+/// is the one that can be sent to a single process group, or the console closing.
+#[cfg(windows)]
 async fn told_to_end(steps: UnboundedSender<Step>) {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        _ = steps.send(Step::End(2));
-    }
+    use std::pin::pin;
+
+    use futures_util::future::select;
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
+
+    let (Ok(mut interrupted), Ok(mut broken), Ok(mut closed)) =
+        (ctrl_c(), ctrl_break(), ctrl_close())
+    else {
+        eprintln!("remote: no event can be waited for: nothing is pushed when the daemon ends");
+        return;
+    };
+    let (interrupted, broken, closed) =
+        (pin!(interrupted.recv()), pin!(broken.recv()), pin!(closed.recv()));
+    select(select(interrupted, broken), closed).await;
+    _ = steps.send(Step::End(CONTROL_C_EXIT));
 }
+
+/// How Windows ends a process that waits for none of those events.
+#[cfg(windows)]
+const CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 
 /// Ends the process the way the signal would have, had nothing waited for it.
 #[cfg(unix)]
@@ -239,7 +257,7 @@ fn end_by(signal: i32) -> ! {
     std::process::exit(128 + signal)
 }
 
-#[cfg(not(unix))]
-fn end_by(signal: i32) -> ! {
-    std::process::exit(128 + signal)
+#[cfg(windows)]
+fn end_by(status: i32) -> ! {
+    std::process::exit(status)
 }

@@ -340,8 +340,7 @@ impl Partial {
         (want, most): (Digest, u64),
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<bool> {
-        // The last bytes appended are written behind this task's back until they are flushed:
-        // unpacked before that, the file ends in the middle of a frame.
+        // The last write is still on its way to the file until this: tokio writes behind.
         let flushed = self.file.flush().await;
         let (from, to) = (self.path, to.to_owned());
         drop(self.file);

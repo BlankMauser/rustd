@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """storefull.py: a store on a disk that has no room.
 
-The store is on a small file system of its own (a tmpfs, mounted with sudo), and a file next
-to it takes up all but so many bytes, so that the daemon runs out of room at another place
+The store is on a small file system of its own (a tmpfs, mounted with sudo; on Windows NTFS
+in a virtual disk, attached by an administrator), and a file next to it takes up all but so many bytes, so that the daemon runs out of room at another place
 each time: before it can say which format the store is of, when it opens its pack, in the
 middle of the records, and when it seals. Each time:
 
@@ -23,12 +23,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from storelib import Checkout, Daemon, cache, files, scratch, stats, verify
 
-SIZE = 8 << 20
+WINDOWS = os.name == "nt"
+# NTFS keeps a log and a file table of its own, which do not fit in the 8 MB a tmpfs can be.
+SIZE = (64 if WINDOWS else 8) << 20
 # How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB
-# with Cranelift and 0.9 MB with LLVM.
-ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10, 768 << 10]
+# with Cranelift on Linux and under 1 MB with LLVM on Windows, so the last room is measured.
+ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10]
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
-NO_ROOM = "No space left on device"
+NO_ROOM = "There is not enough space on the disk" if WINDOWS else "No space left on device"
 
 
 def fail(what):
@@ -41,16 +43,38 @@ class Disk:
     def __init__(self, work):
         self.at = os.path.join(work, "disk")
         os.mkdir(self.at)
+        self.image = os.path.join(work, "disk.vhd")
+        if WINDOWS:
+            self.diskpart(f'create vdisk file="{self.image}" maximum={SIZE >> 20} type=fixed', "attach vdisk",
+                          "create partition primary", "format fs=ntfs quick unit=4096", f'assign mount="{self.at}"')
+        else:
+            self.mount()
+        self.store, self.ballast = os.path.join(self.at, "store"), os.path.join(self.at, "ballast")
+
+    def empty_store(self):
+        """The store's directory, empty and the user's alone. A volume just formatted lets
+        every user of a Windows machine write to what is made at its top, and rustd takes
+        no store that others can write to."""
+        shutil.rmtree(self.store, ignore_errors=True)
+        os.mkdir(self.store)
+        if WINDOWS:
+            mine = f'{os.environ["USERNAME"]}:(OI)(CI)F'
+            subprocess.run(["icacls", self.store, "/inheritance:r", "/grant:r", mine], check=True, capture_output=True)
+
+    def mount(self):
         options = f"size={SIZE},uid={os.getuid()},gid={os.getgid()},mode=700"
         mounted = subprocess.run(["sudo", "-n", "mount", "-t", "tmpfs", "-o", options, "tmpfs", self.at],
                                  capture_output=True, text=True)
         if mounted.returncode != 0:
             fail(f"a small file system could not be mounted (sudo is needed): {mounted.stderr.strip()}")
-        self.store, self.ballast = os.path.join(self.at, "store"), os.path.join(self.at, "ballast")
+
+    def diskpart(self, *script):
+        ran = subprocess.run(["diskpart"], input="".join(line + chr(10) for line in script), capture_output=True, text=True)
+        if ran.returncode != 0:
+            fail(f"a small file system could not be attached (an administrator is needed): {ran.stdout[-600:]}")
 
     def free(self):
-        found = os.statvfs(self.at)
-        return found.f_bavail * found.f_frsize
+        return shutil.disk_usage(self.at).free
 
     def leave(self, room):
         """Takes up all of the disk but `room` bytes, to the block."""
@@ -64,13 +88,25 @@ class Disk:
         return self.free()
 
     def unmount(self):
+        if WINDOWS:
+            return self.diskpart(f'select vdisk file="{self.image}"', "detach vdisk")
         subprocess.run(["sudo", "-n", "umount", self.at], capture_output=True)
+
+
+def cold(checkout, disk):
+    """How many bytes a cold build of the workspace writes to a store with room."""
+    disk.empty_store()
+    if os.path.exists(disk.ballast):
+        os.remove(disk.ballast)
+    daemon = Daemon(checkout, disk.store, name="cold", env=SEALS)
+    checkout.check(daemon, "with room, to measure")
+    daemon.kill()
+    return sum(os.path.getsize(os.path.join(disk.store, name)) for name in os.listdir(disk.store))
 
 
 def built_without(checkout, disk, room):
     """A daemon on a store with `room` bytes builds, and says what it could not keep."""
-    shutil.rmtree(disk.store, ignore_errors=True)
-    os.mkdir(disk.store)
+    disk.empty_store()
     left = disk.leave(room)
     checkout.set(room % 7)
     daemon = Daemon(checkout, disk.store, name=f"room{room}", env=SEALS)
@@ -97,8 +133,7 @@ def built_without(checkout, disk, room):
 
 def kept_again(checkout, disk):
     """Room is made while a daemon runs; the next build that writes the store keeps what it compiles."""
-    shutil.rmtree(disk.store, ignore_errors=True)
-    os.mkdir(disk.store)
+    disk.empty_store()
     disk.leave(128 << 10)
     checkout.set(11)
     daemon = Daemon(checkout, disk.store, name="again", env=SEALS)
@@ -168,13 +203,14 @@ def main():
     checkout = Checkout(work)
     disk = Disk(work)
     try:
-        not_used = sum(built_without(checkout, disk, room) for room in ROOMS)
+        rooms = [*ROOMS, cold(checkout, disk) * 2 // 3]
+        not_used = sum(built_without(checkout, disk, room) for room in rooms)
         kept_again(checkout, disk)
         commands(checkout, disk, work)
     finally:
         disk.unmount()
     shutil.rmtree(work, ignore_errors=True)
-    print(f"PASS: {len(ROOMS)} full disks built without a store or without the rest of it "
+    print(f"PASS: {len(rooms)} full disks built without a store or without the rest of it "
           f"({not_used} could not open it at all), in {time.time() - start:.0f}s")
 
 

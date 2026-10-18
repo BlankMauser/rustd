@@ -32,6 +32,10 @@ def wait_for(port, seconds=30):
     raise SystemExit(f"nothing listens on {port} after {seconds}s")
 
 
+# A service started with this is the head of a group or tree that `kill` ends whole.
+OWN_GROUP = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else dict(start_new_session=True)
+
+
 class Server:
     """An S3 service on this machine, which can be killed and started again on the same data."""
     def __init__(self, kind, binary, top, certs=None):
@@ -58,12 +62,15 @@ class Server:
             command = [self.binary, "server", f"-dir={self.dir}", "-ip=127.0.0.1", "-s3", f"-s3.port={self.port}",
                        f"-s3.config={config}", f"-master.port={master}", f"-volume.port={volume}", f"-filer.port={filer}",
                        "-volume.max=100"]
-        self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=self.log, start_new_session=True)
+        self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=self.log, **OWN_GROUP)
         wait_for(self.port)
 
     def kill(self):
         if self.process:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.process.pid)], capture_output=True)
+            else:
+                os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait()
             self.process = None
 
@@ -118,7 +125,12 @@ class Bucket:
         return data
 
     def create(self):
-        status, data = self.request("PUT")
+        """Makes the bucket. A server that has only just started says 503 until it is ready."""
+        for _ in range(100):
+            status, data = self.request("PUT")
+            if status != 503:
+                break
+            time.sleep(0.1)
         if status not in (200, 409):
             raise SystemExit(f"creating the bucket answered {status}: {data[:300]!r}")
 
@@ -340,7 +352,8 @@ class Proxy:
 
 def find(name, variable):
     """The binary of a service: what the variable names, one on PATH, or ~/s3tools/NAME."""
-    for it in (os.environ.get(variable), shutil.which(name), os.path.expanduser(f"~/s3tools/{name}")):
+    exe = ".exe" if os.name == "nt" else ""
+    for it in (os.environ.get(variable), shutil.which(name), os.path.expanduser(f"~/s3tools/{name}{exe}")):
         if it and os.path.exists(it):
             return it
     return None

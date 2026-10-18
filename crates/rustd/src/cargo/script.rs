@@ -52,11 +52,32 @@ pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
     Ok(std::fs::set_permissions(linked, std::fs::Permissions::from_mode(0o755))?)
 }
 
-/// Where there is no shell to run a script through, cargo runs the script itself, and a
-/// change it reruns for is cargo's to build.
-#[cfg(not(unix))]
-pub(crate) fn stand_in_front(_: &Path) -> anyhow::Result<()> {
+/// Has cargo run the script rustc linked at `linked` through `rustd build-script`. There is
+/// no shell to say so in a file cargo runs, so this executable is linked there under the
+/// script's name, and [`stood_in_front_of`] is how it knows. Where it can't be linked, on
+/// another volume, cargo runs the script itself and a change it reruns for is cargo's to
+/// build.
+#[cfg(windows)]
+pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
+    let real = real_of(linked);
+    std::fs::rename(linked, &real)?;
+    if std::fs::hard_link(std::env::current_exe()?, linked).is_err() {
+        std::fs::rename(&real, linked)?;
+    }
     Ok(())
+}
+
+/// The script this executable stands in front of, when it runs under the name of one:
+/// the name rustc linked it under, or the one cargo gives it in the same directory.
+#[cfg(windows)]
+pub(crate) fn stood_in_front_of() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_stem()?.to_str()?;
+    if !name.starts_with("build_script_") && !name.starts_with("build-script-") {
+        return None;
+    }
+    let beside = std::fs::read_dir(exe.parent()?).ok()?.flatten().map(|it| it.path());
+    beside.into_iter().find(|it| it.to_str().is_some_and(|it| it.ends_with(".exe.real")))
 }
 
 fn real_of(linked: &Path) -> PathBuf {
@@ -68,6 +89,14 @@ fn real_of(linked: &Path) -> PathBuf {
 /// `rustd build-script`: writes down how cargo runs the script and becomes it.
 pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let real = PathBuf::from(std::env::var_os(REAL).context("no build script is named")?);
+    run_as_cargo_does(real, args)
+}
+
+/// Writes down how cargo runs the script at `real` and becomes it.
+pub(crate) fn run_as_cargo_does(
+    real: PathBuf,
+    args: impl Iterator<Item = OsString>,
+) -> anyhow::Result<()> {
     let env: Vec<(String, String)> = std::env::vars_os()
         .filter(|(name, _)| name != REAL)
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
