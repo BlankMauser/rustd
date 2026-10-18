@@ -69,6 +69,9 @@ class Builds {
   }
 
   message(data) {
+    if ("progress" in data) {
+      return;
+    }
     if (data.loaded) {
       this.line("info", "compiler ready", this.describe(data.loaded));
       this.ready = true;

@@ -248,4 +248,5 @@ targets. It is not written for Windows, and has not been checked on macOS. See
 
 `crates/rustd-wasm` is an experiment that builds the compiler itself for wasm and runs it in
 a web page. It is excluded from the workspace and is not part of the daemon. See
-[reports/WASM.md](reports/WASM.md).
+[reports/WASM.md](reports/WASM.md). The website runs a small
+version of it: [playground.md](playground.md).

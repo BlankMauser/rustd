@@ -3,21 +3,52 @@
 import { Compiler } from "./compiler.js";
 
 // `?pack=<url>` names a packed cargo workspace to compile instead of one file over `core`.
-const pack = new URL(location.href).searchParams.get("pack");
+// `?gz` says the files are the gzipped ones `build-site.sh` makes, for a host that does not
+// compress what it serves.
+const query = new URL(location.href).searchParams;
+const pack = query.get("pack");
+const suffix = query.has("gz") ? ".gz" : "";
 let compiler;
 let compiled;
 let core;
+
+// The bytes at `url`, saying how many have arrived as they do.
+const received = {};
+async function load(url) {
+  // Asked of the server each time: a compiler the browser kept from an earlier build does
+  // not have what this JavaScript calls.
+  const response = await fetch(url, { cache: "no-cache" });
+  if (!response.ok) {
+    throw new Error(`${url}: ${response.status}`);
+  }
+  const chunks = [];
+  received[url] = 0;
+  for (const reader = response.body.getReader(); ; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    chunks.push(value);
+    received[url] += value.length;
+    postMessage({ progress: Object.values(received).reduce((sum, it) => sum + it, 0) });
+  }
+  let bytes = new Blob(chunks);
+  // A server that knows gzip may have undone it already.
+  const magic = new Uint8Array(await bytes.slice(0, 2).arrayBuffer());
+  if (suffix && magic[0] === 0x1f && magic[1] === 0x8b) {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("this browser has no DecompressionStream");
+    }
+    bytes = new Response(bytes.stream().pipeThrough(new DecompressionStream("gzip")));
+  }
+  return new Uint8Array(await bytes.arrayBuffer());
+}
+
 try {
   const started = performance.now();
   let wasm;
   [wasm, core] = await Promise.all(
-    ["pkg/rustd_wasm.wasm", pack ?? "pkg/core.bundle"].map(async (url) => {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`${url}: ${response.status}`);
-      }
-      return new Uint8Array(await response.arrayBuffer());
-    }),
+    ["pkg/rustd_wasm.wasm", pack ?? "pkg/core.bundle"].map((url) => load(url + suffix)),
   );
   const fetched = performance.now();
   compiled = await WebAssembly.compile(wasm);

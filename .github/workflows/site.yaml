@@ -4,7 +4,13 @@ name: site
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/site.yaml"]
+    paths:
+      - "site/**"
+      - "crates/rustd-wasm/**"
+      # What the compiler in the playground is built from.
+      - "crates/hir-ty-codegen/**"
+      - "vendor/rust-analyzer"
+      - ".github/workflows/site.yaml"
   workflow_dispatch:
 
 permissions:
@@ -25,6 +31,31 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: sh -n site/install.sh
+      # The playground's compiler is built here and not committed. Every step of it may fail:
+      # the page then says the demo is unavailable, and the install scripts are deployed all
+      # the same.
+      - name: Playground toolchain
+        id: toolchain
+        continue-on-error: true
+        run: |
+          git submodule update --init --depth 1 vendor/rust-analyzer
+          rustup toolchain install 1.99.0 --profile minimal -c rust-src -t wasm32-unknown-unknown
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
+        if: steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        with:
+          workspaces: "crates/rustd-wasm -> ../../target"
+      - name: Playground
+        id: playground
+        if: steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        run: crates/rustd-wasm/web/build-site.sh
+      - name: Playground unavailable
+        if: steps.playground.outcome != 'success'
+        run: |
+          rm -rf site/playground/rustd/pkg
+          echo "::warning::The playground was not built; the site is deployed without it."
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

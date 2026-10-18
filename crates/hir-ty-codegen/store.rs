@@ -365,6 +365,14 @@ fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<()> {
         }
         Ok(())
     }
+    // Where a file has no read at a place (wasm): nothing else reads this file here.
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(buffer)
+    }
 }
 
 /// The directory of a store, for what is done to it as a whole. Every one of these can run
