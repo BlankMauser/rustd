@@ -8,9 +8,13 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use super::{package, units::Record};
+use crate::weaken;
 
 /// What an ELF linker is told so that the first definition of a name is the one that stays.
 const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
+
+/// What Apple's linker is told so that a splice has room in the header for its two segments.
+const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
 
 /// The same for `link.exe`, which warns of every name it does so for unless told not to.
 const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
@@ -82,7 +86,7 @@ impl Plan {
         let line =
             std::fs::read_to_string(line).with_context(|| format!("reading {}", line.display()))?;
         let Some(mut link) = LinkLine::parse(&line) else {
-            let why = "the link line is not one of an ELF linker driven by `cc` or of `link.exe`";
+            let why = "the link line is not one of a linker driven by `cc` or of `link.exe`";
             return Ok(Err(why.to_owned()));
         };
         let mut plan = Plan {
@@ -128,6 +132,7 @@ impl Plan {
         }
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
+        link.give_way(&plan.copies)?;
         plan.link_cmd =
             link.command(&[&plan.patch, &plan.object], &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
@@ -179,6 +184,8 @@ fn unsupported(unit: &Record) -> Option<String> {
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
 pub(crate) struct LinkLine {
+    /// What the line starts with to run the driver without some variables: `env -u NAME`.
+    without: Vec<String>,
     env: Vec<(String, String)>,
     linker: String,
     args: Vec<String>,
@@ -190,6 +197,8 @@ pub(crate) struct LinkLine {
 enum Flavor {
     /// An ELF linker driven by `cc`.
     Cc,
+    /// Apple's linker driven by `cc`, which tells it its architecture.
+    Apple,
     /// `link.exe`, or one that takes its arguments.
     Msvc,
 }
@@ -199,9 +208,12 @@ impl Flavor {
         if args.iter().any(|it| it == "/NOLOGO") {
             return args.iter().any(|it| it.starts_with(OUT)).then_some(Flavor::Msvc);
         }
-        let elf = args.iter().any(|it| it == "-o")
-            && !args.iter().any(|it| it == "-flavor" || it == "-arch");
-        elf.then_some(Flavor::Cc)
+        let of_cc = args.iter().any(|it| it == "-o") && !args.iter().any(|it| it == "-flavor");
+        let flavor = match args.iter().any(|it| it == "-arch") {
+            true => Flavor::Apple,
+            false => Flavor::Cc,
+        };
+        of_cc.then_some(flavor)
     }
 }
 
@@ -209,6 +221,11 @@ impl LinkLine {
     /// `None` for a line that is of no linker the daemon knows.
     pub(crate) fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
+        let unsets = match words.first().map(String::as_str) {
+            Some("env") => words[1..].chunks(2).take_while(|it| it[0] == "-u").count(),
+            _ => 0,
+        };
+        let (without, words) = words.split_at(if unsets == 0 { 0 } else { 1 + 2 * unsets });
         let first = words.iter().position(|it| !is_assignment(it))?;
         let env = words[..first]
             .iter()
@@ -222,7 +239,22 @@ impl LinkLine {
             .cloned()
             .collect();
         let flavor = Flavor::of(&args)?;
-        Some(LinkLine { env, linker: words[first].clone(), args, flavor })
+        let (without, linker) = (without.to_vec(), words[first].clone());
+        Some(LinkLine { without, env, linker, args, flavor })
+    }
+
+    /// Has what rustc built of the workspace give way to the daemon's by being weak, where
+    /// the linker has no flag for the first definition staying: Apple's.
+    fn give_way(&mut self, copies: &[PathBuf]) -> anyhow::Result<()> {
+        if self.flavor != Flavor::Apple {
+            return Ok(());
+        }
+        for arg in &mut self.args {
+            if copies.iter().any(|it| it == Path::new(arg)) {
+                *arg = weaken::copy_of(Path::new(arg))?.display().to_string();
+            }
+        }
+        Ok(())
     }
 
     /// The executable the line links.
@@ -277,7 +309,7 @@ impl LinkLine {
             .context("nothing of rustc's is linked")?;
         let ours = ahead.iter().map(|it| it.display().to_string()).collect();
         match self.flavor {
-            Flavor::Cc => self.command_of_cc(ours, first, binary, response),
+            Flavor::Cc | Flavor::Apple => self.command_of_cc(ours, first, binary, response),
             Flavor::Msvc => self.command_of_msvc(ours, first, binary, response),
         }
     }
@@ -289,7 +321,11 @@ impl LinkLine {
         binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
-        self.args.splice(first..first, ours.into_iter().chain([FIRST_DEFINITION_STAYS.to_owned()]));
+        let flag = match self.flavor {
+            Flavor::Apple => ROOM_FOR_SEGMENTS,
+            _ => FIRST_DEFINITION_STAYS,
+        };
+        self.args.splice(first..first, ours.into_iter().chain([flag.to_owned()]));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
@@ -301,7 +337,7 @@ impl LinkLine {
             .collect::<Result<_, _>>()
             .context("an argument of the link can't be quoted")?;
         std::fs::write(response, quoted.join("\n"))?;
-        let mut command = Vec::new();
+        let mut command = self.without;
         for (name, value) in &self.env {
             command.push(format!("{name}={}", shlex::try_quote(value)?));
         }
@@ -431,8 +467,67 @@ mod tests {
         assert!(LinkLine::parse("no quotes here").is_none());
         assert!(LinkLine::parse(r#""link.exe" "/NOLOGO" "-o""#).is_none());
         assert!(LinkLine::parse(r#""rust-lld" "-flavor" "wasm" "-o" "a.wasm""#).is_none());
-        assert!(LinkLine::parse(r#""cc" "-arch" "arm64" "-o" "a""#).is_none());
         assert!(LinkLine::parse(r#"A="1" "cc" "unterminated"#).is_none());
+    }
+
+    #[test]
+    fn link_line_of_cc_for_mach_o() {
+        let line = r#"env -u IPHONEOS_DEPLOYMENT_TARGET -u TVOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "/t/deps/a.1.rcgu.o" "-arch" "arm64" "-o" "/t/deps/a-1""#;
+        let link = LinkLine::parse(line).unwrap();
+        assert_eq!(
+            link.without,
+            ["env", "-u", "IPHONEOS_DEPLOYMENT_TARGET", "-u", "TVOS_DEPLOYMENT_TARGET"]
+        );
+        assert_eq!(link.env, [("LC_ALL".to_owned(), "C".to_owned())]);
+        assert_eq!(link.linker, "cc");
+        assert_eq!(link.flavor, Flavor::Apple);
+        assert_eq!(LinkLine::parse(LINE).unwrap().flavor, Flavor::Cc);
+    }
+
+    #[test]
+    fn rustcs_copies_give_way_for_apple() {
+        let dir = std::env::temp_dir().join(format!("rustd-plan-apple-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("a.1.rcgu.o");
+        std::fs::write(&copy, b"not an object").unwrap();
+        let line = format!(
+            r#"env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "{}" "/t/libstd-3.rlib" "-arch" "arm64" "-o" "/t/deps/a-1""#,
+            copy.display()
+        );
+        let mut link = LinkLine::parse(&line).unwrap();
+        link.give_way(std::slice::from_ref(&copy)).unwrap();
+        let response = dir.join("link.args");
+        let command =
+            link.command(&[Path::new("/p/rustd.o")], Path::new("/p/bin"), &response).unwrap();
+        assert_eq!(
+            shlex::split(&command).unwrap(),
+            [
+                "env",
+                "-u",
+                "IPHONEOS_DEPLOYMENT_TARGET",
+                "LC_ALL=C",
+                "cc",
+                &format!("@{}", response.display())
+            ]
+        );
+        let weak = dir.join(weaken::DIR).join("a.1.rcgu.o");
+        assert!(weak.exists());
+        let args = std::fs::read_to_string(&response).unwrap();
+        let args: Vec<String> = args.lines().flat_map(|it| shlex::split(it).unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "/p/rustd.o",
+                ROOM_FOR_SEGMENTS,
+                &weak.display().to_string(),
+                "/t/libstd-3.rlib",
+                "-arch",
+                "arm64",
+                "-o",
+                "/p/bin"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

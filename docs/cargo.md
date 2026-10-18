@@ -5,7 +5,8 @@ subcommand, described here. The second, switching rustd on globally so that plai
 goes through it, has its own section at the end.
 
 Everything in this file was checked against the code in `crates/rustd/src/cargo/` and run on
-Linux x86-64. The design notes it was written from are in
+Linux x86-64. On macOS arm64 `harness/cargo_rustd.py --small` was run, and what is known of
+it is under [macOS arm64](#macos-arm64). The design notes it was written from are in
 [reports/CARGO.md](reports/CARGO.md).
 
 ## Install
@@ -82,7 +83,7 @@ A whole invocation goes to cargo when any of these hold (`Invocation::only_cargo
 | more than one `--target` | several targets in one build |
 | `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `RUSTC_WORKSPACE_WRAPPER` is set to another wrapper |
 | `rustd-rustc` missing | `rustd-rustc` is not installed next to `rustd` |
-| `--target` or `CARGO_BUILD_TARGET` naming a target that is not ELF, or one rustd does not know | programs for the triple are not linked through `cargo rustd` yet |
+| `--target` or `CARGO_BUILD_TARGET` naming a target that is neither ELF nor Mach-O, or one rustd does not know | programs for the triple are not linked through `cargo rustd` yet |
 
 A single build goes to cargo when:
 
@@ -199,11 +200,13 @@ a shell without the variable keeps no store, whatever later shells have set.
   a borrow or move error is not found: with a warm daemon, `cargo rustd run` built and ran
   a program that uses a value after moving it. Nothing is reported until cargo next builds
   that crate. Run `cargo rustd check` when you want rustc's verdict.
-- Only Linux has been run. The code compiles for macOS and Windows, but every build there
-  would go to cargo (the link step is written for ELF), and the command has not been built
-  or run on either. The socket's permission and peer checks do nothing on Windows.
-- `cargo rustd` was measured with the Cranelift backend only. LLVM has been run through the
-  harness gate, not through `harness/cargo_rustd.py`.
+- Linux x86-64 and macOS arm64 have been run; on macOS only ripgrep, fd and hyperfine and
+  the generated workspace of the harness. The code compiles for Windows, but every build
+  there would go to cargo (the link step knows ELF and Mach-O), and the command has not
+  been built or run there. The socket's permission and peer checks do nothing on Windows.
+- On Linux `cargo rustd` was measured with the Cranelift backend only; LLVM has been run
+  through the harness gate, not through `harness/cargo_rustd.py`. On macOS the harness was
+  run under both.
 - In ten runs of just's test suite through `harness/cargo_rustd.py` there were two
   differences from cargo that are not explained. One was a test failing in the
   daemon-built executable and passing under cargo. The other was between two executables
@@ -285,8 +288,8 @@ match cargo on every step. `harness/cargo_rustd.py` runs all of this.
 
 Not checked: a proc macro defined in the workspace, `--target` for another triple,
 `cargo install` from the registry, a real rust-analyzer session next to it, real sccache (a
-stand-in wrapper was used). On macOS and Windows every build is cargo's in this mode and
-nothing was run.
+stand-in wrapper was used). On Windows every build is cargo's in this mode and nothing was
+run. macOS arm64 is below.
 
 ### Known problems
 
@@ -297,3 +300,48 @@ nothing was run.
 - A socket path over 108 bytes cannot be bound; the build goes to cargo and says so. The
   default locations are well under that.
 
+
+## macOS arm64
+
+`cargo rustd` and plain cargo after `rustd enable` serve dev and test builds for
+`aarch64-apple-darwin`. x86-64 macOS is not a target rustd knows, so builds for it are
+cargo's.
+
+Two things differ from Linux. Apple's linker has no way to let the first of two
+definitions win, so the daemon links rustc's line with copies of the workspace's objects in
+which every definition is weak, and its own object in front; this is the link the daemon
+already did on macOS, and the line also gets `-Wl,-headerpad,0x200` so that the executable
+can be spliced later. And there is no `/proc`: in the global mode, the cargo above the
+wrapper is read through `libproc` and `sysctl`.
+
+What was run, on an 8-CPU Apple M4 virtual machine with macOS 26.5 and Rust 1.99.0:
+`harness/cargo_rustd.py --small`, under Cranelift and under LLVM (`RUSTD_OPT=2`,
+`RUSTD_EMIT=fast`). Under each it passed: ripgrep, fd and hyperfine gave the same output,
+exit status and test results as cargo alone on every step of both modes (134 comparisons),
+and the 101 checks of the flags, the daemon and plain cargo held. Those include the
+`enable`/`disable` round trip of `config.toml`, byte for byte, over five configurations, and
+the second user at the socket, for which the harness uses `nobody` on macOS.
+
+Seconds for the build after an edit, rustd / cargo alone, one run each:
+
+| Project | `cargo rustd`, Cranelift | `cargo rustd`, LLVM | plain cargo, Cranelift | plain cargo, LLVM |
+|---|---:|---:|---:|---:|
+| ripgrep 15.1.0 | 2.08 / 1.43 | 0.40 / 0.67 | 1.35 / 0.97 | 1.07 / 0.69 |
+| fd 10.3.0 | 0.24 / 0.42 | 0.25 / 0.43 | 0.26 / 0.42 | 0.29 / 0.42 |
+| hyperfine 1.19.0 | 0.34 / 0.35 | 0.21 / 0.33 | 0.24 / 0.34 | 0.23 / 0.34 |
+
+The ripgrep numbers are not steady. Two earlier Cranelift runs of the same step on the same
+machine gave 0.52 / 0.73 and 1.08 / 1.30 for `cargo rustd`, and 1.86 / 0.78 and 1.30 / 1.30
+for plain cargo; in every run the daemon did that build, and under plain cargo it was not
+faster than cargo. Why ripgrep's edit takes one to two seconds in some runs was not looked
+into. A build with no change took 0.03 to 0.06 s through `cargo rustd` against 0.31 to
+0.41 s, and 0.16 to 0.19 s through plain cargo.
+
+Builds that went to cargo in those runs, each with its reason printed: the first build of
+every project, the build of source that does not compile, ripgrep's tests after an edit
+under `cargo rustd` (a library the unit tests are linked with as rustc built it), and the
+tests of ripgrep and hyperfine after an edit under plain cargo ("the build is not one the
+daemon has loaded").
+
+Not run on macOS: the projects of the harness other than those three, `cargo rustd` with
+debug info looked at in a debugger, and anything on x86-64.

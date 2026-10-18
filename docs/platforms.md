@@ -132,7 +132,10 @@ What is specific to the port:
   arguments always go on the stack.
 
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
-`cargo rustd` hands every build to cargo and has not been run. `buildmodel.py`,
+`cargo rustd` and plain cargo after `rustd enable` serve dev and test builds;
+`harness/cargo_rustd.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
+the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
+`buildmodel.py`,
 `storefull.py`, `remote.py`, `farsplices.py` and the fuzzer are not run. The first port
 noted that under LLVM the unwind rules are not exact inside prologues and epilogues;
 nothing later says that changed.

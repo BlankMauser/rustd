@@ -933,8 +933,8 @@ impl<'a> Patch<'a> {
                 _ => vec![relocation.symbol],
             };
             for symbol in symbols {
-                if !targets.contains_key(&symbol) {
-                    targets.insert(symbol, patch.target(symbol, image)?);
+                if let std::collections::hash_map::Entry::Vacant(unseen) = targets.entry(symbol) {
+                    unseen.insert(patch.target(symbol, image)?);
                 }
             }
             let target = targets[&relocation.symbol];

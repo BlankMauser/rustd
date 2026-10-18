@@ -43,7 +43,15 @@ import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, tim
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+# `difftest` turns incremental compilation off for the harnesses that build with rustc
+# alone. Here it stays as the caller has it: without it the tests of every project are
+# cargo's, and that case is one of the flags.
+INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
 from difftest import host
+if INCREMENTAL is None:
+    os.environ.pop("CARGO_INCREMENTAL", None)
+else:
+    os.environ["CARGO_INCREMENTAL"] = INCREMENTAL
 ROOT = os.path.dirname(HERE)
 WINDOWS = os.name == "nt"
 EXE = ".exe" if WINDOWS else ""
@@ -193,8 +201,12 @@ def kill(pid):
 
 def alive(pid):
     """Whether `pid` is a process that still runs."""
-    if not WINDOWS:
+    if os.path.isdir("/proc/self"):
         return os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
+    if not WINDOWS:
+        # No /proc on macOS: `ps` says the state, and nothing of a process that is gone.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and "Z" not in state
     listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True)
     return f'"{pid}"' in listed.stdout
 
@@ -374,6 +386,12 @@ def served(side, command, ask):
 def checking(root):
     """Whether a `cargo check` runs below `root`: the one `cargo rustd` starts after cargo
     built, for the dependencies to be checked by the time the daemon builds."""
+    if not os.path.isdir("/proc/self"):
+        # No /proc on macOS: `ps` has the commands and `lsof` where each one runs.
+        listed = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        checks = [l.split()[0] for l in listed.splitlines() if l.split()[2:3] == ["check"]]
+        cwd = lambda pid: subprocess.run(["lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"], capture_output=True, text=True).stdout
+        return any(os.path.realpath(l[1:]).startswith(root) for pid in checks for l in cwd(pid).splitlines() if l.startswith("n"))
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
@@ -786,7 +804,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
     right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
     by_daemon = sum(how_built(out[1]) == "daemon" for _, _, out, _ in ended)
-    check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker")
+    check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker" + "".join(f"; tree{n} c{i}: exit {code}, {out[0][-80:]!r} {out[1][-200:]!r}" for (n, i, out, code), ok in zip(ended, right) if not ok))
 
     # A worker that is stopped holds the build a client asks for until it is continued.
     edit = lambda text: open(os.path.join(ws, "app/src/main.rs"), "a").write(f"\n// {text}\n")
@@ -852,8 +870,13 @@ def stranger(home, check):
     if sudo("true").returncode != 0:
         check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RUSTD_NO_SUDO") == "1", "not run")
         return
-    sudo("userdel", name)
-    made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
+    # macOS has no `useradd`, and has a user with nothing of its own.
+    DARWIN = sys.platform == "darwin"
+    if DARWIN:
+        name, made = "nobody", sudo("-u", "nobody", "true")
+    else:
+        sudo("userdel", name)
+        made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
     sock = os.path.join(home, "daemon.sock")
     version = re.search(r"version (\S+),", subprocess.run(["cargo", "rustd", "status"], env=dict(os.environ, RUSTD_HOME=home, PATH=os.path.dirname(RUSTD) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
     request = json.dumps({"version": version, "replaces": False, "request": "Status"})
@@ -895,7 +918,8 @@ def stranger(home, check):
             sudo("rm", "-rf", os.path.dirname(trap))
         check("the client says nothing to a socket a second user serves", asked.returncode != 0 and "the peer is user" in asked.stderr and heard == "heard: 0", f"status {asked.returncode}, {heard}")
     finally:
-        sudo("userdel", name)
+        if not DARWIN:
+            sudo("userdel", name)
 
 
 WRAPPER = '#!/bin/sh\necho "$1" >> "{log}"\nexec "$@"\n'
@@ -987,8 +1011,6 @@ def plain(work):
     calls = lambda name: open(logs[name]).read().splitlines() if os.path.exists(logs[name]) else []
     edit = lambda text, root=ws: rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("', f'format!("{text} ')
     touch = lambda text, root=ws: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
-
-    alive = lambda pid: os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
 
     def status(rustd=RUSTD):
         text = subprocess.run([rustd, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
@@ -1212,7 +1234,8 @@ def main():
     names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
     modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
     # As the daemon names it: with no link and no short name in it.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-"))
+    # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:

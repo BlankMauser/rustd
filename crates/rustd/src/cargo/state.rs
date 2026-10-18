@@ -15,7 +15,6 @@ use cargo_metadata::{
     Artifact, BuildScript, Message, Metadata, MetadataCommand, Package, TargetKind,
 };
 use rustc_hash::FxHashSet;
-use same_file::Handle;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -719,13 +718,12 @@ fn records_of(artifacts: &[&Artifact]) -> anyhow::Result<Vec<Record>> {
 }
 
 /// The records of the units of this build: a directory has those of other builds too. Cargo
-/// names a program by its hard link to what rustc wrote, so the files are told by what
-/// they are and not by their paths.
+/// names a program by its hard link to what rustc wrote or by its copy of it, so the files
+/// are told by what they are and not by their paths.
 fn used_by(artifacts: &[&Artifact], records: &[Record]) -> Vec<Record> {
     let files = artifacts.iter().flat_map(|it| &it.filenames);
-    let built: FxHashSet<Handle> = files.filter_map(|it| Handle::from_path(it).ok()).collect();
-    let is_built = |file: &PathBuf| Handle::from_path(file).is_ok_and(|it| built.contains(&it));
-    records.iter().filter(|it| it.outputs().iter().any(is_built)).cloned().collect()
+    let is_built = |record: &&Record| files.clone().any(|it| record.wrote(it.as_std_path()));
+    records.iter().filter(is_built).cloned().collect()
 }
 
 /// The directory of the package the build is of, whose features the daemon loads the
