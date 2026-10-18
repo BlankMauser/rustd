@@ -848,6 +848,9 @@ async fn lacking(
     let asked = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
         let most = listed.keys_max(remote);
         let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await;
+        if let Err(e) = &keys {
+            eprintln!("remote: the keys of {pack}.pack are not known, so it is fetched: {e:#}");
+        }
         let all_here = keys.is_ok_and(|keys| {
             !keys.is_empty()
                 && keys

@@ -775,7 +775,9 @@ def profiler(tally, what, binary, cwd, crates):
     script = subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
     frames = re.findall(r"^\s+[0-9a-f]+ (\S+)\n\s+(\S+)$", script, re.M)
     mine = [(name, line) for name, line in frames if any(f"{len(c)}{c}" in name or f"{c}::" in name for c in crates)]
-    lost = [name for name, line in mine if not re.search(r"\.rs:\d+$", line)]
+    # A line 0 of one of rustc's codegen units is rustc saying of its own code that it has no
+    # line: the crate's functions that were left to rustc are not what is asked about here.
+    lost = [name for name, line in mine if not re.search(r"\.rs:\d+$|-cgu\.\d+:0$", line)]
     stacks = [stack for stack in script.split("\n\n") if stack.strip()]
     through = sum(bool(re.search(r"4main\b|::main\b", stack)) for stack in stacks)
     verdict = "NO SAMPLES" if not mine else "NO LINE" if lost else "NOT UNWOUND" if not through else "named"

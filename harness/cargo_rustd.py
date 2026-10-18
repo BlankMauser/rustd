@@ -99,6 +99,12 @@ PROJECTS = {
         test=["-p", "cargo-platform"],
         edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
     ),
+    # The unit tests of cargo's own library, which is most of cargo.
+    "cargo-lib": dict(
+        repo="rust-lang/cargo", tag="0.99.0", rev="797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+        run=["--list"], test=["--lib"],
+        edits=[("src/bin/cargo/main.rs", "fn main() {", 'fn main() {\n    eprintln!("edited main");')],
+    ),
     "rust-analyzer": dict(
         repo="rust-lang/rust-analyzer", tag="2026-10-12", rev="2ad81e72b7e978cb800dffe1bcce5c9f98032acf",
         build=["-p", "rust-analyzer"], run=["--version"], test=["-p", "stdx"],
@@ -442,6 +448,10 @@ def project(name, spec, work, mode):
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
             open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w", encoding="utf-8").write(other.stdout + other.stderr)
         print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
+        # What the tests that failed here alone said.
+        said = wrong and re.search(r"^failures:\n(.*?)^failures:", mine.stdout, re.M | re.S)
+        if said:
+            print("".join(f"      {line}\n" for line in said[1].splitlines()[:60]), end="", flush=True)
 
     def runs(label):
         if ask:

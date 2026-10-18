@@ -127,6 +127,16 @@ pub enum CodegenError {
     /// rustc exports nothing for the function, so there is nothing to replace: only code in
     /// its own crate can call it.
     NoSymbol,
+    /// rustc built the function under a symbol private to its object, so its copy stays the
+    /// one that code of that object calls, and goes on using rustc's statics.
+    Private,
+}
+
+impl CodegenError {
+    /// Whether rustc has no symbol of the function that ours could take the place of.
+    pub fn no_symbol(&self) -> bool {
+        matches!(self, CodegenError::NoSymbol | CodegenError::Private)
+    }
 }
 
 impl fmt::Display for CodegenError {
@@ -135,7 +145,9 @@ impl fmt::Display for CodegenError {
             CodegenError::Unsupported(it) => write!(f, "unsupported: {it}"),
             CodegenError::Frontend(it) => write!(f, "frontend: {it}"),
             CodegenError::Backend(it) => write!(f, "backend: {it}"),
-            CodegenError::NoSymbol => write!(f, "unsupported: no rustc symbol for function"),
+            CodegenError::NoSymbol | CodegenError::Private => {
+                write!(f, "unsupported: no rustc symbol for function")
+            }
         }
     }
 }
@@ -174,6 +186,10 @@ pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
     fn static_(&self, id: StaticId) -> Option<String>;
+    /// Whether rustc built the function under a symbol that only its own object can link to.
+    fn private(&self, _func: FunctionId) -> bool {
+        false
+    }
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
     /// The path of an item, e.g. `core::any::TypeId`.
@@ -521,7 +537,7 @@ impl CodegenUnit {
                         Err(e) => {
                             // rustc's copy calls what ours would have.
                             if !on_demand.is_empty()
-                                && !matches!(e, CodegenError::NoSymbol)
+                                && !e.no_symbol()
                                 && !cg.want_reachable_from(root)
                             {
                                 let krate = root.krate(db);
@@ -1761,7 +1777,7 @@ fn left_to_rustc<'a>(
 ) -> impl Iterator<Item = FunctionId> + 'a {
     skipped
         .iter()
-        .filter(|(_, e)| !matches!(e, CodegenError::NoSymbol))
+        .filter(|(_, e)| !e.no_symbol())
         .map(|it| it.0)
         .filter(|&func| symbols.rustc_built(func.krate(db)))
 }
@@ -2717,7 +2733,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let db = self.db;
         db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let Some(symbol) = self.symbols.function(func) else {
-            return Err(CodegenError::NoSymbol);
+            // FIXME: with a `main` of ours only what it reaches is compiled, and a function
+            // left to rustc can still call one private to its object.
+            let private = self.on_demand_crates.is_empty() && self.symbols.private(func);
+            return Err(if private { CodegenError::Private } else { CodegenError::NoSymbol });
         };
         let start = stdx::time::Instant::now();
         let compiled = compiled_root(db, func);

@@ -257,7 +257,7 @@ impl Frozen {
         base: &Base,
     ) -> Option<(FunctionId, String)> {
         let now = || {
-            let theirs = base.skipped.iter().filter(|it| !matches!(it.1, CodegenError::NoSymbol));
+            let theirs = base.skipped.iter().filter(|it| !it.1.no_symbol());
             theirs.map(|(root, why)| (*root, why))
         };
         let distrusted = |root: FunctionId| self.distrusted.contains(&root.krate(db));
@@ -533,7 +533,7 @@ impl Base {
         }
         let left = skipped
             .iter()
-            .map(|(root, e)| (!matches!(e, CodegenError::NoSymbol)).then(|| Left::of(db, *root)))
+            .map(|(root, e)| (!e.no_symbol()).then(|| Left::of(db, *root)))
             .collect();
         let from_rustc: Vec<FunctionId> = left_to_rustc(db, cg.symbols, skipped).collect();
         let (their_statics, walked) = TheirStatics::walk(db, from_rustc.iter().copied());
