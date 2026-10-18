@@ -1883,7 +1883,7 @@ index 0a47e031b720f9e6f45f93d676da2ae31ef7963c..194597d059cabdbe93f81b34f77a3e5b
  
      /// Check for cases where arbitrary self types allows shadowing
 diff --git a/crates/hir-ty/src/mir.rs b/crates/hir-ty/src/mir.rs
-index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef04289f1708c 100644
+index 0494b4f08da996732af67a8a5598cbb81121e1cd..0087b6ca892cbe8094463eaec91c39ef8fd39a04 100644
 --- a/crates/hir-ty/src/mir.rs
 +++ b/crates/hir-ty/src/mir.rs
 @@ -9,7 +9,7 @@ use hir_def::{
@@ -1964,7 +1964,7 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
  impl StatementKind {
      fn with_span(self, span: MirSpan) -> Statement {
          Statement { kind: self, span }
-@@ -1021,17 +1057,593 @@ pub struct MirBody<'db> {
+@@ -1021,17 +1057,547 @@ pub struct MirBody<'db> {
      pub binding_locals: ArenaMap<BindingId, LocalId>,
      pub upvar_locals: FxHashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
      pub param_locals: Vec<LocalId>,
@@ -1976,6 +1976,10 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
      pub closures: Vec<InternedClosureId<'db>>,
 +    /// Set for the body of an `async` block, which is compiled as its `Future::poll`.
 +    pub coroutine: Option<CoroutineLocals>,
++    /// Blocks that rustc builds no way into: where a match arm binds that its tree of tests
++    /// never gets to. They run if control gets there, and what is moved out in them does not
++    /// count for the order a value is dropped in.
++    pub unreached: Vec<BasicBlockId>,
 +}
 +
 +/// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -2323,56 +2327,6 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
 +        HeldLocals { locals, yields, conflicts, flagged, parts }
 +    }
 +
-+    /// For the end of each block, which of `locals` may have had a part moved out since the
-+    /// local last got a whole value. `moves` says whether using a place as an operand takes its
-+    /// value, which the operand does not say.
-+    pub fn parted_at_block_ends(
-+        &self,
-+        locals: &[LocalId],
-+        moves: impl Fn(&StoredPlace) -> bool,
-+    ) -> ArenaMap<BasicBlockId, Vec<bool>> {
-+        let mut effects: ArenaMap<BasicBlockId, Vec<(usize, bool)>> = ArenaMap::new();
-+        let mut successors: ArenaMap<BasicBlockId, SmallVec<[BasicBlockId; 2]>> = ArenaMap::new();
-+        let (mut starts, mut ends) = (ArenaMap::new(), ArenaMap::new());
-+        for (id, _) in self.basic_blocks.iter() {
-+            let mut in_block = Vec::new();
-+            let next = self.accesses(id, &mut |local, access| {
-+                let Some(at) = locals.iter().position(|&it| it == local) else { return };
-+                match access {
-+                    Access::Part(projection) => {
-+                        if moves(&StoredPlace { local, projection }) {
-+                            in_block.push((at, true));
-+                        }
-+                    }
-+                    Access::Write => in_block.push((at, false)),
-+                    Access::Read | Access::Borrow => (),
-+                }
-+            });
-+            effects.insert(id, in_block);
-+            successors.insert(id, next);
-+            starts.insert(id, vec![false; locals.len()]);
-+            ends.insert(id, vec![false; locals.len()]);
-+        }
-+        let mut changed = true;
-+        while changed {
-+            changed = false;
-+            for (id, _) in self.basic_blocks.iter() {
-+                let mut parted = starts[id].clone();
-+                for &(at, is_parted) in &effects[id] {
-+                    parted[at] = is_parted;
-+                }
-+                for &successor in &successors[id] {
-+                    for (known, &now) in starts[successor].iter_mut().zip(&parted) {
-+                        changed |= now && !*known;
-+                        *known |= now;
-+                    }
-+                }
-+                ends.insert(id, parted);
-+            }
-+        }
-+        ends
-+    }
-+
 +    /// The locals read after the start of each block before they are written, the ones
 +    /// borrowed anywhere, and the parts of each that are used as an operand.
 +    fn liveness(
@@ -2559,7 +2513,7 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
          fn for_operand(op: &mut Operand, f: &mut impl FnMut(&mut StoredPlace)) {
              match &mut op.kind {
                  OperandKind::Copy(p) | OperandKind::Move(p) => {
-@@ -1072,6 +1684,27 @@ impl MirBody<'_> {
+@@ -1072,6 +1638,27 @@ impl MirBody<'_> {
                          }
                      }
                      StatementKind::FakeRead(p) | StatementKind::Deinit(p) => f(p),
@@ -2587,19 +2541,21 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
                      StatementKind::StorageLive(_)
                      | StatementKind::StorageDead(_)
                      | StatementKind::Nop => (),
-@@ -1122,8 +1755,11 @@ impl MirBody<'_> {
+@@ -1122,8 +1709,13 @@ impl MirBody<'_> {
              binding_locals,
              upvar_locals,
              param_locals,
 +            promoted_locals,
              closures,
 +            coroutine: _,
++            unreached,
          } = self;
++        unreached.shrink_to_fit();
 +        promoted_locals.shrink_to_fit();
          basic_blocks.shrink_to_fit();
          locals.shrink_to_fit();
          binding_locals.shrink_to_fit();
-@@ -1137,9 +1773,11 @@ impl MirBody<'_> {
+@@ -1137,9 +1729,11 @@ impl MirBody<'_> {
      }
  }
  
@@ -2612,7 +2568,7 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
      PatId(PatId),
      BindingId(BindingId),
      SelfParam,
-@@ -1147,6 +1785,16 @@ pub enum MirSpan {
+@@ -1147,6 +1741,16 @@ pub enum MirSpan {
  }
  impl_from!(ExprId, PatId for MirSpan);
  
@@ -2629,7 +2585,7 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
  impl From<&ExprId> for MirSpan {
      fn from(value: &ExprId) -> Self {
          (*value).into()
-@@ -1220,7 +1868,12 @@ impl<'db> PlaceTy<'db> {
+@@ -1220,7 +1824,12 @@ impl<'db> PlaceTy<'db> {
                  TyKind::Closure(_, args) => {
                      args.as_closure().tupled_upvars_ty().tuple_fields()[f.0 as usize]
                  }
@@ -2643,7 +2599,7 @@ index 0494b4f08da996732af67a8a5598cbb81121e1cd..7e4c83d3914a46f8e5497d17fb5ef042
                  TyKind::Tuple(tys) => tys
                      .get(f.0 as usize)
                      .cloned()
-@@ -1277,25 +1930,27 @@ impl<'db> PlaceTy<'db> {
+@@ -1277,25 +1886,27 @@ impl<'db> PlaceTy<'db> {
          }
          match *elem {
              ProjectionElem::Deref => {
@@ -4134,7 +4090,7 @@ index ff16ea68704d6e660dd5d1b0b1fddd9078b0239c..f113bc68417679a5bc51d6e9d266a360
          }
      }
 diff --git a/crates/hir-ty/src/mir/lower.rs b/crates/hir-ty/src/mir/lower.rs
-index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6504561bb 100644
+index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..0562bbcdc2e18a36728fe82f419ce834498b437f 100644
 --- a/crates/hir-ty/src/mir/lower.rs
 +++ b/crates/hir-ty/src/mir/lower.rs
 @@ -9,8 +9,9 @@ use hir_def::{
@@ -4193,7 +4149,15 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      },
      next_solver::{
          Const, DbInterner, ParamConst, ParamEnv, Region, StoredGenericArgs, StoredTy, TyKind,
-@@ -73,6 +77,9 @@ struct LoopBlocks {
+@@ -58,6 +62,7 @@ use crate::{
+ use super::{OperandKind, Place};
+ 
+ mod as_place;
++mod match_tree;
+ mod pattern_matching;
+ 
+ #[derive(Debug, Clone)]
+@@ -73,6 +78,9 @@ struct LoopBlocks {
  struct DropScope {
      /// locals, in order of definition (so we should run drop glues in reverse order)
      locals: Vec<LocalId>,
@@ -4203,7 +4167,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  }
  
  struct MirLowerCtx<'a, 'db> {
-@@ -88,6 +95,21 @@ struct MirLowerCtx<'a, 'db> {
+@@ -88,6 +96,24 @@ struct MirLowerCtx<'a, 'db> {
      types: &'db crate::next_solver::DefaultAny<'db>,
      resolver: Resolver<'db>,
      drop_scopes: Vec<DropScope>,
@@ -4216,6 +4180,9 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
 +    /// tail of a block. The operands of such an expression are in one scope with its
 +    /// temporaries, where those of any other expression are in a scope inside it.
 +    ends_temporaries: FxHashSet<ExprId>,
++    /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
++    /// way into.
++    arm_unreached: bool,
 +    /// The alternative to match for an or-pattern, while an arm is lowered once per
 +    /// combination of alternatives.
 +    or_choices: FxHashMap<PatId, usize>,
@@ -4225,7 +4192,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      env: ParamEnv<'db>,
      infcx: InferCtxt<'db>,
  }
-@@ -210,8 +232,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -210,8 +236,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              binding_locals,
              upvar_locals: FxHashMap::default(),
              param_locals: vec![],
@@ -4233,22 +4200,24 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              owner,
              closures: vec![],
 +            coroutine: None,
++            unreached: vec![],
          };
          let store_owner = owner.expression_store_owner(db);
          let resolver = owner.resolver(db);
-@@ -233,6 +257,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -233,6 +262,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              labeled_loop_blocks: Default::default(),
              discr_temp: None,
              drop_scopes: vec![DropScope::default()],
 +            extended_temporaries: FxHashMap::default(),
 +            super_let: None,
 +            ends_temporaries: FxHashSet::default(),
++            arm_unreached: false,
 +            or_choices: FxHashMap::default(),
 +            guarded_moves: None,
              env,
              infcx,
          }
-@@ -266,9 +295,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -266,9 +301,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              && let Expr::Literal(l) = &self.store[expr_id]
          {
              let ty = self.expr_ty_without_adjust(expr_id);
@@ -4262,7 +4231,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              return Ok(None);
          };
          Ok(Some((
-@@ -277,6 +308,34 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -277,6 +314,34 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          )))
      }
  
@@ -4297,7 +4266,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn lower_expr_to_place_with_adjust(
          &mut self,
          expr_id: ExprId,
-@@ -345,11 +404,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -345,11 +410,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          rest: &[Adjustment],
          m: Mutability,
      ) -> Result<'db, Option<BasicBlockId>> {
@@ -4319,7 +4288,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
          let bk = BorrowKind::from_rustc_mutability(m);
          self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
          Ok(Some(current))
-@@ -374,11 +443,165 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -374,11 +449,165 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          mut current: BasicBlockId,
      ) -> Result<'db, Option<BasicBlockId>> {
          match &self.store[expr_id] {
@@ -4489,7 +4458,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              }
              Expr::Missing => {
                  if let Some(f) = self.owner.as_function() {
-@@ -487,33 +710,112 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -487,33 +716,112 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                          Ok(Some(current))
                      }
                      ValueNs::FunctionId(_) | ValueNs::StructId(_) | ValueNs::ImplSelf(_) => {
@@ -4619,7 +4588,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()))
              }
              Expr::Let { pat, expr } => {
-@@ -548,20 +850,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -548,20 +856,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              Expr::Block { id: _, statements, tail, label, unsafe_: _ } => {
                  if let Some(label) = label {
                      self.lower_loop(current, place, Some(*label), expr_id.into(), |this, begin| {
@@ -4644,7 +4613,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  }
              }
              Expr::Loop { body, label, source: _ } => {
-@@ -590,20 +888,33 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -590,20 +894,33 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                          place,
                          current,
                          self.is_uninhabited(expr_id),
@@ -4682,7 +4651,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          )
                      }
                      TyKind::FnPtr(..) => {
-@@ -618,7 +929,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -618,7 +935,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                              place,
                              current,
                              self.is_uninhabited(expr_id),
@@ -4691,7 +4660,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          )
                      }
                      TyKind::Closure(_, _) => {
-@@ -646,13 +957,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -646,42 +963,118 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      place,
                      current,
                      self.is_uninhabited(expr_id),
@@ -4712,12 +4681,14 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      return Ok(None);
                  };
                  self.push_fake_read(current, cond_place, expr_id.into());
-@@ -660,28 +977,95 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+                 let mut end = None;
                  let resolver_guard =
                      self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
-                 for MatchArm { pat, guard, expr } in arms.iter() {
+-                for MatchArm { pat, guard, expr } in arms.iter() {
 -                    let (then, mut otherwise) =
 -                        self.pattern_match(current, None, cond_place, *pat)?;
++                let reached = self.reached_arms(arms);
++                for (MatchArm { pat, guard, expr }, reached) in arms.iter().zip(reached) {
 +                    // When the guard fails, rustc goes on to the next way the or-patterns of
 +                    // the arm can match, and runs the guard again for it.
 +                    let expansions = match guard {
@@ -4733,6 +4704,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
 +                        for choice in expansions {
 +                            self.or_choices = choice.into_iter().collect();
 +                            let outer = self.guarded_moves.replace(Vec::new());
++                            self.arm_unreached = !reached;
 +                            let matched = self.pattern_match(current, None, cond_place, *pat);
 +                            let moves = std::mem::replace(&mut self.guarded_moves, outer);
 +                            self.or_choices.clear();
@@ -4772,6 +4744,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
 +                        Some(_) => self.guarded_moves.replace(Vec::new()),
 +                        None => self.guarded_moves.take(),
 +                    };
++                    self.arm_unreached = !reached;
 +                    let matched = self.pattern_match(current, None, cond_place, *pat);
 +                    let moves = std::mem::replace(&mut self.guarded_moves, outer);
 +                    let (then, mut otherwise) = matched?;
@@ -4813,7 +4786,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      }
                      match otherwise {
                          Some(o) => current = o,
-@@ -696,7 +1080,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -696,7 +1089,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  if self.is_unterminated(current) {
                      self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
                  }
@@ -4831,7 +4804,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              }
              Expr::Continue { label } => {
                  let loop_data = match label {
-@@ -770,17 +1163,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -770,17 +1172,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              Expr::Become { .. } => not_supported!("tail-calls"),
              Expr::Yield { .. } => not_supported!("yield"),
              Expr::RecordLit { fields, path, spread, .. } => {
@@ -4849,7 +4822,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  let variant_id =
                      self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
                          MirLowerError::UnresolvedName {
-@@ -796,6 +1178,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -796,6 +1187,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  match variant_id {
                      VariantId::EnumVariantId(_) | VariantId::StructId(_) => {
                          let mut operands = vec![None; variant_fields.fields().len()];
@@ -4857,7 +4830,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          for RecordLitField { name, expr } in fields.iter() {
                              let field_id =
                                  variant_fields.field(name).ok_or(MirLowerError::UnresolvedField)?;
-@@ -806,6 +1189,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -806,6 +1198,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                              current = c;
                              operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                          }
@@ -4879,7 +4852,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          let rvalue = Rvalue::Aggregate(
                              AggregateKind::Adt(variant_id, subst.store()),
                              match spread_place {
-@@ -849,13 +1247,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -849,13 +1256,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      }
                  }
              }
@@ -4904,7 +4877,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  self.lower_expr_to_place(id, place, current)
              }
              Expr::Cast { expr, type_ref: _ } => {
-@@ -870,45 +1278,74 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -870,45 +1287,74 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  } else {
                      let source_ty = self.infer.expr_ty(*expr);
                      let target_ty = self.infer.expr_ty(expr_id);
@@ -5016,7 +4989,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      let cast_kind = if source_ty.as_reference().is_some() {
                          CastKind::PointerCoercion(PointerCast::ArrayToPointer)
                      } else {
-@@ -920,9 +1357,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -920,9 +1366,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  Ok(Some(current))
              }
              Expr::Ref { expr, rawness: _, mutability } => {
@@ -5043,7 +5016,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  let bk = BorrowKind::from_hir_mutability(*mutability);
                  self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
                  Ok(Some(current))
-@@ -947,6 +1401,36 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -947,6 +1410,36 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  expr,
                  op: op @ (hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg),
              } => {
@@ -5080,7 +5053,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  let Some((operand, current)) = self.lower_expr_to_some_operand(*expr, current)?
                  else {
                      return Ok(None);
-@@ -971,7 +1455,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -971,7 +1464,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      // for binary operator, and use without adjust to simplify our conditions.
                      let lhs_ty = self.expr_ty_without_adjust(*lhs);
                      let rhs_ty = self.expr_ty_without_adjust(*rhs);
@@ -5091,7 +5064,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          && matches!(lhs_ty.kind(), TyKind::RawPtr(..))
                          && matches!(rhs_ty.kind(), TyKind::RawPtr(..))
                      {
-@@ -1008,7 +1494,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1008,7 +1503,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                          place,
                          current,
                          self.is_uninhabited(expr_id),
@@ -5100,7 +5073,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      );
                  }
                  if let hir_def::hir::BinaryOp::Assignment { op: Some(op) } = op {
-@@ -1020,12 +1506,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1020,12 +1515,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                          .and_then(|it| it.split_last())
                          .map(|it| it.1)
                          .ok_or(MirLowerError::TypeError("adjustment of binary op was missing"))?;
@@ -5118,7 +5091,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      else {
                          return Ok(None);
                      };
-@@ -1037,9 +1525,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1037,9 +1534,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      self.push_assignment(current, lhs_place, r_value, expr_id.into());
                      return Ok(Some(current));
                  }
@@ -5151,7 +5124,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  };
                  if let hir_def::hir::BinaryOp::LogicOp(op) = op {
                      let value_to_short = match op {
-@@ -1055,7 +1563,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1055,7 +1572,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      );
                      let end_of_then = Some(start_of_then);
                      let start_of_else = self.new_basic_block();
@@ -5172,7 +5145,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      self.set_terminator(
                          current,
                          TerminatorKind::SwitchInt {
-@@ -1095,8 +1615,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1095,8 +1624,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  Ok(Some(current))
              }
              &Expr::Assignment { target, value } => {
@@ -5188,7 +5161,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      return Ok(None);
                  };
                  self.push_fake_read(current, value, expr_id.into());
-@@ -1106,13 +1631,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1106,13 +1640,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  self.resolver.reset_to_guard(resolver_guard);
                  Ok(Some(current))
              }
@@ -5219,7 +5192,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  
                  let span = |sources: &[CaptureSourceStack]| match sources
                      .first()
-@@ -1177,7 +1714,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1177,7 +1723,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              }
              Expr::Closure { closure_kind, .. } => not_supported!("{closure_kind:?} closure"),
              Expr::Tuple { exprs } => {
@@ -5229,7 +5202,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      .iter()
                      .map(|it| {
                          let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)? else {
-@@ -1190,6 +1728,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1190,6 +1737,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  else {
                      return Ok(None);
                  };
@@ -5237,7 +5210,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  let r = Rvalue::Aggregate(
                      AggregateKind::Tuple(self.expr_ty_without_adjust(expr_id).store()),
                      values,
-@@ -1207,7 +1746,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1207,7 +1755,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                              ));
                          }
                      };
@@ -5247,7 +5220,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          .iter()
                          .map(|it| {
                              let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)?
-@@ -1221,32 +1761,51 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1221,32 +1770,51 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                      else {
                          return Ok(None);
                      };
@@ -5309,7 +5282,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  self.push_assignment(current, place, op.into(), expr_id.into());
                  Ok(Some(current))
              }
-@@ -1255,6 +1814,57 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1255,6 +1823,57 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          }
      }
  
@@ -5367,7 +5340,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn push_field_projection(
          &mut self,
          place: &mut Place<'db>,
-@@ -1291,6 +1901,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1291,6 +1910,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          match &self.store[*loc] {
              Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
              Expr::Path(c) => {
@@ -5379,7 +5352,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                  let unresolved_name = || MirLowerError::UnresolvedName {
                      owner: self.owner.expression_store_owner(self.db),
                      path: c.clone(),
-@@ -1327,31 +1942,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1327,31 +1951,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  )
                  .map(|it| it.size.bytes_usize())
          };
@@ -5423,7 +5396,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              }
              hir_def::hir::Literal::Char(c) => Box::new(u32::from(*c).to_le_bytes()),
              hir_def::hir::Literal::Bool(b) => Box::new([*b as u8]),
-@@ -1455,15 +2069,109 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1455,15 +2078,109 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          Ok((operand, discr_ty, current))
      }
  
@@ -5541,7 +5514,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
          let Some(args) = args
              .map(|arg| {
                  if let Some((temp, c)) = self.lower_expr_to_some_operand(arg, current)? {
-@@ -1477,7 +2185,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1477,7 +2194,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          else {
              return Ok(None);
          };
@@ -5551,7 +5524,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      }
  
      fn lower_call(
-@@ -1517,6 +2226,144 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1517,6 +2235,144 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          self.set_terminator(source, TerminatorKind::Goto { target }, span);
      }
  
@@ -5696,7 +5669,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn expr_ty_without_adjust(&self, e: ExprId) -> Ty<'db> {
          self.infer.expr_ty(e)
      }
-@@ -1669,28 +2516,146 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1669,28 +2525,146 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          current: BasicBlockId,
          span: MirSpan,
      ) -> Result<'db, ()> {
@@ -5846,7 +5819,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                              scope.pop_assume_dropped(self);
                              return Ok(None);
                          };
-@@ -1703,8 +2668,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1703,8 +2677,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                              self.store_owner,
                              *expr_id,
                          );
@@ -5859,7 +5832,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          self.resolver.reset_to_guard(resolver_guard);
                          match (else_block, else_branch) {
                              (None, _) => (),
-@@ -1712,13 +2679,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1712,13 +2688,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                  self.set_terminator(else_block, TerminatorKind::Unreachable, span);
                              }
                              (Some(else_block), Some(else_branch)) => {
@@ -5875,7 +5848,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      } else {
                          let mut err = None;
                          self.store.walk_bindings_in_pat(*pat, |b| {
-@@ -1733,7 +2697,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1733,7 +2706,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                  }
                  &hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
                      let scope2 = self.push_drop_scope();
@@ -5895,7 +5868,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                          scope2.pop_assume_dropped(self);
                          scope.pop_assume_dropped(self);
                          return Ok(None);
-@@ -1745,16 +2720,70 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1745,16 +2729,70 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              }
          }
          if let Some(tail) = tail {
@@ -5966,7 +5939,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn lower_params_and_bindings(
          &mut self,
          params: impl Iterator<Item = (PatId, Ty<'db>)> + Clone,
-@@ -1820,7 +2849,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1820,7 +2858,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
              {
                  continue;
              }
@@ -5984,7 +5957,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              if let Some(b) = r.1 {
                  self.set_terminator(b, TerminatorKind::Unreachable, param.into());
              }
-@@ -1866,6 +2905,164 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1866,6 +2914,164 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          self.krate().data(self.db).edition
      }
  
@@ -6149,7 +6122,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn krate(&self) -> Crate {
          self.owner.krate(self.db)
      }
-@@ -1882,6 +3079,51 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1882,6 +3088,51 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          current
      }
  
@@ -6201,7 +6174,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn push_drop_scope(&mut self) -> DropScopeToken {
          self.drop_scopes.push(DropScope::default());
          DropScopeToken
-@@ -1899,7 +3141,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1899,7 +3150,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          span: MirSpan,
      ) -> BasicBlockId {
          let scope = self.drop_scopes.pop().unwrap();
@@ -6210,7 +6183,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
          current
      }
  
-@@ -1915,6 +3157,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+@@ -1915,6 +3166,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
          Ok(current)
      }
  
@@ -6237,7 +6210,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
      fn emit_drop_and_storage_dead_for_scope(
          &mut self,
          scope: &DropScope,
-@@ -1999,60 +3261,213 @@ pub fn mir_body_for_closure_query<'db>(
+@@ -1999,60 +3270,213 @@ pub fn mir_body_for_closure_query<'db>(
      db: &'db dyn HirDatabase,
      closure: InternedClosureId<'db>,
  ) -> Result<'db, MirBody<'db>> {
@@ -6484,7 +6457,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
              projections.push(ProjectionElem::Deref);
          }
          projections.push(ProjectionElem::Field(FieldIndex(capture_idx as u32)));
-@@ -2066,16 +3481,20 @@ pub fn mir_body_for_closure_query<'db>(
+@@ -2066,16 +3490,20 @@ pub fn mir_body_for_closure_query<'db>(
          };
          let capture_local_rvalue =
              Rvalue::Use(Operand { kind: OperandKind::Move(capture_param_place), span: None });
@@ -6512,7 +6485,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  
          ctx.result
              .upvar_locals
-@@ -2085,50 +3504,61 @@ pub fn mir_body_for_closure_query<'db>(
+@@ -2085,50 +3513,61 @@ pub fn mir_body_for_closure_query<'db>(
      }
  
      ctx.resolver.reset_to_guard(resolver_guard);
@@ -6611,7 +6584,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
                      mir_place.projection = Projection::new_from_iter(
                          maybe_deref
                              .iter()
-@@ -2154,6 +3584,45 @@ pub fn mir_body_for_closure_query<'db>(
+@@ -2154,6 +3593,45 @@ pub fn mir_body_for_closure_query<'db>(
      Ok(ctx.result)
  }
  
@@ -6657,7 +6630,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  #[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result)]
  pub fn mir_body_query<'db>(
      db: &'db dyn HirDatabase,
-@@ -2198,6 +3667,35 @@ pub fn mir_body_query<'db>(
+@@ -2198,6 +3676,35 @@ pub fn mir_body_query<'db>(
      Ok(result)
  }
  
@@ -6693,7 +6666,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  fn mir_body_cycle_result<'db>(
      _db: &'db dyn HirDatabase,
      _: salsa::Id,
-@@ -2237,6 +3735,9 @@ pub fn lower_body_to_mir<'db>(
+@@ -2237,6 +3744,9 @@ pub fn lower_body_to_mir<'db>(
          };
          let mut param_tys = callable_sig.inputs().iter().copied();
          let self_param = self_param.and_then(|id| Some((id, param_tys.next()?)));
@@ -6703,7 +6676,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
  
          lower_to_mir_with_store(
              db,
-@@ -2266,6 +3767,26 @@ pub fn lower_to_mir_with_store<'db>(
+@@ -2266,6 +3776,26 @@ pub fn lower_to_mir_with_store<'db>(
      self_param: Option<(BindingId, Ty<'db>)>,
  ) -> Result<'db, MirBody<'db>> {
      if infer.has_type_mismatches() || infer.is_erroneous() {
@@ -6730,7 +6703,7 @@ index 5e097c56ec6efa1ebf0abf29358785afbfac26bb..836eb115dbdd3af6ec16761203c3deb6
          return Err(MirLowerError::HasErrors);
      }
      let mut ctx = MirLowerCtx::new(db, owner, store, infer);
-@@ -2275,9 +3796,29 @@ pub fn lower_to_mir_with_store<'db>(
+@@ -2275,9 +3805,29 @@ pub fn lower_to_mir_with_store<'db>(
          if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
      let binding_picker = |b: BindingId| ctx.store.binding_owner(b) == expected_binding_owner;
      let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
@@ -6832,8 +6805,505 @@ index beb1d317d1101257efe202b387eef90fd38f10a3..221994fcf10290d8cc85ad96a556d555
                      let Some(index_fn) = self.infer.method_resolution(expr_id) else {
                          return Err(MirLowerError::UnresolvedMethod(
                              "[overloaded index]".to_owned(),
+diff --git a/crates/hir-ty/src/mir/lower/match_tree.rs b/crates/hir-ty/src/mir/lower/match_tree.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1ff9fe5ac19c4d90a4bbb45d66fa586ceeaed3e
+--- /dev/null
++++ b/crates/hir-ty/src/mir/lower/match_tree.rs
+@@ -0,0 +1,491 @@
++//! Which arms of a `match` rustc builds a way into.
++//!
++//! rustc lowers the arms of a `match` to one tree of tests (`rustc_mir_build`'s
++//! `builder::matches`). An arm that an arm before it has taken every value from is still
++//! built, but no edge of the tree leads to it, and its analysis of what a drop finds moved out
++//! never sees what that arm binds. rustd tests the arms one after the other, where every arm
++//! is on some way. This follows rustc's construction far enough to say which arms it gets
++//! to, and builds nothing: the candidates are sorted by the same tests in the same order.
++
++use std::rc::Rc;
++
++use hir_def::{
++    EnumVariantId, Lookup, VariantId,
++    hir::{Expr, Literal, MatchArm, Pat, PatId, UnaryOp},
++};
++use rustc_type_ir::inherent::IntoKind;
++use syntax::ast::RangeOp;
++
++use crate::mir::lower::{MirLowerCtx, Ty, TyKind};
++
++/// One step from a matched value to a part of it.
++#[derive(Clone, PartialEq)]
++enum Step {
++    Field(u32),
++    Variant(EnumVariantId),
++    Index(u64),
++    FromEnd(u64),
++    Deref,
++}
++
++/// What a pattern asks of the place it is at.
++#[derive(Clone, PartialEq)]
++enum Ask {
++    Variant(EnumVariantId),
++    /// An integer or a `char`, as a number that orders the way the type does.
++    Int(u128),
++    Bool(bool),
++    /// Both ends are in it.
++    Range(u128, u128),
++    /// A constant that is compared with `==`.
++    Equal(Literal),
++    Len {
++        len: u64,
++        or_more: bool,
++    },
++    Or(Vec<Vec<Pair>>),
++}
++
++/// A place, what a pattern asks of it, and what the pattern asks inside once that holds.
++#[derive(Clone, PartialEq)]
++struct Pair {
++    place: Vec<Step>,
++    ask: Ask,
++    inside: Vec<Pair>,
++}
++
++/// One way an arm can match: what is still to be tested for it.
++#[derive(Clone)]
++struct Candidate {
++    arm: usize,
++    pairs: Vec<Pair>,
++    guarded: bool,
++    /// What an or-pattern left to be tested after its alternative has matched.
++    then: Option<Rc<[Pair]>>,
++}
++
++/// Where a test sends a candidate.
++#[derive(Clone, PartialEq)]
++enum Branch {
++    Variant(EnumVariantId),
++    Int(u128),
++    Success,
++    Failure,
++}
++
++/// The run over the candidates. A `bool` that goes with a list of candidates says whether
++/// the block they start from can be reached.
++struct Tree {
++    reached: Vec<bool>,
++    /// Whether what an or-pattern left to be tested has failed since the or-pattern was
++    /// expanded: that goes to where the whole expansion falls through to.
++    escaped: bool,
++}
++
++impl Tree {
++    /// Matches the candidates in order, and says whether none of them matching can happen.
++    fn run(&mut self, mut start: bool, mut candidates: Vec<Candidate>) -> bool {
++        loop {
++            let Some(first) = candidates.first() else { return start };
++            match first.pairs.first() {
++                None => start = self.matched(start, candidates.remove(0)),
++                Some(Pair { ask: Ask::Or(_), .. }) => {
++                    (start, candidates) = self.expand(start, candidates)
++                }
++                Some(_) => (start, candidates) = self.test(start, candidates),
++            }
++        }
++    }
++
++    /// A candidate with nothing left to test. Says whether the candidates after it can
++    /// still be reached: only through a guard.
++    fn matched(&mut self, start: bool, candidate: Candidate) -> bool {
++        let Candidate { arm, guarded, then, .. } = candidate;
++        let Some(then) = then else {
++            self.reached[arm] |= start;
++            return start && guarded;
++        };
++        let rest = Candidate { arm, pairs: then.to_vec(), guarded, then: None };
++        let fell = self.run(start, vec![rest]);
++        if guarded {
++            return fell;
++        }
++        self.escaped |= fell;
++        false
++    }
++
++    /// Expands the or-patterns that candidates start with into a candidate for each
++    /// alternative. The candidates after one that has more to test after its or-pattern are
++    /// left for after.
++    fn expand(&mut self, start: bool, mut candidates: Vec<Candidate>) -> (bool, Vec<Candidate>) {
++        let starts_with_or =
++            |it: &Candidate| matches!(it.pairs.first(), Some(Pair { ask: Ask::Or(_), .. }));
++        let last = candidates.iter().position(|it| starts_with_or(it) && it.pairs.len() > 1);
++        let remaining = candidates.split_off(last.map_or(candidates.len(), |it| it + 1));
++        let mut expanded = Vec::new();
++        for mut candidate in candidates {
++            if !starts_with_or(&candidate) {
++                expanded.push(candidate);
++                continue;
++            }
++            let Ask::Or(alternatives) = candidate.pairs.remove(0).ask else { continue };
++            let after = candidate.then.iter().flat_map(|it| it.iter().cloned());
++            let left: Vec<Pair> = candidate.pairs.into_iter().chain(after).collect();
++            let then: Option<Rc<[Pair]>> = (!left.is_empty()).then(|| left.into());
++            expanded.extend(alternatives.into_iter().map(|pairs| Candidate {
++                arm: candidate.arm,
++                pairs,
++                guarded: candidate.guarded,
++                then: then.clone(),
++            }));
++        }
++        let outer = std::mem::take(&mut self.escaped);
++        let fell = self.run(start, expanded);
++        let escaped = std::mem::replace(&mut self.escaped, outer);
++        (fell || escaped, remaining)
++    }
++
++    /// Makes the test the first candidate asks for first, sorts the candidates that the
++    /// outcome says something about into its branches, and matches each branch. The
++    /// candidates from the first one it says nothing about are left for after.
++    fn test(&mut self, start: bool, candidates: Vec<Candidate>) -> (bool, Vec<Candidate>) {
++        let Pair { place, ask, .. } = candidates[0].pairs[0].clone();
++        let mut branches: Vec<(Branch, Vec<Candidate>)> = Vec::new();
++        let mut remaining = Vec::new();
++        let mut candidates = candidates.into_iter();
++        for mut candidate in candidates.by_ref() {
++            let Some(branch) = sort(&place, &ask, &mut candidate, &branches) else {
++                remaining.push(candidate);
++                break;
++            };
++            match branches.iter_mut().find(|(it, _)| *it == branch) {
++                Some((_, sorted)) => sorted.push(candidate),
++                None => branches.push((branch, vec![candidate])),
++            }
++        }
++        remaining.extend(candidates);
++        // A switch always has a target for the values none of the candidates named.
++        let mut fell = start && !branches.iter().any(|(it, _)| *it == Branch::Failure);
++        for (_, sorted) in branches {
++            fell |= self.run(start, sorted);
++        }
++        (fell, remaining)
++    }
++}
++
++/// The branch of the test `ask` makes of `place` that `candidate` belongs in, if the outcome
++/// decides anything for it. A candidate the test answers a pair of loses the pair and gets
++/// what was inside it, with the or-patterns last.
++fn sort(
++    place: &[Step],
++    ask: &Ask,
++    candidate: &mut Candidate,
++    branches: &[(Branch, Vec<Candidate>)],
++) -> Option<Branch> {
++    let at = candidate.pairs.iter().position(|it| it.place == place)?;
++    let (branch, answered) = match (ask, &candidate.pairs[at].ask) {
++        (Ask::Variant(_), &Ask::Variant(variant)) => (Branch::Variant(variant), true),
++        (Ask::Int(_), &Ask::Int(value)) => {
++            let covers = |it: &Pair| {
++                it.place == place
++                    && matches!(it.ask, Ask::Range(lo, hi) if lo <= value && value <= hi)
++            };
++            let failed = branches.iter().filter(|(it, _)| *it == Branch::Failure);
++            if failed.flat_map(|(_, sorted)| sorted).any(|it| it.pairs.iter().any(covers)) {
++                return None;
++            }
++            (Branch::Int(value), true)
++        }
++        (Ask::Int(_), &Ask::Range(lo, hi)) => {
++            let named = |it: &(Branch, Vec<Candidate>)| matches!(it.0, Branch::Int(value) if lo <= value && value <= hi);
++            if branches.iter().any(named) {
++                return None;
++            }
++            (Branch::Failure, false)
++        }
++        (Ask::Bool(_), &Ask::Bool(value)) => {
++            (if value { Branch::Success } else { Branch::Failure }, true)
++        }
++        (Ask::Range(lo, hi), &Ask::Range(other_lo, other_hi)) => {
++            if (lo, hi) == (&other_lo, &other_hi) {
++                (Branch::Success, true)
++            } else if other_hi < *lo || *hi < other_lo {
++                (Branch::Failure, false)
++            } else {
++                return None;
++            }
++        }
++        (Ask::Range(lo, hi), &Ask::Int(value)) if value < *lo || *hi < value => {
++            (Branch::Failure, false)
++        }
++        (Ask::Equal(value), Ask::Equal(other)) if value == other => (Branch::Success, true),
++        (&Ask::Len { len: tested, or_more: false }, &Ask::Len { len, or_more }) => {
++            match (tested.cmp(&len), or_more) {
++                (std::cmp::Ordering::Equal, false) => (Branch::Success, true),
++                (std::cmp::Ordering::Less, _) | (std::cmp::Ordering::Greater, false) => {
++                    (Branch::Failure, false)
++                }
++                _ => return None,
++            }
++        }
++        (&Ask::Len { len: tested, or_more: true }, &Ask::Len { len, or_more }) => {
++            match (tested.cmp(&len), or_more) {
++                (std::cmp::Ordering::Equal, true) => (Branch::Success, true),
++                (std::cmp::Ordering::Greater, true) => return None,
++                _ => (Branch::Failure, false),
++            }
++        }
++        _ => return None,
++    };
++    if answered {
++        let pair = candidate.pairs.remove(at);
++        candidate.pairs.extend(pair.inside);
++        candidate.pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
++    }
++    Some(branch)
++}
++
++impl<'db> MirLowerCtx<'_, 'db> {
++    /// For each arm, whether rustc's tree of tests has a way into it. Every arm, where a
++    /// pattern has something in it that is not followed here.
++    pub(super) fn reached_arms(&self, arms: &[MatchArm]) -> Vec<bool> {
++        let candidates = arms.iter().enumerate().map(|(arm, it)| {
++            let mut pairs = Vec::new();
++            self.pairs_of(it.pat, Vec::new(), &mut pairs)?;
++            pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
++            Some(Candidate { arm, pairs, guarded: it.guard.is_some(), then: None })
++        });
++        let Some(candidates) = candidates.collect::<Option<Vec<_>>>() else {
++            return vec![true; arms.len()];
++        };
++        let mut tree = Tree { reached: vec![false; arms.len()], escaped: false };
++        tree.run(true, candidates);
++        tree.reached
++    }
++
++    /// Adds what `pattern` asks of the value at `place` to `pairs`. `None` when the pattern
++    /// has a part whose test is not known here.
++    fn pairs_of(&self, pattern: PatId, mut place: Vec<Step>, pairs: &mut Vec<Pair>) -> Option<()> {
++        let derefs = self.infer.pat_adjustments.get(&pattern).map_or(0, |it| it.len());
++        place.extend(std::iter::repeat_n(Step::Deref, derefs));
++        let ty = self.infer.pat_ty(pattern);
++        match &self.store[pattern] {
++            Pat::Wild | Pat::Bind { subpat: None, .. } => (),
++            &Pat::Bind { subpat: Some(inner), .. } => self.pairs_of(inner, place, pairs)?,
++            &Pat::Ref { pat: inner, .. } | &Pat::Box { inner } => {
++                place.push(Step::Deref);
++                self.pairs_of(inner, place, pairs)?
++            }
++            Pat::Tuple { args, ellipsis } => {
++                let TyKind::Tuple(fields) = ty.kind() else { return None };
++                self.pairs_of_fields(args, *ellipsis, fields.len(), &place, pairs)?
++            }
++            Pat::Or(alternatives) => {
++                let alternatives = alternatives.iter().map(|&it| {
++                    let mut pairs = Vec::new();
++                    self.pairs_of(it, place.clone(), &mut pairs)?;
++                    pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
++                    Some(pairs)
++                });
++                let ask = Ask::Or(alternatives.collect::<Option<_>>()?);
++                pairs.push(Pair { place, ask, inside: Vec::new() })
++            }
++            Pat::Lit(literal) => {
++                let ask = self.constant_ask(ty, *literal)?;
++                pairs.push(Pair { place, ask, inside: Vec::new() })
++            }
++            Pat::Range { start, end, range_type } => {
++                let (least, most, bounded) = int_bounds(ty)?;
++                let end_of = |end: &Option<_>, missing| match end {
++                    Some(it) => match self.constant_ask(ty, *it)? {
++                        Ask::Int(value) => Some(value),
++                        _ => None,
++                    },
++                    None => Some(missing),
++                };
++                let (lo, hi) = (end_of(start, least)?, end_of(end, most)?);
++                let hi = match (range_type, end) {
++                    (RangeOp::Exclusive, Some(_)) => hi.checked_sub(1)?,
++                    _ => hi,
++                };
++                let ask = match lo.cmp(&hi) {
++                    std::cmp::Ordering::Greater => return None,
++                    std::cmp::Ordering::Equal => Ask::Int(lo),
++                    // A range of every value of the type asks nothing.
++                    std::cmp::Ordering::Less if bounded && (lo, hi) == (least, most) => {
++                        return Some(());
++                    }
++                    std::cmp::Ordering::Less => Ask::Range(lo, hi),
++                };
++                pairs.push(Pair { place, ask, inside: Vec::new() })
++            }
++            Pat::Slice { prefix, slice, suffix } => {
++                if !slice.is_none_or(|it| self.is_rest(it)) {
++                    return None;
++                }
++                let mut inside = Vec::new();
++                for (i, &element) in prefix.iter().enumerate() {
++                    let mut place = place.clone();
++                    place.push(Step::Index(i as u64));
++                    self.pairs_of(element, place, &mut inside)?;
++                }
++                let named = (prefix.len() + suffix.len()) as u64;
++                let len = match ty.kind() {
++                    TyKind::Array(_, len) => {
++                        Some(u64::try_from(crate::consteval::try_const_usize(self.db, len)?).ok()?)
++                    }
++                    TyKind::Slice(_) => None,
++                    _ => return None,
++                };
++                for (i, &element) in suffix.iter().enumerate() {
++                    let mut place = place.clone();
++                    place.push(match len {
++                        Some(len) => Step::Index(len.checked_sub(suffix.len() as u64)? + i as u64),
++                        None => Step::FromEnd((suffix.len() - 1 - i) as u64),
++                    });
++                    self.pairs_of(element, place, &mut inside)?;
++                }
++                // An array has its length, and `[..]` is any slice.
++                if len.is_some() || (named == 0 && slice.is_some()) {
++                    pairs.extend(inside);
++                } else {
++                    let ask = Ask::Len { len: named, or_more: slice.is_some() };
++                    pairs.push(Pair { place, ask, inside });
++                }
++            }
++            Pat::Path(_) => {
++                let variant = self.infer.variant_resolution_for_pat(pattern)?;
++                self.pairs_of_variant(variant, Vec::new(), place, pairs)
++            }
++            Pat::TupleStruct { args, ellipsis, .. } => {
++                let variant = self.infer.variant_resolution_for_pat(pattern)?;
++                let fields = match variant {
++                    VariantId::EnumVariantId(it) => it.fields(self.db),
++                    VariantId::StructId(it) => it.fields(self.db),
++                    VariantId::UnionId(_) => return None,
++                };
++                let mut inside = Vec::new();
++                let within = variant_place(variant, &place);
++                self.pairs_of_fields(args, *ellipsis, fields.fields().len(), &within, &mut inside)?;
++                self.pairs_of_variant(variant, inside, place, pairs)
++            }
++            Pat::Record { args, .. } => {
++                let variant = self.infer.variant_resolution_for_pat(pattern)?;
++                let fields = match variant {
++                    VariantId::EnumVariantId(it) => it.fields(self.db),
++                    VariantId::StructId(it) => it.fields(self.db),
++                    VariantId::UnionId(_) => return None,
++                };
++                let mut inside = Vec::new();
++                for field in args.iter() {
++                    let mut within = variant_place(variant, &place);
++                    within.push(Step::Field(u32::from(fields.field(&field.name)?.into_raw())));
++                    self.pairs_of(field.pat, within, &mut inside)?;
++                }
++                self.pairs_of_variant(variant, inside, place, pairs)
++            }
++            Pat::Missing | Pat::Rest | Pat::NotNull | Pat::Deref { .. } | Pat::Expr(_) => {
++                return None;
++            }
++        }
++        Some(())
++    }
++
++    /// Whether the pattern for the middle of a slice asks nothing of it: `..` or `name @ ..`.
++    fn is_rest(&self, pattern: PatId) -> bool {
++        match self.store[pattern] {
++            Pat::Wild | Pat::Rest | Pat::Bind { subpat: None, .. } => true,
++            Pat::Bind { subpat: Some(inner), .. } => self.is_rest(inner),
++            _ => false,
++        }
++    }
++
++    /// The patterns of the fields of a tuple or a tuple struct of `arity` fields, where
++    /// `ellipsis` says how many of them come before a `..`.
++    fn pairs_of_fields(
++        &self,
++        args: &[PatId],
++        ellipsis: Option<u32>,
++        arity: usize,
++        place: &[Step],
++        pairs: &mut Vec<Pair>,
++    ) -> Option<()> {
++        let before = ellipsis.map_or(args.len(), |it| it as usize);
++        for (i, &arg) in args.iter().enumerate() {
++            let field = if i < before { i } else { arity.checked_sub(args.len() - i)? };
++            let mut place = place.to_vec();
++            place.push(Step::Field(field as u32));
++            self.pairs_of(arg, place, pairs)?;
++        }
++        Some(())
++    }
++
++    /// A pattern that names a variant: the variant is asked for when the type has another,
++    /// and what the fields ask comes after that.
++    fn pairs_of_variant(
++        &self,
++        variant: VariantId,
++        inside: Vec<Pair>,
++        place: Vec<Step>,
++        pairs: &mut Vec<Pair>,
++    ) {
++        match variant {
++            VariantId::EnumVariantId(it)
++                if it.lookup(self.db).parent.enum_variants(self.db).variants.len() > 1 =>
++            {
++                pairs.push(Pair { place, ask: Ask::Variant(it), inside })
++            }
++            _ => pairs.extend(inside),
++        }
++    }
++
++    /// What a literal in a pattern of type `ty` asks.
++    fn constant_ask(&self, ty: Ty<'db>, literal: hir_def::hir::ExprId) -> Option<Ask> {
++        let literal = match &self.store[literal] {
++            Expr::Literal(it) => it.clone(),
++            Expr::UnaryOp { expr, op: UnaryOp::Neg } => match &self.store[*expr] {
++                Expr::Literal(it) => it.clone().negate()?,
++                _ => return None,
++            },
++            _ => return None,
++        };
++        let signed = matches!(ty.kind(), TyKind::Int(_));
++        let ordered = |value: u128| if signed { value ^ (1 << 127) } else { value };
++        Some(match literal {
++            Literal::Bool(it) => Ask::Bool(it),
++            Literal::Char(it) => Ask::Int(u128::from(it)),
++            Literal::Int(it, _) => Ask::Int(ordered(it as u128)),
++            Literal::Uint(it, _) => Ask::Int(ordered(it)),
++            it => Ask::Equal(it),
++        })
++    }
++}
++
++/// Where the fields of a variant are, from the place of the value.
++fn variant_place(variant: VariantId, place: &[Step]) -> Vec<Step> {
++    let mut place = place.to_vec();
++    if let VariantId::EnumVariantId(it) = variant {
++        place.push(Step::Variant(it));
++    }
++    place
++}
++
++/// The least and the greatest value of an integer type or `char`, as `Ask::Int` has them,
++/// and whether a range of all of them is known to be one: not for `usize` and `isize`.
++fn int_bounds(ty: Ty<'_>) -> Option<(u128, u128, bool)> {
++    use rustc_type_ir::{IntTy, UintTy};
++    let unsigned = |bits: u32| (0, u128::MAX >> (128 - bits));
++    let signed = |bits: u32| {
++        let half = 1u128 << (bits - 1);
++        ((1 << 127) - half, (1 << 127) + (half - 1))
++    };
++    let ((least, most), bounded) = match ty.kind() {
++        TyKind::Char => ((0, u128::from(char::MAX)), true),
++        TyKind::Uint(UintTy::Usize) => (unsigned(64), false),
++        TyKind::Int(IntTy::Isize) => (signed(64), false),
++        TyKind::Uint(it) => (unsigned(it.bit_width()? as u32), true),
++        TyKind::Int(it) => (signed(it.bit_width()? as u32), true),
++        _ => return None,
++    };
++    Some((least, most, bounded))
++}
 diff --git a/crates/hir-ty/src/mir/lower/pattern_matching.rs b/crates/hir-ty/src/mir/lower/pattern_matching.rs
-index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff68e829141 100644
+index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..914bb723eb08978748584afc1f6cef44ab530542 100644
 --- a/crates/hir-ty/src/mir/lower/pattern_matching.rs
 +++ b/crates/hir-ty/src/mir/lower/pattern_matching.rs
 @@ -17,7 +17,10 @@ use crate::{
@@ -6848,10 +7318,14 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
  
  macro_rules! not_supported {
      ($x: expr) => {
-@@ -77,6 +80,20 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -77,6 +80,24 @@ impl<'db> MirLowerCtx<'_, 'db> {
              pattern,
              MatchingMode::Check,
          )?;
++        let current = match std::mem::take(&mut self.arm_unreached) {
++            true => self.unreached_block(current, pattern.into()),
++            false => current,
++        };
 +        // Bindings are dropped in the reverse of the order the pattern names them, whichever
 +        // alternative of an or-pattern ends up binding them.
 +        let mut bindings = Vec::new();
@@ -6869,10 +7343,19 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
          let (current, current_else) = self.pattern_match_inner(
              current,
              current_else,
-@@ -87,6 +104,37 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -87,6 +108,46 @@ impl<'db> MirLowerCtx<'_, 'db> {
          Ok((current, current_else))
      }
  
++    /// Goes on from `current` in a block that rustc has no way into: what is moved out there
++    /// is not counted where a drop asks what may be gone.
++    fn unreached_block(&mut self, current: BasicBlockId, span: MirSpan) -> BasicBlockId {
++        let block = self.new_basic_block();
++        self.set_goto(current, block, span);
++        self.result.unreached.push(block);
++        block
++    }
++
 +    /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
 +    /// rustc tries them. A choice maps an or-pattern to the index of its alternative.
 +    pub(super) fn or_expansions(&self, pattern: PatId) -> Vec<Vec<(PatId, usize)>> {
@@ -6907,7 +7390,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
      pub(super) fn pattern_match_assignment(
          &mut self,
          current: BasicBlockId,
-@@ -137,7 +185,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -137,7 +198,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
              }
              Pat::Wild => (current, current_else),
              Pat::Tuple { args, ellipsis } => {
@@ -6916,7 +7399,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                  let subst = match place_ty.kind() {
                      TyKind::Tuple(s) => s,
                      _ => {
-@@ -156,6 +204,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -156,6 +217,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                      mode,
                  )?
              }
@@ -6926,7 +7409,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
              Pat::Or(pats) => {
                  let then_target = self.new_basic_block();
                  let mut finished = false;
-@@ -205,7 +256,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -205,7 +269,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                      mode,
                  )?
              }
@@ -6935,7 +7418,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                  let mut add_check = |l: &ExprId, binop| -> Result<'db, ()> {
                      let lv =
                          self.lower_literal_or_const_to_operand(self.infer.pat_ty(pattern), l)?;
-@@ -240,7 +291,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -240,7 +304,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
                          add_check(start, BinOp::Le)?;
                      }
                      if let Some(end) = end {
@@ -6948,7 +7431,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                      }
                  }
                  (current, current_else)
-@@ -289,7 +344,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -289,7 +357,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                              );
                          } else {
                              let c = Operand::from_concrete_const(
@@ -6957,7 +7440,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                                  MemoryMap::default(),
                                  Ty::new_usize(self.interner()),
                              );
-@@ -350,8 +405,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -350,8 +418,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                      )?;
                  }
                  for (i, &pat) in suffix.iter().enumerate() {
@@ -6968,7 +7451,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                          from_end: true,
                      });
                      (current, current_else) =
-@@ -386,6 +442,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -386,6 +455,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                      ) = (mode, &pr)
                      {
                          let local = self.binding_local(*binding)?;
@@ -6977,7 +7460,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                          self.push_match_assignment(
                              current,
                              local,
-@@ -486,7 +544,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -486,7 +557,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                  )?
              }
              Pat::Ref { pat, mutability: _ } => {
@@ -6986,7 +7469,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                  if !ty.is_ref() {
                      return Err(MirLowerError::TypeError(
                          "non reference type matched with reference pattern",
-@@ -504,6 +562,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -504,6 +575,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                  else {
                      return Ok((current, current_else));
                  };
@@ -6995,7 +7478,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
                  self.push_assignment(
                      current,
                      lhs_place,
-@@ -512,7 +572,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -512,7 +585,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
                  );
                  (current, current_else)
              }
@@ -7007,7 +7490,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
              Pat::Deref { .. } => not_supported!("deref pattern"),
          })
      }
-@@ -528,6 +591,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -528,6 +604,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
      ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
          let target_place = self.binding_local(id)?;
          self.push_storage_live(id, current)?;
@@ -7023,7 +7506,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
          self.push_match_assignment(current, target_place, mode, cond_place, span);
          Ok((current, current_else))
      }
-@@ -592,6 +664,16 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -592,6 +677,16 @@ impl<'db> MirLowerCtx<'_, 'db> {
          Ok((then_target, Some(else_target)))
      }
  
@@ -7040,7 +7523,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
      fn pattern_matching_variant(
          &mut self,
          cond_place: Place<'db>,
-@@ -602,7 +684,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -602,7 +697,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
          shape: AdtPatternShape<'_>,
          mode: MatchingMode,
      ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
@@ -7049,7 +7532,7 @@ index 3218b918d349b619c8233ab1b7b5f77bb2c0e240..8f7eefe081ab249e277e0598c0147ff6
          let Some((place_adt, _)) = place_ty.as_adt() else {
              return Err(MirLowerError::TypeError("non ADT type matched with ADT pattern"));
          };
-@@ -612,7 +694,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
+@@ -612,7 +707,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
  
          Ok(match variant {
              VariantId::EnumVariantId(v) => {

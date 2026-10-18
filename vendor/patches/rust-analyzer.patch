@@ -1,0 +1,13 @@
+diff --git a/crates/rust-analyzer/src/config.rs b/crates/rust-analyzer/src/config.rs
+index 0258ec5ce33bd802d37766c21c8a76e62c46f418..010fa597f8c259ed2afd80bd8b1c335e1ce76ef5 100644
+--- a/crates/rust-analyzer/src/config.rs
++++ b/crates/rust-analyzer/src/config.rs
+@@ -2494,6 +2494,8 @@ impl Config {
+             no_deps: *self.cargo_noDeps(source_root),
+             metadata_extra_args: self.cargo_metadataExtraArgs(source_root).clone(),
+             config_path,
++            extra_env_for_commands_only: false,
++            only_manifest_package: false,
+         }
+     }
+ 

@@ -25,7 +25,14 @@ from difftest import Fixture, RUNNER, bucket, minimize
 
 FOUND = os.path.join(HERE, "found")
 SMOKE = {"seed": "smoke", "rounds": 2, "cases": 25}
-BACKENDS = {"cranelift": {"RUSTD_BACKEND": "cranelift"}, "llvm": {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": "2", "RUSTD_EMIT": "fast"}}
+# What `--backends` can name. `llvm` is the pair the other harnesses run; the two after it are
+# the other ends: no passes, and the passes with LLVM's own instruction selection.
+BACKENDS = {
+    "cranelift": {"RUSTD_BACKEND": "cranelift"},
+    "llvm": {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": "2", "RUSTD_EMIT": "fast"},
+    "llvm-O0": {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": "0", "RUSTD_EMIT": "fast"},
+    "llvm-full": {"RUSTD_BACKEND": "llvm", "RUSTD_OPT": "2", "RUSTD_EMIT": "optimized"},
+}
 MANIFEST = """[package]
 name = "fz"
 version = "0.0.0"
