@@ -111,6 +111,8 @@ jobs:
           run storecorrupts.py --rounds 4
           run storefull.py
           run storeshared.py
+          run storeguards.py
+          run selects.py
           if [ -x "$HOME/s3tools/minio" ]; then run remote.py; fi
           echo "failed:${failed:- none}"
           test -z "$failed"

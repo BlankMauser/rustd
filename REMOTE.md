@@ -117,6 +117,7 @@ calls `block_on` from inside a task.
     packs/<sha256 of the pack>.pack.zst    the pack, compressed with zstd
     keys/<sha256 of the key list>          the 32-byte keys of one pack, back to back
     manifests/<project>                    one line a pack: PACK SIZE KEYS FORMAT ZDIGEST ZSIZE
+                                           and, when signed, a last line: signed KEY TURN SIGNATURE
     units/<sha256>, deps/<project>         cargo's units, the same way
 
 ### Address and configuration
@@ -140,6 +141,8 @@ does for AWS.
 | `RUSTD_REMOTE_PUSH_EVERY` | how often a daemon that stays pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
 | `RUSTD_REMOTE_SIGN` | file with the key this machine signs manifests with | none |
 | `RUSTD_REMOTE_TRUST` | public keys this machine takes manifests from | none |
+| `RUSTD_REMOTE_UNSIGNED` | `1`: with no keys named, take lists nobody signed | off: a pull is refused |
+| `RUSTD_REMOTE_MAX` | the most taken of one object that is neither a list nor a pack | 512M |
 
 In read-only mode `cache push` and `deps push` fail with "RUSTD_REMOTE_READONLY is set:
 nothing is sent", and the daemon does not push.
@@ -227,15 +230,38 @@ so its name.
 fetch. Somebody who can write to the bucket can upload a well-formed pack of their own
 making, with wrong code under real keys, and list it; its name is honestly the hash of its
 bytes. Content addressing cannot catch that. Signing does: with `RUSTD_REMOTE_SIGN` a
-machine signs each manifest it writes (Ed25519, over the manifest's object name and its
-body, so one project's manifest cannot be replayed as another's), and with
+machine signs each manifest it writes (Ed25519, over the manifest's object name, its turn
+and its body, so one project's manifest cannot be replayed as another's), and with
 `RUSTD_REMOTE_TRUST` a machine refuses any manifest that is not signed by a key it lists.
 `rustd cache keygen FILE` makes a key and prints the public half.
 
+**A machine that names no keys pulls nothing** unless `RUSTD_REMOTE_UNSIGNED=1` is set:
+"RUSTD_REMOTE_TRUST names no key, and without one whoever writes to the remote says what is
+run here". Pushing asks for nothing. This is the default that was left open here; it was
+decided in the security round (`SECURITY.md`).
+
+**An old list.** A signature says who wrote a list, not that it is the newest. Each signed
+list carries a turn, a number inside the signed bytes that is one more than the turn of the
+list it replaces and never less than the signer's clock in seconds. A machine remembers the
+highest turn it took of each list of each remote, in `turns/` of its store (for `rustd
+deps` without a store, in `.rustd/turns` of the target directory), and refuses a list with
+a lower one: "`manifests/default` is turn N, and this machine has taken turn M of it: an
+older list is not taken". `rustd cache forget REMOTE` removes what is remembered of a
+remote. A machine that has never pulled remembers nothing and takes the first list it is
+given. The design, with what it does not cover, is in `SECURITY.md`.
+
+**How much.** A list is read to 16 MiB, a pack to the sizes its manifest gives it (the
+object as sent to ZSIZE, and what it unpacks to to SIZE, so a small object that unpacks to
+a great deal is stopped at SIZE), the keys
+of a pack to no more than the pack, and the archive of a unit to `RUSTD_REMOTE_MAX`; a
+`deps pull` unpacks no more than `RUSTD_DEPS_MAX` (64G, `off` for none). An object that is
+longer is rejected and counted like one with the wrong hash, with nothing of it left on
+disk.
+
 So the honest statement is: with `RUSTD_REMOTE_TRUST` set, nobody without a trusted signing
 key can make rustd emit different code than a local build, whatever they do to the bucket.
-Without it, whoever can write to the bucket is trusted, the same as with sccache or a cargo
-registry mirror. A trusted signer is trusted completely; rustd does not recompile to check
+With `RUSTD_REMOTE_UNSIGNED=1` instead, whoever can write to the bucket is trusted, the same
+as with sccache or a cargo registry mirror. A trusted signer is trusted completely; rustd does not recompile to check
 them. One more assumption sits under all of it and predates this branch: two machines with
 the same rustd binary compile the same key to equivalent code. That is what the local store
 already relies on between workspaces.
@@ -249,7 +275,14 @@ Tested by the harness, on both servers:
 - with trust on: a manifest forged under A's old signature, one with no signature, and one
   signed by a key B does not list are each refused, nothing is fetched, and the program is
   the same;
-- a machine that trusts keys but has none to sign with refuses to push.
+- a machine that trusts keys but has none to sign with refuses to push;
+- with no keys and without `RUSTD_REMOTE_UNSIGNED=1`: a pull is refused and fetches nothing,
+  a push goes through;
+- a pack listed as shorter than it is, and a manifest one byte over 16 MiB: rejected,
+  nothing kept;
+- a signed manifest put back after a newer one was taken: refused as older, nothing
+  fetched; taken by a machine that never pulled; taken after `cache forget`; and a signer
+  that pushes over it writes a new list with a later turn.
 
 ## Where the slowdown after the merge went
 
@@ -615,8 +648,9 @@ is green.
 - **Lazy hydration fetches whole packs and does not win on a fresh machine.** It is behind
   `RUSTD_REMOTE_LAZY`. Fetching a pack ahead of the thread that will want it, or packs
   cut by crate so that a build wants fewer of them, were not tried.
-- **Without `RUSTD_REMOTE_TRUST`, a writer to the bucket is trusted.** Left alone here, as
-  asked; the security session has it.
+- **A machine with an empty store can be given any list that was ever signed.** The turn
+  keeps out a list older than one a machine has taken, and a machine that has taken none
+  has nothing to compare with. See `SECURITY.md`.
 - **The lazy hook is one per process** (`fetch_missing_with` in `store.rs`, first call
   wins). The daemon's pull on a miss hangs on the same hook. That fits a daemon with one
   remote; it would have to become part of the store if a daemon ever serves two.

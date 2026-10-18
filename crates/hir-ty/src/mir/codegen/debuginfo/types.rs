@@ -49,9 +49,10 @@ impl<'db> Types<'db> {
         Types { db, env, interner, infcx }
     }
 
-    /// `None` is a type that has no layout or no name rustc would spell.
+    /// `None` is a type that has no layout or no name rustc would spell, or one that is
+    /// made of types inside types deeper than is kept.
     pub(in super::super) fn describe(&self, ty: Ty<'db>) -> Option<DebugType> {
-        self.ty(ty, POINTERS)
+        self.ty(ty, POINTERS)?.kept()
     }
 
     fn ty(&self, ty: Ty<'db>, pointers: u32) -> Option<DebugType> {
