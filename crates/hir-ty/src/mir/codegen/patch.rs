@@ -982,3 +982,20 @@ impl Base {
         Ok(Ok(Patch { object, bodies, phases }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::probe;
+
+    #[test]
+    fn a_probe_that_is_interrupted_goes_on_unwinding_and_one_that_panics_finds_nothing() {
+        let gone: Option<()> = probe(|| panic!("the base no longer has it"));
+        assert_eq!(gone, None);
+        assert_eq!(probe(|| 7), Some(7));
+        let interrupted = std::panic::catch_unwind(|| {
+            probe(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite)))
+        });
+        let stopped: Box<dyn std::any::Any + Send> = interrupted.unwrap_err();
+        assert!(stopped.is::<salsa::Cancelled>());
+    }
+}
