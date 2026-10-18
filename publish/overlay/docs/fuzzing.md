@@ -1,8 +1,8 @@
 # The fuzzer
 
 Every other harness runs programs somebody wrote. The fuzzer makes programs up, builds each
-with cargo and with rustd, and compares what they print. It found sixteen bugs the other
-harnesses had not, eleven of them miscompiles, so it is worth knowing how to run it and what
+with cargo and with rustd, and compares what they print. It found twenty-one bugs the other
+harnesses had not, most of them miscompiles, so it is worth knowing how to run it and what
 it does not cover. The full account, with every finding, is in
 [reports/FUZZ.md](reports/FUZZ.md).
 
@@ -86,27 +86,32 @@ again. Reduction is bounded by time, so a reduced file is small but not always m
 
 ## What it has found
 
-Sixteen distinct problems, on Linux x86-64 with Rust 1.99.0. Eleven were miscompiles: the
-program ran and did the wrong thing. Most of those were the order in which temporaries and
-partly moved values are dropped, in `if let`, `let ... else`, `match` guards, `for` loops in
-tail position and when an operand panics. One was an index that was not bounds-checked when
-its value was unused. One was LLVM miscompiling valid IR, which rustd works around by
-turning a vectoriser pass off. Three were wrong panic text and two were functions rustd
-refused.
+Twenty-one distinct problems in whole builds, on Linux x86-64 with Rust 1.99.0, one of them
+only on AArch64. Most were miscompiles: the program ran and did the wrong thing. Nearly all
+of those were the order in which temporaries and partly moved values are dropped, in
+`if let`, `let ... else`, `match` guards, `for` loops in tail position and when an operand
+panics. One was an index that was not bounds-checked when its value was unused. The rest
+were wrong panic text and functions rustd refused.
 
-Thirteen are fixed and one is worked around. Two are open and listed in
-[support.md](support.md): the text of a long `assert!` condition, and the drop order of an
-array behind an unreachable match arm.
+Eighteen are fixed. Two are worked around and look like LLVM bugs rather than rustd's: an
+array of `i128` rows left partly unwritten, which rustd avoids by turning a vectoriser pass
+off, and a crash while unwinding on AArch64 at `-O2`. One is open and listed in
+[support.md](support.md): the text of a long `assert!` condition.
 
-The long runs are tabulated in [results.md](results.md). Up to the eighth, about one program
-in a few hundred still found something. The ninth, 360 programs and 106,116 generated
-functions on commit 27a94f2770, found nothing, and so did a shorter run of 60 programs
-after the last merge.
+Generated edits against a running daemon found four more problems in the incremental path,
+all fixed, and a fifth that is open and has not been looked into: after some edits a panic
+inside `core` names the file by its `/rustc/<commit>/library/...` path instead of the local
+one.
+
+The long runs are tabulated in [results.md](results.md). Almost every full-size run found
+one to three more drop-order bugs, which were fixed before the next. The last two runs were
+stopped early, at 57 programs (finding 21) and at 60 programs with nothing found. Expect
+that more exist.
 
 ## What it does not cover
 
-- It builds whole programs. It does not edit a program and splice the change in, so the
-  daemon's incremental path, the patch object and the splice are not fuzzed.
+- Generated edits have had a few short runs only (24 rounds in the last), so the daemon's
+  incremental path, the patch object and the splice are barely fuzzed.
 - Only Linux x86-64 has been run. The ABI shapes the generator aims at are the System V
   ones. The smoke run is in the Linux x86-64 CI jobs only.
 - Single-crate programs using only `std`: nothing about dependencies, features, build

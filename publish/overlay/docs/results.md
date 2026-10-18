@@ -236,9 +236,9 @@ dioxus-cli is the large case: a step takes about four seconds and the daemon hol
 `fuzz/fuzz.py run`, 30 cases per program, both backends. Linux x86-64, Rust 1.99.0,
 LLVM 20.1.8. Source: FUZZ.md, report at 8f21942505.
 
-Sixteen distinct problems were found. Eleven were miscompiles, three were wrong panic
-text, and two were functions rustd refused. Thirteen are fixed, one (an LLVM bug) is worked
-around, and two are open.
+Twenty-one distinct problems were found, most of them miscompiles. Eighteen are fixed, two
+(believed to be LLVM bugs) are worked around, and one is open. The table stops at L10; the
+later runs, which found findings 17 to 21, are in FUZZ.md.
 
 | Run | rustd at | Programs | Functions generated | Compiled by rustd, each backend | Differences | Left to rustc |
 |---|---|---:|---:|---:|---|---|

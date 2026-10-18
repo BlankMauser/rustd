@@ -26,7 +26,7 @@ to stable; those are marked where they are used.
 | LLVM | yes (1) | yes (1) | yes (1) | yes (1) | no |
 | Full link | yes (1) | yes (1) | yes (1) | yes (1) | yes, older branch (2) |
 | Splice | yes (3) | yes (3) | yes (4) | yes, with a limit (5) | yes, older branch (2) |
-| Debug info | yes (6) | yes (6) | no (7) | unverified (7) | no |
+| Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
 | `cargo rustd` | yes (8) | unverified (9) | no: goes to cargo (9) | no: goes to cargo (9) | no |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
 | Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
@@ -57,8 +57,10 @@ to stable; those are marked where they are used.
 6. [reports/DEBUGINFO.md](reports/DEBUGINFO.md) for x86-64 and PLAT-ABI2 for native
    AArch64: `debuginfo.py` passes under both backends. See "Debug info" below for what that
    covers.
-7. Debug info is not written for Windows. On macOS it is not checked: the harness reads
-   DWARF out of an ELF executable. Both are design notes only in DEBUGINFO.md.
+7. On Windows rustd writes CodeView procedures and line tables, checked by `debuginfo.py`
+   with `llvm-pdbutil` and `cdb` (WINDOWS.md). There are no types, parameters or locals,
+   and the PDB is stale after a splice until the next full link. On macOS debug info is
+   not checked here.
 8. `harness/cargo_rustd.py`, Cranelift only: seven real projects with no difference from
    cargo, 66 of 66 flag steps, 11 of 11 lifecycle checks
    ([reports/CARGO.md](reports/CARGO.md)). Not in CI. Run by hand for these docs on a new
@@ -148,15 +150,14 @@ marked open in `harness/breakers.py`:
 | Case | Difference |
 |---|---|
 | `assert_message` | `assert!` of a condition longer than a line prints it on one line; rustc breaks it over several |
-| `unreachable_arm_move` | an array matched by an unreachable arm that would move elements out is dropped back to front instead of front to back |
 | `future_unwind_flags` | a future can be one byte smaller than rustc's, because rustc keeps a drop flag rustd does not. Only code that depends on the exact size of a future sees it |
 | `raw_write_then_match` | a value written through a raw pointer into a local rustc believes is `None`, then partly moved out, is dropped by rustd and leaked by rustc |
 | `fragment_edition_through_macro` | rustd does what rustc's own test says rustc will do once rust-lang/rust#130484 is fixed |
 
-The differential fuzzer found sixteen problems in generated programs, eleven of them
-miscompiles, mostly in the order temporaries are dropped. Fourteen are fixed or worked
-around and two are the first two rows above. The last full-size run found nothing, but
-every run before it found something, so expect that more exist.
+The differential fuzzer found twenty-one problems in generated programs, most of them
+miscompiles in the order temporaries are dropped. Twenty are fixed or worked around and one
+is the first row above. Nearly every full-size run found something, so expect that more
+exist.
 
 rustd has no borrow checker and no diagnostics. The daemon refuses source in which
 rust-analyzer finds an error (a type mismatch, an unresolved name, a missing field), and
@@ -191,7 +192,7 @@ cargo, as [cargo.md](cargo.md) lists.
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by rustd | served; an edit to the proc-macro crate itself is cargo's |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |
-| doctests | refused: rustdoc compiles each example as a crate of its own and stable rustdoc does not say where | `cargo test --doc` |
+| doctests | supported through `cargo rustd test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example rustd cannot build is left to rustdoc with the reason |
 | features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` handed to cargo |
 | path, git, registry, renamed, vendored, `[patch]` and `[replace]` dependencies | supported | served |
 | an edit to a path dependency the daemon was not asked to build | refused with a reason | cargo |
