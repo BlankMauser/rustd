@@ -1,23 +1,29 @@
 name: release
 
 # Builds rustd for the four platforms CI tests and attaches the archives to a GitHub release.
-# A tag `v*` makes a release of that name; a manual run makes or replaces the prerelease
-# named by its input, `nightly` unless told otherwise.
+# A tag `v*` makes a release of that name. A push to main replaces the prerelease `nightly`,
+# and a manual run makes or replaces the prerelease named by its input.
 on:
   push:
     tags: ["v*"]
+    branches: ["main"]
+    paths-ignore: ["site/**", "**.md", "docs/**", "harness/**"]
   workflow_dispatch:
     inputs:
       name:
         description: Release to make or replace
         default: nightly
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE: ${{ github.event_name == 'push' && github.ref_name || inputs.name }}
+  RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || inputs.name || 'nightly' }}
 
 jobs:
   build:
@@ -84,10 +90,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="Built from ${GITHUB_SHA}. Cranelift backend only; the LLVM backend is built from source. See the README for what rustd does and does not do yet."
-          if [ "${{ github.event_name }}" = push ]; then
+          if [ "${{ github.ref_type }}" = tag ]; then
             gh release create "$RELEASE" --title "$RELEASE" --notes "$notes" --verify-tag out/*
           else
-            # A release made by hand moves with the branch it was run from.
+            # A prerelease moves with the branch it was built from.
             gh release delete "$RELEASE" --yes --cleanup-tag || true
             gh release create "$RELEASE" --title "$RELEASE" --notes "$notes" --prerelease --target "$GITHUB_SHA" out/*
           fi
