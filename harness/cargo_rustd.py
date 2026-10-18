@@ -160,7 +160,10 @@ def kill_all(process):
     if WINDOWS:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
     else:
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # it and its group have already ended
 
 
 def kill(pid):
