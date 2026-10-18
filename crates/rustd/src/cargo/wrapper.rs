@@ -44,6 +44,11 @@ const TALLY: &str = "plain-cargo.log";
 const NOT_LOADED: &str = "the daemon had not loaded the build yet";
 /// The directory there with a file for every cargo whose build is being loaded.
 const SETTLING: &str = "settling";
+/// The codegen option cargo names rustc's incremental directory with, as its own argument
+/// after `-C`.
+const INCREMENTAL: &str = "incremental";
+/// The directory, in cargo's incremental one, of the checks that go with the daemon's builds.
+const CHECKS: &str = "rustd-check";
 
 /// Builds what cargo asked rustc for and ends as rustc would have.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
@@ -81,8 +86,13 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::fs::create_dir_all(&copies)?;
         compiler.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
     }
+    // The check of the next build, which the daemon may link, then has little to do.
+    let checked_ahead = (plain && unit.is_incremental()).then(|| unit.checked(&rustc));
     let status =
         compiler.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
+    if let Some(checked) = checked_ahead {
+        let _ = checked.join();
+    }
     if status.success()
         && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line))
     {
@@ -277,14 +287,23 @@ impl Unit {
     /// daemon has no borrow checker and compiles a program rustc would turn down, and the
     /// warnings are rustc's to give. It also writes the dep-info cargo reads to know what
     /// the program was compiled from. What it says is kept until the program is the
-    /// daemon's.
+    /// daemon's. The check keeps its incremental state apart from the build's: rustc
+    /// starts one over when what it is asked to emit changes.
     fn checked(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
-        let emits = |it: &String| it.starts_with("--emit=");
-        let check = "--emit=dep-info,metadata";
-        let args = self.args.iter().map(|it| if emits(it) { check } else { it });
+        let args = self.args.iter().map(|it| match it.split_once('=') {
+            Some(("--emit", _)) => "--emit=dep-info,metadata".to_owned(),
+            Some((INCREMENTAL, dir)) => format!("{INCREMENTAL}={dir}/{CHECKS}"),
+            _ => it.clone(),
+        });
         let mut command = Command::new(rustc);
         command.args(args).stdin(Stdio::null());
         std::thread::spawn(move || command.output())
+    }
+
+    /// Whether rustc keeps incremental state for the unit, so that a check of it now
+    /// makes the next one short.
+    fn is_incremental(&self) -> bool {
+        self.args.iter().any(|it| it.starts_with(INCREMENTAL))
     }
 
     /// Says in one line why rustc links the program and not the daemon, and counts it.

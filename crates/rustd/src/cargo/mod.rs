@@ -152,22 +152,24 @@ enum Left {
 }
 
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
-/// them, once `cargo check` has passed the source: the daemon has no borrow checker and
-/// builds programs rustc turns down, and the warnings are rustc's to give. A program the
+/// them, once `cargo check` has passed the source as it is now: the daemon has no borrow
+/// checker and builds programs rustc turns down, and the warnings are rustc's to give. A program the
 /// daemon does not build stays as cargo built it while its source is what cargo compiled.
 fn by_daemon(mut state: State, typed: &Invocation) -> Result<State, Left> {
     if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
         return Err(Left::ToCargo(Box::new(state), reason));
     }
-    let checking = check_of(typed).spawn();
+    let checking = state.unchecked().then(|| (units::stamp_now(), check_of(typed).spawn()));
     let asked: Vec<Result<Vec<Result<(), String>>, String>> =
         state.checkouts.iter().map(synced).collect();
-    match checking.and_then(|mut check| check.wait()) {
-        Ok(status) if status.success() => {}
-        Ok(status) => return Err(Left::WithErrors(run::exit_code(status))),
-        Err(error) => {
-            let reason = format!("`cargo check` did not run: {error}");
-            return Err(Left::ToCargo(Box::new(state), reason));
+    if let Some((began, checking)) = checking {
+        match checking.and_then(|mut check| check.wait()) {
+            Ok(status) if status.success() => state.checked(began),
+            Ok(status) => return Err(Left::WithErrors(run::exit_code(status))),
+            Err(error) => {
+                let reason = format!("`cargo check` did not run: {error}");
+                return Err(Left::ToCargo(Box::new(state), reason));
+            }
         }
     }
     let answers: Vec<Vec<Result<(), String>>> = std::iter::zip(&asked, &state.checkouts)

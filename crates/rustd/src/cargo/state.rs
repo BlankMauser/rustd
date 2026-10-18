@@ -42,6 +42,9 @@ pub(crate) struct State {
     pub(crate) root: PathBuf,
     /// When the cargo build this is the state of started.
     built_at: u128,
+    /// When the last check by rustc that passed the source started: the cargo build, or
+    /// the `cargo check` of a build by the daemon since.
+    checked_at: u128,
     /// The profile, as cargo's `Finished` line names it.
     pub(crate) profile: String,
     pub(crate) programs: Vec<Program>,
@@ -439,6 +442,19 @@ impl State {
         Ok(cargos)
     }
 
+    /// Whether rustc has not seen the source as it is: a file a program is compiled from
+    /// was written since the last check that passed. A build of no program is one of
+    /// libraries, whose files are not listed.
+    pub(crate) fn unchecked(&self) -> bool {
+        let written = |it: &Program| it.newer_input(self.checked_at).is_some();
+        self.programs.is_empty() || self.programs.iter().any(written)
+    }
+
+    /// Records that a check by rustc that started at `stamp` passed the source.
+    pub(crate) fn checked(&mut self, stamp: u128) {
+        self.checked_at = stamp;
+    }
+
     /// The programs cargo built that the daemon is never asked for, and why.
     pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
@@ -467,6 +483,7 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
+            checked_at: built.started,
             profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),
@@ -618,7 +635,7 @@ impl Program {
         std::iter::once(&*self.executable).chain(self.names.iter().map(|it| &**it))
     }
 
-    /// The first of its source files that was written after cargo started.
+    /// The first of its source files that was written after `built_at`.
     fn newer_input(&self, built_at: u128) -> Option<&Path> {
         let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
         self.inputs.iter().find(newer).map(PathBuf::as_path)
