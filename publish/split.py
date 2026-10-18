@@ -105,6 +105,12 @@ def main():
         f'[submodule "vendor/rust-analyzer"]\n\tpath = vendor/rust-analyzer\n\turl = {REPO}.git\n\tbranch = {BRANCH}\n'
     )
 
+    # The test corpus is beside the code generator, which is no longer under `hir-ty`.
+    fuzz = f"{out}/{CODEGEN_AT}/fuzz.rs"
+    text = open(fuzz).read()
+    assert text.count('"src/mir/codegen/corpus"') == 1
+    open(fuzz, "w").write(text.replace('"src/mir/codegen/corpus"', f'"../../../../{CODEGEN_AT}/corpus"'))
+
     wasm = f"{out}/crates/rustd-wasm/Cargo.toml"
     text = open(wasm).read()
     text = re.sub(r'path = "\.\./(?!\.\.)', 'path = "../../vendor/rust-analyzer/crates/', text)

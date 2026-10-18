@@ -265,7 +265,13 @@ impl SymbolTable {
             self.makers.entry(function).or_default().insert(maker);
         }
         // `{:#}` drops the crate disambiguator hashes.
-        symbols.push(Symbol { private, name: name.to_owned(), place: V0::place(name), with_ids, path });
+        symbols.push(Symbol {
+            private,
+            name: name.to_owned(),
+            place: V0::place(name),
+            with_ids,
+            path,
+        });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
