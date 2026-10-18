@@ -8,6 +8,8 @@ pub use span::RealSpanMap;
 
 use crate::{HirFileId, MacroCallId};
 
+use syntax_bridge::{FragmentBounds, MacroFragments};
+
 pub type ExpansionSpanMap = span::SpanMap;
 
 /// Spanmap for a macro file or a real file
@@ -22,6 +24,22 @@ pub enum SpanMap<'db> {
 impl syntax_bridge::SpanMapper for SpanMap<'_> {
     fn span_for(&self, range: TextRange) -> Span {
         self.span_for_range(range)
+    }
+}
+
+/// The spans for the arguments of a `macro_rules` macro, see [`MacroFragments`].
+pub(crate) struct MacroRulesArgs<'db>(pub(crate) SpanMap<'db>);
+
+impl syntax_bridge::SpanMapper for MacroRulesArgs<'_> {
+    fn span_for(&self, range: TextRange) -> Span {
+        self.0.span_for_range(range)
+    }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        match self.0 {
+            SpanMap::ExpansionSpanMap(map) => MacroFragments(map).fragment_bounds(range),
+            SpanMap::RealSpanMap(_) => FragmentBounds::default(),
+        }
     }
 }
 
@@ -106,6 +124,9 @@ pub(crate) fn real_span_map(
         }
         _ => (),
     });
+    // The lookup is a binary search, and the nested items were added after the items that
+    // hold them.
+    pairs.sort_by_key(|&(offset, _)| offset);
 
     RealSpanMap::from_file(
         editioned_file_id.span_file_id(db),

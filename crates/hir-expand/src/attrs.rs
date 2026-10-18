@@ -49,12 +49,12 @@ impl AstPathExt for ast::Path {
     }
 
     fn as_one_segment(&self) -> Option<SmolStr> {
-        Some(self.as_single_name_ref()?.text().into())
+        Some(self.as_single_name_ref()?.text().trim_start_matches("r#").into())
     }
 
     fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
         let parent = self.qualifier().as_one_segment();
-        let this = self.segment()?.name_ref()?.text().into();
+        let this = self.segment()?.name_ref()?.text().trim_start_matches("r#").into();
         if let Some(parent) = parent { Some((parent, Some(this))) } else { Some((this, None)) }
     }
 }

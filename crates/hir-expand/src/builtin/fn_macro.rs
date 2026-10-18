@@ -186,13 +186,29 @@ fn trace_macros_expand(
     ExpandResult::ok(quote! {span =>})
 }
 
+/// Whether the source has another token right after the token `text` at `span`. `None` if the
+/// source does not have that token there, which is the case for a token made by a macro.
+fn source_joined(db: &dyn SourceDatabase, span: Span, text: &str) -> Option<bool> {
+    let crate::FileRange { file_id, range } = crate::resolve_span(db, span);
+    let source = db.file_text(file_id.file_id(db)).text(db);
+    if source.get(std::ops::Range::<usize>::from(range))? != text {
+        return None;
+    }
+    let rest = &source[usize::from(range.end())..];
+    let is_trivia = rest.starts_with(char::is_whitespace)
+        || rest.starts_with("//")
+        || rest.starts_with("/*")
+        || rest.is_empty();
+    Some(!is_trivia)
+}
+
 fn stringify_expand(
-    _db: &dyn SourceDatabase,
+    db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let pretty = ::tt::pretty(tt.token_trees());
+    let pretty = ::tt::stringify(tt.token_trees(), &|span, text| source_joined(db, span, text));
 
     let expanded = quote! {span =>
         #pretty
@@ -222,7 +238,14 @@ fn assert_expand(
 
     let dollar_crate = dollar_crate(span);
     let panic_args = rest.iter();
-    let mac = if use_panic_2021(db, span) {
+    let mac = if rest.is_empty() {
+        // Without a message of its own, the assertion reports the condition.
+        let message = format!(
+            "assertion failed: {}",
+            ::tt::stringify(cond.value, &|span, text| source_joined(db, span, text))
+        );
+        quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
+    } else if use_panic_2021(db, span) {
         quote! {call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args) }
     } else {
         quote! {call_site_span => #dollar_crate::panic!(# #panic_args) }
@@ -272,26 +295,61 @@ fn format_args_expand(
 }
 
 fn format_args_nl_expand(
-    _db: &dyn SourceDatabase,
+    db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let pound = mk_pound(span);
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
     let lit = tt.as_token_trees().iter_flat_tokens().nth(1);
     if let Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
-        mut lit @ tt::Literal { kind: tt::LitKind::Str, .. },
+        mut lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
     ))) = lit
     {
+        let mut tt = tt.clone();
+        tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+        // A raw string has no escapes: the newline goes in as it is.
+        let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
         let (text, suffix) = lit.text_and_suffix();
-        lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}\\n{suffix}"));
+        lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}{newline}{suffix}"));
         tt.set_token(1, lit.into());
+        return ExpandResult::ok(quote! {span =>
+            builtin #pound format_args #tt
+        });
     }
-    ExpandResult::ok(quote! {span =>
-        builtin #pound format_args #tt
-    })
+    format_args_nl_of_macro(db, tt, span)
+}
+
+/// `format_args_nl!` whose template is not written as a string: a macro that expands to one.
+///
+/// rustc expands the template and then appends the newline to the string it got
+/// (`expand_format_args_impl` with `append_newline` in
+/// `compiler/rustc_builtin_macros/src/format.rs`). Here the template becomes
+/// `concat!(template, "\n")`, which expands to that same string.
+fn format_args_nl_of_macro(
+    db: &dyn SourceDatabase,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let pound = mk_pound(span);
+    let mut iter = tt.iter();
+    let template = expect_fragment(
+        db,
+        &mut iter,
+        parser::PrefixEntryPoint::Expr,
+        tt.top_subtree().delimiter.delim_span(),
+    );
+    let rest = iter.remaining();
+    let arguments = rest.iter();
+    let dollar_crate = dollar_crate(span);
+    let value = template.value;
+    let expanded = quote! {span =>
+        builtin #pound format_args (#dollar_crate::concat!(#value, "\n") # #arguments)
+    };
+    match template.err {
+        Some(err) => ExpandResult::new(expanded, err.into()),
+        None => ExpandResult::ok(expanded),
+    }
 }
 
 fn asm_expand(
@@ -757,9 +815,10 @@ fn relative_file(
     let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
-    let res: FileId = db
-        .resolve_path(path)
-        .ok_or_else(|| ExpandError::other(err_span, format!("failed to load file `{path_str}`")))?;
+    let res: FileId = db.resolve_path(path).ok_or_else(|| {
+        db.include_source(path);
+        ExpandError::other(err_span, format!("failed to load file `{path_str}`"))
+    })?;
     // Prevent include itself
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`")))
@@ -858,17 +917,41 @@ pub fn include_input_to_file_id(
 }
 
 fn include_bytes_expand(
-    _db: &dyn SourceDatabase,
-    _arg_id: MacroCallId,
-    _tt: &tt::TopSubtree,
+    db: &dyn SourceDatabase,
+    arg_id: MacroCallId,
+    tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // FIXME: actually read the file here if the user asked for macro expansion
-    let pound = mk_pound(span);
-    let res = quote! {span =>
-        builtin #pound include_bytes
-    };
-    ExpandResult::ok(res)
+    let read = parse_string(tt, false).and_then(|(path, input_span)| {
+        included_bytes(db, arg_id, path.as_str())
+            .ok_or_else(|| ExpandError::other(input_span, format!("failed to load file `{path}`")))
+    });
+    match read {
+        Ok(bytes) => {
+            let text = bytes.escape_ascii().to_string();
+            let literal = tt::Literal::new_no_suffix(&text, span, tt::LitKind::ByteStr);
+            ExpandResult::ok(quote!(span =>#literal))
+        }
+        // The length is not known, so the type is `&[u8; _]`.
+        Err(e) => {
+            let pound = mk_pound(span);
+            ExpandResult::new(quote! {span => builtin #pound include_bytes }, e)
+        }
+    }
+}
+
+/// The contents of the file an `include_bytes!` or `include_str!` at `call_id` names.
+fn included_bytes<'db>(
+    db: &'db dyn SourceDatabase,
+    call_id: MacroCallId,
+    path: &str,
+) -> Option<&'db [u8]> {
+    let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
+    let path = AnchoredPath { anchor, path };
+    if let Some(file) = db.resolve_path(path) {
+        return Some(db.file_text(file).text(db).as_bytes());
+    }
+    db.included_file(path)?.bytes(db).as_deref()
 }
 
 fn include_str_expand(
@@ -887,26 +970,22 @@ fn include_str_expand(
         }
     };
 
-    // FIXME: we're not able to read excluded files (which is most of them because
-    // it's unusual to `include_str!` a Rust file), but we can return an empty string.
-    // Ideally, we'd be able to offer a precise expansion if the user asks for macro
-    // expansion.
-    let file_id = match relative_file(db, arg_id, path.as_str(), true, input_span) {
-        Ok(file_id) => file_id,
-        Err(_) => {
-            return ExpandResult::ok(quote!(call_site =>""));
-        }
-    };
-
-    let text = db.file_text(file_id.file_id(db));
-    let text = &**text.text(db);
-
-    ExpandResult::ok(quote!(call_site =>#text))
+    let text = included_bytes(db, arg_id, path.as_str())
+        .map(|it| String::from_utf8_lossy(it).into_owned());
+    match text {
+        Some(text) => ExpandResult::ok(quote!(call_site =>#text)),
+        None => ExpandResult::new(
+            quote!(call_site =>""),
+            ExpandError::other(input_span, format!("failed to load file `{path}`")),
+        ),
+    }
 }
 
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
-    krate.env(db).get(key.as_str())
+    db.env_is_read(krate, key.as_str());
+    // As rustc reads them: what cargo set for the crate, then the process the build is for.
+    krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
 }
 
 fn env_expand(
@@ -927,6 +1006,7 @@ fn env_expand(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
+        db.env_is_unset(arg_id.loc(db).krate, key.as_str());
         // The only variable rust-analyzer ever sets is `OUT_DIR`, so only diagnose that to avoid
         // unnecessary diagnostics for eg. `CARGO_PKG_NAME`.
         if key.as_str() == "OUT_DIR" {
