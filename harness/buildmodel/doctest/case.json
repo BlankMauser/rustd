@@ -4,6 +4,5 @@
   "crates": [
     "app"
   ],
-  "expect": "refused",
-  "unbuilt": "rustdoc takes each example out of the documentation, compiles it as a crate of its own and runs it, and a stable rustdoc tells nobody where that crate and its link line are (`--persist-doctests`, `--test-builder` are unstable); rustd neither takes the examples out itself (hidden `#` lines, the `main` around an example, `should_panic`/`no_run`/`compile_fail` marks) nor links a program of its own for each. `rustd --doc` says so"
+  "doctests": true
 }

@@ -7,7 +7,7 @@ from. Both are off until you configure them.
 
 The reports behind this file are [reports/DISKCACHE.md](reports/DISKCACHE.md) and
 [reports/REMOTE.md](reports/REMOTE.md). The variables and commands below were checked
-against `crates/hir-ty-codegen/codegen/store.rs` and `crates/rustd/src/remote.rs`.
+against `crates/hir-ty-codegen/store.rs` and `crates/rustd/src/remote.rs`.
 
 ## What is stored and under what key
 

@@ -24,6 +24,8 @@ use super::{Machine, Patch, Target};
 pub(super) struct Described {
     headers: Vec<elf::SectionHeader64<Endianness>>,
     sections: FxHashMap<Box<[u8]>, usize>,
+    /// Which of the headers is of the section their names are in.
+    names: usize,
 }
 
 /// A run of the file that is written again further on.
@@ -38,8 +40,8 @@ pub(super) struct Moved {
 pub(super) struct Tail {
     pub(super) moved: Vec<Moved>,
     pub(super) written: Vec<(u64, Vec<u8>)>,
-    /// Where the section headers are, when they are among what is written.
-    pub(super) headers_offset: Option<u64>,
+    /// Where the section headers are and how many, when they are among what is written.
+    pub(super) headers: Option<(u64, u16)>,
 }
 
 impl Described {
@@ -53,7 +55,9 @@ impl Described {
                 sections.insert(name.into(), section.index().0);
             }
         }
-        Ok(Described { headers, sections })
+        let names = file.elf_header().shstrndx(endian, file.data())? as usize;
+        ensure!(names < headers.len(), "the names of the sections are in none of them");
+        Ok(Described { headers, sections, names })
     }
 
     fn says_lines(&self) -> bool {
@@ -101,12 +105,21 @@ impl Patch<'_> {
             return Ok(tail);
         }
         let mut headers = described.headers.clone();
+        let mut sections = described.sections.clone();
+        let mut names = Vec::new();
+        let named = headers[described.names].sh_size(e);
         let mut theirs = FxHashMap::<SectionIndex, u64>::default();
         for section in self.described() {
             let name = section.name_bytes()?;
             let shown = String::from_utf8_lossy(name);
-            let header = described.sections.get(name).map(|&index| &headers[index]);
-            let header = header.with_context(|| format!("the executable has no {shown}"))?;
+            let index = *sections.entry(name.into()).or_insert_with(|| {
+                let at = named + names.len() as u64;
+                names.extend_from_slice(name);
+                names.push(0);
+                headers.push(empty(section.elf_section_header(), at as u32));
+                headers.len() - 1
+            });
+            let header = &headers[index];
             ensure!(
                 header.sh_flags(e) & u64::from(elf::SHF_COMPRESSED) == 0,
                 "the executable's {shown} is compressed"
@@ -146,7 +159,7 @@ impl Patch<'_> {
                 }
             }
             let name = section.name_bytes()?;
-            let header = &mut headers[described.sections[name]];
+            let header = &mut headers[sections[name]];
             let len = header.sh_size(e);
             tail.moved.push(Moved { from: header.sh_offset(e), len, to: end });
             header.sh_offset.set(e, end);
@@ -154,9 +167,37 @@ impl Patch<'_> {
             tail.written.push((end + len, data));
             end += header.sh_size(e);
         }
+        if !names.is_empty() {
+            let header = &mut headers[described.names];
+            tail.moved.push(Moved { from: header.sh_offset(e), len: named, to: end });
+            header.sh_offset.set(e, end);
+            header.sh_size.set(e, named + names.len() as u64);
+            tail.written.push((end + named, names));
+            end += header.sh_size(e);
+        }
         let end = end.next_multiple_of(8);
+        let count = u16::try_from(headers.len()).ok().filter(|&it| it < elf::SHN_LORESERVE);
+        let count = count.context("more sections than the file's header counts")?;
         tail.written.push((end, object::bytes_of_slice(&headers).to_vec()));
-        tail.headers_offset = Some(end);
+        tail.headers = Some((end, count));
         Ok(tail)
+    }
+}
+
+/// The header of a section the executable has none of yet, like the patch's and with nothing
+/// in it, named by what is `name` into the names of the sections.
+fn empty(like: &elf::SectionHeader64<Endianness>, name: u32) -> elf::SectionHeader64<Endianness> {
+    let e = Endianness::Little;
+    elf::SectionHeader64 {
+        sh_name: object::U32::new(e, name),
+        sh_type: like.sh_type,
+        sh_flags: like.sh_flags,
+        sh_addr: object::U64::new(e, 0),
+        sh_offset: object::U64::new(e, 0),
+        sh_size: object::U64::new(e, 0),
+        sh_link: object::U32::new(e, 0),
+        sh_info: object::U32::new(e, 0),
+        sh_addralign: object::U64::new(e, 1),
+        sh_entsize: like.sh_entsize,
     }
 }

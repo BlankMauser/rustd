@@ -9,6 +9,8 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
+use crate::plan::Selection;
+
 /// The flags of cargo's build commands that take their value as the next argument.
 const VALUED: &[&str] = &[
     "-p",
@@ -70,7 +72,8 @@ const BUILD_ENV: &[&str] = &[
     "RUSTD_SPLICE",
 ];
 
-/// The variables a worker is started with: the ones that pick its toolchain and its backend.
+/// The variables a worker is started with: the ones that pick its toolchain and its backend,
+/// and the ones cargo reads flags and profiles from.
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -120,6 +123,9 @@ pub(crate) enum Asked {
     Cargo(Vec<String>),
     Status,
     Stop,
+    Enable,
+    Disable,
+    Help,
 }
 
 /// A build command and its arguments, split into what is cargo's to read and what is the
@@ -167,15 +173,42 @@ impl Asked {
     /// From the arguments after `cargo rustd`.
     pub(crate) fn parse(args: Vec<String>) -> Asked {
         let Some((first, rest)) = args.split_first() else {
-            return Asked::Cargo(vec!["help".to_owned()]);
+            return Asked::Help;
         };
         match (first.as_str(), Subcommand::named(first)) {
+            ("--help" | "-h" | "help", _) => Asked::Help,
             (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
+            ("enable", _) => Asked::Enable,
+            ("disable", _) => Asked::Disable,
             _ => Asked::Cargo(args),
         }
     }
+}
+
+/// The build command a cargo was run for, from its arguments. Cargo takes its own flags
+/// ahead of the subcommand as well as after it, and they are read as if they were after.
+/// `None` when the command is not one that builds programs rustd has a part in, or is one
+/// with a directory to change to first.
+pub(crate) fn of_cargo(args: &[String]) -> Option<Invocation> {
+    let mut ahead = Vec::new();
+    let mut words = args.iter();
+    let subcommand = loop {
+        let word = words.next()?;
+        if !word.starts_with('-') {
+            break Subcommand::named(word)?;
+        }
+        if word == "-C" {
+            return None;
+        }
+        ahead.push(word.clone());
+        if VALUED.contains(&word.as_str()) {
+            ahead.push(words.next()?.clone());
+        }
+    };
+    let typed: Vec<String> = ahead.into_iter().chain(words.cloned()).collect();
+    Some(Invocation::parse(subcommand, &typed))
 }
 
 impl Invocation {
@@ -245,17 +278,22 @@ impl Invocation {
 
     /// Why this command is cargo's alone, when it is clear before anything is built.
     pub(crate) fn only_cargo(&self) -> Option<String> {
+        let surroundings = match () {
+            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
+            _ if !wrapper_installed() => "`rustd-rustc` is not installed next to `rustd`",
+            _ => return self.asks_for_cargo(),
+        };
+        Some(surroundings.to_owned())
+    }
+
+    /// Why what was typed is cargo's alone, wherever it is typed.
+    fn asks_for_cargo(&self) -> Option<String> {
         let flags = &self.flags;
-        let set = |name: &str| std::env::var_os(name).is_some_and(|it| !it.is_empty());
         let reason = match () {
-            _ if flags.doc => "doc tests are built by rustdoc",
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
             _ if flags.excludes => "--exclude is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => "several targets in one build",
-            _ if set("RUSTC_WORKSPACE_WRAPPER") && !set(super::wrapper::ENABLED) => {
-                "RUSTC_WORKSPACE_WRAPPER is set already"
-            }
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -265,6 +303,21 @@ impl Invocation {
     pub(crate) fn profile(&self) -> &str {
         let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
         self.flags.profile.as_deref().unwrap_or(of_command)
+    }
+
+    /// Which build of the package the command is, as the daemon plans it. With no package
+    /// named it is the one of the directory the worker is started in.
+    pub(crate) fn selection(&self) -> Selection {
+        Selection {
+            profile: self.flags.profile.clone().unwrap_or_else(|| "dev".to_owned()),
+            features: self.flags.features.clone(),
+            no_default_features: self.flags.no_default_features,
+            all_features: self.flags.all_features,
+            packages: self.flags.packages.clone(),
+            workspace: self.flags.workspace,
+            target: self.target(),
+            dev_deps: self.subcommand == Subcommand::Test,
+        }
     }
 
     /// The triple cargo builds for, when it is told one.
@@ -303,6 +356,19 @@ impl Flags {
             _ => {}
         }
     }
+}
+
+/// Whether the environment names a wrapper for the crates of the workspace that is not
+/// rustd's.
+fn another_wrapper() -> bool {
+    let ours = super::switch::wrapper_path().ok();
+    std::env::var_os(super::switch::VARIABLE)
+        .is_some_and(|it| !it.is_empty() && Some(Path::new(&it)) != ours.as_deref())
+}
+
+/// Whether the wrapper cargo is to run in place of rustc is where rustd looks for it.
+fn wrapper_installed() -> bool {
+    super::switch::wrapper_path().is_ok_and(|it| it.is_file())
 }
 
 /// Why rustd does not build for `triple`, when it does not.
@@ -381,12 +447,15 @@ mod tests {
     #[test]
     fn what_is_cargos_alone() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
-        assert_eq!(Asked::parse(Vec::new()), Asked::Cargo(vec!["help".to_owned()]));
+        assert_eq!(Asked::parse(Vec::new()), Asked::Help);
+        assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
         for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
-            assert!(build("build", args).only_cargo().is_some(), "{args}");
+            assert!(build("build", args).asks_for_cargo().is_some(), "{args}");
         }
-        for args in ["--release", "--profile bench", "-p a -p b", "--all-features"] {
-            assert_eq!(build("build", args).only_cargo(), None, "{args}");
+        for args in
+            ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
+        {
+            assert_eq!(build("build", args).asks_for_cargo(), None, "{args}");
         }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");

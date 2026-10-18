@@ -1,9 +1,13 @@
 //! Maps Rust paths to the mangled names rustc gave them, read from rlibs and objects.
 
-use std::path::{Path, PathBuf};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use anyhow::Context;
-use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
+use object::{Object, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
@@ -25,6 +29,17 @@ pub(crate) struct SymbolTable {
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
+    /// The paths of the functions defined under a symbol private to its object, hashed.
+    private: FxHashSet<u64>,
+    /// The files rustc built that cargo left a dep-info file for, each with its sources.
+    built_from: Vec<(PathBuf, Vec<Source>)>,
+    /// When the files started to be read.
+    read: Option<SystemTime>,
+    /// The copies crates made of one instance, by the symbol without the crate that made it.
+    copies: FxHashMap<String, Vec<String>>,
+    /// The crates that made a copy of an instance of a function, by the function's name
+    /// alone: what there is to go by for an instance whose types cannot be spelled.
+    makers: FxHashMap<String, FxHashSet<u64>>,
 }
 
 struct NestedSymbol {
@@ -42,16 +57,55 @@ struct Placed {
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
 struct Symbol {
+    /// Whether only the object that defines it can link to it.
+    private: bool,
     name: String,
     place: Option<u64>,
     with_ids: String,
     path: String,
 }
 
+/// A file of the source of a crate rustc built.
+#[derive(Debug)]
+struct Source {
+    path: PathBuf,
+    /// What a file that a build script wrote came to when the symbols were read. cargo runs
+    /// a script again without building the crate again when the script says the same, so
+    /// when such a file was written says nothing.
+    generated: Option<u64>,
+}
+
+impl Source {
+    fn new(path: PathBuf) -> Source {
+        let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
+        let of_script = names.windows(3).any(|it| it[0] == "build" && it[2] == "out");
+        let generated = of_script.then(|| content(&path)).flatten();
+        Source { path, generated }
+    }
+
+    /// Whether the file is another than the one rustc read when it finished at `built`.
+    fn written_since(&self, built: SystemTime) -> bool {
+        match self.generated {
+            Some(generated) => content(&self.path) != Some(generated),
+            None => written(&self.path).is_some_and(|it| it > built),
+        }
+    }
+}
+
+fn written(file: &Path) -> Option<SystemTime> {
+    std::fs::metadata(file).and_then(|it| it.modified()).ok()
+}
+
+fn content(file: &Path) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    std::fs::read(file).ok()?.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
-        let mut table = SymbolTable::default();
+        let mut table = SymbolTable { read: Some(SystemTime::now()), ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
         for file in files {
@@ -66,8 +120,10 @@ impl SymbolTable {
                 }
                 Err(_) => table.add_object(&data, &mut symbols),
             }
-            if let Some((name, source)) = crate_root(file, root) {
-                owners.push((name, source, first..symbols.len()));
+            if let Some((name, sources)) = crate_sources(file, root) {
+                owners.push((name, sources[0].clone(), first..symbols.len()));
+                let sources = sources.into_iter().map(Source::new).collect();
+                table.built_from.push((file.clone(), sources));
             }
         }
         // A crate's symbols mention the crates of its name that it depends on (a binary
@@ -98,7 +154,7 @@ impl SymbolTable {
         let mut table = SymbolTable::default();
         let mut symbols = Vec::new();
         for name in names {
-            table.add_name(name, &mut symbols);
+            table.add_name(name, false, &mut symbols);
         }
         table.index(symbols);
         table
@@ -107,13 +163,17 @@ impl SymbolTable {
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
         let table = self;
-        for Symbol { name, place, with_ids, path } in symbols {
+        for Symbol { private, name, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
             } else {
                 path
             };
+            if private {
+                table.private.insert(Self::hashed(&path));
+                continue;
+            }
             // A closure is not an item nested in itself.
             let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
             if path.contains("::{") && !unnamed {
@@ -142,6 +202,11 @@ impl SymbolTable {
         rustc_hash::FxBuildHasher.hash_one(symbol)
     }
 
+    /// Whether the function at `path` is defined under a symbol private to its object.
+    pub(crate) fn private(&self, path: &str) -> bool {
+        self.private.contains(&Self::hashed(path))
+    }
+
     pub(crate) fn defines(&self, symbol: &str) -> bool {
         self.names.contains(&Self::hashed(symbol))
     }
@@ -157,7 +222,8 @@ impl SymbolTable {
                 && symbol.section() == object::SymbolSection::Unknown;
             let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
             let linkable = symbol.is_undefined() || (defined && symbol.is_global());
-            if !linkable {
+            let private = defined && symbol.is_local() && symbol.kind() == SymbolKind::Text;
+            if !linkable && !private {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
@@ -167,12 +233,15 @@ impl SymbolTable {
                 object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
                 _ => name,
             };
-            self.add_name(name, symbols);
+            self.add_name(name, private, symbols);
         }
     }
 
-    fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
-        self.names.insert(Self::hashed(name));
+    fn add_name(&mut self, name: &str, private: bool, symbols: &mut Vec<Symbol>) {
+        let instance = without_instantiating_crate(name);
+        if !private && self.names.insert(Self::hashed(name)) && instance.len() != name.len() {
+            self.copies.entry(instance.to_owned()).or_default().push(name.to_owned());
+        }
         // The memory a static points to is a symbol that demangles to the static's path.
         if name.starts_with("_RNn") {
             return;
@@ -188,12 +257,20 @@ impl SymbolTable {
                 }
             }
         }
+        let path = format!("{demangled:#}");
+        if instance.len() != name.len()
+            && let Some(maker) = V0::instantiating_crate(name)
+            && let Some(function) = function_name(&path)
+        {
+            self.makers.entry(function).or_default().insert(maker);
+        }
         // `{:#}` drops the crate disambiguator hashes.
         symbols.push(Symbol {
+            private,
             name: name.to_owned(),
             place: V0::place(name),
             with_ids,
-            path: format!("{demangled:#}"),
+            path,
         });
     }
 
@@ -239,6 +316,22 @@ impl SymbolTable {
     /// bench may be named as the library, start where a test does, and be another program.
     pub(crate) fn links(&self, name: &str, root: &Path) -> bool {
         self.linked.contains(&(name.to_owned(), root.to_owned()))
+    }
+
+    /// A source that was written after rustc built the crate it is of: what rustc built is
+    /// then not what it would build now.
+    pub(crate) fn written_since_built(&self) -> Option<&Path> {
+        self.built_from.iter().find_map(|(built, sources)| {
+            let built = written(built)?;
+            sources.iter().find(|it| it.written_since(built)).map(|it| &*it.path)
+        })
+    }
+
+    /// Whether rustc has built one of the files again since they were read.
+    pub(crate) fn built_since_read(&self) -> bool {
+        self.read.is_some_and(|read| {
+            self.built_from.iter().any(|(built, _)| written(built).is_some_and(|it| it > read))
+        })
     }
 
     pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
@@ -296,26 +389,58 @@ impl SymbolTable {
         symbols.next().is_none().then_some(&*symbol.name)
     }
 
+    /// The copies of the instance `symbol` is one of, each with rustc's `StableCrateId` of
+    /// the crate that compiled it. None for a symbol that is of one crate only.
+    pub(crate) fn copies(&self, symbol: &str) -> impl Iterator<Item = (&str, u64)> {
+        let copies = self.copies.get(without_instantiating_crate(symbol));
+        copies.into_iter().flatten().filter_map(|it| Some((&**it, V0::instantiating_crate(it)?)))
+    }
+
+    /// rustc's `StableCrateId` of each crate that made a copy of an instance of a function
+    /// named `function`, in any module and of any type.
+    pub(crate) fn makers(&self, function: &str) -> impl Iterator<Item = u64> {
+        self.makers.get(function).into_iter().flatten().copied()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.by_path.len()
     }
 }
 
+/// The name of the function a demangled symbol is an instance of: the last of its path that
+/// is not types or a closure.
+fn function_name(path: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut bare = String::new();
+    for c in path.replace("->", "").chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            _ if depth == 0 => bare.push(c),
+            _ => {}
+        }
+    }
+    let name = bare.rsplit("::").find(|it| !it.is_empty() && !it.starts_with('{'))?;
+    Some(name.to_owned())
+}
+
 /// The name of the crate in `libname-hash.rlib`, or in the `name-hash.<unit>.rcgu.o` of a crate
-/// built as a test binary, and the file its source starts at, which the dep-info file cargo
-/// leaves next to it lists first.
-fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
+/// built as a program, and the files of its source, which the dep-info file cargo leaves
+/// next to it lists, the one the crate starts at first.
+fn crate_sources(rlib: &Path, root: &Path) -> Option<(String, Vec<PathBuf>)> {
     let file = rlib.file_name()?.to_str()?;
     let stem = match file.strip_suffix(".rlib") {
         Some(stem) => stem.strip_prefix("lib")?,
         None => file.strip_suffix(".rcgu.o")?.split_once('.')?.0,
     };
-    let (name, _) = stem.rsplit_once('-')?;
+    // A crate's name has no `-`. cargo gives the program of an MSVC or Apple target no hash:
+    // the file of its symbols is named after it.
+    let name = stem.rsplit_once('-').map_or(stem, |(name, _)| name);
     let dep_info = std::fs::read_to_string(rlib.with_file_name(format!("{stem}.d"))).ok()?;
     let (_, sources) = dep_info.lines().next()?.split_once(": ")?;
     // FIXME: a path with a space in it is escaped.
-    let source = sources.split(' ').next()?;
-    Some((name.to_owned(), root.join(source)))
+    let sources: Vec<PathBuf> = sources.split(' ').map(|it| root.join(it)).collect();
+    (!sources.is_empty()).then(|| (name.to_owned(), sources))
 }
 
 /// A v0 symbol without the crate that instantiated it, which ends the symbol of a generic
@@ -395,6 +520,18 @@ impl V0<'_> {
     /// that name in what it is written in, `1` for the next.
     fn place(symbol: &str) -> Option<u64> {
         V0 { rest: symbol.strip_prefix("_R")?.as_bytes() }.path()
+    }
+
+    /// The `StableCrateId` of the crate that compiled a copy of an instance, which ends the
+    /// symbol: see [`without_instantiating_crate`].
+    fn instantiating_crate(symbol: &str) -> Option<u64> {
+        let at = without_instantiating_crate(symbol).len();
+        let mut reader = V0 { rest: symbol.as_bytes().get(at..)? };
+        if reader.eat(b'B') {
+            let to = usize::try_from(reader.base62()?).ok()?;
+            reader = V0 { rest: symbol.strip_prefix("_R")?.as_bytes().get(to..)? };
+        }
+        reader.eat(b'C').then(|| reader.disambiguator())?
     }
 
     fn next(&mut self) -> Option<u8> {
@@ -585,7 +722,7 @@ mod tests {
 
     use rustc_hash::FxHashMap;
 
-    use super::{SymbolTable, V0};
+    use super::{SymbolTable, V0, function_name};
 
     fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
         let mut table = SymbolTable::default();
@@ -598,6 +735,21 @@ mod tests {
             table.by_root.iter().map(|(root, id)| (root.display().to_string(), *id)).collect();
         placed.sort();
         placed
+    }
+
+    #[test]
+    fn the_crate_that_compiled_a_copy() {
+        let of_lib = "_RINvCslFwujm09uXn_4kdep3sumhECsjPNOOTmEH7l_4klib";
+        let of_app = "_RINvCslFwujm09uXn_4kdep3sumhECsjSK0TBt3L2V_4kapp";
+        let by_reference = "_RNvXs_NtNtCsevLNFiNqfJP_4core3ops5arithhNtB4_3Add3addB8_";
+        let table = SymbolTable::of_names([of_lib, of_app, by_reference]);
+        let copies: Vec<_> = table.copies(of_app).map(|it| it.0).collect();
+        assert_eq!(copies, [of_lib, of_app]);
+        let ids: Vec<_> = table.copies(of_lib).map(|it| it.1).collect();
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(table.crates["core"], table.copies(by_reference).next().map(|it| it.1));
+        assert_eq!(table.copies("_RNvCslFwujm09uXn_4kdep5small").count(), 0);
+        assert_eq!(table.makers("sum").count(), 2);
     }
 
     #[test]
@@ -622,5 +774,17 @@ mod tests {
         assert_eq!(V0::place(first), Some(0));
         assert_eq!(V0::place(second), Some(1));
         assert_eq!(V0::place(third), Some(2));
+    }
+
+    #[test]
+    fn the_function_a_symbol_is_an_instance_of() {
+        let name = |path| function_name(path).unwrap();
+        assert_eq!(
+            name("std::panic::catch_unwind::<&dyn core::ops::Fn<(), Output = u8>, u8>"),
+            "catch_unwind"
+        );
+        assert_eq!(name("<core::fmt::Arguments>::new::<5, 2>"), "new");
+        assert_eq!(name("<alloc::boxed::Box<fn(u8) -> u8> as core::ops::Drop>::drop"), "drop");
+        assert_eq!(name("kdep::each::<u8, klib::run::{closure#0}>::{closure#1}"), "each");
     }
 }

@@ -126,7 +126,13 @@ impl Contents {
             } else {
                 continue;
             };
-            let hash = FileHashes::of(db, file);
+            // One that is not UTF-8 has no text: it is hashed as it is on disk, where an
+            // `include_bytes!` reads it from.
+            let hash = if db.has_text(file) {
+                FileHashes::of(db, file)
+            } else {
+                Sha256::digest(std::fs::read(path).unwrap_or_default()).into()
+            };
             files.push((by, relative.to_string_lossy().into_owned(), hash));
         }
         files.sort_unstable();

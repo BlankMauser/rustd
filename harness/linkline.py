@@ -32,7 +32,9 @@ def output_of(link):
 def with_output(link, path):
     """The line with the linked file written to `path`."""
     if msvc(link):
-        return [f"/OUT:{path}" if a.upper().startswith("/OUT:") else a for a in link]
+        # A library's import library goes with it, not over the one of the line's own link.
+        moved = {"/OUT:": f"/OUT:{path}", "/IMPLIB:": f"/IMPLIB:{path}.lib"}
+        return [next((to for flag, to in moved.items() if a.upper().startswith(flag)), a) for a in link]
     link = list(link)
     link[link.index("-o") + 1] = path
     return link

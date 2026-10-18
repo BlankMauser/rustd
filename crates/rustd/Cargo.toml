@@ -32,11 +32,15 @@ pdb = "0.8"
 sha2 = "0.10"
 cargo_metadata.workspace = true
 shlex = "2"
+toml.workspace = true
+thorin-dwp = "0.10"
+typed-arena = "2.0.2"
 
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 ide-db.workspace = true
+pulldown-cmark.workspace = true
 load-cargo.workspace = true
 project-model.workspace = true
 vfs.workspace = true
@@ -66,7 +70,9 @@ tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+find-msvc-tools = "0.1"
 uds_windows = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [features]
 # Allocate with jemalloc, which can profile the heap: see `memory.rs`.

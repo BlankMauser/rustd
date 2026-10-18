@@ -20,6 +20,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use uds_windows::{UnixListener, UnixStream};
 
+#[cfg(windows)]
+mod windows;
+
 /// The longest request: a build names every file rustc linked and every source it read.
 pub(crate) const LONGEST_REQUEST: u64 = 16 << 20;
 
@@ -191,11 +194,23 @@ fn not_swapped_under(dir: &Path) -> io::Result<()> {
     ))
 }
 
-/// A directory of the user's profile is the user's by its access control list, which a
-/// directory made in it inherits.
+/// The same by owner and access control list. A directory made here is closed to whom
+/// its parent is open to; one that was there is refused if its list lets others in.
 #[cfg(windows)]
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => windows::only_the_user_opens(dir)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if !std::fs::symlink_metadata(dir)?.is_dir() {
+        let why = format!("{} is not a directory", dir.display());
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
+    }
+    windows::the_users_alone(dir)
 }
 
 #[cfg(unix)]
@@ -205,8 +220,8 @@ fn only_the_user_connects(socket: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn only_the_user_connects(_: &Path) -> io::Result<()> {
-    Ok(())
+fn only_the_user_connects(socket: &Path) -> io::Result<()> {
+    windows::only_the_user_opens(socket)
 }
 
 #[cfg(unix)]
@@ -253,12 +268,8 @@ fn check_peer(stream: &UnixStream) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the peer is user {peer}")))
 }
 
-/// Windows has no user of a peer to ask for: the socket is in the user's profile, which
-/// other users can't open.
 #[cfg(windows)]
-fn check_peer(_: &UnixStream) -> io::Result<()> {
-    Ok(())
-}
+use windows::check_peer;
 
 /// Reads the one line a client sends, without its end: of the user, within the time and
 /// the length a request may take.
@@ -310,6 +321,39 @@ fn read_line(lines: &mut BufReader<io::Take<&UnixStream>>) -> io::Result<String>
             Err(io::Error::new(io::ErrorKind::InvalidData, "the request is too long"))
         }
         None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the request has no end")),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn the_directory_and_the_socket_are_the_users_alone() {
+        let dir = std::env::temp_dir().join(format!("rustd-socket-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        private_dir(&dir).unwrap();
+        private_dir(&dir).unwrap();
+        let served = Served::bind(&dir.join("sock")).unwrap();
+        // The peer of a connection from this process is this user.
+        let _client = UnixStream::connect(dir.join("sock")).unwrap();
+        let (peer, _) = served.listener.accept().unwrap();
+        check_peer(&peer).unwrap();
+        windows::the_users_alone(&dir.join("sock")).unwrap();
+
+        let opened = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .unwrap();
+        assert!(opened.status.success(), "{opened:?}");
+        let refused = private_dir(&dir).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let file = dir.join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(private_dir(&file).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        drop(served);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

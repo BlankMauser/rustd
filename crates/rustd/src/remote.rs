@@ -848,6 +848,9 @@ async fn lacking(
     let asked = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
         let most = listed.keys_max(remote);
         let keys = remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await;
+        if let Err(e) = &keys {
+            eprintln!("remote: the keys of {pack}.pack are not known, so it is fetched: {e:#}");
+        }
         let all_here = keys.is_ok_and(|keys| {
             !keys.is_empty()
                 && keys
@@ -917,7 +920,7 @@ const USAGE: &str = "usage: rustd cache push|pull REMOTE [PROJECT]\n       \
                      rustd cache keygen FILE\n       \
                      rustd cache forget REMOTE";
 
-/// `rustd cache VERB`, on the store `RUSTD_CACHE` names.
+/// `rustd cache VERB`, on the store of the user's builds.
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
     if verb == "keygen" {
@@ -927,7 +930,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     if verb == "gc" && args.next_if(|it| it == "--remote").is_some() {
         return collect_remote(args);
     }
-    let store = PathBuf::from(std::env::var_os("RUSTD_CACHE").context("RUSTD_CACHE is not set")?);
+    let store = crate::cargo::daemon::store().context("RUSTD_CACHE says there is no store")?;
     match verb.as_str() {
         "stats" => stats(&store),
         "gc" => collect(&store, args),
@@ -1481,6 +1484,32 @@ pub(crate) mod tests {
         let more = held(&store) - (1 << 20);
         assert!(more < 100, "the pack and the store's two files, and {more} bytes more");
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packed_pack_is_all_written_before_it_is_unpacked() {
+        // Bytes zstd makes nothing smaller of, so what is sent ends in a chunk of its own.
+        let mut pack = [&b"rustdpk"[..], &[STORE_FORMAT as u8]].concat();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        while pack.len() < (64 << 10) + 9 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            pack.extend_from_slice(&seed.to_le_bytes());
+        }
+        let sent = zstd::encode_all(&pack[..], 3).unwrap();
+        let (named, keys) = (Digest::of(&pack), Digest::of(&[1; 32]));
+        let packed = Some((Digest::of(&sent), sent.len() as u64));
+        let listed = Listed { size: pack.len() as u64, keys, format: STORE_FORMAT, packed };
+        for round in 0..500 {
+            let (remote, dir) = unsigned("flushed-pack", 1 << 20);
+            put(&dir, &format!("packs/{named}.pack.zst"), &sent);
+            put(&dir, &keys_object(&keys), &[1; 32]);
+            put(&dir, "manifests/default", Manifest([(named, listed)].into()).lines().as_bytes());
+            let pulled = wait(pull(&dir.join("store"), &remote, "default"));
+            _ = std::fs::remove_dir_all(&dir);
+            pulled.unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+        }
     }
 
     #[test]

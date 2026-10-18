@@ -21,6 +21,9 @@ correct compilers:
 import contextlib, os, random, sys
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from scenes import Scenes
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 INTS = {"i8": (8, True), "i16": (16, True), "i32": (32, True), "i64": (64, True), "i128": (128, True), "isize": (64, True),
         "u8": (8, False), "u16": (16, False), "u32": (32, False), "u64": (64, False), "u128": (128, False), "usize": (64, False)}
@@ -207,7 +210,7 @@ class Types:
         return all(self.unify(p, t, bound) for p, t in zip(pattern.args, ty.args))
 
 
-class Gen:
+class Gen(Scenes):
     """Generates one case. Methods named `x_KIND` list the ways to make a value of that kind."""
 
     def __init__(self, seed, index):
@@ -226,6 +229,7 @@ class Gen:
         self.blk, self.blocks, self.ldepth = 0, 0, 0
         self.scale = {}
         self.functions = 0
+        self.phases, self.cut = [], None
 
     # ---- plumbing -------------------------------------------------------------------------
 
@@ -1638,6 +1642,7 @@ class Gen:
             (0.8, "drop.move", self.s_move),
             (0.5, "static.mut_write", self.s_static),
             (0.5, "map.btree", self.s_map),
+            (3, "scene", self.s_scene),
         ])
 
     def some_ty(self):
@@ -2503,15 +2508,27 @@ class Gen:
         self.statics, self.constant, self.cap = [], False, WORK
         self.pool = [self.scalar() for _ in range(6)]
         self.pool = list(dict.fromkeys(self.pool))
+        self.phase("adts")
         self.make_adts()
         for _ in range(self.r.choice([2, 4, 6])):
             self.ty(lambda x: x.kind != "param")
+        self.phase("constants")
         self.make_constants()
+        self.phase("traits")
         self.make_traits()
-        for _ in range(self.r.choice([1, 2, 3, 4, 5, 6, 8])):
+        for index in range(self.r.choice([1, 2, 3, 4, 5, 6, 8])):
+            self.phase(f"fn{index}")
             self.make_fn()
+        self.phase("run")
         self.make_run()
         return self.lines
+
+    def phase(self, name):
+        """Notes that a part of the case starts. From the part named by `cut` on, the case is
+        generated from other random numbers: the same case with that part and the rest edited."""
+        self.phases.append(name)
+        if self.cut and self.cut[0] == name:
+            self.r = random.Random(f"{self.key}/{self.cut[1]}")
 
 
 class Trait:
@@ -2535,8 +2552,19 @@ def case(seed, index):
             lines = gen.case()
         except NoValue:
             continue
+        gen.index = index if attempt == 0 else f"{index}/{attempt}"
         return lines, gen
     raise SystemExit(f"case {index} of seed {seed}: no program after 8 attempts")
+
+
+def variant(seed, index, name, cut):
+    """The case `index` of `seed` generated anew from the part `cut` names, or None when that gave no program."""
+    gen = Gen(seed, index)
+    gen.name, gen.cut = name, cut
+    try:
+        return gen.case()
+    except NoValue:
+        return None
 
 
 def module(name, lines):
@@ -2546,7 +2574,7 @@ def module(name, lines):
 def render(modules):
     """A whole program from `(name, lines)` per case."""
     table = "const CASES: &[(&str, fn())] = &[" + ", ".join(f'("{name}", {name}::run)' for name, _ in modules) + "];"
-    return "\n\n".join([open(os.path.join(HERE, "prelude.rs")).read(), table, *(module(name, lines) for name, lines in modules)]) + "\n"
+    return "\n\n".join([open(os.path.join(HERE, "prelude.rs"), encoding="utf-8").read(), table, *(module(name, lines) for name, lines in modules)]) + "\n"
 
 
 def program(seed, cases):

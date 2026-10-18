@@ -49,14 +49,13 @@ You need Rust 1.99.0 with the `rust-src` component. LLVM 20 is optional and adds
 backend.
 
     rustup toolchain install 1.99.0 --component rust-src
-    git clone https://github.com/DioxusLabs/rustd
+    git clone --recursive https://github.com/DioxusLabs/rustd
     cd rustd
-    git submodule update --init
-    python3 vendor/apply.py
     cargo +1.99.0 build -p rustd --release
 
-`vendor/rust-analyzer` is rust-analyzer at the commit rustd was forked from, and
-`vendor/apply.py` applies rustd's patches to it. With LLVM 20 installed (on Debian and
+`vendor/rust-analyzer` is a submodule: rust-analyzer with rustd's changes to it, kept on the
+`rust-analyzer` branch of this repository. If you cloned without `--recursive`, run
+`git submodule update --init`. With LLVM 20 installed (on Debian and
 Ubuntu, `llvm-20-dev` and `libpolly-20-dev` from apt.llvm.org):
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.0 build -p rustd --release --features llvm
@@ -88,15 +87,27 @@ shows what the daemon holds and how many builds it served or handed to cargo, by
 `cargo rustd stop` ends it; it also exits by itself after 30 minutes without a request.
 `cargo rustd check` is `cargo check`.
 
-Nothing is kept on disk between daemons unless `RUSTD_CACHE` names a directory when the
-daemon starts. See [docs/cache.md](docs/cache.md) for the store and the S3 remote.
+Compiled functions are kept on disk in `~/.cache/rustd/store` (8 GiB at most;
+`RUSTD_CACHE=off` turns it off), so a new daemon starts from what the last one built. See [docs/cache.md](docs/cache.md) for the store and the S3 remote.
 
 ### Plain `cargo`, switched on globally
 
-<!-- GLOBAL-MODE: to be filled from the cargo session's report. Not present at the commit
-     this README was written against. -->
+Run `rustd enable` once. It adds one key to `~/.cargo/config.toml`
+(`build.rustc-workspace-wrapper`, pointing at `rustd-rustc`), and from then on ordinary
+`cargo build`, `cargo run`, `cargo test` and `cargo check` in any workspace go through the
+daemon. `rustd disable` puts the file back as it was. `rustd status` says whether it is on
+and how many programs the daemon linked or left to rustc, by reason.
 
-Not written yet. See [docs/cargo.md](docs/cargo.md).
+    $ rustd enable
+    $ cargo run            # the daemon's, once it has loaded the workspace
+    $ rustd disable
+
+`rustd`, `cargo-rustd` and `rustd-rustc` have to be installed in the same directory. A
+wrapper you already use, such as sccache, keeps running. When the daemon cannot serve a
+build, rustc does, and one line on stderr says why. This mode is for agents and scripts that
+call cargo themselves; it has only been run on Linux. On edits it is currently slower than
+`cargo rustd`, and on some projects slower than cargo alone; see
+[docs/cargo.md](docs/cargo.md).
 
 ## Results
 
@@ -166,8 +177,8 @@ Windows, and targets other than the ones in the table.
 rustd's front end is rust-analyzer: its parser, name resolution, type inference, MIR,
 monomorphisation, layout and const evaluation, and its cargo workspace loading. rustd adds a
 code generator on top of rust-analyzer's MIR and the daemon around it. rust-analyzer is
-included as a submodule pinned to one commit, with a patch series in `vendor/patches/` for
-the files rustd changes. None of this would exist without the rust-analyzer team's work.
+included as a submodule. It points at the `rust-analyzer` branch of this repository, which is
+upstream rust-analyzer at the commit rustd forked from with rustd's changes committed on top. None of this would exist without the rust-analyzer team's work.
 rustd is not part of the rust-analyzer project and is not endorsed by it; please do not
 report rustd problems there.
 
@@ -189,6 +200,6 @@ MIT or Apache-2.0, at your option, the same as rust-analyzer and rustc. See
 - [docs/results.md](docs/results.md): measurements and where each came from
 - [docs/harness.md](docs/harness.md): the test harnesses
 - [docs/fuzzing.md](docs/fuzzing.md): the differential fuzzer
-- [docs/contributing.md](docs/contributing.md): layout, patches, moving the rust-analyzer pin
+- [docs/contributing.md](docs/contributing.md): layout, changing rust-analyzer, moving to a newer one
 - [SECURITY.md](SECURITY.md): reporting a problem, and what the daemon and a shared store trust
 - `docs/reports/`: the working reports the above were written from

@@ -34,7 +34,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -62,7 +61,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
       # What `buildmodel.py` builds for besides the host.
       - run: rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
@@ -71,6 +69,15 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
           sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb
+      # `debuginfo.py` has perf unwind what rustd built, which it says it did not run where
+      # there is no perf or the kernel does not let this user sample.
+      - name: perf
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
+          perf --version || sudo ln -sf "$(ls /usr/lib/linux-tools/*/perf | tail -n 1)" /usr/local/bin/perf
+          perf --version
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
       - name: Cross tools
         if: matrix.os == 'ubuntu-24.04'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
@@ -108,6 +115,8 @@ jobs:
           run keys.py
           # Generated programs on fixed seeds. Only x86-64 has been fuzzed so far.
           if [ "$(uname -m)" = x86_64 ]; then run fuzz/fuzz.py smoke --backends "$RUSTD_BACKEND"; fi
+          # Generated edits under a daemon against cold builds, and the sequences that found faults.
+          if [ "$(uname -m)" = x86_64 ]; then run fuzz/edits.py smoke --backends "$RUSTD_BACKEND"; fi
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
@@ -142,7 +151,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
       - name: LLVM 20
         run: |
@@ -170,7 +178,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -179,7 +186,7 @@ jobs:
   windows-harness:
     name: harness (windows, ${{ matrix.backend }})
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -198,7 +205,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       # The harnesses run the linker themselves, with the environment the compiler has. In
       # this shell the `link` of coreutils comes before the linker, so it goes.
       - uses: ilammy/msvc-dev-cmd@v1
@@ -208,9 +214,9 @@ jobs:
         id: llvm
         with:
           path: C:\llvm20
-          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc-pdbutil
       # The release has the libraries, the headers and `llvm-config`, which is all the build
-      # reads. Its libraries want a static libxml2 that it does not have and that nothing
+      # reads, and `llvm-pdbutil`, which debuginfo.py reads a PDB with. Its libraries want a static libxml2 that it does not have and that nothing
       # here calls into, so an archive of nothing stands in for it.
       - name: LLVM 20
         if: steps.llvm.outputs.cache-hit != 'true'
@@ -218,7 +224,7 @@ jobs:
           name="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc"
           curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
           mkdir -p /c/llvm20
-          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe"
+          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe" "$name/bin/llvm-pdbutil.exe"
           rm llvm.tar.xz
           echo '#![no_std]' > nothing.rs
           rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
@@ -249,11 +255,13 @@ jobs:
           run keys.py
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
-          # Not run here: `debuginfo.py` reads DWARF with gdb, and the debug info of this
-          # target is not written; `buildmodel.py` builds for Linux targets; `storefull.py`
-          # mounts a tmpfs; `farsplices.py` is about the reach of an AArch64 branch.
+          run debuginfo.py
+          # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
+          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
+          run storefull.py
           run storeshared.py
           echo "failed:${failed:- none}"
           test -z "$failed"
@@ -274,7 +282,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
       - name: LLVM 20
         run: |
@@ -331,7 +338,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: python3 vendor/apply.py
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
       - name: LLVM 20
         run: |
@@ -346,3 +352,34 @@ jobs:
       - name: cargo rustd against cargo
         working-directory: harness
         run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+
+  # Not required to pass yet: the baseline was measured on another machine than the runner, so
+  # the threshold on times is wide, and what it holds exactly is who built each step, whether
+  # it was spliced and how many functions were compiled.
+  bench:
+    name: bench (ripgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      - name: Bench
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" RUSTD_LLVM_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          python3 bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
+          python3 bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: ${{ runner.temp }}/bench.json

@@ -18,7 +18,7 @@ use uds_windows::UnixStream;
 
 use super::{
     daemon::{Envelope, Reply, Request, home, socket_in, version},
-    wrapper,
+    switch, wrapper,
 };
 use crate::socket::{connect, private_dir, private_file};
 
@@ -48,19 +48,86 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
         (Err(_), Start::Never) => return Ok(None),
         (Err(_), Start::IfMissing) => started(&home)?,
     };
-    let mut reply = exchange(&mut stream, &envelope)?;
+    let mut reply = match exchange(&mut stream, &envelope) {
+        // A daemon that was on its way out when it was asked is as good as none.
+        Err(_) if start == Start::IfMissing => {
+            gone(&socket);
+            exchange(&mut started(&home)?, &envelope)?
+        }
+        // One that took its socket with it shut down; one that was killed left it.
+        Err(_) if left(&socket) => return Ok(None),
+        reply => reply?,
+    };
     if let Reply::Restart { .. } = reply {
         if start == Start::Never {
             return Ok(Some(reply));
         }
-        // It exits once it has answered; its socket goes with it.
-        let asked = Instant::now();
-        while connect(&socket).is_ok() && asked.elapsed() < PATIENCE {
-            std::thread::sleep(POLL);
-        }
+        gone(&socket);
         reply = exchange(&mut started(&home)?, &envelope)?;
     }
     Ok(Some(reply))
+}
+
+/// Whether the daemon that did not answer has shut down, rather than been killed.
+fn left(socket: &Path) -> bool {
+    let asked = Instant::now();
+    while socket.exists() && asked.elapsed() < Duration::from_millis(200) {
+        std::thread::sleep(POLL);
+    }
+    !socket.exists()
+}
+
+/// Waits for a daemon that is exiting to be gone: it exits once it has answered, and its
+/// socket goes with it.
+pub(crate) fn gone(socket: &Path) {
+    let asked = Instant::now();
+    while connect(socket).is_ok() && asked.elapsed() < PATIENCE {
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Starts `daemon` in a process group and a console of its own, and until the result is
+/// dropped lets it inherit no handle of this process but those it is given. A process is
+/// started with every handle of its parent that can be inherited, and those of a pipe this
+/// command writes to are among them, under their own numbers and under those the commands
+/// above this one had: whoever reads the pipe would wait for the daemon to end.
+#[cfg(windows)]
+fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::{
+        Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
+        System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW},
+    };
+
+    /// Handles are multiples of four, and a command as short as this one has few.
+    const HANDLES: std::ops::RangeInclusive<usize> = 4..=0x1_0000;
+
+    struct Inherited(Vec<HANDLE>);
+    impl Drop for Inherited {
+        fn drop(&mut self) {
+            for &handle in &self.0 {
+                // SAFETY: the handle was open and inheritable when it was listed, and
+                // nothing closed one of this command's since.
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+            }
+        }
+    }
+
+    daemon.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let mut inherited = Vec::new();
+    for handle in HANDLES.step_by(4).map(|it| it as HANDLE) {
+        let mut flags = 0;
+        // SAFETY: a number that is no open handle is refused, and `flags` is only written.
+        let held = unsafe {
+            GetHandleInformation(handle, &mut flags) != 0
+                && flags & HANDLE_FLAG_INHERIT != 0
+                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+        };
+        if held {
+            inherited.push(handle);
+        }
+    }
+    Inherited(inherited)
 }
 
 /// Why no daemon answered: there is none, or one ended without taking its socket with it.
@@ -79,7 +146,8 @@ fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
     stream.write_all(format!("{envelope}\n").as_bytes())?;
     let mut line = String::new();
     let read = BufReader::new(stream).read_line(&mut line);
-    if !matches!(read, Ok(1..)) {
+    // A line without its end is one the daemon did not live to finish.
+    if !matches!(read, Ok(1..)) || !line.ends_with('\n') {
         let log = home()?.join("daemon.log");
         anyhow::bail!(
             "the daemon ended before it answered (killed?), its log is {}",
@@ -95,11 +163,15 @@ fn started(home: &Path) -> anyhow::Result<UnixStream> {
     private_dir(home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let log = private_file(OpenOptions::new().create(true).append(true), &home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
-    daemon.arg("daemon").env_remove(wrapper::ENABLED).env_remove("RUSTC_WORKSPACE_WRAPPER");
+    daemon.arg("daemon").env_remove(wrapper::DRIVEN).env_remove(switch::VARIABLE);
     daemon.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
+    #[cfg(windows)]
+    let kept = on_its_own(&mut daemon);
     daemon.spawn().context("starting the daemon")?;
+    #[cfg(windows)]
+    drop(kept);
     let socket = socket_in(home);
     let asked = Instant::now();
     loop {

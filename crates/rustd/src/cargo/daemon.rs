@@ -102,16 +102,8 @@ pub(crate) struct WorkerConfig {
     /// The directory of the package being built, from the root of the checkout.
     pub(crate) project: PathBuf,
     pub(crate) cfg_test: bool,
-    pub(crate) dev_deps: bool,
-    pub(crate) features: Vec<String>,
-    pub(crate) no_default_features: bool,
-    pub(crate) all_features: bool,
-    /// The packages named with `-p`.
-    pub(crate) packages: Vec<String>,
-    pub(crate) workspace: bool,
-    /// The profile, when it is not the one cargo has for the command.
-    pub(crate) profile: Option<String>,
-    pub(crate) target: Option<String>,
+    /// Which build the worker stands in for, as the daemon's own plan of it has it.
+    pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
 }
@@ -229,33 +221,17 @@ impl Worker {
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let config = &checkout.config;
         let mut command = Command::new(std::env::current_exe()?);
-        command.arg(checkout.project());
-        if let Some(target) = &config.target {
-            command.args(["--target", target]);
-        }
+        command.arg(checkout.project()).arg("--own-target");
+        match store() {
+            Some(store) => command.env("RUSTD_CACHE", store),
+            None => command.env_remove("RUSTD_CACHE"),
+        };
+        command.args(config.selection.flags());
         if config.cfg_test {
             command.arg("--cfg-test");
         }
-        if config.dev_deps {
+        if config.selection.dev_deps {
             command.arg("--dev-deps");
-        }
-        if !config.features.is_empty() {
-            command.args(["--features", &config.features.join(",")]);
-        }
-        if config.no_default_features {
-            command.arg("--no-default-features");
-        }
-        if config.all_features {
-            command.arg("--all-features");
-        }
-        for package in &config.packages {
-            command.args(["--package", package]);
-        }
-        if config.workspace {
-            command.arg("--workspace");
-        }
-        if let Some(profile) = &config.profile {
-            command.args(["--profile", profile]);
         }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));
@@ -263,9 +239,13 @@ impl Worker {
         command.arg("--out").arg(&first.object).arg("--patch").arg(&first.patch);
         command.arg("--link-cmd").arg(&first.link_cmd).arg("--splice").arg(&first.binary);
         command.arg("--socket").arg(&socket);
-        for file in &first.symbol_files {
-            command.arg("--symbols").arg(file);
-        }
+        // In a file: a program of many crates has more of them than fit the command line
+        // of a process on Windows.
+        let symbols = dir.join("symbols");
+        let listed: String =
+            first.symbol_files.iter().map(|it| format!("{}\n", it.display())).collect();
+        std::fs::write(&symbols, listed)?;
+        command.arg("--symbols-in").arg(&symbols);
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
         command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
@@ -334,6 +314,13 @@ impl Worker {
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
         self.set(&checkout.key, warmth);
+        // Nobody could ask it for a build until now.
+        *lock(&self.asked) = Instant::now();
+    }
+
+    /// Whether a checkout is still being loaded.
+    fn loads(&self) -> bool {
+        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
     }
 
     fn warmed(&self, checkout: &Checkout, started_on: bool) -> anyhow::Result<()> {
@@ -443,6 +430,19 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     Ok(Path::new(&home.context("no RUSTD_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/rustd"))
+}
+
+/// The disk store of the user's builds: the directory `RUSTD_CACHE` names, none when it
+/// says `off`, and without it `rustd/store` in the user's cache directory. Unlike `home`
+/// it is not in `XDG_RUNTIME_DIR`, which does not outlive the session.
+pub(crate) fn store() -> Option<PathBuf> {
+    if let Some(named) = std::env::var_os("RUSTD_CACHE") {
+        return (!hir_ty::mir::codegen::store_is_off(&named)).then(|| PathBuf::from(named));
+    }
+    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
+    Some(caches.join("rustd/store"))
 }
 
 pub(crate) fn socket_in(home: &Path) -> PathBuf {
@@ -640,7 +640,8 @@ impl Daemon {
                 self.end();
             }
             lock(&self.workers).retain(|_, worker| {
-                let keep = lock(&worker.asked).elapsed() < idle;
+                // Loading can take longer than the idle time, and is what was asked for.
+                let keep = worker.loads() || lock(&worker.asked).elapsed() < idle;
                 if !keep {
                     worker.stop();
                 }
