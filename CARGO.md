@@ -209,7 +209,7 @@ stderr and a count in `cargo rustd status`:
 
 - The whole invocation: `--release` and any profile but dev, `RUSTFLAGS`, `--all-features`
   and `--no-default-features`, several `-p`, several `--target`, a target that is not ELF,
-  `--message-format`, `-Z` flags, `-q`, a `RUSTC_WORKSPACE_WRAPPER` that is already set.
+  `--message-format`, `-Z` flags, a `RUSTC_WORKSPACE_WRAPPER` that is already set.
   `check` is always `cargo check`.
 - One build: the daemon is still loading; a manifest, lock file, cargo config, toolchain
   file or a build script's input changed; a `#[test]` was added, removed or given other

@@ -20,7 +20,7 @@ use span::Edition;
 use stdx::TupleExt;
 
 use crate::{
-    AdtId, ModuleDefId, ModuleId,
+    AdtId, EnumId, Lookup, ModuleDefId, ModuleId,
     item_scope::{BUILTIN_SCOPE, ImportOrExternCrate},
     nameres::{
         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, assoc::TraitItems,
@@ -445,6 +445,23 @@ impl DefMap {
         }
     }
 
+    /// The visibility `e` is declared with. Its variants are that visible, even when the
+    /// path reached the enum through a more private import.
+    fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
+        let module = e.lookup(db).container;
+        let module_data = if module.krate(db) == self.krate && module.block(db) == self.block_id() {
+            &self.module(db, module)
+        } else {
+            &module.def_map(db).module(db, module)
+        };
+        let def = ModuleDefId::from(e);
+        module_data
+            .scope(db)
+            .types()
+            .find(|(_, item)| item.def == def && item.import.is_none())
+            .map(|(_, item)| item.vis)
+    }
+
     fn resolve_remaining_segments<'a>(
         &self,
         db: &dyn SourceDatabase,
@@ -516,11 +533,12 @@ impl DefMap {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
 
+                    let vis = self.declared_enum_visibility(db, e).unwrap_or(curr.vis);
                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
-                            PerNs::both(variant.into(), variant.into(), curr.vis, None)
+                            PerNs::both(variant.into(), variant.into(), vis, None)
                         } else {
-                            PerNs::types(variant.into(), curr.vis, None)
+                            PerNs::types(variant.into(), vis, None)
                         }
                     });
                     // FIXME: Need to filter visibility here and below? Not sure.

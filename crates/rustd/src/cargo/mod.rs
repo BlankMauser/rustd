@@ -14,7 +14,7 @@ pub(crate) mod script;
 mod state;
 mod units;
 
-use std::{path::Path, process::Command, time::Instant};
+use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
 
 use anyhow::Context as _;
 
@@ -55,13 +55,13 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let key = asked.key(&cwd);
     let known = State::read(&key);
     let state = match known.map(by_daemon) {
-        Some(Ok(state)) => {
+        Ok(Ok(state)) => {
             let took = started.elapsed().as_secs_f64();
             let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
             say::status(asked.flags.quiet, "Finished", &finished);
             state
         }
-        Some(Err((state, reason))) => {
+        Ok(Err((state, reason))) => {
             say::fallback(&reason, "building with cargo");
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
@@ -70,50 +70,95 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                 Err(code) => return Ok(code),
             }
         }
-        None => match by_cargo(asked, &cwd, &key, Counts::default())? {
-            Ok(state) => state,
-            Err(code) => return Ok(code),
-        },
+        Err(unread) => {
+            if let Some(why) = unread {
+                say::fallback(why, "building with cargo");
+            }
+            match by_cargo(asked, &cwd, &key, Counts::default())? {
+                Ok(state) => state,
+                Err(code) => return Ok(code),
+            }
+        }
     };
     state.write()?;
     after_build(asked, &state, &cwd)
 }
 
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
-/// them. `Err` is the state and why the build is cargo's.
-fn by_daemon(mut state: State) -> Result<State, (State, String)> {
-    let refused = state.refusal.clone().or_else(|| state.broken_guard());
-    let refused = refused.or_else(|| {
-        let mut asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
-        asked.find_map(|checkout| synced(checkout).err())
-    });
-    let refused = refused.or_else(|| state.install().err().map(|it| format!("{it:#}")));
-    match refused {
-        Some(reason) => Err((state, reason)),
-        None => {
-            state.counts.served += 1;
-            Ok(state)
+/// them. A program the daemon does not build stays as cargo built it while its source is
+/// what cargo compiled. `Err` is the state and why the build is cargo's.
+fn by_daemon(mut state: State) -> Result<State, (Box<State>, String)> {
+    if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
+        return Err((Box::new(state), reason));
+    }
+    let asked: Vec<Result<Vec<Result<(), String>>, String>> =
+        state.checkouts.iter().map(synced).collect();
+    let answers: Vec<Vec<Result<(), String>>> = std::iter::zip(&asked, &state.checkouts)
+        .map(|(answer, checkout)| match answer {
+            Ok(programs) => programs.clone(),
+            Err(cold) => vec![Err(cold.clone()); checkout.programs.len()],
+        })
+        .collect();
+    let cargos = match state.settle(&answers) {
+        Ok(cargos) => cargos,
+        Err(reason) => return Err((Box::new(state), reason)),
+    };
+    let unchanged = "it is as cargo built it, and its source has not changed";
+    for (answer, checkout) in std::iter::zip(&asked, &state.checkouts) {
+        let (Err(cold), false) = (answer, checkout.programs.is_empty()) else { continue };
+        // Loaded now, the daemon builds what changes next.
+        match warmed(checkout) {
+            Ok(()) => say::fallback(cold, "nothing has changed since cargo built"),
+            Err(why) => say::fallback(&why, "nothing has changed since cargo built"),
         }
+    }
+    for (program, why) in &cargos {
+        let asked_of_worker = program.asked_as.is_some_and(|(checkout, _)| asked[checkout].is_ok());
+        if asked_of_worker {
+            say::fallback(&format!("`{}`: {why}", program.name), unchanged);
+        }
+    }
+    let served = cargos.len() < state.programs.len() || state.programs.is_empty();
+    state.counts.served += u64::from(served);
+    Ok(state)
+}
+
+/// Asks the daemon for the programs of `checkout`, and says how each went. `Err` is why it
+/// has no part in any.
+fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
+    if checkout.programs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The daemon knows the source files from when it was told to load them.
+    let asked = Checkout { sources: Vec::new(), ..asking(checkout) };
+    let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
+    match reply {
+        None => Err(client::why_none()),
+        Some(Reply::Synced { programs }) => {
+            Ok(programs.into_iter().map(|it| it.map(drop)).collect())
+        }
+        Some(Reply::Cold { reason }) => Err(reason),
+        Some(Reply::Restart { version }) => {
+            Err(format!("the daemon running is another build of rustd ({version}), it is replaced"))
+        }
+        Some(other) => Err(format!("the daemon answered {other:?}")),
     }
 }
 
-/// Asks the daemon for the programs of `checkout`. `Err` is why it built none or not all.
-fn synced(checkout: &Checkout) -> Result<(), String> {
-    // The daemon knows the source files from when it was told to load them.
-    let asked = Checkout { sources: Vec::new(), ..checkout.clone() };
-    let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
-    match reply {
-        None => Err("no daemon is running".to_owned()),
-        Some(Reply::Synced { programs }) => programs.into_iter().try_for_each(|it| it.map(drop)),
-        Some(Reply::Cold { reason }) => Err(reason),
-        Some(other) => Err(format!("the daemon answered {other:?}")),
-    }
+/// `checkout` as a request names it: with the variables of this process, which `env!`
+/// reads where cargo set none. The ones that make rustd the wrapper are cargo's alone.
+fn asking(checkout: &Checkout) -> Checkout {
+    let wraps = |name: &str| name == wrapper::ENABLED || name == "RUSTC_WORKSPACE_WRAPPER";
+    let mut env: BTreeMap<String, String> =
+        std::env::vars().filter(|(name, _)| !wraps(name)).collect();
+    env.extend(checkout.env.clone());
+    Checkout { env, ..checkout.clone() }
 }
 
 /// Tells the daemon to load `checkout` as cargo just built it, starting one when there is
 /// none. `Err` is why it does not.
 fn warmed(checkout: &Checkout) -> Result<(), String> {
-    match client::ask(Request::Warm(checkout.clone()), Start::IfMissing) {
+    match client::ask(Request::Warm(asking(checkout)), Start::IfMissing) {
         Ok(Some(Reply::Cold { reason })) => Err(reason),
         Ok(_) => Ok(()),
         Err(why) => Err(format!("{why:#}")),
@@ -140,6 +185,9 @@ fn by_cargo(
         for why in cold {
             say::fallback(&why, "the daemon has no part in the next build");
             state.count_cargo(&why);
+        }
+        for (program, why) in state.left_to_cargo() {
+            say::fallback(why, &format!("`{}` is cargo's to build", program.name));
         }
     }
     Ok(Ok(state))
@@ -196,6 +244,12 @@ fn status() -> anyhow::Result<i32> {
                     let _ = writeln!(said, "    {}: {warmth}", root.display());
                 }
             }
+        }
+        Some(Reply::Restart { version }) => {
+            let _ = writeln!(
+                said,
+                "daemon: another build of rustd, version {version}; the next build replaces it"
+            );
         }
         _ => said.push_str("daemon: not running\n"),
     }

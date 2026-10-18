@@ -84,6 +84,8 @@ pub struct Files {
     views: Arc<std::sync::RwLock<Vec<View>>>,
     /// The variables `env!` and `option_env!` have asked for, by the crate asking.
     env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
+    /// The variables `env!` has found unset, by the crate asking.
+    env_unset: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
 }
 
 #[derive(Debug)]
@@ -202,6 +204,14 @@ impl Files {
 
     pub fn env_read(&self) -> Vec<(Crate, String)> {
         self.env_read.iter().map(|it| it.key().clone()).collect()
+    }
+
+    pub fn env_is_unset(&self, krate: Crate, key: &str) {
+        self.env_unset.insert((krate, key.to_owned()), ());
+    }
+
+    pub fn env_unset(&self) -> Vec<(Crate, String)> {
+        self.env_unset.iter().map(|it| it.key().clone()).collect()
     }
 
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
@@ -426,6 +436,10 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
 
     /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
     fn env_is_read(&self, _krate: Crate, _key: &str) {}
+
+    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
+    /// crate down for.
+    fn env_is_unset(&self, _krate: Crate, _key: &str) {}
 
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;

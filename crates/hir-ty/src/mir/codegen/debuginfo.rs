@@ -138,6 +138,9 @@ pub(super) enum DebugType {
 }
 
 impl DebugType {
+    /// How many types inside each other a debugger is told of.
+    pub(super) const DEEPEST: u32 = 128;
+
     /// Every type this one is made of, as it names them.
     fn parts_mut(&mut self) -> Vec<&mut TypeIndex> {
         match self {
@@ -422,6 +425,8 @@ enum SharedType {
 struct FunctionTypes<'a> {
     types: &'a [DebugType],
     entries: Vec<Option<UnitEntryId>>,
+    /// How many types the one being told of is inside of.
+    inside: u32,
 }
 
 impl DebugContext {
@@ -538,11 +543,25 @@ impl DebugContext {
         id
     }
 
-    /// The entry of the type at `index` of `of`.
+    /// The entry of the type at `index` of `of`. A type inside more than
+    /// [`DebugType::DEEPEST`] others is not told of: the types of an entry read from the
+    /// store are not known to be what a compiler would have written, and each one inside
+    /// another takes a few frames of the stack.
     fn ty(&mut self, of: &mut FunctionTypes<'_>, index: TypeIndex) -> Option<UnitEntryId> {
         if let Some(entry) = of.entries.get(index as usize).copied()? {
             return Some(entry);
         }
+        if of.inside == DebugType::DEEPEST {
+            return None;
+        }
+        of.inside += 1;
+        let entry = self.new_type(of, index);
+        of.inside -= 1;
+        entry
+    }
+
+    /// The entry of the type at `index` of `of`, which has none yet.
+    fn new_type(&mut self, of: &mut FunctionTypes<'_>, index: TypeIndex) -> Option<UnitEntryId> {
         let ty = of.types.get(index as usize)?;
         let shared = match ty {
             DebugType::Base { name, size, .. } => {
@@ -763,8 +782,11 @@ impl DebugContext {
         }
         let base = Expression::raw(debug.frame_base.clone());
         self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
-        let mut types =
-            FunctionTypes { types: &debug.types, entries: vec![None; debug.types.len()] };
+        let mut types = FunctionTypes {
+            types: &debug.types,
+            entries: vec![None; debug.types.len()],
+            inside: 0,
+        };
         let mut blocks = vec![None; debug.scopes.len()];
         for variable in &debug.variables {
             let Some(ty) = self.ty(&mut types, variable.ty) else { continue };
@@ -784,6 +806,8 @@ impl DebugContext {
     }
 
     /// The entry of the scope `scope` of a function, inside the entry of the scope it is in.
+    /// `None` is a scope that no code is of, or that is in one, or that is inside itself,
+    /// which the scopes of an entry read from the store are not known not to be.
     fn block(
         &mut self,
         function: UnitEntryId,
@@ -792,19 +816,38 @@ impl DebugContext {
         blocks: &mut [Option<UnitEntryId>],
         scope: u32,
     ) -> Option<UnitEntryId> {
-        if let Some(block) = blocks.get(scope as usize).copied()? {
-            return Some(block);
+        // The scopes from this one out that have no entry yet, and the entry they are in.
+        let mut without = Vec::new();
+        let mut outer = Some(scope);
+        let mut parent = function;
+        while let Some(scope) = outer {
+            if let Some(block) = blocks.get(scope as usize).copied()? {
+                parent = block;
+                break;
+            }
+            let Scope { parent, ranges } = debug.scopes.get(scope as usize)?;
+            if ranges.is_empty() || without.len() == debug.scopes.len() {
+                return None;
+            }
+            without.push((scope, ranges));
+            outer = *parent;
         }
-        let Scope { parent, ranges } = debug.scopes.get(scope as usize)?;
-        if ranges.is_empty() {
-            return None;
+        for (scope, ranges) in without.into_iter().rev() {
+            parent = self.lexical_block(parent, start, ranges);
+            blocks[scope as usize] = Some(parent);
         }
-        let parent = match parent {
-            Some(parent) => self.block(function, start, debug, blocks, *parent)?,
-            None => function,
-        };
+        Some(parent)
+    }
+
+    /// An entry in `parent` for a scope whose code is `ranges` of the function at `start`.
+    fn lexical_block(
+        &mut self,
+        parent: UnitEntryId,
+        start: Address,
+        ranges: &[(CodeOffset, CodeOffset)],
+    ) -> UnitEntryId {
         let block = self.dwarf.unit.add(parent, DW_TAG_lexical_block);
-        if let &[(from, to)] = ranges.as_slice()
+        if let &[(from, to)] = ranges
             && self.apart.is_some()
         {
             self.code(block, past(start, from), (to - from).into());
@@ -818,8 +861,7 @@ impl DebugContext {
             let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
             self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
         }
-        blocks[scope as usize] = Some(block);
-        Some(block)
+        block
     }
 
     /// Says of `entry` that its code is the `length` bytes from `begin`. An entry kept apart

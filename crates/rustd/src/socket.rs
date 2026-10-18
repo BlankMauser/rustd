@@ -5,9 +5,13 @@
 //! by a thread of its own, so a client that says nothing holds up no other.
 
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, BufRead as _, BufReader, Read as _},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -22,10 +26,28 @@ pub(crate) const LONGEST_REQUEST: u64 = 16 << 20;
 /// How long a client has to send its request once it is connected.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a client has to take a reply once there is one: a client that asks and never
+/// reads does not keep the thread that answers it.
+pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most connections served at a time, each by a thread. One more is closed unheard.
+pub(crate) const MOST_CONNECTIONS: usize = 256;
+
 /// A socket this process alone serves, for as long as this is kept.
 pub(crate) struct Served {
-    pub(crate) listener: UnixListener,
+    listener: UnixListener,
+    open: Arc<AtomicUsize>,
+    most: usize,
     _lock: File,
+}
+
+/// One of the connections a socket serves at a time, until it is dropped.
+pub(crate) struct Open(Arc<AtomicUsize>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Why a socket is not served by this process.
@@ -46,30 +68,88 @@ impl Served {
     /// Listens on `socket`. The lock next to it is taken first, so of two processes that
     /// start together one listens and the other is told the socket is taken; a socket file
     /// that is there once the lock is held was left by a process that is gone.
+    ///
+    /// The socket is made in a directory of its own that only the user can enter and is
+    /// moved to `socket` once only the user can connect to it: at no time is it somewhere
+    /// others reach with the mode the umask gave it, whatever directory `socket` is in.
     pub(crate) fn bind(socket: &Path) -> Result<Served, NotServed> {
-        let lock = File::create(lock_of(socket))?;
+        let lock = private_file(OpenOptions::new().write(true).create(true), &lock_of(socket))?;
         if lock.try_lock().is_err() {
             return Err(NotServed::Taken);
         }
-        match std::fs::remove_file(socket) {
+        let made_in = with_suffix(socket, ".new");
+        match std::fs::remove_dir_all(&made_in) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
             _ => {}
         }
-        let listener = UnixListener::bind(socket)?;
-        only_the_user_connects(socket)?;
-        Ok(Served { listener, _lock: lock })
+        private_dir(&made_in)?;
+        let made = made_in.join("s");
+        let listener = UnixListener::bind(&made)?;
+        only_the_user_connects(&made)?;
+        std::fs::rename(&made, socket)?;
+        std::fs::remove_dir(&made_in)?;
+        Ok(Served { listener, open: Arc::default(), most: MOST_CONNECTIONS, _lock: lock })
+    }
+
+    /// The connections made to the socket, one after another, each with its place among
+    /// the ones served at a time. One made when there are as many as that is closed, and
+    /// said so on the standard error.
+    pub(crate) fn incoming(&self) -> impl Iterator<Item = (UnixStream, Open)> {
+        self.listener.incoming().flatten().filter_map(|stream| {
+            if self.open.fetch_add(1, Ordering::Relaxed) < self.most {
+                return Some((stream, Open(self.open.clone())));
+            }
+            self.open.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("a connection is closed: {} are open", self.most);
+            None
+        })
     }
 }
 
+/// Connects to the socket at `socket` when the process that serves it is the user's. A
+/// socket can be anywhere a command line says, and what is sent to it is the request and
+/// the variables of this process: not for another user who listens there first.
+pub(crate) fn connect(socket: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket)?;
+    check_peer(&stream)?;
+    Ok(stream)
+}
+
+/// Opens the file at `path` as `options` say, for the user alone: a lock or a log, which
+/// has the paths of projects and what their builds print. A link is not followed: in a
+/// directory others write to, it could name any file of the user's.
+#[cfg(unix)]
+pub(crate) fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = options.mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    // One that was there keeps the mode it had.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    options.open(path)
+}
+
 fn lock_of(socket: &Path) -> PathBuf {
-    let mut lock = socket.as_os_str().to_owned();
-    lock.push(".lock");
-    PathBuf::from(lock)
+    with_suffix(socket, ".lock")
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 /// Makes `dir` if it is not there, for the user alone, and refuses one that is someone
 /// else's or that others can enter: whoever can enter it can put a socket of their own in
 /// the place of the daemon's.
+///
+/// The directories above it are checked too, as far as they can be: one that another
+/// user owns, or that everyone can write to without the sticky bit, lets someone else put
+/// a directory of theirs in the place of this one after it is checked. Root's are trusted,
+/// and so is the group of a directory the user owns.
 #[cfg(unix)]
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
@@ -88,7 +168,27 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     if is.mode() & 0o077 != 0 {
         return refused("can be entered by other users (`chmod 700` it)");
     }
-    Ok(())
+    let whole = std::path::absolute(dir)?;
+    whole.ancestors().skip(1).try_for_each(not_swapped_under)
+}
+
+/// Refuses a directory in which another user can rename what the user has made.
+#[cfg(unix)]
+fn not_swapped_under(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    // A link above is followed: what matters is the directory the name is looked up in.
+    let is = std::fs::metadata(dir)?;
+    let why = if is.uid() != user() && is.uid() != 0 {
+        "belongs to another user"
+    } else if is.mode() & 0o002 != 0 && is.mode() & 0o1000 == 0 {
+        "can be written to by every user"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} {why}, who can replace what is in it", dir.display()),
+    ))
 }
 
 /// A directory of the user's profile is the user's by its access control list, which a
@@ -179,15 +279,25 @@ fn read_lines_within<const LINES: usize>(
     timeout: Duration,
 ) -> io::Result<[String; LINES]> {
     check_peer(stream)?;
-    stream.set_read_timeout(Some(timeout))?;
+    unless_hung_up(stream.set_write_timeout(Some(REPLY_TIMEOUT)))?;
+    unless_hung_up(stream.set_read_timeout(Some(timeout)))?;
     let mut lines = BufReader::new(stream.take(longest));
     let mut read = [const { String::new() }; LINES];
     for line in &mut read {
         *line = read_line(&mut lines)?;
     }
     // What a build takes is not the client's to be timed for.
-    stream.set_read_timeout(None)?;
+    unless_hung_up(stream.set_read_timeout(None))?;
     Ok(read)
+}
+
+/// `limited` as it is, but for the refusal macOS gives a time limit on a stream whose peer
+/// has hung up. Nothing waits on such a stream, so it needs no limit.
+fn unless_hung_up(limited: io::Result<()>) -> io::Result<()> {
+    match limited {
+        Err(refused) if refused.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        limited => limited,
+    }
 }
 
 /// The next line of `lines` without its end, when it has one before `lines` is at its limit.
@@ -227,7 +337,7 @@ mod tests {
         );
         // The peer of a connection from this process is this user.
         let _client = UnixStream::connect(dir.join("sock")).unwrap();
-        let (peer, _) = served.listener.accept().unwrap();
+        let (peer, _open) = served.incoming().next().unwrap();
         assert_eq!(peer_user(&peer).unwrap(), user());
         check_peer(&peer).unwrap();
 
@@ -247,7 +357,7 @@ mod tests {
         let served = Served::bind(&dir.join("sock")).unwrap();
         let connect = || {
             let client = UnixStream::connect(dir.join("sock")).unwrap();
-            (client, served.listener.accept().unwrap().0)
+            (client, served.incoming().next().unwrap().0)
         };
         let short = Duration::from_millis(100);
 
@@ -273,6 +383,119 @@ mod tests {
         good.write_all(b"sync\nA=b\n").unwrap();
         let heard: [String; 2] = read_lines_within(&stream, 64, short).unwrap();
         assert_eq!(heard, ["sync", "A=b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_socket_in_a_shared_directory_is_never_open_to_others() {
+        // What a `--socket` in a directory everyone can enter is given.
+        let dir = scratch("shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = dir.join("sock");
+        let served = Served::bind(&socket).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&socket), 0o600);
+        assert_eq!(mode(&lock_of(&socket)), 0o600);
+        // The directory it was made in is gone, and was the user's alone while it was there.
+        assert!(!with_suffix(&socket, ".new").exists());
+        // The client is as sure of who serves it as the server is of the client.
+        let stream = connect(&socket).unwrap();
+        assert_eq!(peer_user(&stream).unwrap(), user());
+        drop(served);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_that_was_there_becomes_the_users_alone() {
+        let dir = scratch("log");
+        private_dir(&dir).unwrap();
+        let log = dir.join("log");
+        std::fs::write(&log, "before\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = private_file(OpenOptions::new().create(true).append(true), &log).unwrap();
+        file.write_all(b"after\n").unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "before\nafter\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_others_can_swap_is_refused() {
+        let dir = scratch("parents");
+        let open = dir.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = private_dir(&open.join("home")).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused.to_string().contains("written to by every user"), "{refused}");
+        // With the sticky bit only the one who made a directory renames it.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        private_dir(&open.join("home")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_client_that_never_reads_is_given_up_on() {
+        let dir = scratch("replies");
+        private_dir(&dir).unwrap();
+        let served = Served::bind(&dir.join("sock")).unwrap();
+        let mut client = connect(&dir.join("sock")).unwrap();
+        client.write_all(b"sync\n").unwrap();
+        let (stream, _open) = served.incoming().next().unwrap();
+        read_request(&stream).unwrap();
+        stream.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
+        let began = Instant::now();
+        let reply = [b'r'; 1 << 16];
+        let gave_up = loop {
+            if let Err(error) = (&stream).write_all(&reply) {
+                break error;
+            }
+            assert!(began.elapsed() < Duration::from_secs(20), "the write never timed out");
+        };
+        assert!(matches!(gave_up.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reply_has_a_time_limit_once_the_request_is_read() {
+        let dir = scratch("reply-limit");
+        private_dir(&dir).unwrap();
+        let served = Served::bind(&dir.join("sock")).unwrap();
+        let mut client = connect(&dir.join("sock")).unwrap();
+        client.write_all(b"sync\n").unwrap();
+        let (stream, _open) = served.incoming().next().unwrap();
+        assert_eq!(stream.write_timeout().unwrap(), None);
+        read_request(&stream).unwrap();
+        assert_eq!(stream.write_timeout().unwrap(), Some(REPLY_TIMEOUT));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_connection_too_many_is_closed() {
+        let dir = scratch("most");
+        private_dir(&dir).unwrap();
+        let mut served = Served::bind(&dir.join("sock")).unwrap();
+        served.most = 2;
+        let clients: Vec<UnixStream> =
+            (0..3).map(|_| connect(&dir.join("sock")).unwrap()).collect();
+        let mut incoming = served.incoming();
+        let first = incoming.next().unwrap();
+        let second = incoming.next().unwrap();
+        assert_eq!(served.open.load(Ordering::Relaxed), 2);
+        let fourth = std::thread::scope(|scope| {
+            // The third is closed, and the one after it is waited for.
+            let next = scope.spawn(|| incoming.next().unwrap());
+            let mut end = String::new();
+            assert_eq!((&clients[2]).read_to_string(&mut end).unwrap_or(0), 0);
+            drop(first);
+            let _fourth = connect(&dir.join("sock")).unwrap();
+            next.join().unwrap()
+        });
+        assert_eq!(served.open.load(Ordering::Relaxed), 2);
+        drop((second, fourth));
+        assert_eq!(served.open.load(Ordering::Relaxed), 0);
+        drop(incoming);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
