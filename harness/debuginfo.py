@@ -9,6 +9,13 @@ workspace's own files that the cargo build prints: the same functions at the sam
 `llvm-dwarfdump --verify` has to find nothing wrong with any of the binaries, and gdb has to stop
 at a line of a function rustd compiled, say where it is, and step to other lines of it.
 
+On Windows what a debugger reads is the PDB `link.exe /DEBUG` writes from the CodeView of the
+objects, so `llvm-pdbutil` reads it in place of `llvm-dwarfdump`, and `cdb` is the debugger. Only
+lines and procedures are written there: no variable is told of, and the names of functions are
+held against the cargo build's by the last part of each, which the two spell differently
+(`pick::<u8>` for `pick<u8>`). A splice leaves the PDB as it was, and that is what is checked
+of it: the old lines stay true, and the code that was added has no line rather than a wrong one.
+
 Then the cost: the time and the size of the corpus's object with and without debug info, and
 whether rustd leaves it out when the profile says `debug = false`.
 
@@ -22,13 +29,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "true")
 import linkline
-from difftest import Fixture, RUSTD, sysroot_rlibs, built
+from difftest import Fixture, RUSTD, WINDOWS, sysroot_rlibs, built
 
 LLVM = os.environ.get("RUSTD_BACKEND") == "llvm"
 DWARFDUMP = shutil.which("llvm-dwarfdump") or shutil.which("llvm-dwarfdump-20") or "/usr/lib/llvm-20/bin/llvm-dwarfdump"
+PDBUTIL = shutil.which("llvm-pdbutil") or os.path.join(os.environ.get("LLVM_SYS_201_PREFIX", r"C:\llvm20"), "bin", "llvm-pdbutil.exe")
+CDB = shutil.which("cdb") or r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+DEBUGGER = "cdb" if WINDOWS else "gdb"
 PANIC = 'if std::env::var_os("DEBUGINFO_PANIC").is_some() { drop(std::panic::take_hook()); panic!("deliberate"); }'
 # What rustc calls the code that drops a coroutine, which rustd has the coroutine itself do.
 DROP_GLUE = re.compile(r"^core::ptr::drop_glue::<(.*)>$")
+# The same in CodeView, where rustc calls a coroutine `async_fn$0` and what it keeps `async_fn_env$0`.
+COROUTINE = re.compile(r"\b(?:async_gen|async|gen)_(?:fn|block)\$(\d+)")
+DROP_GLUE_CODEVIEW = re.compile(r"^core::ptr::drop_glue<enum2\$<(.*)::(?:async_gen|async|gen)_(?:fn|block)_env\$(\d+)> >$")
 
 EDITS_TOML = """[package]
 name = "sline"
@@ -337,13 +350,44 @@ def panics(stderr):
     return found
 
 
+def last_part(name):
+    """What a function is called without what it is in and what it is given: `pick` of both
+    `sline::pick::<u8>`, which is how a symbol of rustc's reads, and `sline::pick<u8>`, which
+    is how rustc names it in CodeView. A closure keeps what it is a closure of."""
+    if glue := DROP_GLUE_CODEVIEW.match(name):
+        name = f"{glue.group(1)}::closure${glue.group(2)}"
+    name = COROUTINE.sub(r"closure$\1", name)
+    parts, depth, start, at = [], 0, 0, 0
+    while at < len(name):
+        if name[at] in "<({[":
+            depth += 1
+        elif name[at] in ")}]" or (name[at] == ">" and name[at - 1] != "-"):
+            depth -= 1
+        elif depth == 0 and name.startswith("::", at):
+            parts.append(name[start:at])
+            start, at = at + 2, at + 1
+        at += 1
+    parts = [re.sub(r"^\{closure#(\d+)\}$", r"closure$\1", part) for part in parts + [name[start:]]]
+    named = [part.split("<")[0] for part in parts if part and not part.startswith("<")] or [name]
+    keep = len(named) - 1
+    while keep > 0 and named[keep].startswith("closure$"):
+        keep -= 1
+    return "::".join(named[keep:])
+
+
 def own(frames):
     """The frames of the workspace's own files, by function and file:line."""
     kept = []
     for name, place in frames:
-        if place and place.startswith("./"):
-            glue = DROP_GLUE.match(name)
-            kept.append((glue.group(1) if glue else name, place.rsplit(":", 1)[0]))
+        place = place.replace("\\", "/") if place else ""
+        if not place.startswith("./"):
+            continue
+        if WINDOWS:
+            # A frame has no column there.
+            kept.append((last_part(name), place))
+            continue
+        glue = DROP_GLUE.match(name)
+        kept.append((glue.group(1) if glue else name, place.rsplit(":", 1)[0]))
     return kept
 
 
@@ -449,8 +493,127 @@ def units(binary):
     return [head + left.get(ident(head), "") for head in heads if "DW_AT_producer" in head or ident(head) not in left]
 
 
+class Image:
+    """What the headers of a PE executable say of it."""
+
+    def __init__(self, binary):
+        data = self.data = open(binary, "rb").read()
+        pe, = struct.unpack_from("<I", data, 0x3c)
+        count, = struct.unpack_from("<H", data, pe + 6)
+        optional_size, = struct.unpack_from("<H", data, pe + 20)
+        self.optional = pe + 24
+        self.entry, = struct.unpack_from("<I", data, self.optional + 16)
+        headers = [self.optional + optional_size + 40 * i for i in range(count)]
+        # (address, bytes of it in the file, where they are in the file)
+        self.sections = [struct.unpack_from("<III", data, at + 12) for at in headers]
+
+    def directory(self, index):
+        return struct.unpack_from("<II", self.data, self.optional + 112 + 8 * index)
+
+    def at(self, address):
+        return next(raw + address - start for start, size, raw in self.sections if start <= address < start + size)
+
+    def address(self, section, offset):
+        return self.sections[section - 1][0] + offset
+
+    def frames(self):
+        """Where the code of each frame an unwinder finds starts and ends."""
+        address, size = self.directory(3)
+        table = self.at(address)
+        return {begin: end for begin, end, _ in struct.iter_unpack("<III", self.data[table:table + size])}
+
+    def pdb(self):
+        """The identity of the PDB the linker wrote for it, and what it is called."""
+        address, size = self.directory(6)
+        for at in range(self.at(address), self.at(address) + size, 28):
+            kind, _, _, raw = struct.unpack_from("<IIII", self.data, at + 12)
+            if kind == 2 and self.data[raw:raw + 4] == b"RSDS":
+                a, b, c = struct.unpack_from("<IHH", self.data, raw + 4)
+                rest = self.data[raw + 12:raw + 20].hex().upper()
+                name = self.data[raw + 24:self.data.index(b"\0", raw + 24)].decode()
+                return f"{a:08X}-{b:04X}-{c:04X}-{rest[:4]}-{rest[4:]}", name
+        return None, None
+
+
+class Pdb:
+    """What the PDB beside an executable tells a debugger of rustd's objects: the procedures
+    as (address, end, name), the lines as (file, line, address), and how many variables."""
+    read = {}
+
+    @classmethod
+    def of(cls, binary):
+        key = (binary, os.path.getmtime(binary))
+        if key not in cls.read:
+            cls.read[key] = cls(binary)
+        return cls.read[key]
+
+    def __init__(self, binary):
+        self.image = image = Image(binary)
+        guid, name = image.pdb()
+        path = os.path.join(os.path.dirname(binary), os.path.basename(name or "none.pdb"))
+        ran = subprocess.run([PDBUTIL, "dump", "--summary", "--symbols", "-l", path], capture_output=True, text=True, errors="replace")
+        self.sound = ran.returncode == 0
+        found = re.search(r"GUID: \{([0-9A-Fa-f-]+)\}", ran.stdout)
+        self.same = bool(guid and found and found.group(1).upper() == guid)
+        # It prints the lines of every module, then the symbols of every module.
+        lines, _, symbols = ran.stdout.partition("\n                          Symbols")
+        ours = set()
+        self.procedures, self.lines, self.variables = [], [], 0
+        for module in re.split(r"^\s*Mod (?=\d{4} \|)", symbols, flags=re.M)[1:]:
+            if "Ver = rustd " not in module:
+                continue
+            ours.add(module[:4])
+            self.variables += len(re.findall(r"\| S_(?:LOCAL|REGREL32|BPREL32|REGISTER) ", module))
+            for name, section, offset, size in re.findall(
+                    r"S_[GL]PROC32(?:_ID)? \[size = \d+\] `(.*)`\n.*addr = (\d+):(\d+), code size = (\d+)", module):
+                begin = image.address(int(section), int(offset))
+                self.procedures.append((begin, begin + int(size), name))
+        self.modules = len(ours)
+        for module in re.split(r"^\s*Mod (?=\d{4} \|)", lines, flags=re.M)[1:]:
+            if module[:4] not in ours:
+                continue
+            file = section = None
+            for line in module.splitlines()[1:]:
+                if block := re.match(r"\s+(\d{4}):[0-9A-F]{8}-[0-9A-F]{8}, line/addr", line):
+                    section = int(block.group(1))
+                elif line and not line[0].isspace():
+                    file = line.rsplit(" (", 1)[0]
+                else:
+                    self.lines += [(file, int(n), image.address(section, int(at, 16)))
+                                   for n, at in re.findall(r"(\d+) ([0-9A-F]{8})\b", line)]
+
+    def function(self, address):
+        return next((name for begin, end, name in self.procedures if begin <= address < end), None)
+
+
+def stale(tally, what, theirs, ours, said):
+    """Holds the frames of a binary whose PDB a splice left behind against the cargo build's.
+
+    The PDB knows nothing of the code a splice adds, so a frame in it has no line, and the
+    name it gets is whatever symbol is nearest below. What has to hold is that no frame says
+    a line the cargo build does not, and that the daemon said `said` of the splice."""
+    if not theirs or len(theirs) != len(ours):
+        return tally.say(what, "NOT THE PANICS", f"{len(ours)} for {len(theirs)}")
+    wrong, lost, frames = 0, 0, 0
+    for (their_at, their_frames), (our_at, our_frames) in zip(theirs, ours):
+        want, got = own(their_frames), own(our_frames)
+        frames += len(want)
+        lost += len(want) - len(got)
+        wrong += their_at != our_at or not within(got, want)
+    if wrong:
+        return tally.say(what, "WRONG LINE", f"{wrong} of {len(theirs)} panics have a frame the cargo build does not")
+    if lost and not said:
+        return tally.say(what, "NOT SAID", f"{lost} of {frames} frames have no line and the daemon said nothing of the PDB")
+    tally.say(what, "stale" if lost else "same", f"{len(theirs)} panics, {lost} of {frames} frames without a line, none with a wrong one"
+              + (": the daemon says the PDB is of the code before the splice" if lost else ""))
+
+
 def verify(tally, what, binary):
     """Whether `llvm-dwarfdump --verify` finds the program sound."""
+    if WINDOWS:
+        pdb = Pdb.of(binary)
+        verdict = "INVALID" if not pdb.sound else "NOT ITS PDB" if not pdb.same else "sound" if pdb.modules else "NO UNIT"
+        return tally.say(f"{what}: llvm-pdbutil reads the PDB", verdict, f"{pdb.modules} modules of rustd's")
     read = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True)
     ours = sum(bool(re.search(r'DW_AT_producer\s+\("rustd ', unit)) for unit in units(binary))
     wrong = read.returncode != 0 or "No errors." not in read.stdout
@@ -564,27 +727,43 @@ def unwinding(tally, what, binary):
     end no earlier than it. It may end later: a function shorter than a jump to another place is
     filled up to the length of one, for an edit to put that jump there, and the fill is not code
     to unwind from. A `#[naked]` function is its assembly, which says nothing of unwinding and has
-    no lines either: one with no entry and no line is that."""
+    no lines either: one with no entry and no line is that.
+
+    On Windows the frames are the entries of `.pdata` and the functions are the procedures of
+    rustd's modules in the PDB."""
+    if WINDOWS:
+        pdb = Pdb.of(binary)
+        ours, ends = {(begin, end) for begin, end, _ in pdb.procedures}, pdb.image.frames()
+        bare = sorted((a, b) for a, b in ours if a not in ends)
+        lined = sorted({address for _, _, address in pdb.lines})
+        return tally.say(f"{what}: .pdata and the procedures", *frames_agree(ours, ends, bare, lined))
     ours = own_ranges(binary)
     ends = frames_of(binary)
     bare = sorted((a, b) for a, b in ours if a not in ends)
     rows = subprocess.run([DWARFDUMP, "--debug-line", binary], capture_output=True, text=True).stdout if bare else ""
     # The row a sequence ends with is of the address past its code, where another function may begin.
     lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9](?!.*end_sequence)", rows, re.M)})
-    without = sum(any(a <= row < b for row in lined) for a, b in bare)
-    beyond = sum(a in ends and ends[a] > b for a, b in ours)
-    filled = sum(a in ends and ends[a] < b for a, b in ours)
-    verdict = "NO FUNCTIONS" if not ours else "DISAGREE" if without or beyond else "agree"
-    tally.say(f"{what}: .eh_frame and the ranges", verdict,
-              f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone")
+    tally.say(f"{what}: .eh_frame and the ranges", *frames_agree(ours, ends, bare, lined))
     gaps = unlined(binary)
     worst = ", ".join(f"{a:#x}+{b - a}" for a, b in sorted(gaps, key=lambda gap: gap[0] - gap[1])[:3])
     tally.say(f"{what}: a line for every instruction", "NO LINE" if gaps or not ours else "all",
               f"{len(gaps)} runs of {sum(b - a for a, b in gaps)} bytes without one in {len(ours)} functions" + (f": {worst}" if gaps else ""))
 
 
+def frames_agree(ours, ends, bare, lined):
+    """The verdict on the functions `ours` against the frames `ends`, where `bare` are the
+    ones no frame begins at and `lined` is where the lines are."""
+    without = sum(any(a <= row < b for row in lined) for a, b in bare)
+    beyond = sum(a in ends and ends[a] > b for a, b in ours)
+    filled = sum(a in ends and ends[a] < b for a, b in ours)
+    verdict = "NO FUNCTIONS" if not ours else "DISAGREE" if without or beyond else "agree"
+    return verdict, f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone"
+
+
 def profiler(tally, what, binary, cwd, crates):
     """Whether perf, unwinding by `.eh_frame`, names the functions of `crates` and their lines."""
+    if WINDOWS:
+        return tally.say(f"{what}: perf", "not run", "perf is of Linux")
     perf = shutil.which("perf")
     data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
     record = perf and subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
@@ -612,6 +791,8 @@ def unit_of(binary, address):
 
 def debugger(tally, what, binary, cwd, place, env=None):
     """Has gdb stop at `place` (file:line), say where that is, and step on from there."""
+    if WINDOWS:
+        return cdb(tally, what, binary, cwd, place, env)
     commands = ["set pagination off", "set confirm off", "set print demangle off", "set print asm-demangle off",
                 "set startup-with-shell off", f"break {place}", "run", "echo <where>\\n", "bt 3", "echo <mapped>\\n",
                 "info proc mappings", "print/x $pc", "echo <line>\\n", "info line *$pc",
@@ -653,6 +834,49 @@ def debugger(tally, what, binary, cwd, place, env=None):
     tally.say(said, "stopped", f"in {name.group(1)[:40] if name else '?'}, {frames} frames up, stepped to {', '.join(sorted(stepped))[:60]}")
 
 
+def cdb(tally, what, binary, cwd, place, env=None):
+    """The same of cdb. It names a line of several places as ambiguous and stops at none of
+    them, and rustc's own copy of the code is in the program too, so it is asked which places
+    the line is, and then to stop at the ones of them the PDB says are rustd's."""
+    file, line = place.rsplit(":", 1)
+    said = f"{what}: cdb at {os.path.basename(file)}:{line}"
+    pdb = Pdb.of(binary)
+    file = file.replace("/", "\\")
+    ours = sorted({address for path, n, address in pdb.lines if n == int(line) and path.endswith("\\" + file)})
+    if not ours:
+        return tally.say(said, "NOT RUSTD'S", "no line of a module of rustd's is that one")
+    # The program is loaded where it likes: places are counted from where it starts.
+    base = f"@$exentry-{pdb.image.entry:#x}"
+    commands = ["l+t", ".echo <break>", f"bu `{file}:{line}`", "bl", "bc *", *[f"bp {base}+{address:#x}" for address in ours],
+                "g", ".echo <where>", "kn 4", *[x for _ in range(4) for x in (".echo <step>", "t", "kn 1")], "q"]
+    try:
+        ran = subprocess.run([CDB, "-lines", "-y", os.path.dirname(binary), binary], input="\n".join(commands) + "\n",
+                             capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300,
+                             env={**os.environ, **(env or {})})
+    except subprocess.TimeoutExpired:
+        return tally.say(said, "NO ANSWER")
+    out = ran.stdout
+    if "<where>" not in out or "<break>" not in out:
+        return tally.say(said, "NO ANSWER", (out.strip().splitlines() or ["nothing printed"])[-1][:80])
+    loaded = re.search(r"^ModLoad: ([0-9a-f`]+) ", out, re.M)
+    start = int(loaded.group(1).replace("`", ""), 16)
+    asked = out.split("<break>")[1].split("<where>")[0]
+    by_line = {int(a.replace("`", ""), 16) - start for a in re.findall(r"\b([0-9a-f]{8}`[0-9a-f]{8})\b", asked.split("Breakpoint ")[0])}
+    if not by_line & set(ours):
+        return tally.say(said, "NOT BY LINE", f"cdb finds the line at {len(by_line)} places, none of them rustd's")
+    where = out.split("<where>")[1].split("<step>")[0]
+    stop = re.search(r"^00 \S+ \S+\s+(\S.*?)(?:\+0x[0-9a-f]+)? \[(.*) @ (\d+)\]", where, re.M)
+    if "Breakpoint" not in asked or not stop or stop.group(3) != line or not stop.group(2).endswith(file):
+        return tally.say(said, "NOT STOPPED", (where.strip().splitlines() or ["nothing printed"])[-1][:80])
+    stepped = {f"{os.path.basename(path.replace(chr(92), '/'))}:{n}" for part in out.split("<step>")[1:]
+               for path, n in re.findall(r"^00 .* \[(.*) @ (\d+)\]", part, re.M)}
+    stepped = {s for s in stepped if not s.endswith(f":{line}")}
+    if not stepped:
+        return tally.say(said, "NOT STEPPED")
+    frames = len(re.findall(r"^[0-9a-f]{2} [0-9a-f`]+ [0-9a-f`]+ ", where, re.M))
+    tally.say(said, "stopped", f"in {stop.group(1).split('!')[-1][:40]}, {frames} frames up, stepped to {', '.join(sorted(stepped))[:60]}")
+
+
 def call_site(ours):
     """Where the function that panics first is called from, for a debugger to stop at and step
     into it from: the panic itself is the last line that runs of the function it is in."""
@@ -681,7 +905,7 @@ def program(tally, what, workspace, crates, package, inject=None):
     if place := call_site(ours):
         debugger(tally, what, fx.binary, fx.ws, place[2:], env)
     else:
-        tally.say(f"{what}: gdb", "NO PLACE")
+        tally.say(f"{what}: {DEBUGGER}", "NO PLACE")
     functions, count = described(fx.binary)
     tally.say(f"{what}: what a debugger is told of", "counted", f"{functions} functions, {count} parameters and locals in them")
     if not inject:
@@ -719,7 +943,7 @@ def edited(tally, part):
     daemon = subprocess.Popen([RUSTD, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
-            raise SystemExit(f"the daemon did not start: {log_path}")
+            raise SystemExit(f"the daemon did not start: {open(log_path).read()[-2000:]}")
         time.sleep(0.05)
     spliced = 0
     for what, changes in EDITS:
@@ -742,16 +966,25 @@ def edited(tally, part):
         if not (reply.stdout + reply.stderr).strip().startswith("ok"):
             tally.say(f"{part}: {what}", "REFUSED", (reply.stdout + reply.stderr).strip()[:60])
             continue
-        compare(tally, f"{part}: {what} ({how})", backtraces(built(reference, "sline"), ws), backtraces(binary, ws))
+        theirs, ours = backtraces(built(reference, "sline"), ws), backtraces(binary, ws)
+        if WINDOWS and how == "spliced":
+            said = "debug: the PDB is of the code before the splice" in open(log_path).read()[seen:]
+            stale(tally, f"{part}: {what} ({how})", theirs, ours, said)
+        else:
+            compare(tally, f"{part}: {what} ({how})", theirs, ours)
         verify(tally, f"{part}: {what}", binary)
         unwinding(tally, f"{part}: {what}", binary)
     ours = backtraces(binary, ws)
-    if place := call_site(ours):
+    if WINDOWS and how == "spliced":
+        # The lines the PDB has are of code a jump now leads away from.
+        tally.say(f"{part}: the last binary: cdb", "not asked", "its PDB is of the code before the splices: RUSTD_SPLICE=0 asks")
+    elif place := call_site(ours):
         debugger(tally, f"{part}: the last binary", binary, ws, place[2:])
-    line = open(os.path.join(ws, MAIN)).read().split("must(length)")[0].count("\n") + 1
-    theirs, mine = (printed_by("gdb", it, ws, f"{MAIN}:{line}", ["at"])["at"] for it in (built(reference, "sline"), binary))
-    right = mine == theirs or (LLVM and mine == "<optimized out>")
-    tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
+    if not WINDOWS:
+        line = open(os.path.join(ws, MAIN)).read().split("must(length)")[0].count("\n") + 1
+        theirs, mine = (printed_by("gdb", it, ws, f"{MAIN}:{line}", ["at"])["at"] for it in (built(reference, "sline"), binary))
+        right = mine == theirs or (LLVM and mine == "<optimized out>")
+        tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
     if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
         kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("rustd ', unit)) for unit in units(binary))
         tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
@@ -762,6 +995,9 @@ def edited(tally, part):
 
 def described(binary):
     """How many functions rustd's units tell a debugger of, and how many variables in them."""
+    if WINDOWS:
+        pdb = Pdb.of(binary)
+        return len(pdb.procedures), pdb.variables
     functions = variables = 0
     for unit in dumped(binary, "--debug-info").split("DW_TAG_compile_unit")[1:]:
         if re.search(r'DW_AT_producer\s+\("rustd', unit):
@@ -782,6 +1018,10 @@ def variables(tally):
     fx.rustc_build()
     fx.rustd_build()
     verify(tally, "locals", fx.binary)
+    if WINDOWS:
+        functions, count = described(fx.binary)
+        return tally.say("locals: cdb prints them", "GUESSED" if count else "not told of",
+                         f"{count} described in {functions} functions: no types are written to `.debug$T` yet")
     line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
     commands = ["set pagination off", "set startup-with-shell off", f"break {MAIN}:{line}", "run",
                 *[x for name, _ in LOCALS for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
@@ -1058,8 +1298,14 @@ def settings(tally):
         if split and not refused:
             verify(tally, f"profile: {what}", fx.binary)
 
+
 def sections(path):
     """The size of an object, and of the sections of it a debugger reads."""
+    if WINDOWS:
+        data = open(path, "rb").read()
+        count, = struct.unpack_from("<H", data, 2)
+        headers = [struct.unpack_from("<8s8xI", data, 20 + 40 * i) for i in range(count)]
+        return len(data), sum(size for name, size in headers if name.startswith(b".debug$"))
     read = subprocess.run(["size", "-A", path], capture_output=True, text=True).stdout
     debug = sum(int(l.split()[1]) for l in read.splitlines() if l.startswith((".debug_", ".rela.debug_")))
     return os.path.getsize(path), debug
@@ -1111,6 +1357,13 @@ def main():
         "profile": lambda: settings(tally),
         "cost": lambda: cost(tally),
     }
+    if WINDOWS:
+        # These ask gdb, lldb and `llvm-dwarfdump` of what only DWARF has so far.
+        for name in ("callers", "types", "scopes", "rich", "profile"):
+            if only in (None, name):
+                tally.say(name, "not run", "CodeView has lines and procedures alone")
+            del parts[name]
+        parts["edits"] = lambda: edits(tally)
     for name, part in parts.items():
         if only in (None, name):
             part()

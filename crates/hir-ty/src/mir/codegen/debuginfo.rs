@@ -11,9 +11,11 @@
 //! A variable is told of when it is kept in one slot of the frame for as long as the function
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
+mod codeview;
 mod split;
 mod types;
 
+use codeview::CodeView;
 pub(super) use types::Types;
 
 use cranelift_codegen::{
@@ -384,13 +386,64 @@ impl FunctionDebug {
     }
 }
 
+/// What a debugger is told of the functions of an object, in the tables its format has.
+pub(super) enum DebugContext {
+    Dwarf(Box<Dwarf>),
+    CodeView(CodeView),
+}
+
+impl DebugContext {
+    /// The tables of an object for `isa` whose files are named from `directory`, or `None`
+    /// where they are not written yet: ELF has DWARF and COFF has CodeView. DWARF leaves
+    /// the variables of the functions out unless `variables` asks for them, and keeps its
+    /// entries apart from what is linked when `apart` names the file a debugger reads them
+    /// from; CodeView has neither yet.
+    pub(super) fn new(
+        isa: &dyn TargetIsa,
+        directory: &str,
+        variables: bool,
+        apart: Option<String>,
+    ) -> Option<Self> {
+        if super::Target::current().is_wasm() {
+            return None;
+        }
+        match isa.triple().binary_format {
+            target_lexicon::BinaryFormat::Elf => {
+                let dwarf = Dwarf::new(isa, directory, variables, apart);
+                Some(DebugContext::Dwarf(Box::new(dwarf)))
+            }
+            target_lexicon::BinaryFormat::Coff => {
+                Some(DebugContext::CodeView(CodeView::new(directory)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Describes the function `func` of the module, which is `len` bytes of code.
+    pub(super) fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
+        match self {
+            DebugContext::Dwarf(dwarf) => dwarf.add_function(func, len, debug),
+            DebugContext::CodeView(codeview) => codeview.add_function(func, len, debug),
+        }
+    }
+
+    /// Writes the sections into the object, when it has a function to describe. What is
+    /// returned is what was kept apart from the object.
+    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
+        match self {
+            DebugContext::Dwarf(dwarf) => dwarf.emit(product),
+            DebugContext::CodeView(codeview) => codeview.emit(product).map(|()| Vec::new()),
+        }
+    }
+}
+
 /// How many functions a compilation unit describes before the next one is begun. What reads
 /// a unit reads all of it to find one function, so a unit of every function of a large
 /// object takes a debugger or `addr2line` a second to answer from.
 const FUNCTIONS_OF_A_UNIT: usize = 256;
 
 /// The compilation units of an object, which every function of the object is described in.
-pub(super) struct DebugContext {
+pub(super) struct Dwarf {
     /// The unit functions are being added to.
     dwarf: DwarfUnit,
     /// The units that have all their functions.
@@ -429,26 +482,15 @@ struct FunctionTypes<'a> {
     inside: u32,
 }
 
-impl DebugContext {
-    /// The unit of an object for `isa` whose files are named from `directory`, or `None`
-    /// where the tables are not written yet: only ELF has them. The variables of the
-    /// functions are left out unless `variables` asks for them.
-    /// Their entries are kept apart from what is linked when `apart` names the file a
-    /// debugger reads them from.
-    pub(super) fn new(
-        isa: &dyn TargetIsa,
-        directory: &str,
-        variables: bool,
-        apart: Option<String>,
-    ) -> Option<Self> {
-        if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf
-            || super::Target::current().is_wasm()
-        {
-            return None;
-        }
+impl Dwarf {
+    /// The unit of an object for `isa` whose files are named from `directory`. The
+    /// variables of the functions are left out unless `variables` asks for them. Their
+    /// entries are kept apart from what is linked when `apart` names the file a debugger
+    /// reads them from.
+    fn new(isa: &dyn TargetIsa, directory: &str, variables: bool, apart: Option<String>) -> Self {
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
-        let mut context = DebugContext {
+        let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Vec::new(),
             apart: apart.map(|name| (name, Vec::new())),
@@ -463,7 +505,7 @@ impl DebugContext {
             variables,
         };
         context.begin_unit();
-        Some(context)
+        context
     }
 
     /// Sets up the unit functions are added to, which is a new one.
@@ -912,7 +954,7 @@ impl DebugContext {
     }
 
     /// Describes the function `func` of the module, which is `len` bytes of code.
-    pub(super) fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
+    fn add_function(&mut self, func: FuncId, len: u32, debug: &FunctionDebug) {
         if len == 0 {
             return;
         }
@@ -976,7 +1018,7 @@ impl DebugContext {
 
     /// Writes the sections into the object, when it has a function to describe.
     /// Answers the files of what is kept apart from it.
-    pub(super) fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
+    fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         self.end_unit();
         if product.object.format() != BinaryFormat::Elf {
             return Ok(Vec::new());

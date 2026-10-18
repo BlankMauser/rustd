@@ -794,7 +794,11 @@ Estimate: one week for full-link objects with backtrace and lldb checks on aarch
 more for the splice and for a macOS variant of `debuginfo.py` (lldb in place of gdb,
 `dwarfdump --verify`, `atos`). I have not run any of this.
 
-## Windows (design only)
+## Windows (the design; WINDOWS.md has what was built)
+
+Lines and procedures are written since, under both backends, and checked by `debuginfo.py`:
+the last section of WINDOWS.md has what was done and measured. Types and the PDB after a
+splice are still as described here.
 
 MSVC targets use CodeView: `.debug$S` (symbols and line tables per function) and `.debug$T`
 (types) in the COFF object, which `link.exe` or `lld-link` merge into a PDB.

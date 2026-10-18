@@ -10,9 +10,9 @@ for v in 0.1.0 0.1.1; do
   echo '{"name":"dep","vers":"'$v'","deps":[],"cksum":"'$sum'","features":{},"yanked":false}' >> registry/index/3/d/dep
 done
 rm -rf stage
-echo '{"dl": "file://'$PWD'/registry/crates/{crate}-{version}.crate"}' > registry/index/config.json
+echo '{"dl": "file://'${BM_HERE:-$PWD}'/registry/crates/{crate}-{version}.crate"}' > registry/index/config.json
 (cd registry/index && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm index)
 mkdir -p .cargo
-printf '[registries.local]\nindex = "file://%s/registry/index"\n' "$PWD" > .cargo/config.toml
+printf '[registries.local]\nindex = "file://%s/registry/index"\n' "${BM_HERE:-$PWD}" > .cargo/config.toml
 cargo generate-lockfile --quiet
 cargo update --quiet -p dep --precise 0.1.0

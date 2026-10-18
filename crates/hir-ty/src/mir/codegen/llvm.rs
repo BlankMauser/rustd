@@ -107,17 +107,35 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| format!("inline assembly: {e}"))
 }
 
-/// Turns LLVM's SLP vectorizer off for the process. LLVM 20.1's makes one store of several
-/// equal rows of an array of `i128` with lanes of it left as poison, so that part of the
-/// array is never written (`breakers/cases/src/repeat_rows.rs`). The `default<O2>` pipeline
-/// turns the pass on whatever its options say, which leaves the flag the pass itself reads.
-fn disable_slp_vectorizer() {
-    static DISABLED: Once = Once::new();
-    DISABLED.call_once(|| {
-        let arguments = [c"rustd".as_ptr(), c"-vectorize-slp=false".as_ptr()];
-        // SAFETY: the two arguments are C strings that outlive the call, and LLVM is given
+/// Sets the options of LLVM that only its command line reaches, for the process.
+///
+/// The SLP vectorizer is off. LLVM 20.1's makes one store of several equal rows of an array
+/// of `i128` with lanes of it left as poison, so that part of the array is never written
+/// (`breakers/cases/src/repeat_rows.rs`). The `default<O2>` pipeline turns the pass on
+/// whatever its options say, which leaves the flag the pass itself reads.
+///
+/// On AArch64 the quick selection is not the global instruction selector. That one deletes
+/// the unused copy of the selector register at a landing pad and leaves the register a
+/// live-in of the block, and LLVM 20.1's fast register allocator does not reload a value it
+/// has put in a live-in register: after optimization, which keeps values in registers across
+/// an unwind edge, a landing pad then reads the selector where it wants a drop flag
+/// (`breakers/cases/src/unwind_many_flags.rs`).
+fn set_options(arch: Arch) {
+    static SET: Once = Once::new();
+    SET.call_once(|| {
+        let mut arguments = vec![c"rustd".as_ptr(), c"-vectorize-slp=false".as_ptr()];
+        if arch == Arch::Aarch64 {
+            arguments.push(c"-aarch64-enable-global-isel-at-O=-1".as_ptr());
+        }
+        // SAFETY: the arguments are C strings that outlive the call, and LLVM is given
         // their number.
-        unsafe { LLVMParseCommandLineOptions(2, arguments.as_ptr(), std::ptr::null()) }
+        unsafe {
+            LLVMParseCommandLineOptions(
+                arguments.len() as i32,
+                arguments.as_ptr(),
+                std::ptr::null(),
+            )
+        }
     });
 }
 
@@ -188,7 +206,7 @@ impl Machine {
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
-        disable_slp_vectorizer();
+        set_options(emitted.arch);
         match emitted.arch {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),

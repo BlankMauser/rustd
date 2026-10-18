@@ -215,6 +215,8 @@ pub(super) struct Tally {
     pub(super) large: AtomicUsize,
     /// Where LLVM's time went.
     pub(super) phases: [AtomicU64; Phase::COUNT],
+    /// Where the time around the producer went.
+    steps: [AtomicU64; Step::COUNT],
 }
 
 #[derive(Default)]
@@ -238,6 +240,38 @@ impl Phase {
     const COUNT: usize = 5;
     const ALL: [Phase; Phase::COUNT] =
         [Phase::Lower, Phase::Verify, Phase::Optimize, Phase::Emit, Phase::Read];
+}
+
+/// The steps of compiling one function that are not the producer's.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Step {
+    /// The types of a body.
+    Infer,
+    /// The MIR of a body, without the time its types took when they were asked for first.
+    Mir,
+    /// A generic body with the types of one instance in it.
+    Monomorphize,
+    /// From MIR to the IR the producer takes.
+    Translate,
+    /// Lines and variables for a debugger.
+    Describe,
+    /// Reading an entry of the store.
+    StoreRead,
+    /// Encoding an entry and adding it to the store.
+    StoreWrite,
+}
+
+impl Step {
+    const COUNT: usize = 7;
+    const ALL: [(Step, &str); Step::COUNT] = [
+        (Step::Infer, "infer"),
+        (Step::Mir, "mir"),
+        (Step::Monomorphize, "monomorphize"),
+        (Step::Translate, "translate"),
+        (Step::Describe, "describe"),
+        (Step::StoreRead, "store read"),
+        (Step::StoreWrite, "store write"),
+    ];
 }
 
 impl Produced {
@@ -279,6 +313,18 @@ impl Tally {
         out
     }
 
+    /// Runs `work` as part of `step`.
+    pub(super) fn step<T>(&self, step: Step, work: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let out = work();
+        self.add(step, start.elapsed());
+        out
+    }
+
+    pub(super) fn add(&self, step: Step, took: Duration) {
+        self.steps[step as usize].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     /// Says what was compiled by which producer since the last call, on stderr. Times are
     /// summed over the threads that compiled.
     pub(super) fn report(&self) {
@@ -290,9 +336,17 @@ impl Tally {
         });
         let (llvm, cranelift) = (self.llvm.take(), self.cranelift.take());
         let large = self.large.swap(0, Ordering::Relaxed);
+        let steps = Step::ALL.map(|(step, name)| {
+            let took = Duration::from_nanos(self.steps[step as usize].swap(0, Ordering::Relaxed));
+            format!("{name} {took:.1?}")
+        });
         let selected = Self::selected_llvm();
-        if !selected && std::env::var_os("RUSTD_STATS").is_none() {
+        let stats = std::env::var_os("RUSTD_STATS").is_some();
+        if !selected && !stats {
             return;
+        }
+        if stats {
+            eprintln!("steps: {}", steps.join(", "));
         }
         if let Some(llvm) = llvm {
             let phases = std::iter::zip(Phase::ALL, phases)
