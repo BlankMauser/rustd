@@ -1,9 +1,10 @@
 # Debug info
 
-Branch `rustd-debuginfo`. Everything here is Linux x86-64 ELF. Mach-O and Windows are design
-notes at the end. Rounds one and two (line tables, backtraces, the splice path, variables and
+Branch `rustd-debuginfo`. Everything of mine here is Linux x86-64 ELF. Mach-O is a design
+note at the end; Windows has lines and procedures in CodeView from the Windows work, which
+came in with the merge of `rustd-collate-next` (WINDOWS.md). Rounds one and two (line tables, backtraces, the splice path, variables and
 types under both backends, profile settings) are in `rustd-collate`. Round three is on top of
-`rustd-collate` at 14ee89181b and is described in "Round three" below; the sections marked
+`rustd-collate-next` at 1b022ff6f2 and is described in "Round three" below; the sections marked
 "round two" are kept as written then, and where they say something else about scopes,
 closures, split debug info, the LLVM counts or cost, "Round three" is right.
 
@@ -52,16 +53,16 @@ Debug info follows the profile; see "Profile settings" below.
 
 ### At this head
 
-`debuginfo.py` and the whole regression gate pass under both backends on this head (which
-has `rustd-collate` 14ee89181b merged in). What `debuginfo.py` printed:
+This head has `rustd-collate-next` 1b022ff6f2 merged in (a plain merge). The gate below was
+run once on it, on Linux x86-64, under both backends. What `debuginfo.py` printed:
 
 | part | Cranelift | LLVM -O2 |
 |---|---|---|
 | corpus backtraces | 85 panics, 448 frames, same | 447 frames; 1 function seen to leave by a jump (see "Tail calls") |
 | callers | 6 panics, 19 frames, same | 18 frames, 1 function seen to leave by a jump |
 | `llvm-dwarfdump --verify` | no errors in any binary | no errors in any binary |
-| `.eh_frame` and ranges, corpus | 11,714 functions, 0 disagree | 0 disagree |
-| a line for every instruction | 0 bytes without, 11,714 functions | 0 bytes without |
+| `.eh_frame` and ranges, corpus | 11,700 functions, 0 disagree | 0 disagree |
+| a line for every instruction | 0 bytes without, 11,700 functions | 0 bytes without |
 | locals (gdb) | 9 of 9 | 8 of 9, 1 optimized out that rustc keeps |
 | types (`rust-gdb`, 21 values) | 21 of 21 | 21 of 21 |
 | scopes (30 names by block) | 30 of 30 | 23 of 30; 7 optimized out, 2 of them kept by rustc |
@@ -71,20 +72,36 @@ has `rustd-collate` 14ee89181b merged in). What `debuginfo.py` printed:
 | last line | `all right (cranelift)` | `all right, 2 open (llvm)` |
 
 The gate: difftest MATCH with 0 of 893 layouts differing, programs 22 of 22, stress 99 of 99,
-breakers 62 of 62 with 7 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 10, includes
+breakers 94 of 94 with 6 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 10, includes
 9 of 9, worktrees 62 of 62, keys 46 of 46 with 0 open, buildmodel 194 of 194 as expected, the
 five store harnesses (`storekills`, `storecorrupts`, `storefull`, `storeshared`,
-`storeguards`) pass, `selects.py` 3 of 3, `fuzz/fuzz.py smoke` 0 differences, `backends.py`
-under LLVM 822 of 931 functions compiled, `cargo_rustd.py --small` PASS under both; `cargo
-fmt` clean, `cargo test` 1010 passed, 0 failed, 1 ignored.
+`storeguards`) pass, `selects.py` 3 of 3, `fuzz/fuzz.py smoke` and `fuzz/edits.py smoke`
+exit 0, `backends.py` under LLVM exits 0, `cargo_rustd.py --small` PASS under both; `cargo fmt` clean, `cargo test`
+1015 passed, 0 failed, 1 ignored. `realdebug.py` (ripgrep and axum) was last run on the
+head before this merge and not on this one.
 
-Three rows did not pass where the gate first ran them and passed when run again, each for a
-reason of this machine and not of the code. Cranelift's `difftest.py` said `no linker line`
-because both backends' gates began on the one corpus target directory at once; alone it is
-MATCH. `buildmodel.py` had 4 of 194 wrong with `Error: listening on ...`, the two cases with
-the longest names under a scratch `TMPDIR` long enough to put the daemon's socket past the
-length a socket path may have; under `/tmp` it is 194 of 194. `cargo_rustd.py` wants
-`cargo-rustd` beside `rustd`, and the copy of the binary the gate ran had none.
+`cargo_rustd.py` did not pass where the gate first ran it and passed when run again alone,
+under both backends, for reasons of this machine: a scratch `TMPDIR` long enough to put
+the daemon's socket past the length a socket path may have, and then a full disk.
+
+### What the merge of 1b022ff6f2 needed
+
+`rustd-collate-next` had made `DebugContext` an enum of two writers, DWARF for ELF and
+CodeView for COFF, where this branch had one DWARF writer that had grown since (indexed
+types, scopes, units of 256 functions, split DWARF). The writer of this branch is now the
+`Dwarf` of that enum, unchanged inside; `emit` returns the files kept apart, which CodeView
+has none of. The timing steps of the perf work (`Tally`, `Step::Describe`,
+`Step::StoreWrite`) are around the same calls as there. In `harness/debuginfo.py` the
+Windows paths (`Pdb`, `Image`, `cdb`, `.pdata` against the procedures) are kept beside the
+ELF ones; the parts that ask gdb, lldb and `llvm-dwarfdump` for what only DWARF has so far
+(`callers`, `types`, `scopes`, `rich`, `profile`, and the second run of `edits` kept apart)
+say `not run` on Windows. That Windows side of the script was merged by reading and was not
+run: there was no Windows machine in this session.
+
+The script in `rustd-collate-next` before this merge is the one of round one. The row that
+failed on the AArch64 runner is explained below and is fixed by this branch's script. Of the
+one failure under LLVM in the coordinator's gate I do not know the row; the script that
+failed is replaced whole by this one, which passed under LLVM each time it was run here.
 
 ### What the merge of 14ee89181b needed
 
@@ -299,7 +316,10 @@ with `RUSTD_DEBUGINFO=0` and without.
 | Binary, no debug | 86,995,944 | 83,613,408 |
 | Binary, debug | 91,645,816 | 88,434,528 |
 
-Measured at this head. The sizes are exact; the time is not. Each backend was measured
+Measured at the head before the merge of `rustd-collate-next`. With it merged, the one run
+inside the whole `debuginfo.py` gave 6.09 s and 7.42 s (+21.9%, object +21.6%) for
+Cranelift and 6.99 s and 7.87 s (+12.5%, object +26.8%) for LLVM. The sizes are exact; the
+time is not. Each backend was measured
 twice here, once inside the whole `debuginfo.py` run and once alone: Cranelift gave 9.32 s
 and 12.13 s (+30.1%) and then the row above; LLVM gave the row above and then 9.39 s and
 9.66 s (+2.8%). Before the merge of 14ee89181b the same measure gave 6.12 s and 6.92 s
@@ -472,10 +492,10 @@ section symbols.
   `__DWARF,__debug_*`, and use the relocation forms Mach-O has (section-relative
   references inside `__DWARF` are written as plain offsets, not relocations). Then the
   linker's debug map and `dsymutil` do the rest; see the Mach-O notes.
-- Windows needs a second writer next to `DebugContext` that takes the same `FunctionDebug`
-  values and writes `.debug$S` and `.debug$T`; see the Windows notes. `ObjectCodegen` holds an
-  `Option<DebugContext>`; that becomes an enum of the two writers, picked from the target's
-  binary format in one place.
+- Windows has a second writer, `CodeView` in `debuginfo/codeview.rs`, that takes the same
+  `FunctionDebug` values and writes `.debug$S`; `DebugContext` is the enum of the two
+  writers, picked from the target's binary format in `DebugContext::new`. A Mach-O writer
+  is a third arm there.
 - The splice path appends debug sections to a linked ELF (`crates/rustd/src/splice`); that
   code is per format already and is separate from the above.
 
@@ -769,6 +789,21 @@ Compressed debug sections in the executable make the splice fall back to a full 
 
 gdb prints a warning about `.debug_gdb_scripts` for these binaries; it comes from rustc's
 std objects and is the same for the cargo build.
+
+## Where the work stopped, and what I would do next
+
+Done: everything in "At this head", on ELF under both backends, with `rustd-collate-next`
+merged and the gate run once on that.
+
+Half done: split DWARF (`unpacked` is checked through a splice, `packed` only on the
+fixture and never through `cargo rustd`); the cost, which is measured and not yet profiled
+for this round; the Windows side of `debuginfo.py`, merged and not run.
+
+Next, in this order: run `debuginfo.py` on the Windows and AArch64 runners and read the
+rows; write the debug sections with fewer relocations (one symbol a unit, DWARF 5
+`addrx`), since the relocations are as large as the sections; a `packed` program through a
+splice and through `cargo rustd`; the three LLVM values, which need inlining and the
+inlined-subroutine entries with it; variables and types in CodeView; Mach-O.
 
 ## Mach-O (design only)
 
