@@ -1,7 +1,11 @@
 // The playground: the editor, the compiler in a worker, and the program it builds.
 //
-// Everything of the compiler is under `rustd/`, put there by
+// Everything of the compiler is under `rustd/` next to this file, put there by
 // `crates/rustd-wasm/web/build-site.sh`. Nothing of it is asked for until the page is shown.
+// The front page has the same editor without the list of builds and without a program in its
+// address, which is what `log` being absent means here.
+
+import { paint } from "./highlight.js";
 
 const PROGRAMS = [
   ["balls", "Bouncing balls"],
@@ -14,8 +18,9 @@ const PROGRAMS = [
 const DELAY = 150;
 
 const $ = (id) => document.getElementById(id);
-const [source, canvas, cover, coverText, bar, state, log, picker] =
-  ["source", "canvas", "cover", "cover-text", "progress", "state", "log", "demo"].map($);
+const [source, painted, canvas, cover, coverText, bar, state, log, picker] =
+  ["source", "paint", "canvas", "cover", "cover-text", "progress", "state", "log", "demo"].map($);
+const at = (path) => new URL(`rustd/${path}`, import.meta.url);
 const context = canvas.getContext("2d");
 
 const ms = (value) => (value < 1000 ? `${value.toFixed(0)} ms` : `${(value / 1000).toFixed(1)} s`);
@@ -29,6 +34,9 @@ function say(kind, text) {
 
 // A line of the builds: `level` is `info`, `good` or `bad`, `notes` longer text under it.
 function line(level, head, parts = [], notes = []) {
+  if (log === null) {
+    return;
+  }
   const newest = log.scrollHeight - log.scrollTop - log.clientHeight < 8;
   const item = document.createElement("li");
   item.className = level;
@@ -61,32 +69,36 @@ function unavailable(why) {
 for (const [name, title] of PROGRAMS) {
   picker.add(new Option(title, name));
 }
-const named = location.hash.slice(1);
+const named = log === null ? "" : location.hash.slice(1);
 picker.value = PROGRAMS.some(([name]) => name === named) ? named : PROGRAMS[0][0];
 
 const opened = performance.now();
 let manifest;
 let Program;
 try {
-  const response = await fetch("rustd/pkg/manifest.json", { cache: "no-cache" });
+  const response = await fetch(at("pkg/manifest.json"), { cache: "no-cache" });
   if (!response.ok) {
     throw new Error(`rustd/pkg/manifest.json: ${response.status}`);
   }
   manifest = await response.json();
-  ({ Program } = await import(`./rustd/program.js?${manifest.build}`));
+  ({ Program } = await import(at(`program.js?${manifest.build}`)));
 } catch (error) {
   unavailable(String(error.message ?? error));
   throw error;
 }
-$("size-compiler").textContent = mb(manifest.compiler_bytes);
-$("size-transfer").textContent = mb(manifest.transfer_bytes);
+for (const [id, bytes] of [["size-compiler", manifest.compiler_bytes], ["size-transfer", manifest.transfer_bytes]]) {
+  const size = $(id);
+  if (size !== null) {
+    size.textContent = mb(bytes);
+  }
+}
 
 // The source of each program as it was last left, and as it came.
 const texts = {};
 const originals = {};
 async function original(name) {
   if (!(name in originals)) {
-    const response = await fetch(`rustd/demos/${name}.rs?${manifest.build}`);
+    const response = await fetch(at(`demos/${name}.rs?${manifest.build}`));
     if (!response.ok) {
       throw new Error(`rustd/demos/${name}.rs: ${response.status}`);
     }
@@ -137,9 +149,22 @@ function build() {
   }
 }
 
+// The coloured text under the textarea, kept where the textarea has scrolled to.
+function repaint() {
+  painted.innerHTML = paint(source.value);
+  scrolled();
+}
+function scrolled() {
+  painted.style.transform = `translate(${-source.scrollLeft}px, ${-source.scrollTop}px)`;
+}
+
 async function show(name) {
-  history.replaceState(null, "", `#${name}`);
+  if (log !== null) {
+    history.replaceState(null, "", `#${name}`);
+  }
   source.value = texts[name] ?? (await original(name));
+  source.scrollTo(0, 0);
+  repaint();
   source.disabled = false;
   program = new Program(host);
   stopped = null;
@@ -152,7 +177,7 @@ async function show(name) {
   build();
 }
 
-const worker = new Worker(`rustd/worker.js?gz&${manifest.build}`, { type: "module" });
+const worker = new Worker(at(`worker.js?gz&${manifest.build}`), { type: "module" });
 worker.onerror = (event) => failed("the compiler failed to load", event.message ?? "");
 worker.onmessage = ({ data }) => {
   if ("progress" in data) {
@@ -194,7 +219,7 @@ function failed(head, error) {
   line("bad", head, [], [String(error)]);
   say("error", head);
   if (!built) {
-    coverText.textContent = `${head}. The details are in the list below.`;
+    coverText.textContent = log === null ? `${head}: ${error}` : `${head}. The details are in the list below.`;
     bar.hidden = true;
   }
 }
@@ -258,7 +283,9 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 canvas.addEventListener("click", (event) => run("click", event.offsetX, event.offsetY));
+source.addEventListener("scroll", scrolled);
 source.addEventListener("input", () => {
+  repaint();
   texts[picker.value] = source.value;
   edited += 1;
   clearTimeout(timer);

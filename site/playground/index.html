@@ -7,9 +7,9 @@
 <link rel="icon" href="data:,">
 <meta name="description" content="Edit a Rust program and rustd compiles it to WebAssembly inside the page, a function at a time, while it runs.">
 <style>
-:root { color-scheme: light dark; --bg: #fbfaf7; --fg: #1c1b19; --dim: #6b6862; --line: #e3dfd6; --code: #f1eee7; --accent: #b4441c; --good: #2f7d4f; }
+:root { color-scheme: light dark; --bg: #fbfaf7; --fg: #1c1b19; --dim: #6b6862; --line: #e3dfd6; --code: #f1eee7; --accent: #b4441c; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #151413; --fg: #ece8e0; --dim: #9a958b; --line: #2e2c29; --code: #1f1e1c; --accent: #f08a5d; --good: #7cc79a; }
+  :root { --bg: #151413; --fg: #ece8e0; --dim: #9a958b; --line: #2e2c29; --code: #1f1e1c; --accent: #f08a5d; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -23,43 +23,14 @@ a:hover { text-decoration: underline; }
 h1 { font-size: 32px; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 12px; }
 h2 { font-size: 22px; margin: 48px 0 12px; padding-top: 24px; border-top: 1px solid var(--line); }
 .lede { font-size: 19px; color: var(--dim); margin: 0 0 24px; }
-code, pre, textarea, select, button, #log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; }
 code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
 ul { padding-left: 22px; }
 li { margin: 6px 0; }
 .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; color: var(--dim); }
 footer { margin-top: 64px; color: var(--dim); font-size: 14px; }
-
-/* Wider than the text: the editor and what the program draws, side by side. */
-#playground { width: min(1240px, 100vw - 28px); margin: 0 0 0 50%; transform: translateX(-50%); }
-#bar { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
-#bar label { color: var(--dim); font-size: 15px; }
-select, button { color: var(--fg); background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
-button { cursor: pointer; }
-#state { margin-left: auto; color: var(--dim); font-size: 14px; font-variant-numeric: tabular-nums; }
-#state[data-kind="running"] { color: var(--good); }
-#state[data-kind="error"] { color: var(--accent); }
-#panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; height: min(560px, 70vh); }
-#panes > * { min-height: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-textarea { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: 0; padding: 12px 14px; line-height: 1.5; tab-size: 4; white-space: pre; color: var(--fg); background: var(--code); }
-#stage { position: relative; background: var(--code); }
-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-#cover { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; padding: 24px; text-align: center; color: var(--dim); font-size: 15px; background: var(--code); }
-#cover[hidden] { display: none; }
-progress { width: min(320px, 80%); height: 6px; accent-color: var(--accent); }
-#log { list-style: none; margin: 10px 0 0; padding: 6px 0; height: 132px; overflow-y: scroll; border: 1px solid var(--line); border-radius: 8px; background: var(--code); line-height: 1.6; }
-#log li { margin: 0; padding: 1px 12px; border-left: 3px solid transparent; white-space: pre-wrap; overflow-wrap: anywhere; }
-#log time { color: var(--dim); margin-right: 10px; }
-#log span { color: var(--dim); }
-#log .good { border-left-color: var(--good); }
-#log .good b { color: var(--good); font-weight: 600; }
-#log .bad { border-left-color: var(--accent); }
-#log .bad b { color: var(--accent); font-weight: 600; }
-#log p { margin: 0 0 0 76px; color: var(--fg); }
-@media (max-width: 820px) {
-  #panes { grid-template-columns: minmax(0, 1fr); grid-template-rows: 1fr 1fr; height: 760px; }
-}
 </style>
+<link rel="stylesheet" href="playground.css">
 </head>
 <body>
 <main>
@@ -75,7 +46,7 @@ progress { width: min(320px, 80%); height: 6px; accent-color: var(--accent); }
 <h1>rustd, compiling in this page.</h1>
 <p class="lede">The program on the left is compiled to WebAssembly by rustd running in your
 browser. Change it while it runs: only the functions the edit touched are compiled again and
-swapped in, and the program keeps its state.</p>
+swapped in, and the program carries on from where it was.</p>
 
 <section id="playground">
   <div id="bar">
@@ -85,7 +56,10 @@ swapped in, and the program keeps its state.</p>
     <span id="state" role="status">not loaded yet</span>
   </div>
   <div id="panes">
-    <textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Rust source" disabled></textarea>
+    <div id="editor">
+      <pre aria-hidden="true"><code id="paint"></code></pre>
+      <textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Rust source" disabled></textarea>
+    </div>
     <div id="stage">
       <canvas id="canvas" aria-label="What the program draws"></canvas>
       <div id="cover">
@@ -107,7 +81,8 @@ rustc nor LLVM is involved at any point.</p>
 it reaches, from <code>core</code>'s source, which takes a few seconds. After an edit rustd
 compiles the functions whose code changed, writes a small module with them, and the page
 puts them into the running program's function table. Statics are left alone, which is why the
-balls stay where they are.</p>
+balls stay where they are. An edit that changes the type of a static starts that static
+again.</p>
 
 <h2>What it does not do</h2>
 <ul>

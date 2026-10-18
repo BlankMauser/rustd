@@ -33,7 +33,19 @@ td b { color: var(--accent); font-weight: 600; }
 ul { padding-left: 22px; }
 li { margin: 6px 0; }
 footer { margin-top: 64px; color: var(--dim); font-size: 14px; }
+.hero { font: 600 56px/1.05 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -0.03em; margin: 0 0 14px; }
+#get { margin: 0 0 28px; }
+#get [role="tablist"] { display: flex; gap: 4px; }
+#get [role="tab"] { font: inherit; font-size: 14px; color: var(--dim); background: none; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; padding: 5px 12px; cursor: pointer; }
+#get [role="tab"][aria-selected="true"] { color: var(--fg); background: var(--code); border-color: var(--line); }
+#get pre { margin: 0; border-top-left-radius: 0; display: flex; gap: 12px; align-items: center; }
+#get pre code { flex: 1; overflow-x: auto; white-space: pre; }
+#get #copy { font: inherit; font-size: 13px; color: var(--dim); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 9px; cursor: pointer; }
+#get small { display: block; margin-top: 8px; color: var(--dim); font-size: 14px; }
+.caption { color: var(--dim); font-size: 15px; margin: 10px 0 0; }
+#panes { height: min(480px, 64vh); }
 </style>
+<link rel="stylesheet" href="playground/playground.css">
 </head>
 <body>
 <main>
@@ -46,10 +58,48 @@ footer { margin-top: 64px; color: var(--dim); font-size: 14px; }
   <a href="https://github.com/DioxusLabs/rustd">GitHub</a>
 </nav>
 
-<h1>A Rust compiler that stays running.</h1>
-<p class="lede">rustd is a daemon that keeps rust-analyzer's analysis of your workspaces in memory
-and compiled functions on disk. After an edit it compiles the functions that changed and links
-them into the program rustc already built.</p>
+<h1 class="hero">rustd</h1>
+<p class="lede">A Rust compiler that stays running. After an edit it compiles the functions
+that changed and links them into the program rustc already built.</p>
+
+<div id="get">
+  <div role="tablist" aria-label="Operating system">
+    <button role="tab" id="tab-unix" aria-selected="true" aria-controls="command" type="button">macOS / Linux</button>
+    <button role="tab" id="tab-windows" aria-selected="false" aria-controls="command" type="button">Windows</button>
+  </div>
+  <pre><code id="command">curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh</code><button id="copy" type="button">Copy</button></pre>
+  <small>Then <code>cargo rustd run</code> in a workspace. Needs Rust 1.99.0 with
+  <code>rust-src</code>; <a href="#install">the details</a>.</small>
+</div>
+
+<section id="playground">
+  <div id="bar">
+    <label for="demo">Program</label>
+    <select id="demo"></select>
+    <button id="reset" type="button">Reset</button>
+    <span id="state" role="status">not loaded yet</span>
+  </div>
+  <div id="panes">
+    <div id="editor">
+      <pre aria-hidden="true"><code id="paint"></code></pre>
+      <textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Rust source" disabled></textarea>
+    </div>
+    <div id="stage">
+      <canvas id="canvas" aria-label="What the program draws"></canvas>
+      <div id="cover">
+        <span id="cover-text">Loading the playground…</span>
+        <progress id="progress" max="1" value="0" hidden></progress>
+      </div>
+    </div>
+  </div>
+</section>
+<p class="caption">This is rustd itself, built as WebAssembly and compiling the program on the
+left in your browser. Edit it while it runs. <a href="playground/">The full playground</a> shows
+each build and says what the browser version cannot do.</p>
+
+<h2>What it is</h2>
+<p>rustd is a daemon that keeps rust-analyzer's analysis of your workspaces in memory and
+compiled functions on disk.</p>
 
 <pre><code>$ cargo rustd run          # first build is cargo's; the daemon loads behind it
 $ $EDITOR src/main.rs
@@ -135,5 +185,30 @@ support notes</a>.</li>
 and <a href="https://cranelift.dev">Cranelift</a>.
 <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/architecture.md">How it works</a>.</footer>
 </main>
+<script type="module">
+// The install command for the system the browser says it is on, or the one picked.
+const commands = {
+  unix: "curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh",
+  windows: "irm https://dioxuslabs.github.io/rustd/install.ps1 | iex",
+};
+const command = document.getElementById("command");
+const copy = document.getElementById("copy");
+function pick(system) {
+  command.textContent = commands[system];
+  for (const name of Object.keys(commands)) {
+    document.getElementById(`tab-${name}`).setAttribute("aria-selected", String(name === system));
+  }
+}
+for (const name of Object.keys(commands)) {
+  document.getElementById(`tab-${name}`).addEventListener("click", () => pick(name));
+}
+pick(/Win/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "") ? "windows" : "unix");
+copy.addEventListener("click", async () => {
+  await navigator.clipboard.writeText(command.textContent);
+  copy.textContent = "Copied";
+  setTimeout(() => (copy.textContent = "Copy"), 1500);
+});
+</script>
+<script type="module" src="playground/page.js"></script>
 </body>
 </html>
