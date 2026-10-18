@@ -289,6 +289,46 @@ def worktree_recreated(row):
     row.both("the first checkout still", want="mark 1000")
 
 
+def worktrees_built_apart(row):
+    """Two worktrees whose libraries rustc built from different source: the one's holds code
+    of the standard library for a type of its own that the program calls too, and the other's
+    does not. The worktree asked second is read as the first."""
+    kept = "\npub fn kept(count: usize) -> usize {\n    let mut all: Vec<Reading> = Vec::new();\n    for _ in 0..count {\n        all.push(Reading::default());\n    }\n    all.len()\n}\n"
+    main = row.path("app/src/main.rs")
+    text = open(main).read().replace("fn main() {", 'fn main() {\n    println!("kept {}", kept(std::env::args().count() + 4));', 1)
+    open(main, "w").write(text + kept.replace("pub fn", "fn").replace("Reading", "soak_core::Reading"))
+    row.git("commit", "-qam", "the program keeps readings")
+    row.git("branch", "-M", "master")
+    row.git("checkout", "-q", "-b", "one", "master")
+    with open(row.path("core/src/lib.rs"), "a") as lib:
+        lib.write(kept)
+    row.git("commit", "-qam", "the library keeps them too")
+    row.git("checkout", "-q", "master")
+    tree = os.path.join(row.dir, "tree")
+    row.git("worktree", "add", "-q", tree, "one")
+    row.warm(ws=tree)
+    row.both("the worktree whose library keeps readings", ws=tree, want="kept 5")
+    row.warm()
+    def asked_after_the_other(label, ws, file):
+        """The first build of one after the other may fail to link, which is said with what
+        the linker lacked; the daemon loads it by itself once cargo has built it again."""
+        how, _ = row.both(label, ws=ws, want="kept 5")
+        if "link failed" in how and "undefined symbol" not in how:
+            raise Wrong(f"refused without what the linker lacked: {how}")
+        row.warm(ws=ws)
+        row.edit(file)
+        row.both(f"{label}, edited", ws=ws, want=f"mark {row.mark}")
+        row.warm(ws=ws)
+        for _ in range(3):
+            row.edit(file)
+            how, _ = row.both(f"{label}, edited again", ws=ws, want=f"mark {row.mark}")
+            if how != "daemon":
+                raise Wrong(f"an edit was not built by the daemon: {how}")
+
+    asked_after_the_other("the one whose library does not", row.ws, None)
+    asked_after_the_other("the first", tree, os.path.join(tree, "core/src/lib.rs"))
+
+
 def non_utf8_names(row):
     src = row.path("core/src").encode()
     with open(os.path.join(src, b"caf\xe9.rs"), "wb") as file:
@@ -541,6 +581,7 @@ ROWS = {
     "checkout of thousands of files": (checkout_of_thousands, {}),
     "case-only rename": (case_only_rename, {}),
     "worktree deleted and recreated": (worktree_recreated, {}),
+    "worktrees whose libraries were built apart": (worktrees_built_apart, {}),
     "names and text that are not UTF-8": (non_utf8_names, {}),
     "workspace under a name that is not UTF-8": (non_utf8_root, {}),
     "store on another filesystem": (other_filesystem, {}),

@@ -2094,9 +2094,12 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
-    let status = shell(cmd).status()?;
+    let linked = shell(cmd).output()?;
+    let status = linked.status;
+    let said = String::from_utf8_lossy(&linked.stderr);
+    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
-    anyhow::ensure!(status.success(), "the link failed ({status})");
+    anyhow::ensure!(status.success(), "the link failed ({status}): {}", last_lines(&said, 6));
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
         lock(&LINKED).insert(binary.to_owned(), linked);
@@ -2138,6 +2141,13 @@ fn set_aside(binary: &Path) -> anyhow::Result<bool> {
 #[cfg(unix)]
 fn set_aside(_: &Path) -> anyhow::Result<bool> {
     Ok(false)
+}
+
+/// The last `count` lines of `text` that say something, on one line: what a linker that
+/// failed said last is why.
+fn last_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|it| !it.is_empty()).collect();
+    lines[lines.len().saturating_sub(count)..].join(" | ")
 }
 
 /// The command that runs the line `cmd` as the platform's shell would.
@@ -3408,6 +3418,9 @@ fn main() -> anyhow::Result<()> {
     let mut slow: FxHashMap<PathBuf, u32> = FxHashMap::default();
     // The ones that are loaded instead from the next time on.
     let mut given_up: FxHashSet<PathBuf> = FxHashSet::default();
+    // The ones whose link failed: what rustc built of one lacks what the object of the
+    // checkout it was read as takes from what rustc built of that.
+    let unlinked: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
     let slow_switch = std::env::var("RUSTD_SLOW_SWITCH_MS")
         .ok()
         .and_then(|it| it.parse().ok())
@@ -3523,6 +3536,7 @@ fn main() -> anyhow::Result<()> {
                             lock(&as_built).clear();
                         }
                     }
+                    given_up.extend(lock(&unlinked).drain(..));
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
                             // What a checkout reads is known once a build of it is over.
@@ -4089,6 +4103,7 @@ fn main() -> anyhow::Result<()> {
             let over = viewed.get(base).unwrap_or(base);
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
+            let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
             let linked = std::thread::spawn(move || {
                 let failed = link(
                     link_cmd.as_deref(),
@@ -4106,6 +4121,10 @@ fn main() -> anyhow::Result<()> {
                         None => writeln!(&client, "ok {built}"),
                         Some(why) => writeln!(&client, "error: {why}"),
                     };
+                }
+                if let (Some(_), Some((over, unlinked))) = (&failed, read_as) {
+                    eprintln!("view: {} is loaded from now on", over.display());
+                    lock(&unlinked).push(over);
                 }
                 if failed.is_some() {
                     let _ = sender.send(Event::Unlinked(at));
@@ -4476,6 +4495,16 @@ mod tests {
         assert_eq!(commit_of_sources(built.as_bytes()).as_deref(), Some(commit));
         assert_eq!(commit_of_sources(b"/rustc/"), None);
         assert_eq!(commit_of_sources(format!("/rustc/{commit}").as_bytes()), None);
+    }
+
+    #[test]
+    fn a_link_that_failed_says_what_the_linker_said_last() {
+        let said = "note: one\n\nld: cannot find -lmissing\n  collect2: error: ld returned 1\n";
+        assert_eq!(
+            last_lines(said, 2),
+            "ld: cannot find -lmissing | collect2: error: ld returned 1"
+        );
+        assert_eq!(last_lines("", 2), "");
     }
 
     #[test]

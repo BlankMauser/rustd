@@ -479,6 +479,8 @@ class Soak:
         if ours:
             self.requests.append(dict(tree=os.path.relpath(tree.root, self.work), kind=argv[0], secs=round(time.time() - began, 3),
                                       built=how_built(err), cancelled=cancelled))
+            if any(it in err for it in ODD):
+                self.requests[-1]["said"] = err[-6000:]
         else:
             shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         return ran
