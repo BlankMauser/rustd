@@ -335,13 +335,20 @@ impl Partial {
     /// and starts as `is_wanted` says, and removes it. `false` is what came out being
     /// something else.
     async fn unpack(
-        self,
+        mut self,
         to: &Path,
         (want, most): (Digest, u64),
         is_wanted: fn(&[u8]) -> bool,
     ) -> anyhow::Result<bool> {
+        // The last bytes appended are written behind this task's back until they are flushed:
+        // unpacked before that, the file ends in the middle of a frame.
+        let flushed = self.file.flush().await;
         let (from, to) = (self.path, to.to_owned());
         drop(self.file);
+        if let Err(e) = flushed {
+            _ = tokio::fs::remove_file(&from).await;
+            return Err(e.into());
+        }
         let unpacked = tokio::task::spawn_blocking(move || {
             let unpacked = unpack_whole(&from, &to, (want, most), is_wanted);
             _ = std::fs::remove_file(&from);
