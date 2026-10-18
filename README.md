@@ -33,9 +33,10 @@ Read this section before relying on it.
   or the next build cargo does.
 - It is pinned to one toolchain, Rust 1.99.0. It links against rustc's output, so it has to
   agree with that rustc on symbol names, type layout and the unstable Rust ABI.
-- `cargo rustd` serves dev and test builds on Linux (ELF). Release builds, other profiles,
-  `RUSTFLAGS` and several other flags are handed to cargo unchanged. The command has not been
-  built or run on macOS or Windows; the daemon underneath it has, through the harnesses.
+- `cargo rustd` serves dev and test builds on Linux (ELF) and on macOS arm64 (Mach-O).
+  Release builds, other profiles, `RUSTFLAGS` and several other flags are handed to cargo
+  unchanged. On macOS it has been run on ripgrep, fd and hyperfine only. The command has not
+  been built or run on Windows; the daemon underneath it has, through the harnesses.
 - The code rustd generates is for the edit loop. Each function is compiled alone and nothing
   is inlined across functions, under either backend.
 - When rustd cannot build something it says so in one line and cargo or rustc builds it. It
@@ -105,7 +106,7 @@ and how many programs the daemon linked or left to rustc, by reason.
 `rustd`, `cargo-rustd` and `rustd-rustc` have to be installed in the same directory. A
 wrapper you already use, such as sccache, keeps running. When the daemon cannot serve a
 build, rustc does, and one line on stderr says why. This mode is for agents and scripts that
-call cargo themselves; it has only been run on Linux. On edits it is currently slower than
+call cargo themselves; it has been run on Linux and on macOS arm64. On edits it is currently slower than
 `cargo rustd`, and on some projects slower than cargo alone; see
 [docs/cargo.md](docs/cargo.md).
 
@@ -124,6 +125,18 @@ full table, the commit and the other steps are in [docs/results.md](docs/results
 | just 1.43.0 | 0.02 / 0.06 | 0.11 / 0.28 | 2.50 |
 | axum 0.8.6 | 0.02 / 0.13 | 0.07 / 0.40 | 3.86 |
 | nushell 0.108.0 | 0.04 / 0.26 | 0.96 / 1.65 | 42.36 |
+
+The same step on macOS arm64 (8-CPU Apple M4 virtual machine), one run each, from
+`harness/cargo_rustd.py --small`:
+
+| Project | No-change build | Build after an edit, Cranelift | Build after an edit, LLVM |
+|---|---:|---:|---:|
+| ripgrep 15.1.0 | 0.06 / 0.39 | 2.08 / 1.43 | 0.40 / 0.67 |
+| fd 10.3.0 | 0.05 / 0.41 | 0.24 / 0.42 | 0.25 / 0.43 |
+| hyperfine 1.19.0 | 0.04 / 0.32 | 0.34 / 0.35 | 0.21 / 0.33 |
+
+ripgrep's edit build varied between runs there (0.52 / 0.73 and 1.08 / 1.30 in two other
+Cranelift runs); see [docs/cargo.md](docs/cargo.md#macos-arm64).
 
 The first build is not faster than cargo's, because it is cargo's. A build of source that
 does not compile goes to cargo and costs 0.1 to 0.5 s more than cargo alone. On nushell the
@@ -146,7 +159,7 @@ were left out, for reasons listed in the results.
 | Full link | yes | yes | yes | yes | older branch only |
 | Splice | yes | yes | yes | yes, not with chained fixups | older branch only |
 | Debug info | yes | yes | lines only | unverified | no |
-| `cargo rustd` | yes | unverified | not run | not run | no |
+| `cargo rustd` | yes | unverified | not run | yes, three projects | no |
 | Disk store | yes | yes | yes | yes | unverified |
 | S3 remote | yes, not real AWS | unverified | unverified | unverified | unverified |
 

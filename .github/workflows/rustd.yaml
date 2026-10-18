@@ -355,6 +355,35 @@ jobs:
         working-directory: harness
         run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
 
+  # The same on macOS arm64, where the link is Apple's and the cargo above the wrapper is
+  # read through libproc.
+  cargo-rustd-macos:
+    name: cargo rustd (macos, ${{ matrix.backend }})
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          brew install llvm@20
+          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      - name: cargo rustd against cargo
+        working-directory: harness
+        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+
   # Not required to pass yet: the baseline was measured on another machine than the runner, so
   # the threshold on times is wide, and what it holds exactly is who built each step, whether
   # it was spliced and how many functions were compiled.
