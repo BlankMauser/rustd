@@ -111,4 +111,5 @@ cases![
     promoted_constructor,
     renamed_variant_pattern,
     alias_under_binder,
+    array_in_tuple_moved_out,
 ];
