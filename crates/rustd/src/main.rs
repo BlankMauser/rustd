@@ -3998,6 +3998,9 @@ struct Beside {
     at: usize,
     /// What cargo has to say for the whole of it to be read.
     awaited: FxHashSet<Awaited>,
+    /// The packages cargo builds, by id: a member of the workspace that the build leaves
+    /// out is not read for it, nor is what only that member depends on.
+    built: FxHashSet<String>,
     /// How many lines of cargo's the loaded workspace has taken in.
     applied: usize,
 }
@@ -4011,6 +4014,7 @@ impl Beside {
     ) {
         for package in built {
             let id = &cargo[package].id.repr;
+            self.built.insert(id.clone());
             for &target in &cargo[package].targets {
                 match cargo[target].kind {
                     TargetKind::BuildScript => _ = self.awaited.insert(Awaited::Script(id.clone())),
@@ -4023,8 +4027,21 @@ impl Beside {
         }
     }
 
-    /// The crates of the workspace's own packages that `lines` of cargo's say everything
-    /// of, by the file each starts from, and whether those are all its crates.
+    /// The crates of the workspace's own packages that cargo builds, by the file each starts
+    /// from.
+    fn built_roots(&self, cargo: &CargoWorkspace) -> FxHashSet<PathBuf> {
+        let built = cargo
+            .packages()
+            .filter(|&it| cargo[it].is_member && self.built.contains(&cargo[it].id.repr));
+        built
+            .flat_map(|it| {
+                cargo[it].targets.iter().map(|&it| PathBuf::from(cargo[it].root.clone()))
+            })
+            .collect()
+    }
+
+    /// The crates of the workspace's own packages cargo builds that `lines` of cargo's say
+    /// everything of, by the file each starts from, and whether those are all its crates.
     fn ready(&self, cargo: &CargoWorkspace, lines: &[String]) -> (FxHashSet<PathBuf>, bool) {
         let arrived: FxHashSet<Awaited> =
             lines.iter().filter_map(|it| Awaited::arrived(it)).collect();
@@ -4057,7 +4074,8 @@ impl Beside {
         }
         let mut ready = FxHashSet::default();
         let mut all = true;
-        for package in cargo.packages().filter(|&it| cargo[it].is_member) {
+        let built = |it: &project_model::Package| self.built.contains(&cargo[*it].id.repr);
+        for package in cargo.packages().filter(|&it| cargo[it].is_member).filter(built) {
             if any_waits(cargo, package, &waits, &mut waiting) {
                 all = false;
                 continue;
@@ -4070,20 +4088,21 @@ impl Beside {
 }
 
 /// Compiles the crates of the checkout loaded beside cargo's build that cargo has said
-/// everything of, and takes in what cargo says next, until it has said all of it.
+/// everything of, and takes in what cargo says next, until it has said all of it. The crates
+/// of the packages cargo builds are what it comes back with, by the file each starts from.
 fn follow_cargo(
     db: &mut RootDatabase,
     vfs: &mut Vfs,
     checkouts: &mut Checkouts,
     args: &Args,
     listed: &Listed,
-) -> anyhow::Result<()> {
-    let Some(mut beside) = checkouts.beside.take() else { return Ok(()) };
+) -> anyhow::Result<Option<FxHashSet<PathBuf>>> {
+    let Some(mut beside) = checkouts.beside.take() else { return Ok(None) };
     let mut ready = FxHashSet::default();
     loop {
         let (lines, ended) = beside.said.so_far();
         let workspace = &checkouts.loaded.workspaces()[beside.at];
-        let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { return Ok(()) };
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { return Ok(None) };
         let (now, all) = beside.ready(cargo, &lines);
         let all = all || ended;
         if lines.len() > beside.applied && (all || now != ready) {
@@ -4097,7 +4116,12 @@ fn follow_cargo(
             beside.applied = lines.len();
         }
         if all {
-            return Ok(());
+            // With all of it said, every crate of the build is ready.
+            let workspace = &checkouts.loaded.workspaces()[beside.at];
+            let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
+                return Ok(None);
+            };
+            return Ok(Some(beside.built_roots(cargo)));
         }
         ready = now;
         // Whether cargo has said what makes another crate ready, asked once a line.
@@ -4234,6 +4258,7 @@ fn run_holding(
         said: said.clone(),
         at: usize::MAX,
         awaited: FxHashSet::default(),
+        built: FxHashSet::default(),
         applied: 0,
     };
     let held = held.and_then(|mut held| {
@@ -4256,9 +4281,19 @@ fn run_holding(
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
-    follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
+    let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
+    // The names are resolved before cargo says which program it built: those of the crates
+    // it built are, and not of every crate of the workspace.
+    if let Some(built) = built {
+        let mut names =
+            args.crates().filter(|it| built.contains(&args.checkout.join(it.as_str()))).cloned();
+        if let Some(krate) = names.next() {
+            let batch = names.collect();
+            (args.krate, args.batch, args.widened) = (krate, batch, Vec::new());
+        }
+    }
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
 
