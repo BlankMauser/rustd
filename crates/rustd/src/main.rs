@@ -1968,6 +1968,9 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
                         let names = start.elapsed();
                         warm_impls(&db, krate, helping, threads);
                         _ = hir::TraitImpls::for_crate(&db, krate);
+                        // Which of its dependencies the crate names is read off its files,
+                        // and the first body inferred would wait for that of every crate.
+                        _ = hir::TraitImpls::for_crate_and_deps(&db, krate);
                         // A build asks which functions written in the bodies of the standard
                         // library share a path, which every body of the crate is lowered for:
                         // threads are idle here, waiting for the crates that come next.
@@ -2074,12 +2077,37 @@ impl ListedCrate {
             .copied()
             .find(|&it| hir::Function::from(it).is_main(db))
             .filter(|_| !has_no_main(db, krate));
-        let exported = functions
-            .iter()
-            .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
-            .collect();
+        let exported = exported(db, &functions);
         ListedCrate { functions, kept, exported, main }
     }
+}
+
+/// For each of `functions`, whether a runtime looks it up by name. Its attributes say, which
+/// are read off the source: on every core, as a build waits for this of every crate it builds.
+fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
+    let exported = |db: &RootDatabase, functions: &[FunctionId]| -> Vec<bool> {
+        let exported = |&it| exported_symbol(db, it).is_some() || serves_allocator(db, it);
+        functions.iter().map(exported).collect()
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let each = functions.len().div_ceil(threads).max(256);
+    if functions.len() <= each {
+        return exported(db, functions);
+    }
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = functions
+            .chunks(each)
+            .map(|part| {
+                let db = db.clone();
+                scope.spawn(move || hir::attach_db(&db, || exported(&db, part)))
+            })
+            .collect();
+        // A query that is cancelled unwinds, and goes on unwinding here as what it is.
+        let joined = |it: std::thread::ScopedJoinHandle<'_, Vec<bool>>| {
+            it.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+        };
+        parts.into_iter().flat_map(joined).collect()
+    })
 }
 
 /// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
