@@ -46,9 +46,11 @@ pub(crate) struct Outlines {
 }
 
 impl Outlines {
-    /// Takes note of a file that is about to change, unless it is known already.
-    pub(crate) fn before_edit(&mut self, db: &RootDatabase, listed: &Listed, file: FileId) {
-        self.files.entry(file).or_insert_with(|| outline(db, listed, file));
+    /// Takes note of the files that are about to change, unless they are known already.
+    pub(crate) fn before_edit(&mut self, db: &RootDatabase, listed: &Listed, files: &[FileId]) {
+        let new: Vec<_> = files.iter().copied().filter(|it| !self.files.contains_key(it)).collect();
+        let outlines = outlines(db, listed, &new);
+        self.files.extend(new.into_iter().zip(outlines));
     }
 
     /// For each file of the edit that was just applied, whether nothing changed in it but
@@ -60,10 +62,11 @@ impl Outlines {
         files: Vec<FileId>,
     ) -> Vec<(FileId, bool)> {
         let off = std::env::var_os("RUSTD_NO_BODIES").is_some();
+        let outlines = outlines(db, listed, &files);
         let files: Vec<_> = files
             .into_iter()
-            .map(|file| {
-                let now = outline(db, listed, file);
+            .zip(outlines)
+            .map(|(file, now)| {
                 let was = self.files.insert(file, now);
                 (file, !off && now.is_some() && was == Some(now))
             })
@@ -77,19 +80,53 @@ impl Outlines {
     }
 }
 
-/// A hash of everything in the file but the bodies nothing else sees into, or `None` when the
-/// file is not all ours to compile or is not read as a file of its own.
-fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
+/// The [`outline`] of each file. A wide edit is of thousands of files: their bodies are
+/// lowered together and the files are hashed on all threads.
+fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<u64>> {
     let stats = std::env::var_os("RUSTD_STATS").is_some();
-    let Some(functions) = listed.in_file(db, file) else {
-        if stats {
-            eprintln!("outline: {file:?} has functions that are not listed");
+    let functions = listed.in_files(db, files);
+    let bodies = functions.iter().flatten().flatten().map(|&it| it.into()).collect();
+    crate::lower(db, bodies);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let mut outlines = vec![None; files.len()];
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads.min(files.len()))
+            .map(|part| {
+                let (db, functions) = (db.clone(), &functions);
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        let files = files.iter().zip(functions).enumerate();
+                        files
+                            .skip(part)
+                            .step_by(threads)
+                            .map(|(at, (&file, functions))| {
+                                let Some(functions) = functions else {
+                                    if stats {
+                                        eprintln!(
+                                            "outline: {file:?} has functions that are not listed"
+                                        );
+                                    }
+                                    return (at, None);
+                                };
+                                (at, outline(&db, file, functions))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+            })
+            .collect();
+        for (at, outline) in parts.into_iter().flat_map(|it| it.join().unwrap_or_default()) {
+            outlines[at] = outline;
         }
-        return None;
-    };
-    crate::lower(db, functions.iter().map(|&it| it.into()).collect());
-    let Some(seen) = Written::of(db, &functions) else {
-        if stats {
+    });
+    outlines
+}
+
+/// A hash of everything in the file but the bodies nothing else sees into, or `None` when
+/// the file is not read as a file of its own. `functions` are those written in it.
+fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<u64> {
+    let Some(seen) = Written::of(db, functions) else {
+        if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!("outline: {file:?} is included in another file");
         }
         return None;
@@ -273,26 +310,56 @@ impl Listed {
             })
     }
 
-    /// The functions written in the file that no body declares, as the file is now, or `None`
-    /// when it belongs to a crate that is not listed: one that the crates being built use and
-    /// that is not one of them.
-    pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
-        let mut functions = Vec::new();
-        let listed: Vec<_> = self.functions.lock().unwrap().keys().copied().collect();
-        for &krate in relevant_crates(db, file).iter() {
-            if listed.contains(&krate.into()) {
-                functions.extend(
-                    crate::functions_of_modules(db, krate.into())
-                        .into_iter()
-                        .filter(|&it| hir_ty::mir::codegen::body_file(db, it.into()) == file),
-                );
-            } else if listed.iter().any(|&built| {
-                ide_db::base_db::Crate::from(built).transitive_deps(db).contains(&krate)
-            }) {
-                return None;
-            }
-        }
-        Some(functions)
+    /// For each file the functions written in it that no body declares, as the file is now,
+    /// or `None` when it belongs to a crate that is not listed: one that the crates being
+    /// built use and that is not one of them.
+    pub(crate) fn in_files(
+        &self,
+        db: &RootDatabase,
+        files: &[FileId],
+    ) -> Vec<Option<Vec<FunctionId>>> {
+        type Crate = ide_db::base_db::Crate;
+        let listed: Vec<Crate> =
+            self.functions.lock().unwrap().keys().map(|&it| it.into()).collect();
+        // The functions of a listed crate by the file they are in, and `None` for a crate
+        // that the listed ones use.
+        let mut crates: FxHashMap<Crate, Option<FxHashMap<FileId, Vec<FunctionId>>>> =
+            FxHashMap::default();
+        let mut used = None;
+        files
+            .iter()
+            .map(|&file| {
+                let mut functions = Vec::new();
+                for &krate in relevant_crates(db, file).iter() {
+                    let of_crate = crates.entry(krate).or_insert_with(|| {
+                        if !listed.contains(&krate) {
+                            return None;
+                        }
+                        let mut by_file: FxHashMap<_, Vec<_>> = FxHashMap::default();
+                        for func in crate::functions_of_modules(db, krate.into()) {
+                            let file = hir_ty::mir::codegen::body_file(db, func.into());
+                            by_file.entry(file).or_default().push(func);
+                        }
+                        Some(by_file)
+                    });
+                    match of_crate {
+                        Some(by_file) => {
+                            functions.extend(by_file.get(&file).into_iter().flatten().copied())
+                        }
+                        None => {
+                            let used = used.get_or_insert_with(|| {
+                                let used = listed.iter().flat_map(|it| it.transitive_deps(db));
+                                used.collect::<FxHashSet<Crate>>()
+                            });
+                            if used.contains(&krate) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Some(functions)
+            })
+            .collect()
     }
 }
 

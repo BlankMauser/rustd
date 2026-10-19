@@ -364,6 +364,17 @@ impl SymbolTable {
         })
     }
 
+    /// Every source that was written after rustc built the crate it is of.
+    pub(crate) fn all_written_since_built(&self) -> impl Iterator<Item = &Path> {
+        self.built_from.iter().flat_map(|(built, sources)| {
+            let built = written(built);
+            sources
+                .iter()
+                .filter(move |it| built.is_some_and(|built| it.written_since(built)))
+                .map(|it| &*it.path)
+        })
+    }
+
     /// Whether rustc has built one of the files again since they were read.
     pub(crate) fn built_since_read(&self) -> bool {
         self.read.is_some_and(|read| {

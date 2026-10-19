@@ -2749,11 +2749,13 @@ struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
 }
 
-/// Why the source as it is can't be built by the daemon, when it can't.
+/// Why the source as it is can't be built by the daemon, when it can't: a file that does
+/// not parse, then the errors found in the edited files, then a function left uncompiled.
 fn refusal(
     db: &RootDatabase,
     sources: &[vfs::FileId],
     watched: &Sources,
+    broken: Option<String>,
     out_of_date: Option<(FunctionId, String)>,
 ) -> Option<String> {
     let Sources { paths } = watched;
@@ -2778,81 +2780,97 @@ fn refusal(
             return Some(format!("{path}:{}: {error}", line + 1));
         }
     }
+    if broken.is_some() {
+        return broken;
+    }
     let (func, why) = out_of_date?;
     let name = hir::Function::from(func).name(db).display(db, syntax::Edition::CURRENT).to_string();
     // What the frontend turns down is as a rule code that does not compile.
     if why.starts_with("frontend:") {
-        return Some(format!("`{name}` has errors, `cargo check` shows them: {why}"));
+        return Some(format!("`{name}` has an error rustd cannot say more of: {why}"));
     }
-    Some(format!(
-        "`{name}` is not compiled by rustd and rustc's copy is from before the edit, \
-         build with cargo: {why}"
-    ))
+    Some(format!("`{name}` is not compiled by rustd: {why}"))
 }
 
-/// Something written in one of the edited files that cargo turns the crate down for. Nothing
-/// may reach it, so the build never looks at it.
-fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
-    use hir::AnyDiagnostic as Diagnostic;
+/// The errors rust-analyzer is as sure of as rustc is: a wrong one fails a build that is
+/// right.
+const SURE: &[&str] = &[
+    "E0004",
+    "E0005",
+    "E0023",
+    "E0046",
+    "E0057",
+    "E0061",
+    "E0063",
+    "E0308",
+    "E0407",
+    "E0425",
+    "E0432",
+    "E0559",
+    "E0560",
+    "E0583",
+    "E0599",
+    "unresolved-macro-call",
+];
+
+/// How many errors a failed build says.
+const SAID: usize = 8;
+
+/// The errors written in the edited files, as rust-analyzer finds them. Nothing may reach
+/// them, so the build never looks at them.
+fn broken_in(db: &RootDatabase, edited: &[vfs::FileId], watched: &Sources) -> Option<String> {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    let broken = std::thread::scope(|scope| {
+    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
+    let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let db = db.clone();
+                let (db, config) = (db.clone(), &config);
                 scope.spawn(move || {
+                    let files = edited.iter().skip(part).step_by(threads);
                     hir::attach_db(&db, || {
-                        let sema = hir::Semantics::new(&db);
-                        let modules = edited
-                            .iter()
-                            .skip(part)
-                            .step_by(threads)
-                            .flat_map(|&file| sema.file_to_module_defs(file));
-                        for module in modules {
-                            let mut found = Vec::new();
-                            module.diagnostics(&db, &mut found, false);
-                            // Only what rust-analyzer is as sure of as rustc is: a wrong
-                            // refusal costs a cargo build.
-                            let why = found.iter().find_map(|it| match it {
-                                Diagnostic::TypeMismatch(_) => Some("mismatched types"),
-                                Diagnostic::UnresolvedIdent(_) => Some("unresolved name"),
-                                Diagnostic::MismatchedArgCount(_)
-                                | Diagnostic::MismatchedTupleStructPatArgCount(_) => {
-                                    Some("wrong number of arguments")
-                                }
-                                Diagnostic::MissingFields(_) => Some("missing fields"),
-                                Diagnostic::NoSuchField(_) | Diagnostic::UnresolvedField(_) => {
-                                    Some("no such field")
-                                }
-                                Diagnostic::UnresolvedMethodCall(_)
-                                | Diagnostic::UnresolvedAssocItem(_) => Some("no such method"),
-                                Diagnostic::MissingMatchArms(_)
-                                | Diagnostic::NonExhaustiveLet(_) => Some("patterns not covered"),
-                                Diagnostic::TraitImplMissingAssocItems(_)
-                                | Diagnostic::TraitImplRedundantAssocItems(_) => {
-                                    Some("an impl does not match its trait")
-                                }
-                                Diagnostic::UnresolvedModule(_) => Some("a module without a file"),
-                                Diagnostic::UnresolvedImport(_) => Some("unresolved import"),
-                                Diagnostic::UnresolvedMacroCall(_) => Some("unresolved macro"),
-                                _ => None,
-                            });
-                            if let Some(why) = why {
-                                let name = module.name(&db).map_or_else(
-                                    || "the crate root".to_owned(),
-                                    |it| format!("`{}`", it.display(&db, syntax::Edition::CURRENT)),
-                                );
-                                return Some((name, why));
-                            }
-                        }
-                        None
+                        files
+                            .flat_map(|&file| {
+                                ide_diagnostics::semantic_diagnostics(
+                                    &db,
+                                    config,
+                                    &ide_db::assists::AssistResolveStrategy::None,
+                                    file,
+                                )
+                            })
+                            .filter(|it| {
+                                it.severity == ide_db::Severity::Error
+                                    && SURE.contains(&it.code.as_str())
+                            })
+                            .map(|it| (it.range, it.code.as_str(), it.message))
+                            .collect::<Vec<_>>()
                     })
                 })
             })
             .collect();
-        checks.into_iter().find_map(|it| it.join().ok().flatten())
+        checks.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
     });
-    let (module, why) = broken?;
-    Some(format!("{module} has errors, `cargo check` shows them: {why}"))
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_by_key(|(at, ..)| (at.file_id, at.range.start()));
+    let more = found.len().saturating_sub(SAID);
+    let mut said: Vec<_> = found
+        .iter()
+        .take(SAID)
+        .map(|(at, code, message)| {
+            let text = db.file_text(at.file_id).text(db);
+            let before = &text[..usize::from(at.range.start()).min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, |it| it.chars().count()) + 1;
+            let path = watched.paths.get(&at.file_id);
+            let path = path.map(|it| it.display().to_string()).unwrap_or_default();
+            format!("{path}:{line}:{column}: {message} [{code}]")
+        })
+        .collect();
+    if more > 0 {
+        said.push(format!("and {more} more"));
+    }
+    Some(said.join("\n"))
 }
 
 /// The text of the source file at `path` as the database has it.
@@ -4290,6 +4308,26 @@ fn run_holding(
     if let Some(stale) = stale_copies(&db, &table, &args) {
         anyhow::bail!(stale);
     }
+    // What rustc built stands in for a function that is not compiled, and it is not of a
+    // source written since: an error there fails the build rather than run the old code.
+    let written: FxHashSet<&Path> = table.all_written_since_built().collect();
+    if !written.is_empty() {
+        let paths: FxHashMap<vfs::FileId, PathBuf> = files
+            .iter()
+            .filter_map(|it| match it.file {
+                Watched::Source(id) if written.contains(&*it.path) => Some((id, it.path.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut edited: Vec<_> = paths.keys().copied().collect();
+        edited.sort_unstable();
+        let sources = Sources { paths };
+        let broken = broken_in(&db, &edited, &sources);
+        let why = hir::attach_db(&db, || refusal(&db, &edited, &sources, broken, None));
+        if let Some(why) = why {
+            bail!(why);
+        }
+    }
     let mut cold = build(&db, &table, &args, &mut known, &listed)?;
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
@@ -4851,9 +4889,13 @@ fn run_holding(
         let mut included = Vec::new();
         let mut sources = Vec::new();
         let mut removed = Vec::new();
+        let editing = gone.iter().chain(&touched).filter_map(|&index| match files[index].file {
+            Watched::Source(id) => Some(id),
+            Watched::Included(_) => None,
+        });
+        outlines.before_edit(&db, &listed, &editing.collect::<Vec<_>>());
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
-                outlines.before_edit(&db, &listed, id);
                 change.change_file(id, None);
                 sources.push(id);
                 removed.push(id);
@@ -4863,7 +4905,6 @@ fn run_holding(
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
-                    outlines.before_edit(&db, &listed, *id);
                     let text = source_on_disk(&db.on_disk(path))?;
                     change.change_file(*id, Some(text));
                     sources.push(*id);
@@ -5408,7 +5449,7 @@ impl Program {
         let (warm, broken) = std::thread::scope(|scope| {
             let check = {
                 let (db, edited) = (db.clone(), &edited);
-                scope.spawn(move || broken_in(&db, edited))
+                scope.spawn(move || broken_in(&db, edited, paths))
             };
             let warm = build(db, table, args, known, listed);
             (warm, check.join().ok().flatten())
@@ -5425,8 +5466,7 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = unnamed
-            .or_else(|| refusal(db, &edited, paths, out_of_date))
-            .or(broken)
+            .or_else(|| refusal(db, &edited, paths, broken, out_of_date))
             .or_else(|| warm.unset.clone());
         failed = failed.or_else(|| stale_copies(db, table, args));
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));

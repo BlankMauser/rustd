@@ -189,6 +189,12 @@ pub(crate) struct Checkout {
 }
 
 impl Checkout {
+    /// Whether one of the source files was written after `then`.
+    fn written_since(&self, then: SystemTime) -> bool {
+        let written = |file: &PathBuf| std::fs::metadata(file).and_then(|it| it.modified());
+        self.sources.iter().any(|file| written(file).is_ok_and(|it| it > then))
+    }
+
     fn project(&self) -> PathBuf {
         self.root.join(&self.config.project)
     }
@@ -223,7 +229,7 @@ enum Warmth {
     Loading(Instant),
     Ready,
     /// Why the worker has no part in the checkout as cargo last built it.
-    Failed(String),
+    Failed(String, SystemTime),
 }
 
 impl Warmth {
@@ -231,7 +237,7 @@ impl Warmth {
         match self {
             Warmth::Loading(since) => format!("loading for {:.0?}", since.elapsed()),
             Warmth::Ready => "ready".to_owned(),
-            Warmth::Failed(why) => format!("failed: {why}"),
+            Warmth::Failed(why, _) => format!("failed: {why}"),
         }
     }
 }
@@ -365,7 +371,7 @@ impl Worker {
     fn warm(&self, checkout: &Checkout, started_on: bool) {
         let warmth = match self.warmed(checkout, started_on) {
             Ok(()) => Warmth::Ready,
-            Err(why) => Warmth::Failed(format!("{why:#}")),
+            Err(why) => Warmth::Failed(format!("{why:#}"), SystemTime::now()),
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
         self.set(&checkout.key, warmth);
@@ -726,7 +732,10 @@ impl Daemon {
         *lock(&worker.asked) = Instant::now();
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {
             Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
+            _ => Warmth::Failed(
+                "the daemon has not loaded this build of the workspace".to_owned(),
+                SystemTime::now(),
+            ),
         };
         match warmth {
             Warmth::Ready => worker.sync(checkout),
@@ -736,7 +745,7 @@ impl Daemon {
                     since.elapsed()
                 ),
             },
-            Warmth::Failed(reason) => Reply::Cold { reason },
+            Warmth::Failed(reason, _) => Reply::Cold { reason },
         }
     }
 
@@ -765,17 +774,24 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
-        // What a worker could not load once it can't load again, until cargo builds anew.
+        // What a worker could not load once it can't load again, until cargo builds anew or
+        // a source is written: the failure may be an error in the source.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
-            Some(Loaded { generation, warmth: Warmth::Failed(why), .. })
+            Some(Loaded { generation, warmth: Warmth::Failed(why, at), .. })
                 if *generation == checkout.generation =>
             {
-                Some(why.clone())
+                Some((why.clone(), *at))
             }
             _ => None,
         });
-        if let Some(why) = failed {
-            anyhow::bail!(why);
+        match failed {
+            Some((why, at)) if !checkout.written_since(at) => anyhow::bail!(why),
+            Some(_) => {
+                if let Some(old) = workers.remove(&id) {
+                    old.stop();
+                }
+            }
+            None => {}
         }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
