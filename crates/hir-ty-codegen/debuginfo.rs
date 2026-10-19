@@ -415,6 +415,60 @@ impl DebugContext {
     }
 }
 
+/// A [`DebugContext`] on a thread of its own, which describes the functions it is sent
+/// while the thread that sends them goes on putting code in the object.
+pub(super) struct Describer {
+    functions: std::sync::mpsc::Sender<(FuncId, u32, FunctionDebug)>,
+    described: std::thread::JoinHandle<Described>,
+}
+
+/// What a [`Describer`] ends with.
+enum Described {
+    /// The sections, written already.
+    Sections(Result<Vec<Section>, String>),
+    /// What writes them once it has the object to look into.
+    Context(DebugContext),
+}
+
+impl Describer {
+    pub(super) fn new(mut context: DebugContext) -> Describer {
+        let (functions, sent) = std::sync::mpsc::channel::<(FuncId, u32, FunctionDebug)>();
+        let described = std::thread::spawn(move || {
+            for (func, len, debug) in sent {
+                context.add_function(func, len, &debug);
+            }
+            match context {
+                DebugContext::Dwarf(dwarf) if dwarf.apart.is_none() => {
+                    Described::Sections(dwarf.sections())
+                }
+                context => Described::Context(context),
+            }
+        });
+        Describer { functions, described }
+    }
+
+    /// Describes the function `func` of the module, which is `len` bytes of code.
+    pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
+        // The thread ends only when it panicked, which `emit` says.
+        let _ = self.functions.send((func, len, debug));
+    }
+
+    /// Writes the sections into the object, when it has a function to describe. What is
+    /// returned is what was kept apart from the object.
+    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
+        drop(self.functions);
+        match self.described.join().map_err(|_| "describing the functions panicked")? {
+            Described::Sections(sections) => {
+                if product.object.format() == BinaryFormat::Elf {
+                    place(product, sections?)?;
+                }
+                Ok(Vec::new())
+            }
+            Described::Context(context) => context.emit(product),
+        }
+    }
+}
+
 /// How many functions a compilation unit describes before the next one is begun. What reads
 /// a unit reads all of it to find one function, so a unit of every function of a large
 /// object takes a debugger or `addr2line` a second to answer from.
@@ -1007,6 +1061,28 @@ impl Dwarf {
         }
     }
 
+    /// The sections of the units, none of which is kept apart: none when no function is
+    /// described.
+    fn sections(mut self) -> Result<Vec<Section>, String> {
+        self.end_unit();
+        let mut sections = Vec::new();
+        if self.full.is_empty() {
+            return Ok(sections);
+        }
+        let mut dwarf = gimli::write::Dwarf::new();
+        (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
+        for unit in self.full {
+            dwarf.units.add(unit);
+        }
+        let mut written = Sections::new(SectionWriter::default());
+        dwarf.write(&mut written).map_err(|e| e.to_string())?;
+        written.for_each(|id, section: &SectionWriter| {
+            sections.push(Section { id, written: section.clone() });
+            Ok::<_, String>(())
+        })?;
+        Ok(sections)
+    }
+
     /// Writes the sections into the object, when it has a function to describe.
     /// Answers the files of what is kept apart from it.
     fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
@@ -1014,34 +1090,15 @@ impl Dwarf {
         if product.object.format() != BinaryFormat::Elf {
             return Ok(Vec::new());
         }
-        let (sections, files) = match self.apart {
-            Some((name, apart)) => {
-                let mut split =
-                    split::Split::new(self.encoding, self.directory, name, &product.object);
-                for unit in apart {
-                    split.add(unit)?;
-                }
-                split.finish()
-            }
-            None => {
-                if self.full.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let mut dwarf = gimli::write::Dwarf::new();
-                (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
-                for unit in self.full {
-                    dwarf.units.add(unit);
-                }
-                let mut written = Sections::new(SectionWriter::default());
-                dwarf.write(&mut written).map_err(|e| e.to_string())?;
-                let mut sections = Vec::new();
-                written.for_each(|id, section: &SectionWriter| {
-                    sections.push(Section { id, written: section.clone() });
-                    Ok::<_, String>(())
-                })?;
-                (sections, Vec::new())
-            }
+        let Some((name, apart)) = self.apart.take() else {
+            place(product, self.sections()?)?;
+            return Ok(Vec::new());
         };
+        let mut split = split::Split::new(self.encoding, self.directory, name, &product.object);
+        for unit in apart {
+            split.add(unit)?;
+        }
+        let (sections, files) = split.finish();
         place(product, sections)?;
         Ok(files)
     }

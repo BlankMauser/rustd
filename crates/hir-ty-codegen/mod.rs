@@ -988,7 +988,7 @@ struct ObjectCodegen<'a, 'db> {
     module: ObjectModule,
     unwind: UnwindContext,
     /// What a debugger is told about the functions, when the build tells one anything.
-    debug: Option<DebugContext>,
+    debug: Option<debuginfo::Describer>,
     /// The types of the variables a debugger is told of, by the environment they are in.
     types: OwnTypes<'db>,
     /// What those types are told as, and the ones the threads that compile told of.
@@ -1269,6 +1269,35 @@ fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnv
 fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u64 {
     compiled_static(db, id);
     next_serial()
+}
+
+/// Where the code from an offset on is written: the file, the line and the column.
+type Row = (u32, base_db::FileId, u32, u32);
+
+/// The rows of the code of a non-generic function, in the order of [`Code::lines`].
+#[salsa::tracked(returns(ref))]
+fn root_rows(db: &dyn HirDatabase, func: FunctionId) -> Vec<Row> {
+    compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
+}
+
+/// The rows of the code of an instance, in the order of [`Code::lines`].
+#[salsa::tracked(returns(ref))]
+fn instance_rows(
+    db: &dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> Vec<Row> {
+    compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
+}
+
+fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
+    let Some((owner, spans)) = &compiled.source else { return Vec::new() };
+    let rows = compiled.code.lines.iter().filter_map(|row| {
+        let span = *spans.get(row.span as usize)?;
+        let (file, line, column) = (*row_location(db, *owner, compiled.closure, span))?;
+        Some((row.offset, file, line, column))
+    });
+    rows.collect()
 }
 
 /// The code of a non-generic function.
@@ -2850,6 +2879,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let apart = symbols.debug_apart().filter(|_| base.is_none());
         let debug = symbols.debug_directory().and_then(|directory| {
             DebugContext::new(module.isa(), &directory, symbols.describes_variables(), apart)
+                .map(debuginfo::Describer::new)
         });
         let debugged = debug.is_some();
         let mixed = settled::Mixed::of(db, symbols, &own_statics.crates);
@@ -3034,7 +3064,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = super::type_name::rustc_debug_function(db, func, &[])
             .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned());
         let declared = self.declaration_at(func);
-        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), declared);
+        let rows = self.debug.as_ref().map(|_| root_rows(db, func));
+        self.describe(id, compiled, rows, FunctionDebug::new(name, symbol.clone()), declared);
         Ok(symbol)
     }
 
@@ -3071,6 +3102,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
                             told.ahead(db, &mut FxHashMap::default(), compiled);
+                            instance_rows(db, instance.clone(), env.clone());
                         }
                     });
                     self.phases.compile += start.elapsed();
@@ -3187,14 +3219,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let (mut found, mut called) = (Vec::new(), Vec::new());
                 let compiled = match &job {
                     // One without a symbol is left to rustc, and so is what only it calls.
-                    either::Either::Left(root) => {
-                        symbols.function(*root).and_then(|_| compiled_root(db, *root).as_ref().ok())
-                    }
+                    either::Either::Left(root) => symbols.function(*root).and_then(|_| {
+                        if told.is_some() {
+                            root_rows(db, *root);
+                        }
+                        compiled_root(db, *root).as_ref().ok()
+                    }),
                     either::Either::Right((instance, env)) => {
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         let compiled = compiled.as_ref().ok();
                         if let (Some(compiled), Some(told)) = (compiled, told) {
                             told.ahead(db, &mut types, compiled);
+                            instance_rows(db, instance.clone(), env.clone());
                         }
                         compiled
                     }
@@ -3296,7 +3332,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             _ => None,
         };
         let known = known.unwrap_or_else(|| name.clone());
-        let debug = self.describe(id, compiled, FunctionDebug::new(known, name), declared);
+        let rows =
+            self.debug.as_ref().map(|_| instance_rows(self.db, instance.clone(), env.clone()));
+        let debug = self.describe(id, compiled, rows, FunctionDebug::new(known, name), declared);
         let tally = backend::Tally::global();
         tally.step(Step::StoreWrite, || self.keep(instance, compiled, &ids, debug));
         Ok(())
@@ -3350,32 +3388,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
-    /// has it, and which line each of its instructions is of. `None` when no debugger is
-    /// told anything.
+    /// has it, and which line each of its instructions is of, as `rows` have it. `None`
+    /// when no debugger is told anything, which is when there are no `rows`.
     fn describe(
         &mut self,
         id: FuncId,
         compiled: &CompiledFunction,
+        rows: Option<&Vec<Row>>,
         mut debug: FunctionDebug,
         declared: Option<(String, u32, u32)>,
     ) -> Option<FunctionDebug> {
-        self.debug.as_ref()?;
+        let rows = rows?;
         let start = stdx::time::Instant::now();
         if let Some((file, line, column)) = declared {
             debug.declared = Some(debug.place(file, line, column));
         }
-        if let Some((owner, spans)) = &compiled.source {
-            for row in &compiled.code.lines {
-                let Some(&span) = spans.get(row.span as usize) else { continue };
-                let Some((file, line, column)) =
-                    *row_location(self.db, *owner, compiled.closure, span)
-                else {
-                    continue;
-                };
-                let Some(file) = self.source_path(file) else { continue };
-                let place = debug.place(file, line, column);
-                debug.row(row.offset, place);
-            }
+        for &(offset, file, line, column) in rows {
+            let Some(file) = self.source_path(file) else { continue };
+            let place = debug.place(file, line, column);
+            debug.row(offset, place);
         }
         // Compiled code of no statement with a place is of where the function is written
         // throughout. A function that is its assembly has no lines, as rustc gives it none.
@@ -3403,7 +3434,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             describe_variables(db, *owner, types, variables, places, &scopes, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
-        self.debug.as_mut()?.add_function(id, len, &debug);
+        self.debug.as_ref()?.add_function(id, len, debug.clone());
         backend::Tally::global().add(Step::Describe, start.elapsed());
         Some(debug)
     }
@@ -3812,9 +3843,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let code = entry.code.code();
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
-        if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
+        if let (Some(debug), Some(of)) = (&self.debug, &entry.debug) {
             let len = code.bytes.len() as u32;
-            backend::Tally::global().step(Step::Describe, || debug.add_function(id, len, of));
+            backend::Tally::global()
+                .step(Step::Describe, || debug.add_function(id, len, of.clone()));
         }
         self.bodies += 1;
         self.kept.found += 1;

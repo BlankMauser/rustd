@@ -102,23 +102,97 @@ fn content(file: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
+/// A symbol of an object, and how it demangles when it is one of Rust's.
+struct Named {
+    name: String,
+    /// Whether only the object that defines it can link to it.
+    private: bool,
+    /// With the ids of the crates it names, and without them.
+    demangled: Option<(String, String)>,
+}
+
+impl Named {
+    fn new(name: &str, private: bool) -> Named {
+        // The memory a static points to is a symbol that demangles to the static's path.
+        let demangled = (!name.starts_with("_RNn"))
+            .then(|| rustc_demangle::try_demangle(name).ok())
+            .flatten()
+            // `{:#}` drops the crate disambiguator hashes.
+            .map(|it| (it.to_string(), format!("{it:#}")));
+        Named { name: name.to_owned(), private, demangled }
+    }
+}
+
+/// The symbols of each of `files`, which are objects or archives of them, read on every core.
+fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Named>>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let read = || {
+        let mut read = Vec::new();
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(file) = files.get(at) else { return read };
+            read.push((at, names_of_file(file)));
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(files.len());
+    let mut read: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..threads).map(|_| scope.spawn(read)).collect();
+        threads.into_iter().flat_map(|it| it.join().expect("reading symbols panicked")).collect()
+    });
+    read.sort_by_key(|it| it.0);
+    read.into_iter().map(|it| it.1).collect()
+}
+
+fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
+    let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let mut names = Vec::new();
+    match ArchiveFile::parse(&*data) {
+        Ok(archive) => {
+            for member in archive.members() {
+                names_of_object(member?.data(&*data)?, &mut names);
+            }
+        }
+        Err(_) => names_of_object(&data, &mut names),
+    }
+    Ok(names)
+}
+
+fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
+    // rlibs also hold `lib.rmeta`, which isn't an object file.
+    let Ok(object) = object::File::parse(data) else { return };
+    for symbol in object.symbols() {
+        // A reference is as good as a definition: something in the link defines it.
+        // Not `is_definition`, which leaves out thread locals.
+        // A wasm object's data is in segments, which are not sections.
+        let in_segment = object.format() == object::BinaryFormat::Wasm
+            && symbol.section() == object::SymbolSection::Unknown;
+        let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
+        let linkable = symbol.is_undefined() || (defined && symbol.is_global());
+        let private = defined && symbol.is_local() && symbol.kind() == SymbolKind::Text;
+        if !linkable && !private {
+            continue;
+        }
+        let Ok(name) = symbol.name() else { continue };
+        // Mach-O spells every name of C and Rust with an underscore in front, which the
+        // writer of an object adds back.
+        let name = match object.format() {
+            object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
+            _ => name,
+        };
+        names.push(Named::new(name, private));
+    }
+}
+
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
         let mut table = SymbolTable { read: Some(SystemTime::now()), ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
-        for file in files {
-            let data =
-                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+        for (file, names) in files.iter().zip(names_of(files)) {
             let first = symbols.len();
-            match ArchiveFile::parse(&*data) {
-                Ok(archive) => {
-                    for member in archive.members() {
-                        table.add_object(member?.data(&*data)?, &mut symbols);
-                    }
-                }
-                Err(_) => table.add_object(&data, &mut symbols),
+            for name in names? {
+                table.add_name(name, &mut symbols);
             }
             if let Some((name, sources)) = crate_sources(file, root) {
                 owners.push((name, sources[0].clone(), first..symbols.len()));
@@ -154,7 +228,7 @@ impl SymbolTable {
         let mut table = SymbolTable::default();
         let mut symbols = Vec::new();
         for name in names {
-            table.add_name(name, false, &mut symbols);
+            table.add_name(Named::new(name, false), &mut symbols);
         }
         table.index(symbols);
         table
@@ -211,43 +285,13 @@ impl SymbolTable {
         self.names.contains(&Self::hashed(symbol))
     }
 
-    fn add_object(&mut self, data: &[u8], symbols: &mut Vec<Symbol>) {
-        // rlibs also hold `lib.rmeta`, which isn't an object file.
-        let Ok(object) = object::File::parse(data) else { return };
-        for symbol in object.symbols() {
-            // A reference is as good as a definition: something in the link defines it.
-            // Not `is_definition`, which leaves out thread locals.
-            // A wasm object's data is in segments, which are not sections.
-            let in_segment = object.format() == object::BinaryFormat::Wasm
-                && symbol.section() == object::SymbolSection::Unknown;
-            let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
-            let linkable = symbol.is_undefined() || (defined && symbol.is_global());
-            let private = defined && symbol.is_local() && symbol.kind() == SymbolKind::Text;
-            if !linkable && !private {
-                continue;
-            }
-            let Ok(name) = symbol.name() else { continue };
-            // Mach-O spells every name of C and Rust with an underscore in front, which the
-            // writer of an object adds back.
-            let name = match object.format() {
-                object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
-                _ => name,
-            };
-            self.add_name(name, private, symbols);
+    fn add_name(&mut self, named: Named, symbols: &mut Vec<Symbol>) {
+        let Named { name, private, demangled } = named;
+        let instance = without_instantiating_crate(&name);
+        if !private && self.names.insert(Self::hashed(&name)) && instance.len() != name.len() {
+            self.copies.entry(instance.to_owned()).or_default().push(name.clone());
         }
-    }
-
-    fn add_name(&mut self, name: &str, private: bool, symbols: &mut Vec<Symbol>) {
-        let instance = without_instantiating_crate(name);
-        if !private && self.names.insert(Self::hashed(name)) && instance.len() != name.len() {
-            self.copies.entry(instance.to_owned()).or_default().push(name.to_owned());
-        }
-        // The memory a static points to is a symbol that demangles to the static's path.
-        if name.starts_with("_RNn") {
-            return;
-        }
-        let Ok(demangled) = rustc_demangle::try_demangle(name) else { return };
-        let with_ids = demangled.to_string();
+        let Some((with_ids, path)) = demangled else { return };
         for (krate, id) in crate_ids(&with_ids) {
             match self.crates.get_mut(krate) {
                 Some(known) if *known != Some(id) => *known = None,
@@ -257,21 +301,14 @@ impl SymbolTable {
                 }
             }
         }
-        let path = format!("{demangled:#}");
         if instance.len() != name.len()
-            && let Some(maker) = V0::instantiating_crate(name)
+            && let Some(maker) = V0::instantiating_crate(&name)
             && let Some(function) = function_name(&path)
         {
             self.makers.entry(function).or_default().insert(maker);
         }
-        // `{:#}` drops the crate disambiguator hashes.
-        symbols.push(Symbol {
-            private,
-            name: name.to_owned(),
-            place: V0::place(name),
-            with_ids,
-            path,
-        });
+        let place = V0::place(&name);
+        symbols.push(Symbol { private, name, place, with_ids, path });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
