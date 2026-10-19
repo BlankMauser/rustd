@@ -31,7 +31,7 @@ use super::{
 /// What a compiled function or static was when the base took it in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Mark {
-    serial: u64,
+    serial: u128,
     /// The source locations it reports, which stitching fills in.
     locations: u64,
     /// The lines its code is of, when a debugger is told them.
@@ -39,7 +39,7 @@ struct Mark {
 }
 
 impl Mark {
-    fn new(db: &dyn HirDatabase, serial: u64, requests: &Requests) -> Mark {
+    fn new(db: &dyn HirDatabase, serial: u128, requests: &Requests) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
         for request in &requests.datas {
             match request {
@@ -57,7 +57,7 @@ impl Mark {
     /// and a line of it is another: an edit above it in the file moves them all.
     fn of_function(
         db: &dyn HirDatabase,
-        serial: u64,
+        serial: u128,
         compiled: &CompiledFunction,
         debug: bool,
     ) -> Mark {
@@ -122,7 +122,7 @@ pub(super) struct BaseInstance {
 struct TheirInstance {
     instance: Instance,
     env: StoredParamEnvAndCrate,
-    serial: Option<u64>,
+    serial: Option<u128>,
     files: Option<Box<[FileId]>>,
 }
 
@@ -130,7 +130,7 @@ struct TheirInstance {
 #[derive(Clone)]
 struct TheirStatic {
     id: StaticId,
-    serial: Option<u64>,
+    serial: Option<u128>,
     krate: Crate,
     file: FileId,
 }

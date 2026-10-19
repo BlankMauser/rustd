@@ -16,19 +16,14 @@ mod state;
 mod switch;
 mod units;
 
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    process::{Command, Stdio},
-    time::Instant,
-};
+use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
 
 use anyhow::Context as _;
 
 use cli::{Asked, Invocation, Subcommand};
 use client::Start;
 use daemon::{Checkout, Reply, Request};
-use state::{Built, Counts, State};
+use state::{Built, Counts, Staged, State};
 
 /// `rustd cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -107,20 +102,26 @@ fn plain_cargo(args: Vec<String>) -> anyhow::Result<i32> {
     Ok(run::exit_code(status))
 }
 
-/// Builds what `asked` names, by the daemon when it can and by cargo otherwise, and then
-/// runs what the subcommand runs.
+/// Builds what `asked` names and then runs what the subcommand runs. Cargo builds what
+/// the daemon has not been given yet and what only cargo acts on (a manifest, a build
+/// script); a program the daemon was asked for and did not build fails the build.
 fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let key = asked.key(&cwd);
-    let known = State::read(&key);
-    let state = match known.map(|state| by_daemon(state, asked)) {
-        Ok(Err(Left::WithErrors(code))) => return Ok(code),
+    let finished = |state: &State| {
+        let took = started.elapsed().as_secs_f64();
+        let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
+        say::status(asked.flags.quiet, "Finished", &finished);
+    };
+    let state = match State::read(&key).map(|state| by_daemon(state)) {
         Ok(Ok(state)) => {
-            let took = started.elapsed().as_secs_f64();
-            let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
-            say::status(asked.flags.quiet, "Finished", &finished);
+            finished(&state);
             state
+        }
+        Ok(Err(Left::Failed(why))) => {
+            say::error(&why);
+            return Ok(FAILED);
         }
         Ok(Err(Left::ToCargo(state, reason))) => {
             say::fallback(&reason, "building with cargo");
@@ -135,9 +136,25 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             if let Some(why) = unread {
                 say::fallback(why, "building with cargo");
             }
-            match by_cargo(asked, &cwd, &key, Counts::default())? {
-                Ok(state) => state,
-                Err(code) => return Ok(code),
+            match staged(asked, &cwd, &key)? {
+                Ok(state) => {
+                    finished(&state);
+                    state
+                }
+                Err(NotStaged::Failed(code)) => return Ok(code),
+                Err(NotStaged::Daemons(why)) => {
+                    say::error(&why);
+                    return Ok(FAILED);
+                }
+                Err(NotStaged::Cargos(why)) => {
+                    if let Some(why) = why {
+                        say::fallback(&why, "building with cargo");
+                    }
+                    match by_cargo(asked, &cwd, &key, Counts::default())? {
+                        Ok(state) => state,
+                        Err(code) => return Ok(code),
+                    }
+                }
             }
         }
     };
@@ -145,85 +162,128 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     after_build(asked, &state, &cwd)
 }
 
+/// The status of a build that failed, as cargo's of one rustc turned down.
+const FAILED: i32 = 101;
+
+/// Why the first build of a workspace is not rustc's of what the workspace depends on and
+/// the daemon's of the workspace.
+enum NotStaged {
+    /// Cargo failed, with this status: rustc turned the source down.
+    Failed(i32),
+    /// Cargo builds all of it, which it has not begun to, and why when that is worth a line.
+    Cargos(Option<String>),
+    /// Cargo built its part and the daemon did not build a program, and why.
+    Daemons(String),
+}
+
+/// The first build of a workspace: cargo has rustc build what the workspace depends on
+/// and check the crates of the workspace, and the daemon compiles those. Every program is
+/// the daemon's: cargo linked only what stands in for it.
+fn staged(asked: &Invocation, cwd: &Path, key: &str) -> anyhow::Result<Result<State, NotStaged>> {
+    if std::env::var_os(STAGED).is_none_or(|it| it == "0") {
+        return Ok(Err(NotStaged::Cargos(None)));
+    }
+    let crates = match Staged::of(asked)? {
+        Ok(crates) => crates,
+        Err(why) => return Ok(Err(NotStaged::Cargos(Some(why)))),
+    };
+    State::give_back(key);
+    let ahead = crates.ahead.as_ref().map(|ahead| {
+        // Without an answer the daemon loads the workspace once cargo is done.
+        let _ = client::ask(Request::Ahead(ahead.clone()), Start::IfMissing);
+        ahead.config.id()
+    });
+    let state = match Built::staged(asked, &crates)? {
+        Ok(built) => daemons(asked, cwd, key, built)
+            .unwrap_or_else(|why| Err(format!("{why:#}")))
+            .map_err(NotStaged::Daemons),
+        Err(code) => Err(NotStaged::Failed(code)),
+    };
+    if let (Err(_), Some(id)) = (&state, ahead) {
+        let _ = client::ask(Request::Forget(id), Start::Never);
+    }
+    Ok(state)
+}
+
+/// The programs of a build whose workspace crates cargo built what stands in for, as the
+/// daemon builds them. `Err` is why it did not build one.
+fn daemons(
+    asked: &Invocation,
+    cwd: &Path,
+    key: &str,
+    built: Built,
+) -> anyhow::Result<Result<State, String>> {
+    let state = State::after(asked, cwd, key, built, Counts::default())?;
+    Ok(first_by_daemon(state))
+}
+
+fn first_by_daemon(mut state: State) -> Result<State, String> {
+    if let Some(why) = &state.refusal {
+        return Err(why.clone());
+    }
+    if let Some((program, why)) = state.left_to_cargo().next() {
+        return Err(format!("`{}`: {why}", program.name));
+    }
+    let answers = state.checkouts.iter().map(built).collect::<Result<Vec<_>, _>>()?;
+    let cargos = state.settle(&answers)?;
+    if let Some((_, why)) = cargos.first() {
+        return Err(why.clone());
+    }
+    // What cargo linked stands in for the program, and is not what it is while its source
+    // is unchanged: the daemon's is.
+    state.keep_daemons().map_err(|why| format!("{why:#}"))?;
+    state.counts.served += 1;
+    Ok(state)
+}
+
+/// The variable that has the first build of a workspace be the daemon's too.
+const STAGED: &str = "RUSTD_FIRST_BUILD";
+
 /// Why the daemon's programs are not the build.
 enum Left {
-    /// The build is cargo's, with the state so far and the reason.
+    /// The build is cargo's, with the state so far and the reason: something cargo acts
+    /// on changed, or the build is one the daemon is never asked for.
     ToCargo(Box<State>, String),
-    /// `cargo check` turned the source down and said why; this is its exit status.
-    WithErrors(i32),
+    /// The daemon did not build a program, and why.
+    Failed(String),
 }
 
 /// Has the daemon bring the programs of `state` up to date and puts them where cargo has
-/// them, once `cargo check` has passed the source as it is now: the daemon has no borrow
-/// checker and builds programs rustc turns down, and the warnings are rustc's to give. A program the
-/// daemon does not build stays as cargo built it while its source is what cargo compiled.
-fn by_daemon(mut state: State, typed: &Invocation) -> Result<State, Left> {
-    if let Some(reason) = state.refusal.clone().or_else(|| state.broken_guard()) {
+/// them. Rustc sees none of it: the daemon builds what rust-analyzer passes, which has no
+/// borrow checker and few of rustc's lints.
+fn by_daemon(mut state: State) -> Result<State, Left> {
+    let cargos = state.refusal.clone().or_else(|| state.broken_guard());
+    if let Some(reason) = cargos.or_else(|| state.stale_cargos()) {
         return Err(Left::ToCargo(Box::new(state), reason));
     }
-    let checking = state.unchecked().then(|| (units::stamp_now(), check_of(typed).spawn()));
-    let asked: Vec<Result<Vec<Result<(), String>>, String>> =
-        state.checkouts.iter().map(synced).collect();
-    if let Some((began, checking)) = checking {
-        match checking.and_then(|mut check| check.wait()) {
-            Ok(status) if status.success() => state.checked(began),
-            Ok(status) => return Err(Left::WithErrors(run::exit_code(status))),
-            Err(error) => {
-                let reason = format!("`cargo check` did not run: {error}");
-                return Err(Left::ToCargo(Box::new(state), reason));
-            }
-        }
-    }
-    let answers: Vec<Vec<Result<(), String>>> = std::iter::zip(&asked, &state.checkouts)
-        .map(|(answer, checkout)| match answer {
-            Ok(programs) => programs.clone(),
-            Err(cold) => vec![Err(cold.clone()); checkout.programs.len()],
-        })
-        .collect();
-    let cargos = match state.settle(&answers) {
-        Ok(cargos) => cargos,
-        Err(reason) => return Err(Left::ToCargo(Box::new(state), reason)),
-    };
-    let unchanged = "it is as cargo built it, and its source has not changed";
-    for (answer, checkout) in std::iter::zip(&asked, &state.checkouts) {
-        let (Err(cold), false) = (answer, checkout.programs.is_empty()) else { continue };
-        // Loaded now, the daemon builds what changes next.
-        match warmed(checkout) {
-            Ok(()) => say::fallback(cold, "nothing has changed since cargo built"),
-            Err(why) => say::fallback(&why, "nothing has changed since cargo built"),
-        }
-    }
-    for (program, why) in &cargos {
-        let asked_of_worker = program.asked_as.is_some_and(|(checkout, _)| asked[checkout].is_ok());
-        if asked_of_worker {
-            say::fallback(&format!("`{}`: {why}", program.name), unchanged);
-        }
-    }
+    let answers =
+        state.checkouts.iter().map(built).collect::<Result<Vec<_>, _>>().map_err(Left::Failed)?;
+    let cargos = state.settle(&answers).map_err(Left::Failed)?;
     let served = cargos.len() < state.programs.len() || state.programs.is_empty();
     state.counts.served += u64::from(served);
     Ok(state)
 }
 
-/// Asks the daemon for the programs of `checkout`, and says how each went. `Err` is why it
-/// has no part in any.
-pub(super) fn synced(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
+/// Has the daemon build the programs of `checkout`, loading it first when it has not.
+/// `Err` is why a program is not built.
+pub(super) fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, String> {
     if checkout.programs.is_empty() {
         return Ok(Vec::new());
     }
-    // The daemon knows the source files from when it was told to load them.
-    let asked = Checkout { sources: Vec::new(), ..asking(checkout) };
-    let reply = client::ask(Request::Sync(asked), Start::Never).map_err(|it| format!("{it:#}"))?;
-    match reply {
-        None => Err(client::why_none()),
-        Some(Reply::Synced { programs }) => {
-            Ok(programs.into_iter().map(|it| it.map(drop)).collect())
-        }
-        Some(Reply::Cold { reason }) => Err(reason),
-        Some(Reply::Restart { version }) => {
-            Err(format!("the daemon running is another build of rustd ({version}), it is replaced"))
-        }
-        Some(other) => Err(format!("the daemon answered {other:?}")),
-    }
+    let reply = client::ask(Request::Build(asking(checkout)), Start::IfMissing)
+        .map_err(|it| format!("{it:#}"))?;
+    let programs = match reply {
+        Some(Reply::Synced { programs }) => programs,
+        None => return Err(client::why_none()),
+        Some(Reply::Cold { reason }) => return Err(reason),
+        Some(other) => return Err(format!("the daemon answered {other:?}")),
+    };
+    std::iter::zip(&checkout.programs, programs)
+        .map(|(program, built)| match built {
+            Ok(_) => Ok(Ok(())),
+            Err(why) => Err(format!("rustd did not build {}: {why}", program.binary.display())),
+        })
+        .collect()
 }
 
 /// `checkout` as a request names it: with the variables of this process, which `env!`
@@ -246,37 +306,6 @@ fn warmed(checkout: &Checkout) -> Result<(), String> {
     }
 }
 
-/// The `cargo check` of what `asked` builds: the same packages, targets, features and
-/// profile, and for `test` the test targets with `cfg(test)`. It says what rustc has to
-/// say and nothing of its own.
-fn check_of(asked: &Invocation) -> Command {
-    let mut check = Command::new(state::cargo_path());
-    check.arg("check").args(&asked.build_args).stdin(Stdio::null()).stdout(Stdio::null());
-    if !asked.flags.quiet {
-        check.arg("--quiet");
-    }
-    if asked.subcommand == Subcommand::Test {
-        if !asked.flags.selects_targets {
-            check.arg("--tests");
-        }
-        if asked.flags.profile.is_none() {
-            check.args(["--profile", "test"]);
-        }
-    }
-    check
-}
-
-/// Has cargo check the dependencies of what `asked` builds while the daemon loads, so
-/// that the check of the first build by the daemon has only the workspace to look at.
-/// Nobody waits for it: a check that comes while it runs waits for cargo's lock.
-fn check_ahead(asked: &Invocation) {
-    let mut check = check_of(asked);
-    check.stderr(Stdio::null());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut check, 0);
-    let _ = check.spawn();
-}
-
 /// Builds with cargo, and has the daemon load what cargo built for the builds to come.
 /// `Err` is cargo's exit status when it failed.
 fn by_cargo(
@@ -292,7 +321,6 @@ fn by_cargo(
     };
     let mut state = State::after(asked, cwd, key, built, counts)?;
     if state.refusal.is_none() {
-        check_ahead(asked);
         let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
         let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();
         for why in cold {

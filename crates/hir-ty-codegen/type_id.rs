@@ -41,7 +41,7 @@ use crate::{
 
 /// rustc's `Fingerprint`, which is also the shape of a `DefPathHash`: the crate, then the item.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Fingerprint(u64, u64);
+pub(super) struct Fingerprint(pub(super) u64, pub(super) u64);
 
 impl FromStableHash for Fingerprint {
     type Hash = SipHasher128Hash;
@@ -118,6 +118,12 @@ pub(super) struct TypeIdHasher<'a, 'db> {
     signatures: usize,
     /// The crates whose code is ours.
     owned: &'a FxHashSet<Crate>,
+    /// Whether a hash of our own will do: see [`Self::type_id`].
+    ours: bool,
+    /// Whether the type names something of a crate rustc compiled nothing of.
+    unbuilt: bool,
+    /// The innermost type that could not be hashed.
+    pub(super) stuck: Option<String>,
 }
 
 impl<'a, 'db> TypeIdHasher<'a, 'db> {
@@ -126,25 +132,103 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         symbols: &'a dyn SymbolResolver,
         owned: &'a FxHashSet<Crate>,
     ) -> Self {
-        Self { db, symbols, binders: Vec::new(), signatures: 0, owned }
+        Self {
+            db,
+            symbols,
+            binders: Vec::new(),
+            signatures: 0,
+            owned,
+            ours: false,
+            unbuilt: false,
+            stuck: None,
+        }
     }
 
+    /// rustc's hash of the type, or one of our own for a type that names something of a crate
+    /// rustc compiled nothing of: only code instantiated with such a type can ask for its
+    /// `TypeId`, and that code is all ours, so there is no hash of rustc's to agree with. Ours
+    /// stands on what the type is written in rather than on where, so that it is the same in
+    /// every build.
     pub(super) fn type_id(&mut self, ty: Ty<'db>) -> Option<u128> {
         let mut hasher = StableSipHasher128::new();
-        self.ty(&mut hasher, ty)?;
+        if self.ty(&mut hasher, ty).is_none() {
+            (self.ours, self.unbuilt, self.stuck) = (true, false, None);
+            self.binders.clear();
+            self.signatures = 0;
+            hasher = StableSipHasher128::new();
+            hasher.write(b"rustd type");
+            self.ty(&mut hasher, ty)?;
+            if !self.unbuilt {
+                return None;
+            }
+        }
         let Fingerprint(low, high) = hasher.finish();
         Some(u128::from(low) | u128::from(high) << 64)
     }
 
-    fn crate_root(&self, krate: Crate) -> Option<Fingerprint> {
+    fn crate_root(&mut self, krate: Crate) -> Option<Fingerprint> {
+        self.unbuilt |= !self.symbols.rustc_built(krate);
         self.symbols.stable_crate_id(krate).map(Fingerprint::crate_root)
     }
 
-    fn module(&self, module: ModuleIdLt<'db>) -> Option<Fingerprint> {
+    /// What a block is written in, told apart from the other blocks of it by where it is.
+    fn block(&mut self, block: hir_def::BlockIdLt<'db>) -> Option<Fingerprint> {
+        let db = self.db;
+        let (owner, _) = crate::mir::type_name::block_owner(db, block)?;
+        let (container, name, place) = match owner {
+            DefWithBodyId::FunctionId(it) => {
+                (it.lookup(db).container, FunctionSignature::of(db, it).name.clone(), 0)
+            }
+            DefWithBodyId::ConstId(it) => {
+                let loc = it.lookup(db);
+                match hir_def::signatures::ConstSignature::of(db, it).name.clone() {
+                    Some(name) => (loc.container, name, 0),
+                    // One `const _` of many: by where it is.
+                    None => (
+                        loc.container,
+                        hir_expand::name::Name::new_symbol_root(intern::sym::underscore),
+                        loc.id.value.erase().into_raw(),
+                    ),
+                }
+            }
+            DefWithBodyId::StaticId(it) => (
+                it.lookup(db).container,
+                hir_def::signatures::StaticSignature::of(db, it).name.clone(),
+                0,
+            ),
+            _ => return None,
+        };
+        let parent = match container {
+            ItemContainerId::ModuleId(module) => self.module(module)?,
+            ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
+            ItemContainerId::ImplId(id) => self.own_impl(id)?,
+            ItemContainerId::ExternBlockId(_) => return None,
+        };
+        let owner = parent.child_at(DefPathData::ValueNs(name.as_str()), place);
+        Some(owner.child_at(DefPathData::AnonConst, block.ast_id(db).value.erase().into_raw()))
+    }
+
+    /// An `impl` by what it is of, where rustc counts the `impl`s before it.
+    fn own_impl(&mut self, id: hir_def::ImplId) -> Option<Fingerprint> {
+        let db = self.db;
+        let module = self.module(id.lookup(db).container)?;
+        let mut hasher = StableSipHasher128::new();
+        module.hash(&mut hasher);
+        self.ty(&mut hasher, db.impl_self_ty(id).instantiate_identity().skip_norm_wip())?;
+        if let Some(trait_ref) = db.impl_trait(id) {
+            let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
+            self.trait_path(trait_ref.def_id.0)?.hash(&mut hasher);
+            self.args(trait_ref.args)?.hash(&mut hasher);
+        }
+        let Fingerprint(_, local) = hasher.finish();
+        Some(Fingerprint(module.0, local))
+    }
+
+    fn module(&mut self, module: ModuleIdLt<'db>) -> Option<Fingerprint> {
         let db = self.db;
         // An item in a body is a child of what the body belongs to, which a module does not say.
         if module.is_block_module(db) {
-            return None;
+            return if self.ours { self.block(module.block(db)?) } else { None };
         }
         match module.containing_module(db) {
             Some(parent) => {
@@ -155,7 +239,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         }
     }
 
-    fn adt_path(&self, adt: AdtId) -> Option<Fingerprint> {
+    fn adt_path(&mut self, adt: AdtId) -> Option<Fingerprint> {
         let db = self.db;
         let name = match adt {
             AdtId::StructId(it) => &StructSignature::of(db, it).name,
@@ -163,7 +247,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             AdtId::EnumId(it) => &EnumSignature::of(db, it).name,
         };
         let module = adt.module(db);
-        let parent = if module.is_block_module(db) {
+        let parent = if module.is_block_module(db) && !self.ours {
             self.body_path(self.symbols.declared_in(adt)?)?
         } else {
             self.module(module)?
@@ -172,9 +256,10 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     }
 
     /// A function that the items of its body are children of.
-    fn body_path(&self, func: FunctionId) -> Option<Fingerprint> {
+    fn body_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
         let parent = match func.lookup(db).container {
+            ItemContainerId::ImplId(id) if self.ours => self.own_impl(id)?,
             ItemContainerId::ImplId(id) => {
                 let earlier = self.symbols.impl_place(id)?;
                 self.module(id.lookup(db).container)?.child_at(DefPathData::Impl, earlier)
@@ -190,7 +275,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Some(parent.child_at(DefPathData::ValueNs(name.as_str()), earlier))
     }
 
-    fn assoc_type_path(&self, alias: TypeAliasId) -> Option<Fingerprint> {
+    fn assoc_type_path(&mut self, alias: TypeAliasId) -> Option<Fingerprint> {
         let ItemContainerId::TraitId(trait_) = alias.lookup(self.db).container else {
             return None;
         };
@@ -198,22 +283,55 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Some(self.trait_path(trait_)?.child(DefPathData::TypeNs(name.as_str())))
     }
 
-    fn trait_path(&self, trait_: TraitId) -> Option<Fingerprint> {
+    fn trait_path(&mut self, trait_: TraitId) -> Option<Fingerprint> {
         let name = &TraitSignature::of(self.db, trait_).name;
         Some(self.module(trait_.module(self.db))?.child(DefPathData::TypeNs(name.as_str())))
     }
 
     /// A function of a module or a trait. One of an `impl` is under the `impl`'s disambiguator,
     /// which counts the `impl`s before it as rustc saw them.
-    fn function_path(&self, func: FunctionId) -> Option<Fingerprint> {
+    fn function_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
+        let name = &FunctionSignature::of(db, func).name;
         let parent = match func.lookup(db).container {
+            ItemContainerId::ModuleId(module) if module.is_block_module(db) && !self.ours => {
+                self.around_local(module.block(db)?, name)?
+            }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ImplId(_) | ItemContainerId::ExternBlockId(_) => return None,
         };
-        let name = &FunctionSignature::of(db, func).name;
         Some(parent.child(DefPathData::ValueNs(name.as_str())))
+    }
+
+    /// The function whose body declares, in `block`, the one function of it named `name`:
+    /// rustc makes that function a child of this one, whichever block it is written in.
+    fn around_local(
+        &mut self,
+        block: hir_def::BlockIdLt<'db>,
+        name: &hir_expand::name::Name,
+    ) -> Option<Fingerprint> {
+        let db = self.db;
+        let (owner, _) = crate::mir::type_name::block_owner(db, block)?;
+        let DefWithBodyId::FunctionId(around) = owner else { return None };
+        // One written in a closure is a child of the closure.
+        if !crate::mir::type_name::is_outside_closures(db, owner, block) {
+            return None;
+        }
+        let named_so = hir_def::expr_store::Body::of(db, owner)
+            .blocks(db)
+            .flat_map(|(_, def_map)| def_map.modules(db))
+            .flat_map(|(_, module)| module.scope(db).declarations())
+            .filter(|def| match def {
+                hir_def::ModuleDefId::FunctionId(it) => {
+                    FunctionSignature::of(db, *it).name == *name
+                }
+                _ => false,
+            });
+        if named_so.count() != 1 {
+            return None;
+        }
+        self.body_path(around)
     }
 
     /// A closure of a crate we compile, which is named by what only we know.
@@ -224,7 +342,11 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// function it is written in is, so there is no hash of rustc's to agree with.
     // FIXME: a function of the crate that is left to rustc, and got the closure from one that
     // is ours, has rustc's hash for it.
-    fn closure(&self, hasher: &mut StableSipHasher128, closure: InternedClosure<'_>) -> Option<()> {
+    fn closure(
+        &mut self,
+        hasher: &mut StableSipHasher128,
+        closure: InternedClosure<'_>,
+    ) -> Option<()> {
         let db = self.db;
         let InternedClosure { owner, expr, .. } = closure;
         let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
@@ -261,6 +383,14 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     }
 
     fn ty(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
+        let hashed = self.kind(hasher, ty);
+        if hashed.is_none() && self.stuck.is_none() {
+            self.stuck = Some(format!("{ty:?}"));
+        }
+        hashed
+    }
+
+    fn kind(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
         let mutability = |hasher: &mut StableSipHasher128, it| {
             hasher.write_isize(match it {
                 Mutability::Not => 0,
@@ -450,6 +580,11 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 self.region(hasher, region)?;
             }
             TyKind::Never => hasher.write_isize(21),
+            // What an `impl` is generic over, in the type it is of.
+            TyKind::Param(param) if self.ours => {
+                hasher.write_isize(23);
+                hasher.write_u32(param.index);
+            }
             TyKind::Tuple(tys) => {
                 hasher.write_isize(22);
                 self.list(hasher, tys.iter(), |this, list, ty| this.ty(list, ty))?;
@@ -497,7 +632,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     fn region(&mut self, hasher: &mut StableSipHasher128, region: Region<'db>) -> Option<()> {
         let RegionKind::ReBound(index, bound) = region.kind() else {
             // An error in a signature is a lifetime nothing settled, which rustc may have bound.
-            if self.signatures > 0 && region.is_error() {
+            if self.signatures > 0 && region.is_error() && !self.ours {
                 return None;
             }
             // `ReErased`.
@@ -587,7 +722,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     }
 
     /// `AdtDefData`'s hash: the definition with its variants, fields and representation.
-    fn adt_def(&self, adt: AdtId) -> Option<Fingerprint> {
+    fn adt_def(&mut self, adt: AdtId) -> Option<Fingerprint> {
         let db = self.db;
         let did = self.adt_path(adt)?;
         let attrs = AttrFlags::query(db, adt.into());
@@ -705,7 +840,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
 
     /// A `VariantDef`. `path` is the variant's own, which for a struct or union is the type's.
     fn variant(
-        &self,
+        &mut self,
         hasher: &mut StableSipHasher128,
         path: Fingerprint,
         variant: VariantId,

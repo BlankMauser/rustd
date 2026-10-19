@@ -191,7 +191,16 @@ pub fn fetch_missing_with(fetch: FetchMissing) {
 /// sent to other machines now. Between builds a small pack is otherwise left open.
 pub fn seal_open() {
     if let Some(store) = Store::global() {
+        store.settled();
         store.settle(1);
+    }
+}
+
+/// Waits for the store of this process to have what the last build added. A process that
+/// ends before it does leaves that to be compiled again.
+pub fn settled() {
+    if let Some(store) = Store::global() {
+        store.settled();
     }
 }
 
@@ -867,6 +876,8 @@ pub(super) struct Store {
     /// Sealed packs that were not what their names say, and values that were not what
     /// their checksums say, since the last report.
     corrupt: AtomicUsize,
+    /// The thread that settles what the last build added, until someone waits for it.
+    settling: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -992,6 +1003,7 @@ impl Store {
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
             corrupt: AtomicUsize::new(0),
+            settling: Mutex::default(),
         };
         store.collect();
         store.refresh();
@@ -1097,6 +1109,25 @@ impl Store {
             Err(e) => format!("not removed: {e}"),
         };
         eprintln!("store: {name} {why}; {removed}");
+    }
+
+    /// Runs `settle`, which ends a build's use of the store, beside what the build does
+    /// next. One at a time: the one before is waited for.
+    pub(super) fn settle_with(&self, settle: impl FnOnce() + Send + 'static) {
+        self.settled();
+        let Ok(mut settling) = self.settling.lock() else { return settle() };
+        match std::thread::Builder::new().name("rustd store settle".to_owned()).spawn(settle) {
+            Ok(thread) => *settling = Some(thread),
+            Err(e) => eprintln!("store: what this build added is not kept: {e}"),
+        }
+    }
+
+    /// Waits for what [`Self::settle_with`] started.
+    pub(super) fn settled(&self) {
+        let thread = self.settling.lock().ok().and_then(|mut it| it.take());
+        if let Some(thread) = thread {
+            _ = thread.join();
+        }
     }
 
     /// Writes out what has been added, seals it when there is enough of it, and reads what

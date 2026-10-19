@@ -55,6 +55,12 @@ pub(crate) fn wrapper_path() -> std::io::Result<PathBuf> {
     Ok(this.with_file_name(format!("rustd-rustc{}", std::env::consts::EXE_SUFFIX)))
 }
 
+/// The same wrapper under the path it has in the first build of a workspace.
+pub(crate) fn first_wrapper_path() -> std::io::Result<PathBuf> {
+    let this = std::env::current_exe()?;
+    Ok(this.with_file_name(format!("rustd-rustc-first{}", std::env::consts::EXE_SUFFIX)))
+}
+
 impl Enabled {
     fn path() -> anyhow::Result<PathBuf> {
         Ok(cargo_home().context("no CARGO_HOME or HOME")?.join("rustd-enabled.json"))

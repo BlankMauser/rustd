@@ -55,7 +55,7 @@ use std::hash::{Hash, Hasher};
 
 /// The statement the code of a function is of from `offset` on, as an index into the
 /// statements the function was built from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct LineRow {
     pub(super) offset: CodeOffset,
     pub(super) span: u32,
@@ -184,7 +184,7 @@ pub(super) struct Variant {
 }
 
 /// Where the value of a variable is while the function runs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum VariablePlace {
     /// In the frame, this far from what the frame is found by, from the first instruction
     /// to the last.
@@ -196,7 +196,7 @@ pub(super) enum VariablePlace {
 
 /// Where the stack slots of a function are while it runs, for the ones that hold a local
 /// written with a name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct SlotPlaces {
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
     pub(super) frame_base: Vec<u8>,

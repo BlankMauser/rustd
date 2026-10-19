@@ -5,7 +5,7 @@
 
 use std::process::{Command, ExitCode};
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let mut asked = std::env::args_os().skip(1);
     let rustd = std::env::current_exe()
         .map(|this| this.with_file_name(format!("rustd{}", std::env::consts::EXE_SUFFIX)));

@@ -153,22 +153,38 @@ the details, and <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/pla
 platform notes</a> say what has been run where.</p>
 
 <h2 id="numbers">Numbers</h2>
-<p>Seconds for <code>cargo rustd</code> against plain cargo on the same edit (a line added to a
-function), one run each, Linux x86-64, 8 CPUs, Cranelift.</p>
+<p>Linux x86-64, 8 CPUs, Cranelift, seconds, plain cargo against <code>cargo rustd</code>. Both
+use the same linker, cargo is warm and incremental, the daemon is warm, and the program both
+produce is run and compared. No <code>cargo check</code> runs beside a rustd build and nothing
+is handed back to cargo, so the numbers that used to be here no longer apply.</p>
+<p>Edits in a generated workspace of 200 crates, median of three:</p>
 <table>
-<tr><th>Project</th><th>No-change build</th><th>Build after an edit</th><th>Daemon warm-up</th></tr>
-<tr><td>ripgrep 15.1.0</td><td><b>0.02</b> / 0.44</td><td><b>0.34</b> / 0.86</td><td>6.87</td></tr>
-<tr><td>fd 10.3.0</td><td><b>0.03</b> / 0.55</td><td><b>0.16</b> / 0.51</td><td>0.02</td></tr>
-<tr><td>bat 0.26.0</td><td><b>0.02</b> / 0.08</td><td><b>0.30</b> / 0.53</td><td>8.50</td></tr>
-<tr><td>hyperfine 1.19.0</td><td><b>0.03</b> / 0.39</td><td><b>0.13</b> / 0.34</td><td>5.28</td></tr>
-<tr><td>just 1.43.0</td><td><b>0.02</b> / 0.06</td><td><b>0.11</b> / 0.28</td><td>2.50</td></tr>
-<tr><td>axum 0.8.6</td><td><b>0.02</b> / 0.13</td><td><b>0.07</b> / 0.40</td><td>3.86</td></tr>
-<tr><td>nushell 0.108.0</td><td><b>0.04</b> / 0.26</td><td><b>0.96</b> / 1.65</td><td>42.36</td></tr>
+<tr><th>Edit</th><th>cargo</th><th>rustd</th><th></th></tr>
+<tr><td>A function body in the program's crate</td><td>1.74</td><td><b>0.44</b></td><td>3.9x</td></tr>
+<tr><td>A function body in the crate every other depends on</td><td>6.49</td><td><b>0.53</b></td><td>12.3x</td></tr>
+<tr><td>Function bodies in 30 crates at once</td><td>6.03</td><td><b>0.66</b></td><td>9.2x</td></tr>
+<tr><td>A new function</td><td>2.05</td><td><b>0.57</b></td><td>3.6x</td></tr>
+<tr><td>A signature whose callers are in every crate</td><td>13.01</td><td>13.41</td><td>1.0x</td></tr>
 </table>
-<p>The first build is not faster than cargo's, because it is cargo's. The plain-cargo mode is
-currently slower on edits than <code>cargo rustd</code>, and on some projects slower than cargo
-alone. The full tables, the commit they were measured at and how correctness is checked against
-rustc are in <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/results.md">the
+<p>The last row is not ahead, and after an edit that wide later edits in the same daemon are
+slower until it is restarted. Both are open.</p>
+<p>Real projects, one run each, a line added to a function:</p>
+<table>
+<tr><th>Project</th><th>No-change build</th><th>Build after an edit</th></tr>
+<tr><td>ripgrep 15.1.0</td><td>0.42 / <b>0.02</b></td><td>1.28 / <b>0.36</b></td></tr>
+<tr><td>fd 10.3.0</td><td>0.41 / <b>0.03</b></td><td>0.52 / <b>0.17</b></td></tr>
+<tr><td>hyperfine 1.19.0</td><td>0.33 / <b>0.03</b></td><td>0.36 / <b>0.15</b></td></tr>
+</table>
+<p>First build from an empty target directory with <code>RUSTD_FIRST_BUILD=1</code>, where cargo
+builds the dependencies and rustd the workspace's crates, one run each except nushell:</p>
+<table>
+<tr><th>Project</th><th><code>cargo build</code></th><th><code>cargo rustd build</code></th></tr>
+<tr><td>ripgrep 15.1.0</td><td>5.43</td><td>6.05</td></tr>
+<tr><td>fd 10.3.0</td><td>20.5</td><td>22.0</td></tr>
+<tr><td>nushell 0.108.0</td><td>42.7, 42.9</td><td>66.4, 68.1, 89.9</td></tr>
+</table>
+<p>rustd is behind on first builds, and far behind on nushell. How correctness is checked
+against rustc is in <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/results.md">the
 results</a>.</p>
 
 <h2>What it does not do</h2>

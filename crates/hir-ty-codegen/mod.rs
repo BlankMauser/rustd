@@ -102,7 +102,7 @@ mod patch;
 mod promote;
 mod settled;
 mod stable;
-pub use stable::block_place;
+pub use stable::{block_place, lower_declared};
 mod store;
 mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
@@ -111,7 +111,8 @@ pub use patch::{Stale, StaleSteps};
 pub use store::{
     Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
     fetch_missing_with, identify_ahead, is_off as store_is_off, is_pack, limit_from_env,
-    name_file_whole, pack_format, pack_keys, pack_name, parse_size, seal_open, write_file_whole,
+    name_file_whole, pack_format, pack_keys, pack_name, parse_size, seal_open, settled,
+    write_file_whole,
 };
 mod type_id;
 mod unwind;
@@ -409,6 +410,9 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
+    /// The statics a linker or a runtime finds though no code names them, in the crates
+    /// rustc built nothing of: `#[used]` ones, and those put in a section by name.
+    pub kept: &'a [StaticId],
 }
 
 impl CodegenUnit {
@@ -527,6 +531,9 @@ impl CodegenUnit {
             if let Some(main) = roots.start {
                 cg.define_start(main)?;
             }
+            for &id in roots.kept {
+                cg.static_data(id)?;
+            }
             loop {
                 // Every core compiles the roots found so far, before they are put in the
                 // object one by one.
@@ -634,18 +641,25 @@ impl CodegenUnit {
             if failed.is_empty() {
                 let instances = cg.instances.len();
                 if let Some(store) = store::Store::global() {
-                    cg.written();
-                    store.flush();
-                    let (hits, misses) = store.take_counts();
-                    if hits + misses != 0 {
-                        eprintln!("store: {hits} functions found, {misses} compiled and added");
-                    }
-                    cg.kept.report();
                     let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
                     misses.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
-                    if !misses.is_empty() {
-                        eprintln!("without a stable name: {misses:?}");
-                    }
+                    let (mut kept, writer) = (std::mem::take(&mut cg.kept), cg.writer.take());
+                    // The object and the link do not wait for the store to have what was
+                    // kept: whoever reads the store next does.
+                    store.settle_with(move || {
+                        if let Some(mut writer) = writer {
+                            kept.written(writer.finish());
+                        }
+                        store.flush();
+                        let (found, added) = store.take_counts();
+                        if found + added != 0 {
+                            eprintln!("store: {found} functions found, {added} compiled and added");
+                        }
+                        kept.report();
+                        if !misses.is_empty() {
+                            eprintln!("without a stable name: {misses:?}");
+                        }
+                    });
                 }
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
@@ -1085,6 +1099,13 @@ struct Kept {
 }
 
 impl Kept {
+    fn written(&mut self, written: cached::Written) {
+        self.added += written.added;
+        if written.of_cargo != 0 {
+            *self.unkept.entry(OF_CARGO).or_default() += written.of_cargo;
+        }
+    }
+
     fn unfound<T>(&mut self, why: &'static str) -> Option<T> {
         *self.unfound.entry(why).or_default() += 1;
         None
@@ -1245,30 +1266,125 @@ fn selected_target() -> Result<&'static Target> {
 /// How many functions went through Cranelift since the process started.
 static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A number no other compiled function or static has.
-fn next_serial() -> u64 {
-    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// What tells compiled code from any other: equal for the same code however often an edit
+/// went away from it and came back, so that a patch holds what differs from its base alone.
+fn print_of(code: &impl std::hash::Hash) -> u128 {
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    code.hash(&mut hasher);
+    let type_id::Fingerprint(low, high) = hasher.finish();
+    u128::from(low) | u128::from(high) << 64
 }
 
-/// A number that is another once the code of the function is. The database runs this again
-/// only when compiling gave something else, not each time it compiled.
+/// The print of the function's code. The database runs this again only when compiling gave
+/// something else, not each time it compiled.
 #[salsa::tracked(returns(copy))]
-fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
-    compiled_root(db, func);
-    next_serial()
-}
-
-#[salsa::tracked(returns(copy))]
-fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u64 {
-    compiled_instance(db, instance, env);
-    next_serial()
+fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u128 {
+    compiled_root(db, func).as_ref().map_or(0, print_of)
 }
 
 #[salsa::tracked(returns(copy))]
-fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u64 {
-    compiled_static(db, id);
-    next_serial()
+fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
+    compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
+}
+
+#[salsa::tracked(returns(copy))]
+fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u128 {
+    compiled_static(db, id).as_ref().map_or(0, print_of)
+}
+
+/// What the threads of [`compile_unnamed`] have left to compile.
+#[derive(Default)]
+pub struct Unnamed {
+    state: std::sync::Mutex<UnnamedState>,
+    told: ToldTypes,
+}
+
+/// The types [`compile_unnamed`] told of, for the build that comes next.
+// FIXME: a build after an edit must not find these.
+static TOLD_UNNAMED: std::sync::Mutex<Option<ToldTypes>> = std::sync::Mutex::new(None);
+
+#[derive(Default)]
+struct UnnamedState {
+    roots: Vec<FunctionId>,
+    queue: Vec<(Instance, StoredParamEnvAndCrate)>,
+    seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
+    working: usize,
+    compiled: usize,
+}
+
+impl Unnamed {
+    pub fn new(roots: Vec<FunctionId>) -> Unnamed {
+        let state = UnnamedState { roots, ..Default::default() };
+        let told = ToldTypes::default();
+        *TOLD_UNNAMED.lock().unwrap_or_else(|e| e.into_inner()) = Some(told.clone());
+        Unnamed { state: std::sync::Mutex::new(state), told }
+    }
+
+    /// How many functions and instances were compiled.
+    pub fn compiled(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).compiled
+    }
+}
+
+/// Compiles the functions `unnamed` starts from and the generic instances they reach, until
+/// `done`, as one of the threads that do. Which symbols rustc built is not known yet: the
+/// code of a function is the same whichever they are, and a build that knows them finds it
+/// compiled. A call of a function without generic arguments is not followed, since rustc
+/// may have built the one called.
+pub fn compile_unnamed(db: &dyn HirDatabase, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
+    let mut homes = home::Homes::default();
+    let mut types = OwnTypes::default();
+    loop {
+        let job = {
+            let mut state = unnamed.state.lock().unwrap_or_else(|e| e.into_inner());
+            let job = match state.roots.pop() {
+                Some(root) => Some(either::Either::Left(root)),
+                None => state.queue.pop().map(either::Either::Right),
+            };
+            if job.is_none() && state.working == 0 {
+                return;
+            }
+            state.working += usize::from(job.is_some());
+            job
+        };
+        if done() {
+            return;
+        }
+        let Some(job) = job else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        };
+        let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &job {
+            either::Either::Left(root) => {
+                root_rows(db, *root);
+                compiled_root(db, *root).as_ref().ok()
+            }
+            either::Either::Right((instance, env)) => {
+                instance_rows(db, instance.clone(), env.clone());
+                compiled_instance(db, instance.clone(), env.clone()).as_ref().ok()
+            }
+        }));
+        let mut found = Vec::new();
+        if let Ok(Some(compiled)) = compiled {
+            unnamed.told.ahead(db, &mut types, compiled);
+        }
+        for request in compiled.iter().flatten().flat_map(|it| &it.requests.funcs) {
+            let FuncTarget::Instance(callee, asked) = &request.target else { continue };
+            let named = matches!(callee.def, InstanceDef::Fn(_))
+                && callee.args.as_ref().iter().all(|it| it.region().is_some());
+            if !named {
+                found.push((callee.clone(), homes.home(db, callee, asked)));
+            }
+        }
+        let mut state = unnamed.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.working -= 1;
+        state.compiled += 1;
+        for it in found {
+            if state.seen.insert(it.clone()) {
+                state.queue.push(it);
+            }
+        }
+    }
 }
 
 /// Where the code from an offset on is written: the file, the line and the column.
@@ -2886,6 +3002,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Without an identity for such a program, nothing of it is kept or found.
         let program = mixed.as_ref().map(|it| it.key);
         let store = store::Store::global().filter(|_| program != Some(None));
+        if let Some(store) = store {
+            store.settled();
+        }
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -2893,7 +3012,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unwind,
             debug,
             types: FxHashMap::default(),
-            told: ToldTypes::default(),
+            told: TOLD_UNNAMED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default(),
             writer: None,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
@@ -3509,15 +3628,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer {
         let home = || self.symbols.cargo_home();
         self.writer.get_or_insert_with(|| cached::Writer::new(store, home()))
-    }
-
-    /// Waits for what was kept to be in the store.
-    fn written(&mut self) {
-        let Some(written) = self.writer.as_mut().map(|it| it.finish()) else { return };
-        self.kept.added += written.added;
-        if written.of_cargo != 0 {
-            *self.kept.unkept.entry(OF_CARGO).or_default() += written.of_cargo;
-        }
     }
 
     /// Whether the instance is compiled with the flags of the crate its function is written
@@ -4166,8 +4276,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         // One the build after this may replace where it is has to say how large it is.
         let named = (again.is_some() || self.patching) && !thread_local;
-        let section =
-            named.then(|| Target::current().section_of_static(compiled.writable)).flatten();
+        let asked = AttrFlags::link_section(db, id.into());
+        let section = asked.as_ref().map(|it| it.as_str()).or_else(|| {
+            named.then(|| Target::current().section_of_static(compiled.writable)).flatten()
+        });
         let known = if compiled.writable { &mut self.statics } else { &mut self.frozen_statics };
         known.insert(id, data);
         let begun = self.own_static_order.len();
@@ -4303,13 +4415,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && let Some(of) = self.type_id_of(func, args)
         {
-            let hash = type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates)
-                .type_id(of);
-            if let Some(hash) = hash {
+            let mut hasher =
+                type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates);
+            if let Some(hash) = hasher.type_id(of) {
                 return self.constant_type_id(instance.clone(), sig, hash);
             }
+            let stuck = hasher.stuck.unwrap_or_default();
             let Some(ty) = self.symbol_type(of) else {
-                unsupported!("`TypeId` of `{of:?}`, neither hashed nor named by a rustc symbol");
+                unsupported!(
+                    "`TypeId` of `{of:?}`, neither hashed (at `{stuck}`) nor named by a rustc symbol"
+                );
             };
             if let Some(symbol) = self.symbols.path(&format!("<core::any::TypeId>::of::<{ty}>")) {
                 return self.import(&symbol, sig);
@@ -4318,7 +4433,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // `Any` method a `dyn Any` of the type calls, which makes no use of its `self`.
             let Some(symbol) = self.symbols.path(&format!("<{ty} as core::any::Any>::type_id"))
             else {
-                unsupported!("`TypeId` of `{ty}`, which rustc has no symbol for");
+                unsupported!(
+                    "`TypeId` of `{ty}`, not hashed (at `{stuck}`) and without a rustc symbol"
+                );
             };
             let mut method = sig.clone();
             method.params.push(AbiParam::new(ptr()));
@@ -4873,7 +4990,9 @@ impl Relocations<'_, '_> {
 }
 
 /// Whether a data object can be the same object as another with the same content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde_derive::Serialize, serde_derive::Deserialize,
+)]
 enum DataIdentity {
     /// Read-only and one object with every equal constant, as the same constant is for rustc
     /// wherever it is named.

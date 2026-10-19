@@ -32,6 +32,12 @@ use crate::{
 /// builds and leaves the rest to the command that drives cargo.
 pub(crate) const DRIVEN: &str = "RUSTD_CARGO_DRIVES";
 
+/// The variable `cargo rustd` sets in the first build of a workspace: the roots of the
+/// crates that are the daemon's to compile, as a list of paths.
+pub(crate) const STAGED: &str = "RUSTD_STAGED_CRATES";
+/// The file in the record of a unit that says rustc built what stands in for the crate.
+const STANDS_IN: &str = "stands-in";
+
 /// What the variables that name the programs of a build start with.
 const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
 /// The variable that names the directory cargo gives the integration tests of a build.
@@ -69,6 +75,13 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     };
     let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
     let dir = unit.records.join(&unit.id);
+    if unit.is_staged() {
+        match unit.stood_in(&rustc, &dir) {
+            Ok(code) => std::process::exit(code),
+            // rustc compiles the crate as cargo asked, and the daemon links against that.
+            Err(why) => eprintln!("warning: rustc compiles `{}`: {why:#}", unit.id),
+        }
+    }
     let known = if plain { State::of_unit(&dir) } else { Vec::new() };
     if !known.is_empty() {
         match unit.by_daemon(&dir, &known, &rustc) {
@@ -86,15 +99,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         std::fs::create_dir_all(&copies)?;
         compiler.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
     }
-    // The check of the next build, which the daemon may link, then has little to do.
-    let checked_ahead = (plain && unit.is_incremental()).then(|| unit.checked(&rustc));
     let status =
         compiler.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
-    if let Some(checked) = checked_ahead {
-        let _ = checked.join();
-    }
     if status.success()
-        && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line))
+        && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line), &unit.source)
     {
         // The build is good; the daemon has no part in this crate until it is built again.
         eprintln!("warning: rustd did not record `{}`: {error:#}", unit.id);
@@ -262,16 +270,22 @@ impl Unit {
             return Err(why);
         }
         let (checkout, at) = state.asked_for(dir)?;
-        let checked = self.checked(rustc);
-        let answer = super::synced(checkout).and_then(|programs| {
+        let deps = self.dep_info(rustc);
+        let answer = super::built(checkout).and_then(|programs| {
             programs.get(at).cloned().unwrap_or(Err("the daemon said nothing of it".to_owned()))
         });
-        let read = checked.join().map_err(|_| "rustc did not run".to_owned());
+        let read = deps.join().map_err(|_| "rustc did not run".to_owned());
         let read = read?.map_err(|it| format!("rustc did not run: {it}"))?;
-        if !read.status.success() {
-            return Err("rustc finds errors in the source".to_owned());
+        // What the daemon was asked for and did not build fails the build: rustc is not
+        // given it instead.
+        if let Err(why) = answer {
+            say::error(&why);
+            std::process::exit(super::FAILED);
         }
-        answer?;
+        if !read.status.success() {
+            let _ = std::io::stderr().write_all(&read.stderr);
+            std::process::exit(super::FAILED);
+        }
         let binary = &checkout.programs[at].binary;
         let record = self.as_record(0, Vec::new(), None);
         let linked = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
@@ -283,15 +297,12 @@ impl Unit {
         Ok(())
     }
 
-    /// Has rustc check the unit, as `cargo check` would, while the daemon builds it: the
-    /// daemon has no borrow checker and compiles a program rustc would turn down, and the
-    /// warnings are rustc's to give. It also writes the dep-info cargo reads to know what
-    /// the program was compiled from. What it says is kept until the program is the
-    /// daemon's. The check keeps its incremental state apart from the build's: rustc
-    /// starts one over when what it is asked to emit changes.
-    fn checked(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
+    /// Has rustc write the dep-info cargo reads to know what the program was compiled
+    /// from, while the daemon builds it. Rustc stops once it has read the source: it
+    /// checks nothing, and the daemon builds what rust-analyzer passes.
+    fn dep_info(&self, rustc: &OsString) -> JoinHandle<std::io::Result<Output>> {
         let args = self.args.iter().map(|it| match it.split_once('=') {
-            Some(("--emit", _)) => "--emit=dep-info,metadata".to_owned(),
+            Some(("--emit", _)) => "--emit=dep-info".to_owned(),
             Some((INCREMENTAL, dir)) => format!("{INCREMENTAL}={dir}/{CHECKS}"),
             _ => it.clone(),
         });
@@ -300,10 +311,95 @@ impl Unit {
         std::thread::spawn(move || command.output())
     }
 
-    /// Whether rustc keeps incremental state for the unit, so that a check of it now
-    /// makes the next one short.
-    fn is_incremental(&self) -> bool {
-        self.args.iter().any(|it| it.split_once('=').is_some_and(|(name, _)| name == INCREMENTAL))
+    /// Whether the crate is one the first build of the workspace leaves to the daemon.
+    fn is_staged(&self) -> bool {
+        let Some(staged) = std::env::var_os(STAGED) else { return false };
+        let lists = std::env::split_paths(&staged).any(|it| it == self.source);
+        lists && !self.script && !self.args.iter().any(|it| it == "--test")
+    }
+
+    /// Has rustc do of the crate what it does in a build by the daemon: check it, and
+    /// build what stands in for it, which is what cargo links and has no code. `dir` is
+    /// where the unit is recorded. `Ok` is the status rustc's check ended with; `Err` is
+    /// why nothing stands in for the crate.
+    ///
+    /// What stands in is built first and from the libraries that stand in for the crates
+    /// it depends on, and the check reads the metadata of the checks of those. Cargo
+    /// starts the units that depend on this one when the check has written the metadata,
+    /// which is when both are there.
+    fn stood_in(&self, rustc: &OsString, dir: &Path) -> anyhow::Result<i32> {
+        let program = crate::stub::is_program(&self.args).context("not a library or a program")?;
+        let stamp = stamp_now();
+        let copies = dir.join(stamp.to_string());
+        std::fs::create_dir_all(&copies)?;
+        let line = copies.join("link.line");
+        let extra = self.as_record(0, Vec::new(), None);
+        let stem =
+            format!("{}{}", self.crate_name, extra.codegen("extra-filename").unwrap_or_default());
+        let source = copies.join(format!("{stem}.rustd.rs"));
+        std::fs::write(&source, crate::stub::text_of(&self.args, program))?;
+
+        let mut stand_in = Command::new(rustc);
+        let mut args = self.args.iter().peekable();
+        while let Some(arg) = args.next() {
+            let incremental = |it: &&String| it.starts_with(&format!("{INCREMENTAL}="));
+            if arg == "-C" && args.peek().is_some_and(incremental) {
+                args.next();
+            } else if self.cwd.join(arg) == self.source {
+                stand_in.arg(&source);
+            } else if arg.starts_with("--emit=") {
+                stand_in.arg("--emit=link");
+            } else {
+                stand_in.arg(self.standing_in(arg).unwrap_or_else(|| arg.clone()));
+            }
+        }
+        if program {
+            stand_in.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
+        }
+        let built = stand_in.stdin(Stdio::null()).output().context("running rustc")?;
+        anyhow::ensure!(
+            built.status.success(),
+            "what stands in for it does not build: {}",
+            String::from_utf8_lossy(&built.stderr).trim_end()
+        );
+        std::fs::write(dir.join(STANDS_IN), "")?;
+
+        let checked = self.args.iter().map(|it| match it.split_once('=') {
+            Some(("--emit", _)) => "--emit=dep-info,metadata".to_owned(),
+            Some((INCREMENTAL, dir)) => format!("{INCREMENTAL}={dir}/{CHECKS}"),
+            _ => self.checked_against(it).unwrap_or_else(|| it.clone()),
+        });
+        let status = Command::new(rustc).args(checked).status().context("running rustc")?;
+        if status.success() {
+            self.record(stamp, &copies, program.then_some(line), &source)?;
+        }
+        Ok(status.code().unwrap_or(1))
+    }
+
+    /// `--extern`'s value `named` with the library that stands in for the crate, when the
+    /// value is the metadata of a crate that has one.
+    fn standing_in(&self, named: &str) -> Option<String> {
+        let (name, path) = named.split_once('=')?;
+        let stem = Path::new(path).file_name()?.to_str()?.strip_suffix(".rmeta")?;
+        let id = stem.strip_prefix("lib")?;
+        self.records
+            .join(id)
+            .join(STANDS_IN)
+            .exists()
+            .then(|| format!("{name}={}", Path::new(path).with_extension("rlib").display()))
+    }
+
+    /// `--extern`'s value `named` with the metadata rustc's check wrote of the crate, when
+    /// the value is the library that stands in for one.
+    fn checked_against(&self, named: &str) -> Option<String> {
+        let (name, path) = named.split_once('=')?;
+        let stem = Path::new(path).file_name()?.to_str()?.strip_suffix(".rlib")?;
+        let id = stem.strip_prefix("lib")?;
+        self.records
+            .join(id)
+            .join(STANDS_IN)
+            .exists()
+            .then(|| format!("{name}={}", Path::new(path).with_extension("rmeta").display()))
     }
 
     /// Says in one line why rustc links the program and not the daemon, and counts it.
@@ -329,7 +425,14 @@ impl Unit {
     }
 
     /// Copies what a later build of the unit writes over and writes the record.
-    fn record(&self, stamp: u128, to: &Path, link_line: Option<PathBuf>) -> anyhow::Result<()> {
+    /// `compiled` is the root of the source rustc was given.
+    fn record(
+        &self,
+        stamp: u128,
+        to: &Path,
+        link_line: Option<PathBuf>,
+        compiled: &Path,
+    ) -> anyhow::Result<()> {
         let record = self.as_record(stamp, Vec::new(), link_line.clone());
         // The executable is the daemon's to link; of the outputs it reads the libraries.
         let libraries =
@@ -355,10 +458,7 @@ impl Unit {
         // which it reads the first source: the root of the crate.
         let stem =
             format!("{}{}", self.crate_name, record.codegen("extra-filename").unwrap_or_default());
-        std::fs::write(
-            to.join(format!("{stem}.d")),
-            format!("{stem}: {}\n", self.source.display()),
-        )?;
+        std::fs::write(to.join(format!("{stem}.d")), format!("{stem}: {}\n", compiled.display()))?;
         if self.script
             && let Some(linked) = record.outputs().first()
         {

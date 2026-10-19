@@ -496,8 +496,30 @@ impl Plan {
 
     /// How the package cargo calls `id` is built, when the build has it.
     pub(crate) fn package(&self, id: &str) -> Option<&Built> {
-        self.packages.get(id)
+        self.packages.get(&package_named(id))
     }
+}
+
+/// The one name of a package for the two ways cargo spells its id: `source#name@version`,
+/// and `name version (source)` as the unit graph of an older cargo does, with the
+/// commit of a git source after it.
+fn package_named(id: &str) -> String {
+    let old = id.strip_suffix(')').and_then(|it| it.split_once(" ("));
+    if let Some((name_version, source)) = old
+        && let Some((name, version)) = name_version.split_once(' ')
+    {
+        let source = source.split_once('#').map_or(source, |it| it.0);
+        return format!("{source}#{name}@{version}");
+    }
+    let Some((source, named)) = id.split_once('#') else { return id.to_owned() };
+    if named.contains('@') {
+        return id.to_owned();
+    }
+    // A package whose directory or repository is called what it is has only its version.
+    let path = source.split_once('?').map_or(source, |it| it.0);
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    format!("{source}#{name}@{named}")
 }
 
 #[derive(Deserialize)]
@@ -585,7 +607,7 @@ impl UnitGraph {
             .map(|(id, (_, unit))| {
                 let features = unit.features.iter().cloned().collect();
                 let (profile, primary) = (unit.profile.with(flags), roots.contains(id));
-                (id.to_owned(), Built { features, profile, primary })
+                (package_named(id), Built { features, profile, primary })
             })
             .collect();
         Ok(Plan { packages, lto })

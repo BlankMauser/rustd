@@ -37,7 +37,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -56,8 +56,8 @@ use hir_ty::mir::codegen::{
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
-    CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource, TargetDirectoryConfig, TargetKind,
+    CargoConfig, CargoFeatures, CargoWorkspace, ProjectManifest, ProjectWorkspace,
+    ProjectWorkspaceKind, RustLibSource, TargetDirectoryConfig, TargetKind, WorkspaceBuildScripts,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -355,8 +355,10 @@ impl Resolver<'_> {
             return None;
         }
         // The symbol of a path is the one rustc gave a function it built under it, which is
-        // not known to be this one when a body has two of the path.
-        if self.shares_path(func) {
+        // not known to be this one when a body has two of the path. One of a crate rustc
+        // built nothing of is named by where it is written as well.
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        if self.rustc_built(krate) && self.shares_path(func) {
             return None;
         }
         let path = self.path(func)?;
@@ -376,12 +378,15 @@ impl Resolver<'_> {
         if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
             return None;
         }
-        let krate = hir_def::HasModule::krate(&func, self.db);
-        let id = self.own_crate_id(krate)?;
-        match hir_ty::mir::codegen::block_place(self.db, self, func) {
-            Some(place) => Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place))),
-            None => Some(format!("rustd.{id:x}.{path}")),
+        if self.rustc_built(krate) {
+            return None;
         }
+        let id = self.own_crate_id(krate)?;
+        if hir_def::HasModule::module(&func, self.db).block(self.db).is_none() {
+            return Some(format!("rustd.{id:x}.{path}"));
+        }
+        let place = hir_ty::mir::codegen::block_place(self.db, self, func)?;
+        Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place)))
     }
 
     /// Whether the function, or the `impl` it is in, takes types or constants.
@@ -419,7 +424,7 @@ impl Resolver<'_> {
         let listed = self.listed.functions.lock().unwrap().get(&krate).cloned();
         let functions = match &listed {
             Some(listed) => listed.functions.clone(),
-            None => functions_of(self.db, krate),
+            None => declared_in(self.db, krate).functions,
         };
         for func in functions {
             if !is_in_body(self.db, hir::Function::from(func).module(self.db)) {
@@ -698,6 +703,21 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
+/// The built `std` of the toolchain whose library was loaded, for `triple`.
+fn built_library(vfs: &vfs::Vfs, triple: &str) -> Vec<PathBuf> {
+    let toolchain = vfs.iter().find_map(|(_, path)| {
+        let path = path.as_path()?.as_str().replace('\\', "/");
+        let (toolchain, _) = path.split_once("lib/rustlib/src/rust/")?;
+        Some(toolchain.to_owned())
+    });
+    let Some(toolchain) = toolchain else { return Vec::new() };
+    let dir = PathBuf::from(format!("{toolchain}lib/rustlib/{triple}/lib"));
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let named = |name: &str| name.starts_with("libstd-") && name.ends_with(".rlib");
+    let names = entries.filter_map(|it| it.ok()?.file_name().into_string().ok());
+    names.filter(|it| named(it)).map(|it| dir.join(it)).collect()
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -798,8 +818,18 @@ impl SymbolResolver for Resolver<'_> {
         self.table.copies(symbol).map(|(copy, of)| (copy.to_owned(), of)).collect()
     }
 
+    /// A crate rustc built may have no symbol that says which it is: one of generics alone,
+    /// when nothing rustc built gives them their types. Its functions are still not ours to
+    /// name.
     fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
-        self.own_crate_id(krate).is_none()
+        if self.own_crate_id(krate).is_none() {
+            return true;
+        }
+        let named = Crate::from(krate).display_name(self.db);
+        let root = self.crate_root(krate.into());
+        named
+            .zip(root)
+            .is_some_and(|(name, root)| self.table.links(name.crate_name().as_str(), &root))
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
@@ -1201,6 +1231,7 @@ fn load(
     cargo_config: &CargoConfig,
     load_config: LoadCargoConfig,
     selection: plan::Selection,
+    beside: Option<Beside>,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let mut checkouts = Checkouts {
         compared: Default::default(),
@@ -1212,6 +1243,7 @@ fn load(
         selection,
         inputs: inputs::Inputs::default(),
         debug: Vec::new(),
+        beside,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
@@ -1240,6 +1272,9 @@ struct Checkouts {
     selection: plan::Selection,
     /// For each of `roots`, what its plan says of the program as a whole.
     debug: Vec<plan::Whole>,
+    /// Where cargo's own build says what the scripts and proc macros of the next checkout
+    /// are, when it is loaded beside that build: nothing is then run to find out.
+    beside: Option<Beside>,
 }
 
 impl Checkouts {
@@ -1475,8 +1510,18 @@ impl Checkouts {
                 continue;
             }
             splits.push(None);
-            let (workspace, told) =
-                workspace_at(project, &self.cargo_config, &self.load_config, &self.selection)?;
+            let beside = self.beside.as_mut().filter(|it| it.at == usize::MAX);
+            let beside = beside.map(|it| {
+                it.at = self.roots.len() + roots.len();
+                it
+            });
+            let (workspace, told) = workspace_at(
+                project,
+                &self.cargo_config,
+                &self.load_config,
+                &self.selection,
+                beside,
+            )?;
             debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
@@ -1596,7 +1641,7 @@ impl Checkouts {
         let mut config = self.cargo_config.clone();
         config.extra_env.extend(self.inputs.variables(root, env));
         let (workspace, debug) =
-            workspace_at(project, &config, &self.load_config, &self.selection)?;
+            workspace_at(project, &config, &self.load_config, &self.selection, None)?;
         Ok((workspace, debug, config))
     }
 
@@ -1759,11 +1804,13 @@ fn workspace_at(
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
+    beside: Option<&mut Beside>,
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     let mut debug = plan::Whole { debug: plan::Described::NOTHING, lto: false };
+    let mut scripts = None;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -1781,6 +1828,16 @@ fn workspace_at(
         let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
         debug = plan.whole()?;
         let packages: Vec<_> = cargo.packages().collect();
+        if let Some(beside) = beside {
+            let built = packages.iter().filter(|it| plan.package(&cargo[**it].id.repr).is_some());
+            beside.awaits(cargo, built.copied());
+            // Nothing cargo has yet to say is waited for here: what there is of it so far
+            // is what the crates that need no more are read with.
+            let (lines, _) = beside.said.so_far();
+            beside.applied = lines.len();
+            scripts =
+                Some(WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str)));
+        }
         for package in packages {
             let Some(built) = plan.package(&cargo[package].id.repr) else { continue };
             cargo.set_active_features(package, built.features.iter().cloned().collect());
@@ -1788,7 +1845,9 @@ fn workspace_at(
             cargo.set_primary(package, built.primary);
         }
     }
-    if load_config.load_out_dirs_from_check {
+    if let Some(scripts) = scripts {
+        workspace.set_build_scripts(scripts);
+    } else if load_config.load_out_dirs_from_check {
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
             && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
         {
@@ -1898,7 +1957,7 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
                         // library share a path, which every body of the crate is lowered for:
                         // threads are idle here, waiting for the crates that come next.
                         if krate.data(&db).origin.is_lang() {
-                            _ = functions_of(&db, krate.into());
+                            _ = declared_in(&db, krate.into());
                         }
                         if std::env::var_os("RUSTD_STATS").is_some() {
                             let name = krate.extra_data(&db).display_name.as_ref();
@@ -1932,6 +1991,8 @@ struct Listed {
 
 struct ListedCrate {
     functions: Vec<FunctionId>,
+    /// The statics a linker or a runtime finds though no code names them.
+    kept: Vec<StaticId>,
     /// For each, whether a runtime looks it up by name.
     exported: Vec<bool>,
     main: Option<FunctionId>,
@@ -1946,7 +2007,15 @@ fn has_no_main(db: &RootDatabase, krate: Crate) -> bool {
 
 impl ListedCrate {
     fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
-        let functions = functions_of(db, krate);
+        let Declared { functions, statics, .. } = declared_in(db, krate);
+        let kept = statics
+            .into_iter()
+            .filter(|&it| {
+                hir_def::attrs::AttrFlags::query(db, it.into())
+                    .contains(hir_def::attrs::AttrFlags::USED)
+                    || hir_def::attrs::AttrFlags::link_section(db, it.into()).is_some()
+            })
+            .collect();
         // A crate with `#![no_main]` has no `main` of Rust's: one it exports is the runtime's.
         let main = functions
             .iter()
@@ -1957,7 +2026,7 @@ impl ListedCrate {
             .iter()
             .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
             .collect();
-        ListedCrate { functions, exported, main }
+        ListedCrate { functions, kept, exported, main }
     }
 }
 
@@ -2002,7 +2071,7 @@ impl Listed {
     }
 }
 
-fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
     let start = Instant::now();
     // The first thing asked of a crate after an edit: name resolution is redone here.
     hir_def::nameres::crate_def_map(db, krate.into());
@@ -2029,7 +2098,7 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
             start.elapsed() - scopes
         );
     }
-    declared.functions
+    declared
 }
 
 /// The functions of a crate that no body declares, as its modules are now. The ones listed
@@ -2044,6 +2113,7 @@ fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
 #[derive(Default)]
 struct Declared {
     functions: Vec<FunctionId>,
+    statics: Vec<StaticId>,
     /// The bodies whose blocks declare more scopes.
     bodies: Vec<DefWithBodyId>,
 }
@@ -2069,7 +2139,10 @@ impl Declared {
                     self.bodies.push(id.into());
                 }
                 ModuleDefId::ConstId(id) => self.bodies.push(id.into()),
-                ModuleDefId::StaticId(id) => self.bodies.push(id.into()),
+                ModuleDefId::StaticId(id) => {
+                    self.statics.push(id);
+                    self.bodies.push(id.into());
+                }
                 _ => {}
             }
         }
@@ -2157,6 +2230,7 @@ fn build(
     };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
+    let mut kept = Vec::new();
     // The `main` of the crate asked for: another program of the workspace among the crates
     // is only here for what this one uses of it.
     let mut main = None;
@@ -2171,6 +2245,10 @@ fn build(
                 main = main.or(listed.main);
             }
             functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
+            // rustc's copy of the crate has them when rustc built it.
+            if resolver.own_crate_id(krate.into()).is_some() {
+                kept.extend(&listed.kept);
+            }
         }
     }
     let list = start.elapsed();
@@ -2187,6 +2265,7 @@ fn build(
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
+        kept: &kept,
     };
     let setup = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -2277,7 +2356,7 @@ fn build(
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
-                let roots = Roots { entries: &[func], on_demand: &[], start: None };
+                let roots = Roots { entries: &[func], on_demand: &[], start: None, kept: &[] };
                 CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
@@ -3498,6 +3577,10 @@ fn main() -> anyhow::Result<()> {
         Some("daemon") => return cargo::daemon::serve(),
         _ => {}
     }
+    if std::env::args().nth(1).as_deref() == Some("--spare") {
+        let dir = std::env::args().nth(2).context("--spare needs a directory")?;
+        return spare(Path::new(&dir));
+    }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);
     }
@@ -3521,49 +3604,73 @@ fn main() -> anyhow::Result<()> {
     run(Args::parse(std::env::args().skip(1))?, None)
 }
 
-/// Loads the workspace `args` names and builds what they ask for, then serves it when they
-/// ask for that. With `doc` the build is of a library whose examples are then run.
-fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
-    // As cargo does: the flag, then the environment, then the host.
-    if args.selection.target.is_none() {
-        args.selection.target =
-            std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+/// Compiles the crates `args` names on every core until `done`: the symbols a build waits
+/// for are not needed for it.
+fn lower_until(
+    db: &RootDatabase,
+    args: &Args,
+    listed: &Listed,
+    done: &(dyn Fn() -> bool + Sync),
+) -> anyhow::Result<()> {
+    if done() {
+        return Ok(());
     }
-    let emits = match &args.selection.target {
-        Some(triple) => hir_ty::mir::codegen::Target::select(triple),
-        None => hir_ty::mir::codegen::Target::selected(),
+    let start = Instant::now();
+    let mut functions = Vec::new();
+    let mut crates = Vec::new();
+    for name in args.crates() {
+        for krate in crates_named(db, name, args)? {
+            crates.push(krate.into());
+            functions.extend(listed.of(db, krate).functions.iter().copied().filter(|&func| {
+                let generic = |def: hir::GenericDef| !def.type_or_const_params(db).is_empty();
+                let container = match func.lookup(db).container {
+                    ItemContainerId::ImplId(it) => !generic(hir::Impl::from(it).into()),
+                    ItemContainerId::TraitId(_) => false,
+                    _ => true,
+                };
+                container && !generic(hir::Function::from(func).into())
+            }));
+        }
+    }
+    let count = functions.len();
+    let unnamed = hir_ty::mir::codegen::Unnamed::new(functions);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (db, unnamed) = (db.clone(), &unnamed);
+            scope.spawn(move || {
+                hir::attach_db(&db, || hir_ty::mir::codegen::compile_unnamed(&db, unnamed, done))
+            });
+        }
+    });
+    // What the build lists of the crates to name what it keeps, while there is still time.
+    let lower = |bodies: &[hir_def::DefWithBodyId]| {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let (db, next) = (db.clone(), &next);
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        while let Some(&body) = bodies.get(next.fetch_add(1, Ordering::Relaxed))
+                            && !done()
+                        {
+                            hir_def::expr_store::Body::of(&db, body);
+                        }
+                    })
+                });
+            }
+        });
     };
-    let emits = emits.map_err(anyhow::Error::msg)?;
-    if args.selection.target.is_some() {
-        eprintln!("target: {}", emits.triple());
+    if !done() {
+        hir_ty::mir::codegen::lower_declared(db, &crates, &lower);
     }
-    let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
-    if backend != Backend::Cranelift {
-        eprintln!("backend: {backend}");
-    }
-    hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
-    project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Nothing asks for a symbol before the first build, so they load next to the workspace.
-    let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
-    let table = std::thread::spawn(move || {
-        let start = Instant::now();
-        let table = SymbolTable::load(&symbol_files, &root);
-        if let Ok(table) = &table {
-            eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
-        }
-        table
-    });
+    let compiled = unnamed.compiled();
+    eprintln!("compiled ahead: {compiled} from {count} functions in {:.1?}", start.elapsed());
+    Ok(())
+}
 
-    // What other machines compiled is fetched next to the workspace too.
-    let shared = std::thread::spawn(|| {
-        let shared = remote::Shared::from_env();
-        if let Some(shared) = &shared {
-            shared.pull();
-        }
-        shared
-    });
-
-    let mut start = Instant::now();
+/// How cargo is asked about the workspace of `args`.
+fn cargo_config(args: &Args) -> CargoConfig {
     // The library is read as the toolchain that built the program has it: one the directory
     // would pick now may be another, whose library has names the built one does not.
     let built_with = args.symbol_files.iter().find_map(|file| {
@@ -3575,7 +3682,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         Some(Ok(toolchain)) => RustLibSource::Path(toolchain),
         _ => RustLibSource::Discover,
     };
-    let cargo_config = CargoConfig {
+    CargoConfig {
         // The variables of whoever asks for a build: those of crates are read as rustc does.
         extra_env_for_commands_only: true,
         sysroot: Some(sysroot),
@@ -3600,38 +3707,495 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
             false => TargetDirectoryConfig::None,
         },
         ..Default::default()
-    };
-    let selection = args.selection.clone();
-    let load_config = LoadCargoConfig {
+    }
+}
+
+/// How a workspace is loaded, whichever it is.
+fn load_config() -> LoadCargoConfig {
+    LoadCargoConfig {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: false,
         num_worker_threads: 1,
         proc_macro_processes: 1,
+    }
+}
+
+/// What a process loaded before it was told its build: a package of nothing, and with it the
+/// library of the toolchain, its names resolved.
+struct Held {
+    db: RootDatabase,
+    vfs: Vfs,
+    checkouts: Checkouts,
+}
+
+impl Held {
+    /// Loads an empty package in `dir` and resolves what it depends on, which is the library.
+    fn load(dir: &Path) -> anyhow::Result<Held> {
+        let start = Instant::now();
+        std::fs::create_dir_all(dir.join("src"))?;
+        let manifest =
+            "[package]\nname = \"rustd-spare\"\nversion = \"0.0.0\"\nedition = \"2024\"\n";
+        std::fs::write(dir.join("Cargo.toml"), manifest)?;
+        std::fs::write(dir.join("src/lib.rs"), "")?;
+        // The crate and the object are ones nothing asks for.
+        let asked = ["--crate", "rustd_spare", "--out", "none"].map(str::to_owned);
+        let asked = std::iter::once(dir.display().to_string()).chain(asked);
+        let args = Args::parse(asked)?;
+        process_wide();
+        let (db, vfs, checkouts) =
+            load(&[dir], &cargo_config(&args), load_config(), args.selection, None)?;
+        let all: Vec<ide_db::base_db::Crate> =
+            Crate::all(&db).into_iter().map(Into::into).collect();
+        resolve_all(&db, &all);
+        eprintln!("spare: {} crates in {:.1?}", all.len(), start.elapsed());
+        Ok(Held { db, vfs, checkouts })
+    }
+
+    /// This with `projects` loaded next to the empty package, as a build of `selection` has
+    /// them. `None` when their library is another toolchain's: nothing held is of use then,
+    /// and the proc macros would be expanded by the wrong server.
+    fn with(
+        mut self,
+        projects: &[&Path],
+        cargo_config: &CargoConfig,
+        selection: &plan::Selection,
+    ) -> Option<Held> {
+        let start = Instant::now();
+        // The toolchain of the build is asked for before its workspace is loaded for nothing.
+        let held = self.checkouts.loaded.workspaces().first()?.sysroot.root()?.to_owned();
+        let asked = match &cargo_config.sysroot {
+            Some(RustLibSource::Path(toolchain)) => Some(toolchain.clone()),
+            _ => {
+                let dir = AbsPathBuf::assert_utf8(std::env::current_dir().ok()?.join(projects[0]));
+                let sysroot = project_model::Sysroot::discover(&dir, &cargo_config.extra_env);
+                sysroot.root().map(ToOwned::to_owned)
+            }
+        };
+        if asked.as_ref() != Some(&held) {
+            eprintln!(
+                "spare: not used: it holds the library of {held:?}, the build is of {asked:?}"
+            );
+            return None;
+        }
+        self.checkouts.cargo_config = cargo_config.clone();
+        self.checkouts.selection = selection.clone();
+        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs) {
+            eprintln!("spare: not used: {why:#}");
+            return None;
+        }
+        let workspaces = self.checkouts.loaded.workspaces();
+        let library = |it: &ProjectWorkspace| it.sysroot.root().map(ToOwned::to_owned);
+        let (held, asked) = (library(workspaces.first()?), library(workspaces.last()?));
+        if held != asked {
+            eprintln!(
+                "spare: not used: it holds the library of {held:?}, the build is of {asked:?}"
+            );
+            return None;
+        }
+        eprintln!("spare: workspace added in {:.1?}", start.elapsed());
+        Some(self)
+    }
+}
+
+/// What a worker that was started before its build was known is told on its standard input.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Told {
+    pub(crate) args: Vec<String>,
+    pub(crate) env: std::collections::BTreeMap<String, String>,
+    pub(crate) cwd: PathBuf,
+    /// The build is one cargo has only started: these are the workspace and its crates, and
+    /// what cargo wrote is in the arguments of the line that follows.
+    #[serde(default)]
+    pub(crate) ahead: bool,
+}
+
+/// A line a worker told a build ahead of cargo's reads while cargo runs.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Line {
+    /// One cargo printed of a build script it ran or a proc macro it built.
+    Said { said: String },
+    /// What cargo built, which ends its build.
+    Whole(Told),
+}
+
+static DBGT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// What cargo says of the build scripts and the proc macros of a build as it runs.
+#[derive(Default)]
+struct Said {
+    lines: Mutex<Lines>,
+    more: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Lines {
+    said: Vec<String>,
+    /// Cargo's build is over: nothing more is said.
+    ended: bool,
+}
+
+impl Said {
+    /// Reads the lines of the standard input on a thread: what cargo said, then on the
+    /// second what it built. The process ends when its input does without that: there is
+    /// no build.
+    fn read() -> (Arc<Said>, std::sync::mpsc::Receiver<anyhow::Result<Args>>) {
+        let said = Arc::new(Said::default());
+        let (built, whole) = std::sync::mpsc::channel();
+        let read = said.clone();
+        std::thread::spawn(move || {
+            let tell = |told: &dyn Fn(&mut Lines)| {
+                told(&mut read.lines.lock().unwrap_or_else(|e| e.into_inner()));
+                read.more.notify_all();
+            };
+            for line in std::io::stdin().lines() {
+                let line = line.ok().and_then(|it| serde_json::from_str::<Line>(&it).ok());
+                match line {
+                    Some(Line::Said { said: line }) => tell(&|it| it.said.push(line.clone())),
+                    Some(Line::Whole(told)) => {
+                        tell(&|it| it.ended = true);
+                        _ = built.send(Args::parse(told.args.into_iter()));
+                        return end_with_input();
+                    }
+                    None => break,
+                }
+            }
+            std::process::exit(0);
+        });
+        (said, whole)
+    }
+
+    /// The lines so far, and whether they are all there will be.
+    fn so_far(&self) -> (Vec<String>, bool) {
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        (lines.said.clone(), lines.ended)
+    }
+
+    /// Whether there is more than the first `seen` lines to take in.
+    fn more_than(&self, seen: usize) -> bool {
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        lines.said.len() > seen || lines.ended
+    }
+
+    /// Waits until [`Self::more_than`] `seen`.
+    fn wait_more_than(&self, seen: usize) {
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        let more = |it: &mut Lines| it.said.len() <= seen && !it.ended;
+        drop(self.more.wait_while(lines, more));
+    }
+}
+
+/// A script cargo runs or a proc macro it builds for a package, by the id of the package.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Awaited {
+    Script(String),
+    ProcMacro(String),
+}
+
+impl Awaited {
+    /// The one a line of cargo's says is there, when it says that.
+    fn arrived(line: &str) -> Option<Awaited> {
+        #[derive(serde::Deserialize)]
+        struct Message {
+            reason: String,
+            package_id: String,
+            target: Option<Target>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Target {
+            kind: Vec<String>,
+        }
+        let message: Message = serde_json::from_str(line).ok()?;
+        let proc_macro =
+            message.target.is_some_and(|it| it.kind.iter().any(|it| it == "proc-macro"));
+        match &*message.reason {
+            "build-script-executed" => Some(Awaited::Script(message.package_id)),
+            "compiler-artifact" if proc_macro => Some(Awaited::ProcMacro(message.package_id)),
+            _ => None,
+        }
+    }
+}
+
+/// A checkout that is loaded while cargo builds it. What its build scripts say and where
+/// its proc macros are is what cargo says as it gets to each, and a crate is read once
+/// cargo has said that of every package it is built from.
+struct Beside {
+    said: Arc<Said>,
+    /// Which of the loaded workspaces it is.
+    at: usize,
+    /// What cargo has to say for the whole of it to be read.
+    awaited: FxHashSet<Awaited>,
+    /// How many lines of cargo's the loaded workspace has taken in.
+    applied: usize,
+}
+
+impl Beside {
+    /// Takes note of what a build of the packages `built` of `cargo` has to say.
+    fn awaits(
+        &mut self,
+        cargo: &CargoWorkspace,
+        built: impl Iterator<Item = project_model::Package>,
+    ) {
+        for package in built {
+            let id = &cargo[package].id.repr;
+            for &target in &cargo[package].targets {
+                match cargo[target].kind {
+                    TargetKind::BuildScript => _ = self.awaited.insert(Awaited::Script(id.clone())),
+                    TargetKind::Lib { is_proc_macro: true } => {
+                        _ = self.awaited.insert(Awaited::ProcMacro(id.clone()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The crates of the workspace's own packages that `lines` of cargo's say everything
+    /// of, by the file each starts from, and whether those are all its crates.
+    fn ready(&self, cargo: &CargoWorkspace, lines: &[String]) -> (FxHashSet<PathBuf>, bool) {
+        let arrived: FxHashSet<Awaited> =
+            lines.iter().filter_map(|it| Awaited::arrived(it)).collect();
+        let waits = |package: project_model::Package| {
+            let id = &cargo[package].id.repr;
+            [Awaited::Script(id.clone()), Awaited::ProcMacro(id.clone())]
+                .iter()
+                .any(|it| self.awaited.contains(it) && !arrived.contains(it))
+        };
+        // A package is read with every package it depends on.
+        let mut waiting: FxHashMap<project_model::Package, bool> = FxHashMap::default();
+        fn any_waits(
+            cargo: &CargoWorkspace,
+            package: project_model::Package,
+            waits: &dyn Fn(project_model::Package) -> bool,
+            waiting: &mut FxHashMap<project_model::Package, bool>,
+        ) -> bool {
+            if let Some(&known) = waiting.get(&package) {
+                return known;
+            }
+            // One that depends on itself through another waits for no more than the other.
+            waiting.insert(package, false);
+            let any = waits(package)
+                || cargo[package]
+                    .dependencies
+                    .iter()
+                    .any(|it| any_waits(cargo, it.pkg, waits, waiting));
+            waiting.insert(package, any);
+            any
+        }
+        let mut ready = FxHashSet::default();
+        let mut all = true;
+        for package in cargo.packages().filter(|&it| cargo[it].is_member) {
+            if any_waits(cargo, package, &waits, &mut waiting) {
+                all = false;
+                continue;
+            }
+            let roots = cargo[package].targets.iter().map(|&it| cargo[it].root.clone());
+            ready.extend(roots.map(PathBuf::from));
+        }
+        (ready, all)
+    }
+}
+
+/// Compiles the crates of the checkout loaded beside cargo's build that cargo has said
+/// everything of, and takes in what cargo says next, until it has said all of it.
+fn follow_cargo(
+    db: &mut RootDatabase,
+    vfs: &mut Vfs,
+    checkouts: &mut Checkouts,
+    args: &Args,
+    listed: &Listed,
+) -> anyhow::Result<()> {
+    let Some(mut beside) = checkouts.beside.take() else { return Ok(()) };
+    let mut ready = FxHashSet::default();
+    loop {
+        let (lines, ended) = beside.said.so_far();
+        let workspace = &checkouts.loaded.workspaces()[beside.at];
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { return Ok(()) };
+        let (now, all) = beside.ready(cargo, &lines);
+        let all = all || ended;
+        if lines.len() > beside.applied && (all || now != ready) {
+            let scripts =
+                WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
+            let mut workspace = workspace.clone();
+            workspace.set_build_scripts(scripts);
+            checkouts.loaded.replace(beside.at, workspace);
+            let Checkouts { loaded, cargo_config, load_config, .. } = checkouts;
+            loaded.add(Vec::new(), &cargo_config.extra_env, load_config, vfs, db)?;
+            beside.applied = lines.len();
+        }
+        if all {
+            return Ok(());
+        }
+        eprintln!(
+            "DBGREADY {:?} lines {} ready {} of {:?} waiting {:?}",
+            DBGT.get_or_init(Instant::now).elapsed(),
+            lines.len(),
+            now.len(),
+            args.crates().count(),
+            beside
+                .awaited
+                .iter()
+                .filter(|a| !lines.iter().filter_map(|l| Awaited::arrived(l)).any(|b| b == **a))
+                .map(|a| match a {
+                    Awaited::Script(s) => format!("S {}", s.rsplit('/').next().unwrap_or(s)),
+                    Awaited::ProcMacro(s) => format!("P {}", s.rsplit('/').next().unwrap_or(s)),
+                })
+                .collect::<Vec<_>>()
+        );
+        ready = now;
+        // Whether cargo has said what makes another crate ready, asked once a line.
+        let seen = Mutex::new((lines.len(), false));
+        let more = || {
+            let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.1 && beside.said.more_than(seen.0) {
+                let (lines, ended) = beside.said.so_far();
+                let workspace = &checkouts.loaded.workspaces()[beside.at];
+                let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
+                    return true;
+                };
+                *seen = (lines.len(), ended || beside.ready(cargo, &lines).0 != ready);
+            }
+            seen.1
+        };
+        let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+        let mut names = args.crates().filter(|it| ready.contains(&root.join(it.as_str()))).cloned();
+        if let Some(krate) = names.next() {
+            let of_ready = Args {
+                krate,
+                batch: names.collect(),
+                widened: Vec::new(),
+                checkout: root,
+                base,
+                members,
+                debug,
+                ..args.clone()
+            };
+            // Every core resolves the names; one would, were it left to the compiling.
+            resolve_crates(db, &of_ready)?;
+            lower_until(db, &of_ready, listed, &more)?;
+        }
+        while !more() {
+            let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).0;
+            beside.said.wait_more_than(seen);
+        }
+    }
+}
+
+/// Loads the library of the toolchain, waits to be told a build, and runs as the worker of
+/// it. The process ends when its input does without a build.
+fn spare(dir: &Path) -> anyhow::Result<()> {
+    let held = Held::load(dir).inspect_err(|why| eprintln!("spare: nothing held: {why:#}")).ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(());
+    }
+    let told: Told = serde_json::from_str(&line).context("what the spare worker is told")?;
+    for (name, value) in &told.env {
+        // SAFETY: the threads that loaded the library have ended, and the ones that remain
+        // wait for files to change or for a proc macro to expand: none reads a variable.
+        unsafe { std::env::set_var(name, value) };
+    }
+    std::env::set_current_dir(&told.cwd)?;
+    if !told.ahead {
+        std::thread::spawn(end_with_input);
+    }
+    run_holding(Args::parse(told.args.into_iter())?, None, held, told.ahead)
+}
+
+/// What is said once for the process about how every workspace is read.
+fn process_wide() {
+    hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
+    project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Loads the workspace `args` names and builds what they ask for, then serves it when they
+/// ask for that. With `doc` the build is of a library whose examples are then run.
+fn run(args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
+    run_holding(args, doc, None, false)
+}
+
+/// [`run`], with what a process started before its build was known has loaded already.
+fn run_holding(
+    mut args: Args,
+    doc: Option<&doctest::Asked>,
+    held: Option<Held>,
+    ahead: bool,
+) -> anyhow::Result<()> {
+    // As cargo does: the flag, then the environment, then the host.
+    if args.selection.target.is_none() {
+        args.selection.target =
+            std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+    }
+    let emits = match &args.selection.target {
+        Some(triple) => hir_ty::mir::codegen::Target::select(triple),
+        None => hir_ty::mir::codegen::Target::selected(),
     };
+    let emits = emits.map_err(anyhow::Error::msg)?;
+    if args.selection.target.is_some() {
+        eprintln!("target: {}", emits.triple());
+    }
+    let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
+    if backend != Backend::Cranelift {
+        eprintln!("backend: {backend}");
+    }
+    process_wide();
+    // Nothing asks for a symbol before the first build, so they load next to the workspace.
+    let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
+    let (said, whole) = match ahead {
+        true => {
+            let (said, whole) = Said::read();
+            (Some(said), Some(whole))
+        }
+        false => (None, None),
+    };
+    let table = std::thread::spawn(move || {
+        // The files are cargo's to write first, when the build was told ahead of them.
+        let whole = whole.map(|it| it.recv()?).transpose()?;
+        let symbol_files = whole.as_ref().map_or(&symbol_files, |it| &it.symbol_files);
+        let start = Instant::now();
+        let table = SymbolTable::load(symbol_files, &root)?;
+        eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
+        Ok::<_, anyhow::Error>((table, whole))
+    });
+
+    // What other machines compiled is fetched next to the workspace too.
+    let shared = std::thread::spawn(|| {
+        let shared = remote::Shared::from_env();
+        if let Some(shared) = &shared {
+            shared.pull();
+        }
+        shared
+    });
+
+    let start = Instant::now();
+    let cargo_config = cargo_config(&args);
+    let selection = args.selection.clone();
     hir_ty::mir::codegen::identify_ahead();
     let projects: Vec<&Path> =
         std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
-    let (mut db, vfs, mut checkouts) = match std::env::var_os("RUSTD_PREWARM") {
-        Some(tiny) => {
-            let tiny = PathBuf::from(tiny);
-            let (mut db, mut vfs, mut checkouts) =
-                load(&[tiny.as_path()], &cargo_config, load_config, selection)?;
-            let at = Instant::now();
-            let all: Vec<ide_db::base_db::Crate> =
-                Crate::all(&db).into_iter().map(Into::into).collect();
-            resolve_all(&db, &all);
-            eprintln!("prewarm: {} crates in {:.1?}", all.len(), at.elapsed());
-            let at = Instant::now();
-            checkouts.add(&projects, &mut db, &mut vfs)?;
-            eprintln!("prewarm: added in {:.1?}", at.elapsed());
-            start = Instant::now();
-            (db, vfs, checkouts)
-        }
-        None => load(&projects, &cargo_config, load_config, selection)?,
+    let beside = |said: &Arc<Said>| Beside {
+        said: said.clone(),
+        at: usize::MAX,
+        awaited: FxHashSet::default(),
+        applied: 0,
     };
+    let held = held.and_then(|mut held| {
+        held.checkouts.beside = said.as_ref().map(beside);
+        held.with(&projects, &cargo_config, &selection)
+    });
+    let (mut db, mut vfs, mut checkouts) = match held {
+        Some(Held { db, vfs, checkouts }) => (db, vfs, checkouts),
+        None => {
+            load(&projects, &cargo_config, load_config(), selection, said.as_ref().map(beside))?
+        }
+    };
+    let listed = Arc::new(Listed::default());
+    follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     ide_db::base_db::set_process_env(&mut db, process::own());
-    match toolchain_identity(&vfs, &args.symbol_files) {
+    // A build told ahead of cargo's links the library of the toolchain that was loaded, or
+    // is not the daemon's.
+    let library = ahead.then(|| built_library(&vfs, emits.triple()));
+    match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
@@ -3691,9 +4255,27 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
     }));
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
-    let listed = Arc::new(Listed::default());
     let mut outlines = outline::Outlines::default();
-    let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    lower_until(&db, &args, &listed, &|| table.is_finished())?;
+    let (table, whole) =
+        table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    if let Some(whole) = whole {
+        // What was loaded is the workspace of both; the rest is as cargo built it.
+        args = Args {
+            checkout: args.checkout,
+            base: args.base,
+            members: args.members,
+            debug: args.debug,
+            selection: args.selection,
+            ..whole
+        };
+        let links = |file: &PathBuf| args.symbol_files.contains(file);
+        anyhow::ensure!(
+            library.is_some_and(|it| !it.is_empty() && it.iter().all(links)),
+            "cargo built with another toolchain than the one that was loaded"
+        );
+        known.patching = args.patch.is_some();
+    }
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     if let Some(asked) = doc {
         let krate = *crates_named(&db, &args.krate, &args)?.first().context("no such crate")?;
@@ -3702,6 +4284,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         report(&built);
         doctest::document(&mut db, krate);
         let code = doctest::run(&db, asked, krate, &args.out, emits.triple())?;
+        hir_ty::mir::codegen::settled();
         std::process::exit(code);
     }
     if let Some(stale) = stale_copies(&db, &table, &args) {
@@ -3730,7 +4313,10 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     match shared {
-        Some(shared) if args.socket.is_none() && !args.watch => shared.push(),
+        Some(shared) if args.socket.is_none() && !args.watch => {
+            hir_ty::mir::codegen::settled();
+            shared.push()
+        }
         Some(shared) => shared.keep(),
         None => {}
     }
@@ -3756,6 +4342,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
         },
         None if args.watch => None,
         None => {
+            hir_ty::mir::codegen::settled();
             // The process is ending: what these hold is not freed one allocation at a time.
             std::mem::forget((db, table, known, cold, as_compiled));
             return Ok(());

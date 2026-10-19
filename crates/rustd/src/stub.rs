@@ -88,24 +88,35 @@ fn valued<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
 fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
     let args: Vec<&str> = args.iter().map(|it| it.to_str()).collect::<Option<_>>()?;
     valued_in(&args, "--target")?;
-    let kinds: Vec<&str> =
-        args.windows(2).filter(|it| it[0] == "--crate-type").map(|it| it[1]).collect();
-    let program = match *kinds {
-        ["bin"] => true,
-        ["lib" | "rlib"] => false,
-        _ => return None,
-    };
+    let program = is_program(&args)?;
     if args.contains(&"--test") || valued_in(&args, "--crate-name")?.starts_with("build_script_") {
         return None;
     }
     let source = (0..args.len())
         .find(|&at| args[at].ends_with(".rs") && !(at > 0 && VALUED.contains(&args[at - 1])))?;
+    Some((source, text_of(&args, program)))
+}
+
+/// Whether rustc is asked for a program and nothing else. `None` when it is asked for
+/// neither that nor a Rust library alone: nothing stands in for the crate then.
+pub(crate) fn is_program<S: AsRef<str>>(args: &[S]) -> Option<bool> {
+    let kinds = args.windows(2).filter(|it| it[0].as_ref() == "--crate-type");
+    match *kinds.map(|it| it[1].as_ref()).collect::<Vec<_>>() {
+        ["bin"] => Some(true),
+        ["lib" | "rlib"] => Some(false),
+        _ => None,
+    }
+}
+
+/// The source that stands in for the crate rustc is given `args` for: it names the
+/// libraries the crate is linked against and has no code.
+pub(crate) fn text_of<S: AsRef<str>>(args: &[S], program: bool) -> String {
     let mut text = String::from("#![allow(warnings)]\n");
     if program {
         text.push_str("#![no_main]\n");
     }
-    for pair in args.windows(2).filter(|it| it[0] == "--extern") {
-        let Some((name, path)) = pair[1].split_once('=') else { continue };
+    for pair in args.windows(2).filter(|it| it[0].as_ref() == "--extern") {
+        let Some((name, path)) = pair[1].as_ref().split_once('=') else { continue };
         let name = name.rsplit_once(':').map_or(name, |it| it.1);
         // A proc macro is not linked into the program.
         if path.ends_with(".rlib") || path.ends_with(".rmeta") {
@@ -115,7 +126,7 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
     if program {
         text.push_str(WEAK_MAIN);
     }
-    Some((source, text))
+    text
 }
 
 fn valued_in<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {

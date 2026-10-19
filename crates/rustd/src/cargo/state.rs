@@ -12,13 +12,16 @@ use std::{
 
 use anyhow::Context as _;
 use cargo_metadata::{
-    Artifact, BuildScript, Message, Metadata, MetadataCommand, Package, TargetKind,
+    Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, MetadataCommand, Package,
+    Target, TargetKind,
 };
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use super::{
+    Request, Start,
     cli::{Invocation, Subcommand, worker_env},
+    client,
     daemon::{self, Checkout, WorkerConfig},
     package,
     plan::Plan,
@@ -42,9 +45,6 @@ pub(crate) struct State {
     pub(crate) root: PathBuf,
     /// When the cargo build this is the state of started.
     built_at: u128,
-    /// When the last check by rustc that passed the source started: the cargo build, or
-    /// the `cargo check` of a build by the daemon since.
-    checked_at: u128,
     /// The profile, as cargo's `Finished` line names it.
     pub(crate) profile: String,
     pub(crate) programs: Vec<Program>,
@@ -238,11 +238,109 @@ pub(crate) struct Built {
     scripts: Vec<BuildScript>,
 }
 
+/// The crates of a workspace the first build of it leaves to the daemon.
+pub(crate) struct Staged {
+    /// The root file of each.
+    roots: Vec<PathBuf>,
+    /// What the daemon is told of the workspace before cargo starts, so that it loads it
+    /// while cargo builds. `None` when the build is of no one project of it.
+    pub(crate) ahead: Option<daemon::Ahead>,
+}
+
+impl Staged {
+    /// `Err` is why rustc builds every crate of the build `asked` for. The crates that
+    /// run during the build are rustc's, and so are the ones those depend on: a build
+    /// script, a proc macro, and what either is declared to need under any feature.
+    pub(crate) fn of(asked: &Invocation) -> anyhow::Result<Result<Staged, String>> {
+        if asked.subcommand == Subcommand::Test || asked.flags.selects_targets {
+            return Ok(Err("the build picks its targets".to_owned()));
+        }
+        let metadata = metadata(asked)?;
+        let members: Vec<&Package> = metadata.workspace_packages();
+        let needs = |package: &Package, kinds: &[DependencyKind]| -> Vec<usize> {
+            let needed = package.dependencies.iter().filter(|it| kinds.contains(&it.kind));
+            let dirs = needed.filter_map(|it| it.path.as_ref());
+            dirs.filter_map(|dir| members.iter().position(|it| package_dir(it) == *dir)).collect()
+        };
+        let is_macro = |it: &&Package| it.targets.iter().any(|it| it.is_proc_macro());
+        let mut at_build: Vec<usize> =
+            members.iter().flat_map(|it| needs(it, &[DependencyKind::Build])).collect();
+        at_build.extend((0..members.len()).filter(|&at| is_macro(&&members[at])));
+        let mut reached = FxHashSet::default();
+        while let Some(member) = at_build.pop() {
+            if reached.insert(member) {
+                let kinds = [DependencyKind::Normal, DependencyKind::Build];
+                at_build.extend(needs(members[member], &kinds));
+            }
+        }
+        let mut roots = Vec::new();
+        for (at, member) in members.iter().enumerate() {
+            if reached.contains(&at) {
+                continue;
+            }
+            let of_build = |it: &&Target| {
+                let apart = [
+                    TargetKind::CustomBuild,
+                    TargetKind::Example,
+                    TargetKind::Test,
+                    TargetKind::Bench,
+                ];
+                !it.kind.iter().any(|it| apart.contains(it))
+            };
+            for target in member.targets.iter().filter(of_build) {
+                let alone = matches!(
+                    *target.crate_types,
+                    [CrateType::Lib | CrateType::RLib | CrateType::Bin]
+                );
+                if !alone {
+                    return Ok(Err(format!(
+                        "`{}` is linked into more than a program of the workspace",
+                        target.name
+                    )));
+                }
+                roots.push(target.src_path.clone().into_std_path_buf());
+            }
+        }
+        if roots.is_empty() {
+            return Ok(Err("every crate of the workspace runs during the build".to_owned()));
+        }
+        // Before cargo builds what would then be built again.
+        if let Some(why) = other_toolchain() {
+            return Ok(Err(why));
+        }
+        let root = metadata.workspace_root.clone().into_std_path_buf();
+        let ahead = project(asked, &std::env::current_dir()?, &metadata).ok().map(|project| {
+            let config = WorkerConfig {
+                repository: repository(&root),
+                project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
+                cfg_test: false,
+                selection: asked.selection(),
+                env: worker_env(),
+            };
+            daemon::Ahead { config, crates: roots.clone(), root }
+        });
+        Ok(Ok(Staged { roots, ahead }))
+    }
+}
+
 impl Built {
     /// Runs cargo on what `asked` builds, with rustd as the wrapper of the workspace's
     /// crates. Progress and diagnostics are cargo's own. `Err` is cargo's exit status when
     /// it failed.
     pub(crate) fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
+        Built::by(asked, None)
+    }
+
+    /// The same, with rustc building of the crates rooted at `staged` only what stands in
+    /// for them: the code of those is the daemon's to compile.
+    pub(crate) fn staged(
+        asked: &Invocation,
+        staged: &Staged,
+    ) -> anyhow::Result<Result<Built, i32>> {
+        Built::by(asked, Some(staged))
+    }
+
+    fn by(asked: &Invocation, staged: Option<&Staged>) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
@@ -251,12 +349,29 @@ impl Built {
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
         as_built(&mut cargo)?;
+        if let Some(staged) = staged {
+            cargo.env(switch::VARIABLE, switch::first_wrapper_path()?);
+            cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+        }
         cargo.stdout(Stdio::piped());
         let mut cargo = cargo.spawn().context("running cargo")?;
         let said = cargo.stdout.take().context("cargo has no output")?;
         let mut built = Built { started, artifacts: Vec::new(), scripts: Vec::new() };
+        let ahead = staged.and_then(|it| it.ahead.as_ref()).map(|it| it.config.id());
         for message in Message::parse_stream(BufReader::new(said)) {
-            match message? {
+            let message = message?;
+            // The worker that loads the workspace meanwhile reads what the scripts said and
+            // where the proc macros are from cargo's one build of them.
+            let loads = match &message {
+                Message::BuildScriptExecuted(_) => true,
+                Message::CompilerArtifact(it) => it.target.is_proc_macro(),
+                _ => false,
+            };
+            if loads && let Some(id) = &ahead {
+                let said = Request::Said { id: id.clone(), line: serde_json::to_string(&message)? };
+                let _ = client::ask(said, Start::Never);
+            }
+            match message {
                 Message::CompilerArtifact(artifact) => built.artifacts.push(artifact),
                 Message::BuildScriptExecuted(script) => built.scripts.push(script),
                 // Whoever reads this may stop reading before its end.
@@ -375,6 +490,15 @@ impl State {
         self.guards.iter_mut().find_map(|it| it.broken(self.built_at))
     }
 
+    /// Why the next build is cargo's: a program the daemon is never asked for has new
+    /// source.
+    pub(crate) fn stale_cargos(&self) -> Option<String> {
+        self.left_to_cargo().find_map(|(program, why)| {
+            let file = program.newer_input(self.built_at)?;
+            Some(format!("`{}`: {why}, and {} changed", program.name, file.display()))
+        })
+    }
+
     /// Counts a build that went to cargo.
     pub(crate) fn count_cargo(&mut self, reason: &str) {
         *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
@@ -451,17 +575,15 @@ impl State {
         Ok(cargos)
     }
 
-    /// Whether rustc has not seen the source as it is: a file a program is compiled from
-    /// was written since the last check that passed. A build of no program is one of
-    /// libraries, whose files are not listed.
-    pub(crate) fn unchecked(&self) -> bool {
-        let written = |it: &Program| it.newer_input(self.checked_at).is_some();
-        self.programs.is_empty() || self.programs.iter().any(written)
-    }
-
-    /// Records that a check by rustc that started at `stamp` passed the source.
-    pub(crate) fn checked(&mut self, stamp: u128) {
-        self.checked_at = stamp;
+    /// Has each program be, where cargo's own is kept, a copy of the one the daemon
+    /// built: the daemon writes an edit into its own.
+    pub(crate) fn keep_daemons(&self) -> anyhow::Result<()> {
+        for program in &self.programs {
+            let Some((checkout, at)) = program.asked_as else { continue };
+            let _ = std::fs::remove_file(&program.cargos);
+            std::fs::copy(&self.checkouts[checkout].programs[at].binary, &program.cargos)?;
+        }
+        Ok(())
     }
 
     /// The programs cargo built that the daemon is never asked for, and why.
@@ -492,7 +614,6 @@ impl State {
             key: key.to_owned(),
             root: root.clone(),
             built_at: built.started,
-            checked_at: built.started,
             profile: asked.profile().to_owned(),
             programs: Vec::new(),
             guards: Vec::new(),

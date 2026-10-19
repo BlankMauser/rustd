@@ -37,6 +37,83 @@ const CHECKED: &str = " checked";
 /// Before what stands for a crate from outside the checkout that rustc has no id for.
 const OF_LIBRARY: char = '^';
 
+enum Declared {
+    Function(FunctionId),
+    Static(StaticId),
+}
+
+/// Lowers what [`StableNames`] lists of `crates`, so that a build that lists them later
+/// finds it done. `lower` is given the bodies of each round to lower at once.
+pub fn lower_declared(db: &dyn HirDatabase, crates: &[Crate], lower: &dyn Fn(&[DefWithBodyId])) {
+    declared(db, crates, lower, &mut |_| ());
+}
+
+/// The functions and statics `crates` declare, in their modules and in the blocks of their
+/// bodies: a `static` is often written by a macro.
+fn declared(
+    db: &dyn HirDatabase,
+    crates: &[Crate],
+    lower: &dyn Fn(&[DefWithBodyId]),
+    found: &mut dyn FnMut(Declared),
+) {
+    let mut bodies: Vec<DefWithBodyId> = Vec::new();
+    let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
+        for def in scope.declarations() {
+            match def {
+                ModuleDefId::StaticId(id) => {
+                    found(Declared::Static(id));
+                    bodies.push(id.into());
+                }
+                ModuleDefId::FunctionId(id) => {
+                    found(Declared::Function(id));
+                    bodies.push(id.into());
+                }
+                ModuleDefId::ConstId(id) => bodies.push(id.into()),
+                // A method a trait provides has blocks of its own.
+                ModuleDefId::TraitId(id) => {
+                    for &(_, item) in id.trait_items(db).items.iter() {
+                        match item {
+                            AssocItemId::FunctionId(id) => bodies.push(id.into()),
+                            AssocItemId::ConstId(id) => bodies.push(id.into()),
+                            AssocItemId::TypeAliasId(_) => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                match item {
+                    AssocItemId::FunctionId(id) => {
+                        found(Declared::Function(id));
+                        bodies.push(id.into());
+                    }
+                    AssocItemId::ConstId(id) => bodies.push(id.into()),
+                    AssocItemId::TypeAliasId(_) => {}
+                }
+            }
+        }
+    };
+    for &krate in crates {
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            scope(module.scope(db), &mut bodies);
+        }
+    }
+    while !bodies.is_empty() {
+        let round = std::mem::take(&mut bodies);
+        lower(&round);
+        for body in round {
+            for (_, def_map) in Body::of(db, body).blocks(db) {
+                for (_, module) in def_map.modules(db) {
+                    scope(module.scope(db), &mut bodies);
+                }
+            }
+        }
+    }
+}
+
 /// The statics and the functions without type parameters that one build of a crate declares.
 #[derive(Default)]
 struct Listed {
@@ -149,6 +226,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
     /// one build of its crate is here.
     pub(super) fn functions_named(&self, name: &str) -> Vec<FunctionId> {
         let name = name.strip_suffix(CHECKED).unwrap_or(name);
+        // An instance of a library's function with a type of the checkout is asked about
+        // too, and no function without type parameters is named so: its crate is not listed.
+        let of_checkout = name.split_once(' ').is_some_and(|it| it.1.starts_with(OF_CHECKOUT));
+        if !of_checkout {
+            return Vec::new();
+        }
         self.listed(name, |it| it.functions.get(name).cloned()).unwrap_or_default()
     }
 
@@ -179,70 +262,25 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     fn list(&self, crates: &[Crate]) -> Listed {
-        let db = self.db;
         let mut found = Listed::default();
-        // The statics of a body's blocks too: a `static` is often written by a macro.
-        let mut bodies: Vec<DefWithBodyId> = Vec::new();
-        let function = |found: &mut Listed, id: FunctionId, bodies: &mut Vec<_>| {
-            let mut name = String::from("fn ");
-            if self.function(&mut name, id).is_some() {
-                name.push_str("<>");
-                found.functions.entry(name).or_default().push(id);
-            }
-            bodies.push(id.into());
-        };
-        let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
-            for def in scope.declarations() {
-                match def {
-                    ModuleDefId::StaticId(id) => {
-                        if let Some(name) = self.static_name(id) {
-                            found.statics.entry(name).or_insert(id);
-                        }
-                        bodies.push(id.into());
-                    }
-                    ModuleDefId::FunctionId(id) => function(&mut found, id, bodies),
-                    ModuleDefId::ConstId(id) => bodies.push(id.into()),
-                    // A method a trait provides has blocks of its own.
-                    ModuleDefId::TraitId(id) => {
-                        for &(_, item) in id.trait_items(db).items.iter() {
-                            match item {
-                                AssocItemId::FunctionId(id) => bodies.push(id.into()),
-                                AssocItemId::ConstId(id) => bodies.push(id.into()),
-                                AssocItemId::TypeAliasId(_) => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            bodies.extend(scope.unnamed_consts().map(DefWithBodyId::from));
-            for imp in scope.impls() {
-                for &(_, item) in imp.impl_items(db).items.iter() {
-                    match item {
-                        AssocItemId::FunctionId(id) => function(&mut found, id, bodies),
-                        AssocItemId::ConstId(id) => bodies.push(id.into()),
-                        AssocItemId::TypeAliasId(_) => {}
-                    }
-                }
-            }
-        };
-        for &krate in crates {
-            for (_, module) in crate_def_map(db, krate).modules(db) {
-                scope(module.scope(db), &mut bodies);
-            }
-        }
-        while !bodies.is_empty() {
-            let round = std::mem::take(&mut bodies);
-            // Lowering a body is most of the listing, and the bodies do not wait on each other.
+        // Lowering a body is most of the listing, and the bodies do not wait on each other.
+        let lower = |round: &[DefWithBodyId]| {
             self.symbols.in_parallel(round.len(), &|db, _, at| _ = Body::of(db, round[at]));
-            for body in round {
-                for (_, def_map) in Body::of(db, body).blocks(db) {
-                    for (_, module) in def_map.modules(db) {
-                        scope(module.scope(db), &mut bodies);
-                    }
+        };
+        declared(self.db, crates, &lower, &mut |declared| match declared {
+            Declared::Function(id) => {
+                let mut name = String::from("fn ");
+                if self.function(&mut name, id).is_some() {
+                    name.push_str("<>");
+                    found.functions.entry(name).or_default().push(id);
                 }
             }
-        }
+            Declared::Static(id) => {
+                if let Some(name) = self.static_name(id) {
+                    found.statics.entry(name).or_insert(id);
+                }
+            }
+        });
         found
     }
 

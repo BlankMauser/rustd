@@ -1,5 +1,5 @@
 {
- "rustd": "/home/ubuntu/rbin/new/rustd",
+ "rustd": "/home/ubuntu/rustd-main/target/release/rustd",
  "toolchain": "1.99.0",
  "projects": [
   {
@@ -9,71 +9,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     4.59,
-     5.38
+     6.11,
+     6.11
     ],
     "cold run": [
-     0.03,
-     1.27
+     2.24,
+     0.42
     ],
     "warm-up": [
-     3.8,
+     0.03,
      null
     ],
     "warm build": [
      0.02,
-     1.2
+     0.42
     ],
     "warm run": [
      0.03,
-     1.21
+     0.43
     ],
     "cold test": [
-     4.57,
-     4.46
+     5.28,
+     6.14
     ],
     "test warm-up": [
-     5.15,
+     2.51,
      null
     ],
     "warm test": [
-     0.94,
-     2.23
+     1.0,
+     1.39
     ],
     "edit build": [
-     0.62,
-     1.57
+     0.36,
+     1.28
     ],
     "edit run": [
      0.03,
-     1.24
+     0.44
     ],
     "edit test": [
-     3.65,
-     2.37
+     2.13,
+     1.61
     ],
     "broken": [
-     0.38,
-     0.39
+     0.27,
+     0.51
     ],
     "mended": [
-     0.38,
-     1.22
+     0.43,
+     0.6
     ],
     "mended run": [
-     0.03,
-     1.25
+     0.04,
+     0.68
     ],
     "tree build": [
-     4.68,
+     9.56,
      null
     ],
     "tree warm-up": [
-     2.75,
+     0.3,
      null
     ],
     "tree edit": [
-     0.61,
+     0.35,
      null
     ],
     "tree run": [
@@ -83,16 +83,16 @@
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "unchanged: the daemon is still loading the workspace (5s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready",
+    "test warm-up": "ready; ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: `rg`: the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/ripgrep/crates/core/main.rs changed",
+    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /tmp/rustd-cargo-jhktzz09/ripgrep/crates/printer/src/standard.rs changed",
     "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
@@ -102,10 +102,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 3584922, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3604443, /dev/shm/rustd-cargo-vix3v3he/ripgrep/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/ccef460884ba2ef03034a1566eea6f8b/log\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep: failed: /dev/shm/rustd-cargo-vix3v3he/ripgrep/crates/core/main.rs changed while cargo built or the daemon loaded\n  worker: pid 3584925, /dev/shm/rustd-cargo-vix3v3he/ripgrep/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/1d879461893281b0803dd5b1934e5179/log\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep: ready\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep-worktree-rustd: ready\n/dev/shm/rustd-cargo-vix3v3he/ripgrep (dev, 6c4de10a26a55ebb): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/ripgrep (test, 5b7548b48d6475a4): 1 builds by the daemon, 1 by cargo\n  1 x `rg`: the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/ripgrep/crates/core/main.rs changed\n"
+   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 834595, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 834596, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep-worktree-rustd: ready\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n  worker: pid 850147, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/2/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n  worker: pid 856779, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-rustd/workers/3245e90a4f88ed4b141ec085142c6578/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n/tmp/rustd-cargo-jhktzz09/ripgrep (test, 33a102c830554a58): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /tmp/rustd-cargo-jhktzz09/ripgrep/crates/printer/src/standard.rs changed\n/tmp/rustd-cargo-jhktzz09/ripgrep (dev, f75b162a0468098f): 8 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "ripgrep",
@@ -114,71 +114,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     4.62,
-     5.26
+     5.56,
+     6.26
     ],
     "cold run": [
-     1.67,
-     1.23
+     2.13,
+     0.43
     ],
     "warm-up": [
-     7.7,
+     0.01,
      null
     ],
     "warm build": [
-     0.38,
-     1.22
+     0.12,
+     0.44
     ],
     "warm run": [
-     0.39,
-     1.23
+     0.14,
+     0.44
     ],
     "cold test": [
-     4.55,
-     4.53
+     5.14,
+     5.86
     ],
     "test warm-up": [
-     6.16,
+     4.24,
      null
     ],
     "warm test": [
-     2.32,
-     2.39
+     1.18,
+     1.45
     ],
     "edit build": [
-     1.54,
-     1.59
+     0.88,
+     0.82
     ],
     "edit run": [
-     0.39,
-     1.28
+     0.21,
+     0.43
     ],
     "edit test": [
-     2.35,
-     2.42
+     1.46,
+     1.69
     ],
     "broken": [
-     0.74,
-     0.4
+     0.2,
+     0.2
     ],
     "mended": [
-     0.38,
-     1.21
+     0.31,
+     0.81
     ],
     "mended run": [
-     0.38,
-     1.23
+     0.2,
+     0.56
     ],
     "tree build": [
-     4.7,
+     7.16,
      null
     ],
     "tree warm-up": [
-     2.98,
+     0.41,
      null
     ],
     "tree edit": [
-     0.71,
+     0.59,
      null
     ],
     "tree run": [
@@ -188,17 +188,17 @@
    },
    "built": {
     "cold build": "cargo: the daemon had not loaded the build yet",
-    "cold run": "cargo: the daemon is still loading the workspace (5s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo: the daemon had not loaded the build yet",
-    "test warm-up": "ready; ready",
-    "warm test": "cargo: the tests of `integration` are built without incremental compilation, where rustc keeps them private to its object",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
     "edit test": "cargo: the build is not one the daemon has loaded",
-    "broken": "cargo: rustc finds errors in the source",
+    "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
     "tree build": "cargo: the daemon had not loaded the build yet",
@@ -207,10 +207,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev/shm/rustd-cargo-vix3v3he/cargo-home/config.toml\n  11 programs linked by the daemon, 10 by rustc\n    1 x rustc finds errors in the source\n    2 x the build is not one the daemon has loaded\n    4 x the daemon had not loaded the build yet\n    1 x the daemon is still loading the workspace (5s so far)\n    1 x the tests of `integration` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object\ndaemon: pid 3616434, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3636907, /dev/shm/rustd-cargo-vix3v3he/ripgrep/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/baaf967866fda82cadd28fef7e355dcb/log\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep: failed: /dev/shm/rustd-cargo-vix3v3he/ripgrep/crates/core/main.rs changed while cargo built or the daemon loaded\n  worker: pid 3617730, /dev/shm/rustd-cargo-vix3v3he/ripgrep/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/42f1d6788c6cc5c5362ec16c3fac3d76/log\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep: ready\n    /dev/shm/rustd-cargo-vix3v3he/ripgrep-worktree-plain: ready\n/dev/shm/rustd-cargo-vix3v3he/ripgrep (dev, 6c4de10a26a55ebb): 0 builds by the daemon, 0 by cargo\n"
+   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp/rustd-cargo-jhktzz09/cargo-home/config.toml\n  14 programs linked by the daemon, 6 by rustc\n    2 x the build is not one the daemon has loaded\n    4 x the daemon had not loaded the build yet\ndaemon: pid 878570, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 898450, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/2/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n  worker: pid 909291, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-plain/workers/4298cc19c705c6cb9505c7bebea390e4/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n  worker: pid 878577, /tmp/rustd-cargo-jhktzz09/ripgrep/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/ripgrep: ready\n    /tmp/rustd-cargo-jhktzz09/ripgrep-worktree-plain: ready\n/tmp/rustd-cargo-jhktzz09/ripgrep (dev, f75b162a0468098f): 0 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "fd",
@@ -219,71 +219,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     18.32,
-     26.83
+     21.1,
+     22.28
     ],
     "cold run": [
-     0.04,
-     1.02
+     0.05,
+     0.43
     ],
     "warm-up": [
-     5.42,
+     0.03,
      null
     ],
     "warm build": [
      0.03,
-     1.0
+     0.41
     ],
     "warm run": [
      0.04,
-     0.98
+     0.42
     ],
     "cold test": [
-     4.3,
-     4.12
+     4.97,
+     6.16
     ],
     "test warm-up": [
-     4.87,
+     1.48,
      null
     ],
     "warm test": [
-     0.58,
-     1.5
+     0.77,
+     1.16
     ],
     "edit build": [
-     0.38,
-     0.98
+     0.17,
+     0.52
     ],
     "edit run": [
-     0.04,
-     0.98
+     0.06,
+     0.46
     ],
     "edit test": [
-     2.18,
-     1.56
+     1.32,
+     1.09
     ],
     "broken": [
-     0.36,
-     0.36
+     0.13,
+     0.2
     ],
     "mended": [
-     0.36,
-     0.97
+     0.17,
+     0.4
     ],
     "mended run": [
-     0.04,
-     0.98
+     0.05,
+     0.43
     ],
     "tree build": [
-     19.11,
+     20.62,
      null
     ],
     "tree warm-up": [
-     2.48,
+     0.3,
      null
     ],
     "tree edit": [
-     0.34,
+     0.29,
      null
     ],
     "tree run": [
@@ -293,16 +293,16 @@
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "unchanged: the daemon is still loading the workspace (27s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready",
+    "test warm-up": "ready; ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: `fd`: the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/fd/src/main.rs changed",
+    "edit test": "daemon",
     "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
@@ -312,10 +312,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 3647335, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3674883, /dev/shm/rustd-cargo-vix3v3he/fd/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/e687b5491e7c5803f4940449dea9f406/log\n    /dev/shm/rustd-cargo-vix3v3he/fd: failed: /dev/shm/rustd-cargo-vix3v3he/fd/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 3647338, /dev/shm/rustd-cargo-vix3v3he/fd/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/af0532878c8132adac1982a59395684d/log\n    /dev/shm/rustd-cargo-vix3v3he/fd-worktree-rustd: ready\n    /dev/shm/rustd-cargo-vix3v3he/fd: ready\n/dev/shm/rustd-cargo-vix3v3he/fd (dev, 2e6895f65c2c295d): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/fd (test, a7880260a3fa7352): 1 builds by the daemon, 1 by cargo\n  1 x `fd`: the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/fd/src/main.rs changed\n"
+   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 923780, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 923781, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n    /tmp/rustd-cargo-jhktzz09/fd-worktree-rustd: ready\n  worker: pid 932825, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-rustd/workers/f43fba28c1fcb373839511ecc4fb922a/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n  worker: pid 928893, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/1/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n/tmp/rustd-cargo-jhktzz09/fd (test, c4425ccbfc8562b1): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/fd (dev, 0c8c7dde4ab3c155): 8 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "fd",
@@ -324,91 +324,91 @@
    "wrong": [],
    "times": {
     "cold build": [
-     18.26,
-     26.25
+     20.72,
+     22.58
     ],
     "cold run": [
-     1.3,
-     0.99
+     0.16,
+     0.49
     ],
     "warm-up": [
-     7.45,
+     0.01,
      null
     ],
     "warm build": [
-     0.35,
-     1.01
+     0.15,
+     0.41
     ],
     "warm run": [
-     0.35,
-     0.99
+     0.16,
+     0.45
     ],
     "cold test": [
-     4.21,
-     4.08
+     4.87,
+     6.31
     ],
     "test warm-up": [
-     4.88,
+     1.61,
      null
     ],
     "warm test": [
-     1.43,
-     1.6
+     0.85,
+     1.22
     ],
     "edit build": [
-     0.35,
-     1.0
+     0.24,
+     0.49
     ],
     "edit run": [
-     0.36,
-     1.01
+     0.17,
+     0.5
     ],
     "edit test": [
-     1.92,
-     1.57
+     1.28,
+     1.08
     ],
     "broken": [
-     0.64,
-     0.36
+     0.19,
+     0.2
     ],
     "mended": [
-     0.34,
-     0.98
+     0.29,
+     0.4
     ],
     "mended run": [
-     0.35,
-     0.99
+     0.17,
+     0.43
     ],
     "tree build": [
-     18.78,
+     20.37,
      null
     ],
     "tree warm-up": [
-     2.45,
+     0.44,
      null
     ],
     "tree edit": [
-     0.34,
+     0.18,
      null
     ],
     "tree run": [
-     0.05,
+     0.06,
      null
     ]
    },
    "built": {
     "cold build": "cargo: the daemon had not loaded the build yet",
-    "cold run": "cargo: the daemon is still loading the workspace (26s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo: the daemon had not loaded the build yet",
-    "test warm-up": "ready; ready",
-    "warm test": "cargo: the tests of `tests` are built without incremental compilation, where rustc keeps them private to its object",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: the tests of `tests` are built without incremental compilation, where rustc keeps them private to its object",
-    "broken": "cargo: rustc finds errors in the source",
+    "edit test": "daemon",
+    "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
     "tree build": "cargo: the daemon had not loaded the build yet",
@@ -417,10 +417,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev/shm/rustd-cargo-vix3v3he/cargo-home/config.toml\n  20 programs linked by the daemon, 22 by rustc\n    2 x rustc finds errors in the source\n    2 x the build is not one the daemon has loaded\n    9 x the daemon had not loaded the build yet\n    1 x the daemon is still loading the workspace (26s so far)\n    1 x the daemon is still loading the workspace (4s so far)\n    1 x the daemon is still loading the workspace (5s so far)\n    2 x the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `integration` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object\n    2 x the tests of `tests` are built without incremental compilation, where rustc keeps them private to its object\ndaemon: pid 3694069, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3722147, /dev/shm/rustd-cargo-vix3v3he/fd/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/3c67b8b6703f5a950118df0a34e6fa8e/log\n    /dev/shm/rustd-cargo-vix3v3he/fd: failed: /dev/shm/rustd-cargo-vix3v3he/fd/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 3704653, /dev/shm/rustd-cargo-vix3v3he/fd/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/6ca211cecceba7d60f967e9e475c34fc/log\n    /dev/shm/rustd-cargo-vix3v3he/fd-worktree-plain: ready\n    /dev/shm/rustd-cargo-vix3v3he/fd: ready\n/dev/shm/rustd-cargo-vix3v3he/fd (test, a7880260a3fa7352): 0 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/fd (dev, 2e6895f65c2c295d): 0 builds by the daemon, 0 by cargo\n"
+   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp/rustd-cargo-jhktzz09/cargo-home/config.toml\n  29 programs linked by the daemon, 11 by rustc\n    2 x the build is not one the daemon has loaded\n    9 x the daemon had not loaded the build yet\ndaemon: pid 969927, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 979288, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-plain/workers/13d56923ffc92c54b214e51d94b6f9c2/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n  worker: pid 969931, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n    /tmp/rustd-cargo-jhktzz09/fd-worktree-plain: ready\n  worker: pid 974802, /tmp/rustd-cargo-jhktzz09/fd/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/1/log\n    /tmp/rustd-cargo-jhktzz09/fd: ready\n/tmp/rustd-cargo-jhktzz09/fd (test, c4425ccbfc8562b1): 0 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/fd (dev, 0c8c7dde4ab3c155): 0 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "bat",
@@ -639,71 +639,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     4.97,
-     7.46
+     6.38,
+     6.39
     ],
     "cold run": [
-     0.03,
-     0.73
+     2.69,
+     0.34
     ],
     "warm-up": [
-     4.07,
+     0.03,
      null
     ],
     "warm build": [
-     0.02,
-     0.7
+     0.03,
+     0.33
     ],
     "warm run": [
      0.03,
-     0.71
+     0.36
     ],
     "cold test": [
-     3.91,
-     3.9
+     4.44,
+     6.44
     ],
     "test warm-up": [
-     2.71,
+     0.38,
      null
     ],
     "warm test": [
-     0.34,
-     1.08
+     0.41,
+     0.79
     ],
     "edit build": [
-     0.34,
-     0.71
+     0.15,
+     0.36
     ],
     "edit run": [
      0.03,
-     0.71
+     0.34
     ],
     "edit test": [
-     1.64,
-     1.1
+     0.65,
+     1.26
     ],
     "broken": [
-     0.33,
-     0.3
+     0.15,
+     0.18
     ],
     "mended": [
-     0.33,
-     0.74
+     0.14,
+     0.35
     ],
     "mended run": [
      0.03,
-     0.72
+     0.32
     ],
     "tree build": [
-     5.31,
+     5.73,
      null
     ],
     "tree warm-up": [
-     3.06,
+     0.39,
      null
     ],
     "tree edit": [
-     0.29,
+     0.06,
      null
     ],
     "tree run": [
@@ -713,16 +713,16 @@
    },
    "built": {
     "cold build": "cargo",
-    "cold run": "unchanged: the daemon is still loading the workspace (7s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo",
-    "test warm-up": "ready; ready",
+    "test warm-up": "ready; ready; ready",
     "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
-    "edit test": "cargo: `hyperfine`: the tests of `hyperfine` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/hyperfine/src/main.rs changed",
+    "edit test": "daemon",
     "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
@@ -732,10 +732,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 3736343, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3753066, /dev/shm/rustd-cargo-vix3v3he/hyperfine/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/d468bf552cd75e6801eda00b23698b9a/log\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine: failed: /dev/shm/rustd-cargo-vix3v3he/hyperfine/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 3736346, /dev/shm/rustd-cargo-vix3v3he/hyperfine/, log /dev/shm/rustd-cargo-vix3v3he/home-rustd/workers/8b5340db350995fa534eefff68387f72/log\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine-worktree-rustd: ready\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine: ready\n/dev/shm/rustd-cargo-vix3v3he/hyperfine (dev, 39b6d354311ae2ea): 7 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/hyperfine (test, 965490fd18f7aadd): 1 builds by the daemon, 1 by cargo\n  1 x `hyperfine`: the tests of `hyperfine` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/hyperfine/src/main.rs changed\n"
+   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 1018452, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 1021985, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/1/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n  worker: pid 1018453, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-rustd/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine-worktree-rustd: ready\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n  worker: pid 1023922, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-rustd/workers/0b30cf8ce1a980a48a2bb66d7743d964/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n/tmp/rustd-cargo-jhktzz09/hyperfine (test, 22bf7dc208145c92): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/hyperfine (dev, 1769ab4fe1c23151): 8 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "hyperfine",
@@ -744,71 +744,71 @@
    "wrong": [],
    "times": {
     "cold build": [
-     4.99,
-     7.24
+     5.74,
+     6.48
     ],
     "cold run": [
-     0.96,
-     0.71
+     2.66,
+     0.34
     ],
     "warm-up": [
-     6.17,
+     0.01,
      null
     ],
     "warm build": [
-     0.3,
-     0.71
+     0.15,
+     0.39
     ],
     "warm run": [
-     0.3,
-     0.72
+     0.15,
+     0.33
     ],
     "cold test": [
-     3.7,
-     4.07
+     4.33,
+     5.7
     ],
     "test warm-up": [
-     3.34,
+     1.12,
      null
     ],
     "warm test": [
-     1.19,
-     1.15
+     0.61,
+     0.86
     ],
     "edit build": [
-     0.29,
-     0.71
+     0.23,
+     0.35
     ],
     "edit run": [
-     0.29,
-     0.72
+     0.16,
+     0.33
     ],
     "edit test": [
-     1.32,
-     1.15
+     1.16,
+     1.17
     ],
     "broken": [
-     0.54,
-     0.3
+     0.22,
+     0.19
     ],
     "mended": [
-     0.3,
-     0.74
+     0.28,
+     0.41
     ],
     "mended run": [
-     0.3,
-     0.73
+     0.2,
+     0.36
     ],
     "tree build": [
-     5.24,
+     8.16,
      null
     ],
     "tree warm-up": [
-     2.98,
+     0.46,
      null
     ],
     "tree edit": [
-     0.28,
+     0.15,
      null
     ],
     "tree run": [
@@ -818,17 +818,17 @@
    },
    "built": {
     "cold build": "cargo: the daemon had not loaded the build yet",
-    "cold run": "cargo: the daemon is still loading the workspace (7s so far)",
+    "cold run": "daemon",
     "warm-up": "ready",
     "warm build": "daemon",
     "warm run": "daemon",
     "cold test": "cargo: the daemon had not loaded the build yet",
-    "test warm-up": "ready; ready",
-    "warm test": "cargo: the tests of `common` are built without incremental compilation, where rustc keeps them private to its object",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
     "edit build": "daemon",
     "edit run": "daemon",
     "edit test": "cargo: the build is not one the daemon has loaded",
-    "broken": "cargo: rustc finds errors in the source",
+    "broken": "cargo",
     "mended": "daemon",
     "mended run": "daemon",
     "tree build": "cargo: the daemon had not loaded the build yet",
@@ -837,10 +837,10 @@
     "tree run": "daemon"
    },
    "share": [
-    1422,
-    1422
+    1044,
+    1244
    ],
-   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev/shm/rustd-cargo-vix3v3he/cargo-home/config.toml\n  31 programs linked by the daemon, 38 by rustc\n    3 x rustc finds errors in the source\n    6 x the build is not one the daemon has loaded\n    15 x the daemon had not loaded the build yet\n    1 x the daemon is still loading the workspace (26s so far)\n    1 x the daemon is still loading the workspace (4s so far)\n    1 x the daemon is still loading the workspace (5s so far)\n    1 x the daemon is still loading the workspace (7s so far)\n    1 x the tests of `common` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `execution_order_tests` are built without incremental compilation, where rustc keeps them private to its object\n    2 x the tests of `fd` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `hyperfine` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `integration_tests` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `integration` are built without incremental compilation, where rustc keeps them private to its object\n    1 x the tests of `rg` are built without incremental compilation, where rustc keeps them private to its object\n    2 x the tests of `tests` are built without incremental compilation, where rustc keeps them private to its object\ndaemon: pid 3762830, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3765488, /dev/shm/rustd-cargo-vix3v3he/hyperfine/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/499f15e09ff3e372ae856f4023f91ad8/log\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine-worktree-plain: ready\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine: ready\n  worker: pid 3782441, /dev/shm/rustd-cargo-vix3v3he/hyperfine/, log /dev/shm/rustd-cargo-vix3v3he/home-plain/workers/b132bb26dd58bc44214fc48e386a2d1b/log\n    /dev/shm/rustd-cargo-vix3v3he/hyperfine: failed: /dev/shm/rustd-cargo-vix3v3he/hyperfine/src/main.rs changed while cargo built or the daemon loaded\n/dev/shm/rustd-cargo-vix3v3he/hyperfine (dev, 39b6d354311ae2ea): 0 builds by the daemon, 0 by cargo\n"
+   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp/rustd-cargo-jhktzz09/cargo-home/config.toml\n  45 programs linked by the daemon, 21 by rustc\n    6 x the build is not one the daemon has loaded\n    15 x the daemon had not loaded the build yet\ndaemon: pid 1055186, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 1077722, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-plain/workers/79abb30356faf5544e492c34cfad9cd5/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n  worker: pid 1055192, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine-worktree-plain: ready\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n  worker: pid 1069510, /tmp/rustd-cargo-jhktzz09/hyperfine/, log /tmp/rustd-cargo-jhktzz09/home-plain/spares/2/log\n    /tmp/rustd-cargo-jhktzz09/hyperfine: ready\n/tmp/rustd-cargo-jhktzz09/hyperfine (dev, 1769ab4fe1c23151): 0 builds by the daemon, 0 by cargo\n"
   },
   {
    "project": "just",
@@ -2394,13 +2394,41 @@
   [
    "cold",
    "cargo rustd run -- fail",
-   "unchanged: the daemon is still loading the workspace (326ms so far)",
+   "daemon",
    3,
    "same"
   ],
   [
    "cold",
    "cargo rustd run --release",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "cargo rustd run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "cold",
+   "RUSTFLAGS=-C overflow-checks=off cargo rustd run -- world",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 cargo rustd run --release",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "cargo rustd run --no-default-features -p app",
    "cargo",
    0,
    "same"
@@ -2513,35 +2541,49 @@
   [
    "cold",
    "cargo rustd test greets",
-   "unchanged: the daemon is still loading the workspace (717ms so far)",
+   "daemon",
    0,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "unchanged: the daemon is still loading the workspace (776ms so far)",
+   "daemon",
    101,
    "same"
   ],
   [
    "cold",
    "FLAGS_FAIL=1 cargo rustd test",
-   "unchanged: the daemon is still loading the workspace (981ms so far)",
+   "daemon",
    101,
    "same"
   ],
   [
    "cold",
    "cargo rustd test --no-run",
-   "unchanged: the daemon is still loading the workspace (1s so far)",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "cargo rustd test --doc",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "cargo rustd test --doc --features loud -p util",
+   "cargo",
    0,
    "same"
   ],
   [
    "cold",
    "CARGO_INCREMENTAL=0 cargo rustd test",
-   "unchanged: the daemon is still loading the workspace (1s so far)",
+   "cargo",
    0,
    "same"
   ],
@@ -2568,6 +2610,34 @@
   ],
   [
    "warm",
+   "cargo rustd run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "warm",
+   "RUSTFLAGS=-C overflow-checks=off cargo rustd run -- world",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 cargo rustd run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "cargo rustd run --no-default-features -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
    "cargo rustd run --target x86_64-unknown-linux-gnu",
    "daemon",
    0,
@@ -2696,6 +2766,20 @@
    "warm",
    "cargo rustd test --no-run",
    "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "cargo rustd test --doc",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "cargo rustd test --doc --features loud -p util",
+   "cargo",
    0,
    "same"
   ],
@@ -2729,6 +2813,34 @@
   ],
   [
    "edit",
+   "cargo rustd run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "edit",
+   "RUSTFLAGS=-C overflow-checks=off cargo rustd run -- world",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 cargo rustd run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "cargo rustd run --no-default-features -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
    "cargo rustd run --target x86_64-unknown-linux-gnu",
    "daemon",
    0,
@@ -2772,9 +2884,9 @@
   [
    "edit",
    "cargo rustd run --profile quick",
-   "daemon",
-   0,
-   "same"
+   "cargo",
+   101,
+   "101 for 0"
   ],
   [
    "edit",
@@ -2814,57 +2926,71 @@
   [
    "edit",
    "cargo rustd test",
-   "cargo: `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/flags/app/src/main.rs changed",
-   0,
+   "cargo: a library its unit tests are linked with as rustc built it: /tmp/rustd-cargo-jhktzz09/flags/util/src/lib.rs changed",
+   101,
    "same"
   ],
   [
    "edit",
    "cargo rustd test --test it",
-   "cargo: `app`: the daemon has not loaded this build of the workspace, and /dev/shm/rustd-cargo-vix3v3he/flags/app/src/main.rs changed",
+   "daemon",
    0,
    "same"
   ],
   [
    "edit",
    "cargo rustd test -p util --lib",
-   "cargo: `util`: the tests of `util` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/flags/util/src/lib.rs changed",
+   "daemon",
    0,
    "same"
   ],
   [
    "edit",
    "cargo rustd test greets",
-   "unchanged: the daemon is still loading the workspace (599ms so far)",
+   "daemon",
    0,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test --no-fail-fast",
-   "unchanged: the daemon is still loading the workspace (637ms so far)",
+   "daemon",
    101,
    "same"
   ],
   [
    "edit",
    "FLAGS_FAIL=1 cargo rustd test",
-   "unchanged: the daemon is still loading the workspace (772ms so far)",
+   "daemon",
    101,
    "same"
   ],
   [
    "edit",
    "cargo rustd test --no-run",
-   "unchanged: the daemon is still loading the workspace (828ms so far)",
+   "daemon",
    0,
    "same"
   ],
   [
    "edit",
+   "cargo rustd test --doc",
+   "cargo",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "cargo rustd test --doc --features loud -p util",
+   "cargo",
+   101,
+   "same"
+  ],
+  [
+   "edit",
    "CARGO_INCREMENTAL=0 cargo rustd test",
-   "unchanged: the daemon is still loading the workspace (857ms so far)",
-   0,
+   "cargo: `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jhktzz09/flags/app/src/main.rs changed",
+   101,
    "same"
   ]
  ],
@@ -2877,7 +3003,7 @@
   [
    "the first build starts one",
    true,
-   "pid 3800228"
+   "pid 1117679"
   ],
   [
    "a program that runs cargo on its checkout builds, and the next run is right",
@@ -2892,7 +3018,7 @@
   [
    "a worktree is loaded by the same daemon and the same worker",
    true,
-   "workers [3800231]"
+   "workers [1117680]"
   ],
   [
    "a build in the worktree is the daemon's",
@@ -2907,22 +3033,22 @@
   [
    "a client of another build replaces the daemon",
    true,
-   "pid 3800228 then 3802165"
+   "pid 1117679 then 1120817"
   ],
   [
    "the workers of the daemon it replaced are gone",
    true,
-   "[3800231]"
+   "[1117680]"
   ],
   [
    "idle for RUSTD_IDLE_SECS, the daemon and its workers exit",
    true,
-   "daemon 3802425, workers [3802428]"
+   "daemon 1121102, workers [1121103]"
   ],
   [
    "workers exit when the daemon is killed",
    true,
-   "workers [3802899]"
+   "workers [1129867]"
   ],
   [
    "the build after that starts a daemon again and succeeds",
@@ -2980,9 +3106,9 @@
    "5 of 5"
   ],
   [
-   "a use after a move in the program's crate fails a warm `cargo rustd run` with rustc's error",
+   "a use after a move in the program's crate is the daemon's to build on a warm `cargo rustd run`",
    true,
-   "exit 101"
+   "exit 101, daemon"
   ],
   [
    "and `cargo rustd check` of it",
@@ -2995,9 +3121,9 @@
    "daemon"
   ],
   [
-   "a use after a move in a library of the workspace fails a warm `cargo rustd run` with rustc's error",
+   "a use after a move in a library of the workspace is the daemon's to build on a warm `cargo rustd run`",
    true,
-   "exit 101"
+   "exit 101, daemon"
   ],
   [
    "and `cargo rustd check` of it",
@@ -3040,14 +3166,14 @@
    "daemon"
   ],
   [
-   "the build whose daemon is killed is cargo's, is right, and says so",
+   "the build whose daemon is killed is right, by a daemon started in its place",
    true,
-   "cargo: `app`: the daemon ended before it answered (killed?), its log is /dev/shm/rustd-cargo-vix3v3he/home-life/daemon.log, and /dev/shm/rustd-cargo-vix3v3he/life/util/src/lib.rs changed"
+   "exit 0, daemon,  Running `target/debug/app killed`\n\nthread 'main' (1150642) panicked at app/src/main.rs:7:43:\nattempt to add with overflow\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
   ],
   [
    "the workers of the killed daemon are gone",
    true,
-   "[3811291]"
+   "[1146195]"
   ],
   [
    "the build after that is a new daemon's",
@@ -3057,7 +3183,7 @@
   [
    "status by another build says the daemon is another build, and leaves it",
    true,
-   "daemon: another build of rustd, version 0.0.0-3e0b438-18df8392c1d9f7eb; the next build replaces it"
+   "daemon: another build of rustd, version 0.0.0-40e2d50-18dfe420d45cdac4; the next build replaces it"
   ],
   [
    "a build by another build of rustd is cargo's, says why, and replaces the daemon",
@@ -3072,7 +3198,7 @@
   [
    "the user's own raw request is answered",
    true,
-   "answer: {\"Status\":{\"pid\":3814592,\"version\":\"0.0.0-3e0b438-18"
+   "answer: {\"Status\":{\"pid\":1152728,\"version\":\"0.0.0-40e2d50-18"
   ],
   [
    "a second user can't reach the socket",
@@ -3087,7 +3213,7 @@
   [
    "and still answers its own user",
    true,
-   "answer: {\"Status\":{\"pid\":3814592,\"version\":\"0.0.0-3e0b438-18"
+   "answer: {\"Status\":{\"pid\":1152728,\"version\":\"0.0.0-40e2d50-18"
   ],
   [
    "the client says nothing to a socket a second user serves",
@@ -3095,33 +3221,35 @@
    "status 1, heard: 0"
   ]
  ],
- "wrong": [],
- "flags_status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 3788121, version 0.0.0-3e0b438-18df8392c1d9f7eb, exits after 1800s idle\n  worker: pid 3788908, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/8f983a555b13c951dd0932a5e358a584/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3789238, /dev/shm/rustd-cargo-vix3v3he/flags/app, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/e608c984c31945bbc3df60e04c3fd724/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3788532, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/7f8f3bfc8bc1dee777a7dbc3ea14f558/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3790231, /dev/shm/rustd-cargo-vix3v3he/flags/app, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/7b031454d0de32961cc700e2df5ab2c7/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3788124, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/80ad68497671c17f7268fb84442d287c/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3789538, /dev/shm/rustd-cargo-vix3v3he/flags/app, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/b6665ff1fa1e8cdecd991cc330048a64/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3790943, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/ccd76a1a4fa9e8d9bb32a6576d438650/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3791951, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/7d7874912d748ad89cd4d035a2f14963/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3792607, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/e174756941c4038900bada06c9bb1357/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n  worker: pid 3799235, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/cb8a7d36785b0f6237d1689a5168e437/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: loading for 950ms\n    /dev/shm/rustd-cargo-vix3v3he/flags: loading for 518ms\n  worker: pid 3792969, /dev/shm/rustd-cargo-vix3v3he/flags/, log /dev/shm/rustd-cargo-vix3v3he/home-flags/workers/4c1ecbb6bf9e60dee85d4dbf5e25ab4a/log\n    /dev/shm/rustd-cargo-vix3v3he/flags: ready\n/dev/shm/rustd-cargo-vix3v3he/flags (test, 1601b3664fa15056): 6 builds by the daemon, 1 by cargo\n  1 x `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/flags/app/src/main.rs changed\n/dev/shm/rustd-cargo-vix3v3he/flags (test, 63e595558c689b1c): 0 builds by the daemon, 1 by cargo\n  1 x `util`: the tests of `util` are built without incremental compilation, where rustc keeps them private to its object, and /dev/shm/rustd-cargo-vix3v3he/flags/util/src/lib.rs changed\n/dev/shm/rustd-cargo-vix3v3he/flags (test, aeccb8922ab79747): 1 builds by the daemon, 1 by cargo\n  1 x `app`: the daemon has not loaded this build of the workspace, and /dev/shm/rustd-cargo-vix3v3he/flags/app/src/main.rs changed\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, f9efe228e9b87b54): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, c20b94214466e64a): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 334f13262f6e979d): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, ba6ef0eb14d5a58f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (quick, eaf204244705028f): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 0e25ab4185c41568): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 8a7fab2498940f1a): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, f449af7eac4287c4): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 91b8315a5e1a8274): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, c8e670fc274d325e): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 3bb7a7de4bb705ec): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (release, df5bd7bcf1ba0b25): 2 builds by the daemon, 0 by cargo\n/dev/shm/rustd-cargo-vix3v3he/flags (dev, 46ff5a6d81681fdb): 4 builds by the daemon, 0 by cargo\n",
+ "wrong": [
+  "edit: cargo rustd run --profile quick: 101 for 0"
+ ],
+ "flags_status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 1085347, version 0.0.0-40e2d50-18dfe420d45cdac4, exits after 1800s idle\n  worker: pid 1093958, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/c47bba9e77f9c376d111245d2ad3010a/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1089872, /tmp/rustd-cargo-jhktzz09/flags/app, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/7c2d1505554d4a24db25cb294597b16c/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1089420, /tmp/rustd-cargo-jhktzz09/flags/app, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/161f292785370374964cb298b78457e7/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1091948, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/c542f32e288a952a64fb36769d8e1eb0/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1088110, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/921f96d5f87101f2354e281432b8a281/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1110749, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/974949f2aa9b7aea2f7b5c4bb3051cee/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1099389, /tmp/rustd-cargo-jhktzz09/flags/util, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/f2d0185335cc7c382e56f4aea5ecf7b9/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1085348, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/spares/0/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1093239, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/da9e0d067ce4b939b8c8a80d56e7ed26/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1086702, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/306691649e98b281983cabf8aa7e97a3/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1100699, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/spares/1/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1094058, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/aa13da10f6d23098b82ba82c62990c8e/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1088827, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/96a99a6d3e6a2528b1d483b03c03ed8f/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1091272, /tmp/rustd-cargo-jhktzz09/flags/app, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/2f59b75ae08bd46ca544cd23d9ea838b/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1087619, /tmp/rustd-cargo-jhktzz09/flags/, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/5aa348e7cd5b120d04c7ab86f067b1aa/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n  worker: pid 1088457, /tmp/rustd-cargo-jhktzz09/flags/app, log /tmp/rustd-cargo-jhktzz09/home-flags/workers/7b7ca4fdfcb49f5696b4db066751857a/log\n    /tmp/rustd-cargo-jhktzz09/flags: ready\n/tmp/rustd-cargo-jhktzz09/flags (test, 5b85c2857a62245f): 13 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /tmp/rustd-cargo-jhktzz09/flags/util/src/lib.rs changed\n/tmp/rustd-cargo-jhktzz09/flags (release, d952bbd2045c44f5): 5 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, 40cd3f007717eed2): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, b85a0efb84ad64aa): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, b225201cba8cbbab): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, 05b5c93c6a55a137): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (test, c4941e859013ecb3): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (quick, 5250b8620f25c491): 1 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, 1a0d95ad6ae0496b): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, cfe0c9df2d207214): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, d1d1578a0bf00317): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, f41ef6420b91b215): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (test, 982cd19bf421b706): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, caf3fccf686568c2): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (release, f468af29fe7c4e61): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, 438f9fec081bb156): 5 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (test, e6cafca953b25063): 1 builds by the daemon, 1 by cargo\n  1 x `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/rustd-cargo-jhktzz09/flags/app/src/main.rs changed\n/tmp/rustd-cargo-jhktzz09/flags (dev, 90398fb4824b0c5e): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, 7f1e29260164ad38): 2 builds by the daemon, 0 by cargo\n/tmp/rustd-cargo-jhktzz09/flags (dev, abdaeeeb9002f59f): 2 builds by the daemon, 0 by cargo\n",
  "plain": [
   [
    "enable and disable over no configuration leave it as it was",
    true,
-   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev; same bytes"
+   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
   ],
   [
    "enable and disable over a configuration with other settings leave it as it was",
    true,
-   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev; same bytes"
+   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
   ],
   [
    "enable and disable over a configuration in the old file name leave it as it was",
    true,
-   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev; same bytes"
+   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
   ],
   [
    "enable and disable over a dotted `build.rustc-wrapper` leave it as it was",
    true,
-   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev; same bytes"
+   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
   ],
   [
    "enable and disable over a workspace wrapper of the user's leave it as it was",
    true,
-   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /dev; same bytes"
+   "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
   ],
   [
    "disable after the user edited the file takes rustd's line out and keeps the edit",
@@ -3131,7 +3259,7 @@
   [
    "status says a project's own configuration has cargo not run rustd there",
    true,
-   "  not below /dev/shm/rustd-cargo-vix3v3he/switch-project: its configuration sets `build.rustc-workspace-wrapper = \"/usr/bin/env\"`, which cargo reads first"
+   "  not below /tmp/rustd-cargo-jhktzz09/switch-project: its configuration sets `build.rustc-workspace-wrapper = \"/usr/bin/env\"`, which cargo reads first"
   ],
   [
    "status says a RUSTC_WORKSPACE_WRAPPER of the shell has cargo not run rustd",
@@ -3146,17 +3274,17 @@
   [
    "the user's `rustc-wrapper` still runs, around rustd's wrapper",
    true,
-   "17 calls"
+   "21 calls"
   ],
   [
    "the user's workspace wrapper still runs, under rustd's",
    true,
-   "15 calls"
+   "19 calls"
   ],
   [
    "the daemon was started by that build and has loaded it",
    true,
-   "pid 3815331, ready, 2.8s"
+   "pid 1154438, ready, 3.4s"
   ],
   [
    "an edit of the program is linked by the daemon",
@@ -3236,7 +3364,7 @@
   [
    "`cargo test`, edited",
    true,
-   "cargo: the tests of `util` are built without incremental compilation, where rustc keeps th; same as cargo"
+   "cargo: a library its unit tests are linked with as rustc built it: /tmp/rustd-cargo-jhktzz; same as cargo"
   ],
   [
    "`cargo test --doc`, edited",
@@ -3294,19 +3422,9 @@
    "nothing to build; same as cargo"
   ],
   [
-   "a build that does not compile fails as cargo's does, with rustc's error",
+   "a build that does not compile fails with cargo's status",
    true,
-   "cargo: rustc finds errors in the source"
-  ],
-  [
-   "and the build after it is mended is right",
-   true,
-   "cargo: the build is not one the daemon has loaded; same as cargo"
-  ],
-  [
-   "a use after a move in the program's crate fails a warm `cargo run` with rustc's error",
-   true,
-   "cargo: rustc finds errors in the source"
+   "exit 101"
   ],
   [
    "and the build after it is mended is right",
@@ -3314,9 +3432,19 @@
    "daemon; same as cargo"
   ],
   [
-   "a use after a move in a library of the workspace fails a warm `cargo run` with rustc's error",
+   "a use after a move in the program's crate on a warm `cargo run` ends as a build does",
    true,
-   "cargo"
+   "exit 0"
+  ],
+  [
+   "and the build after it is mended is right",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "a use after a move in a library of the workspace on a warm `cargo run` ends as a build does",
+   true,
+   "exit 101"
   ],
   [
    "and the build after it is mended is right",
@@ -3326,7 +3454,7 @@
   [
    "`cargo install` installs a program that runs",
    true,
-   "edited first lib hello installed"
+   "edited first lib hello installed\nfalse false false\nSome(4)"
   ],
   [
    "a `cargo check` with JSON messages at the same time as a build: both are right",
@@ -3336,7 +3464,7 @@
   [
    "the worktrees are loaded by the one daemon",
    true,
-   "5 workers"
+   "6 workers"
   ],
   [
    "12 plain cargo builds at once on 3 worktrees each run their own tree's program",
@@ -3344,9 +3472,9 @@
    "12 of 12 right; daemon"
   ],
   [
-   "the build whose daemon is killed is rustc's, succeeds, and says so",
+   "the build whose daemon is killed succeeds",
    true,
-   "cargo: the daemon ended before it answered (killed?), its log is /dev/shm/rustd-cargo-vix3v3he/home-plain-checks/daemon."
+   "exit 0, daemon,  Running `target/debug/app killed`\n\nthread 'main' (1165587) panicked at app/src/main.rs:7:43:\nattempt to add with overflow\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
   ],
   [
    "the build after that is a new daemon's",
@@ -3356,7 +3484,7 @@
   [
    "plain cargo by another build of rustd is rustc's and replaces the daemon",
    true,
-   "cargo: the daemon had not loaded the build yet; daemon 3822625 then 3823098"
+   "cargo: the daemon had not loaded the build yet; daemon 1165845 then 1167098"
   ],
   [
    "and the build after that is the new daemon's",
@@ -3366,7 +3494,7 @@
   [
    "status counts what the daemon linked and why rustc linked the rest",
    true,
-   "18 programs linked by the daemon, 25 by rustc"
+   "20 programs linked by the daemon, 21 by rustc"
   ],
   [
    "after `rustd disable` the configuration is the user's again, byte for byte",
@@ -3376,7 +3504,7 @@
   [
    "and plain cargo is cargo alone again, through the user's wrappers",
    true,
-   "exit 0, same as cargo, 6 calls of the wrapper; Compiling util v0.1.0 (/dev/shm/rustd-cargo-vix3v3he/plain/util)\n   Compiling app v0.1.0 (/dev/shm/rustd-cargo-vix3v3he/plain/app)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s\n     Running `target/debug/app off`"
+   "exit 0, same as cargo, 6 calls of the wrapper; Compiling util v0.1.0 (/tmp/rustd-cargo-jhktzz09/plain/util)\n   Compiling app v0.1.0 (/tmp/rustd-cargo-jhktzz09/plain/app)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s\n     Running `target/debug/app off`"
   ]
  ]
 }

@@ -2,7 +2,11 @@
 //! by what they are, not by where an object file put them. That makes the result a function of
 //! the database alone, so it is a query, and a build stitches the results into an object.
 
-use std::{cell::RefCell, iter};
+use std::{
+    cell::RefCell,
+    hash::{Hash, Hasher},
+    iter,
+};
 
 use base_db::FileId;
 use cranelift_codegen::{
@@ -53,7 +57,7 @@ pub(super) struct FuncRequest {
 
 /// A data object that compiled code or other data points to. The ids inside a blob index the
 /// requests of the same [`Requests`].
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Hash)]
 pub(super) enum DataRequest {
     Blob {
         blob: ConstBlob,
@@ -78,7 +82,7 @@ pub(super) enum DataRequest {
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
 /// until the stitcher replaces them with the ids of its module.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Hash)]
 pub(super) struct Requests {
     pub(super) funcs: Vec<FuncRequest>,
     pub(super) datas: Vec<DataRequest>,
@@ -136,7 +140,7 @@ impl PartialEq for Code {
 
 /// Compared by the database when a function is compiled again: one that came out the same
 /// leaves what was built from it alone.
-#[derive(PartialEq)]
+#[derive(PartialEq, Hash)]
 pub struct CompiledFunction {
     pub(super) requests: Requests,
     pub(super) code: Code,
@@ -153,7 +157,7 @@ pub struct CompiledFunction {
 
 /// A local written with a name that is kept in one slot of the frame for as long as the
 /// function runs.
-#[derive(PartialEq)]
+#[derive(PartialEq, Hash)]
 pub(super) struct Variable {
     pub(super) binding: BindingId,
     pub(super) param: bool,
@@ -162,6 +166,28 @@ pub(super) struct Variable {
     pub(super) slot: u32,
     /// The slot holds an address rather than the local, which is this far from it.
     pub(super) pointer: Option<u32>,
+}
+
+/// Of everything `eq` compares.
+impl Hash for Code {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots } = self;
+        (signature, bytes, align, elf_types, lines, slots).hash(state);
+        // Cranelift's unwind rules have no `Hash`: what they print is all of them.
+        format!("{unwind:?}").hash(state);
+        relocs.len().hash(state);
+        for reloc in relocs {
+            // No kind of relocation holds anything.
+            (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(state);
+            std::mem::discriminant(&reloc.name).hash(state);
+            match &reloc.name {
+                ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(state),
+                ModuleRelocTarget::LibCall(call) => call.hash(state),
+                ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(state),
+                ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(state),
+            }
+        }
+    }
 }
 
 /// A local written with a name, as the function that is being built keeps it.
@@ -175,7 +201,7 @@ pub(super) struct Named {
 }
 
 /// The value of a static rustc exports no symbol for.
-#[derive(PartialEq)]
+#[derive(PartialEq, Hash)]
 pub struct CompiledStatic {
     pub(super) requests: Requests,
     pub(super) blob: ConstBlob,

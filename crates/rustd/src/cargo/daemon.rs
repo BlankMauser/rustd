@@ -5,11 +5,15 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::OpenOptions,
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -29,6 +33,9 @@ use crate::socket::{self, NotServed, Served, private_dir, private_file, read_req
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
 const IDLE: Duration = Duration::from_secs(1800);
+
+/// How often the daemon looks for what is idle.
+const TICK: Duration = Duration::from_secs(1);
 
 /// How often a worker that is loading is looked at.
 const POLL: Duration = Duration::from_millis(20);
@@ -53,6 +60,20 @@ pub(crate) enum Request {
     Sync(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
+    /// Load a checkout cargo has just built what stands in for the crates of, and answer
+    /// when its programs are built.
+    Build(Checkout),
+    /// A workspace cargo is about to build what stands in for the crates of: a worker
+    /// loads it meanwhile, for the [`Request::Build`] that follows.
+    Ahead(Ahead),
+    /// A line cargo printed of a build script it ran or a proc macro it built, for the
+    /// worker of the [`Request::Ahead`] of this [`WorkerConfig::id`].
+    Said {
+        id: String,
+        line: String,
+    },
+    /// No build follows the [`Request::Ahead`] of this [`WorkerConfig::id`].
+    Forget(String),
     Status,
     Stop,
 }
@@ -109,10 +130,40 @@ pub(crate) struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         let text = serde_json::to_vec(self).unwrap_or_default();
         Sha256::digest(text).iter().take(16).map(|it| format!("{it:02x}")).collect()
     }
+}
+
+impl WorkerConfig {
+    /// What a worker's command line says of the workspace under `root` and of `crates` of
+    /// it: all that loading it and compiling its functions reads.
+    fn args(&self, root: &Path, crates: &[PathBuf]) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![root.join(&self.project).into(), "--own-target".into()];
+        args.extend(self.selection.flags().into_iter().map(Into::into));
+        if self.cfg_test {
+            args.push("--cfg-test".into());
+        }
+        if self.selection.dev_deps {
+            args.push("--dev-deps".into());
+        }
+        for krate in crates {
+            args.push("--crate".into());
+            args.push(krate.strip_prefix(root).unwrap_or(krate).into());
+        }
+        args
+    }
+}
+
+/// What is known of a build before cargo has built anything of it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Ahead {
+    pub(crate) config: WorkerConfig,
+    /// The root of the checkout.
+    pub(crate) root: PathBuf,
+    /// Where the source of each crate the daemon compiles starts.
+    pub(crate) crates: Vec<PathBuf>,
 }
 
 /// A checkout as cargo last built it, and the programs of it the daemon is asked for.
@@ -140,15 +191,6 @@ pub(crate) struct Checkout {
 impl Checkout {
     fn project(&self) -> PathBuf {
         self.root.join(&self.config.project)
-    }
-
-    /// The first source file that was written after cargo started.
-    fn newer_source(&self) -> Option<&Path> {
-        let newer = |path: &&PathBuf| {
-            let written = std::fs::metadata(path).and_then(|it| it.modified());
-            written.is_ok_and(|it| stamp_of(it) > self.built_at)
-        };
-        self.sources.iter().find(newer).map(PathBuf::as_path)
     }
 
     /// The line that asks a worker for `plan`.
@@ -215,48 +257,61 @@ struct Worker {
 
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
-    fn start(checkout: &Checkout, dir: PathBuf) -> anyhow::Result<Worker> {
+    /// `spare` is a process that waits to be told a build, and is told this one.
+    fn start(checkout: &Checkout, dir: PathBuf, spare: Option<Spare>) -> anyhow::Result<Worker> {
         let first = checkout.programs.first().context("a checkout without programs")?;
         private_dir(&dir)?;
-        let (socket, log) = (dir.join("sock"), dir.join("log"));
+        let (socket, mut log) = (dir.join("sock"), dir.join("log"));
+        // The worker of a daemon that was killed may still be there, on its way out: it
+        // is not the one to connect to.
+        let _ = std::fs::remove_file(&socket);
         let config = &checkout.config;
-        let mut command = Command::new(std::env::current_exe()?);
-        command.arg(checkout.project()).arg("--own-target");
-        match store() {
-            Some(store) => command.env("RUSTD_CACHE", store),
-            None => command.env_remove("RUSTD_CACHE"),
-        };
-        command.args(config.selection.flags());
-        if config.cfg_test {
-            command.arg("--cfg-test");
+        let mut args = config.args(&checkout.root, &first.crates);
+        let named: [(&str, &Path); 5] = [
+            ("--out", &first.object),
+            ("--patch", &first.patch),
+            ("--link-cmd", Path::new(&first.link_cmd)),
+            ("--splice", &first.binary),
+            ("--socket", &socket),
+        ];
+        for (flag, path) in named {
+            args.push(flag.into());
+            args.push(path.into());
         }
-        if config.selection.dev_deps {
-            command.arg("--dev-deps");
-        }
-        for krate in &first.crates {
-            command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));
-        }
-        command.arg("--out").arg(&first.object).arg("--patch").arg(&first.patch);
-        command.arg("--link-cmd").arg(&first.link_cmd).arg("--splice").arg(&first.binary);
-        command.arg("--socket").arg(&socket);
         // In a file: a program of many crates has more of them than fit the command line
         // of a process on Windows.
         let symbols = dir.join("symbols");
         let listed: String =
             first.symbol_files.iter().map(|it| format!("{}\n", it.display())).collect();
         std::fs::write(&symbols, listed)?;
-        command.arg("--symbols-in").arg(&symbols);
-        let output =
-            private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-        command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+        args.push("--symbols-in".into());
+        args.push(symbols.into());
         let mut env = crate::process::own();
         for (name, value) in &config.env {
             env.set(name, value);
         }
         env.set(ENDS_WITH_INPUT, "1");
-        command.current_dir(&checkout.root);
-        command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
-        let child = command.spawn().context("starting a worker")?;
+        let told = spare.and_then(|it| it.told(&args, &checkout.config, &checkout.root, false));
+        let child = match told {
+            Some(spare) => {
+                log = spare.log;
+                spare.child
+            }
+            None => {
+                let mut command = Command::new(std::env::current_exe()?);
+                command.args(&args);
+                match store() {
+                    Some(store) => command.env("RUSTD_CACHE", store),
+                    None => command.env_remove("RUSTD_CACHE"),
+                };
+                let output =
+                    private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
+                command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.current_dir(&checkout.root);
+                command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
+                command.spawn().context("starting a worker")?
+            }
+        };
         let loading = Loaded {
             generation: checkout.generation,
             root: checkout.root.clone(),
@@ -324,22 +379,28 @@ impl Worker {
     }
 
     fn warmed(&self, checkout: &Checkout, started_on: bool) -> anyhow::Result<()> {
-        while socket::connect(&self.socket).is_err() {
-            if let Some(how) = self.ended() {
-                anyhow::bail!("the daemon could not load the workspace ({how})");
-            }
-            std::thread::sleep(POLL);
-        }
-        let stale = |file: &Path| {
-            anyhow::anyhow!("{} changed while cargo built or the daemon loaded", file.display())
-        };
-        if let Some(file) = checkout.newer_source() {
-            return Err(stale(file));
-        }
+        self.connected()?;
+        // A source written since cargo built is the daemon's like any edit: it compiles
+        // every function and static of the workspace from what it reads.
         for plan in checkout.programs.iter().skip(usize::from(started_on)) {
             self.ask(checkout, plan)?.map_err(anyhow::Error::msg)?;
         }
         Ok(())
+    }
+
+    /// A connection to the process, once it has loaded the workspace and listens.
+    fn connected(&self) -> anyhow::Result<UnixStream> {
+        loop {
+            match socket::connect(&self.socket) {
+                Ok(stream) => return Ok(stream),
+                Err(_) => {
+                    if let Some(how) = self.ended() {
+                        anyhow::bail!("the daemon could not load the workspace ({how})");
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+        }
     }
 
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
@@ -349,7 +410,7 @@ impl Worker {
             Some(how) => format!("the daemon's worker ended ({how})"),
             None => "the daemon's worker did not answer".to_owned(),
         };
-        let mut stream = socket::connect(&self.socket).with_context(failed)?;
+        let mut stream = self.connected()?;
         let mut env = self.env.clone();
         for (name, value) in &checkout.env {
             env.set(name, value);
@@ -411,12 +472,94 @@ impl Worker {
     }
 }
 
+/// A worker started before a build asked for one. It has the library of the toolchain
+/// loaded and its names resolved, which the first build of a workspace then does not wait
+/// for, and reads the build it is the worker of from its standard input.
+struct Spare {
+    child: Child,
+    log: PathBuf,
+}
+
+impl Spare {
+    /// Starts one with its files in `dir`.
+    fn start(dir: &Path) -> anyhow::Result<Spare> {
+        private_dir(dir)?;
+        let log = dir.join("log");
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg("--spare").arg(dir.join("package"));
+        match store() {
+            Some(store) => command.env("RUSTD_CACHE", store),
+            None => command.env_remove("RUSTD_CACHE"),
+        };
+        let output =
+            private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
+        command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
+        let child = command.spawn().context("starting a spare worker")?;
+        Ok(Spare { child, log })
+    }
+
+    /// Tells it to be the worker `args` start for `checkout`. `None` when it can't be
+    /// told: it has ended, or a path of the build is not text.
+    /// One told a build `ahead` has what cargo has not built yet left out of `args`, and
+    /// is told them whole afterwards.
+    fn told(
+        mut self,
+        args: &[OsString],
+        config: &WorkerConfig,
+        cwd: &Path,
+        ahead: bool,
+    ) -> Option<Spare> {
+        let told = || {
+            let args: Option<Vec<String>> =
+                args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
+            let told =
+                crate::Told { args: args?, env: config.env.clone(), cwd: cwd.to_owned(), ahead };
+            let mut line = serde_json::to_string(&told).ok()?;
+            line.push('\n');
+            Some(line)
+        };
+        let sent = match (self.child.try_wait(), told()) {
+            (Ok(None), Some(line)) => {
+                self.child.stdin.as_mut().is_some_and(|it| it.write_all(line.as_bytes()).is_ok())
+            }
+            _ => false,
+        };
+        if !sent {
+            self.stop();
+            return None;
+        }
+        Some(self)
+    }
+
+    /// Passes on what cargo said of a script or a proc macro. One that has ended is found
+    /// out when it is told its build.
+    fn said(&mut self, line: String) {
+        let Ok(mut line) = serde_json::to_string(&crate::Line::Said { said: line }) else { return };
+        line.push('\n');
+        if let Some(input) = self.child.stdin.as_mut() {
+            let _ = input.write_all(line.as_bytes());
+        }
+    }
+
+    fn stop(&mut self) {
+        // One that has exited already has nothing to kill.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// The daemon: its version, its workers, and when it was last asked.
 struct Daemon {
     version: String,
     home: PathBuf,
     idle: Option<Duration>,
     workers: Mutex<FxHashMap<String, Arc<Worker>>>,
+    /// The worker the next workspace is loaded by. `RUSTD_SPARE=0` has none.
+    spare: Mutex<Option<Spare>>,
+    /// The workers told a build ahead of cargo's, by [`WorkerConfig::id`].
+    ahead: Mutex<FxHashMap<String, Spare>>,
+    /// How many spare workers were started: each has a directory of its own.
+    spares: AtomicUsize,
     asked: Mutex<Instant>,
 }
 
@@ -488,8 +631,12 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         home,
         idle,
         workers: Mutex::default(),
+        spare: Mutex::default(),
+        ahead: Mutex::default(),
+        spares: AtomicUsize::new(0),
         asked: Mutex::new(Instant::now()),
     });
+    daemon.spare();
     eprintln!(
         "daemon {} of pid {} listens on {}",
         daemon.version,
@@ -541,6 +688,26 @@ impl Daemon {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
+            Request::Ahead(ahead) => {
+                self.ahead(ahead);
+                Reply::Warming
+            }
+            Request::Said { id, line } => {
+                if let Some(spare) = lock(&self.ahead).get_mut(&id) {
+                    spare.said(line);
+                }
+                Reply::Warming
+            }
+            Request::Forget(id) => {
+                if let Some(mut spare) = lock(&self.ahead).remove(&id) {
+                    spare.stop();
+                }
+                Reply::Warming
+            }
+            Request::Build(checkout) => match self.warm(checkout.clone()) {
+                Ok(()) => self.built(&checkout),
+                Err(why) => Reply::Cold { reason: format!("{why:#}") },
+            },
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
                 version: self.version.clone(),
@@ -571,6 +738,26 @@ impl Daemon {
             },
             Warmth::Failed(reason) => Reply::Cold { reason },
         }
+    }
+
+    /// What the worker that loads `checkout` has to say of its programs once it has.
+    fn built(&self, checkout: &Checkout) -> Reply {
+        loop {
+            match self.sync(checkout) {
+                Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
+                reply => return reply,
+            }
+        }
+    }
+
+    /// Whether a worker is loading this build of `checkout`.
+    fn loads(&self, checkout: &Checkout) -> bool {
+        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
+        worker.is_some_and(|worker| {
+            lock(&worker.checkouts).get(&checkout.key).is_some_and(|it| {
+                it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
+            })
+        })
     }
 
     /// Has a worker load `checkout`: the one of its configuration when that has not loaded
@@ -613,7 +800,10 @@ impl Daemon {
         if let Some(old) = workers.remove(&id) {
             old.stop();
         }
-        let worker = Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id))?);
+        let ahead = lock(&self.ahead).remove(&id);
+        let spare = ahead.or_else(|| lock(&self.spare).take());
+        let worker =
+            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
         eprintln!(
             "worker {id} of pid {} for {}",
             lock(&worker.child).id(),
@@ -627,9 +817,14 @@ impl Daemon {
     /// Stops the workers nobody has asked for the idle time, and the daemon when nobody has
     /// asked it.
     fn reap(&self) {
-        let Some(idle) = self.idle else { return };
         loop {
-            std::thread::sleep(idle.min(Duration::from_secs(1)));
+            std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
+            // The next spare starts when the worker that was one has loaded its workspace.
+            let loading = lock(&self.workers).values().any(|it| it.loading());
+            if !loading && lock(&self.ahead).is_empty() {
+                self.spare();
+            }
+            let Some(idle) = self.idle else { continue };
             // Loading is what the last build asked for: the idle time starts after it.
             for worker in lock(&self.workers).values().filter(|it| it.loading()) {
                 *lock(&worker.asked) = Instant::now();
@@ -650,8 +845,49 @@ impl Daemon {
         }
     }
 
+    /// Has the spare worker load the workspace of a build cargo has only started.
+    fn ahead(&self, ahead: Ahead) {
+        let id = ahead.config.id();
+        if lock(&self.workers).contains_key(&id) {
+            return;
+        }
+        let Some(spare) = lock(&self.spare).take() else { return };
+        let mut args = ahead.config.args(&ahead.root, &ahead.crates);
+        args.extend(["--out".into(), "none".into()]);
+        if let Some(spare) = spare.told(&args, &ahead.config, &ahead.root, true)
+            && let Some(mut other) = lock(&self.ahead).insert(id, spare)
+        {
+            other.stop();
+        }
+    }
+
+    /// Starts a spare worker when there is none.
+    fn spare(&self) {
+        if std::env::var_os("RUSTD_SPARE").is_some_and(|it| it == "0") {
+            return;
+        }
+        let mut spare = lock(&self.spare);
+        if spare.as_mut().is_some_and(|it| matches!(it.child.try_wait(), Ok(None))) {
+            return;
+        }
+        let dir = self.home.join("spares").join(self.spares.fetch_add(1, Relaxed).to_string());
+        *spare = match Spare::start(&dir) {
+            Ok(spare) => Some(spare),
+            Err(why) => {
+                eprintln!("no spare worker: {why:#}");
+                None
+            }
+        };
+    }
+
     /// Stops the workers and the daemon.
     fn end(&self) -> ! {
+        if let Some(spare) = lock(&self.spare).as_mut() {
+            spare.stop();
+        }
+        for spare in lock(&self.ahead).values_mut() {
+            spare.stop();
+        }
         for worker in lock(&self.workers).values() {
             worker.stop();
         }
