@@ -22,6 +22,19 @@ mod tests {
     use crate::tests::check_diagnostics;
 
     #[test]
+    fn statement_that_is_configured_out() {
+        check_diagnostics(
+            r#"
+pub fn work(n: u32) -> u32 {
+    #[cfg(feature = "tracing")] tracing::trace!("working");
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: feature = "tracing" is disabled
+    n + 1
+}
+"#,
+        );
+    }
+
+    #[test]
     fn unresolved_macro_diag() {
         check_diagnostics(
             r#"

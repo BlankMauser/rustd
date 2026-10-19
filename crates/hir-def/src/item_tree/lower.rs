@@ -108,21 +108,31 @@ impl<'db> Ctx<'db> {
                 // Macro calls can be both items and expressions. The syntax library always treats
                 // them as expressions here, so we undo that.
                 ast::Stmt::ExprStmt(es) => match es.expr()? {
-                    ast::Expr::MacroExpr(expr) => self.lower_mod_item(&expr.macro_call()?.into()),
+                    ast::Expr::MacroExpr(expr) => self.lower_macro_stmt(&expr),
                     _ => None,
                 },
                 _ => None,
             })
             .collect();
         if let Some(ast::Expr::MacroExpr(expr)) = block.tail_expr()
-            && let Some(call) = expr.macro_call()
-            && let Some(mod_item) = self.lower_mod_item(&call.into())
+            && let Some(mod_item) = self.lower_macro_stmt(&expr)
         {
             self.top_level.push(mod_item);
         }
         self.tree.vis.arena = self.visibilities.into_iter().collect();
         self.tree.top_level = self.top_level.into_boxed_slice();
         self.tree
+    }
+
+    /// A macro call written as a statement is an item of the block when it expands to items.
+    /// Its attributes are on the expression: one that is configured out is no item at all.
+    fn lower_macro_stmt(&mut self, expr: &ast::MacroExpr) -> Option<ModItemId> {
+        let call = expr.macro_call()?;
+        let attrs = self.lower_attrs(&ast::Expr::MacroExpr(expr.clone()));
+        if matches!(attrs, AttrsOrCfg::CfgDisabled(_)) {
+            return None;
+        }
+        self.lower_mod_item(&call.into())
     }
 
     fn lower_mod_item(&mut self, item: &ast::Item) -> Option<ModItemId> {
