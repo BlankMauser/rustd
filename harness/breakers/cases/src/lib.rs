@@ -116,4 +116,5 @@ cases![
     import_called_and_pointed,
     literal_operands,
     moved_bits_unread,
+    pads_hold_the_payload,
 ];

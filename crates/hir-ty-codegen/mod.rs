@@ -12713,11 +12713,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
+        let held = self.hold_exception(exception);
         self.drop_live_locals(None)?;
         if let Some(state) = &self.suspended {
             let (addr, ty) = (state.addr, state.ty);
             self.store_state(addr, ty, PANICKED);
         }
+        let exception = self.held_exception(held);
         self.resume_unwinding(exception)
     }
 
@@ -12949,6 +12951,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.emit_call(Callee::Instance(def, parent_args), &values, ignored, poll_ty)
     }
 
+    /// Puts the exception a landing pad was reached with in the frame, to be read back with
+    /// `held_exception` once the pad has dropped what it drops. Every call that unwinds to the
+    /// pad arrives with the exception in the same register, and kept in a register through
+    /// the drops it would be moved to another one on the way from each of those calls. The
+    /// slot is addressed past its start, which is what keeps `promote` from making a value
+    /// of it again.
+    fn hold_exception(&mut self, exception: Value) -> ir::StackSlot {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
+        self.builder.ins().stack_store(ptr(), exception, slot, 8);
+        slot
+    }
+
+    fn held_exception(&mut self, slot: ir::StackSlot) -> Value {
+        self.builder.ins().stack_load(ptr(), ptr(), slot, 8)
+    }
+
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(ptr()));
@@ -13000,10 +13022,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         self.builder.switch_to_block(pad);
         let exception = self.builder.block_params(pad)[0];
+        let held = self.hold_exception(exception);
         self.in_cleanup = true;
         let cleaned = cleanup(self);
         self.in_cleanup = false;
         cleaned?;
+        let exception = self.held_exception(held);
         match outer {
             Some(outer) => {
                 self.builder.ins().jump(outer, &[exception.into()]);
@@ -13495,10 +13519,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for at in 1..count {
             self.builder.switch_to_block(pads[at - 1]);
             let exception = self.builder.block_params(pads[at - 1])[0];
+            let held = self.hold_exception(exception);
             cleaned = drop(self, at);
             if cleaned.is_err() {
                 break;
             }
+            let exception = self.held_exception(held);
             match (pads.get(at), outer) {
                 (Some(&next), _) | (None, Some(next)) => {
                     self.builder.ins().jump(next, &[exception.into()]);
