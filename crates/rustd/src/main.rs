@@ -1946,6 +1946,25 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     Ok(crates.len())
 }
 
+/// Resolves the names of `crates` again after an edit to many files, on every core: whoever
+/// asks first otherwise reads every file that changed on one.
+fn resolve_names(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(crates.len()) {
+            let (db, next) = (db.clone(), &next);
+            scope.spawn(move || {
+                while let Some(&krate) =
+                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    hir::attach_db(&db, || _ = hir::crate_def_map(&db, krate));
+                }
+            });
+        }
+    });
+}
+
 /// Resolves the names and finds the impls of `crates`, on every core.
 fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     // A crate comes after its dependencies in the list: a thread that starts on one whose

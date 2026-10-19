@@ -84,6 +84,13 @@ impl Outlines {
 /// lowered together and the files are hashed on all threads.
 fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<u64>> {
     let stats = std::env::var_os("RUSTD_STATS").is_some();
+    if files.len() > 1 {
+        let mut crates: Vec<_> =
+            files.iter().flat_map(|&file| relevant_crates(db, file).iter().copied()).collect();
+        crates.sort_unstable();
+        crates.dedup();
+        crate::resolve_names(db, &crates);
+    }
     let functions = listed.in_files(db, files);
     let bodies = functions.iter().flatten().flatten().map(|&it| it.into()).collect();
     crate::lower(db, bodies);
