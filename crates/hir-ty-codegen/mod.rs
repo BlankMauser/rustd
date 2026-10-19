@@ -495,6 +495,7 @@ impl CodegenUnit {
             counted,
             stale: _,
             frozen: _,
+            imported,
         } = known;
         let mut own_statics = OwnStatics::new(
             db,
@@ -692,6 +693,7 @@ impl CodegenUnit {
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
                 let start = stdx::time::Instant::now();
+                *imported = cg.imported_statics.keys().copied().collect();
                 let (object, apart) = cg.finish()?;
                 stats.phases.object = start.elapsed();
                 backend::Tally::global().report();
@@ -810,6 +812,8 @@ pub struct Rejections {
     pub patching: bool,
     base: Option<patch::Base>,
     frozen: patch::Frozen,
+    /// The statics the last build in full uses rustc's copies of.
+    imported: Vec<StaticId>,
     stale: Vec<Stale>,
     /// How many functions had been compiled when the last build finished.
     counted: usize,
@@ -886,6 +890,12 @@ impl Rejections {
     /// be made after that build, notes what they are copies of.
     pub fn out_of_date(&mut self, db: &dyn HirDatabase) -> Option<(FunctionId, String)> {
         self.frozen.out_of_date(db, self.base.as_ref()?)
+    }
+
+    /// A static the last build in full uses rustc's copy of that is not what rustc compiled.
+    /// Called as [`Rejections::out_of_date`] is.
+    pub fn out_of_date_static(&mut self, db: &dyn HirDatabase) -> Option<StaticId> {
+        self.frozen.out_of_date_static(db, &self.imported)
     }
 
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no

@@ -1,0 +1,19 @@
+[workspace]
+members = [".", "helper", "macros"]
+
+[package]
+name = "hazards"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+extra = []
+
+[dependencies]
+helper = { path = "helper" }
+macros = { path = "macros" }
+
+[[test]]
+name = "custom"
+harness = false

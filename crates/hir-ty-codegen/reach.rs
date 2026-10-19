@@ -5,7 +5,7 @@
 use base_db::{Crate, CrateOrigin, LangCrateOrigin};
 use hir_def::{
     AdtId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
-    signatures::{FunctionSignature, StructSignature},
+    signatures::{FunctionSignature, StaticSignature, StructSignature},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
@@ -15,7 +15,7 @@ use crate::next_solver::TyKind;
 use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
-    Instance, InstanceDef, compiled_instance, compiled_root, compiled_static,
+    CodegenError, Instance, InstanceDef, compiled_instance, compiled_root, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
     instance_serial, is_thread_local,
     patch::Mark,
@@ -39,6 +39,18 @@ pub struct Reached {
     pub group: usize,
 }
 
+impl Node {
+    fn name(&self, db: &dyn HirDatabase) -> String {
+        match self {
+            Node::Root(func) | Node::Instance(Instance { def: InstanceDef::Fn(func), .. }, _) => {
+                FunctionSignature::of(db, *func).name.as_str().to_owned()
+            }
+            Node::Instance(instance, _) => format!("{:?}", instance.def),
+            Node::Static(id) => StaticSignature::of(db, *id).name.as_str().to_owned(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Graph {
     ids: FxHashMap<Node, usize>,
@@ -49,6 +61,8 @@ struct Graph {
     written: Vec<usize>,
     /// The crates an edit can change the code of.
     edited: FxHashSet<Crate>,
+    /// The first nodes that did not compile, and why.
+    unknown: Vec<String>,
 }
 
 /// Whether the instance is `core::any::TypeId::of::<T>`.
@@ -60,6 +74,16 @@ fn names_type_id(db: &dyn HirDatabase, instance: &Instance) -> bool {
     FunctionSignature::of(db, func).name.as_str() == "of"
         && StructSignature::of(db, id).name.as_str() == "TypeId"
         && matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Core))
+}
+
+/// Whether the node is a function of an `extern` block: a name the linker resolves, to code
+/// rustc compiled or to an exported function, which the caller hands in as always reached.
+fn foreign(db: &dyn HirDatabase, node: &Node) -> bool {
+    let (Node::Root(func) | Node::Instance(Instance { def: InstanceDef::Fn(func), .. }, _)) = node
+    else {
+        return false;
+    };
+    matches!(func.lookup(db).container, ItemContainerId::ExternBlockId(_))
 }
 
 impl Graph {
@@ -92,23 +116,20 @@ impl Graph {
         let id = self.own.len();
         self.ids.insert(node.clone(), id);
         self.edges.push(Vec::new());
-        if self.settled(db, &node) {
+        if self.settled(db, &node) || foreign(db, &node) {
             self.own.push(Some(0));
             return Vec::new();
         }
-        let compiled: Option<(u128, &Requests)> = match &node {
-            Node::Root(func) => compiled_root(db, *func)
-                .as_ref()
-                .ok()
-                .map(|it| (root_serial(db, *func), &it.requests)),
+        let compiled: Result<(u128, &Requests), &CodegenError> = match &node {
+            Node::Root(func) => {
+                compiled_root(db, *func).as_ref().map(|it| (root_serial(db, *func), &it.requests))
+            }
             Node::Instance(instance, env) => compiled_instance(db, instance.clone(), env.clone())
                 .as_ref()
-                .ok()
                 .map(|it| (instance_serial(db, instance.clone(), env.clone()), &it.requests)),
-            Node::Static(id) => compiled_static(db, *id)
-                .as_ref()
-                .ok()
-                .map(|it| (static_serial(db, *id), &it.requests)),
+            Node::Static(id) => {
+                compiled_static(db, *id).as_ref().map(|it| (static_serial(db, *id), &it.requests))
+            }
         };
         if let Node::Static(it) = node
             && (is_thread_local(db, it)
@@ -116,11 +137,17 @@ impl Graph {
         {
             self.written.push(id);
         }
-        let Some((serial, requests)) = compiled else {
-            // `TypeId::of` is a number the build takes from rustc, of the type alone.
-            let known = matches!(&node, Node::Instance(it, _) if names_type_id(db, it));
-            self.own.push(known.then_some(0));
-            return Vec::new();
+        let (serial, requests) = match compiled {
+            Ok(compiled) => compiled,
+            Err(why) => {
+                // `TypeId::of` is a number the build takes from rustc, of the type alone.
+                let known = matches!(&node, Node::Instance(it, _) if names_type_id(db, it));
+                if !known && self.unknown.len() < 8 {
+                    self.unknown.push(format!("{}: {why:?}", node.name(db)));
+                }
+                self.own.push(known.then_some(0));
+                return Vec::new();
+            }
         };
         self.own.push(Some(print_of(&Mark::new(db, serial, requests).seen())));
         let funcs = requests.funcs.iter().filter_map(|it| match &it.target {
@@ -228,15 +255,16 @@ impl Bits {
 }
 
 /// For each of `tests`, what it can run, where an edit reaches the crates `edited` and no
-/// others. `always` and `kept` are what runs or is found
-/// without any code naming it: every test is taken to reach them.
+/// others. `always` and `kept` are what runs or is found without any code naming it: every
+/// test is taken to reach them. With it, the print of what all of them reach, and the first
+/// things reached that did not compile.
 pub fn reached(
     db: &dyn HirDatabase,
     edited: FxHashSet<Crate>,
     tests: &[FunctionId],
     always: &[FunctionId],
     kept: &[StaticId],
-) -> Vec<Reached> {
+) -> (Vec<Reached>, Option<u128>, Vec<String>) {
     let mut graph = Graph { edited, ..Graph::default() };
     let tests: Vec<usize> = tests.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
     let mut ambient: Vec<usize> = always.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
@@ -308,10 +336,11 @@ pub fn reached(
         }
     }
     together.values_mut().flatten().for_each(|it| it.sort_unstable());
-    std::iter::zip(group, alone)
+    let reached = std::iter::zip(group, alone)
         .map(|(group, alone)| {
             let all = together[&group].as_ref();
             Reached { print: alone.zip(all).map(|it| print_of(&it)), group }
         })
-        .collect()
+        .collect();
+    (reached, everywhere.as_ref().map(print_of), graph.unknown)
 }

@@ -240,6 +240,8 @@ pub(in crate::mir) struct Frozen {
     /// The crates rustc compiled from other source than the daemon first saw them with: no
     /// copy of a function of theirs is good.
     distrusted: FxHashSet<Crate>,
+    /// What each static was when a build first used rustc's copy of it.
+    statics: FxHashMap<StaticId, u128>,
 }
 
 impl Frozen {
@@ -253,6 +255,31 @@ impl Frozen {
 
     pub(in crate::mir) fn edit(&mut self, crates: impl IntoIterator<Item = Crate>) {
         self.edited.extend(crates);
+    }
+
+    /// One of `imported`, the statics a build uses rustc's copies of, that rustc's copy is
+    /// no longer right for.
+    pub(in crate::mir) fn out_of_date_static(
+        &mut self,
+        db: &dyn HirDatabase,
+        imported: &[StaticId],
+    ) -> Option<StaticId> {
+        imported.iter().copied().find(|&id| {
+            let now = probe(|| static_serial(db, id));
+            let krate = id.krate(db);
+            // Nothing to tell a change by when it was not used before an edit could reach it.
+            let unseen = self.distrusted.contains(&krate)
+                || self.edited.contains(&krate)
+                || self.edited_bodies.contains(&body_file(db, id.into()));
+            match (self.statics.get(&id), now) {
+                (Some(was), now) => now != Some(*was),
+                (None, Some(now)) if !unseen => {
+                    self.statics.insert(id, now);
+                    false
+                }
+                (None, _) => true,
+            }
+        })
     }
 
     /// A function of `base` that rustc's copy is no longer right for, and why.

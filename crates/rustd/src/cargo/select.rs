@@ -165,14 +165,12 @@ impl<'a> Selective<'a> {
                 }
             }
         }
-        let cached = Tally { passed, ignored, kept: kept.len(), all: self.reached.len() };
+        let cached = Tally { passed, ignored, all: self.reached.len() };
         if run.is_empty() {
-            println!(
-                "\ntest result: ok. {passed} passed ({passed} cached); 0 failed; {ignored} \
-                 ignored; 0 measured; {} filtered out; finished in {:.2}s\n",
-                self.reached.len() - named.len(),
-                started.elapsed().as_secs_f64()
-            );
+            let none = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+            let took = format!("finished in {:.2}s", started.elapsed().as_secs_f64());
+            let line = cached.rewritten(&format!("{none}; {took}")).unwrap_or_default();
+            println!("\n{line}\n");
             return Ok(Some(ExitStatus::default()));
         }
         let mut command = self.command()?;
@@ -264,13 +262,12 @@ impl<'a> Selective<'a> {
 struct Tally {
     passed: usize,
     ignored: usize,
-    kept: usize,
     all: usize,
 }
 
 impl Tally {
     /// The harness's last line, `test result: ok. 3 passed; 0 failed; ...`, with the tests
-    /// that were not run counted as what they are.
+    /// that were not run counted as what they are, and said to be.
     fn rewritten(&self, line: &str) -> Option<String> {
         let (verdict, counts) = line.strip_prefix("test result: ")?.split_once(". ")?;
         let mut parts = counts.split("; ");
@@ -282,12 +279,16 @@ impl Tally {
         let measured = count("measured")?;
         let _ = count("filtered out")?;
         let rest = parts.next()?;
-        let ran = passed + failed + ignored + measured;
+        let filtered = self.all.saturating_sub(passed + failed + ignored + measured);
+        let cached = |count: usize| match count {
+            0 => String::new(),
+            count => format!(" ({count} cached)"),
+        };
         Some(format!(
-            "test result: {verdict}. {passed} passed ({} cached); {failed} failed; {ignored} \
-             ignored; {measured} measured; {} filtered out; {rest}",
-            self.kept,
-            self.all.saturating_sub(ran),
+            "test result: {verdict}. {passed} passed{}; {failed} failed; {ignored} ignored{}; \
+             {measured} measured; {filtered} filtered out; {rest}",
+            cached(self.passed),
+            cached(self.ignored),
         ))
     }
 }
@@ -415,14 +416,14 @@ mod tests {
 
     #[test]
     fn counts_what_was_not_run() {
-        let tally = Tally { passed: 5, ignored: 1, kept: 6, all: 10 };
+        let tally = Tally { passed: 5, ignored: 1, all: 10 };
         let line = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 8 filtered \
                     out; finished in 0.01s";
         assert_eq!(
             tally.rewritten(line).as_deref(),
             Some(
-                "test result: FAILED. 6 passed (6 cached); 1 failed; 1 ignored; 0 measured; 2 \
-                 filtered out; finished in 0.01s"
+                "test result: FAILED. 6 passed (5 cached); 1 failed; 1 ignored (1 cached); 0 \
+                 measured; 2 filtered out; finished in 0.01s"
             )
         );
     }

@@ -3220,7 +3220,12 @@ struct Program {
 /// by what `#[ignore]` and `#[should_panic]` say of them, so a build after the list changed
 /// would run the tests of before.
 #[derive(PartialEq)]
-struct Tests(Vec<(String, String)>);
+struct Tests {
+    listed: Vec<(String, String)>,
+    /// What the statics a linker or a runtime finds can run, when there are tests: rustc's
+    /// copies of them point to rustc's copies of that. `None` when it is not all known.
+    found: Option<Option<u128>>,
+}
 
 impl Tests {
     /// The tests of the program's own crate, each under the name the harness has for it.
@@ -3247,19 +3252,35 @@ impl Tests {
         tests
     }
 
-    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Tests {
+    fn of(db: &RootDatabase, listed_crates: &Listed, args: &Args) -> Tests {
         use hir::HasSource as _;
         use syntax::ast::HasAttrs as _;
-        let tests = Tests::named(db, listed, args).into_iter().map(|(id, path)| {
+        let tests = Tests::named(db, listed_crates, args).into_iter().map(|(id, path)| {
             let attrs = hir::Function::from(id).source(db).map(|it| {
                 let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
                 attrs.collect::<Vec<_>>().join(" ")
             });
             (path, attrs.unwrap_or_default())
         });
-        let mut tests: Vec<_> = tests.collect();
-        tests.sort();
-        Tests(tests)
+        let mut listed: Vec<_> = tests.collect();
+        listed.sort();
+        let kept: Vec<StaticId> = args
+            .crates()
+            .flat_map(|krate| crates_named(db, krate, args).unwrap_or_default())
+            .flat_map(|krate| listed_crates.of(db, krate).kept.clone())
+            .collect();
+        let found = (!listed.is_empty() && !kept.is_empty()).then(|| {
+            let edited = Tests::edited(db, args);
+            hir_ty::mir::codegen::reached(db, edited, &[], &[], &kept).1
+        });
+        Tests { listed, found }
+    }
+
+    /// The crates an edit can change the code of.
+    fn edited(db: &RootDatabase, args: &Args) -> FxHashSet<ide_db::base_db::Crate> {
+        let crates =
+            args.crates().flat_map(|krate| crates_named(db, krate, args).unwrap_or_default());
+        crates.map(Into::into).collect()
     }
 
     /// What each test of the program can run, as lines for the client that decides which
@@ -3283,7 +3304,11 @@ impl Tests {
         }
         let tests = Tests::named(db, listed, args);
         let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).chain(main).collect();
-        let reached = hir_ty::mir::codegen::reached(db, edited, &roots, &always, &kept);
+        let (reached, _, unknown) =
+            hir_ty::mir::codegen::reached(db, edited, &roots, &always, &kept);
+        if !unknown.is_empty() {
+            eprintln!("reached: not known: {}", unknown.join("; "));
+        }
         let print = |it: Option<u128>| it.map_or("-".to_owned(), |it| format!("{it:032x}"));
         let mut lines = String::new();
         for ((_, name), reached) in std::iter::zip(&tests, &reached) {
@@ -3300,8 +3325,16 @@ impl Tests {
         if self == now {
             return None;
         }
-        let differs =
-            |a: &Tests, b: &Tests| a.0.iter().find(|it| !b.0.contains(it)).map(|it| it.0.clone());
+        if self.listed == now.listed {
+            return Some(
+                "what a static the linker or a runtime finds can run changed or is not all \
+                 known, and such a static is linked as rustc built it, build with cargo"
+                    .to_owned(),
+            );
+        }
+        let differs = |a: &Tests, b: &Tests| {
+            a.listed.iter().find(|it| !b.listed.contains(it)).map(|it| it.0.clone())
+        };
         let which = differs(now, self).or_else(|| differs(self, now)).unwrap_or_default();
         Some(format!(
             "the test `{which}` was added, removed or given other attributes, and the list of \
@@ -4391,7 +4424,10 @@ fn run_holding(
         Some(shared) => shared.keep(),
         None => {}
     }
-    hir::attach_db(&db, || known.out_of_date(&db));
+    hir::attach_db(&db, || {
+        known.out_of_date(&db);
+        known.out_of_date_static(&db);
+    });
     // What rustc compiled, by where in the checkout it is: the files as this build read them.
     let as_compiled: FxHashMap<PathBuf, triomphe::Arc<str>> = files
         .iter()
@@ -5501,6 +5537,15 @@ impl Program {
             .or(broken)
             .or_else(|| warm.unset.clone());
         failed = failed.or_else(|| stale_copies(db, table, args));
+        failed = failed.or_else(|| {
+            let id = hir::attach_db(db, || known.out_of_date_static(db))?;
+            let name =
+                hir::Static::from(id).name(db).display(db, syntax::Edition::CURRENT).to_string();
+            Some(format!(
+                "the static `{name}` is linked as rustc built it and is from before the edit, \
+                 build with cargo"
+            ))
+        });
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         match tests {
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
