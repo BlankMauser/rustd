@@ -43,13 +43,14 @@ jobs:
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
   harness:
-    name: harness (${{ matrix.backend }}${{ matrix.suffix }})
+    name: harness (${{ matrix.backend }}${{ matrix.suffix }}, ${{ matrix.part }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        part: [core, keys, store]
         os: [warp-ubuntu-latest-x64-8x, warp-ubuntu-latest-arm64-4x]
         include:
           - os: warp-ubuntu-latest-x64-8x
@@ -60,6 +61,7 @@ jobs:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
+      PART: ${{ matrix.part }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -105,7 +107,10 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          # The harnesses are split over three machines by how long they take: keys.py alone, the
+          # ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -141,13 +146,15 @@ jobs:
   # `cargo rustd` in place of cargo on projects as they are published, natively on AArch64:
   # what the programs print and what every test says has to be what cargo gives.
   projects:
-    name: projects (${{ matrix.backend }}, aarch64)
+    name: projects (${{ matrix.backend }}, aarch64, ${{ matrix.projects }})
     runs-on: warp-ubuntu-latest-arm64-4x
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        # Each group on a machine of its own: one after another they take most of an hour.
+        projects: ["ripgrep fd bat hyperfine", "just axum", "nushell"]
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
@@ -172,7 +179,7 @@ jobs:
           status=0
           # The projects a hosted runner has the time and the memory for: the ten after these
           # take more than its three hours, and it was shut down loading rust-analyzer.
-          python3 cargo_rustd.py ripgrep fd bat hyperfine just axum nushell || status=$?
+          python3 cargo_rustd.py ${{ matrix.projects }} || status=$?
           cat CARGO-RUSTD.md
           exit $status
 
@@ -195,18 +202,20 @@ jobs:
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
   windows-harness:
-    name: harness (windows, ${{ matrix.backend }})
+    name: harness (windows, ${{ matrix.backend }}, ${{ matrix.part }})
     runs-on: warp-windows-2025-x64-8x
     timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        part: [core, keys, store]
     defaults:
       run:
         shell: bash
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
+      PART: ${{ matrix.part }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
       LLVM_VERSION: 20.1.8
@@ -255,7 +264,10 @@ jobs:
         run: |
           export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
           failed=
-          run() { echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          # The harnesses are split over three machines by how long they take: keys.py alone, the
+          # ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
@@ -280,17 +292,19 @@ jobs:
           test -z "$failed"
 
   macos:
-    name: macOS arm64 (${{ matrix.backend }})
+    name: macOS arm64 (${{ matrix.backend }}, ${{ matrix.part }})
     runs-on: warp-macos-latest-arm64-6x
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
+        part: [core, keys, store]
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
+      PART: ${{ matrix.part }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -304,16 +318,19 @@ jobs:
         with:
           cache-provider: "warpbuild"
       - run: cargo fmt --all -- --check
-        if: matrix.backend == 'cranelift'
+        if: matrix.backend == 'cranelift' && matrix.part == 'core'
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
-        if: matrix.backend == 'cranelift'
+        if: matrix.backend == 'cranelift' && matrix.part == 'core'
       - run: cargo build -p rustd --release --features llvm
       - name: Harnesses
         working-directory: harness
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          run() { echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          # The harnesses are split over three machines by how long they take: keys.py alone, the
+          # ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
           run stress.py
