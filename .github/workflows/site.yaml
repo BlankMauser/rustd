@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-8x
     steps:
       - uses: actions/checkout@v6
       - run: sh -n site/install.sh
@@ -44,6 +44,7 @@ jobs:
           rustup default 1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-provider: "warpbuild"
           workspaces: "crates/rustd-wasm -> ../../target"
       - name: Playground
         run: crates/rustd-wasm/web/build-site.sh
