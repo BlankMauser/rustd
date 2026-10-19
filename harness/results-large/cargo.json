@@ -1,0 +1,7098 @@
+{
+ "results": {
+  "cargo/cranelift/rustd": {
+   "phases": {
+    "cold": {
+     "rustd_s": 46.609,
+     "warm_s": 116.569,
+     "cargo_s": 45.204,
+     "mold_s": 45.312,
+     "states": [
+      "ready"
+     ],
+     "rss_mb": 15197,
+     "fns": [
+      2664,
+      2664,
+      197367
+     ],
+     "steps_s": {
+      "load": 15.4,
+      "resolve": 6.4,
+      "compile": 92.6,
+      "emit": 0.242,
+      "link": 1.0
+     },
+     "built": "cargo",
+     "disk_mb": {
+      "target": 5447,
+      "target-ref": 2882
+     }
+    },
+    "no-op": {
+     "rustd": {
+      "median": 0.036,
+      "min": 0.032,
+      "max": 0.042,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.172,
+      "min": 0.166,
+      "max": 0.19,
+      "n": 5
+     },
+     "mold": {
+      "median": 0.173,
+      "min": 0.165,
+      "max": 0.177,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "None": 5
+     },
+     "compiled": {
+      "median": 0,
+      "min": 0,
+      "max": 0,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 0,
+      "min": 0,
+      "max": 0,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.015,
+      "min": 0.015,
+      "max": 0.016,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15197,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": [],
+     "back": null,
+     "samples": [
+      {
+       "rustd_s": 0.042,
+       "cargo_s": 0.19,
+       "mold_s": 0.177,
+       "built": "daemon",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.015,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.036,
+       "cargo_s": 0.172,
+       "mold_s": 0.168,
+       "built": "daemon",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.015,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.036,
+       "cargo_s": 0.168,
+       "mold_s": 0.165,
+       "built": "daemon",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.015,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.032,
+       "cargo_s": 0.184,
+       "mold_s": 0.173,
+       "built": "daemon",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.016,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.033,
+       "cargo_s": 0.166,
+       "mold_s": 0.175,
+       "built": "daemon",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.015,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": []
+    },
+    "body": {
+     "rustd": {
+      "median": 2.273,
+      "min": 2.267,
+      "max": 3.767,
+      "n": 5
+     },
+     "cargo": {
+      "median": 4.991,
+      "min": 4.978,
+      "max": 5.483,
+      "n": 5
+     },
+     "mold": {
+      "median": 4.926,
+      "min": 4.765,
+      "max": 5.726,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.016,
+      "max": 0.019,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15197,
+     "steps_ms": {
+      "settle": 0.02,
+      "read": 0.06,
+      "apply": 30.52,
+      "roots": 2.93,
+      "check": 274.03,
+      "reach": 3.66,
+      "resolve": 29.18,
+      "define": 2.26,
+      "object": 36.61,
+      "discarded": 0.0,
+      "compile-rest": 245.27,
+      "write": 0.97,
+      "build-rest": 19.25,
+      "report": 0.1,
+      "link": 557.56
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.287,
+       "min": 2.215,
+       "max": 2.308,
+       "n": 5
+      },
+      "cargo": {
+       "median": 4.967,
+       "min": 4.901,
+       "max": 5.794,
+       "n": 5
+      },
+      "mold": {
+       "median": 4.971,
+       "min": 4.752,
+       "max": 5.314,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 2.273,
+       "cargo_s": 4.978,
+       "mold_s": 4.765,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 10.53,
+        "apply": 10.77,
+        "roots": 1.42,
+        "check": 155.1,
+        "reach": 0.86,
+        "resolve": 59.93,
+        "define": 0.25,
+        "object": 6.67,
+        "discarded": 0.0,
+        "compile-rest": 103.09,
+        "write": 0.61,
+        "build-rest": 4.57,
+        "report": 0.09,
+        "link": 252.26
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.267,
+       "cargo_s": 4.991,
+       "mold_s": 4.797,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.04,
+        "apply": 181.49,
+        "roots": 1.4,
+        "check": 98.11,
+        "reach": 0.66,
+        "resolve": 15.85,
+        "define": 0.26,
+        "object": 6.56,
+        "discarded": 0.0,
+        "compile-rest": 96.24,
+        "write": 0.7,
+        "build-rest": 4.35,
+        "report": 0.09,
+        "link": 282.17
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.269,
+       "cargo_s": 4.982,
+       "mold_s": 4.926,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.04,
+        "apply": 11.53,
+        "roots": 1.42,
+        "check": 101.15,
+        "reach": 0.63,
+        "resolve": 14.78,
+        "define": 0.25,
+        "object": 6.82,
+        "discarded": 0.0,
+        "compile-rest": 95.14,
+        "write": 0.64,
+        "build-rest": 4.68,
+        "report": 0.08,
+        "link": 295.49
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 3.767,
+       "cargo_s": 5.483,
+       "mold_s": 5.726,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.019,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.06,
+        "apply": 30.52,
+        "roots": 2.93,
+        "check": 274.03,
+        "reach": 3.66,
+        "resolve": 29.18,
+        "define": 2.26,
+        "object": 36.61,
+        "discarded": 0.0,
+        "compile-rest": 245.27,
+        "write": 0.97,
+        "build-rest": 19.25,
+        "report": 0.1,
+        "link": 557.56
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.758,
+       "cargo_s": 5.147,
+       "mold_s": 5.571,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.19,
+        "apply": 15.0,
+        "roots": 1.2,
+        "check": 165.26,
+        "reach": 3.55,
+        "resolve": 16.12,
+        "define": 0.26,
+        "object": 7.74,
+        "discarded": 0.0,
+        "compile-rest": 105.18,
+        "write": 0.69,
+        "build-rest": 3.97,
+        "report": 0.08,
+        "link": 289.95
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.266,
+       "cargo_s": 5.151,
+       "mold_s": 4.752,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.04,
+        "apply": 12.98,
+        "roots": 1.47,
+        "check": 96.39,
+        "reach": 0.05,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.7,
+        "discarded": 0.0,
+        "compile-rest": 10.06,
+        "write": 0.37,
+        "build-rest": 4.47,
+        "report": 0.09,
+        "link": 278.72
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.215,
+       "cargo_s": 4.922,
+       "mold_s": 4.868,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.04,
+        "apply": 11.63,
+        "roots": 1.31,
+        "check": 92.75,
+        "reach": 0.04,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.69,
+        "discarded": 0.0,
+        "compile-rest": 9.94,
+        "write": 0.37,
+        "build-rest": 4.6,
+        "report": 0.09,
+        "link": 293.17
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.303,
+       "cargo_s": 4.901,
+       "mold_s": 4.983,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.04,
+        "apply": 11.84,
+        "roots": 1.39,
+        "check": 97.55,
+        "reach": 0.05,
+        "resolve": 0.05,
+        "define": 0.01,
+        "object": 1.81,
+        "discarded": 0.0,
+        "compile-rest": 9.95,
+        "write": 0.4,
+        "build-rest": 4.51,
+        "report": 0.07,
+        "link": 316.39
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.287,
+       "cargo_s": 5.794,
+       "mold_s": 5.314,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.04,
+        "apply": 10.96,
+        "roots": 1.23,
+        "check": 97.37,
+        "reach": 0.05,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 2.18,
+        "discarded": 0.0,
+        "compile-rest": 11.0,
+        "write": 0.37,
+        "build-rest": 4.03,
+        "report": 0.08,
+        "link": 284.84
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.308,
+       "cargo_s": 4.967,
+       "mold_s": 4.971,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.01,
+        "read": 0.03,
+        "apply": 11.01,
+        "roots": 1.2,
+        "check": 92.44,
+        "reach": 0.04,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.76,
+        "discarded": 0.0,
+        "compile-rest": 9.74,
+        "write": 0.36,
+        "build-rest": 4.02,
+        "report": 0.08,
+        "link": 291.57
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "leaf": {
+     "rustd": {
+      "median": 2.728,
+      "min": 2.631,
+      "max": 2.807,
+      "n": 5
+     },
+     "cargo": {
+      "median": 5.682,
+      "min": 5.609,
+      "max": 5.798,
+      "n": 5
+     },
+     "mold": {
+      "median": 5.539,
+      "min": 5.444,
+      "max": 6.486,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.015,
+      "max": 0.018,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15197,
+     "steps_ms": {
+      "settle": 3.79,
+      "read": 2.46,
+      "apply": 8.41,
+      "roots": 1.23,
+      "check": 44.63,
+      "reach": 0.67,
+      "resolve": 1.82,
+      "define": 0.31,
+      "object": 2.75,
+      "discarded": 0.0,
+      "compile-rest": 14.44,
+      "write": 0.47,
+      "build-rest": 3.98,
+      "report": 0.08,
+      "link": 296.65
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.794,
+       "min": 2.673,
+       "max": 2.866,
+       "n": 5
+      },
+      "cargo": {
+       "median": 5.695,
+       "min": 5.661,
+       "max": 5.725,
+       "n": 5
+      },
+      "mold": {
+       "median": 5.592,
+       "min": 5.478,
+       "max": 6.21,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 2.807,
+       "cargo_s": 5.716,
+       "mold_s": 6.486,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 2.46,
+        "apply": 8.41,
+        "roots": 1.23,
+        "check": 44.63,
+        "reach": 0.67,
+        "resolve": 1.82,
+        "define": 0.31,
+        "object": 2.75,
+        "discarded": 0.0,
+        "compile-rest": 14.44,
+        "write": 0.47,
+        "build-rest": 3.98,
+        "report": 0.08,
+        "link": 296.65
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.631,
+       "cargo_s": 5.648,
+       "mold_s": 5.539,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 0.03,
+        "apply": 5.3,
+        "roots": 1.25,
+        "check": 52.15,
+        "reach": 0.65,
+        "resolve": 1.99,
+        "define": 0.43,
+        "object": 3.09,
+        "discarded": 0.0,
+        "compile-rest": 15.87,
+        "write": 0.53,
+        "build-rest": 4.05,
+        "report": 0.08,
+        "link": 291.31
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.728,
+       "cargo_s": 5.682,
+       "mold_s": 5.503,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 0.04,
+        "apply": 5.37,
+        "roots": 1.31,
+        "check": 44.64,
+        "reach": 0.64,
+        "resolve": 1.88,
+        "define": 0.32,
+        "object": 3.25,
+        "discarded": 0.0,
+        "compile-rest": 15.11,
+        "write": 0.54,
+        "build-rest": 4.05,
+        "report": 0.08,
+        "link": 296.78
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.786,
+       "cargo_s": 5.609,
+       "mold_s": 5.686,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 0.04,
+        "apply": 6.53,
+        "roots": 1.37,
+        "check": 47.97,
+        "reach": 0.65,
+        "resolve": 1.84,
+        "define": 0.3,
+        "object": 2.75,
+        "discarded": 0.0,
+        "compile-rest": 15.0,
+        "write": 0.5,
+        "build-rest": 4.22,
+        "report": 0.06,
+        "link": 282.95
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.692,
+       "cargo_s": 5.798,
+       "mold_s": 5.444,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.36,
+        "read": 0.04,
+        "apply": 5.74,
+        "roots": 1.35,
+        "check": 48.27,
+        "reach": 1.39,
+        "resolve": 2.12,
+        "define": 0.34,
+        "object": 2.85,
+        "discarded": 0.0,
+        "compile-rest": 19.06,
+        "write": 0.48,
+        "build-rest": 4.63,
+        "report": 0.08,
+        "link": 289.04
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.811,
+       "cargo_s": 5.695,
+       "mold_s": 5.622,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.9,
+        "read": 0.04,
+        "apply": 5.91,
+        "roots": 1.22,
+        "check": 47.01,
+        "reach": 0.04,
+        "resolve": 0.12,
+        "define": 0.01,
+        "object": 2.54,
+        "discarded": 0.0,
+        "compile-rest": 12.93,
+        "write": 0.34,
+        "build-rest": 4.01,
+        "report": 0.09,
+        "link": 331.35
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.866,
+       "cargo_s": 5.684,
+       "mold_s": 5.592,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 0.04,
+        "apply": 5.4,
+        "roots": 1.24,
+        "check": 46.41,
+        "reach": 0.05,
+        "resolve": 0.13,
+        "define": 0.01,
+        "object": 1.85,
+        "discarded": 0.0,
+        "compile-rest": 10.68,
+        "write": 0.36,
+        "build-rest": 4.05,
+        "report": 0.08,
+        "link": 295.29
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.673,
+       "cargo_s": 5.725,
+       "mold_s": 5.56,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.019,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.82,
+        "read": 0.04,
+        "apply": 5.35,
+        "roots": 1.22,
+        "check": 46.97,
+        "reach": 0.05,
+        "resolve": 0.11,
+        "define": 0.01,
+        "object": 1.71,
+        "discarded": 0.0,
+        "compile-rest": 10.5,
+        "write": 0.35,
+        "build-rest": 3.98,
+        "report": 0.08,
+        "link": 280.08
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.794,
+       "cargo_s": 5.661,
+       "mold_s": 5.478,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.88,
+        "read": 0.03,
+        "apply": 5.97,
+        "roots": 1.27,
+        "check": 48.06,
+        "reach": 0.04,
+        "resolve": 0.12,
+        "define": 0.01,
+        "object": 1.63,
+        "discarded": 0.0,
+        "compile-rest": 10.34,
+        "write": 0.35,
+        "build-rest": 4.22,
+        "report": 0.07,
+        "link": 301.57
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.779,
+       "cargo_s": 5.723,
+       "mold_s": 6.21,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 0.04,
+        "apply": 5.67,
+        "roots": 1.38,
+        "check": 51.21,
+        "reach": 0.04,
+        "resolve": 0.13,
+        "define": 0.01,
+        "object": 1.7,
+        "discarded": 0.0,
+        "compile-rest": 10.5,
+        "write": 0.34,
+        "build-rest": 4.07,
+        "report": 0.08,
+        "link": 292.66
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "scatter3": {
+     "rustd": {
+      "median": 2.599,
+      "min": 2.519,
+      "max": 2.635,
+      "n": 5
+     },
+     "cargo": {
+      "median": 6.74,
+      "min": 6.636,
+      "max": 7.322,
+      "n": 5
+     },
+     "mold": {
+      "median": 6.625,
+      "min": 6.563,
+      "max": 6.801,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 4,
+      "min": 4,
+      "max": 4,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.015,
+      "max": 0.02,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15197,
+     "steps_ms": {
+      "settle": 4.31,
+      "read": 0.05,
+      "apply": 6.84,
+      "roots": 1.55,
+      "check": 57.97,
+      "reach": 0.51,
+      "resolve": 0.81,
+      "define": 0.16,
+      "object": 2.47,
+      "discarded": 0.0,
+      "compile-rest": 14.7,
+      "write": 0.44,
+      "build-rest": 4.72,
+      "report": 0.08,
+      "link": 284.23
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.59,
+       "min": 2.452,
+       "max": 2.64,
+       "n": 5
+      },
+      "cargo": {
+       "median": 6.661,
+       "min": 6.595,
+       "max": 6.95,
+       "n": 5
+      },
+      "mold": {
+       "median": 6.604,
+       "min": 6.538,
+       "max": 6.676,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 2.535,
+       "cargo_s": 6.74,
+       "mold_s": 6.704,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.016,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.04,
+        "read": 3.31,
+        "apply": 9.37,
+        "roots": 1.35,
+        "check": 54.81,
+        "reach": 2.39,
+        "resolve": 0.81,
+        "define": 0.16,
+        "object": 2.53,
+        "discarded": 0.0,
+        "compile-rest": 14.78,
+        "write": 0.4,
+        "build-rest": 47.62,
+        "report": 0.07,
+        "link": 284.84
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.635,
+       "cargo_s": 6.726,
+       "mold_s": 6.563,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.015,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.31,
+        "read": 0.05,
+        "apply": 6.84,
+        "roots": 1.55,
+        "check": 57.97,
+        "reach": 0.51,
+        "resolve": 0.81,
+        "define": 0.16,
+        "object": 2.47,
+        "discarded": 0.0,
+        "compile-rest": 14.7,
+        "write": 0.44,
+        "build-rest": 4.72,
+        "report": 0.08,
+        "link": 284.23
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.599,
+       "cargo_s": 6.757,
+       "mold_s": 6.801,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.015,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.31,
+        "read": 0.05,
+        "apply": 6.79,
+        "roots": 1.28,
+        "check": 51.52,
+        "reach": 0.49,
+        "resolve": 0.78,
+        "define": 0.15,
+        "object": 2.33,
+        "discarded": 0.0,
+        "compile-rest": 14.72,
+        "write": 0.41,
+        "build-rest": 4.51,
+        "report": 0.05,
+        "link": 292.28
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.519,
+       "cargo_s": 6.636,
+       "mold_s": 6.625,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.02,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.04,
+        "read": 0.05,
+        "apply": 6.55,
+        "roots": 1.47,
+        "check": 50.3,
+        "reach": 0.52,
+        "resolve": 0.87,
+        "define": 0.15,
+        "object": 2.4,
+        "discarded": 0.0,
+        "compile-rest": 15.14,
+        "write": 0.41,
+        "build-rest": 7.27,
+        "report": 0.08,
+        "link": 282.79
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.618,
+       "cargo_s": 7.322,
+       "mold_s": 6.581,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.016,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.5,
+        "read": 0.06,
+        "apply": 7.72,
+        "roots": 1.38,
+        "check": 50.25,
+        "reach": 0.51,
+        "resolve": 0.87,
+        "define": 0.18,
+        "object": 2.88,
+        "discarded": 0.0,
+        "compile-rest": 16.75,
+        "write": 9.96,
+        "build-rest": 4.46,
+        "report": 0.1,
+        "link": 306.94
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.584,
+       "cargo_s": 6.95,
+       "mold_s": 6.622,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.017,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.0,
+        "read": 0.04,
+        "apply": 15.62,
+        "roots": 1.25,
+        "check": 46.14,
+        "reach": 0.04,
+        "resolve": 0.11,
+        "define": 0.02,
+        "object": 1.7,
+        "discarded": 0.0,
+        "compile-rest": 10.68,
+        "write": 0.32,
+        "build-rest": 4.15,
+        "report": 0.07,
+        "link": 305.63
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.59,
+       "cargo_s": 6.661,
+       "mold_s": 6.538,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.02,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.02,
+        "read": 0.05,
+        "apply": 6.58,
+        "roots": 1.25,
+        "check": 47.15,
+        "reach": 0.05,
+        "resolve": 0.11,
+        "define": 0.02,
+        "object": 1.65,
+        "discarded": 0.0,
+        "compile-rest": 10.7,
+        "write": 0.37,
+        "build-rest": 4.1,
+        "report": 0.09,
+        "link": 295.57
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.622,
+       "cargo_s": 6.64,
+       "mold_s": 6.604,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.016,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.34,
+        "read": 0.05,
+        "apply": 6.76,
+        "roots": 1.25,
+        "check": 46.0,
+        "reach": 0.04,
+        "resolve": 0.11,
+        "define": 0.02,
+        "object": 1.7,
+        "discarded": 0.0,
+        "compile-rest": 10.4,
+        "write": 0.34,
+        "build-rest": 4.16,
+        "report": 0.07,
+        "link": 290.47
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.64,
+       "cargo_s": 6.78,
+       "mold_s": 6.676,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.016,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.02,
+        "read": 0.05,
+        "apply": 6.57,
+        "roots": 1.28,
+        "check": 47.28,
+        "reach": 0.04,
+        "resolve": 0.11,
+        "define": 0.02,
+        "object": 1.67,
+        "discarded": 0.0,
+        "compile-rest": 10.46,
+        "write": 0.35,
+        "build-rest": 4.12,
+        "report": 0.08,
+        "link": 294.76
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.452,
+       "cargo_s": 6.595,
+       "mold_s": 6.562,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.015,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.27,
+        "read": 0.05,
+        "apply": 6.8,
+        "roots": 1.53,
+        "check": 47.84,
+        "reach": 0.04,
+        "resolve": 0.12,
+        "define": 0.02,
+        "object": 1.79,
+        "discarded": 0.0,
+        "compile-rest": 11.04,
+        "write": 0.35,
+        "build-rest": 4.71,
+        "report": 0.08,
+        "link": 287.21
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 3,
+     "files": 3
+    },
+    "scatter10": {
+     "skipped": "the workspace has no such edit"
+    },
+    "scatter30": {
+     "skipped": "the workspace has no such edit"
+    },
+    "signature": {
+     "rustd": {
+      "median": 129.043,
+      "min": 125.541,
+      "max": 134.817,
+      "n": 4
+     },
+     "cargo": {
+      "median": 10.323,
+      "min": 9.214,
+      "max": 11.35,
+      "n": 4
+     },
+     "mold": {
+      "median": 9.589,
+      "min": 8.58,
+      "max": 9.959,
+      "n": 4
+     },
+     "built": {
+      "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed": 4
+     },
+     "link": {
+      "None": 4
+     },
+     "compiled": {
+      "median": 0.0,
+      "min": 0,
+      "max": 0,
+      "n": 4
+     },
+     "cargo_crates": {
+      "median": 1.0,
+      "min": 1,
+      "max": 1,
+      "n": 4
+     },
+     "settle": {
+      "median": 86.257,
+      "min": 83.887,
+      "max": 87.648,
+      "n": 4
+     },
+     "reload": {
+      "median": 0.024,
+      "min": 0.023,
+      "max": 0.026,
+      "n": 4
+     },
+     "rss_mb": 17968,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 126.827,
+       "min": 126.109,
+       "max": 127.405,
+       "n": 4
+      },
+      "cargo": {
+       "median": 10.058,
+       "min": 8.354,
+       "max": 12.173,
+       "n": 4
+      },
+      "mold": {
+       "median": 9.715,
+       "min": 9.031,
+       "max": 11.276,
+       "n": 4
+      },
+      "built": {
+       "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed": 4
+      },
+      "link": {
+       "None": 4
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 134.817,
+       "cargo_s": 9.3,
+       "mold_s": 8.58,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 87.648,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.023
+      },
+      {
+       "rustd_s": 128.685,
+       "cargo_s": 11.347,
+       "mold_s": 9.596,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 83.887,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.023
+      },
+      {
+       "rustd_s": 125.541,
+       "cargo_s": 11.35,
+       "mold_s": 9.959,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 87.451,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.024
+      },
+      {
+       "rustd_s": 129.4,
+       "cargo_s": 9.214,
+       "mold_s": 9.582,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 85.063,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.026
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 126.851,
+       "cargo_s": 8.354,
+       "mold_s": 9.183,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 90.24,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.024
+      },
+      {
+       "rustd_s": 127.405,
+       "cargo_s": 9.287,
+       "mold_s": 10.246,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 85.355,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.028
+      },
+      {
+       "rustd_s": 126.802,
+       "cargo_s": 12.173,
+       "mold_s": 11.276,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 88.648,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.028
+      },
+      {
+       "rustd_s": 126.109,
+       "cargo_s": 10.829,
+       "mold_s": 9.031,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 83.854,
+       "cargo_crates": 1,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null,
+       "reload_s": 0.026
+      }
+     ],
+     "places": 113,
+     "files": 222
+    },
+    "generic": {
+     "rustd": {
+      "median": 2.652,
+      "min": 2.586,
+      "max": 35.772,
+      "n": 5
+     },
+     "cargo": {
+      "median": 6.911,
+      "min": 6.828,
+      "max": 7.069,
+      "n": 5
+     },
+     "mold": {
+      "median": 6.749,
+      "min": 6.706,
+      "max": 6.859,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "full link: the whole object was written again": 1,
+      "spliced": 4
+     },
+     "compiled": {
+      "median": 64,
+      "min": 64,
+      "max": 46261,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.015,
+      "min": 0.015,
+      "max": 0.646,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 17968,
+     "steps_ms": {
+      "settle": 0.21,
+      "read": 7.26,
+      "apply": 170.43,
+      "roots": 1.23,
+      "check": 124.71,
+      "reach": 2234.63,
+      "resolve": 3011.95,
+      "define": 1484.23,
+      "object": 5247.64,
+      "discarded": 0.0,
+      "compile-rest": 21421.62,
+      "write": 524.51,
+      "build-rest": 29.64,
+      "report": 0.07,
+      "link": 1085.55
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.57,
+       "min": 2.533,
+       "max": 2.707,
+       "n": 5
+      },
+      "cargo": {
+       "median": 6.887,
+       "min": 6.82,
+       "max": 6.954,
+       "n": 5
+      },
+      "mold": {
+       "median": 6.8,
+       "min": 6.76,
+       "max": 6.882,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 35.772,
+       "cargo_s": 7.069,
+       "mold_s": 6.776,
+       "built": "daemon",
+       "link": "full link: the whole object was written again",
+       "compiled": 46261,
+       "settle_s": 0.646,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 7.26,
+        "apply": 170.43,
+        "roots": 1.23,
+        "check": 124.71,
+        "reach": 2234.63,
+        "resolve": 3011.95,
+        "define": 1484.23,
+        "object": 5247.64,
+        "discarded": 0.0,
+        "compile-rest": 21421.62,
+        "write": 524.51,
+        "build-rest": 29.64,
+        "report": 0.07,
+        "link": 1085.55
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.652,
+       "cargo_s": 6.828,
+       "mold_s": 6.706,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.36,
+        "read": 0.1,
+        "apply": 26.48,
+        "roots": 1.24,
+        "check": 107.81,
+        "reach": 0.55,
+        "resolve": 0.45,
+        "define": 0.16,
+        "object": 1.34,
+        "discarded": 0.0,
+        "compile-rest": 15.43,
+        "write": 0.49,
+        "build-rest": 3.94,
+        "report": 0.08,
+        "link": 298.86
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.586,
+       "cargo_s": 6.865,
+       "mold_s": 6.749,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.22,
+        "read": 0.06,
+        "apply": 19.87,
+        "roots": 1.41,
+        "check": 125.6,
+        "reach": 0.63,
+        "resolve": 0.45,
+        "define": 0.17,
+        "object": 1.35,
+        "discarded": 0.0,
+        "compile-rest": 15.98,
+        "write": 0.48,
+        "build-rest": 4.18,
+        "report": 0.06,
+        "link": 309.19
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.596,
+       "cargo_s": 6.936,
+       "mold_s": 6.859,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.06,
+        "apply": 20.91,
+        "roots": 1.33,
+        "check": 110.12,
+        "reach": 0.55,
+        "resolve": 0.48,
+        "define": 0.16,
+        "object": 1.35,
+        "discarded": 0.0,
+        "compile-rest": 15.1,
+        "write": 0.49,
+        "build-rest": 4.03,
+        "report": 0.09,
+        "link": 294.16
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.664,
+       "cargo_s": 6.911,
+       "mold_s": 6.744,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.38,
+        "read": 0.09,
+        "apply": 27.81,
+        "roots": 1.23,
+        "check": 119.4,
+        "reach": 0.62,
+        "resolve": 0.49,
+        "define": 0.18,
+        "object": 1.42,
+        "discarded": 0.0,
+        "compile-rest": 17.11,
+        "write": 0.69,
+        "build-rest": 3.98,
+        "report": 0.07,
+        "link": 296.62
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.57,
+       "cargo_s": 6.858,
+       "mold_s": 6.793,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.22,
+        "read": 0.06,
+        "apply": 51.53,
+        "roots": 1.38,
+        "check": 141.52,
+        "reach": 3.43,
+        "resolve": 54.61,
+        "define": 2.46,
+        "object": 4.56,
+        "discarded": 0.0,
+        "compile-rest": 40.25,
+        "write": 1.27,
+        "build-rest": 4.71,
+        "report": 0.08,
+        "link": 260.13
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.582,
+       "cargo_s": 6.954,
+       "mold_s": 6.76,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.2,
+        "read": 0.07,
+        "apply": 19.51,
+        "roots": 1.21,
+        "check": 108.26,
+        "reach": 2.09,
+        "resolve": 24.47,
+        "define": 2.79,
+        "object": 3.81,
+        "discarded": 0.0,
+        "compile-rest": 37.05,
+        "write": 1.17,
+        "build-rest": 3.97,
+        "report": 0.08,
+        "link": 285.27
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.707,
+       "cargo_s": 6.887,
+       "mold_s": 6.882,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.07,
+        "apply": 26.13,
+        "roots": 1.22,
+        "check": 108.92,
+        "reach": 1.66,
+        "resolve": 25.15,
+        "define": 2.01,
+        "object": 4.34,
+        "discarded": 0.0,
+        "compile-rest": 37.22,
+        "write": 1.29,
+        "build-rest": 4.04,
+        "report": 0.08,
+        "link": 289.76
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.533,
+       "cargo_s": 6.82,
+       "mold_s": 6.802,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.05,
+        "apply": 19.79,
+        "roots": 1.22,
+        "check": 124.53,
+        "reach": 2.02,
+        "resolve": 24.34,
+        "define": 2.48,
+        "object": 4.63,
+        "discarded": 0.0,
+        "compile-rest": 37.95,
+        "write": 1.29,
+        "build-rest": 4.16,
+        "report": 0.08,
+        "link": 288.53
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.536,
+       "cargo_s": 6.925,
+       "mold_s": 6.8,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.06,
+        "apply": 20.38,
+        "roots": 1.18,
+        "check": 110.17,
+        "reach": 1.41,
+        "resolve": 23.65,
+        "define": 2.46,
+        "object": 4.34,
+        "discarded": 0.0,
+        "compile-rest": 36.63,
+        "write": 1.27,
+        "build-rest": 4.05,
+        "report": 0.08,
+        "link": 299.97
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "new_fn": {
+     "rustd": {
+      "median": 2.732,
+      "min": 2.642,
+      "max": 2.764,
+      "n": 5
+     },
+     "cargo": {
+      "median": 5.575,
+      "min": 5.539,
+      "max": 5.752,
+      "n": 5
+     },
+     "mold": {
+      "median": 5.585,
+      "min": 5.339,
+      "max": 5.604,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 108,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.015,
+      "max": 0.016,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 17968,
+     "steps_ms": {
+      "settle": 3.81,
+      "read": 2.48,
+      "apply": 10.48,
+      "roots": 38.26,
+      "check": 380.22,
+      "reach": 5.6,
+      "resolve": 25.54,
+      "define": 2.68,
+      "object": 12.62,
+      "discarded": 0.0,
+      "compile-rest": 107.65,
+      "write": 2.2,
+      "build-rest": 3.92,
+      "report": 0.08,
+      "link": 301.65
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.725,
+       "min": 2.689,
+       "max": 2.74,
+       "n": 5
+      },
+      "cargo": {
+       "median": 5.567,
+       "min": 5.5,
+       "max": 5.674,
+       "n": 5
+      },
+      "mold": {
+       "median": 5.45,
+       "min": 5.331,
+       "max": 5.478,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 2.764,
+       "cargo_s": 5.677,
+       "mold_s": 5.604,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 108,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 2.48,
+        "apply": 10.48,
+        "roots": 38.26,
+        "check": 380.22,
+        "reach": 5.6,
+        "resolve": 25.54,
+        "define": 2.68,
+        "object": 12.62,
+        "discarded": 0.0,
+        "compile-rest": 107.65,
+        "write": 2.2,
+        "build-rest": 3.92,
+        "report": 0.08,
+        "link": 301.65
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.748,
+       "cargo_s": 5.552,
+       "mold_s": 5.46,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.8,
+        "read": 1.04,
+        "apply": 6.15,
+        "roots": 34.32,
+        "check": 283.66,
+        "reach": 2.04,
+        "resolve": 25.83,
+        "define": 2.9,
+        "object": 12.8,
+        "discarded": 0.0,
+        "compile-rest": 104.48,
+        "write": 2.15,
+        "build-rest": 3.98,
+        "report": 0.08,
+        "link": 297.88
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.642,
+       "cargo_s": 5.575,
+       "mold_s": 5.585,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.0,
+        "apply": 5.94,
+        "roots": 33.26,
+        "check": 272.96,
+        "reach": 1.73,
+        "resolve": 26.37,
+        "define": 3.06,
+        "object": 12.24,
+        "discarded": 0.0,
+        "compile-rest": 104.49,
+        "write": 2.29,
+        "build-rest": 3.97,
+        "report": 0.08,
+        "link": 302.81
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.732,
+       "cargo_s": 5.539,
+       "mold_s": 5.339,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.82,
+        "read": 1.05,
+        "apply": 6.08,
+        "roots": 36.08,
+        "check": 261.83,
+        "reach": 1.86,
+        "resolve": 26.82,
+        "define": 2.97,
+        "object": 12.34,
+        "discarded": 0.0,
+        "compile-rest": 106.15,
+        "write": 2.04,
+        "build-rest": 3.99,
+        "report": 0.08,
+        "link": 306.52
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.697,
+       "cargo_s": 5.752,
+       "mold_s": 5.586,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.03,
+        "apply": 6.0,
+        "roots": 34.56,
+        "check": 240.79,
+        "reach": 1.65,
+        "resolve": 25.63,
+        "define": 3.42,
+        "object": 12.88,
+        "discarded": 0.0,
+        "compile-rest": 104.96,
+        "write": 2.16,
+        "build-rest": 3.97,
+        "report": 0.08,
+        "link": 298.69
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.689,
+       "cargo_s": 5.567,
+       "mold_s": 5.477,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 1.01,
+        "apply": 10.37,
+        "roots": 32.88,
+        "check": 259.83,
+        "reach": 1.68,
+        "resolve": 24.59,
+        "define": 1.86,
+        "object": 9.2,
+        "discarded": 0.0,
+        "compile-rest": 100.9,
+        "write": 1.97,
+        "build-rest": 3.99,
+        "report": 0.08,
+        "link": 295.55
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.722,
+       "cargo_s": 5.546,
+       "mold_s": 5.401,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.09,
+        "read": 1.54,
+        "apply": 6.37,
+        "roots": 35.86,
+        "check": 255.93,
+        "reach": 1.5,
+        "resolve": 26.75,
+        "define": 3.09,
+        "object": 9.45,
+        "discarded": 0.0,
+        "compile-rest": 107.74,
+        "write": 2.18,
+        "build-rest": 4.53,
+        "report": 0.08,
+        "link": 308.57
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.74,
+       "cargo_s": 5.5,
+       "mold_s": 5.478,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.05,
+        "apply": 5.9,
+        "roots": 35.07,
+        "check": 262.94,
+        "reach": 1.62,
+        "resolve": 22.98,
+        "define": 2.4,
+        "object": 7.92,
+        "discarded": 0.0,
+        "compile-rest": 104.98,
+        "write": 1.84,
+        "build-rest": 3.94,
+        "report": 0.06,
+        "link": 306.03
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.73,
+       "cargo_s": 5.674,
+       "mold_s": 5.45,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.0,
+        "read": 1.13,
+        "apply": 6.2,
+        "roots": 35.09,
+        "check": 328.32,
+        "reach": 1.88,
+        "resolve": 24.51,
+        "define": 2.5,
+        "object": 7.65,
+        "discarded": 0.0,
+        "compile-rest": 98.25,
+        "write": 1.81,
+        "build-rest": 3.97,
+        "report": 0.08,
+        "link": 288.23
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.725,
+       "cargo_s": 5.655,
+       "mold_s": 5.331,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.08,
+        "apply": 6.09,
+        "roots": 34.59,
+        "check": 252.15,
+        "reach": 1.57,
+        "resolve": 23.26,
+        "define": 2.21,
+        "object": 8.57,
+        "discarded": 0.0,
+        "compile-rest": 99.5,
+        "write": 1.89,
+        "build-rest": 3.98,
+        "report": 0.08,
+        "link": 294.71
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 2,
+     "files": 1
+    },
+    "new_type": {
+     "rustd": {
+      "median": 2.774,
+      "min": 2.689,
+      "max": 2.809,
+      "n": 5
+     },
+     "cargo": {
+      "median": 6.09,
+      "min": 6.047,
+      "max": 6.316,
+      "n": 5
+     },
+     "mold": {
+      "median": 5.966,
+      "min": 5.925,
+      "max": 6.154,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 49,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.015,
+      "max": 0.017,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 17968,
+     "steps_ms": {
+      "settle": 3.81,
+      "read": 1.05,
+      "apply": 6.34,
+      "roots": 34.2,
+      "check": 301.87,
+      "reach": 7.07,
+      "resolve": 83.35,
+      "define": 2.05,
+      "object": 14.45,
+      "discarded": 0.0,
+      "compile-rest": 113.81,
+      "write": 2.29,
+      "build-rest": 4.43,
+      "report": 0.1,
+      "link": 313.86
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 2.705,
+       "min": 2.662,
+       "max": 2.764,
+       "n": 5
+      },
+      "cargo": {
+       "median": 6.11,
+       "min": 6.098,
+       "max": 6.127,
+       "n": 5
+      },
+      "mold": {
+       "median": 5.946,
+       "min": 5.895,
+       "max": 5.991,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 2.809,
+       "cargo_s": 6.316,
+       "mold_s": 6.154,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 49,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.05,
+        "apply": 6.34,
+        "roots": 34.2,
+        "check": 301.87,
+        "reach": 7.07,
+        "resolve": 83.35,
+        "define": 2.05,
+        "object": 14.45,
+        "discarded": 0.0,
+        "compile-rest": 113.81,
+        "write": 2.29,
+        "build-rest": 4.43,
+        "report": 0.1,
+        "link": 313.86
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.789,
+       "cargo_s": 6.058,
+       "mold_s": 5.966,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.89,
+        "read": 1.59,
+        "apply": 6.28,
+        "roots": 35.23,
+        "check": 271.65,
+        "reach": 3.0,
+        "resolve": 32.31,
+        "define": 2.66,
+        "object": 11.44,
+        "discarded": 0.0,
+        "compile-rest": 112.46,
+        "write": 2.34,
+        "build-rest": 3.98,
+        "report": 0.06,
+        "link": 309.95
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.774,
+       "cargo_s": 6.09,
+       "mold_s": 5.925,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.85,
+        "read": 1.11,
+        "apply": 6.1,
+        "roots": 33.33,
+        "check": 265.95,
+        "reach": 2.93,
+        "resolve": 31.95,
+        "define": 2.41,
+        "object": 12.43,
+        "discarded": 0.0,
+        "compile-rest": 107.18,
+        "write": 2.53,
+        "build-rest": 4.0,
+        "report": 0.1,
+        "link": 320.34
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.749,
+       "cargo_s": 6.163,
+       "mold_s": 5.959,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.0,
+        "apply": 6.41,
+        "roots": 39.17,
+        "check": 264.81,
+        "reach": 3.43,
+        "resolve": 31.99,
+        "define": 3.24,
+        "object": 14.34,
+        "discarded": 0.0,
+        "compile-rest": 115.33,
+        "write": 2.44,
+        "build-rest": 4.74,
+        "report": 0.09,
+        "link": 299.13
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.689,
+       "cargo_s": 6.047,
+       "mold_s": 5.986,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.83,
+        "read": 1.07,
+        "apply": 6.16,
+        "roots": 39.12,
+        "check": 279.37,
+        "reach": 2.96,
+        "resolve": 30.22,
+        "define": 2.75,
+        "object": 15.86,
+        "discarded": 0.0,
+        "compile-rest": 104.91,
+        "write": 2.34,
+        "build-rest": 4.02,
+        "report": 0.09,
+        "link": 301.02
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 2.662,
+       "cargo_s": 6.125,
+       "mold_s": 5.971,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.85,
+        "read": 1.08,
+        "apply": 6.04,
+        "roots": 34.16,
+        "check": 257.69,
+        "reach": 1.28,
+        "resolve": 23.8,
+        "define": 2.11,
+        "object": 9.41,
+        "discarded": 0.0,
+        "compile-rest": 100.09,
+        "write": 1.92,
+        "build-rest": 3.96,
+        "report": 0.08,
+        "link": 293.23
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.693,
+       "cargo_s": 6.1,
+       "mold_s": 5.991,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 1.07,
+        "apply": 6.02,
+        "roots": 44.58,
+        "check": 263.27,
+        "reach": 1.28,
+        "resolve": 23.79,
+        "define": 2.29,
+        "object": 8.06,
+        "discarded": 0.0,
+        "compile-rest": 96.99,
+        "write": 1.83,
+        "build-rest": 3.99,
+        "report": 0.1,
+        "link": 302.04
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.705,
+       "cargo_s": 6.127,
+       "mold_s": 5.895,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.82,
+        "read": 1.55,
+        "apply": 6.02,
+        "roots": 36.61,
+        "check": 300.66,
+        "reach": 1.7,
+        "resolve": 24.76,
+        "define": 2.42,
+        "object": 8.1,
+        "discarded": 0.0,
+        "compile-rest": 106.69,
+        "write": 1.95,
+        "build-rest": 3.96,
+        "report": 0.09,
+        "link": 299.44
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.751,
+       "cargo_s": 6.11,
+       "mold_s": 5.946,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.98,
+        "read": 1.09,
+        "apply": 6.24,
+        "roots": 36.4,
+        "check": 294.46,
+        "reach": 1.45,
+        "resolve": 25.96,
+        "define": 1.92,
+        "object": 10.36,
+        "discarded": 0.0,
+        "compile-rest": 108.42,
+        "write": 2.25,
+        "build-rest": 4.41,
+        "report": 0.09,
+        "link": 308.2
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 2.764,
+       "cargo_s": 6.098,
+       "mold_s": 5.934,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.8,
+        "read": 1.14,
+        "apply": 6.0,
+        "roots": 35.19,
+        "check": 268.11,
+        "reach": 1.47,
+        "resolve": 25.72,
+        "define": 2.64,
+        "object": 9.47,
+        "discarded": 0.0,
+        "compile-rest": 104.53,
+        "write": 2.1,
+        "build-rest": 4.03,
+        "report": 0.08,
+        "link": 313.47
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 2,
+     "files": 1
+    },
+    "field": {
+     "skipped": "the workspace has no such edit"
+    },
+    "test_body": {
+     "skipped": "the workspace has no such edit"
+    },
+    "test_leaf first": {
+     "rustd_s": 34.994,
+     "cargo_s": 3.875,
+     "mold_s": 3.582,
+     "built": "cargo",
+     "link": "full link: no executable to add to",
+     "compiled": 0,
+     "settle_s": 0.017,
+     "cargo_crates": 20,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": null,
+     "reload_s": 0.026,
+     "warm_s": 0.04
+    },
+    "test_leaf": {
+     "rustd": {
+      "median": 20.778,
+      "min": 20.503,
+      "max": 27.991,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.626,
+      "min": 0.596,
+      "max": 0.686,
+      "n": 5
+     },
+     "mold": {
+      "median": 0.591,
+      "min": 0.571,
+      "max": 0.695,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.016,
+      "max": 0.018,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 21118,
+     "steps_ms": {
+      "settle": 16.79,
+      "read": 2.5,
+      "apply": 12.46,
+      "roots": 0.18,
+      "check": 11.11,
+      "reach": 0.41,
+      "resolve": 6.59,
+      "define": 0.07,
+      "object": 0.39,
+      "discarded": 0.0,
+      "compile-rest": 2.6,
+      "write": 0.61,
+      "build-rest": 5.89,
+      "report": 0.09,
+      "link": 18.06
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 20.517,
+       "min": 20.368,
+       "max": 22.399,
+       "n": 5
+      },
+      "cargo": {
+       "median": 0.6,
+       "min": 0.59,
+       "max": 0.696,
+       "n": 5
+      },
+      "mold": {
+       "median": 0.606,
+       "min": 0.579,
+       "max": 0.694,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 27.991,
+       "cargo_s": 0.686,
+       "mold_s": 0.695,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 16.79,
+        "read": 2.5,
+        "apply": 12.46,
+        "roots": 0.18,
+        "check": 11.11,
+        "reach": 0.41,
+        "resolve": 6.59,
+        "define": 0.07,
+        "object": 0.39,
+        "discarded": 0.0,
+        "compile-rest": 2.6,
+        "write": 0.61,
+        "build-rest": 5.89,
+        "report": 0.09,
+        "link": 18.06
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 22.178,
+       "cargo_s": 0.642,
+       "mold_s": 0.648,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.0,
+        "read": 0.04,
+        "apply": 6.25,
+        "roots": 0.15,
+        "check": 4.78,
+        "reach": 1.89,
+        "resolve": 13.97,
+        "define": 0.08,
+        "object": 0.34,
+        "discarded": 0.0,
+        "compile-rest": 2.51,
+        "write": 0.44,
+        "build-rest": 1.23,
+        "report": 2.12,
+        "link": 38.92
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.778,
+       "cargo_s": 0.614,
+       "mold_s": 0.583,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.42,
+        "roots": 0.16,
+        "check": 4.61,
+        "reach": 0.33,
+        "resolve": 5.72,
+        "define": 0.06,
+        "object": 0.31,
+        "discarded": 0.0,
+        "compile-rest": 2.33,
+        "write": 0.41,
+        "build-rest": 1.18,
+        "report": 0.09,
+        "link": 18.38
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.503,
+       "cargo_s": 0.596,
+       "mold_s": 0.571,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.78,
+        "read": 0.04,
+        "apply": 5.76,
+        "roots": 0.14,
+        "check": 5.03,
+        "reach": 0.36,
+        "resolve": 5.79,
+        "define": 0.07,
+        "object": 0.33,
+        "discarded": 0.0,
+        "compile-rest": 2.31,
+        "write": 0.42,
+        "build-rest": 1.18,
+        "report": 0.12,
+        "link": 18.95
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.629,
+       "cargo_s": 0.626,
+       "mold_s": 0.591,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.21,
+        "read": 0.04,
+        "apply": 5.97,
+        "roots": 0.17,
+        "check": 5.13,
+        "reach": 0.35,
+        "resolve": 6.17,
+        "define": 0.07,
+        "object": 0.36,
+        "discarded": 0.0,
+        "compile-rest": 2.51,
+        "write": 0.43,
+        "build-rest": 1.25,
+        "report": 0.12,
+        "link": 20.01
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 22.399,
+       "cargo_s": 0.696,
+       "mold_s": 0.694,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 10.06,
+        "read": 0.04,
+        "apply": 11.62,
+        "roots": 0.17,
+        "check": 6.26,
+        "reach": 0.01,
+        "resolve": 5.96,
+        "define": 0.01,
+        "object": 0.14,
+        "discarded": 0.0,
+        "compile-rest": 1.33,
+        "write": 0.37,
+        "build-rest": 1.28,
+        "report": 0.12,
+        "link": 16.69
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.916,
+       "cargo_s": 0.6,
+       "mold_s": 0.581,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.55,
+        "roots": 0.14,
+        "check": 4.66,
+        "reach": 0.01,
+        "resolve": 5.3,
+        "define": 0.01,
+        "object": 0.12,
+        "discarded": 0.0,
+        "compile-rest": 1.2,
+        "write": 0.38,
+        "build-rest": 1.18,
+        "report": 0.1,
+        "link": 17.77
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.517,
+       "cargo_s": 0.65,
+       "mold_s": 0.606,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.8,
+        "read": 0.04,
+        "apply": 5.7,
+        "roots": 0.14,
+        "check": 5.48,
+        "reach": 0.01,
+        "resolve": 5.22,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.26,
+        "write": 0.38,
+        "build-rest": 1.22,
+        "report": 0.11,
+        "link": 16.45
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.462,
+       "cargo_s": 0.596,
+       "mold_s": 0.612,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.76,
+        "read": 0.04,
+        "apply": 5.84,
+        "roots": 0.14,
+        "check": 4.61,
+        "reach": 0.01,
+        "resolve": 5.32,
+        "define": 0.01,
+        "object": 0.12,
+        "discarded": 0.0,
+        "compile-rest": 1.23,
+        "write": 0.39,
+        "build-rest": 1.2,
+        "report": 0.11,
+        "link": 17.74
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 20.368,
+       "cargo_s": 0.59,
+       "mold_s": 0.579,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.64,
+        "roots": 0.14,
+        "check": 4.66,
+        "reach": 0.01,
+        "resolve": 5.21,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.23,
+        "write": 0.41,
+        "build-rest": 1.18,
+        "report": 0.1,
+        "link": 17.64
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "test_leaf_lib first": {
+     "rustd_s": 0.381,
+     "cargo_s": 0.095,
+     "mold_s": 0.095,
+     "built": "cargo",
+     "link": null,
+     "compiled": 0,
+     "settle_s": 0.755,
+     "cargo_crates": 0,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": null,
+     "reload_s": 0.024,
+     "warm_s": 0.038
+    },
+    "test_leaf_lib": {
+     "rustd": {
+      "median": 0.267,
+      "min": 0.249,
+      "max": 0.313,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.381,
+      "min": 0.373,
+      "max": 0.399,
+      "n": 5
+     },
+     "mold": {
+      "median": 0.363,
+      "min": 0.357,
+      "max": 0.395,
+      "n": 5
+     },
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.016,
+      "max": 0.026,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 21118,
+     "steps_ms": {
+      "settle": 3.78,
+      "read": 0.04,
+      "apply": 5.34,
+      "roots": 0.14,
+      "check": 4.78,
+      "reach": 0.34,
+      "resolve": 5.72,
+      "define": 0.08,
+      "object": 0.32,
+      "discarded": 0.0,
+      "compile-rest": 2.48,
+      "write": 0.42,
+      "build-rest": 1.21,
+      "report": 0.09,
+      "link": 19.07
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 0.252,
+       "min": 0.248,
+       "max": 0.274,
+       "n": 5
+      },
+      "cargo": {
+       "median": 0.375,
+       "min": 0.366,
+       "max": 0.395,
+       "n": 5
+      },
+      "mold": {
+       "median": 0.364,
+       "min": 0.36,
+       "max": 0.37,
+       "n": 5
+      },
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 0.291,
+       "cargo_s": 0.373,
+       "mold_s": 0.358,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.026,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.41,
+        "read": 0.04,
+        "apply": 10.13,
+        "roots": 0.18,
+        "check": 8.96,
+        "reach": 0.59,
+        "resolve": 6.1,
+        "define": 0.07,
+        "object": 0.33,
+        "discarded": 0.0,
+        "compile-rest": 2.5,
+        "write": 0.46,
+        "build-rest": 1.27,
+        "report": 0.09,
+        "link": 17.0
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.249,
+       "cargo_s": 0.375,
+       "mold_s": 0.363,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 0.04,
+        "apply": 5.63,
+        "roots": 0.15,
+        "check": 4.84,
+        "reach": 0.29,
+        "resolve": 6.03,
+        "define": 0.07,
+        "object": 0.34,
+        "discarded": 0.0,
+        "compile-rest": 2.48,
+        "write": 0.45,
+        "build-rest": 1.2,
+        "report": 0.08,
+        "link": 18.16
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.267,
+       "cargo_s": 0.397,
+       "mold_s": 0.371,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.09,
+        "read": 0.04,
+        "apply": 5.87,
+        "roots": 0.16,
+        "check": 5.01,
+        "reach": 0.54,
+        "resolve": 5.86,
+        "define": 0.07,
+        "object": 0.32,
+        "discarded": 0.0,
+        "compile-rest": 2.32,
+        "write": 0.45,
+        "build-rest": 1.21,
+        "report": 0.08,
+        "link": 18.4
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.255,
+       "cargo_s": 0.381,
+       "mold_s": 0.357,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.49,
+        "roots": 0.15,
+        "check": 4.7,
+        "reach": 0.3,
+        "resolve": 5.7,
+        "define": 0.07,
+        "object": 0.34,
+        "discarded": 0.0,
+        "compile-rest": 2.62,
+        "write": 0.43,
+        "build-rest": 1.2,
+        "report": 0.08,
+        "link": 17.89
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.313,
+       "cargo_s": 0.399,
+       "mold_s": 0.395,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.78,
+        "read": 0.04,
+        "apply": 5.34,
+        "roots": 0.14,
+        "check": 4.78,
+        "reach": 0.34,
+        "resolve": 5.72,
+        "define": 0.08,
+        "object": 0.32,
+        "discarded": 0.0,
+        "compile-rest": 2.48,
+        "write": 0.42,
+        "build-rest": 1.21,
+        "report": 0.09,
+        "link": 19.07
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 0.251,
+       "cargo_s": 0.395,
+       "mold_s": 0.361,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.77,
+        "roots": 0.22,
+        "check": 4.55,
+        "reach": 0.01,
+        "resolve": 5.49,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.21,
+        "write": 0.38,
+        "build-rest": 1.35,
+        "report": 0.1,
+        "link": 17.79
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.252,
+       "cargo_s": 0.382,
+       "mold_s": 0.37,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.82,
+        "read": 0.04,
+        "apply": 5.71,
+        "roots": 0.14,
+        "check": 4.79,
+        "reach": 0.01,
+        "resolve": 5.28,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.24,
+        "write": 0.41,
+        "build-rest": 1.23,
+        "report": 0.08,
+        "link": 17.75
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.274,
+       "cargo_s": 0.366,
+       "mold_s": 0.365,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 0.04,
+        "apply": 5.5,
+        "roots": 0.15,
+        "check": 5.11,
+        "reach": 0.01,
+        "resolve": 5.2,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.25,
+        "write": 0.39,
+        "build-rest": 1.2,
+        "report": 0.08,
+        "link": 17.82
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.248,
+       "cargo_s": 0.375,
+       "mold_s": 0.364,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.78,
+        "read": 0.04,
+        "apply": 5.37,
+        "roots": 0.15,
+        "check": 4.74,
+        "reach": 0.01,
+        "resolve": 5.31,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.22,
+        "write": 0.37,
+        "build-rest": 1.2,
+        "report": 0.1,
+        "link": 17.87
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.26,
+       "cargo_s": 0.366,
+       "mold_s": 0.36,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.24,
+        "read": 0.04,
+        "apply": 5.97,
+        "roots": 0.17,
+        "check": 5.24,
+        "reach": 0.01,
+        "resolve": 5.68,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.34,
+        "write": 0.43,
+        "build-rest": 1.26,
+        "report": 0.1,
+        "link": 19.54
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    }
+   },
+   "made": null,
+   "tag": "0.92.0",
+   "status": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 2947679, version 0.0.0-3fe3648-18dfaf3455c85642, exits after 1800s idle\n  worker: pid 3107079, /home/ubuntu/bench-work/r/cargo-cranelift-rustd/, log /home/ubuntu/bench-work/r/h638044/workers/938d48f08caee927407f0dc9f16f5213/log\n    /home/ubuntu/bench-work/r/cargo-cranelift-rustd: ready\n  worker: pid 3158751, /home/ubuntu/bench-work/r/cargo-cranelift-rustd/crates/cargo-util, log /home/ubuntu/bench-work/r/h638044/workers/e744ab440ec35a71cb84345a61b9301d/log\n    /home/ubuntu/bench-work/r/cargo-cranelift-rustd: ready\n    /home/ubuntu/bench-work/r/cargo-cranelift-rustd: ready\n/home/ubuntu/bench-work/r/cargo-cranelift-rustd (test, 5dbe20497b2d9952): 10 builds by the daemon, 0 by cargo\n/home/ubuntu/bench-work/r/cargo-cranelift-rustd (dev, 97e6cba94b882220): 65 builds by the daemon, 8 by cargo\n  8 x `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd/src/cargo/core/features.rs changed\n/home/ubuntu/bench-work/r/cargo-cranelift-rustd (test, f56275aca7236a10): 10 builds by the daemon, 0 by cargo\n",
+   "session": {
+    "cargo": {
+     "first_s": 45.752,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 5.13,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 5.68,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 6.726,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 7.116,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 7.919,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 5.212,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 6.046,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 7.67,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 7.065,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 8.063,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 5.16,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 5.687,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 6.813,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 7.152,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 7.962,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 5.098,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 5.58,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 6.659,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 7.038,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 7.861,
+       "built": "cargo"
+      }
+     ],
+     "edits_s": 131.637,
+     "total_s": 177.389,
+     "by_daemon": 0
+    },
+    "rustd 0.0": {
+     "first_s": 45.442,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 33.585,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 8.94,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 9.925,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 10.399,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 11.734,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (34ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_output_metadata.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 7.987,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 8.956,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 10.461,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 10.253,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 11.498,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (33ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_output_metadata.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 7.982,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 8.934,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 9.852,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 10.198,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 11.502,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (33ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_output_metadata.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 7.914,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 9.11,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 9.964,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (25ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 10.409,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 11.716,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (32ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-0.0/src/cargo/ops/cargo_output_metadata.rs changed"
+      }
+     ],
+     "edits_s": 221.319,
+     "total_s": 266.761,
+     "by_daemon": 0,
+     "wrong": null
+    },
+    "rustd ready": {
+     "first_s": 45.348,
+     "wait_s": 120.315,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 2.842,
+       "built": "daemon"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 2.62,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 2.548,
+       "built": "daemon"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 2.501,
+       "built": "daemon"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 126.124,
+       "built": "cargo: `cargo`: `for_git` is not compiled by rustd and rustc's copy is from before the edit, build with cargo: unsupported: callee `new`: callee `wrap`: unsupported: writable static `SOURCE_ID_CACHE` without a rustc symbol, and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/tree/mod.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 8.168,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 9.665,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 10.296,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 10.79,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.061,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (32ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/tree/mod.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 8.302,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 9.77,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (32ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 10.369,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 10.789,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.102,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (34ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/tree/mod.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 8.322,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/cargo_compile/mod.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 9.796,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/crates/cargo-util/src/paths.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 10.301,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/credential/cargo-credential/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 10.818,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/util/context/mod.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.346,
+       "built": "cargo: `cargo`: the daemon is still loading the workspace (36ms so far), and /home/ubuntu/bench-work/r/cargo-cranelift-rustd-session-ready/src/cargo/ops/tree/mod.rs changed"
+      }
+     ],
+     "edits_s": 290.53,
+     "total_s": 456.193,
+     "by_daemon": 4,
+     "wrong": null
+    }
+   }
+  },
+  "cargo/cranelift/plain": {
+   "phases": {
+    "cold": {
+     "rustd_s": 47.34,
+     "warm_s": 118.692,
+     "cargo_s": 46.362,
+     "mold_s": null,
+     "states": [
+      "ready"
+     ],
+     "rss_mb": 15118,
+     "fns": [
+      2664,
+      2664,
+      197367
+     ],
+     "steps_s": {
+      "load": 15.6,
+      "resolve": 6.4,
+      "compile": 94.2,
+      "emit": 0.243,
+      "link": 1.0
+     },
+     "built": "cargo: the daemon had not loaded the build yet",
+     "disk_mb": {
+      "target": 5456,
+      "target-ref": 2882
+     }
+    },
+    "no-op": {
+     "rustd": {
+      "median": 0.173,
+      "min": 0.168,
+      "max": 0.182,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.167,
+      "min": 0.166,
+      "max": 0.181,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "nothing to build": 5
+     },
+     "link": {
+      "None": 5
+     },
+     "compiled": {
+      "median": 0,
+      "min": 0,
+      "max": 0,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 0,
+      "min": 0,
+      "max": 0,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.016,
+      "min": 0.015,
+      "max": 0.018,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": [],
+     "back": null,
+     "samples": [
+      {
+       "rustd_s": 0.182,
+       "cargo_s": 0.181,
+       "mold_s": null,
+       "built": "nothing to build",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.017,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.181,
+       "cargo_s": 0.166,
+       "mold_s": null,
+       "built": "nothing to build",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.016,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.168,
+       "cargo_s": 0.167,
+       "mold_s": null,
+       "built": "nothing to build",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.015,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.173,
+       "cargo_s": 0.167,
+       "mold_s": null,
+       "built": "nothing to build",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.016,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.168,
+       "cargo_s": 0.169,
+       "mold_s": null,
+       "built": "nothing to build",
+       "link": null,
+       "compiled": 0,
+       "settle_s": 0.018,
+       "cargo_crates": 0,
+       "steps_ms": {},
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": []
+    },
+    "body": {
+     "rustd": {
+      "median": 4.896,
+      "min": 4.697,
+      "max": 5.089,
+      "n": 5
+     },
+     "cargo": {
+      "median": 5.214,
+      "min": 5.059,
+      "max": 5.38,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.015,
+      "max": 0.018,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 0.03,
+      "read": 12.67,
+      "apply": 10.27,
+      "roots": 1.5,
+      "check": 114.72,
+      "reach": 0.72,
+      "resolve": 55.4,
+      "define": 0.24,
+      "object": 6.63,
+      "discarded": 0.0,
+      "compile-rest": 94.6,
+      "write": 0.65,
+      "build-rest": 4.34,
+      "report": 0.08,
+      "link": 231.53
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 4.806,
+       "min": 4.72,
+       "max": 5.404,
+       "n": 5
+      },
+      "cargo": {
+       "median": 5.161,
+       "min": 5.082,
+       "max": 5.327,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 5.089,
+       "cargo_s": 5.085,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.03,
+        "read": 12.67,
+        "apply": 10.27,
+        "roots": 1.5,
+        "check": 114.72,
+        "reach": 0.72,
+        "resolve": 55.4,
+        "define": 0.24,
+        "object": 6.63,
+        "discarded": 0.0,
+        "compile-rest": 94.6,
+        "write": 0.65,
+        "build-rest": 4.34,
+        "report": 0.08,
+        "link": 231.53
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.896,
+       "cargo_s": 5.38,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 10.9,
+        "roots": 1.32,
+        "check": 102.96,
+        "reach": 1.12,
+        "resolve": 14.69,
+        "define": 0.26,
+        "object": 6.15,
+        "discarded": 0.0,
+        "compile-rest": 93.35,
+        "write": 0.65,
+        "build-rest": 4.25,
+        "report": 0.08,
+        "link": 289.93
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.697,
+       "cargo_s": 5.059,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 11.0,
+        "roots": 1.35,
+        "check": 91.97,
+        "reach": 0.6,
+        "resolve": 14.49,
+        "define": 0.24,
+        "object": 6.56,
+        "discarded": 0.0,
+        "compile-rest": 92.45,
+        "write": 0.6,
+        "build-rest": 4.39,
+        "report": 0.08,
+        "link": 299.82
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.795,
+       "cargo_s": 5.214,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 12.16,
+        "roots": 1.63,
+        "check": 104.77,
+        "reach": 1.48,
+        "resolve": 16.53,
+        "define": 0.26,
+        "object": 6.99,
+        "discarded": 0.0,
+        "compile-rest": 98.85,
+        "write": 0.69,
+        "build-rest": 4.96,
+        "report": 0.09,
+        "link": 310.63
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.031,
+       "cargo_s": 5.254,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 10.95,
+        "roots": 1.31,
+        "check": 95.35,
+        "reach": 0.69,
+        "resolve": 15.09,
+        "define": 0.24,
+        "object": 7.4,
+        "discarded": 0.0,
+        "compile-rest": 94.61,
+        "write": 0.64,
+        "build-rest": 4.48,
+        "report": 0.08,
+        "link": 281.64
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 4.72,
+       "cargo_s": 5.161,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.04,
+        "apply": 12.02,
+        "roots": 1.56,
+        "check": 102.91,
+        "reach": 0.05,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.92,
+        "discarded": 0.0,
+        "compile-rest": 11.42,
+        "write": 0.41,
+        "build-rest": 5.2,
+        "report": 0.08,
+        "link": 309.65
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.404,
+       "cargo_s": 5.117,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 11.5,
+        "roots": 1.41,
+        "check": 95.58,
+        "reach": 0.05,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.82,
+        "discarded": 0.0,
+        "compile-rest": 10.73,
+        "write": 70.06,
+        "build-rest": 4.49,
+        "report": 0.09,
+        "link": 283.75
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.805,
+       "cargo_s": 5.082,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 10.6,
+        "roots": 1.36,
+        "check": 93.27,
+        "reach": 0.04,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.7,
+        "discarded": 0.0,
+        "compile-rest": 9.83,
+        "write": 0.37,
+        "build-rest": 4.43,
+        "report": 0.07,
+        "link": 281.52
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.963,
+       "cargo_s": 5.272,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 10.85,
+        "roots": 1.37,
+        "check": 86.97,
+        "reach": 0.05,
+        "resolve": 0.06,
+        "define": 0.01,
+        "object": 1.71,
+        "discarded": 0.0,
+        "compile-rest": 10.58,
+        "write": 0.37,
+        "build-rest": 4.34,
+        "report": 0.07,
+        "link": 293.19
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 4.806,
+       "cargo_s": 5.327,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.02,
+        "read": 0.03,
+        "apply": 10.91,
+        "roots": 1.37,
+        "check": 94.43,
+        "reach": 0.04,
+        "resolve": 0.05,
+        "define": 0.01,
+        "object": 1.65,
+        "discarded": 0.0,
+        "compile-rest": 10.35,
+        "write": 0.4,
+        "build-rest": 4.28,
+        "report": 0.08,
+        "link": 283.91
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "leaf": {
+     "rustd": {
+      "median": 6.306,
+      "min": 5.504,
+      "max": 6.531,
+      "n": 5
+     },
+     "cargo": {
+      "median": 7.019,
+      "min": 6.303,
+      "max": 7.275,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.016,
+      "max": 0.02,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 4.51,
+      "read": 0.03,
+      "apply": 6.73,
+      "roots": 1.77,
+      "check": 53.53,
+      "reach": 1.45,
+      "resolve": 2.09,
+      "define": 0.37,
+      "object": 3.15,
+      "discarded": 0.0,
+      "compile-rest": 17.74,
+      "write": 0.52,
+      "build-rest": 4.43,
+      "report": 0.06,
+      "link": 322.49
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 6.341,
+       "min": 5.433,
+       "max": 6.732,
+       "n": 5
+      },
+      "cargo": {
+       "median": 6.375,
+       "min": 6.024,
+       "max": 6.736,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 6.306,
+       "cargo_s": 7.275,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.76,
+        "read": 2.6,
+        "apply": 12.11,
+        "roots": 1.43,
+        "check": 49.73,
+        "reach": 2.62,
+        "resolve": 1.93,
+        "define": 0.36,
+        "object": 2.95,
+        "discarded": 0.0,
+        "compile-rest": 16.13,
+        "write": 0.5,
+        "build-rest": 4.32,
+        "report": 0.09,
+        "link": 295.5
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.504,
+       "cargo_s": 6.407,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.84,
+        "read": 0.03,
+        "apply": 5.8,
+        "roots": 1.38,
+        "check": 45.29,
+        "reach": 0.79,
+        "resolve": 1.93,
+        "define": 0.34,
+        "object": 2.65,
+        "discarded": 0.0,
+        "compile-rest": 15.08,
+        "write": 0.46,
+        "build-rest": 4.47,
+        "report": 0.08,
+        "link": 295.72
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.697,
+       "cargo_s": 7.253,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.32,
+        "read": 0.03,
+        "apply": 5.73,
+        "roots": 2.18,
+        "check": 58.01,
+        "reach": 0.74,
+        "resolve": 2.14,
+        "define": 0.35,
+        "object": 3.33,
+        "discarded": 0.0,
+        "compile-rest": 19.21,
+        "write": 0.52,
+        "build-rest": 5.0,
+        "report": 0.09,
+        "link": 299.98
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.531,
+       "cargo_s": 6.303,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.51,
+        "read": 0.03,
+        "apply": 6.73,
+        "roots": 1.77,
+        "check": 53.53,
+        "reach": 1.45,
+        "resolve": 2.09,
+        "define": 0.37,
+        "object": 3.15,
+        "discarded": 0.0,
+        "compile-rest": 17.74,
+        "write": 0.52,
+        "build-rest": 4.43,
+        "report": 0.06,
+        "link": 322.49
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.38,
+       "cargo_s": 7.019,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.02,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.96,
+        "read": 0.03,
+        "apply": 5.64,
+        "roots": 1.44,
+        "check": 51.89,
+        "reach": 0.79,
+        "resolve": 1.97,
+        "define": 0.35,
+        "object": 2.95,
+        "discarded": 0.0,
+        "compile-rest": 16.33,
+        "write": 0.52,
+        "build-rest": 4.42,
+        "report": 0.08,
+        "link": 361.74
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 5.433,
+       "cargo_s": 6.024,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 6.17,
+        "roots": 1.37,
+        "check": 47.71,
+        "reach": 0.05,
+        "resolve": 0.14,
+        "define": 0.01,
+        "object": 1.82,
+        "discarded": 0.0,
+        "compile-rest": 11.12,
+        "write": 0.36,
+        "build-rest": 4.36,
+        "report": 0.08,
+        "link": 288.1
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.341,
+       "cargo_s": 6.382,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 0.03,
+        "apply": 5.42,
+        "roots": 2.85,
+        "check": 51.39,
+        "reach": 0.05,
+        "resolve": 0.13,
+        "define": 0.01,
+        "object": 1.95,
+        "discarded": 0.0,
+        "compile-rest": 12.97,
+        "write": 0.34,
+        "build-rest": 4.84,
+        "report": 0.08,
+        "link": 352.67
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.489,
+       "cargo_s": 6.736,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 6.17,
+        "read": 0.03,
+        "apply": 6.81,
+        "roots": 2.3,
+        "check": 79.94,
+        "reach": 0.05,
+        "resolve": 0.14,
+        "define": 0.01,
+        "object": 1.74,
+        "discarded": 0.0,
+        "compile-rest": 11.7,
+        "write": 0.36,
+        "build-rest": 7.11,
+        "report": 0.08,
+        "link": 332.29
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.732,
+       "cargo_s": 6.375,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.95,
+        "read": 0.04,
+        "apply": 5.83,
+        "roots": 1.52,
+        "check": 56.06,
+        "reach": 0.14,
+        "resolve": 0.13,
+        "define": 0.01,
+        "object": 1.66,
+        "discarded": 0.0,
+        "compile-rest": 14.74,
+        "write": 0.34,
+        "build-rest": 4.66,
+        "report": 0.08,
+        "link": 344.86
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.206,
+       "cargo_s": 6.28,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.92,
+        "read": 0.03,
+        "apply": 6.28,
+        "roots": 2.48,
+        "check": 61.3,
+        "reach": 0.05,
+        "resolve": 0.14,
+        "define": 0.01,
+        "object": 2.22,
+        "discarded": 0.0,
+        "compile-rest": 14.11,
+        "write": 1.94,
+        "build-rest": 7.03,
+        "report": 0.09,
+        "link": 345.74
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "scatter3": {
+     "rustd": {
+      "median": 7.591,
+      "min": 7.442,
+      "max": 7.803,
+      "n": 5
+     },
+     "cargo": {
+      "median": 8.036,
+      "min": 7.9,
+      "max": 8.306,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 4,
+      "min": 4,
+      "max": 4,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.017,
+      "max": 0.025,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 4.13,
+      "read": 2.75,
+      "apply": 6.81,
+      "roots": 1.38,
+      "check": 48.17,
+      "reach": 0.59,
+      "resolve": 0.77,
+      "define": 0.16,
+      "object": 2.45,
+      "discarded": 0.0,
+      "compile-rest": 15.11,
+      "write": 0.44,
+      "build-rest": 55.55,
+      "report": 0.08,
+      "link": 304.92
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 7.471,
+       "min": 7.21,
+       "max": 7.639,
+       "n": 5
+      },
+      "cargo": {
+       "median": 8.118,
+       "min": 7.947,
+       "max": 8.353,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 7.803,
+       "cargo_s": 7.9,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.017,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.13,
+        "read": 2.75,
+        "apply": 6.81,
+        "roots": 1.38,
+        "check": 48.17,
+        "reach": 0.59,
+        "resolve": 0.77,
+        "define": 0.16,
+        "object": 2.45,
+        "discarded": 0.0,
+        "compile-rest": 15.11,
+        "write": 0.44,
+        "build-rest": 55.55,
+        "report": 0.08,
+        "link": 304.92
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.619,
+       "cargo_s": 8.238,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.025,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.87,
+        "read": 0.05,
+        "apply": 8.51,
+        "roots": 1.71,
+        "check": 53.31,
+        "reach": 0.6,
+        "resolve": 0.96,
+        "define": 0.18,
+        "object": 3.07,
+        "discarded": 0.0,
+        "compile-rest": 22.88,
+        "write": 0.48,
+        "build-rest": 5.21,
+        "report": 0.1,
+        "link": 319.0
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.442,
+       "cargo_s": 8.306,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.017,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.18,
+        "read": 0.05,
+        "apply": 6.62,
+        "roots": 1.43,
+        "check": 47.26,
+        "reach": 0.51,
+        "resolve": 0.83,
+        "define": 0.16,
+        "object": 2.52,
+        "discarded": 0.0,
+        "compile-rest": 15.62,
+        "write": 0.43,
+        "build-rest": 4.81,
+        "report": 0.06,
+        "link": 299.19
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.553,
+       "cargo_s": 7.903,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.017,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.01,
+        "read": 0.05,
+        "apply": 6.28,
+        "roots": 1.38,
+        "check": 46.53,
+        "reach": 0.45,
+        "resolve": 0.78,
+        "define": 0.17,
+        "object": 2.53,
+        "discarded": 0.0,
+        "compile-rest": 15.36,
+        "write": 0.41,
+        "build-rest": 4.43,
+        "report": 0.08,
+        "link": 358.45
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.591,
+       "cargo_s": 8.036,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.021,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 5.24,
+        "read": 0.05,
+        "apply": 11.83,
+        "roots": 1.76,
+        "check": 59.66,
+        "reach": 0.66,
+        "resolve": 0.88,
+        "define": 0.17,
+        "object": 2.65,
+        "discarded": 0.0,
+        "compile-rest": 16.58,
+        "write": 0.49,
+        "build-rest": 6.68,
+        "report": 0.1,
+        "link": 323.83
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 7.308,
+       "cargo_s": 7.947,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.016,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.07,
+        "read": 0.05,
+        "apply": 7.51,
+        "roots": 1.36,
+        "check": 49.26,
+        "reach": 0.05,
+        "resolve": 0.12,
+        "define": 0.02,
+        "object": 1.74,
+        "discarded": 0.0,
+        "compile-rest": 11.05,
+        "write": 0.45,
+        "build-rest": 4.56,
+        "report": 0.09,
+        "link": 284.67
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.21,
+       "cargo_s": 8.3,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.018,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.13,
+        "read": 0.05,
+        "apply": 6.61,
+        "roots": 1.51,
+        "check": 46.24,
+        "reach": 0.05,
+        "resolve": 0.12,
+        "define": 0.02,
+        "object": 2.32,
+        "discarded": 0.0,
+        "compile-rest": 14.46,
+        "write": 0.49,
+        "build-rest": 4.58,
+        "report": 0.18,
+        "link": 356.9
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.639,
+       "cargo_s": 8.118,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.018,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 4.79,
+        "read": 0.05,
+        "apply": 7.8,
+        "roots": 1.96,
+        "check": 57.73,
+        "reach": 0.05,
+        "resolve": 0.13,
+        "define": 0.02,
+        "object": 1.87,
+        "discarded": 0.0,
+        "compile-rest": 11.81,
+        "write": 0.36,
+        "build-rest": 5.94,
+        "report": 0.09,
+        "link": 326.69
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.471,
+       "cargo_s": 8.353,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.019,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 3.97,
+        "read": 0.05,
+        "apply": 6.31,
+        "roots": 1.37,
+        "check": 48.08,
+        "reach": 0.05,
+        "resolve": 0.13,
+        "define": 0.02,
+        "object": 1.78,
+        "discarded": 0.0,
+        "compile-rest": 11.27,
+        "write": 0.39,
+        "build-rest": 4.4,
+        "report": 0.08,
+        "link": 310.02
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.542,
+       "cargo_s": 8.049,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 2,
+       "settle_s": 0.017,
+       "cargo_crates": 4,
+       "steps_ms": {
+        "settle": 3.97,
+        "read": 0.05,
+        "apply": 12.99,
+        "roots": 1.35,
+        "check": 49.59,
+        "reach": 0.05,
+        "resolve": 0.13,
+        "define": 0.02,
+        "object": 1.69,
+        "discarded": 0.0,
+        "compile-rest": 11.31,
+        "write": 0.36,
+        "build-rest": 4.42,
+        "report": 0.07,
+        "link": 344.09
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 3,
+     "files": 3
+    },
+    "scatter10": {
+     "skipped": "the workspace has no such edit"
+    },
+    "scatter30": {
+     "skipped": "the workspace has no such edit"
+    },
+    "generic": {
+     "rustd": {
+      "median": 7.791,
+      "min": 6.885,
+      "max": 9.858,
+      "n": 5
+     },
+     "cargo": {
+      "median": 8.037,
+      "min": 7.427,
+      "max": 8.573,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 64,
+      "min": 64,
+      "max": 93,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.018,
+      "min": 0.016,
+      "max": 0.019,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 0.21,
+      "read": 0.05,
+      "apply": 19.77,
+      "roots": 1.32,
+      "check": 116.75,
+      "reach": 1.52,
+      "resolve": 19.55,
+      "define": 2.79,
+      "object": 5.98,
+      "discarded": 0.0,
+      "compile-rest": 48.84,
+      "write": 1.39,
+      "build-rest": 4.24,
+      "report": 0.08,
+      "link": 353.68
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 7.155,
+       "min": 6.839,
+       "max": 7.879,
+       "n": 5
+      },
+      "cargo": {
+       "median": 7.808,
+       "min": 7.255,
+       "max": 8.487,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 7.828,
+       "cargo_s": 8.347,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 93,
+       "settle_s": 0.019,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.2,
+        "read": 3.82,
+        "apply": 20.83,
+        "roots": 1.39,
+        "check": 187.89,
+        "reach": 1.6,
+        "resolve": 37.52,
+        "define": 2.02,
+        "object": 5.95,
+        "discarded": 0.0,
+        "compile-rest": 45.5,
+        "write": 1.47,
+        "build-rest": 4.34,
+        "report": 0.08,
+        "link": 322.01
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.791,
+       "cargo_s": 7.849,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.22,
+        "read": 0.06,
+        "apply": 22.55,
+        "roots": 1.7,
+        "check": 139.92,
+        "reach": 1.54,
+        "resolve": 21.52,
+        "define": 2.61,
+        "object": 5.51,
+        "discarded": 0.0,
+        "compile-rest": 47.82,
+        "write": 1.48,
+        "build-rest": 5.76,
+        "report": 0.08,
+        "link": 368.63
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.885,
+       "cargo_s": 8.037,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.2,
+        "read": 0.06,
+        "apply": 20.09,
+        "roots": 1.44,
+        "check": 127.54,
+        "reach": 1.68,
+        "resolve": 19.59,
+        "define": 3.4,
+        "object": 6.4,
+        "discarded": 0.0,
+        "compile-rest": 47.37,
+        "write": 1.42,
+        "build-rest": 4.32,
+        "report": 0.09,
+        "link": 320.83
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.375,
+       "cargo_s": 8.573,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.23,
+        "read": 0.06,
+        "apply": 23.01,
+        "roots": 1.64,
+        "check": 125.93,
+        "reach": 1.27,
+        "resolve": 22.15,
+        "define": 3.52,
+        "object": 10.1,
+        "discarded": 0.0,
+        "compile-rest": 69.8,
+        "write": 1.74,
+        "build-rest": 4.9,
+        "report": 0.09,
+        "link": 352.48
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 9.858,
+       "cargo_s": 7.427,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.05,
+        "apply": 19.77,
+        "roots": 1.32,
+        "check": 116.75,
+        "reach": 1.52,
+        "resolve": 19.55,
+        "define": 2.79,
+        "object": 5.98,
+        "discarded": 0.0,
+        "compile-rest": 48.84,
+        "write": 1.39,
+        "build-rest": 4.24,
+        "report": 0.08,
+        "link": 353.68
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 7.879,
+       "cargo_s": 8.487,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.22,
+        "read": 0.06,
+        "apply": 22.76,
+        "roots": 1.4,
+        "check": 115.5,
+        "reach": 0.64,
+        "resolve": 0.6,
+        "define": 0.18,
+        "object": 2.38,
+        "discarded": 0.0,
+        "compile-rest": 22.02,
+        "write": 1.05,
+        "build-rest": 4.3,
+        "report": 0.09,
+        "link": 302.1
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.155,
+       "cargo_s": 8.15,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.021,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.23,
+        "read": 0.06,
+        "apply": 41.01,
+        "roots": 1.65,
+        "check": 118.8,
+        "reach": 0.67,
+        "resolve": 0.64,
+        "define": 0.2,
+        "object": 2.38,
+        "discarded": 0.0,
+        "compile-rest": 23.11,
+        "write": 0.72,
+        "build-rest": 5.69,
+        "report": 0.09,
+        "link": 370.12
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.707,
+       "cargo_s": 7.808,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.21,
+        "read": 0.06,
+        "apply": 22.15,
+        "roots": 1.38,
+        "check": 199.34,
+        "reach": 0.57,
+        "resolve": 0.61,
+        "define": 0.18,
+        "object": 2.75,
+        "discarded": 0.0,
+        "compile-rest": 23.12,
+        "write": 0.73,
+        "build-rest": 4.32,
+        "report": 0.08,
+        "link": 274.6
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.839,
+       "cargo_s": 7.652,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.2,
+        "read": 0.06,
+        "apply": 20.55,
+        "roots": 1.34,
+        "check": 111.67,
+        "reach": 0.81,
+        "resolve": 0.59,
+        "define": 0.18,
+        "object": 2.58,
+        "discarded": 0.0,
+        "compile-rest": 22.28,
+        "write": 0.62,
+        "build-rest": 4.24,
+        "report": 0.08,
+        "link": 273.26
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.908,
+       "cargo_s": 7.255,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 64,
+       "settle_s": 0.019,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 0.23,
+        "read": 0.06,
+        "apply": 23.45,
+        "roots": 1.61,
+        "check": 121.12,
+        "reach": 0.65,
+        "resolve": 0.62,
+        "define": 0.2,
+        "object": 2.62,
+        "discarded": 0.0,
+        "compile-rest": 23.34,
+        "write": 0.65,
+        "build-rest": 5.61,
+        "report": 0.08,
+        "link": 310.48
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "new_fn": {
+     "rustd": {
+      "median": 5.948,
+      "min": 5.703,
+      "max": 7.06,
+      "n": 5
+     },
+     "cargo": {
+      "median": 6.014,
+      "min": 5.916,
+      "max": 9.775,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 823,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.018,
+      "min": 0.016,
+      "max": 0.02,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 3.9,
+      "read": 1.39,
+      "apply": 6.16,
+      "roots": 50.27,
+      "check": 439.92,
+      "reach": 1.19,
+      "resolve": 3.1,
+      "define": 0.52,
+      "object": 3.79,
+      "discarded": 0.0,
+      "compile-rest": 34.68,
+      "write": 0.69,
+      "build-rest": 4.11,
+      "report": 0.09,
+      "link": 301.39
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 5.767,
+       "min": 5.59,
+       "max": 7.249,
+       "n": 5
+      },
+      "cargo": {
+       "median": 6.311,
+       "min": 5.959,
+       "max": 6.726,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 6.797,
+       "cargo_s": 5.965,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 823,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.46,
+        "read": 0.04,
+        "apply": 12.19,
+        "roots": 41.49,
+        "check": 1316.75,
+        "reach": 2.19,
+        "resolve": 3.65,
+        "define": 0.53,
+        "object": 3.96,
+        "discarded": 0.0,
+        "compile-rest": 41.61,
+        "write": 0.62,
+        "build-rest": 4.82,
+        "report": 0.06,
+        "link": 281.69
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.703,
+       "cargo_s": 6.014,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.02,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.13,
+        "read": 1.06,
+        "apply": 7.21,
+        "roots": 36.32,
+        "check": 259.16,
+        "reach": 1.53,
+        "resolve": 2.84,
+        "define": 0.48,
+        "object": 3.32,
+        "discarded": 0.0,
+        "compile-rest": 32.1,
+        "write": 0.6,
+        "build-rest": 4.12,
+        "report": 0.08,
+        "link": 288.83
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.948,
+       "cargo_s": 5.916,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.81,
+        "read": 1.06,
+        "apply": 6.08,
+        "roots": 33.12,
+        "check": 235.89,
+        "reach": 1.21,
+        "resolve": 2.82,
+        "define": 0.48,
+        "object": 3.34,
+        "discarded": 0.0,
+        "compile-rest": 37.83,
+        "write": 0.61,
+        "build-rest": 4.15,
+        "report": 0.08,
+        "link": 280.43
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.836,
+       "cargo_s": 6.202,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.1,
+        "read": 1.22,
+        "apply": 7.02,
+        "roots": 42.87,
+        "check": 392.11,
+        "reach": 1.46,
+        "resolve": 2.87,
+        "define": 0.49,
+        "object": 3.57,
+        "discarded": 0.0,
+        "compile-rest": 32.77,
+        "write": 0.58,
+        "build-rest": 4.6,
+        "report": 0.08,
+        "link": 273.0
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.06,
+       "cargo_s": 9.775,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.9,
+        "read": 1.39,
+        "apply": 6.16,
+        "roots": 50.27,
+        "check": 439.92,
+        "reach": 1.19,
+        "resolve": 3.1,
+        "define": 0.52,
+        "object": 3.79,
+        "discarded": 0.0,
+        "compile-rest": 34.68,
+        "write": 0.69,
+        "build-rest": 4.11,
+        "report": 0.09,
+        "link": 301.39
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 5.59,
+       "cargo_s": 5.959,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 1.1,
+        "apply": 17.95,
+        "roots": 35.89,
+        "check": 277.2,
+        "reach": 0.69,
+        "resolve": 0.66,
+        "define": 0.22,
+        "object": 2.76,
+        "discarded": 0.0,
+        "compile-rest": 27.93,
+        "write": 1.74,
+        "build-rest": 4.25,
+        "report": 0.09,
+        "link": 284.02
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.751,
+       "cargo_s": 6.004,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.9,
+        "read": 1.06,
+        "apply": 6.05,
+        "roots": 37.91,
+        "check": 274.81,
+        "reach": 0.9,
+        "resolve": 0.63,
+        "define": 0.2,
+        "object": 2.92,
+        "discarded": 0.0,
+        "compile-rest": 45.19,
+        "write": 0.5,
+        "build-rest": 4.16,
+        "report": 0.07,
+        "link": 288.96
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 5.767,
+       "cargo_s": 6.311,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 4.39,
+        "read": 1.15,
+        "apply": 7.0,
+        "roots": 36.06,
+        "check": 299.7,
+        "reach": 0.72,
+        "resolve": 0.65,
+        "define": 0.21,
+        "object": 2.57,
+        "discarded": 0.0,
+        "compile-rest": 32.26,
+        "write": 0.52,
+        "build-rest": 4.88,
+        "report": 0.08,
+        "link": 312.6
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.148,
+       "cargo_s": 6.726,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.035,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.94,
+        "read": 1.12,
+        "apply": 6.95,
+        "roots": 37.89,
+        "check": 384.93,
+        "reach": 0.98,
+        "resolve": 0.75,
+        "define": 0.23,
+        "object": 5.68,
+        "discarded": 0.0,
+        "compile-rest": 62.13,
+        "write": 0.48,
+        "build-rest": 4.95,
+        "report": 3.14,
+        "link": 587.37
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.249,
+       "cargo_s": 6.622,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.95,
+        "read": 2.45,
+        "apply": 6.08,
+        "roots": 41.65,
+        "check": 386.12,
+        "reach": 0.67,
+        "resolve": 0.63,
+        "define": 0.21,
+        "object": 2.49,
+        "discarded": 0.0,
+        "compile-rest": 26.64,
+        "write": 0.48,
+        "build-rest": 4.24,
+        "report": 0.08,
+        "link": 283.03
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 2,
+     "files": 1
+    },
+    "new_type": {
+     "rustd": {
+      "median": 7.039,
+      "min": 6.506,
+      "max": 11.705,
+      "n": 5
+     },
+     "cargo": {
+      "median": 7.142,
+      "min": 6.972,
+      "max": 8.94,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 49,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.016,
+      "max": 0.019,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 15118,
+     "steps_ms": {
+      "settle": 7.53,
+      "read": 6.64,
+      "apply": 11.3,
+      "roots": 74.79,
+      "check": 653.29,
+      "reach": 16.18,
+      "resolve": 19.04,
+      "define": 0.71,
+      "object": 7.57,
+      "discarded": 0.0,
+      "compile-rest": 72.11,
+      "write": 0.72,
+      "build-rest": 7.16,
+      "report": 0.1,
+      "link": 619.84
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 7.256,
+       "min": 6.459,
+       "max": 11.193,
+       "n": 5
+      },
+      "cargo": {
+       "median": 9.332,
+       "min": 6.986,
+       "max": 12.267,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 7.039,
+       "cargo_s": 7.142,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 49,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 6.96,
+        "read": 3.01,
+        "apply": 11.51,
+        "roots": 38.61,
+        "check": 417.21,
+        "reach": 7.85,
+        "resolve": 60.24,
+        "define": 0.6,
+        "object": 4.36,
+        "discarded": 0.0,
+        "compile-rest": 37.0,
+        "write": 0.61,
+        "build-rest": 4.14,
+        "report": 0.06,
+        "link": 276.18
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 7.428,
+       "cargo_s": 7.041,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 7.08,
+        "read": 1.46,
+        "apply": 6.33,
+        "roots": 51.0,
+        "check": 706.5,
+        "reach": 33.09,
+        "resolve": 16.96,
+        "define": 5.05,
+        "object": 8.46,
+        "discarded": 0.0,
+        "compile-rest": 67.11,
+        "write": 2.65,
+        "build-rest": 4.19,
+        "report": 0.12,
+        "link": 357.65
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.805,
+       "cargo_s": 6.972,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 6.97,
+        "read": 1.21,
+        "apply": 6.25,
+        "roots": 50.69,
+        "check": 407.55,
+        "reach": 10.97,
+        "resolve": 13.72,
+        "define": 6.69,
+        "object": 7.54,
+        "discarded": 0.0,
+        "compile-rest": 62.87,
+        "write": 0.76,
+        "build-rest": 4.16,
+        "report": 0.08,
+        "link": 586.95
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 11.705,
+       "cargo_s": 8.194,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.019,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 7.53,
+        "read": 6.64,
+        "apply": 11.3,
+        "roots": 74.79,
+        "check": 653.29,
+        "reach": 16.18,
+        "resolve": 19.04,
+        "define": 0.71,
+        "object": 7.57,
+        "discarded": 0.0,
+        "compile-rest": 72.11,
+        "write": 0.72,
+        "build-rest": 7.16,
+        "report": 0.1,
+        "link": 619.84
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.506,
+       "cargo_s": 8.94,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.94,
+        "read": 1.4,
+        "apply": 6.79,
+        "roots": 36.92,
+        "check": 415.41,
+        "reach": 3.11,
+        "resolve": 7.28,
+        "define": 0.59,
+        "object": 3.69,
+        "discarded": 0.0,
+        "compile-rest": 33.58,
+        "write": 0.63,
+        "build-rest": 4.27,
+        "report": 0.08,
+        "link": 283.37
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 7.256,
+       "cargo_s": 9.332,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.021,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 7.0,
+        "read": 5.7,
+        "apply": 6.19,
+        "roots": 72.48,
+        "check": 450.73,
+        "reach": 0.67,
+        "resolve": 0.62,
+        "define": 0.2,
+        "object": 2.55,
+        "discarded": 0.0,
+        "compile-rest": 26.91,
+        "write": 0.48,
+        "build-rest": 4.14,
+        "report": 0.08,
+        "link": 292.43
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 11.193,
+       "cargo_s": 7.039,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 8.27,
+        "read": 4.49,
+        "apply": 12.94,
+        "roots": 51.14,
+        "check": 438.24,
+        "reach": 1.63,
+        "resolve": 0.6,
+        "define": 0.2,
+        "object": 2.29,
+        "discarded": 0.0,
+        "compile-rest": 26.88,
+        "write": 0.48,
+        "build-rest": 4.14,
+        "report": 0.08,
+        "link": 281.43
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 10.969,
+       "cargo_s": 12.206,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.022,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 1.11,
+        "apply": 6.57,
+        "roots": 42.05,
+        "check": 426.69,
+        "reach": 0.7,
+        "resolve": 0.67,
+        "define": 0.21,
+        "object": 2.64,
+        "discarded": 0.0,
+        "compile-rest": 35.23,
+        "write": 0.52,
+        "build-rest": 7.37,
+        "report": 0.08,
+        "link": 287.2
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.459,
+       "cargo_s": 6.986,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.015,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 1.26,
+        "apply": 6.34,
+        "roots": 37.63,
+        "check": 322.05,
+        "reach": 1.03,
+        "resolve": 0.61,
+        "define": 0.21,
+        "object": 2.33,
+        "discarded": 0.0,
+        "compile-rest": 26.59,
+        "write": 0.46,
+        "build-rest": 4.13,
+        "report": 0.06,
+        "link": 259.41
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 6.591,
+       "cargo_s": 12.267,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 2,
+       "steps_ms": {
+        "settle": 3.83,
+        "read": 1.15,
+        "apply": 6.13,
+        "roots": 34.18,
+        "check": 383.1,
+        "reach": 0.77,
+        "resolve": 0.67,
+        "define": 0.21,
+        "object": 2.68,
+        "discarded": 0.0,
+        "compile-rest": 63.1,
+        "write": 0.51,
+        "build-rest": 13.31,
+        "report": 0.08,
+        "link": 279.77
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 2,
+     "files": 1
+    },
+    "test_leaf first": {
+     "rustd_s": 3.579,
+     "cargo_s": 3.692,
+     "mold_s": null,
+     "built": "cargo: the daemon had not loaded the build yet",
+     "link": null,
+     "compiled": 0,
+     "settle_s": 19.325,
+     "cargo_crates": 20,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": null,
+     "reload_s": 0.009,
+     "warm_s": 0.04
+    },
+    "test_leaf": {
+     "rustd": {
+      "median": 0.599,
+      "min": 0.568,
+      "max": 0.733,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.693,
+      "min": 0.642,
+      "max": 0.933,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.019,
+      "min": 0.017,
+      "max": 0.031,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 18221,
+     "steps_ms": {
+      "settle": 7.15,
+      "read": 0.03,
+      "apply": 9.18,
+      "roots": 0.16,
+      "check": 6.01,
+      "reach": 0.39,
+      "resolve": 11.86,
+      "define": 0.07,
+      "object": 0.33,
+      "discarded": 0.0,
+      "compile-rest": 2.46,
+      "write": 0.42,
+      "build-rest": 1.2,
+      "report": 0.08,
+      "link": 19.37
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 0.575,
+       "min": 0.553,
+       "max": 0.725,
+       "n": 5
+      },
+      "cargo": {
+       "median": 0.692,
+       "min": 0.66,
+       "max": 0.822,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 0.599,
+       "cargo_s": 0.693,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.019,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 8.75,
+        "read": 1.11,
+        "apply": 7.73,
+        "roots": 0.16,
+        "check": 24.89,
+        "reach": 0.82,
+        "resolve": 5.75,
+        "define": 0.07,
+        "object": 0.42,
+        "discarded": 0.0,
+        "compile-rest": 2.56,
+        "write": 0.41,
+        "build-rest": 1.17,
+        "report": 0.09,
+        "link": 16.51
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.584,
+       "cargo_s": 0.933,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.028,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.2,
+        "read": 0.03,
+        "apply": 11.21,
+        "roots": 0.16,
+        "check": 6.95,
+        "reach": 0.88,
+        "resolve": 5.6,
+        "define": 0.07,
+        "object": 0.33,
+        "discarded": 0.0,
+        "compile-rest": 2.49,
+        "write": 0.39,
+        "build-rest": 1.22,
+        "report": 0.08,
+        "link": 18.34
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.733,
+       "cargo_s": 0.643,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.15,
+        "read": 0.03,
+        "apply": 9.18,
+        "roots": 0.16,
+        "check": 6.01,
+        "reach": 0.39,
+        "resolve": 11.86,
+        "define": 0.07,
+        "object": 0.33,
+        "discarded": 0.0,
+        "compile-rest": 2.46,
+        "write": 0.42,
+        "build-rest": 1.2,
+        "report": 0.08,
+        "link": 19.37
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.616,
+       "cargo_s": 0.705,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.031,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.52,
+        "read": 0.03,
+        "apply": 15.23,
+        "roots": 0.19,
+        "check": 10.89,
+        "reach": 0.39,
+        "resolve": 6.14,
+        "define": 0.07,
+        "object": 0.4,
+        "discarded": 0.0,
+        "compile-rest": 2.8,
+        "write": 0.45,
+        "build-rest": 1.35,
+        "report": 0.11,
+        "link": 20.27
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.568,
+       "cargo_s": 0.642,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 10.07,
+        "read": 0.03,
+        "apply": 10.75,
+        "roots": 0.17,
+        "check": 6.08,
+        "reach": 0.37,
+        "resolve": 5.77,
+        "define": 0.07,
+        "object": 0.33,
+        "discarded": 0.0,
+        "compile-rest": 2.49,
+        "write": 0.42,
+        "build-rest": 1.21,
+        "report": 0.08,
+        "link": 19.39
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 0.553,
+       "cargo_s": 0.822,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.38,
+        "read": 0.04,
+        "apply": 12.82,
+        "roots": 0.17,
+        "check": 4.71,
+        "reach": 0.01,
+        "resolve": 5.12,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.3,
+        "write": 0.37,
+        "build-rest": 1.22,
+        "report": 0.09,
+        "link": 18.16
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.578,
+       "cargo_s": 0.692,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.21,
+        "read": 0.03,
+        "apply": 11.45,
+        "roots": 0.17,
+        "check": 4.71,
+        "reach": 0.01,
+        "resolve": 5.05,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.33,
+        "write": 0.38,
+        "build-rest": 1.3,
+        "report": 0.08,
+        "link": 18.43
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.725,
+       "cargo_s": 0.66,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 5.15,
+        "read": 0.04,
+        "apply": 10.01,
+        "roots": 0.16,
+        "check": 6.42,
+        "reach": 0.01,
+        "resolve": 10.02,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.37,
+        "write": 3.44,
+        "build-rest": 1.22,
+        "report": 0.12,
+        "link": 29.13
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.575,
+       "cargo_s": 0.723,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.03,
+        "read": 2.42,
+        "apply": 9.02,
+        "roots": 0.17,
+        "check": 4.77,
+        "reach": 0.01,
+        "resolve": 5.05,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.35,
+        "write": 0.36,
+        "build-rest": 1.33,
+        "report": 0.1,
+        "link": 18.09
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.568,
+       "cargo_s": 0.672,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 9.99,
+        "read": 0.03,
+        "apply": 144.26,
+        "roots": 0.18,
+        "check": 4.77,
+        "reach": 0.01,
+        "resolve": 5.18,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.32,
+        "write": 0.35,
+        "build-rest": 1.26,
+        "report": 0.08,
+        "link": 18.18
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    },
+    "test_leaf_lib first": {
+     "rustd_s": 0.113,
+     "cargo_s": 0.264,
+     "mold_s": null,
+     "built": "nothing to build",
+     "link": null,
+     "compiled": 0,
+     "settle_s": 0.032,
+     "cargo_crates": 0,
+     "steps_ms": {},
+     "started_over": [],
+     "wrong": null,
+     "warm_s": 0.05
+    },
+    "test_leaf_lib": {
+     "rustd": {
+      "median": 0.379,
+      "min": 0.261,
+      "max": 0.451,
+      "n": 5
+     },
+     "cargo": {
+      "median": 0.457,
+      "min": 0.38,
+      "max": 0.636,
+      "n": 5
+     },
+     "mold": null,
+     "built": {
+      "daemon": 5
+     },
+     "link": {
+      "spliced": 5
+     },
+     "compiled": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "cargo_crates": {
+      "median": 1,
+      "min": 1,
+      "max": 1,
+      "n": 5
+     },
+     "settle": {
+      "median": 0.017,
+      "min": 0.016,
+      "max": 0.024,
+      "n": 5
+     },
+     "reload": null,
+     "rss_mb": 18221,
+     "steps_ms": {
+      "settle": 8.69,
+      "read": 0.03,
+      "apply": 10.4,
+      "roots": 0.16,
+      "check": 9.2,
+      "reach": 9.54,
+      "resolve": 27.62,
+      "define": 0.07,
+      "object": 0.36,
+      "discarded": 0.0,
+      "compile-rest": 3.07,
+      "write": 0.43,
+      "build-rest": 1.23,
+      "report": 0.08,
+      "link": 41.24
+     },
+     "started_over": [],
+     "wrong": [],
+     "back": {
+      "rustd": {
+       "median": 0.271,
+       "min": 0.246,
+       "max": 0.403,
+       "n": 5
+      },
+      "cargo": {
+       "median": 0.416,
+       "min": 0.4,
+       "max": 0.526,
+       "n": 5
+      },
+      "mold": null,
+      "built": {
+       "daemon": 5
+      },
+      "link": {
+       "spliced": 5
+      }
+     },
+     "samples": [
+      {
+       "rustd_s": 0.431,
+       "cargo_s": 0.38,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 4.23,
+        "read": 0.04,
+        "apply": 5.99,
+        "roots": 0.3,
+        "check": 6.49,
+        "reach": 0.44,
+        "resolve": 6.01,
+        "define": 0.07,
+        "object": 0.36,
+        "discarded": 0.0,
+        "compile-rest": 2.58,
+        "write": 0.48,
+        "build-rest": 1.52,
+        "report": 0.1,
+        "link": 20.36
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.379,
+       "cargo_s": 0.524,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.024,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.88,
+        "read": 0.04,
+        "apply": 7.89,
+        "roots": 0.17,
+        "check": 5.94,
+        "reach": 0.28,
+        "resolve": 5.65,
+        "define": 0.08,
+        "object": 0.36,
+        "discarded": 0.0,
+        "compile-rest": 2.48,
+        "write": 0.41,
+        "build-rest": 1.23,
+        "report": 2.1,
+        "link": 34.22
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.261,
+       "cargo_s": 0.457,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.54,
+        "read": 0.03,
+        "apply": 11.66,
+        "roots": 0.16,
+        "check": 10.96,
+        "reach": 0.61,
+        "resolve": 29.3,
+        "define": 0.09,
+        "object": 0.38,
+        "discarded": 0.0,
+        "compile-rest": 2.88,
+        "write": 0.49,
+        "build-rest": 1.44,
+        "report": 0.08,
+        "link": 19.4
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.281,
+       "cargo_s": 0.636,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 7.39,
+        "read": 0.03,
+        "apply": 10.84,
+        "roots": 0.2,
+        "check": 10.32,
+        "reach": 0.37,
+        "resolve": 5.92,
+        "define": 0.07,
+        "object": 0.4,
+        "discarded": 0.0,
+        "compile-rest": 2.63,
+        "write": 0.42,
+        "build-rest": 1.33,
+        "report": 0.08,
+        "link": 19.35
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.451,
+       "cargo_s": 0.391,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.02,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 8.69,
+        "read": 0.03,
+        "apply": 10.4,
+        "roots": 0.16,
+        "check": 9.2,
+        "reach": 9.54,
+        "resolve": 27.62,
+        "define": 0.07,
+        "object": 0.36,
+        "discarded": 0.0,
+        "compile-rest": 3.07,
+        "write": 0.43,
+        "build-rest": 1.23,
+        "report": 0.08,
+        "link": 41.24
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "back_samples": [
+      {
+       "rustd_s": 0.246,
+       "cargo_s": 0.411,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.74,
+        "read": 0.04,
+        "apply": 5.47,
+        "roots": 0.17,
+        "check": 4.7,
+        "reach": 0.01,
+        "resolve": 5.05,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.34,
+        "write": 0.38,
+        "build-rest": 1.22,
+        "report": 0.09,
+        "link": 18.07
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.358,
+       "cargo_s": 0.416,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.016,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.77,
+        "read": 0.04,
+        "apply": 5.41,
+        "roots": 0.16,
+        "check": 4.73,
+        "reach": 0.01,
+        "resolve": 5.04,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.34,
+        "write": 0.39,
+        "build-rest": 1.19,
+        "report": 0.08,
+        "link": 17.75
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.271,
+       "cargo_s": 0.526,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.018,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 10.13,
+        "read": 0.03,
+        "apply": 9.42,
+        "roots": 0.18,
+        "check": 10.98,
+        "reach": 0.01,
+        "resolve": 5.46,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.41,
+        "write": 0.41,
+        "build-rest": 1.25,
+        "report": 0.08,
+        "link": 18.87
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.403,
+       "cargo_s": 0.427,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.017,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.79,
+        "read": 0.04,
+        "apply": 7.72,
+        "roots": 0.17,
+        "check": 4.52,
+        "reach": 0.01,
+        "resolve": 5.21,
+        "define": 0.01,
+        "object": 0.1,
+        "discarded": 0.0,
+        "compile-rest": 1.33,
+        "write": 0.38,
+        "build-rest": 1.19,
+        "report": 0.08,
+        "link": 17.85
+       },
+       "started_over": [],
+       "wrong": null
+      },
+      {
+       "rustd_s": 0.254,
+       "cargo_s": 0.4,
+       "mold_s": null,
+       "built": "daemon",
+       "link": "spliced",
+       "compiled": 1,
+       "settle_s": 0.029,
+       "cargo_crates": 1,
+       "steps_ms": {
+        "settle": 3.87,
+        "read": 0.04,
+        "apply": 5.54,
+        "roots": 0.18,
+        "check": 4.67,
+        "reach": 0.01,
+        "resolve": 11.23,
+        "define": 0.01,
+        "object": 0.11,
+        "discarded": 0.0,
+        "compile-rest": 1.4,
+        "write": 0.4,
+        "build-rest": 1.27,
+        "report": 0.08,
+        "link": 37.05
+       },
+       "started_over": [],
+       "wrong": null
+      }
+     ],
+     "places": 1,
+     "files": 1
+    }
+   },
+   "made": null,
+   "tag": "0.92.0",
+   "status": "plain cargo: through rustd, by `build.rustc-workspace-wrapper` in /home/ubuntu/bench-work/r/h3d5ff9/cargo-home/config.toml\n  80 programs linked by the daemon, 2 by rustc\n    2 x the daemon had not loaded the build yet\ndaemon: pid 1677032, version 0.0.0-3fe3648-18dfaf3455c85642, exits after 1800s idle\n  worker: pid 1677035, /home/ubuntu/bench-work/r/cargo-cranelift-plain/, log /home/ubuntu/bench-work/r/h3d5ff9/workers/2201bf3bfc5d9a27dddb359b7ce793eb/log\n    /home/ubuntu/bench-work/r/cargo-cranelift-plain: ready\n  worker: pid 1763465, /home/ubuntu/bench-work/r/cargo-cranelift-plain/crates/cargo-util, log /home/ubuntu/bench-work/r/h3d5ff9/workers/ca3af786996d6ab3b8a48853b2801c9f/log\n    /home/ubuntu/bench-work/r/cargo-cranelift-plain: ready\n/home/ubuntu/bench-work/r/cargo-cranelift-plain (test, ea8ccdf646c6c4d3): 0 builds by the daemon, 0 by cargo\n/home/ubuntu/bench-work/r/cargo-cranelift-plain (dev, 7ac144c097393a8a): 0 builds by the daemon, 0 by cargo\n",
+   "disk_end_mb": {
+    "target": 33181,
+    "target-ref": 3355
+   }
+  }
+ },
+ "toolchain": "1.99.0",
+ "machine": {
+  "cpu": "Intel(R) Xeon(R) Processor",
+  "cores": 8,
+  "memory_gb": 32.9,
+  "kernel": "6.8.0-1060-aws",
+  "commit": "a235afe8091c047aea93d1fe1d916d8b86c9916d",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "mold": "mold 2.40.4 (083901f42dea2491be8bc7cf6e3b1e2b9a3c850d; compatible with GNU ld)",
+  "cc": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+ },
+ "runs": 5
+}

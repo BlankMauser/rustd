@@ -132,6 +132,11 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 `bench.py`, `editloop.py`, `edittimes.py`, `scaling.py`, `dxedits.py`, `linkbench.py`,
 `shapes.py` and `heap.py` measure and do not gate. Their docstrings say how to run them.
 
+`bench.py --shapes` times cargo alone against rustd on generated workspaces of 10 to 200
+crates (made by `genws.py`) and on large real projects, over edits wider than one body;
+`bench.py --tables` prints its results as Markdown. What it measured is in
+[large-workspaces.md](large-workspaces.md), and the raw results in `harness/results-large/`.
+
 ## The fuzzer
 
 `fuzz/fuzz.py` builds generated programs with cargo and with rustd under each backend and

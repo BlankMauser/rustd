@@ -1,0 +1,279 @@
+{
+ "results": {
+  "nushell/cranelift/rustd": {
+   "session": {
+    "cargo": {
+     "first_s": 46.93,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.996,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf2",
+       "back": false,
+       "s": 6.869,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 8.295,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 9.54,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter10",
+       "back": false,
+       "s": 7.766,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.867,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf2",
+       "back": true,
+       "s": 6.704,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 8.205,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 8.863,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter10",
+       "back": true,
+       "s": 7.71,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.668,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf2",
+       "back": false,
+       "s": 6.619,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 8.427,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 9.705,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter10",
+       "back": false,
+       "s": 7.091,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.717,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf2",
+       "back": true,
+       "s": 6.635,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 7.937,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 9.286,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter10",
+       "back": true,
+       "s": 8.239,
+       "built": "cargo"
+      }
+     ],
+     "edits_s": 135.139,
+     "total_s": 182.069,
+     "by_daemon": 0
+    },
+    "rustd ready": {
+     "first_s": 47.565,
+     "wait_s": 199.957,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.476,
+       "built": "daemon"
+      },
+      {
+       "shape": "leaf2",
+       "back": false,
+       "s": 4.172,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 3.755,
+       "built": "daemon"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 4.898,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter10",
+       "back": false,
+       "s": 4.235,
+       "built": "daemon"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.346,
+       "built": "daemon"
+      },
+      {
+       "shape": "leaf2",
+       "back": true,
+       "s": 3.797,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 4.298,
+       "built": "daemon"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 4.718,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter10",
+       "back": true,
+       "s": 4.033,
+       "built": "daemon"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.412,
+       "built": "daemon"
+      },
+      {
+       "shape": "leaf2",
+       "back": false,
+       "s": 4.055,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 4.087,
+       "built": "daemon"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 5.01,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter10",
+       "back": false,
+       "s": 4.404,
+       "built": "daemon"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.224,
+       "built": "daemon"
+      },
+      {
+       "shape": "leaf2",
+       "back": true,
+       "s": 3.734,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 4.084,
+       "built": "daemon"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 4.408,
+       "built": "daemon"
+      },
+      {
+       "shape": "scatter10",
+       "back": true,
+       "s": 3.583,
+       "built": "daemon"
+      }
+     ],
+     "edits_s": 72.729,
+     "total_s": 320.251,
+     "by_daemon": 20,
+     "wrong": null
+    }
+   }
+  }
+ },
+ "toolchain": "1.99.0",
+ "machine": {
+  "cpu": "Intel(R) Xeon(R) Processor",
+  "cores": 8,
+  "memory_gb": 32.9,
+  "kernel": "6.8.0-1060-aws",
+  "commit": "a235afe8091c047aea93d1fe1d916d8b86c9916d",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "mold": "mold 2.40.4 (083901f42dea2491be8bc7cf6e3b1e2b9a3c850d; compatible with GNU ld)",
+  "cc": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+ },
+ "runs": 5
+}

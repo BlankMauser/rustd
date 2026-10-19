@@ -23,6 +23,10 @@ the difference is listed under [Disagreements](#disagreements).
 To update this file: rerun the harness named in the row, replace the row, and change the
 commit. Do not append a second row for the same measurement.
 
+Larger workspaces and wider edits (generated workspaces of 10 to 200 crates, nushell, cargo,
+ripgrep; scattered edits, signature changes, `cargo test`; medians of 5) are in
+[large-workspaces.md](large-workspaces.md), measured at a235afe809.
+
 ## 1. Checked for these documents
 
 Run on Linux x86-64 (8 CPUs, 31 GB) with Rust 1.99.0 at f191c6e42a, the commit these

@@ -1,0 +1,434 @@
+{
+ "results": {
+  "helix/cranelift/rustd": {
+   "phases": {
+    "cold": {
+     "rustd_s": 35.232,
+     "warm_s": 203.929,
+     "cargo_s": 36.529,
+     "mold_s": 34.946,
+     "states": [
+      "failed: the daemon could not load the workspace (signal: 9 (SIGKILL): listing: name resolution 178.0ns, scopes 4.0ms, 1990 bodies 15.8ms)"
+     ],
+     "rss_mb": 0,
+     "fns": null,
+     "steps_s": {
+      "load": 12.6,
+      "resolve": 5.5
+     },
+     "built": "cargo",
+     "disk_mb": {
+      "target": 4817,
+      "target-ref": 3218
+     },
+     "not_loaded": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 3494611, version 0.0.0-3fe3648-18dfaf3455c85642, exits after 1800s idle\n  worker: pid 3494614, /home/ubuntu/bench-work/r/helix-cranelift-rustd/, log /home/ubuntu/bench-work/r/h42b43a/workers/11900199332e8173270d241111102aca/log\n    /home/ubuntu/bench-work/r/helix-cranelift-rustd: failed: the daemon could not load the workspace (signal: 9 (SIGKILL): listing: name resolution 178.0ns, scopes 4.0ms, 1990 bodies 15.8ms)\n/home/ubuntu/bench-work/r/helix-cranelift-rustd (dev, e9a82dc34afb61eb): 0 builds by the daemon, 0 by cargo\n"
+    }
+   },
+   "made": null,
+   "tag": "25.07.1",
+   "session": {
+    "cargo": {
+     "first_s": 35.376,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 3.081,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 4.808,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 4.935,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 4.776,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 8.917,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 3.164,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 4.989,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 5.014,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 4.823,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 9.515,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 3.078,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 4.989,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 5.591,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 4.778,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 9.047,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 3.048,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 4.811,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 4.973,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 5.272,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.102,
+       "built": "cargo"
+      }
+     ],
+     "edits_s": 111.711,
+     "total_s": 147.087,
+     "by_daemon": 0
+    },
+    "rustd 0.0": {
+     "first_s": 40.27,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 24.477,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (39ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 7.527,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 8.002,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 7.614,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.031,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (29ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-core/src/surround.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 4.457,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 7.746,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 7.682,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 7.532,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 11.805,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (32ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-core/src/surround.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 4.442,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 7.619,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 7.731,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 7.552,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 11.921,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (37ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-core/src/surround.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 4.54,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 7.502,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 7.631,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 7.554,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 11.889,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (29ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-0.0/helix-core/src/surround.rs changed"
+      }
+     ],
+     "edits_s": 177.254,
+     "total_s": 217.524,
+     "by_daemon": 0,
+     "wrong": null
+    },
+    "rustd ready": {
+     "first_s": 35.636,
+     "wait_s": 211.513,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 8.955,
+       "built": "cargo: `hx`: the daemon could not load the workspace (signal: 9 (SIGKILL): listing: name resolution 163.0ns, scopes 4.1ms, 1990 bodies 13.8ms), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 5.919,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 10.322,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 8.922,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.822,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (31ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/ui/completion.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 4.368,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 8.205,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 8.295,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 7.99,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.904,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (29ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/ui/completion.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 4.427,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 8.067,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 8.268,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 8.281,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.4,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (31ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/ui/completion.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 4.439,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 8.171,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 8.101,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-loader/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 8.188,
+       "built": "cargo: what runs during the build: /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-stdx/src/env.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.82,
+       "built": "cargo: `hx`: the daemon is still loading the workspace (33ms so far), and /home/ubuntu/bench-work/r/helix-cranelift-rustd-session-ready/helix-term/src/ui/completion.rs changed"
+      }
+     ],
+     "edits_s": 171.864,
+     "total_s": 419.012,
+     "by_daemon": 0,
+     "wrong": null
+    }
+   }
+  }
+ },
+ "toolchain": "1.99.0",
+ "machine": {
+  "cpu": "Intel(R) Xeon(R) Processor",
+  "cores": 8,
+  "memory_gb": 32.9,
+  "kernel": "6.8.0-1060-aws",
+  "commit": "a235afe8091c047aea93d1fe1d916d8b86c9916d",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "mold": "mold 2.40.4 (083901f42dea2491be8bc7cf6e3b1e2b9a3c850d; compatible with GNU ld)",
+  "cc": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+ },
+ "runs": 5
+}

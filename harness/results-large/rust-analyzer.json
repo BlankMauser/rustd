@@ -1,0 +1,441 @@
+{
+ "results": {
+  "rust-analyzer/cranelift/rustd": {
+   "phases": {
+    "cold": {
+     "rustd_s": 52.422,
+     "warm_s": 388.398,
+     "cargo_s": 53.137,
+     "mold_s": 52.1,
+     "states": [
+      "failed: the daemon could not load the workspace (exit status: 1: Error: the link failed (exit status: 1))"
+     ],
+     "rss_mb": 0,
+     "fns": [
+      11641,
+      11641,
+      403769
+     ],
+     "steps_s": {
+      "load": 8.8,
+      "resolve": 10.1,
+      "compile": 360.2,
+      "emit": 0.309,
+      "link": 3.3
+     },
+     "built": "cargo",
+     "disk_mb": {
+      "target": 6206,
+      "target-ref": 3736
+     },
+     "not_loaded": "plain cargo: not through rustd (`rustd enable` turns it on)\ndaemon: pid 2484968, version 0.0.0-3fe3648-18dfaf3455c85642, exits after 1800s idle\n  worker: pid 2484971, /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd/crates/rust-analyzer, log /home/ubuntu/bench-work/r/h6a6669/workers/c4bdf80797e6186a8ca7de7f9d205d7e/log\n    /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd: failed: the daemon could not load the workspace (exit status: 1: Error: the link failed (exit status: 1))\n/home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd (dev, b935d13000e89b65): 0 builds by the daemon, 0 by cargo\n"
+    }
+   },
+   "made": null,
+   "tag": "2026-10-12",
+   "session": {
+    "cargo": {
+     "first_s": 52.272,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.246,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 11.976,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 11.294,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 11.971,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.702,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.272,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 11.914,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 11.166,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 13.031,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.99,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.456,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 12.098,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 11.815,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 13.027,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 12.815,
+       "built": "cargo"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.253,
+       "built": "cargo"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 11.852,
+       "built": "cargo"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 11.149,
+       "built": "cargo"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 12.01,
+       "built": "cargo"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 12.765,
+       "built": "cargo"
+      }
+     ],
+     "edits_s": 199.802,
+     "total_s": 252.074,
+     "by_daemon": 0
+    },
+    "rustd 0.0": {
+     "first_s": 52.305,
+     "wait_s": 0.0,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 34.755,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 19.637,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 18.522,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/project-model/src/build_dependencies.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 19.826,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 21.205,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (77ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/hir-expand/src/builtin/fn_macro.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.887,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (34ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 21.005,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 18.615,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (24ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/project-model/src/build_dependencies.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 19.703,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 21.645,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (174ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/hir-expand/src/builtin/fn_macro.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.854,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (35ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 20.299,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 20.164,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/project-model/src/build_dependencies.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 21.066,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 22.45,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (65ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/hir-expand/src/builtin/fn_macro.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.8,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 21.678,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (33ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 18.683,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/project-model/src/build_dependencies.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 19.648,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 24.109,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (63ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-0.0/crates/hir-expand/src/builtin/fn_macro.rs changed"
+      }
+     ],
+     "edits_s": 368.551,
+     "total_s": 420.856,
+     "by_daemon": 0,
+     "wrong": null
+    },
+    "rustd ready": {
+     "first_s": 52.141,
+     "wait_s": 370.449,
+     "builds": [
+      {
+       "shape": "body",
+       "back": false,
+       "s": 4.437,
+       "built": "cargo: `rust-analyzer`: the daemon could not load the workspace (exit status: 1: Error: the link failed (exit status: 1)), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 23.327,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (23ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 18.726,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/ide-db/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 20.073,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 21.067,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (65ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/lib.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.761,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 20.224,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 19.57,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/ide-db/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 20.143,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 21.401,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (73ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/lib.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": false,
+       "s": 1.707,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": false,
+       "s": 20.59,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": false,
+       "s": 20.537,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/ide-db/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": false,
+       "s": 20.012,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (22ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": false,
+       "s": 21.528,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (63ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/lib.rs changed"
+      },
+      {
+       "shape": "body",
+       "back": true,
+       "s": 1.853,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/rust-analyzer/src/bin/main.rs changed"
+      },
+      {
+       "shape": "leaf",
+       "back": true,
+       "s": 20.643,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (20ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/stdx/src/lib.rs changed"
+      },
+      {
+       "shape": "scatter3",
+       "back": true,
+       "s": 19.917,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (21ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/ide-db/src/lib.rs changed"
+      },
+      {
+       "shape": "generic",
+       "back": true,
+       "s": 21.653,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (26ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/algo.rs changed"
+      },
+      {
+       "shape": "signature",
+       "back": true,
+       "s": 21.836,
+       "built": "cargo: `rust-analyzer`: the daemon is still loading the workspace (63ms so far), and /home/ubuntu/bench-work/r/rust-analyzer-cranelift-rustd-session-ready/crates/syntax/src/lib.rs changed"
+      }
+     ],
+     "edits_s": 341.005,
+     "total_s": 763.595,
+     "by_daemon": 0,
+     "wrong": null
+    }
+   }
+  }
+ },
+ "toolchain": "1.99.0",
+ "machine": {
+  "cpu": "Intel(R) Xeon(R) Processor",
+  "cores": 8,
+  "memory_gb": 32.9,
+  "kernel": "6.8.0-1060-aws",
+  "commit": "a235afe8091c047aea93d1fe1d916d8b86c9916d",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "mold": "mold 2.40.4 (083901f42dea2491be8bc7cf6e3b1e2b9a3c850d; compatible with GNU ld)",
+  "cc": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+ },
+ "runs": 5
+}
