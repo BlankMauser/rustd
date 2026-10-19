@@ -364,16 +364,10 @@ impl Unit {
         );
         std::fs::write(dir.join(STANDS_IN), "")?;
 
-        let checked = self.args.iter().map(|it| match it.split_once('=') {
-            Some(("--emit", _)) => "--emit=dep-info,metadata".to_owned(),
-            Some((INCREMENTAL, dir)) => format!("{INCREMENTAL}={dir}/{CHECKS}"),
-            _ => self.checked_against(it).unwrap_or_else(|| it.clone()),
-        });
-        let status = Command::new(rustc).args(checked).status().context("running rustc")?;
-        if status.success() {
-            self.record(stamp, &copies, program.then_some(line), &source)?;
-        }
-        Ok(status.code().unwrap_or(1))
+        // The crate is not checked by rustc: the daemon's front end is what checks it, and a
+        // second compile beside the daemon's would only compete with it.
+        self.record(stamp, &copies, program.then_some(line), &source)?;
+        Ok(0)
     }
 
     /// `--extern`'s value `named` with the library that stands in for the crate, when the

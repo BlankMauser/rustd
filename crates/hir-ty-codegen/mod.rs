@@ -6,6 +6,8 @@
 use std::{borrow::Cow, fmt, sync::LazyLock};
 
 use base_db::Crate;
+use std::cell::Cell;
+
 use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
@@ -2697,6 +2699,8 @@ fn build<'db>(
         deferred_drops: Vec::new(),
         at: None,
         moved_here: None,
+        flag_writes: None,
+        holds_here: None,
         cleanup: None,
         inner_pad: None,
         drop_order: Vec::new(),
@@ -2715,6 +2719,7 @@ fn build<'db>(
         location: None,
         span: MirSpan::Unknown,
         constant_locals: Vec::new(),
+        registers: FxHashMap::default(),
         args: None,
         suspended: None,
         suspended_drop: None,
@@ -5127,6 +5132,13 @@ struct MovedPath {
     bit: u32,
 }
 
+/// A local kept in a register.
+#[derive(Clone, Copy)]
+struct Register {
+    var: cranelift_frontend::Variable,
+    ty: Type,
+}
+
 #[derive(Clone, Copy)]
 struct LocalSlot {
     addr: Value,
@@ -5163,6 +5175,13 @@ struct FunctionCx<'cx, 'db> {
     /// While a `Drop` terminator is generated: the fields that may be moved out of their
     /// locals when the body gets to it.
     moved_here: Option<FxHashSet<FieldOfLocal>>,
+    /// What the body does to the drop flags of whole locals, block by block and in order:
+    /// whether the local holds a value after. Kept while the body is generated, and for a
+    /// body whose flags live nowhere but in this call.
+    flag_writes: Option<FxHashMap<BasicBlockId, Vec<(LocalId, bool)>>>,
+    /// While a `Drop` terminator is generated: whether its local holds a value, when every
+    /// way to the terminator agrees on that.
+    holds_here: Option<bool>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -5197,6 +5216,9 @@ struct FunctionCx<'cx, 'db> {
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
     constant_locals: Vec<LocalId>,
+    /// The locals kept in a register in place of their slot: scalars nothing takes the
+    /// address of. The slot is still there, written when something asks where the local is.
+    registers: FxHashMap<LocalId, Register>,
     /// What the body's generic parameters stand for, when it is the body of an instance.
     args: Option<StoredGenericArgs>,
     /// While compiling an `async` body: where it says where it left off.
@@ -6545,6 +6567,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
         }
+        if frame.is_none() {
+            for local in register_locals(body, &forwarded) {
+                if !self.locals[local].borrowed
+                    && let Some(ty) = self.register_ty(body.locals[local].ty.as_ref())
+                {
+                    let var = self.builder.declare_var(ty);
+                    self.registers.insert(local, Register { var, ty });
+                }
+            }
+        }
         for (temp, to) in forwarded {
             self.locals.insert(temp, self.locals[to]);
         }
@@ -6639,6 +6671,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().jump(self.blocks[body.start_block], &[]);
             }
         }
+        self.flag_writes = body.coroutine.is_none().then(FxHashMap::default);
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
         self.index_spans = index_spans(body);
@@ -6698,12 +6731,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().jump(target, &[]);
         }
         let drops = std::mem::take(&mut self.deferred_drops);
+        let held = match self.flag_writes.take() {
+            Some(writes) if !drops.is_empty() => self.held_where_blocks_end(body, &writes),
+            _ => FxHashMap::default(),
+        };
         let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
             true => FxHashMap::default(),
             false => self.moved_where_blocks_end(body),
         };
         for (block, place, target, span, from) in drops {
             self.moved_here = moved.remove(&from);
+            self.holds_here = held.get(&(from, place.local)).copied();
             self.builder.switch_to_block(block);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
@@ -6739,6 +6777,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         self.moved_here = None;
+        self.holds_here = None;
         // So is dropping a suspended future, which drops the same locals as unwinding does.
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
@@ -6880,6 +6919,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Drops what is left of a place, which is nothing if its local holds no value.
     fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
+        let holds = self.holds_here.take();
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -6887,11 +6927,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().jump(target, &[]);
             return Ok(());
         };
+        if holds == Some(false) {
+            self.builder.ins().jump(target, &[]);
+            return Ok(());
+        }
         let state = flag.load(&mut self.builder);
-        let live = self.builder.ins().band_imm(state, 1);
-        let drop = self.dropping_block();
-        self.builder.ins().brif(live, drop, &[], target, &[]);
-        self.builder.switch_to_block(drop);
+        if holds.is_none() {
+            let live = self.builder.ins().band_imm(state, 1);
+            let drop = self.dropping_block();
+            self.builder.ins().brif(live, drop, &[], target, &[]);
+            self.builder.switch_to_block(drop);
+        }
         if path.is_empty() {
             flag.set(&mut self.builder, 0);
         }
@@ -7113,6 +7159,78 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
     }
 
+    fn note_flag_write(&mut self, local: LocalId, holds: bool) {
+        // What a landing pad writes is not on any way through the body.
+        if self.in_cleanup {
+            return;
+        }
+        if let (Some(writes), Some(at)) = (&mut self.flag_writes, self.at) {
+            writes.entry(at).or_default().push((local, holds));
+        }
+    }
+
+    /// Whether each local with a drop flag holds a value where the block that drops it ends,
+    /// for the ones every way there agrees on: what their flags are known to say.
+    fn held_where_blocks_end(
+        &self,
+        body: &MirBody<'db>,
+        writes: &FxHashMap<BasicBlockId, Vec<(LocalId, bool)>>,
+    ) -> FxHashMap<(BasicBlockId, LocalId), bool> {
+        // `None` for a local the ways to a block disagree on.
+        type Held = FxHashMap<LocalId, Option<bool>>;
+        let entered: Held = self
+            .drop_flags
+            .iter()
+            .map(|(local, _)| (local, Some(body.param_locals.contains(&local))))
+            .collect();
+        let mut starts: FxHashMap<BasicBlockId, Held> = FxHashMap::default();
+        let mut ends: FxHashMap<BasicBlockId, Held> = FxHashMap::default();
+        starts.insert(body.start_block, entered);
+        let mut pending = vec![body.start_block];
+        while let Some(id) = pending.pop() {
+            let mut held = starts[&id].clone();
+            for &(local, holds) in writes.get(&id).into_iter().flatten() {
+                held.insert(local, Some(holds));
+            }
+            ends.insert(id, held.clone());
+            // A local is empty once it is dropped, whether it held a value or not.
+            if let Some(TerminatorKind::Drop { place, .. }) =
+                body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
+                && place.projection.as_slice().is_empty()
+                && held.contains_key(&place.local)
+            {
+                held.insert(place.local, Some(false));
+            }
+            for next in successors(body, id) {
+                let Some(known) = starts.get_mut(&next) else {
+                    starts.insert(next, held.clone());
+                    pending.push(next);
+                    continue;
+                };
+                let mut changed = false;
+                for (local, known) in known.iter_mut() {
+                    if known.is_some() && *known != held[local] {
+                        *known = None;
+                        changed = true;
+                    }
+                }
+                if changed && !pending.contains(&next) {
+                    pending.push(next);
+                }
+            }
+        }
+        ends.into_iter()
+            .filter_map(|(id, held)| {
+                let Some(TerminatorKind::Drop { place, .. }) =
+                    body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
+                else {
+                    return None;
+                };
+                Some(((id, place.local), (*held.get(&place.local)?)?))
+            })
+            .collect()
+    }
+
     /// The fields that may be moved out of their locals where each block ends: moved out on
     /// some way there, and not assigned since.
     fn moved_where_blocks_end(
@@ -7239,9 +7357,66 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok((place.addr, place.ty))
     }
 
+    /// The type of the register a local of this type fits, when it is one a place of has
+    /// no part of.
+    fn register_ty(&self, ty: Ty<'db>) -> Option<Type> {
+        let ty = self.normalize(ty);
+        let plain = match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::RawPtr(..)
+            | TyKind::Ref(..)
+            | TyKind::FnPtr(..) => true,
+            _ => false,
+        };
+        if !plain {
+            return None;
+        }
+        match self.layout(ty).ok()?.backend_repr {
+            BackendRepr::Scalar(scalar) => Some(self.scalar(scalar).ok()?.ty),
+            _ => None,
+        }
+    }
+
+    /// Where a local is, with what its register holds written there first.
+    fn local_addr(&mut self, local: LocalId) -> Value {
+        let addr = self.slot_addr(self.locals[local].addr);
+        if let Some(register) = self.registers.get(&local) {
+            let value = self.builder.use_var(register.var);
+            self.builder.ins().store(MEM, value, addr, 0);
+        }
+        addr
+    }
+
+    /// The register an operand is the whole of.
+    fn register_of(&self, operand: &Operand) -> Option<Register> {
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+            return None;
+        };
+        self.whole_register(place)
+    }
+
+    fn whole_register(&self, place: &StoredPlace) -> Option<Register> {
+        if self.registers.is_empty() || !place.projection.as_slice().is_empty() {
+            return None;
+        }
+        self.registers.get(&place.local).copied()
+    }
+
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
-        let LocalSlot { addr, borrowed } = self.locals[place.local];
-        let mut addr = self.slot_addr(addr);
+        let LocalSlot { borrowed, .. } = self.locals[place.local];
+        // A pointer in a register is where it points with no load.
+        let mut pointer = match place.projection.as_slice().first() {
+            Some(ProjectionElem::Deref) => self.registers.get(&place.local).copied(),
+            _ => None,
+        };
+        let mut addr = match pointer {
+            Some(register) => self.builder.use_var(register.var),
+            None => self.local_addr(place.local),
+        };
         let mut meta = None;
         if borrowed {
             meta = Some(self.builder.ins().load(ptr(), MEM, addr, meta_at()));
@@ -7256,6 +7431,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ty.ty = self.normalize(ty.ty);
             match proj {
                 ProjectionElem::Deref => match self.layout(prev.ty)?.backend_repr {
+                    BackendRepr::Scalar(_) if pointer.take().is_some() => (),
                     BackendRepr::Scalar(_) => {
                         addr = self.builder.ins().load(ptr(), MEM, addr, 0);
                         meta = None;
@@ -7297,8 +7473,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
-                    let index = self.slot_addr(self.locals[*local].addr);
-                    let index = self.builder.ins().load(ptr(), MEM, index, 0);
+                    let index = match self.registers.get(local) {
+                        Some(register) => self.builder.use_var(register.var),
+                        None => {
+                            let index = self.slot_addr(self.locals[*local].addr);
+                            self.builder.ins().load(ptr(), MEM, index, 0)
+                        }
+                    };
                     // An index out of bounds is reported at the index expression, which may be
                     // an operand of the statement that reads it.
                     let statement = self.span;
@@ -7400,6 +7581,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn operand_ty(&mut self, operand: &Operand) -> Result<Ty<'db>> {
         Ok(match &operand.kind {
+            OperandKind::Copy(place) | OperandKind::Move(place)
+                if place.projection.as_slice().is_empty() =>
+            {
+                let ty = self.body.expect("MIR body").locals[place.local].ty.as_ref();
+                self.normalize(ty)
+            }
             OperandKind::Copy(place) | OperandKind::Move(place) => self.place(place)?.1.ty,
             OperandKind::Constant { ty, .. } => ty.as_ref(),
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
@@ -7434,7 +7621,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         }
                         // FIXME: a move out of an enum or a box forgets the rest of the local,
                         // which leaks it.
-                        None => self.builder.ins().iconst(flag.ty, 0),
+                        None => {
+                            self.note_flag_write(place.local, false);
+                            self.builder.ins().iconst(flag.ty, 0)
+                        }
                     };
                     flag.store(&mut self.builder, state);
                 }
@@ -8113,6 +8303,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn load_scalar(&mut self, operand: &Operand) -> Result<(Value, AbiScalar)> {
+        if let Some(register) = self.register_of(operand) {
+            let ty = self.operand_ty(operand)?;
+            return Ok((self.builder.use_var(register.var), self.scalar_of(ty)?));
+        }
         let (addr, ty) = self.operand(operand)?;
         let scalar = self.scalar_of(ty)?;
         Ok((self.builder.ins().load(scalar.ty, MEM, addr, 0), scalar))
@@ -8144,6 +8338,36 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn assign(&mut self, place: &StoredPlace, rvalue: &Rvalue) -> Result<()> {
+        let Some(register) = self.whole_register(place) else {
+            return self.assign_to_slot(place, rvalue, None, &Cell::new(false));
+        };
+        if let Rvalue::Use(operand) = rvalue
+            && let Ok(scalar) = self.operand_ty(operand).and_then(|ty| self.scalar_of(ty))
+            && scalar.ty == register.ty
+        {
+            let (value, _) = self.load_scalar(operand)?;
+            self.builder.def_var(register.var, value);
+            return Ok(());
+        }
+        let registered = Cell::new(false);
+        self.assign_to_slot(place, rvalue, Some(register), &registered)?;
+        if !registered.get() {
+            let addr = self.slot_addr(self.locals[place.local].addr);
+            let value = self.builder.ins().load(register.ty, MEM, addr, 0);
+            self.builder.def_var(register.var, value);
+        }
+        Ok(())
+    }
+
+    /// Assigns through memory, or to the register when the value is one: `registered` is
+    /// set then, and the slot of the local is left as it was.
+    fn assign_to_slot(
+        &mut self,
+        place: &StoredPlace,
+        rvalue: &Rvalue,
+        register: Option<Register>,
+        registered: &Cell<bool>,
+    ) -> Result<()> {
         if self.locals[place.local].borrowed && place.projection.as_slice().is_empty() {
             let Rvalue::Use(operand) = rvalue else {
                 unsupported!("unsized local assigned {rvalue:?}");
@@ -8161,9 +8385,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().store(MEM, meta, slot, meta_at());
             return Ok(());
         }
-        let (dst, dst_ty) = self.place(place)?;
-        let store = |this: &mut Self, value: Value| {
-            this.builder.ins().store(MEM, value, dst, 0);
+        let (dst, dst_ty) = match register {
+            // What the register holds is about to be replaced, and is not written back.
+            Some(_) => {
+                let ty = self.body.expect("MIR body").locals[place.local].ty.as_ref();
+                let addr = self.slot_addr(self.locals[place.local].addr);
+                (addr, PlaceTy::from_ty(self.normalize(ty)))
+            }
+            None => self.place(place)?,
+        };
+        let store = |this: &mut Self, value: Value| match register {
+            Some(register) if this.builder.func.dfg.value_type(value) == register.ty => {
+                this.builder.def_var(register.var, value);
+                registered.set(true);
+            }
+            _ => {
+                this.builder.ins().store(MEM, value, dst, 0);
+            }
         };
         match rvalue {
             Rvalue::Use(operand) => {
@@ -8458,11 +8696,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             relative,
                             count as i64,
                         );
+                        // The index is worked out in a register and widened last: an
+                        // `i128` of it is two of every instruction.
+                        let narrow = match to.ty {
+                            types::I128 if tag.ty != types::I128 => {
+                                AbiScalar { ty: types::I64, signed: false, ..to }
+                            }
+                            _ => to,
+                        };
                         let relative =
-                            self.int_cast(relative, AbiScalar { signed: false, ..tag }, to);
+                            self.int_cast(relative, AbiScalar { signed: false, ..tag }, narrow);
                         let niche = self.builder.ins().iadd_imm(relative, first as i64);
-                        let untagged = self.iconst(to.ty, untagged_variant.0 as u128);
-                        Ok(self.builder.ins().select(is_niche, niche, untagged))
+                        let untagged = self.iconst(narrow.ty, untagged_variant.0 as u128);
+                        let index = self.builder.ins().select(is_niche, niche, untagged);
+                        Ok(self.int_cast(index, narrow, to))
                     }
                 }
             }
@@ -9018,12 +9265,44 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().jump(target, &[]);
                     return Ok(());
                 }
-                let (value, _) = self.load_scalar(discr)?;
+                let register = self.register_of(discr);
+                let (addr, ty) = match register {
+                    Some(_) => (self.iconst(ptr(), 0), self.operand_ty(discr)?),
+                    None => self.operand(discr)?,
+                };
+                let scalar = self.scalar_of(ty)?;
+                let otherwise = self.blocks[targets.otherwise()];
                 let mut switch = Switch::new();
                 for (case, target) in targets.iter() {
                     switch.set_entry(case, self.blocks[target]);
                 }
-                switch.emit(&mut self.builder, value, self.blocks[targets.otherwise()]);
+                // A discriminant is an `i128` to MIR and a small number: with the high half
+                // told to be zero first, the rest is a switch on a register.
+                let small = targets.iter().all(|(case, _)| case <= i64::MAX as u128);
+                let value = if let Some(register) = register {
+                    let value = self.builder.use_var(register.var);
+                    if scalar.ty == types::I128 && small {
+                        let (low, high) = self.builder.ins().isplit(value);
+                        let fits = self.builder.create_block();
+                        self.builder.ins().brif(high, otherwise, &[], fits, &[]);
+                        self.builder.switch_to_block(fits);
+                        low
+                    } else {
+                        value
+                    }
+                } else if scalar.ty == types::I128
+                    && small
+                    && self.cg.target_config().pointer_bytes() == 8
+                {
+                    let high = self.builder.ins().load(types::I64, MEM, addr, 8);
+                    let low = self.builder.create_block();
+                    self.builder.ins().brif(high, otherwise, &[], low, &[]);
+                    self.builder.switch_to_block(low);
+                    self.builder.ins().load(types::I64, MEM, addr, 0)
+                } else {
+                    self.builder.ins().load(scalar.ty, MEM, addr, 0)
+                };
+                switch.emit(&mut self.builder, value, otherwise);
             }
             TerminatorKind::Return => {
                 if let Some(state) = &self.suspended {
@@ -12207,6 +12486,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         if let Some(&flag) = self.drop_flags.get(place.local) {
             flag.set(&mut self.builder, live as i64);
+            self.note_flag_write(place.local, live);
         }
     }
 
@@ -12885,6 +13165,65 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The locals that can be kept in a register as far as the body goes: temporaries written
+/// whole by assignments only, that nothing takes the address of.
+fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) -> Vec<LocalId> {
+    let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
+    // Every mention of the whole local, and the ones that are a value read or an assignment.
+    let mut mentions: FxHashMap<LocalId, (usize, usize)> = FxHashMap::default();
+    body.clone().walk_places(|place| {
+        if let Some(local) = whole(place) {
+            mentions.entry(local).or_default().0 += 1;
+        }
+    });
+    let mut plain = |place: &StoredPlace| {
+        if let Some(local) = whole(place) {
+            mentions.entry(local).or_default().1 += 1;
+        }
+    };
+    let mut read = |operand: &Operand, plain: &mut dyn FnMut(&StoredPlace)| {
+        if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+            plain(place);
+        }
+    };
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(to, rvalue) = &statement.kind {
+                plain(to);
+                for operand in operands_of(rvalue) {
+                    read(operand, &mut plain);
+                }
+            }
+        }
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::SwitchInt { discr, .. }) => read(discr, &mut plain),
+            Some(TerminatorKind::Call { func, args, .. }) => {
+                read(func, &mut plain);
+                for arg in args.iter() {
+                    read(arg, &mut plain);
+                }
+            }
+            _ => (),
+        }
+    }
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to]))
+        .collect();
+    body.locals
+        .iter()
+        .map(|(local, _)| local)
+        .filter(|local| {
+            !bound.contains(local) && mentions.get(local).is_none_or(|(all, plain)| all == plain)
+        })
+        .collect()
 }
 
 /// The temporaries a `let` is initialized through, each with the binding it is copied to right

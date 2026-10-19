@@ -3761,8 +3761,12 @@ impl Held {
         let asked = std::iter::once(dir.display().to_string()).chain(asked);
         let args = Args::parse(asked)?;
         process_wide();
-        let (db, vfs, checkouts) =
-            load(&[dir], &cargo_config(&args), load_config(), args.selection, None)?;
+        // An empty package has no build script, and asking cargo for one waits for the lock
+        // of the target directory, which a build that started beside this holds until it ends.
+        let scriptless = LoadCargoConfig { load_out_dirs_from_check: false, ..load_config() };
+        let (db, vfs, mut checkouts) =
+            load(&[dir], &cargo_config(&args), scriptless, args.selection, None)?;
+        checkouts.load_config = load_config();
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
         resolve_all(&db, &all);
@@ -3838,7 +3842,6 @@ pub(crate) enum Line {
     Whole(Told),
 }
 
-static DBGT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// What cargo says of the build scripts and the proc macros of a build as it runs.
 #[derive(Default)]
 struct Said {
@@ -4044,22 +4047,6 @@ fn follow_cargo(
         if all {
             return Ok(());
         }
-        eprintln!(
-            "DBGREADY {:?} lines {} ready {} of {:?} waiting {:?}",
-            DBGT.get_or_init(Instant::now).elapsed(),
-            lines.len(),
-            now.len(),
-            args.crates().count(),
-            beside
-                .awaited
-                .iter()
-                .filter(|a| !lines.iter().filter_map(|l| Awaited::arrived(l)).any(|b| b == **a))
-                .map(|a| match a {
-                    Awaited::Script(s) => format!("S {}", s.rsplit('/').next().unwrap_or(s)),
-                    Awaited::ProcMacro(s) => format!("P {}", s.rsplit('/').next().unwrap_or(s)),
-                })
-                .collect::<Vec<_>>()
-        );
         ready = now;
         // Whether cargo has said what makes another crate ready, asked once a line.
         let seen = Mutex::new((lines.len(), false));
@@ -4208,15 +4195,16 @@ fn run_holding(
         }
     };
     let listed = Arc::new(Listed::default());
-    follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     ide_db::base_db::set_process_env(&mut db, process::own());
-    // A build told ahead of cargo's links the library of the toolchain that was loaded, or
+    // What is compiled while cargo builds is stored too, so the store is told the toolchain
+    // first. A build told ahead of cargo's links the library of the toolchain that was loaded, or
     // is not the daemon's.
     let library = ahead.then(|| built_library(&vfs, emits.triple()));
     match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => hir_ty::mir::codegen::compiles_against(&toolchain),
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
+    follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
     eprintln!("load workspace: {:.1?}", start.elapsed());
