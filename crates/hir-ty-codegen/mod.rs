@@ -5386,12 +5386,21 @@ struct Held {
     empty: Vec<u64>,
     /// The fields that are moved out of a local on every way to the point.
     moved: std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u32>>>,
+    /// The locals that have nothing left to drop on every way to the point they hold a value
+    /// on: every field with a destructor is moved out, which fields being the way's own. A
+    /// `match` that moves out of each variant in its own arm leaves one behind.
+    spent: Vec<u64>,
 }
 
 impl Held {
     fn of(locals: usize) -> Held {
         let words = locals.div_ceil(64);
-        Held { full: vec![0; words], empty: vec![0; words], ..Held::default() }
+        Held {
+            full: vec![0; words],
+            empty: vec![0; words],
+            spent: vec![0; words],
+            ..Held::default()
+        }
     }
 
     fn bit(local: LocalId) -> (usize, u64) {
@@ -5417,7 +5426,20 @@ impl Held {
         };
         set[word] |= bit;
         clear[word] &= !bit;
+        self.spent[word] &= !bit;
         self.moved.remove(&local.into_raw().into());
+    }
+
+    /// Whether every way here that the local holds a value on has moved out all of it that
+    /// has a destructor.
+    fn spent(&self, local: LocalId) -> bool {
+        let (word, bit) = Held::bit(local);
+        self.spent[word] & bit != 0
+    }
+
+    fn set_spent(&mut self, local: LocalId) {
+        let (word, bit) = Held::bit(local);
+        self.spent[word] |= bit;
     }
 
     fn moved(&self, local: LocalId) -> Option<&std::collections::BTreeSet<Vec<u32>>> {
@@ -5431,6 +5453,8 @@ impl Held {
                 self.moved.entry(local.into_raw().into()).or_default().insert(path.clone());
             }
             FlagEvent::Restored(local, paths) => {
+                let (word, bit) = Held::bit(*local);
+                self.spent[word] &= !bit;
                 let key = local.into_raw().into();
                 if let Some(moved) = self.moved.get_mut(&key) {
                     moved.retain(|moved| !paths.iter().any(|path| moved.starts_with(path)));
@@ -5468,6 +5492,14 @@ impl Held {
                     };
                 }
             }
+        }
+        // A local is spent where it is on every way that it holds a value on.
+        for word in 0..self.spent.len() {
+            let mine = self.spent[word] | (self.empty[word] & !self.full[word]);
+            let theirs = other.spent[word] | (other.empty[word] & !other.full[word]);
+            let met = mine & theirs & (self.spent[word] | other.spent[word]);
+            changed |= met != self.spent[word];
+            self.spent[word] = met;
         }
         for (mine, theirs) in [(&mut self.full, &other.full), (&mut self.empty, &other.empty)] {
             for (mine, theirs) in mine.iter_mut().zip(theirs) {
@@ -7618,7 +7650,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Takes out the writes to the drop flags nothing reads: the ones of locals whose every
-    /// drop was decided when the body was generated.
+    /// drop was decided when the body was generated. A flag that is only read to be written
+    /// back with a bit set or cleared, as a move out of a field does, is not read.
     fn forget_unread_flags(&mut self) {
         // The flags of a future are in its frame, which is not only reached by these addresses.
         if self.unwound.is_none() {
@@ -7626,22 +7659,76 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let flags: FxHashSet<Value> = self.drop_flags.iter().map(|(_, flag)| flag.addr).collect();
         let func = &mut *self.builder.func;
+        // What was read from a flag, or is that with bits set or cleared, by the flag.
+        let mut states: FxHashMap<Value, Value> = FxHashMap::default();
+        // The flag whose state a `band` or `bor` of these changes bits of: one side is the
+        // state, and the other has nothing of a flag in it.
+        let updated = |states: &FxHashMap<Value, Value>, args: [Value; 2]| match args
+            .map(|it| (states.get(&it).copied(), flags.contains(&it)))
+        {
+            [(Some(flag), _), (None, false)] | [(None, false), (Some(flag), _)] => Some(flag),
+            _ => None,
+        };
+        loop {
+            let known = states.len();
+            for block in func.layout.blocks() {
+                for inst in func.layout.block_insts(block) {
+                    let flag = match func.dfg.insts[inst] {
+                        ir::InstructionData::Load { opcode: ir::Opcode::Load, arg, .. } => {
+                            flags.get(&arg).copied()
+                        }
+                        ir::InstructionData::Binary {
+                            opcode: ir::Opcode::Band | ir::Opcode::Bor,
+                            args,
+                        } => updated(&states, args),
+                        _ => None,
+                    };
+                    if let Some(flag) = flag {
+                        states.insert(func.dfg.first_result(inst), flag);
+                    }
+                }
+            }
+            if states.len() == known {
+                break;
+            }
+        }
         let mut read = FxHashSet::default();
+        // The writes to a flag, and what makes the states that are only written back to it.
         let mut writes = Vec::new();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
-                if let ir::InstructionData::Store {
-                    opcode: ir::Opcode::Store,
-                    args: [value, addr],
-                    ..
-                } = func.dfg.insts[inst]
-                    && flags.contains(&addr)
-                    && !flags.contains(&value)
-                {
-                    writes.push((addr, inst));
-                    continue;
+                match func.dfg.insts[inst] {
+                    ir::InstructionData::Store {
+                        opcode: ir::Opcode::Store,
+                        args: [value, addr],
+                        ..
+                    } if flags.contains(&addr) && !flags.contains(&value) => {
+                        if let Some(&of) = states.get(&value)
+                            && of != addr
+                        {
+                            read.insert(of);
+                        }
+                        writes.push((addr, inst));
+                    }
+                    ir::InstructionData::Load { opcode: ir::Opcode::Load, arg, .. }
+                        if flags.contains(&arg) =>
+                    {
+                        writes.push((arg, inst));
+                    }
+                    ir::InstructionData::Binary {
+                        opcode: ir::Opcode::Band | ir::Opcode::Bor,
+                        args,
+                    } if let Some(flag) = updated(&states, args) => writes.push((flag, inst)),
+                    _ => {
+                        for value in func.dfg.inst_values(inst) {
+                            if flags.contains(&value) {
+                                read.insert(value);
+                            } else if let Some(&of) = states.get(&value) {
+                                read.insert(of);
+                            }
+                        }
+                    }
                 }
-                read.extend(func.dfg.inst_values(inst).filter(|it| flags.contains(it)));
             }
         }
         for (addr, inst) in writes {
@@ -7764,6 +7851,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 | FlagEvent::Restored(local, _) => {
                     if self.drop_flags.contains_idx(*local) {
                         state.follow(event);
+                        if matches!(event, FlagEvent::Moved(..))
+                            && self.nothing_to_drop(body, *local, state)
+                        {
+                            state.set_spent(*local);
+                        }
                     }
                 }
             }
@@ -7790,7 +7882,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Whether dropping the local would do nothing: it is empty, or every field of it that
     /// has a destructor is moved out.
     fn nothing_to_drop(&self, body: &MirBody<'db>, local: LocalId, held: &Held) -> bool {
-        if held.whole(local) == Some(false) {
+        if held.whole(local) == Some(false) || held.spent(local) {
             return true;
         }
         let Some(moved) = held.moved(local) else { return false };
@@ -8953,9 +9045,44 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = self.operand_ty(operand)?;
             return Ok((self.builder.use_var(register.var), self.scalar_of(ty)?));
         }
+        if let Some((bits, ty)) = self.literal_bits(operand) {
+            let scalar = self.scalar_of(ty)?;
+            return Ok((self.iconst(scalar.ty, bits), scalar));
+        }
         let (addr, ty) = self.operand(operand)?;
         let scalar = self.scalar_of(ty)?;
         Ok((self.builder.ins().load(scalar.ty, MEM, addr, 0), scalar))
+    }
+
+    /// The value of an operand that is an integer, `bool` or `char` whose bytes are known
+    /// here, which is read without being put in memory first. `line!()` and `column!()` are
+    /// literals whose bytes are placeholders.
+    fn literal_bits(&self, operand: &Operand) -> Option<(u128, Ty<'db>)> {
+        let ty = match &operand.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return None,
+        };
+        if !matches!(ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)) {
+            return None;
+        }
+        if let Some(MirSpan::ExprId(expr)) = operand.span
+            && self.body.is_some_and(|body| self.location_macro(body, expr).is_some())
+        {
+            return None;
+        }
+        let OperandKind::Allocation { allocation } = &operand.kind else {
+            return Some((self.const_bits(operand)?, ty));
+        };
+        let memory = &allocation.as_ref().memory;
+        let size = self.layout(ty).ok()?.size.bytes_usize();
+        // Const eval stores some scalars as 16 bytes.
+        if memory.len() != size && memory.len() != 16 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        bytes[..size].copy_from_slice(&memory[..size]);
+        Some((u128::from_le_bytes(bytes), ty))
     }
 
     fn copy(&mut self, dst: Value, src: Value, size: Size) {
@@ -9214,7 +9341,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PointerCast::ReifyFnPointer | PointerCast::ClosureFnPointer(_),
             ) => {
                 let callee = self.fn_item(from_ty)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
                 let pointer = self.builder.ins().func_addr(ptr(), callee);
                 self.builder.ins().store(MEM, pointer, dst, 0);
             }
@@ -9499,8 +9626,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let scalar = self.scalar_of(ty)?;
         let r_scalar = self.scalar_of(r_ty)?;
-        let l = self.builder.ins().load(scalar.ty, MEM, l_addr, 0);
-        let r = self.builder.ins().load(r_scalar.ty, MEM, r_addr, 0);
+        // A literal is an immediate, and the constant it was given an address as is not read.
+        let l = match self.literal_bits(lhs) {
+            Some((bits, _)) => self.iconst(scalar.ty, bits),
+            None => self.builder.ins().load(scalar.ty, MEM, l_addr, 0),
+        };
+        let r = match self.literal_bits(rhs) {
+            Some((bits, _)) => self.iconst(r_scalar.ty, bits),
+            None => self.builder.ins().load(r_scalar.ty, MEM, r_addr, 0),
+        };
         let signed = scalar.signed;
         if scalar.ty.is_float() {
             return self.float_binary_op(op, l, r);
@@ -10950,7 +11084,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let argc = self.builder.ins().sextend(types::I64, argc);
         let callee = self.fn_item(main_ty)?;
-        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
         let pointer = self.builder.ins().func_addr(ptr(), callee);
         // What `SIGPIPE` does is left as the runtime has it.
         let sigpipe = self.builder.ins().iconst(types::I8, 0);
@@ -11467,7 +11601,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.declare_variadic(func, &mut declared)?;
                 }
                 let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
                 self.builder.ins().func_addr(ptr(), callee)
             }
             Callee::Pointer(pointer, ..) => pointer,
@@ -11527,7 +11661,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig.params.push(AbiParam::new(ptr()));
         values.push(callee);
         let through = self.cg.assembly(asm::counted_variadic(ints, stack), sig);
-        let through = self.cg.declare_func_in_func(through, self.builder.func);
+        let through = self.cg.declare_func_address_in_func(through, self.builder.func);
         Ok(self.builder.ins().func_addr(ptr(), through))
     }
 

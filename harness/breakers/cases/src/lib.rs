@@ -171,4 +171,8 @@ cases![
     unit_slice_constant,
     fn_as_pointer_in_const,
     array_in_tuple_moved_out,
+    match_arm_moves_drops,
+    import_called_and_pointed,
+    literal_operands,
+    moved_bits_unread,
 ];

@@ -579,9 +579,33 @@ impl<'db> Recorder<'db> {
         })
     }
 
-    /// Names a requested function in `func`. Whether the function ends up in this object is
-    /// not known here, so it is reached the way a function of another object is.
+    /// Whether a call names its callee in place, for the linker to send through a stub of
+    /// its own when the callee turns out to be another library's, rather than load the
+    /// callee's address from a slot first. An x86-64 ELF linker does that for a `call`.
+    fn calls_in_place(&self) -> bool {
+        let triple = self.isa.triple();
+        self.within_image()
+            || (triple.binary_format == target_lexicon::BinaryFormat::Elf
+                && triple.architecture == target_lexicon::Architecture::X86_64)
+    }
+
+    /// Names a requested function in `func`, to call it. Whether the function ends up in
+    /// this object is not known here.
     pub(super) fn declare_func_in_func(&self, id: FuncId, func: &mut ir::Function) -> ir::FuncRef {
+        self.declare_func(id, func, self.calls_in_place())
+    }
+
+    /// Names a requested function in `func`, to take its address: it is reached the way a
+    /// function of another object is, which a call need not be.
+    pub(super) fn declare_func_address_in_func(
+        &self,
+        id: FuncId,
+        func: &mut ir::Function,
+    ) -> ir::FuncRef {
+        self.declare_func(id, func, self.within_image())
+    }
+
+    fn declare_func(&self, id: FuncId, func: &mut ir::Function, colocated: bool) -> ir::FuncRef {
         let signature =
             func.import_signature(self.requests.funcs[id.as_u32() as usize].sig.clone());
         let name = func.declare_imported_user_function(ir::UserExternalName {
@@ -591,7 +615,7 @@ impl<'db> Recorder<'db> {
         func.import_function(ir::ExtFuncData {
             name: ir::ExternalName::user(name),
             signature,
-            colocated: self.within_image(),
+            colocated,
             patchable: false,
         })
     }
