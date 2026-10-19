@@ -1991,11 +1991,20 @@ struct Listed {
 
 struct ListedCrate {
     functions: Vec<FunctionId>,
+    statics: Vec<StaticId>,
     /// The statics a linker or a runtime finds though no code names them.
     kept: Vec<StaticId>,
     /// For each, whether a runtime looks it up by name.
     exported: Vec<bool>,
     main: Option<FunctionId>,
+}
+
+/// Has `known` take the statics of the checkout to be as rustc compiled them: a build after
+/// an edit can be the first to use rustc's copy of one.
+fn remember_statics(db: &RootDatabase, args: &Args, listed: &Listed, known: &mut Rejections) {
+    for &krate in args.members.iter() {
+        known.remember_statics(db, &listed.of(db, krate.into()).statics);
+    }
 }
 
 /// Whether the root of `krate` says `#![no_main]`.
@@ -2009,7 +2018,8 @@ impl ListedCrate {
     fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
         let Declared { functions, statics, .. } = declared_in(db, krate);
         let kept = statics
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|&it| {
                 hir_def::attrs::AttrFlags::query(db, it.into())
                     .contains(hir_def::attrs::AttrFlags::USED)
@@ -2026,7 +2036,7 @@ impl ListedCrate {
             .iter()
             .map(|&it| exported_symbol(db, it).is_some() || serves_allocator(db, it))
             .collect();
-        ListedCrate { functions, kept, exported, main }
+        ListedCrate { functions, statics, kept, exported, main }
     }
 }
 
@@ -4426,6 +4436,7 @@ fn run_holding(
     }
     hir::attach_db(&db, || {
         known.out_of_date(&db);
+        remember_statics(&db, &args, &listed, &mut known);
         known.out_of_date_static(&db);
     });
     // What rustc compiled, by where in the checkout it is: the files as this build read them.
@@ -5537,6 +5548,9 @@ impl Program {
             .or(broken)
             .or_else(|| warm.unset.clone());
         failed = failed.or_else(|| stale_copies(db, table, args));
+        if tests.is_none() {
+            hir::attach_db(db, || remember_statics(db, args, listed, known));
+        }
         failed = failed.or_else(|| {
             let id = hir::attach_db(db, || known.out_of_date_static(db))?;
             let name =

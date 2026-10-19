@@ -321,10 +321,11 @@ def test_results(ran):
     names = re.sub(r"-[0-9a-f]{16}/", "-HASH/", ran.stdout.replace("target-ref", "target"))
     # A test's result is not always on the line of its name: what a program started by
     # another test prints lands between the two. So the names are read from the lines and
-    # the failures from the list at the end, and the totals say the rest.
+    # the failures from the list at the end, and the totals say the rest. A test rustd did
+    # not run because nothing it can run changed counts as it says: `3 passed (2 cached)`.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
     tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M)] + [(name.strip(), "FAILED") for name in failed if name])
-    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", ran.stdout, re.M))
+    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", re.sub(r" \(\d+ cached\)", "", ran.stdout), re.M))
     return ran.returncode, tests, totals
 
 

@@ -141,7 +141,7 @@ Each line says: tracked, conservative (rerun), or out of scope, and why.
 ## 2. Remembering results
 
 Per test executable, next to the object the daemon builds for it:
-`target/rustd/<key>/programs/<program>/bin.results`, beside `bin.reached`, the fingerprints
+`target/rustd/<key>/programs/<program>/rustd.o.results`, beside `rustd.o.reached`, the fingerprints
 of the build that linked it. `<key>` already separates command lines (profile, features,
 flags). The file maps a test name to the fingerprint it last passed under, and holds one
 hash of everything the client alone knows; when that differs nothing in the file counts.
@@ -273,7 +273,15 @@ unrelated to selection (`origin/perf-climb` at a8db50abc5 has both):
 
 - A static the build takes from rustc (any static of a crate with a function left to
   rustc that the daemon cannot see into) kept rustc's value after its initializer was
-  edited. The daemon now refuses such a build (`Frozen::out_of_date_static`).
+  edited. The daemon now refuses such a build (`Frozen::out_of_date_static`). The refusal
+  is wider than the fault: a program that joins the daemon after an edit to a crate has
+  nothing to compare rustc's copy of that crate's statics with, so any thread-local of
+  the crate refuses it, edited or not. `harness/cargo_rustd.py --small` has one such case
+  (`edit: cargo rustd test --test it`, a `thread_local!` in the edited `util`), which
+  passes on `perf-climb` and is refused here. Telling the two apart needs the serial of
+  the static as rustc compiled it, which the daemon has only for programs built before
+  the edit; compiling thread-locals in the daemon instead of importing them would remove
+  the question.
 - Code that only a `#[used]` or `#[link_section]` static points to (a function run before
   `main`) stayed rustc's after an edit. For a program with tests the daemon now refuses
   the build when what such statics reach changed or is not all known.

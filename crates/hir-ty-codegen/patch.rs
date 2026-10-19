@@ -257,6 +257,28 @@ impl Frozen {
         self.edited.extend(crates);
     }
 
+    /// Whether nothing tells what rustc compiled `id` from: an edit could have reached it
+    /// before it was first looked at.
+    fn unseen(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+        let krate = id.krate(db);
+        self.distrusted.contains(&krate)
+            || self.edited.contains(&krate)
+            || self.edited_bodies.contains(&body_file(db, id.into()))
+    }
+
+    /// Takes `statics` to be what rustc compiled, where no edit can have reached them yet: a
+    /// later build can be the first to use rustc's copy of one.
+    pub(in crate::mir) fn remember_statics(&mut self, db: &dyn HirDatabase, statics: &[StaticId]) {
+        for &id in statics {
+            if !self.statics.contains_key(&id)
+                && !self.unseen(db, id)
+                && let Some(now) = probe(|| static_serial(db, id))
+            {
+                self.statics.insert(id, now);
+            }
+        }
+    }
+
     /// One of `imported`, the statics a build uses rustc's copies of, that rustc's copy is
     /// no longer right for.
     pub(in crate::mir) fn out_of_date_static(
@@ -264,21 +286,11 @@ impl Frozen {
         db: &dyn HirDatabase,
         imported: &[StaticId],
     ) -> Option<StaticId> {
+        self.remember_statics(db, imported);
         imported.iter().copied().find(|&id| {
+            let was = self.statics.get(&id);
             let now = probe(|| static_serial(db, id));
-            let krate = id.krate(db);
-            // Nothing to tell a change by when it was not used before an edit could reach it.
-            let unseen = self.distrusted.contains(&krate)
-                || self.edited.contains(&krate)
-                || self.edited_bodies.contains(&body_file(db, id.into()));
-            match (self.statics.get(&id), now) {
-                (Some(was), now) => now != Some(*was),
-                (None, Some(now)) if !unseen => {
-                    self.statics.insert(id, now);
-                    false
-                }
-                (None, _) => true,
-            }
+            was.is_none() || was != now.as_ref()
         })
     }
 

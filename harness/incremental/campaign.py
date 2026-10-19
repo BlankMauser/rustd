@@ -22,14 +22,16 @@ result in `ref` differs from the step before and that `sel` did not run is count
 recalled: `sel` had its result from an earlier step with the same code. Every step is one line of
 JSON in --work/PROJECT.jsonl, and the full output of every command is in --work/PROJECT.log.
 """
-import json, os, random, re, shutil, subprocess, sys, time
+import json, os, random, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+HANG = 120
 RUSTD = os.environ.get("RUSTD_BIN") or str(HERE.parent.parent / "target/release/rustd")
 TOOLCHAIN = os.environ.get("RUSTUP_TOOLCHAIN", "1.99.0")
 
-LINE = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:, [^(]*)?( \(cached\))?\s*$")
+# Not anchored: what a test's own children write to stderr can end up before it on the line.
+LINE = re.compile(r"test (\S+(?: - should panic)?) \.\.\. (ok|FAILED|ignored)(?:, [^(]*)?( \(cached\))?\s*$")
 RUNNING = re.compile(r"^\s*Running (.+?) \(.*?([^/]+?)-[0-9a-f]{16}\)\s*$")
 DOC = re.compile(r"^\s*Doc-tests (\S+)")
 
@@ -43,7 +45,7 @@ def parse(text):
         if m:
             current = programs.setdefault(" ".join(m.groups()), {})
             continue
-        m = LINE.match(line)
+        m = LINE.search(line)
         if m and current is not None:
             name = m.group(1).removesuffix(" - should panic")
             current[name] = (m.group(2), bool(m.group(3)))
@@ -52,13 +54,21 @@ def parse(text):
 
 def run(cmd, cwd, env, log, label):
     start = time.time()
-    done = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             errors="replace", start_new_session=True)
+    try:
+        out, hung = child.communicate(timeout=HANG)[0], False
+    except subprocess.TimeoutExpired:
+        # A mutation can make the code under test loop for ever, in both copies.
+        os.killpg(child.pid, signal.SIGKILL)
+        out, hung = child.communicate()[0], True
     took = time.time() - start
-    log.write(f"\n$ [{label}] {' '.join(cmd)}  (in {cwd}, {took:.2f}s, exit {done.returncode})\n{done.stdout}")
+    log.write(f"\n$ [{label}] {' '.join(cmd)}  (in {cwd}, {took:.2f}s, exit {child.returncode})\n{out}")
     log.flush()
-    refused = next((l.strip() for l in done.stdout.splitlines() if "rustd did not build" in l), None)
-    return dict(code=done.returncode, took=round(took, 3), results=parse(done.stdout), refused=refused,
-                said=sorted({l.strip() for l in done.stdout.splitlines() if re.match(r"^(\x1b\[[0-9;]*m)*rustd:", l)}))
+    said = out.splitlines()
+    refused = next((l.strip() for l in said if "rustd did not build" in l), None)
+    return dict(code=child.returncode, took=round(took, 3), results=parse(out), refused=refused, hung=hung,
+                said=sorted({l.strip() for l in said if re.match(r"^(\x1b\[[0-9;]*m)*rustd:", l)}))
 
 
 def flat(results):
@@ -72,7 +82,7 @@ class Campaign:
         for copy in (self.a, self.b):
             if copy.exists():
                 shutil.rmtree(copy)
-            shutil.copytree(source, copy, ignore=shutil.ignore_patterns("target", ".git"))
+            shutil.copytree(source, copy, symlinks=True, ignore=shutil.ignore_patterns("target", ".git"))
         self.log = open(work / f"{name}.log", "w")
         self.rows = open(work / f"{name}.jsonl", "w")
         home = work / "rustd-home"
@@ -81,7 +91,7 @@ class Campaign:
         self.plain = dict(base)
         self.rustd = dict(base, RUSTD_HOME=str(home), RUSTD_FIRST_BUILD="1",
                           PATH=f"{Path(RUSTD).parent}:{base['PATH']}")
-        self.before, self.failures, self.refusals, self.steps = None, [], [], 0
+        self.before, self.failures, self.refusals, self.hung, self.steps = None, [], [], [], 0
 
     def step(self, label, kind, extra_args=(), extra_env=None):
         args = ["test", *self.args, *extra_args, "--no-fail-fast"]
@@ -89,6 +99,13 @@ class Campaign:
         sel = run(["cargo", "rustd", *args], self.a, envs[0], self.log, f"{label} sel")
         all_ = run(["cargo", "rustd", *args, "--rerun-all"], self.a, envs[1], self.log, f"{label} all")
         ref = run(["cargo", *args], self.b, envs[2], self.log, f"{label} ref")
+        if sel["hung"] or all_["hung"] or ref["hung"]:
+            # Only cargo's run hanging too says it is the edit and not the build.
+            (self.hung if ref["hung"] else self.failures).append(label)
+            self.rows.write(json.dumps(dict(step=self.steps, label=label, kind=kind, hung=True)) + "\n")
+            self.steps += 1
+            print(f"hung {self.steps:3} {label:44} sel {sel['hung']} all {all_['hung']} ref {ref['hung']}", flush=True)
+            return
         s, a, r = flat(sel["results"]), flat(all_["results"]), flat(ref["results"])
         cached = {k for k, v in s.items() if v[1]}
         misses = sorted(k for k in cached if (k in a and a[k][0] != s[k][0]) or (k in r and r[k][0] != s[k][0]))
@@ -219,7 +236,7 @@ def hazards(c):
 
 
 OPERATORS = [(" == ", " != "), (" != ", " == "), ("true", "false"), ("false", "true"), (" && ", " || "),
-             (" < ", " >= "), (" > ", " <= "), (" + 1", " + 2"), ("Some(", "None.or(")]
+             (" < ", " >= "), (" > ", " <= "), (" + 1", " + 2"), (".is_some()", ".is_none()"), (".is_empty()", ".len() == 1")]
 
 
 def mutations(c, count, seed):
@@ -264,7 +281,7 @@ def main():
     else:
         c = Campaign(name, Path(flag("--source")).resolve(), work, flag("--args", "").split())
         mutations(c, int(flag("--mutations", "25")), int(flag("--seed", "1")))
-    print(f"{c.steps} steps, {len(c.failures)} failed, {len(c.refusals)} refused by rustd"
+    print(f"{c.steps} steps, {len(c.failures)} failed, {len(c.refusals)} refused by rustd, {len(c.hung)} hung and not compared"
           + "".join(f"\n  failed: {it}" for it in c.failures) + "".join(f"\n  refused: {it}" for it in c.refusals))
     sys.exit(1 if c.failures else 0)
 

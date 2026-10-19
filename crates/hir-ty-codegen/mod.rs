@@ -892,6 +892,12 @@ impl Rejections {
         self.frozen.out_of_date(db, self.base.as_ref()?)
     }
 
+    /// Takes `statics` to be as rustc compiled them, for the builds after an edit that use
+    /// rustc's copy of one for the first time.
+    pub fn remember_statics(&mut self, db: &dyn HirDatabase, statics: &[StaticId]) {
+        self.frozen.remember_statics(db, statics);
+    }
+
     /// A static the last build in full uses rustc's copy of that is not what rustc compiled.
     /// Called as [`Rejections::out_of_date`] is.
     pub fn out_of_date_static(&mut self, db: &dyn HirDatabase) -> Option<StaticId> {
