@@ -8712,9 +8712,44 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = self.operand_ty(operand)?;
             return Ok((self.builder.use_var(register.var), self.scalar_of(ty)?));
         }
+        if let Some((bits, ty)) = self.literal_bits(operand) {
+            let scalar = self.scalar_of(ty)?;
+            return Ok((self.iconst(scalar.ty, bits), scalar));
+        }
         let (addr, ty) = self.operand(operand)?;
         let scalar = self.scalar_of(ty)?;
         Ok((self.builder.ins().load(scalar.ty, MEM, addr, 0), scalar))
+    }
+
+    /// The value of an operand that is an integer, `bool` or `char` whose bytes are known
+    /// here, which is read without being put in memory first. `line!()` and `column!()` are
+    /// literals whose bytes are placeholders.
+    fn literal_bits(&self, operand: &Operand) -> Option<(u128, Ty<'db>)> {
+        let ty = match &operand.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return None,
+        };
+        if !matches!(ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)) {
+            return None;
+        }
+        if let Some(MirSpan::ExprId(expr)) = operand.span
+            && self.body.is_some_and(|body| self.location_macro(body, expr).is_some())
+        {
+            return None;
+        }
+        let OperandKind::Allocation { allocation } = &operand.kind else {
+            return Some((self.const_bits(operand)?, ty));
+        };
+        let memory = &allocation.as_ref().memory;
+        let size = self.layout(ty).ok()?.size.bytes_usize();
+        // Const eval stores some scalars as 16 bytes.
+        if memory.len() != size && memory.len() != 16 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        bytes[..size].copy_from_slice(&memory[..size]);
+        Some((u128::from_le_bytes(bytes), ty))
     }
 
     fn copy(&mut self, dst: Value, src: Value, size: Size) {
@@ -9258,8 +9293,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let scalar = self.scalar_of(ty)?;
         let r_scalar = self.scalar_of(r_ty)?;
-        let l = self.builder.ins().load(scalar.ty, MEM, l_addr, 0);
-        let r = self.builder.ins().load(r_scalar.ty, MEM, r_addr, 0);
+        // A literal is an immediate, and the constant it was given an address as is not read.
+        let l = match self.literal_bits(lhs) {
+            Some((bits, _)) => self.iconst(scalar.ty, bits),
+            None => self.builder.ins().load(scalar.ty, MEM, l_addr, 0),
+        };
+        let r = match self.literal_bits(rhs) {
+            Some((bits, _)) => self.iconst(r_scalar.ty, bits),
+            None => self.builder.ins().load(r_scalar.ty, MEM, r_addr, 0),
+        };
         let signed = scalar.signed;
         if scalar.ty.is_float() {
             return self.float_binary_op(op, l, r);
