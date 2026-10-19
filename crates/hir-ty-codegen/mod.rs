@@ -510,6 +510,7 @@ impl CodegenUnit {
             }
         }
         let patching = known.patching;
+        let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
         let Rejections {
@@ -523,6 +524,7 @@ impl CodegenUnit {
             counted,
             stale: _,
             frozen: _,
+            used_by_rustc: _,
         } = known;
         let mut own_statics = OwnStatics::new(
             db,
@@ -653,9 +655,15 @@ impl CodegenUnit {
                 rejected.extend(failed);
                 continue;
             }
-            if failed.is_empty() && !from_rustc.is_empty() {
+            // The copy rustc makes of a function without a symbol, where it is used, handles
+            // the futures the function does.
+            let generic: Vec<FunctionId> = match used_by_rustc {
+                true => skipped.iter().filter(|(_, e)| e.no_symbol()).map(|it| it.0).collect(),
+                false => Vec::new(),
+            };
+            if failed.is_empty() && (!from_rustc.is_empty() || !generic.is_empty()) {
                 let mut theirs = Some(FxHashSet::default());
-                for root in &from_rustc {
+                for root in from_rustc.iter().chain(&generic) {
                     let blocks = async_blocks(db, *root).clone();
                     theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
                         all.extend(blocks);
@@ -843,6 +851,9 @@ pub struct Rejections {
     left: FxHashSet<FunctionId>,
     /// Whether to answer an edit with a patch for the object of the last full build.
     pub patching: bool,
+    /// Whether rustc compiles a crate that uses the ones built, as it does the examples of a
+    /// library: it then has code of its own for every function of theirs without a symbol.
+    pub used_by_rustc: bool,
     base: Option<patch::Base>,
     frozen: patch::Frozen,
     stale: Vec<Stale>,

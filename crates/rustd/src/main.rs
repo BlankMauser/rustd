@@ -4665,6 +4665,7 @@ fn run_holding(
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     if let Some(asked) = doc {
         let krate = *crates_named(&db, &args.krate, &args)?.first().context("no such crate")?;
+        known.used_by_rustc = true;
         let built = build(&db, &table, &args, &mut known, &listed)?;
         eprint!("doctests: ");
         report(&built);
