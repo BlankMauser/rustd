@@ -100,12 +100,15 @@ impl Node {
 
 /// What a query gives for something of the base, or `None` when it panics: the edit may have
 /// taken away what the base knew it by, and only looking tells. A build that is interrupted
-/// goes on unwinding: that says nothing about the base.
+/// goes on unwinding: that says nothing about the base. One that waited for a thread whose
+/// own look panicked has found what that thread found.
 fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(found) => Some(found),
-        Err(stopped) if stopped.is::<salsa::Cancelled>() => std::panic::resume_unwind(stopped),
-        Err(_) => None,
+        Err(stopped) => match stopped.downcast_ref::<salsa::Cancelled>() {
+            Some(salsa::Cancelled::PropagatedPanic) | None => None,
+            Some(_) => std::panic::resume_unwind(stopped),
+        },
     }
 }
 
@@ -1098,6 +1101,9 @@ mod tests {
         let gone: Option<()> = probe(|| panic!("the base no longer has it"));
         assert_eq!(gone, None);
         assert_eq!(probe(|| 7), Some(7));
+        let waited: Option<()> =
+            probe(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PropagatedPanic)));
+        assert_eq!(waited, None);
         let interrupted = std::panic::catch_unwind(|| {
             probe(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite)))
         });
