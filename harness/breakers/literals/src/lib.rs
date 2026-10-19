@@ -16,3 +16,10 @@ pub fn minus_half(_input: TokenStream) -> TokenStream {
 pub fn dashed(_input: TokenStream) -> TokenStream {
     TokenTree::Literal(Literal::string("-1")).into()
 }
+
+/// Names the unit struct it is on, and takes nothing but `struct Unit;` spelled so.
+#[proc_macro_derive(NamedByText)]
+pub fn named_by_text(input: TokenStream) -> TokenStream {
+    assert_eq!(input.to_string(), "struct Unit;");
+    "impl Unit { pub fn name() -> &'static str { \"Unit\" } }".parse().unwrap()
+}

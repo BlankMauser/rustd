@@ -62,7 +62,9 @@ CASES = [
     ("a feature", arg("--features", "extra"), "feature"),
     ("a variable of the process read by option_env!", setenv("KEYS_PROCESS", "set"), "process_env"),
     ("a variable of .cargo/config.toml", replace(".cargo/config.toml", '"config"', '"config anew"'), "config_env"),
-    ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "--cfg keys_flag"), "flag_cfg"),
+    # With the flag `difftest` sets, which this would otherwise take the place of: without it
+    # rustc keeps to one object the functions nothing else calls, and those are left to rustc.
+    ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "-C link-dead-code --cfg keys_flag"), "flag_cfg"),
     ("the release profile", arg("--release"), "assertions"),
     ("overflow checks of the dev profile", append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n"), "overflows"),
     ("debug assertions of the dev profile", append("Cargo.toml", "\n[profile.dev]\ndebug-assertions = false\n"), "assertions"),

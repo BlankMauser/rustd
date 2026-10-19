@@ -40,7 +40,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
@@ -1016,14 +1016,34 @@ impl Store {
         }
     }
 
+    /// What the sealed packs hold, also after a thread panicked with it: the two maps are
+    /// whole between any two statements, and a value read by them is checked against its
+    /// checksum, so the worst a panic leaves is a key that is compiled again.
+    fn sealed(&self) -> RwLockReadGuard<'_, Sealed> {
+        self.sealed.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sealed_mut(&self) -> RwLockWriteGuard<'_, Sealed> {
+        self.sealed.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The writer. After a thread panicked with it, what it was writing is given up as
+    /// after a write that failed: the open pack is left to whoever seals it, which cuts it
+    /// at its last whole record, and nothing more is kept until the build ends.
+    fn writer(&self) -> MutexGuard<'_, Writer> {
+        self.writer.lock().unwrap_or_else(|poisoned| {
+            self.writer.clear_poison();
+            let mut writer = poisoned.into_inner();
+            writer.stop(io::Error::other("a thread panicked while it wrote to the store"));
+            writer
+        })
+    }
+
     /// Reads the sealed packs that were added to the directory since the last call, by this
     /// daemon or any other, and forgets the ones that were taken out of it.
     pub(super) fn refresh(&self) {
         let Ok(names) = self.dir.packs() else { return };
-        let known: FxHashSet<String> = match self.sealed.read() {
-            Ok(sealed) => sealed.packs.keys().cloned().collect(),
-            Err(_) => return,
-        };
+        let known: FxHashSet<String> = self.sealed().packs.keys().cloned().collect();
         let names: FxHashSet<String> = names.into_iter().collect();
         let added: Vec<&String> = names.difference(&known).collect();
         let read = self.read_packs(&added);
@@ -1031,7 +1051,7 @@ impl Store {
         if read.is_empty() && gone.is_empty() {
             return;
         }
-        let Ok(mut sealed) = self.sealed.write() else { return };
+        let mut sealed = self.sealed_mut();
         // First, so that a key of a pack that went is found in the one that took it in.
         if !gone.is_empty() {
             sealed.packs.retain(|name, _| !gone.contains(name));
@@ -1139,18 +1159,15 @@ impl Store {
 
     /// As [`Self::flush`], sealing the open pack if it has `seal_at` bytes.
     fn settle(&self, seal_at: u64) {
-        let sealed = match self.writer.lock() {
-            Ok(mut writer) => writer.settle(&self.dir, seal_at),
-            Err(_) => false,
-        };
+        let sealed = self.writer().settle(&self.dir, seal_at);
         self.mark_used();
         if sealed {
             self.collect();
         }
         self.refresh();
-        if let (Ok(sealed), Ok(mut writer)) = (self.sealed.read(), self.writer.lock()) {
-            writer.keys.retain(|key| !sealed.index.contains_key(key));
-        }
+        let sealed = self.sealed();
+        self.writer().keys.retain(|key| !sealed.index.contains_key(key));
+        drop(sealed);
         let corrupt = self.corrupt.swap(0, Ordering::Relaxed);
         if corrupt != 0 {
             eprintln!("store: {corrupt} packs or values were not what was written, and are gone");
@@ -1160,7 +1177,7 @@ impl Store {
     /// Sets the time of last use of the packs that were read from, which is what a
     /// collection goes by.
     fn mark_used(&self) {
-        let Ok(sealed) = self.sealed.read() else { return };
+        let sealed = self.sealed();
         let now = SystemTime::now();
         for pack in sealed.packs.values() {
             if pack.used.swap(false, Ordering::Relaxed) {
@@ -1173,7 +1190,7 @@ impl Store {
     /// Where the value of a key as it is on disk is. A key no sealed pack has is asked of
     /// whoever fetches packs for this process, and looked for again in what arrived.
     fn place(&self, key: &[u8; KEY]) -> Option<Place> {
-        let known = || self.sealed.read().ok()?.index.get(key).cloned();
+        let known = || self.sealed().index.get(key).cloned();
         if let Some(place) = known() {
             return Some(place);
         }
@@ -1210,9 +1227,7 @@ impl Store {
             return;
         }
         // The pack stays known, so that it is not read again should it not be removable.
-        if let Ok(mut sealed) = self.sealed.write() {
-            sealed.index.retain(|_, place| !Arc::ptr_eq(&place.pack, pack));
-        }
+        self.sealed_mut().index.retain(|_, place| !Arc::ptr_eq(&place.pack, pack));
         self.discard(&pack.name, "has a value that is not what was written");
     }
 
@@ -1228,13 +1243,11 @@ impl Store {
     /// to the build: it is counted, and compiled again by the next.
     pub(super) fn insert(&self, key: &[u8; KEY], value: &[u8]) {
         let key = self.identity.key(key);
-        if self.sealed.read().is_ok_and(|it| it.index.contains_key(&key)) {
+        if self.sealed().index.contains_key(&key) {
             return;
         }
-        let (Ok(mut writer), Ok(len)) = (self.writer.lock(), u32::try_from(value.len())) else {
-            return;
-        };
-        writer.add(&self.dir, self.tuning.seal_at * ROLL_AFTER, &key, value, len);
+        let Ok(len) = u32::try_from(value.len()) else { return };
+        self.writer().add(&self.dir, self.tuning.seal_at * ROLL_AFTER, &key, value, len);
     }
 
     /// How many functions were found, and how many were not, since the last call.
@@ -1950,6 +1963,41 @@ mod tests {
         store.insert(&[1; KEY], b"one");
         store.flush();
         assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_thread_that_panics_with_the_store_stops_the_writer_for_the_build_and_no_longer() {
+        let dir = scratch("poisoned");
+        let store = open(&dir, EAGER);
+        store.insert(&[1; KEY], b"one");
+        store.flush();
+        std::thread::scope(|scope| {
+            let with_the_index = scope.spawn(|| {
+                let _sealed = store.sealed.write().unwrap();
+                panic!("unwinds as an interrupted build does");
+            });
+            let with_the_writer = scope.spawn(|| {
+                let _writer = store.writer.lock().unwrap();
+                panic!("unwinds as an interrupted build does");
+            });
+            assert!(with_the_index.join().is_err() && with_the_writer.join().is_err());
+        });
+        assert!(store.sealed.is_poisoned() && store.writer.is_poisoned());
+        assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        store.insert(&[2; KEY], b"two");
+        assert!(!store.writer.is_poisoned());
+        {
+            let writer = store.writer();
+            assert!(writer.stopped.as_deref().is_some_and(|it| it.contains("panicked")));
+            assert_eq!(writer.dropped, 1);
+        }
+        store.flush();
+        assert_eq!(store.get(&[2; KEY]), None);
+        store.insert(&[2; KEY], b"two");
+        store.flush();
+        assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        assert_eq!(store.get(&[2; KEY]).as_deref(), Some(&b"two"[..]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1037,7 +1037,11 @@ def plain(work):
         _, mine = here.cargo(command, *args, env=more)
         _, other = alone.cargo(command, *args, env=more)
         compare = test_results if command == "test" else program_output
-        return mine, here.how_built(mine.stderr), difference(compare(mine), compare(other))
+        wrong = difference(compare(mine), compare(other))
+        if wrong and mine.returncode != other.returncode:
+            # How it ended is in what it said last: a signal has no other word.
+            wrong += f"; {mine.stderr.strip()[-600:]!r}"
+        return mine, here.how_built(mine.stderr), wrong
 
     first, how, wrong = same("run")
     outer, inner = calls("outer"), calls("inner")
@@ -1055,7 +1059,7 @@ def plain(work):
     mine, how, wrong = same("run", "lib")
     check("an edit of a library of the workspace is built by the daemon into the program", mine.returncode == 0 and not wrong and how == "daemon" and greets(mine.stdout, "lib hello lib"), f"{how}; {wrong or 'same as cargo'}")
     took, noop = here.cargo("run")
-    check("a build with nothing changed runs nothing", noop.returncode == 0 and "Compiling" not in noop.stderr, f"{took:.2f}s")
+    check("a build with nothing changed runs nothing", noop.returncode == 0 and "Compiling" not in noop.stderr, f"{took:.2f}s" if noop.returncode == 0 else f"exit {noop.returncode}; {noop.stderr.strip()[-600:]!r}")
 
     cases = [
         ("test", [], None), ("test", ["--doc"], None), ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
@@ -1176,7 +1180,7 @@ def plain(work):
     touch("off")
     n = len(calls("outer"))
     mine, how, wrong = same("run", "off")
-    check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^rustd:|\[rustd\]", mine.stderr, re.M) and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(calls('outer')) - n} calls of the wrapper; {mine.stderr.strip()[-300:]}")
+    check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^rustd:|\[rustd\]", mine.stderr, re.M) and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(calls('outer')) - n} calls of the wrapper, by rustd's {[c[:200] for c in calls('outer')[n:] if 'rustd-rustc' in c][:2]}; {mine.stderr.strip()[-300:]}")
     subprocess.run([RUSTD, "stop"], env=env, capture_output=True)
     subprocess.run([os.path.join(other, "rustd"), "stop"], env=env, capture_output=True)
     return checks

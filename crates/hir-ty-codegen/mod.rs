@@ -36,7 +36,10 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
 };
-use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
+use hir_expand::{
+    FileRange, HirFileId, InFile, MacroDefKind,
+    builtin::{BuiltinFnLikeExpander, EagerExpander},
+};
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
@@ -47,7 +50,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 use unicode_width::UnicodeWidthChar;
 
@@ -57,7 +60,7 @@ use crate::{
     consteval::try_const_usize,
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
-    drop::{DropGlue, has_drop_glue},
+    drop::{DropGlue, destructor, has_drop_glue},
     infer::PointerCast,
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -74,7 +77,7 @@ use hir_def::lang_item::LangItems;
 use self::debuginfo::{DebugContext, FunctionDebug, LineRow, SlotPlaces, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Named, Recorder,
-    Requests, Variable,
+    Requests, TextPart, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -187,6 +190,26 @@ pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
     rest.starts_with(['/', '\\']).then(|| format!("{to}{rest}"))
 }
 
+/// The sources of the standard library: rustc names them where they are on this machine, and
+/// what is stored names them where they were when the library was built, as every machine can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibrarySources {
+    /// The directory they are in here.
+    pub here: String,
+    /// The directory they were built in, `/rustc/<commit>`.
+    pub built_in: String,
+}
+
+impl LibrarySources {
+    fn stored(&self, path: &str) -> Option<String> {
+        moved(path, &self.here, &self.built_in)
+    }
+
+    fn local(&self, path: &str) -> Option<String> {
+        moved(path, &self.built_in, &self.here)
+    }
+}
+
 /// Symbol names come from the rustc-built artifacts we link against.
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
@@ -246,6 +269,11 @@ pub trait SymbolResolver {
     /// Where cargo keeps the sources it fetched on this machine, when the crates of the
     /// program tell: [`CARGO_HOME`] stands for it in what is stored.
     fn cargo_home(&self) -> Option<String> {
+        None
+    }
+    /// Where the sources of the standard library are, when the toolchain tells where they
+    /// were built.
+    fn library_sources(&self) -> Option<LibrarySources> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -505,6 +533,7 @@ impl CodegenUnit {
         );
         let mut rounds = 0;
         let mut discarded = std::time::Duration::ZERO;
+        let mut start = roots.start;
         loop {
             rounds += 1;
             let round = stdx::time::Instant::now();
@@ -530,7 +559,7 @@ impl CodegenUnit {
             let mut queue = roots.entries.to_vec();
             let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
             let mut next = 0;
-            if let Some(main) = roots.start {
+            if let Some(main) = start {
                 cg.define_start(main)?;
             }
             for &id in roots.kept {
@@ -597,6 +626,12 @@ impl CodegenUnit {
             }
             if cg.misfit {
                 start_over("an entry of the store did not fit");
+                rejected.extend(failed);
+                continue;
+            }
+            // The `main` the C runtime calls would call a `main` that is not in the object.
+            if start.is_some_and(|main| skipped.iter().any(|(root, _)| *root == main)) {
+                start = None;
                 rejected.extend(failed);
                 continue;
             }
@@ -976,6 +1011,9 @@ enum InstanceDef {
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
     /// generic argument: calls the closure through the pointer it is handed, then drops it.
     CallOnceShim,
+    /// A method that takes `self` by value, in a vtable: the slot is called with a pointer to
+    /// the value, which the shim hands to the method as the method takes it.
+    VtableShim(FunctionId),
     /// What a closure that captures nothing coerces to as a function pointer: calls the
     /// closure type that is the instance's only generic argument, which borrows a receiver,
     /// with a dangling one.
@@ -1449,6 +1487,26 @@ fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
     Some(krate.cfg_options(db).check_atom(&flag))
 }
 
+/// Whether the crate `body` is written in keeps the overflow checks in what it keeps of the
+/// body: it does when it has `-C overflow-checks`, or when it is not a crate of the build and
+/// the body takes the setting of its callers. Whether the checks then run is up to the crate
+/// that compiles the body.
+fn body_written_checked(db: &dyn HirDatabase, body: &MirBody<'_>) -> bool {
+    match crate_checks_overflow(db, body.owner.module(db).krate(db)) {
+        Some(written_with) => written_with,
+        None => body.inherits_overflow_checks,
+    }
+}
+
+/// Whether arithmetic of `body` panics when it overflows in a constant, where it is known:
+/// it is not for a body that takes the setting of whichever crate uses it.
+pub(crate) fn body_checks_overflow(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<bool> {
+    if !body_written_checked(db, body) {
+        return Some(false);
+    }
+    crate_checks_overflow(db, body.owner.module(db).krate(db))
+}
+
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
 #[salsa::tracked(returns(ref))]
 fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
@@ -1484,6 +1542,12 @@ fn compiled_instance<'db>(
             return compile(db, env, None, false, instance.checked, |fx| match args.len() {
                 1 => fx.call_once_shim(ty()),
                 _ => fx.call_once_by_pointer(args),
+            });
+        }
+        InstanceDef::VtableShim(func) => {
+            let args = instance.args.as_ref();
+            return compile(db, env, None, false, instance.checked, |fx| {
+                fx.vtable_shim(func, args)
             });
         }
         InstanceDef::FnPointerShim => {
@@ -1783,6 +1847,7 @@ fn instance_body<'db>(
             .map(Cow::Borrowed),
         InstanceDef::DropGlue
         | InstanceDef::CallOnceShim
+        | InstanceDef::VtableShim(_)
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
@@ -2487,6 +2552,94 @@ fn location_macros<'db>(
         .collect()
 }
 
+/// The literals of a body that `concat!` made of arguments with `line!()`, `column!()` or
+/// `file!()` among them, each with the expansion it is in.
+#[salsa::tracked(returns(ref))]
+fn located_concats<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+) -> FxHashMap<ExprId, HirFileId> {
+    let (body, source_map) = Body::with_source_map(db, owner);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+        .filter_map(|(id, _)| {
+            let file_id = source_map.expr_syntax(id).ok()?.file_id;
+            let loc = file_id.macro_file()?.loc(db);
+            let concat =
+                matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
+            (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
+        })
+        .collect()
+}
+
+/// The macro of `name` that expands to a place in the source.
+fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
+    match name {
+        "line" => Some(BuiltinFnLikeExpander::Line),
+        "column" => Some(BuiltinFnLikeExpander::Column),
+        "file" => Some(BuiltinFnLikeExpander::File),
+        _ => None,
+    }
+}
+
+/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+fn names_location(call: &SyntaxNode) -> bool {
+    call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && location_expander(token.text()).is_some()
+            && token
+                .next_token()
+                .and_then(|next| syntax::algo::skip_trivia_token(next, syntax::Direction::Next))
+                .is_some_and(|next| next.kind() == SyntaxKind::BANG)
+    })
+}
+
+/// An argument of a `concat!`.
+enum ConcatPart {
+    Text(String),
+    /// A call of `line!`, `column!` or `file!`, and where it is.
+    Location(BuiltinFnLikeExpander, TextRange),
+}
+
+/// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
+/// or `file!`.
+fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
+    let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
+    let mut inside: Vec<SyntaxElement> =
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
+    inside.pop()?;
+    let inside = inside.get(1..)?;
+    inside
+        .split(|it| it.kind() == SyntaxKind::COMMA)
+        .filter(|argument| !argument.is_empty())
+        .map(concat_part)
+        .collect()
+}
+
+fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
+    if let [SyntaxElement::Token(token)] = argument {
+        let text = match token.kind() {
+            SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
+            SyntaxKind::INT_NUMBER => {
+                ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
+            }
+            SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
+            _ => return None,
+        };
+        return Some(ConcatPart::Text(text));
+    }
+    let [.., SyntaxElement::Token(name), bang, SyntaxElement::Node(arguments)] = argument else {
+        return None;
+    };
+    let expander = location_expander(name.text())?;
+    let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
+    (bang.kind() == SyntaxKind::BANG && empty).then(|| {
+        let range = argument[0].text_range().cover(arguments.text_range());
+        ConcatPart::Location(expander, range)
+    })
+}
+
 /// The macro call an expansion comes from that is itself written out, in the source or in
 /// what a macro was passed, and not by another macro.
 fn written_call(db: &dyn HirDatabase, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
@@ -3067,12 +3220,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             entries: store
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
                 .map(|store| {
-                    let home = symbols.cargo_home();
+                    let (home, library) = (symbols.cargo_home(), symbols.library_sources());
                     std::sync::Arc::new(cached::Entries::new(
                         store,
                         debugged,
                         program.flatten(),
                         home,
+                        library,
                     ))
                 }),
             named: FxHashMap::default(),
@@ -3498,6 +3652,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             InstanceDef::DropGlue => lang_items.DropInPlace.or(lang_items.DropGlue),
             InstanceDef::CallOnceShim => lang_items.FnOnce_call_once,
+            InstanceDef::VtableShim(func) => Some(func),
             InstanceDef::FnPointerShim => match ty()?.kind() {
                 TyKind::Closure(id, _) => {
                     let at = id.0.loc(db);
@@ -3616,7 +3771,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         // The entry as it would be written is set against the one that is there.
         let stored = store.get(&key);
-        let mut alone = cached::Writer::alone(store, self.symbols.cargo_home());
+        let mut alone =
+            cached::Writer::alone(store, self.symbols.cargo_home(), self.symbols.library_sources());
         let Some(bytes) = alone.encoded(&mut entry) else {
             let _: Option<()> = self.kept.unkept(OF_CARGO);
             return;
@@ -3640,8 +3796,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer {
-        let home = || self.symbols.cargo_home();
-        self.writer.get_or_insert_with(|| cached::Writer::new(store, home()))
+        let symbols = self.symbols;
+        self.writer.get_or_insert_with(|| {
+            cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
+        })
     }
 
     /// Whether the instance is compiled with the flags of the crate its function is written
@@ -3683,6 +3841,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // No arithmetic of their own, and what they call is settled when they call it.
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => asking,
         };
@@ -3813,6 +3972,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let placed =
             self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
         let home = self.symbols.cargo_home();
+        let library = self.symbols.library_sources();
         let mut datas = Vec::with_capacity(ids.datas.len());
         for (request, &id) in compiled.requests.datas.iter().zip(&ids.datas) {
             if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
@@ -3821,6 +3981,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 if home.as_deref().is_some_and(|home| cached::holds(&blob.bytes, home)) {
                     return self.kept.unkept("data with the place of cargo's directory");
+                }
+                if library.as_ref().is_some_and(|it| cached::holds(&blob.bytes, &it.here)) {
+                    return self.kept.unkept("data with the place of the library's sources");
                 }
             }
             datas.push(match request {
@@ -3840,7 +4003,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let krate = of.krate(self.db);
                     let of_checkout = self.own_statics.crates.contains(&krate)
                         || krate.data(self.db).origin.is_local();
-                    if decl.linkage != Linkage::Import || of_checkout {
+                    let foreign = static_link_name(self.db, *of).is_some();
+                    if !foreign && (decl.linkage != Linkage::Import || of_checkout) {
                         let Some(name) = self.names.static_(*of) else {
                             return self.kept.unkept("unnamed static");
                         };
@@ -3859,6 +4023,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         return self.kept.unkept("file without a path");
                     };
                     CachedData::FilePath(path)
+                }
+                DataRequest::Text(parts) => {
+                    let Some(text) = self.text(parts) else {
+                        return self.kept.unkept("file without a path");
+                    };
+                    CachedData::FilePath(text)
                 }
             });
         }
@@ -4195,10 +4365,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 self.define_file_path(path)
             }
+            DataRequest::Text(parts) => {
+                let Some(text) = self.text(parts) else {
+                    unsupported!("`file!()` in a file without a path");
+                };
+                self.define_file_path(text)
+            }
         }
     }
 
-    /// The `&str` that `file!()` is.
+    /// The text of the parts, with each file's path for the file.
+    fn text(&mut self, parts: &[TextPart]) -> Option<String> {
+        parts
+            .iter()
+            .map(|part| match part {
+                TextPart::Text(text) => Some(text.clone()),
+                TextPart::FilePath(file) => self.source_path(*file),
+            })
+            .collect()
+    }
+
+    /// The `&str` that `file!()` is, or a `concat!` with it.
     fn define_file_path(&mut self, path: String) -> Result<DataId> {
         let len = path.len();
         let path = self.define_const(ConstBlob {
@@ -4224,6 +4411,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// The data object of a static: rustc's when it exports one, else our own copy of its value.
+    /// The name the linker knows a static by: one of an `extern` block, or one that an
+    /// attribute exports and rustc's build defines.
+    fn linked_static(&self, id: StaticId) -> Result<Option<intern::Symbol>> {
+        let db = self.db;
+        let signature = StaticSignature::of(db, id);
+        if !signature.flags.contains(StaticFlags::EXTERN) {
+            let exported = AttrFlags::export_name(db, id.into()).or_else(|| {
+                let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
+                unmangled.then(|| signature.name.symbol().clone())
+            });
+            return Ok(exported.filter(|name| self.symbols.defines(name.as_str())));
+        }
+        let name = AttrFlags::link_name(db, id.into());
+        Ok(Some(name.unwrap_or_else(|| signature.name.symbol().clone())))
+    }
+
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
         let db = self.db;
         let known = [&self.imported_statics, &self.statics, &self.frozen_statics];
@@ -4232,7 +4435,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         // rustc's copy when ours has no value to give.
         let ours = self.own_statics.replaces(db, id) && compiled_static(db, id).is_ok();
-        if !ours && let Some(symbol) = self.symbols.static_(id) {
+        let theirs = || (!ours).then(|| self.symbols.static_(id)).flatten();
+        if let Some(symbol) = static_link_name(db, id).or_else(theirs) {
             let data = self.module.declare_data(
                 &symbol,
                 Linkage::Import,
@@ -4248,9 +4452,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(data);
         }
-        if let Some(symbol) = static_link_name(db, id) {
+        if let Some(symbol) = self.linked_static(id)? {
             let thread_local = is_thread_local(db, id);
-            let data = self.module.declare_data(&symbol, Linkage::Import, false, thread_local)?;
+            let data =
+                self.module.declare_data(symbol.as_str(), Linkage::Import, false, thread_local)?;
             self.imported_statics.insert(id, data);
             return Ok(data);
         }
@@ -4389,6 +4594,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::CoroutineByMove(_)
             | InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
@@ -4571,6 +4777,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .and_then(|ty| super::type_name::rustc_symbol_type(db, ty))
                 .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
             InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
             | InstanceDef::FnPointerShim
             | InstanceDef::ReifyShim { .. } => None,
         };
@@ -4584,6 +4791,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => "{async}",
             InstanceDef::DropGlue => "drop_in_place",
             InstanceDef::CallOnceShim => "call_once",
+            InstanceDef::VtableShim(_) => "{vtable}",
             InstanceDef::FnPointerShim => "{closure}::fn_pointer",
             InstanceDef::ReifyShim { .. } => "{reify}",
         }
@@ -6386,15 +6594,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
-    /// Equal constants share an address, as they do for rustc.
+    /// Equal constants share an address, as they do for rustc. A type that is not `plain` is
+    /// promoted when the value is: a `None` of an `Option<Box<T>>` has nothing to drop.
     fn promoted_constant(
         &mut self,
         body: &'db MirBody<'db>,
         expr: ExprId,
-        size: usize,
+        layout: &Layout,
+        plain: bool,
     ) -> Option<Value> {
         let db = self.cg.db;
-        if self.mentions_location(body, expr) {
+        if layout.size.bytes() == 0 || self.mentions_location(body, expr) {
             return None;
         }
         let constant = monomorphized_promoted_mir_body_query(
@@ -6406,11 +6616,73 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
         .ok()?;
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
+        let ty = allocation.ty;
         let blob = self.allocation_blob(allocation, false).ok()?;
-        if blob.bytes.len() != size {
+        if blob.bytes.len() != layout.size.bytes_usize()
+            || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
+        {
             return None;
         }
         self.blob_addr(blob).ok()
+    }
+
+    /// Whether a value of `ty` can be read-only data that is never dropped.
+    fn is_plain(&self, ty: Ty<'db>) -> bool {
+        self.is_freeze(ty) && has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
+    }
+
+    /// Whether the value of `ty` at `offset` in `bytes` has nothing to drop and no cell in
+    /// it, which a value of a type that is not plain can be: an enum by its variant.
+    fn is_plain_value(&self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> bool {
+        if self.is_plain(ty) {
+            return true;
+        }
+        let db = self.cg.db;
+        let Ok(layout) = self.layout(ty) else { return false };
+        match ty.kind() {
+            TyKind::Tuple(fields) => fields.iter().enumerate().all(|(i, field)| {
+                let at = offset + layout.fields.offset(i).bytes_usize();
+                self.is_plain_value(bytes, at, field)
+            }),
+            TyKind::Array(element, len) => {
+                let (Some(len), Ok(element_layout)) =
+                    (try_const_usize(db, len), self.layout(element))
+                else {
+                    return false;
+                };
+                let size = element_layout.size.bytes_usize();
+                (0..len as usize).all(|i| self.is_plain_value(bytes, offset + i * size, element))
+            }
+            TyKind::Adt(def, args) => {
+                let adt = def.def_id();
+                if destructor(db, adt).is_some() {
+                    return false;
+                }
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match adt {
+                    AdtId::StructId(id) if Some(id) == self.interner.lang_items().UnsafeCell => {
+                        return false;
+                    }
+                    AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return false,
+                    AdtId::EnumId(id) => {
+                        let Some(bytes) = bytes.get(offset..offset + layout.size.bytes_usize())
+                        else {
+                            return false;
+                        };
+                        match detect_variant_from_bytes(&layout, db, self.dl(), bytes, id) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => return false,
+                        }
+                    }
+                };
+                db.field_types(variant).iter().enumerate().all(|(i, (_, field))| {
+                    let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                    let at = offset + layout.fields.offset(i).bytes_usize();
+                    self.is_plain_value(bytes, at, field)
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Storage for the copy of an argument a callee is handed. The copy is the callee's
@@ -6709,16 +6981,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
-            let addr = if let Some(&(_, expr)) = promoted
-                && self.is_freeze(data.ty.as_ref())
-                && self.glue_of(data.ty.as_ref()) == DropGlue::None
-            {
-                match self.promoted_constant(body, expr, layout.size.bytes_usize()) {
-                    Some(addr) if layout.size.bytes() != 0 => {
+            let addr = if let Some(&(_, expr)) = promoted {
+                let plain = self.is_plain(data.ty.as_ref());
+                match self.promoted_constant(body, expr, &layout, plain) {
+                    Some(addr) => {
                         self.constant_locals.push(local);
                         addr
                     }
-                    _ => self.promoted_slot(&layout)?,
+                    None if plain => self.promoted_slot(&layout)?,
+                    None => self.stack_slot(&layout),
                 }
             } else {
                 self.stack_slot(&layout)
@@ -7196,7 +7467,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             path.pop();
                             return dropped;
                         }
-                        this.call_drop_impl(addr, ty)?;
+                        this.call_drop_impl(addr, meta, ty)?;
                         if let AdtId::StructId(id) = adt_def.def_id() {
                             let layout = this.layout(ty)?;
                             this.drop_fields(addr, &layout, id.into(), subst, ty, meta)?;
@@ -8065,6 +8336,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
+        // The evaluator has the placeholders rust-analyzer expands these to.
+        if !location_macros(db, id.into()).is_empty() || !located_concats(db, id.into()).is_empty()
+        {
+            unsupported!("a static with `line!()`, `column!()` or `file!()` in its value");
+        }
         let allocation = db
             .const_eval_static(id)
             .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
@@ -8091,7 +8367,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             | TyKind::RawPtr(..)
             | TyKind::FnPtr(..)
             | TyKind::FnDef(..) => true,
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.is_freeze(element),
+            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+                self.is_freeze(element)
+            }
             TyKind::Tuple(fields) => fields.iter().all(|field| self.is_freeze(field)),
             TyKind::Adt(def, args) => {
                 let variants: Vec<VariantId> = match def.def_id() {
@@ -9299,7 +9577,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.divide(l, r, div, signed)?
             }
             BinOp::Shl | BinOp::Shr => {
-                let (r, overflow) = self.shift_amount(r, scalar.ty.bits());
+                let (r, beyond_a_word) = self.shift_amount_word(r);
+                let bits = i64::from(scalar.ty.bits());
+                let overflow =
+                    self.builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, r, bits);
+                let overflow = match beyond_a_word {
+                    Some(beyond) => self.builder.ins().bor(overflow, beyond),
+                    None => overflow,
+                };
                 let (shift_op, value) = match (op, signed) {
                     (BinOp::Shl, _) => (OverflowOp::Shl, self.builder.ins().ishl(l, r)),
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
@@ -9312,18 +9597,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
-    /// The amount to shift a value of `bits` bits by, no wider than a register, and whether
-    /// `amount` is out of range: not less than `bits`, read as unsigned.
-    fn shift_amount(&mut self, amount: Value, bits: u32) -> (Value, Value) {
-        let too_far = IntCC::UnsignedGreaterThanOrEqual;
+    /// A shift amount as at most one machine word, and whether the part cut off was not zero.
+    /// A shift takes its amount modulo the width of the value, which the low word decides.
+    fn shift_amount_word(&mut self, amount: Value) -> (Value, Option<Value>) {
         if self.builder.func.dfg.value_type(amount) != types::I128 {
-            let overflow = self.builder.ins().icmp_imm(too_far, amount, i64::from(bits));
-            return (amount, overflow);
+            return (amount, None);
         }
         let (low, high) = self.builder.ins().isplit(amount);
-        let too_far = self.builder.ins().icmp_imm(too_far, low, i64::from(bits));
-        let wide = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
-        (low, self.builder.ins().bor(too_far, wide))
+        let beyond = self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0);
+        (low, Some(beyond))
     }
 
     fn float_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
@@ -9423,21 +9705,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
-    /// Whether arithmetic of the body being compiled panics when it overflows. rustc decides
-    /// it twice: the crate the body is written in leaves the check out of what it keeps of the
-    /// body unless it has `-C overflow-checks` or the function takes the setting of its
-    /// callers, and the crate that compiles the body drops the check unless it has the flag.
+    /// Whether arithmetic of the body being compiled panics when it overflows.
     fn checks_overflow(&self) -> Result<bool> {
-        let db = self.cg.db;
         let Some(body) = self.body else { return Ok(false) };
-        let inherits = match body.owner {
-            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
-                AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
-            }
-            _ => false,
-        };
-        let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
-        if written_with == Some(false) || (written_with.is_none() && !inherits) {
+        if !body_written_checked(self.cg.db, body) {
             return Ok(false);
         }
         Ok(self.cg.checked)
@@ -9495,7 +9766,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Whether a promoted expression takes its value from where it is in the source.
     fn mentions_location(&self, body: &MirBody<'db>, expr: ExprId) -> bool {
         let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
-        if self.location_macro(body, expr).is_some() {
+        if self.location_macro(body, expr).is_some()
+            || located_concats(self.cg.db, owner).contains_key(&expr)
+        {
             return true;
         }
         let mut found = false;
@@ -9504,11 +9777,52 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         found
     }
 
+    /// The `&str` of a literal that a `concat!` with `line!()`, `column!()` or `file!()`
+    /// among its arguments expanded to: the expansion has their placeholders in it.
+    fn located_concat(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let db = self.cg.db;
+        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
+            return Ok(None);
+        };
+        let Some(call) = located_concats(db, owner)
+            .get(&expr)
+            .and_then(|file_id| file_id.macro_file())
+            .map(|it| it.loc(db).to_node(db))
+        else {
+            return Ok(None);
+        };
+        let Some(parts) = concat_parts(&call.value) else {
+            unsupported!("`concat!` of a place in the source and what is not a literal");
+        };
+        let mut text = Vec::new();
+        for part in parts {
+            text.push(match part {
+                ConcatPart::Text(text) => TextPart::Text(text),
+                ConcatPart::Location(expander, range) => {
+                    let Some((file, line, col)) = location_of(db, call.file_id, range) else {
+                        unsupported!("`concat!` of a place that is not in a file");
+                    };
+                    match expander {
+                        BuiltinFnLikeExpander::Line => TextPart::Text(line.to_string()),
+                        BuiltinFnLikeExpander::Column => TextPart::Text(col.to_string()),
+                        _ => TextPart::FilePath(file),
+                    }
+                }
+            });
+        }
+        let text = self.cg.text(text);
+        let text = self.cg.declare_data_in_func(text, self.builder.func);
+        Ok(Some(self.builder.ins().symbol_value(ptr(), text)))
+    }
+
     /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
     /// rust-analyzer expands them to placeholders, since a real value would make every body
     /// below an edit change.
     fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
         let db = self.cg.db;
+        if let Some(text) = self.located_concat(expr)? {
+            return Ok(Some(text));
+        }
         let Some((expander, file_id)) = self.body.and_then(|it| self.location_macro(it, expr))
         else {
             return Ok(None);
@@ -9885,7 +10199,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
                     unsupported!("vtable call on {dyn_ty:?}");
                 };
-                let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(method) else {
+                let Some(slot) = self.vtable_layout(trait_ref).method(method) else {
                     unsupported!("method missing from the vtable of {dyn_ty:?}");
                 };
                 let pointer = self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at());
@@ -10135,7 +10449,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
             unsupported!("vtable call on {dyn_ty:?}");
         };
-        let Some(slot) = VtableLayout::of(self.interner, trait_ref).method(func) else {
+        let Some(slot) = self.vtable_layout(trait_ref).method(func) else {
             unsupported!("method missing from the vtable of {dyn_ty:?}");
         };
         let data = self.builder.ins().load(ptr(), MEM, receiver, 0);
@@ -10161,7 +10475,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// the vtable depends on the object's trait, not on the trait the call was written against.
     fn fn_method_of_object(&self, dyn_ty: Ty<'db>) -> Option<FunctionId> {
         let lang_items = self.interner.lang_items();
-        let vtable = VtableLayout::of(self.interner, self.principal(dyn_ty, dyn_ty)?);
+        let vtable = self.vtable_layout(self.principal(dyn_ty, dyn_ty)?);
         [lang_items.Fn_call, lang_items.FnMut_call_mut]
             .into_iter()
             .flatten()
@@ -10174,11 +10488,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         };
         let principal = bounds.principal()?.with_self_ty(self.interner, self_ty);
-        let principal = self.interner.instantiate_bound_regions_with_erased(principal);
-        // No lifetime tells one vtable from another.
-        Some(rustc_type_ir::fold_regions(self.interner, principal, |_, _| {
-            Region::new_erased(self.interner)
-        }))
+        Some(self.plain_trait(self.interner.instantiate_bound_regions_with_erased(principal)))
+    }
+
+    /// `trait_ref` without its lifetimes and with its projections resolved: two ways of
+    /// writing one trait are one trait in a vtable.
+    fn plain_trait(&self, trait_ref: TraitRef<'db>) -> TraitRef<'db> {
+        let erased = vtable::without_lifetimes(self.interner, trait_ref);
+        crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .deeply_normalize(
+                &crate::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                erased,
+            )
+            .unwrap_or(erased)
+    }
+
+    /// The vtable of `trait_ref`, with each supertrait in the one form `plain_trait` gives it.
+    fn vtable_layout(&self, trait_ref: TraitRef<'db>) -> VtableLayout<'db> {
+        VtableLayout::of(self.interner, trait_ref, &|it| self.plain_trait(it))
     }
 
     /// Writes the value of `from_ty` at `src` to `dst` as `to_ty`, which it is unsized to: a
@@ -10257,7 +10585,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     // Only auto traits or lifetimes change.
                     return Ok(vtable);
                 }
-                match VtableLayout::of(self.interner, trait_ref).upcast(target) {
+                match self.vtable_layout(trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
                     Some(Upcast::Load(slot)) => {
                         Ok(self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at()))
@@ -10304,7 +10632,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(id);
         }
         let layout = self.layout(ty)?;
-        let slots = trait_ref.map_or_else(Vec::new, |it| VtableLayout::of(self.interner, it).slots);
+        let slots = trait_ref.map_or_else(Vec::new, |it| self.vtable_layout(it).slots);
         let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * word()];
         bytes[word()..2 * word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..word()]);
         bytes[2 * word()..3 * word()]
@@ -10321,10 +10649,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (index, slot) in slots.into_iter().enumerate() {
             let offset = ((vtable::HEADER + index) * word()) as u32;
             match slot {
-                Slot::Method(func, trait_ref) => {
+                // A slot nothing can call through is left empty, as rustc leaves it.
+                Slot::Method(func, trait_ref) if self.method_bounds_hold(func, trait_ref) => {
                     let method = self.vtable_method(func, trait_ref)?;
                     blob.fn_relocs.push((offset, method));
                 }
+                Slot::Method(..) => {}
                 Slot::Vptr(trait_ref) => {
                     let vptr = self.vtable(ty, Some(trait_ref))?;
                     blob.relocs.push((offset, vptr, 0));
@@ -10332,6 +10662,42 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         Ok(self.cg.define_vtable(key, blob))
+    }
+
+    /// What trait method `func` is called with through the vtable of `trait_ref`: only
+    /// lifetimes can be generic in a method that is in a vtable.
+    fn vtable_method_args(
+        &self,
+        func: FunctionId,
+        trait_ref: TraitRef<'db>,
+    ) -> Option<GenericArgs<'db>> {
+        let interner = self.interner;
+        let mut generic = false;
+        let args =
+            GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
+                generic |= !matches!(id, hir_def::GenericParamId::LifetimeParamId(_));
+                Region::new_erased(interner).into()
+            });
+        (!generic).then_some(args)
+    }
+
+    /// Whether the `where` clauses trait method `func` has of its own hold for `trait_ref`.
+    /// A method they do not hold for can never be called.
+    fn method_bounds_hold(&self, func: FunctionId, trait_ref: TraitRef<'db>) -> bool {
+        let Some(args) = self.vtable_method_args(func, trait_ref) else { return true };
+        let interner = self.interner;
+        let cause = crate::next_solver::infer::traits::ObligationCause::dummy();
+        let mut ocx = crate::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx);
+        let bounds = crate::GenericPredicates::query_own_explicit(self.cg.db, func.into());
+        for bound in bounds.iter_instantiated(interner, args.as_slice()) {
+            ocx.register_obligation(crate::next_solver::infer::traits::Obligation::new(
+                interner,
+                cause,
+                self.env.param_env,
+                bound.skip_norm_wip(),
+            ));
+        }
+        ocx.try_evaluate_obligations().is_empty()
     }
 
     /// The function a vtable slot for trait method `func` points to.
@@ -10363,16 +10729,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let sig = self.body_signature(self.body_types(def, parent_args)?)?;
             return self.cg.callee(def, parent_args, self.env, &sig);
         }
-        // Only lifetimes can be generic in a method that is in a vtable.
-        let mut generic = false;
-        let args =
-            GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
-                generic |= !matches!(id, hir_def::GenericParamId::LifetimeParamId(_));
-                Region::new_erased(interner).into()
-            });
-        if generic {
+        let Some(args) = self.vtable_method_args(func, trait_ref) else {
             unsupported!("generic method in a vtable");
-        }
+        };
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
         let either::Either::Left(callee) = callee else {
             unsupported!("builtin derive method in a vtable");
@@ -10385,14 +10744,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
-        // A by-value `self` reaches the method through a pointer and needs a shim.
-        let receiver = self.layout(receiver.as_ref())?;
-        let thin = match receiver.backend_repr {
-            BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Primitive::Pointer(_)),
-            _ => false,
-        };
-        if !thin {
-            unsupported!("vtable method taking `self` by value");
+        // A by-value `self` reaches the method through a pointer and needs a shim, unless the
+        // method takes it through a pointer too.
+        if receiver.as_ref() == self_ty {
+            let layout = self.layout(self_ty)?;
+            let mode = self.pass_mode(&layout, false)?;
+            if !matches!(mode, PassMode::Indirect) {
+                if track_caller(db, callee) {
+                    unsupported!("vtable method taking `self` by value that tracks its caller");
+                }
+                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                return self.cg.callee(
+                    InstanceDef::VtableShim(callee),
+                    callee_args,
+                    self.env,
+                    &sig,
+                );
+            }
         }
         // A method declared `#[track_caller]` in the trait is given a location by the call. One
         // that is so only in the impl is called without, and the shim supplies it.
@@ -10688,19 +11056,45 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn call_once_by_pointer(&mut self, args: GenericArgs<'db>) -> Result<()> {
         let (callee, callee_args, sig, mode) = self.call_once_impl(args)?;
         let layout = self.layout(args.type_at(0))?;
-        self.builder.func.signature = Self::by_pointer(&sig, mode);
+        self.call_by_pointer(callee, callee_args, &sig, mode, &layout)
+    }
+
+    /// The body of a `VtableShim`: calls the method with the value the shim is handed a
+    /// pointer to.
+    fn vtable_shim(&mut self, func: FunctionId, args: GenericArgs<'db>) -> Result<()> {
+        let body = self.body_types(InstanceDef::Fn(func), args)?;
+        let sig = self.body_signature(body)?;
+        let Some(receiver) = body.params.first() else {
+            unsupported!("vtable method without a receiver");
+        };
+        let layout = self.layout(receiver.as_ref())?;
+        let mode = self.pass_mode(&layout, false)?;
+        self.call_by_pointer(func, args, &sig, mode, &layout)
+    }
+
+    /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
+    /// it by value as `mode` says.
+    fn call_by_pointer(
+        &mut self,
+        callee: FunctionId,
+        callee_args: GenericArgs<'db>,
+        sig: &Signature,
+        mode: PassMode,
+        layout: &Layout,
+    ) -> Result<()> {
+        self.builder.func.signature = Self::by_pointer(sig, mode);
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
         let mut params = self.builder.block_params(entry).to_vec();
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let Some(&receiver) = params.get(sret as usize) else {
-            unsupported!("call_once shim for a receiver that is not passed");
+            unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)?;
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
-        self.pass(mode, receiver, &layout, &mut values);
+        self.pass(mode, receiver, layout, &mut values);
         params.splice(sret as usize..sret as usize + 1, values);
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
@@ -11192,6 +11586,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (l, scalar) = self.load_scalar(lhs)?;
                 let (r, r_scalar) = self.load_scalar(rhs)?;
                 let signed = scalar.signed;
+                let r = match name {
+                    "unchecked_shl" | "unchecked_shr" => self.shift_amount_word(r).0,
+                    _ => r,
+                };
                 let value = match name {
                     "wrapping_add" | "unchecked_add" => self.builder.ins().iadd(l, r),
                     "wrapping_sub" | "unchecked_sub" => self.builder.ins().isub(l, r),
@@ -12839,7 +13237,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ty: Ty<'db>,
     ) -> Result<()> {
         self.guarded(
-            |this| this.call_drop_impl(addr, ty),
+            |this| this.call_drop_impl(addr, meta, ty),
             |this| this.drop_adt_fields(addr, meta, ty),
         )
     }
@@ -13074,6 +13472,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         switch.emit(&mut self.builder, l_discr, done);
                         for (block, variant) in arms {
                             self.builder.switch_to_block(block);
+                            // A constant of a pattern is never in such a variant, and here
+                            // the two are in the same one.
+                            if !self.fields_compare_in_parts(variant.into(), subst, &mut vec![ty]) {
+                                self.builder.ins().jump(differ, &[]);
+                                continue;
+                            }
                             let index = RustcEnumVariantIdx(variant.index(db));
                             let layout = &Layout::for_variant(&layout, index);
                             self.branch_unless_fields_equal(
@@ -13116,6 +13520,46 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether [`Self::branch_unless_equal`] can compare two values of `ty`. `seen` are the
+    /// types that hold this one.
+    fn compares_in_parts(&self, ty: Ty<'db>, seen: &mut Vec<Ty<'db>>) -> bool {
+        let ty = self.normalize(ty);
+        if seen.contains(&ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Str => true,
+            TyKind::Ref(_, inner, _) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+                self.compares_in_parts(inner, seen)
+            }
+            TyKind::Tuple(tys) => tys.iter().all(|ty| self.compares_in_parts(ty, seen)),
+            TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
+                AdtId::UnionId(_) => false,
+                // Each variant is looked at once the two are known to be in it.
+                AdtId::EnumId(_) => true,
+                AdtId::StructId(id) => {
+                    seen.push(ty);
+                    let compares = self.fields_compare_in_parts(id.into(), subst, seen);
+                    seen.pop();
+                    compares
+                }
+            },
+            _ => self.scalar_of(ty).is_ok(),
+        }
+    }
+
+    fn fields_compare_in_parts(
+        &self,
+        variant: VariantId,
+        subst: GenericArgs<'db>,
+        seen: &mut Vec<Ty<'db>>,
+    ) -> bool {
+        self.cg.db.field_types(variant).iter().all(|(_, ty)| {
+            let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+            self.compares_in_parts(ty, seen)
+        })
     }
 
     fn branch_unless_fields_equal(
@@ -13222,7 +13666,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.guarded(
                         |this| this.drop_value(pointer, pointee_meta, pointee),
                         |this| {
-                            this.call_drop_impl(addr, ty)?;
+                            this.call_drop_impl(addr, meta, ty)?;
                             this.drop_adt_fields(addr, meta, ty)
                         },
                     )?;
@@ -13448,15 +13892,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(index)
     }
 
-    /// Calls `<ty as Drop>::drop` on the value at `addr`.
-    fn call_drop_impl(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
+    /// Calls `<ty as Drop>::drop` on the value at `addr`, whose metadata is `meta` when the
+    /// type is unsized.
+    fn call_drop_impl(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let Some(drop_fn) = self.interner.lang_items().Drop_drop else {
             unsupported!("no `Drop::drop` lang item");
         };
         let reference =
             Ty::new_ref(self.interner, Region::new_erased(self.interner), ty, Mutability::Mut);
-        let slot = self.scratch();
+        let slot = self.scratch_pair();
         self.builder.ins().store(MEM, addr, slot, 0);
+        if let Some(meta) = meta {
+            self.builder.ins().store(MEM, meta, slot, meta_at());
+        }
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         let unit = Ty::new_unit(self.interner);
         self.call_direct(drop_fn, args, &[(slot, reference)], slot, unit)

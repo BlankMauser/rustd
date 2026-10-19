@@ -130,6 +130,7 @@ pub(super) struct StableNames<'a, 'db> {
     by_content: bool,
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
+    library: Option<super::LibrarySources>,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
     /// The crates by what a name starts with, and what the ones asked about declare.
     crates: RefCell<Option<FxHashMap<String, Vec<Crate>>>>,
@@ -151,6 +152,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             owned,
             by_content,
             cargo_home: symbols.cargo_home(),
+            library: symbols.library_sources(),
             files: RefCell::default(),
             crates: RefCell::default(),
             listed: RefCell::default(),
@@ -186,6 +188,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             }
             InstanceDef::DropGlue => out.push_str("drop"),
             InstanceDef::CallOnceShim => out.push_str("call_once"),
+            InstanceDef::VtableShim(func) => {
+                out.push_str("vtable shim ");
+                self.function(&mut out, func)?;
+            }
             InstanceDef::FnPointerShim => out.push_str("fn_pointer"),
             InstanceDef::ReifyShim { receiver } => write!(out, "reify {receiver}").ok()?,
         }
@@ -291,10 +297,13 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
-    /// The name of a file as every machine has it: one that cargo fetched is under
-    /// [`super::CARGO_HOME`] whoever fetched it. `None` for a file that is already named so
-    /// and is not one of those.
+    /// The name of a file as every machine has it: one of the standard library is where it
+    /// was built, and one that cargo fetched is under [`super::CARGO_HOME`] whoever fetched
+    /// it. `None` for a file that is already named so and is not one of those.
     fn stored(&self, path: String) -> Option<String> {
+        if let Some(built) = self.library.as_ref().and_then(|it| it.stored(&path)) {
+            return Some(built);
+        }
         let home = self.cargo_home.as_deref();
         if home == Some(super::CARGO_HOME) {
             return Some(path);
@@ -360,33 +369,13 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     fn file(&self, out: &mut String, file: HirFileId) -> Option<()> {
-        let db = self.db;
-        match file {
-            HirFileId::FileId(file) => {
-                let Some(path) = self.symbols.source_path(file.file_id(db)) else {
-                    return self.miss("no source path");
-                };
-                let Some(path) = self.stored(path) else {
-                    return self.miss("a file under what stands for cargo's directory");
-                };
-                out.push_str(&path);
-            }
-            HirFileId::MacroFile(call) => match &call.loc(db).kind {
-                MacroCallKind::FnLike { ast_id, .. } => {
-                    self.ast(out, ast_id.file_id, ast_id.value.erase())?;
-                    out.push('!');
-                }
-                MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } => {
-                    self.ast(out, ast_id.file_id, ast_id.value.erase())?;
-                    write!(out, "!derive {derive_attr_index:?} {derive_index}").ok()?;
-                }
-                MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
-                    self.ast(out, ast_id.file_id, ast_id.value.erase())?;
-                    write!(out, "!attr {censored_attr_ids:?}").ok()?;
-                }
-            },
-        }
-        Some(())
+        let named = |path: Option<String>| match path {
+            Some(path) => self
+                .stored(path)
+                .or_else(|| self.miss("a file under what stands for cargo's directory")),
+            None => self.miss("no source path"),
+        };
+        file_name(self.db, self.symbols, out, file, &named)
     }
 
     fn function(&self, out: &mut String, func: FunctionId) -> Option<()> {
@@ -663,19 +652,20 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 }
 
-/// A file by its path, or for what a macro wrote by the call that wrote it.
+/// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.
 fn file_name(
     db: &dyn HirDatabase,
     symbols: &dyn SymbolResolver,
     out: &mut String,
     file: HirFileId,
+    named: &dyn Fn(Option<String>) -> Option<String>,
 ) -> Option<()> {
-    let mut written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
-        file_name(db, symbols, out, file)?;
+    let written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
+        file_name(db, symbols, out, file, named)?;
         write!(out, "#{}", id.into_raw()).ok()
     };
     match file {
-        HirFileId::FileId(file) => out.push_str(&symbols.source_path(file.file_id(db))?),
+        HirFileId::FileId(file) => out.push_str(&named(symbols.source_path(file.file_id(db)))?),
         HirFileId::MacroFile(call) => match &call.loc(db).kind {
             MacroCallKind::FnLike { ast_id, .. } => {
                 written_at(out, ast_id.file_id, ast_id.value.erase())?;
@@ -705,7 +695,7 @@ pub fn block_place(
     func.module(db).block(db)?;
     let id = func.lookup(db).id;
     let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id)?;
+    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
     Some(out)
 }

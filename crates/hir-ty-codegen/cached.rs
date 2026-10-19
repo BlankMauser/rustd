@@ -426,10 +426,19 @@ impl Entry {
         self.files().any(|it| super::moved(it, super::CARGO_HOME, "").is_some())
     }
 
-    /// Names the files under `cargo_home` as every machine does, on the way to the store.
-    /// Not to be kept when a file is already named as one of those and is not: it would be
-    /// read back as one.
-    pub(super) fn leave(&mut self, cargo_home: Option<&str>) -> bool {
+    /// Names the files under `cargo_home` and the standard library's as every machine does,
+    /// on the way to the store. Not to be kept when a file is already named as one that
+    /// cargo fetched and is not: it would be read back as one.
+    pub(super) fn leave(
+        &mut self,
+        cargo_home: Option<&str>,
+        library: Option<&super::LibrarySources>,
+    ) -> bool {
+        for file in self.files() {
+            if let Some(there) = library.and_then(|it| it.stored(file)) {
+                *file = there;
+            }
+        }
         if cargo_home == Some(super::CARGO_HOME) {
             return true;
         }
@@ -445,9 +454,19 @@ impl Entry {
         true
     }
 
-    /// Names the files of cargo's directory as this machine does, on the way from the store.
-    /// `None` when the entry has such files and this machine has no such directory.
-    pub(super) fn arrived(mut self, cargo_home: Option<&str>) -> Option<Entry> {
+    /// Names the files of cargo's directory and the standard library's as this machine
+    /// does, on the way from the store. `None` when the entry has files of cargo's and this
+    /// machine has no such directory.
+    pub(super) fn arrived(
+        mut self,
+        cargo_home: Option<&str>,
+        library: Option<&super::LibrarySources>,
+    ) -> Option<Entry> {
+        for file in self.files() {
+            if let Some(here) = library.and_then(|it| it.local(file)) {
+                *file = here;
+            }
+        }
         if cargo_home == Some(super::CARGO_HOME) || !self.of_cargo() {
             return Some(self);
         }
@@ -470,6 +489,7 @@ pub(super) struct Entries {
     program: Option<[u8; 32]>,
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
+    library: Option<super::LibrarySources>,
     known: Mutex<Known>,
 }
 
@@ -530,6 +550,7 @@ pub(super) struct Written {
 pub(super) struct Writer {
     store: &'static Store,
     cargo_home: Option<String>,
+    library: Option<super::LibrarySources>,
     types: KeptTypes,
     written: Written,
     thread: Option<(std::sync::mpsc::Sender<Kept>, std::thread::JoinHandle<Written>)>,
@@ -538,22 +559,31 @@ pub(super) struct Writer {
 }
 
 impl Writer {
-    pub(super) fn new(store: &'static Store, cargo_home: Option<String>) -> Self {
-        let mut writer = Writer::alone(store, cargo_home);
+    pub(super) fn new(
+        store: &'static Store,
+        cargo_home: Option<String>,
+        library: Option<super::LibrarySources>,
+    ) -> Self {
+        let mut writer = Writer::alone(store, cargo_home, library);
         writer.alone = false;
         writer
     }
 
     /// A writer that writes where it is asked to.
-    pub(super) fn alone(store: &'static Store, cargo_home: Option<String>) -> Self {
+    pub(super) fn alone(
+        store: &'static Store,
+        cargo_home: Option<String>,
+        library: Option<super::LibrarySources>,
+    ) -> Self {
         let (types, written) = Default::default();
-        Writer { store, cargo_home, types, written, thread: None, alone: true }
+        Writer { store, cargo_home, library, types, written, thread: None, alone: true }
     }
 
     pub(super) fn keep(&mut self, kept: Kept) {
         if self.thread.is_none() && !self.alone {
             let (jobs, queued) = std::sync::mpsc::channel::<Kept>();
-            let mut writer = Writer::alone(self.store, self.cargo_home.clone());
+            let mut writer =
+                Writer::alone(self.store, self.cargo_home.clone(), self.library.clone());
             let work = move || {
                 queued.into_iter().for_each(|kept| writer.write(kept));
                 std::mem::take(&mut writer.written)
@@ -593,7 +623,7 @@ impl Writer {
             let keys = debug.types.iter().map(|it| self.types.keep(self.store, it));
             debug.stored_types = keys.collect();
         }
-        entry.leave(self.cargo_home.as_deref()).then(|| entry.encode())?
+        entry.leave(self.cargo_home.as_deref(), self.library.as_ref()).then(|| entry.encode())?
     }
 
     /// Waits for everything kept so far to be in the store, and tells what was written
@@ -636,8 +666,9 @@ impl Entries {
         debug: bool,
         program: Option<[u8; 32]>,
         cargo_home: Option<String>,
+        library: Option<super::LibrarySources>,
     ) -> Entries {
-        Entries { store, debug, program, cargo_home, known: Mutex::default() }
+        Entries { store, debug, program, cargo_home, library, known: Mutex::default() }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -666,7 +697,7 @@ impl Entries {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
                 debug.types = types.collect::<Option<_>>()?;
             }
-            entry.arrived(self.cargo_home.as_deref())
+            entry.arrived(self.cargo_home.as_deref(), self.library.as_ref())
         };
         let tally = super::backend::Tally::global();
         let entry = (!banned)
@@ -897,41 +928,61 @@ mod tests {
     fn a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home() {
         let (one, other) = ("/home/one/.cargo", "/srv/another user/cargo");
         let mut stored = fetched_to(one);
-        assert!(stored.leave(Some(one)));
+        assert!(stored.leave(Some(one), None));
         let mut theirs = fetched_to(other);
-        assert!(theirs.leave(Some(other)));
+        assert!(theirs.leave(Some(other), None));
         let bytes = stored.encode().unwrap();
         assert_eq!(bytes, theirs.encode().unwrap());
         assert!(!holds(&bytes, one) && !holds(&bytes, other));
         assert!(holds(&bytes, "/cargo/registry/src/"));
         // The files of the checkout are named as they were.
         assert!(stored.files().any(|it| it == "src/lib.rs"));
-        let here = Entry::decode(&bytes).unwrap().arrived(Some(other)).unwrap();
+        let here = Entry::decode(&bytes).unwrap().arrived(Some(other), None).unwrap();
         assert_eq!(here.encode().unwrap(), fetched_to(other).encode().unwrap());
     }
 
     #[test]
     fn a_fetched_file_is_not_taken_where_cargo_has_no_directory() {
         let mut stored = fetched_to("/home/one/.cargo");
-        assert!(stored.leave(Some("/home/one/.cargo")));
-        assert!(Entry::decode(&stored.encode().unwrap()).unwrap().arrived(None).is_none());
+        assert!(stored.leave(Some("/home/one/.cargo"), None));
+        assert!(Entry::decode(&stored.encode().unwrap()).unwrap().arrived(None, None).is_none());
         // An entry without one is taken anywhere.
-        assert!(entry().arrived(None).is_some());
+        assert!(entry().arrived(None, None).is_some());
     }
 
     #[test]
     fn a_directory_named_as_cargos_stands_in_is_not_mistaken_for_it() {
         // A checkout that really is under `/cargo` is not stored as if cargo fetched it.
-        assert!(!fetched_to("/cargo").leave(Some("/home/one/.cargo")));
-        assert!(!fetched_to("/cargo").leave(None));
+        assert!(!fetched_to("/cargo").leave(Some("/home/one/.cargo"), None));
+        assert!(!fetched_to("/cargo").leave(None, None));
         // A cargo home that is `/cargo` already names its files as every machine does.
         let mut same = fetched_to("/cargo");
-        assert!(same.leave(Some("/cargo")));
+        assert!(same.leave(Some("/cargo"), None));
         assert_eq!(same.encode().unwrap(), fetched_to("/cargo").encode().unwrap());
         // Only whole components are the home.
         let mut beside = fetched_to("/home/one/.cargo-old");
-        assert!(beside.leave(Some("/home/one/.cargo")));
+        assert!(beside.leave(Some("/home/one/.cargo"), None));
         assert!(beside.files().any(|it| it.starts_with("/home/one/.cargo-old/")));
+    }
+
+    #[test]
+    fn a_file_of_the_library_is_stored_as_built_and_read_back_as_installed() {
+        let sources = |here: &str| super::super::LibrarySources {
+            here: here.to_owned(),
+            built_in: "/rustc/0123".to_owned(),
+        };
+        let with_file = |file: &str| {
+            let mut entry = entry();
+            entry.datas.push(CachedData::Location(Some((file.to_owned(), 3, 9))));
+            entry
+        };
+        let (one, other) = (sources("/home/one/toolchain/src"), sources("/opt/rust/src"));
+        let mut stored = with_file("/home/one/toolchain/src/library/core/src/option.rs");
+        assert!(stored.leave(None, Some(&one)));
+        assert!(stored.files().any(|it| it == "/rustc/0123/library/core/src/option.rs"));
+        let here = stored.arrived(None, Some(&other)).unwrap();
+        let theirs = with_file("/opt/rust/src/library/core/src/option.rs");
+        assert_eq!(here.encode().unwrap(), theirs.encode().unwrap());
     }
 
     /// Does with an entry what stitching it does with the places it names.

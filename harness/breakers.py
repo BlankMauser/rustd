@@ -12,20 +12,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015", "fragment"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = {"assert_message", "raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro"}
+OPEN = {"assert_message", "raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro", "assert_long_expression"}
+# Frames that are larger than rustc's, where a program counts on rustc's: the answer is right and the room is not.
+OPEN |= {"frame_of_array", "frame_of_tables"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
-LEFT = {"caller_in_constant", "empty_array_by_impl"}
+LEFT = {"caller_in_constant", "empty_array_by_impl", "macro_reads_its_spelling", "fragment_ends_statement"}
 # Crates reduced and not fixed, where rustd says so: a function of these is left to rustc.
 LEFT_CRATES = []
 
 
 def main():
-    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2021"], ["-p", "breaker"])
+    crates = ["breakers", "breakers2021", "breakers2015"]
+    fx = Fixture(os.path.join(HERE, "breakers"), crates, ["-p", "breaker"])
     fx.rustc_build()
     fx.rustd_build()
-    skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol" not in r[2]]
+    skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol for function" not in r[2]]
     left = {name for name in LEFT if any(f"::{name}::" in row[1] for row in skipped)}
     skipped = [row for row in skipped if not any(f"::{name}::" in row[1] for name in LEFT)]
     for row in skipped:
