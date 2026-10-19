@@ -2583,6 +2583,64 @@ fn located_concats<'db>(
         .collect()
 }
 
+/// What `line!()`, `column!()`, `file!()` or a `concat!` of them is where it is written.
+pub(crate) enum Placed {
+    Number(u32),
+    Text(String),
+}
+
+type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
+
+/// What the build calls each file, for a constant with `file!()` in its value. The evaluator
+/// has no build to ask.
+static SOURCE_PATHS: std::sync::RwLock<Option<std::sync::Arc<SourcePaths>>> =
+    std::sync::RwLock::new(None);
+
+/// Tells the evaluator of constants what the build calls each file: [`Symbols::source_path`].
+pub fn name_sources(
+    paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
+) {
+    *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
+}
+
+/// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
+/// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
+/// and a constant is evaluated from what it expanded them to.
+pub(crate) fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
+    let path = |file| {
+        let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+        paths(db, file)
+    };
+    if let Some(file_id) = located_concats(db, owner).get(&expr) {
+        let call = file_id.macro_file()?.loc(db).to_node(db);
+        let mut text = String::new();
+        for part in concat_parts(&call.value)? {
+            match part {
+                ConcatPart::Text(part) => text.push_str(&part),
+                ConcatPart::Location(expander, range) => {
+                    let (file, line, col) = location_of(db, call.file_id, range)?;
+                    match expander {
+                        BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
+                        BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
+                        _ => text.push_str(&path(file)?),
+                    }
+                }
+            }
+        }
+        return Some(Placed::Text(text));
+    }
+    let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
+    let site = written_call(db, file_id)?;
+    let range = InFile::new(site.file_id, written_range(&site.value));
+    let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
+    let (file, line, col) = location_of(db, file_id.into(), range)?;
+    Some(match expander {
+        BuiltinFnLikeExpander::Line => Placed::Number(line),
+        BuiltinFnLikeExpander::Column => Placed::Number(col),
+        _ => Placed::Text(path(file)?),
+    })
+}
+
 /// The macro of `name` that expands to a place in the source.
 fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
     match name {
@@ -8346,11 +8404,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
-        }
-        // The evaluator has the placeholders rust-analyzer expands these to.
-        if !location_macros(db, id.into()).is_empty() || !located_concats(db, id.into()).is_empty()
-        {
-            unsupported!("a static with `line!()`, `column!()` or `file!()` in its value");
         }
         let allocation = db
             .const_eval_static(id)

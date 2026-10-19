@@ -171,4 +171,5 @@ cases![
     unit_slice_constant,
     fn_as_pointer_in_const,
     array_in_tuple_moved_out,
+    const_location,
 ];
