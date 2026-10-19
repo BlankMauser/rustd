@@ -24,7 +24,7 @@ pub(crate) struct SymbolTable {
     crates: FxHashMap<String, Option<u64>>,
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
-    by_root: FxHashMap<PathBuf, u64>,
+    by_root: FxHashMap<Build, u64>,
     /// The crates of the link, each by its name and the file it starts at.
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
@@ -187,6 +187,11 @@ fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
     }
 }
 
+/// A crate rustc built: the file its source starts at, and whether it is the program itself,
+/// linked from its objects, or a library of it. The unit tests of a library are the first
+/// of its source, and link the second when what they use uses the library.
+type Build = (PathBuf, bool);
+
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
@@ -199,7 +204,8 @@ impl SymbolTable {
                 table.add_name(name, &mut symbols);
             }
             if let Some((name, sources)) = crate_sources(file, root) {
-                owners.push((name, sources[0].clone(), first..symbols.len()));
+                let program = file.extension().is_none_or(|it| it != "rlib");
+                owners.push((name, (sources[0].clone(), program), first..symbols.len()));
                 let sources = sources.into_iter().map(Source::new).collect();
                 table.built_from.push((file.clone(), sources));
             }
@@ -208,9 +214,9 @@ impl SymbolTable {
         // instantiates the generics of its library) besides itself, and never one that depends
         // on it: the id that is left once the others have theirs is its own. A crate may be
         // several files, when it is linked from its objects.
-        let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
+        let mut unplaced: FxHashMap<Build, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
-            table.linked.insert((name.clone(), source.clone()));
+            table.linked.insert((name.clone(), source.0.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
@@ -318,17 +324,24 @@ impl SymbolTable {
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
-    /// another crate has the name too.
-    pub(crate) fn crate_path(&self, name: &str, root: &Path) -> Option<String> {
+    /// another crate has the name too. `program` is whether it is the program's own crate.
+    pub(crate) fn crate_path(&self, name: &str, root: &Path, program: bool) -> Option<String> {
         match self.crates.get(name) {
-            Some(None) => Some(format!("{name}[{:x}]", self.by_root.get(root)?)),
+            Some(None) => Some(format!("{name}[{:x}]", self.id_by_root(root, program)?)),
             _ => Some(name.to_owned()),
         }
     }
 
+    /// The id of the build of the source at `root` that is the program's own crate or is
+    /// not, and of the only build of it when there is one.
+    fn id_by_root(&self, root: &Path, program: bool) -> Option<u64> {
+        let of = |program: bool| self.by_root.get(&(root.to_owned(), program)).copied();
+        of(program).or_else(|| of(!program))
+    }
+
     /// Gives each crate that shares its name the id that is its own, from how often its symbols
     /// mention each id of that name.
-    fn place(&mut self, mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>>) {
+    fn place(&mut self, mut unplaced: FxHashMap<Build, FxHashMap<u64, usize>>) {
         loop {
             let taken: FxHashSet<u64> = self.by_root.values().copied().collect();
             let before = unplaced.len();
@@ -388,10 +401,10 @@ impl SymbolTable {
         })
     }
 
-    pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
+    pub(crate) fn stable_crate_id(&self, name: &str, root: &Path, program: bool) -> Option<u64> {
         match *self.crates.get(name)? {
             Some(id) => Some(id),
-            None => self.by_root.get(root).copied(),
+            None => self.id_by_root(root, program),
         }
     }
 
@@ -815,11 +828,13 @@ mod tests {
         let mut table = SymbolTable::default();
         let unplaced: FxHashMap<_, _> = crates
             .iter()
-            .map(|(root, mentions)| (PathBuf::from(root), mentions.iter().copied().collect()))
+            .map(|(root, mentions)| {
+                ((PathBuf::from(root), false), mentions.iter().copied().collect())
+            })
             .collect();
         table.place(unplaced);
         let mut placed: Vec<_> =
-            table.by_root.iter().map(|(root, id)| (root.display().to_string(), *id)).collect();
+            table.by_root.iter().map(|(root, id)| (root.0.display().to_string(), *id)).collect();
         placed.sort();
         placed
     }

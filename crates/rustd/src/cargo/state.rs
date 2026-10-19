@@ -682,7 +682,7 @@ impl State {
                 .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
                 .collect();
             let plan = match unit {
-                Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
+                Some(unit) => Plan::of(unit, &used, &files)?,
                 None => Err(format!(
                     "cargo built `{name}` before rustd recorded what it is linked from; \
                      `cargo clean -p {}` has it built again",
@@ -749,7 +749,7 @@ impl State {
         let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards = guards(cwd, &metadata, &used, &built.scripts);
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -996,13 +996,7 @@ fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> 
 }
 
 /// Everything a change to which makes the next build cargo's.
-fn guards(
-    cwd: &Path,
-    metadata: &Metadata,
-    used: &[Record],
-    scripts: &[BuildScript],
-    checkouts: &[Checkout],
-) -> Vec<Guard> {
+fn guards(cwd: &Path, metadata: &Metadata, used: &[Record], scripts: &[BuildScript]) -> Vec<Guard> {
     let root = metadata.workspace_root.as_std_path();
     let manifests = metadata
         .workspace_packages()
@@ -1038,8 +1032,6 @@ fn guards(
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
         guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
     }
-    let left = checkouts.iter().flat_map(|it| &it.programs).flat_map(|it| it.left_to_rustc.clone());
-    guards.push(Guard::files("a library its unit tests are linked with as rustc built it:", left));
     guards
 }
 
