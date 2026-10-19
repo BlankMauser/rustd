@@ -66,3 +66,33 @@ pub mod if_branch_temporaries;
 pub mod if_let_temporaries;
 pub mod unwind_operand_tail;
 pub mod unwind_tail_after_local;
+
+/// A macro that panics over how its input is spelled, here so that the function left to
+/// rustc for it is alone in its crate.
+pub mod macro_reads_its_spelling {
+    #[derive(literals::NamedByText)]
+    struct Unit;
+
+    #[inline(never)]
+    pub fn name() -> &'static str {
+        Unit::name()
+    }
+}
+
+/// An `if` passed as an expression fragment and then a closure, here so that the function
+/// left to rustc for it is alone in its crate.
+pub mod fragment_ends_statement {
+    #[inline(never)]
+    pub fn closure_after_fragment() -> u32 {
+        macro_rules! then_closure {
+            ($e:expr) => {{
+                let add: fn(u32) -> u32 = {
+                    $e
+                    |x| x + 1
+                };
+                add(1)
+            }};
+        }
+        then_closure!(if true {})
+    }
+}

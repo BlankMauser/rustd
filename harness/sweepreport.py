@@ -36,11 +36,12 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
         notes = [f"{n} {reason[:60]}" for reason, n in own.most_common(3)]
         notes += [f"differs: {' '.join(differing[:6])}"] if differing else []
         notes += [f"error: {' '.join(errors[:2])}"] if errors else []
-        result = "same" if crate["match"] else "DIFFERS"
+        result = "same" if crate["match"] else "unstable" if crate.get("unstable") else "DIFFERS"
         print(f"| {crate['fixture']} | {result} | {len(crate.get('binaries', []))} | {crate['tests_run']} "
               f"| {done}/{total} | {took:.0f} | {'; '.join(notes).replace('|', '/')} |")
     else:
-        print(f"{'ok  ' if crate['match'] else 'FAIL'} {crate['fixture']:24} {crate['tests_run']:5} tests  "
+        mark = "ok  " if crate["match"] else "flak" if crate.get("unstable") else "FAIL"
+        print(f"{mark} {crate['fixture']:24} {crate['tests_run']:5} tests  "
               f"{done:5}/{total:<5} functions  {' '.join(differing[:6])} {' '.join(errors[:2])}")
     compiled, roots, tests = compiled + done, roots + total, tests + crate["tests_run"]
 print(f"\n{tests} tests, {compiled}/{roots} functions from rustd\n")

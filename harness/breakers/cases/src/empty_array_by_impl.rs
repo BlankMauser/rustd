@@ -1,8 +1,9 @@
 //! library/alloctests vec.rs, `test_into_iter_as_slice`, and vec_deque.rs,
 //! `test_partial_eq_array`: an empty array compared with a slice or a `VecDeque` has the
-//! element type that the one `PartialEq` impl for the other side's elements gives it. rustd's
-//! type inference leaves the element type unknown, so the function has no layout and is left
-//! to rustc.
+//! element type that the one `PartialEq` impl for the other side's elements gives it. rustd
+//! counted the impls of `proc_macro`, which this crate does not load, and with `impl
+//! PartialEq<Punct> for char` the element type was left unknown: the functions had no layout
+//! and were left to rustc.
 
 use std::collections::VecDeque;
 
