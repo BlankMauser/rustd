@@ -8,7 +8,7 @@ use rustc_next_trait_solver::delegate::SolverDelegate;
 use rustc_type_ir::{
     AliasTyKind, GenericArgKind, InferCtxtLike, InferTy, Interner, PredicatePolarity, TypeFlags,
     TypeVisitableExt,
-    inherent::{Const as _, IntoKind, Term as _, Ty as _},
+    inherent::{Const as _, GenericArg as _, IntoKind, Term as _, Ty as _},
     lang_items::SolverTraitLangItem,
     solve::{Certainty, FetchEligibleAssocItemResponse, NoSolution, VisibleForLeakCheck},
 };
@@ -17,6 +17,7 @@ use tracing::debug;
 use crate::{
     ParamEnvAndCrate, Span,
     db::GeneralConstId,
+    lower::GenericPredicates,
     next_solver::{
         AliasTy, AnyImplId, CanonicalVarKind, Clause, ClauseKind, CoercePredicate, ErrorGuaranteed,
         GenericArgs, ImplOrTraitAssocTermId, OpaqueTyIdWrapper, ParamEnv, Predicate, PredicateKind,
@@ -84,20 +85,40 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         Ok(())
     }
 
+    /// What `arg` needs to be well formed: the bounds of every struct, enum and union in it
+    /// on its arguments, and the same of the types in it that are not known yet. A type under
+    /// a `for<..>` it names is passed over, as rustc does. `None` is a type of which nothing
+    /// is known.
     fn well_formed_goals(
         &self,
-        _param_env: ParamEnv<'db>,
-        _arg: <Self::Interner as rustc_type_ir::Interner>::Term,
-    ) -> Option<
-        Vec<
-            rustc_type_ir::solve::Goal<
-                Self::Interner,
-                <Self::Interner as rustc_type_ir::Interner>::Predicate,
-            >,
-        >,
-    > {
-        // FIXME(next-solver):
-        None
+        param_env: ParamEnv<'db>,
+        arg: <Self::Interner as rustc_type_ir::Interner>::Term,
+    ) -> Option<Vec<Goal<'db, Predicate<'db>>>> {
+        let interner = self.interner;
+        let Some(ty) = arg.as_type() else { return Some(Vec::new()) };
+        let ty = self.resolve_vars_if_possible(ty);
+        if ty.is_ty_var() {
+            return None;
+        }
+        let mut goals = Vec::new();
+        let free = |part: &Ty<'db>| !part.has_escaping_bound_vars();
+        for part in ty.walk().filter_map(|it| it.as_type()).filter(free) {
+            match part.kind() {
+                TyKind::Infer(InferTy::TyVar(_)) => {
+                    goals.push(Goal::new(interner, param_env, ClauseKind::WellFormed(part.into())));
+                }
+                TyKind::Adt(def, args) => {
+                    let bounds = GenericPredicates::query_all(interner.db, def.def_id().into());
+                    goals.extend(
+                        bounds
+                            .iter_instantiated(interner, args.as_slice())
+                            .map(|bound| Goal::new(interner, param_env, bound.skip_norm_wip())),
+                    );
+                }
+                _ => {}
+            }
+        }
+        Some(goals)
     }
 
     fn make_deduplicated_region_constraints(

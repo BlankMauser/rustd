@@ -8,6 +8,7 @@ use hir_def::{
     Lookup, ModuleDefId, ModuleIdLt,
     expr_store::{Body, BodySourceMap},
     hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId},
+    lang_item::lang_items,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
         TraitSignature, TypeAliasSignature, UnionSignature,
@@ -24,7 +25,11 @@ use crate::{
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure},
     generics::generics,
-    next_solver::{DbInterner, GenericArg, GenericArgs, TraitRef, Ty, TyKind},
+    next_solver::{
+        BoundExistentialPredicates, DbInterner, ExistentialProjection, ExistentialTraitRef,
+        GenericArg, GenericArgs, RegionKind, TermId, TraitRef, Ty, TyKind,
+    },
+    utils::fn_traits,
 };
 
 /// `None` is a type whose rustc spelling this does not reproduce.
@@ -350,11 +355,17 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
         TyKind::Int(it) => out.push_str(it.name_str()),
         TyKind::Uint(it) => out.push_str(it.name_str()),
         TyKind::Float(it) => out.push_str(it.name_str()),
-        TyKind::Ref(_, pointee, mutability) => {
-            out.push_str(match mutability {
-                Mutability::Not => "&",
-                Mutability::Mut => "&mut ",
-            });
+        TyKind::Ref(region, pointee, mutability) => {
+            out.push('&');
+            // To `type_name` a lifetime of a `for<'a>` is `'_`, and any other is not there.
+            if out.spelling == Spelling::TypeName
+                && matches!(region.kind(), RegionKind::ReBound(..))
+            {
+                out.push_str("'_ ");
+            }
+            if mutability == Mutability::Mut {
+                out.push_str("mut ");
+            }
             write_ty(db, out, pointee)?;
         }
         TyKind::RawPtr(pointee, mutability) => {
@@ -397,56 +408,38 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
         TyKind::Dynamic(bounds, _) if out.spelling == Spelling::Debug => {
             write_dyn_debug(db, out, bounds)?;
         }
-        TyKind::Dynamic(bounds, _) => {
-            let principal = bounds.principal()?.skip_binder();
-            // The order rustc has more than one in is not one that is known here.
-            let mut projections = bounds.projection_bounds().into_iter();
-            let (projection, more) = (projections.next(), projections.next());
-            if more.is_some() || (projection.is_some() && out.spelling == Spelling::TypeName) {
-                return None;
+        TyKind::Dynamic(bounds, _) => write_dyn(db, out, bounds)?,
+        TyKind::FnDef(def, args) => match def.0 {
+            CallableDefId::FunctionId(func) => write_function(db, out, func, args.as_slice())?,
+            _ if out.spelling == Spelling::Symbol => return None,
+            CallableDefId::StructId(it) => {
+                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), it.into(), args))?;
+                out.push_str("::{{constructor}}");
             }
-            if !principal.args.is_empty() && out.spelling == Spelling::TypeName {
-                return None;
+            CallableDefId::EnumVariantId(it) => {
+                let parent = it.lookup(db).parent;
+                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), parent.into(), args))?;
+                let name = &parent.enum_variants(db).variant_name_by_id(it)?;
+                write!(out, "::{}::{{{{constructor}}}}", name.as_str()).ok()?;
             }
-            out.push_str("dyn ");
-            let trait_ = principal.def_id.0;
-            write_module(db, out, trait_.module(db))?;
-            write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
-            let mut written = Spelled::new(out.spelling);
-            write_args(db, &mut written, principal.args.as_slice())?;
-            match projection {
-                Some(bound) => {
-                    let bound = bound.skip_binder();
-                    let crate::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
-                        return None;
-                    };
-                    let given = written.text.strip_prefix('<').and_then(|it| it.strip_suffix('>'));
-                    out.push('<');
-                    if let Some(given) = given {
-                        write!(out, "{given}, ").ok()?;
-                    }
-                    write!(out, "{} = ", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
-                    write_ty(db, out, bound.term.as_type()?)?;
-                    out.push('>');
-                }
-                None => out.push_str(&written.text),
-            }
-            for auto in bounds.auto_traits() {
-                out.push_str(" + ");
-                write_module(db, out, auto.0.module(db))?;
-                write!(out, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
-            }
-        }
-        TyKind::FnDef(def, args) => {
-            let CallableDefId::FunctionId(func) = def.0 else { return None };
-            write_function(db, out, func, args.as_slice())?;
-        }
+        },
         TyKind::Closure(id, args) => {
             let func = written_in(id.0.loc(db))?;
             write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
         }
-        TyKind::Coroutine(id, args) if out.spelling != Spelling::TypeName => {
+        TyKind::Coroutine(id, args) => {
             let func = written_in(id.0.loc(db))?;
+            // The future of an `async` closure is named after how the closure was called.
+            let is_block = matches!(
+                Body::of(db, func.0.into())[func.1],
+                Expr::Closure {
+                    closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Block, .. },
+                    ..
+                }
+            );
+            if out.spelling == Spelling::TypeName && !is_block {
+                return None;
+            }
             write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1, Named::Kept)?;
         }
         TyKind::CoroutineClosure(id, args) if out.spelling != Spelling::TypeName => {
@@ -460,7 +453,7 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
                 Named::Kept,
             )?;
         }
-        TyKind::FnPtr(sig, header) if out.spelling != Spelling::TypeName => {
+        TyKind::FnPtr(sig, header) => {
             let sig = sig.skip_binder();
             if !header.safety().is_safe() {
                 out.push_str("unsafe ");
@@ -470,12 +463,90 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             }
             out.push_str("fn(");
             write_list(db, out, sig.inputs().iter().copied())?;
+            if header.c_variadic() {
+                out.push_str(", ...");
+            }
             out.push(')');
             if !sig.output().is_unit() {
                 out.push_str(" -> ");
                 write_ty(db, out, sig.output())?;
             }
         }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// A trait object: `dyn path::Trait<A, Assoc = B> + path::Auto`, a trait of the `Fn` family as
+/// `dyn path::Fn(A) -> B`, and the auto traits in the order of their paths.
+fn write_dyn<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut Spelled,
+    bounds: BoundExistentialPredicates<'db>,
+) -> Option<()> {
+    let mut parts = Vec::new();
+    if let Some(principal) = bounds.principal() {
+        let mut part = Spelled::new(out.spelling);
+        let projections: Vec<_> =
+            bounds.projection_bounds().into_iter().map(|it| it.skip_binder()).collect();
+        write_principal(db, &mut part, principal.skip_binder(), &projections)?;
+        parts.push(part.text);
+    }
+    let mut autos = Vec::new();
+    for auto in bounds.auto_traits() {
+        let mut part = Spelled::new(out.spelling);
+        write_module(db, &mut part, auto.0.module(db))?;
+        write!(part, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
+        autos.push(part.text);
+    }
+    autos.sort();
+    parts.extend(autos);
+    out.push_str("dyn ");
+    out.push_str(&parts.join(" + "));
+    Some(())
+}
+
+/// The trait a trait object is of, with what it says of the trait's associated types.
+fn write_principal<'db>(
+    db: &'db dyn HirDatabase,
+    out: &mut Spelled,
+    principal: ExistentialTraitRef<'db>,
+    projections: &[ExistentialProjection<'db>],
+) -> Option<()> {
+    let trait_ = principal.def_id.0;
+    write_module(db, out, trait_.module(db))?;
+    write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
+    if out.spelling == Spelling::Symbol {
+        if !projections.is_empty() {
+            return None;
+        }
+        return write_args(db, out, principal.args.as_slice());
+    }
+    let is_fn = fn_traits(lang_items(db, trait_.krate(db))).any(|it| it == trait_);
+    match (is_fn, principal.args.as_slice(), projections) {
+        (true, [inputs], [output]) => {
+            let TyKind::Tuple(inputs) = inputs.ty()?.kind() else { return None };
+            out.push('(');
+            write_list(db, out, inputs.iter())?;
+            out.push(')');
+            let output = output.term.as_type()?;
+            if !output.is_unit() {
+                out.push_str(" -> ");
+                write_ty(db, out, output)?;
+            }
+        }
+        (false, args, []) => write_args(db, out, args)?,
+        (false, args, [projection]) => {
+            let mut inner = Spelled::new(out.spelling);
+            write_args(db, &mut inner, args)?;
+            let before =
+                inner.text.strip_suffix('>').map_or("<".to_owned(), |it| format!("{it}, "));
+            let TermId::TypeAliasId(alias) = projection.def_id.0 else { return None };
+            write!(out, "{before}{} = ", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
+            write_ty(db, out, projection.term.as_type()?)?;
+            out.push('>');
+        }
+        // FIXME: rustc writes several associated types in an order that is not known here.
         _ => return None,
     }
     Some(())

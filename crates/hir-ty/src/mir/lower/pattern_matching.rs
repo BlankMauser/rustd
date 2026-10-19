@@ -7,9 +7,9 @@ use hir_def::{
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
-    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef,
+    Adjust, Adjustment, BindingMode, ByRef,
     mir::{
-        FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, Projection,
+        CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, Projection,
         lower::{
             BasicBlockId, BinOp, BindingId, BorrowKind, Expr, Idx, MemoryMap, MirLowerCtx,
             MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem, ResolveValueResult,
@@ -443,16 +443,23 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         owner: self.owner.expression_store_owner(self.db),
                         path: p.clone(),
                     };
+                    // A path that starts at a type, `<T>::C`, is one only inference resolves.
+                    let associated = match self.infer.assoc_resolutions_for_pat(pattern) {
+                        Some((CandidateId::ConstId(c), subst)) => Some((c, subst)),
+                        _ => None,
+                    };
                     let hygiene = self.store.pat_path_hygiene(pattern);
-                    let pr = self
-                        .resolver
-                        .resolve_path_in_value_ns(self.db, p, hygiene)
-                        .ok_or_else(unresolved_name)?;
+                    let pr = self.resolver.resolve_path_in_value_ns(self.db, p, hygiene);
+                    let pr = match (pr, associated) {
+                        (Some(pr), _) => Some(pr),
+                        (None, Some(_)) => None,
+                        (None, None) => return Err(unresolved_name()),
+                    };
 
                     if let (
                         MatchingMode::Assign,
-                        ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding)),
-                    ) = (mode, &pr)
+                        Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding))),
+                    ) = (mode, pr.as_ref())
                     {
                         let local = self.binding_local(*binding)?;
                         let ty = self.result.locals[local].ty.as_ref();
@@ -467,18 +474,24 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         return Ok((current, current_else));
                     }
 
+                    // A unit struct, by its name or as `Self`, is all there is of its type.
+                    if let Some(ResolveValueResult::ValueNs(
+                        ValueNs::StructId(_) | ValueNs::ImplSelf(_),
+                    )) = pr
+                    {
+                        return Ok((current, current_else));
+                    }
+
                     // The path is not a variant or a local, so it is a const
                     if mode != MatchingMode::Check {
                         // A const don't bind anything. Only needs check.
                         return Ok((current, current_else));
                     }
                     let (c, subst) = 'b: {
-                        if let Some(x) = self.infer.assoc_resolutions_for_pat(pattern)
-                            && let CandidateId::ConstId(c) = x.0
-                        {
-                            break 'b (c, x.1);
+                        if let Some(found) = associated {
+                            break 'b found;
                         }
-                        if let ResolveValueResult::ValueNs(ValueNs::ConstId(c)) = pr {
+                        if let Some(ResolveValueResult::ValueNs(ValueNs::ConstId(c))) = pr {
                             break 'b (c, GenericArgs::empty());
                         }
                         not_supported!("path in pattern position that is not const or variant")
@@ -571,25 +584,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     mode == MatchingMode::Assign,
                     "Pat::Expr can only come in destructuring assignments"
                 );
-                // Inference records on the assignee how the value is coerced to its type; the
-                // assignee itself is a place, as rustc's desugaring to `let lhs = value;
-                // assignee = lhs;` has it.
-                if !self.assigned_value_is_copied(expr) {
-                    not_supported!("a coercion in a destructuring assignment");
-                }
                 let Some((lhs_place, current)) =
                     self.lower_expr_as_place_without_adjust(current, expr, false)?
                 else {
                     return Ok((current, current_else));
                 };
                 let ty = self.expr_ty_without_adjust(expr);
+                let value = self.assigned_part(expr, cond_place)?;
                 let current = self.drop_assigned(lhs_place, ty, current, expr.into());
-                self.push_assignment(
-                    current,
-                    lhs_place,
-                    Operand { kind: OperandKind::Copy(cond_place.store()), span: None }.into(),
-                    expr.into(),
-                );
+                self.push_assignment(current, lhs_place, value, expr.into());
                 (current, current_else)
             }
             &Pat::Box { inner } => {
@@ -600,16 +603,26 @@ impl<'db> MirLowerCtx<'_, 'db> {
         })
     }
 
-    /// Whether the value a destructuring assignment gives to `assignee` is stored as it is:
-    /// it is not coerced, or is a reference that is reborrowed.
-    fn assigned_value_is_copied(&self, assignee: ExprId) -> bool {
-        match self.infer.expr_adjustments.get(&assignee).map_or(&[][..], |it| &**it) {
-            [] => true,
+    /// The part of a destructured value at `part` as it is assigned to `target`. The
+    /// adjustments of the target are the coercion of the part to the type of the target.
+    fn assigned_part(&self, target: ExprId, part: Place<'db>) -> Result<'db, Rvalue> {
+        let part = Operand { kind: OperandKind::Copy(part.store()), span: None };
+        let adjustments = self.infer.expr_adjustments.get(&target).map_or(&[][..], |it| &**it);
+        // A reborrow is the pointer it is of.
+        let adjustments = match adjustments {
             [
                 Adjustment { kind: Adjust::Deref(None), .. },
-                Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_)), target },
-            ] => target.as_ref() == self.expr_ty_without_adjust(assignee),
-            _ => false,
+                Adjustment { kind: Adjust::Borrow(_), .. },
+                rest @ ..,
+            ] => rest,
+            all => all,
+        };
+        match adjustments {
+            [] => Ok(part.into()),
+            [Adjustment { kind: Adjust::Pointer(cast), target }] => {
+                Ok(Rvalue::Cast(CastKind::PointerCoercion(*cast), part, target.clone()))
+            }
+            _ => not_supported!("a coercion of a part of a destructuring assignment"),
         }
     }
 
@@ -775,9 +788,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 &cond_place,
                 mode,
             )?,
-            VariantId::UnionId(_) => {
-                return Err(MirLowerError::TypeError("pattern matching on union"));
-            }
+            VariantId::UnionId(u) => self.pattern_matching_variant_fields(
+                shape,
+                u.fields(self.db),
+                variant,
+                current,
+                current_else,
+                &cond_place,
+                mode,
+            )?,
         })
     }
 

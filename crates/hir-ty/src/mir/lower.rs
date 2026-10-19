@@ -101,6 +101,8 @@ struct MirLowerCtx<'a, 'db> {
     extended_temporaries: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
+    /// How many `const { .. }` blocks deep the expression being lowered is.
+    inline_consts: u32,
     /// The expressions that end their own temporaries: the body, and from the 2024 edition the
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
@@ -244,6 +246,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             coroutine: None,
             unreached: vec![],
             scope_ends: vec![],
+            inherits_overflow_checks: match owner {
+                InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                    hir_def::attrs::AttrFlags::query(db, func.into())
+                        .contains(hir_def::attrs::AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+                }
+                _ => false,
+            },
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -267,6 +276,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
             super_let: None,
+            inline_consts: 0,
             ends_temporaries: FxHashSet::default(),
             operand_locals: FxHashSet::default(),
             arm_unreached: false,
@@ -1277,7 +1287,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.result.binding_locals.insert(binding, local);
                     }
                 }
-                self.lower_expr_to_place(id, place, current)
+                self.inline_consts += 1;
+                let lowered = self.lower_expr_to_place(id, place, current);
+                self.inline_consts -= 1;
+                lowered
             }
             Expr::Cast { expr, type_ref: _ } => {
                 // Since we don't have THIR, this is the "zipped" version of [rustc's HIR lowering](https://github.com/rust-lang/rust/blob/e71f9529121ca8f687e4b725e3c9adc3f1ebab4d/compiler/rustc_mir_build/src/thir/cx/expr.rs#L165-L178)
@@ -1379,7 +1392,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     // Behind a deref the local is a pointer, an overloaded index's result say,
                     // and not the value.
                     && !p.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
-                    && self.is_promotable(*expr)
+                    // What a `const { .. }` block borrows is a constant whatever it is made of.
+                    && (self.inline_consts > 0 || self.is_promotable(*expr))
                 {
                     // The local holds what the fields and elements are taken out of.
                     let mut constant = *expr;
@@ -3369,6 +3383,19 @@ fn mir_body_for_coroutine_cycle_result<'db>(
     Err(MirLowerError::Loop)
 }
 
+/// Refuses a body with a macro call that failed to expand: what stands in for the expansion
+/// is a guess, where rustc stops.
+fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+    for (_, call) in source_map.macro_calls() {
+        if let Some(error) = &call.parse_macro_expansion(db).err {
+            let message = error.render_to_string(db).message;
+            not_supported!("macro call that failed to expand: {message}");
+        }
+    }
+    Ok(())
+}
+
 /// How the body of a closure gets at what the closure captured.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Receiver {
@@ -3398,6 +3425,7 @@ fn lower_closure_body<'db>(
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
+    check_expansions(db, body_owner)?;
     let Expr::Closure { args, body: root, .. } = &store[expr] else {
         implementation_error!("closure expression is not closure");
     };
@@ -3418,6 +3446,7 @@ fn lower_closure_body<'db>(
         }
     };
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
+    ctx.result.inherits_overflow_checks = store.inherits_overflow_checks(expr);
     let interner = ctx.interner();
     let by_ref = |mutability| {
         Ty::new_ref(interner, Region::new_erased(interner), infer.expr_ty(expr), mutability)
@@ -3732,6 +3761,7 @@ pub fn promoted_mir_body_query<'db>(
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return Err(MirLowerError::HasErrors);
     }
+    check_expansions(db, def)?;
     let mut ctx = MirLowerCtx::new(db, def, store, infer);
     // The value itself, before what borrowing or indexing it adjusts it to.
     ctx.result.locals.alloc(Local { ty: ctx.expr_ty_without_adjust(expr).store() });
@@ -3816,6 +3846,7 @@ pub fn lower_to_mir_with_store<'db>(
     params: impl Iterator<Item = (PatId, Ty<'db>)> + Clone,
     self_param: Option<(BindingId, Ty<'db>)>,
 ) -> Result<'db, MirBody<'db>> {
+    check_expansions(db, owner)?;
     if infer.has_type_mismatches() || infer.is_erroneous() {
         if std::env::var_os("RUSTD_DUMP_ERRORS").is_some() {
             for (expr, data) in store.exprs() {
