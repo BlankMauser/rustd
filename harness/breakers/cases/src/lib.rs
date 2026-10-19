@@ -117,4 +117,5 @@ cases![
     literal_operands,
     moved_bits_unread,
     pads_hold_the_payload,
+    panic_while_unwinding,
 ];
