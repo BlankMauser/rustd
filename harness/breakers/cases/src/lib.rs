@@ -111,4 +111,5 @@ cases![
     promoted_constructor,
     renamed_variant_pattern,
     alias_under_binder,
+    match_arm_moves_drops,
 ];
