@@ -164,8 +164,14 @@ impl Tree {
             }
         }
         remaining.extend(candidates);
-        // A switch always has a target for the values none of the candidates named.
-        let mut fell = start && !branches.iter().any(|(it, _)| *it == Branch::Failure);
+        // A switch always has a target for the values none of the candidates named, and
+        // the test of a `bool` has one for the value the first candidate did not ask for.
+        let has = |branch: Branch| branches.iter().any(|(it, _)| *it == branch);
+        let mut fell = start
+            && match ask {
+                Ask::Bool(_) => !(has(Branch::Success) && has(Branch::Failure)),
+                _ => !has(Branch::Failure),
+            };
         for (_, sorted) in branches {
             fell |= self.run(start, sorted);
         }
