@@ -270,17 +270,19 @@ impl DefMap {
                 if self.data.edition == Edition::Edition2015
                     && (path.kind == PathKind::Abs || mode == ResolveMode::Import) =>
             {
-                let (_, segment) = match segments.next() {
-                    Some((idx, segment)) => (idx, segment),
-                    None => return ResolvePathResult::empty(ReachedFixedPoint::Yes),
-                };
-                tracing::debug!("resolving {:?} in crate root (+ extern prelude)", segment);
-                self.resolve_name_in_crate_root_or_extern_prelude(
-                    local_def_map,
-                    db,
-                    original_module,
-                    segment,
-                )
+                match segments.next() {
+                    Some((_, segment)) => {
+                        tracing::debug!("resolving {:?} in crate root (+ extern prelude)", segment);
+                        self.resolve_name_in_crate_root_or_extern_prelude(
+                            local_def_map,
+                            db,
+                            original_module,
+                            segment,
+                        )
+                    }
+                    // `use ::*;` names the crate root itself.
+                    None => PerNs::types(self.crate_root(db).into(), Visibility::Public, None),
+                }
             }
             PathKind::Plain => {
                 let (_, segment) = match segments.next() {
@@ -652,12 +654,9 @@ impl DefMap {
         //  - current module / scope
         //  - extern prelude / macro_use prelude
         //  - std prelude
+        // A module declared in a block is in the textual scope of the macros before the block.
         let from_legacy_macro = self
-            .module(db, module)
-            .legacy_macro_in_scope(db, name)
-            // FIXME: shadowing
-            .and_then(|it| it.last())
-            .copied()
+            .legacy_macro_in_textual_scope(db, module, name)
             .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
             .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None));
         let from_scope =

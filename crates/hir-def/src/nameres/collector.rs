@@ -2613,6 +2613,12 @@ impl ModCollector<'_, '_> {
         let mut flags = MacroRulesLocFlags::empty();
         flags.set(MacroRulesLocFlags::LOCAL_INNER, local_inner);
         flags.set(MacroRulesLocFlags::ALLOW_INTERNAL_UNSAFE, allow_internal_unsafe);
+        let edition_panic = attrs
+            .by_key(sym::allow_internal_unstable)
+            .tt_values()
+            .flat_map(|it| it.iter())
+            .any(|it| matches!(it, tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.sym == sym::edition_panic));
+        flags.set(MacroRulesLocFlags::EDITION_PANIC, edition_panic);
 
         let macro_id = MacroRulesLoc {
             container: module,
