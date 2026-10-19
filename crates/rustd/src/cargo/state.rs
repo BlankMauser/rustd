@@ -601,7 +601,10 @@ impl State {
         counts: Counts,
     ) -> anyhow::Result<State> {
         let metadata = metadata(asked)?;
-        let root = metadata.workspace_root.clone().into_std_path_buf();
+        // By its real path, as rustc's working directory and so the sources of the units
+        // are: a workspace reached through a link is the one it links to.
+        let root = metadata.workspace_root.as_std_path();
+        let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_owned());
         let dir = metadata.target_directory.as_std_path().join("rustd").join(key);
         let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
         let artifacts: Vec<&Artifact> =
@@ -623,7 +626,7 @@ impl State {
             counts,
         };
         let project = match project(asked, cwd, &metadata) {
-            Ok(project) => project,
+            Ok(project) => dunce::canonicalize(&project).unwrap_or(project),
             Err(why) => {
                 state.refusal = Some(why);
                 root.clone()
@@ -646,6 +649,7 @@ impl State {
             selection: asked.selection(),
             env: worker_env(),
         };
+        let sysroot_libraries = sysroot_libraries();
         let checkout = |unit_test: bool| Checkout {
             key: format!("{key}{}", if unit_test { "-unit" } else { "" }),
             generation: 0,
@@ -714,7 +718,10 @@ impl State {
                 asked_as,
                 left_to_cargo,
                 inputs: inputs.into_iter().collect(),
-                env: run_env(package, &built.scripts),
+                env: run_env(package, &built.scripts)
+                    .into_iter()
+                    .chain(library_path(executable.as_std_path(), sysroot_libraries.as_deref()))
+                    .collect(),
             });
         }
         state
@@ -735,7 +742,11 @@ impl State {
         // Cargo runs the doc tests of the packages it runs the tests of.
         let tested: FxHashSet<_> =
             artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
-        let documented = |it: &&Package| it.targets.iter().any(|it| it.is_lib() && it.doctest);
+        // A proc macro is a library with doc tests as much as any other.
+        let library = |it: &cargo_metadata::Target| {
+            it.is_lib() || it.is_rlib() || it.is_dylib() || it.is_proc_macro()
+        };
+        let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
         state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
@@ -912,6 +923,39 @@ fn repository(root: &Path) -> PathBuf {
     common.map_or_else(|| root.to_owned(), spelled)
 }
 
+/// The variable the dynamic linker of this platform looks for libraries by.
+const LIBRARY_PATH: &str = if cfg!(windows) {
+    "PATH"
+} else if cfg!(target_os = "macos") {
+    "DYLD_FALLBACK_LIBRARY_PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
+/// Where the toolchain cargo builds with has the libraries of the host, `libstd` as a
+/// dynamic library among them. `None` when rustc does not say.
+fn sysroot_libraries() -> Option<PathBuf> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc).arg("--print=target-libdir").output().ok()?;
+    let said = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !said.is_empty()).then(|| PathBuf::from(said))
+}
+
+/// Where cargo has the dynamic linker look when it runs `executable`: the dependencies of
+/// the profile, the profile's own directory, the toolchain's libraries, and then wherever
+/// it looked already. A test of a proc macro is linked with the toolchain's `libstd`.
+fn library_path(executable: &Path, sysroot: Option<&Path>) -> Option<(String, String)> {
+    let inside = |it: &&Path| it.file_name().is_some_and(|it| it == "deps" || it == "examples");
+    let dir = executable.parent()?;
+    let profile = if inside(&dir) { dir.parent()? } else { dir };
+    let already = std::env::var_os(LIBRARY_PATH);
+    let already = already.iter().flat_map(std::env::split_paths);
+    let dirs =
+        [profile.join("deps"), profile.to_owned()].into_iter().chain(sysroot.map(Path::to_owned));
+    let joined = std::env::join_paths(dirs.chain(already)).ok()?;
+    Some((LIBRARY_PATH.to_owned(), joined.into_string().ok()?))
+}
+
 /// The variables cargo sets for a program of `package` when it runs it.
 fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> {
     let version = &package.version;
@@ -1064,4 +1108,27 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
     }
     files.extend(variables);
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_program_is_run_with_the_libraries_cargo_runs_it_with() {
+        let sysroot = Path::new("/toolchain/lib/rustlib/host/lib");
+        let dirs = |executable: &str| {
+            let (name, value) = library_path(Path::new(executable), Some(sysroot)).unwrap();
+            assert_eq!(name, LIBRARY_PATH);
+            let dirs: Vec<PathBuf> = std::env::split_paths(&value).take(3).collect();
+            dirs
+        };
+        let expected: Vec<PathBuf> =
+            ["/t/debug/deps", "/t/debug", "/toolchain/lib/rustlib/host/lib"]
+                .map(PathBuf::from)
+                .into();
+        assert_eq!(dirs("/t/debug/deps/unit-0123"), expected);
+        assert_eq!(dirs("/t/debug/app"), expected);
+        assert_eq!(dirs("/t/debug/examples/one"), expected);
+    }
 }

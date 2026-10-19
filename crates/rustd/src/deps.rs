@@ -187,9 +187,7 @@ async fn push(
             let bytes = tokio::task::spawn_blocking(pack).await??;
             let (hash, len) = (Digest::of(&bytes), bytes.len() as u64);
             remote.send_named_by_hash(&format!("units/{hash}"), bytes).await?;
-            if let Ok(mut sent) = sent.lock() {
-                sent.insert(unit, hash);
-            }
+            crate::lock(sent).insert(unit, hash);
             Ok(Fetched::Whole(len))
         }
     };

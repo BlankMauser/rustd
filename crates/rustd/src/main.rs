@@ -271,7 +271,6 @@ struct Resolver<'a> {
     root: PathBuf,
     /// The checkout that the packages which are the same in both are read from.
     base: Option<PathBuf>,
-    rustc_commit: std::cell::OnceCell<Option<String>>,
     contents: &'a content::Contents,
     /// What the code has a debugger told.
     debug: plan::Described,
@@ -366,7 +365,7 @@ impl Resolver<'_> {
         // that describes it to the harness before it, under the same name.
         let function = hir::Function::from(func);
         let symbol = if function.is_test(self.db) || function.is_bench(self.db) {
-            self.table.get_at(&path, 1)
+            self.table.get_at(&path, 1, &[])
         } else {
             self.table.get(&path)
         };
@@ -564,8 +563,8 @@ impl Resolver<'_> {
             }
             match_ast! {
                 match node {
-                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_string())),
-                    ast::Static(it) => inner.push(it.name()?.text().to_string()),
+                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_owned())),
+                    ast::Static(it) => inner.push(it.name()?.text().to_owned()),
                     // Anonymous constants have numbers we don't know.
                     ast::BlockExpr(it) => if it.const_token().is_some() { return None },
                     ast::ConstArg(_) => return None,
@@ -731,7 +730,7 @@ impl SymbolResolver for Resolver<'_> {
                 let db = self.db.clone();
                 let (next, table, root) = (&next, self.table, self.root.clone());
                 let base = self.base.clone();
-                let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
+                let contents = self.contents;
                 let (debug, apart) = (self.debug, self.apart.clone());
                 let (listed, named) = (self.listed, self.named.clone());
                 let shared_paths = self.shared_paths.clone();
@@ -741,7 +740,6 @@ impl SymbolResolver for Resolver<'_> {
                         table,
                         root,
                         base,
-                        rustc_commit,
                         contents,
                         debug,
                         apart,
@@ -768,15 +766,6 @@ impl SymbolResolver for Resolver<'_> {
         let source_root = self.db.file_source_root(file).source_root_id(self.db);
         let source_root = self.db.source_root(source_root).source_root(self.db);
         let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-        // Whichever way this system writes a path; what follows the commit stays as it is.
-        const SOURCES: &str = "lib/rustlib/src/rust/";
-        let slashed = path.replace('\\', "/");
-        if let Some((toolchain, _)) = slashed.split_once(SOURCES)
-            && let Some(commit) = self.rustc_commit.get_or_init(|| rustc_commit(toolchain))
-        {
-            let file = &path[toolchain.len() + SOURCES.len()..];
-            return Some(format!("/rustc/{commit}/{file}"));
-        }
         let relative = self.inside(Path::new(&path));
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
     }
@@ -866,6 +855,10 @@ impl SymbolResolver for Resolver<'_> {
         self.contents.cargo_home(self.db)
     }
 
+    fn library_sources(&self) -> Option<hir_ty::mir::codegen::LibrarySources> {
+        self.contents.library_sources(self.db)
+    }
+
     fn names_place(&self, bytes: &[u8]) -> bool {
         self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
@@ -932,6 +925,7 @@ impl SymbolResolver for Resolver<'_> {
         let source = sema.source(it)?;
         let mut names = vec![name.as_str().to_owned()];
         let mut closures = Vec::new();
+        let mut around = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
             if is_closure(&node) {
@@ -953,11 +947,25 @@ impl SymbolResolver for Resolver<'_> {
                     _ => None,
                 }
             };
-            names.extend(name.map(|it| it.text().to_string()));
+            if let Some(name) = name {
+                let named = |other: &SyntaxNode| {
+                    let other = match_ast! {
+                        match other {
+                            ast::Const(it) => it.name(),
+                            ast::Static(it) => it.name(),
+                            _ => None,
+                        }
+                    };
+                    other.is_some_and(|it| it.text() == name.text())
+                };
+                around.push(place_in_definition(&sema, &node, &named)?.into());
+                names.push(name.text().to_string());
+            }
         }
         let owner = match owner {
             Some(owner) => owner,
             None => {
+                around.pop();
                 let outer = names.pop()?;
                 self.item_path(module.nearest_non_block_module(self.db), &outer)?
             }
@@ -965,6 +973,7 @@ impl SymbolResolver for Resolver<'_> {
         names.push(owner);
         names.reverse();
         closures.reverse();
+        around.reverse();
         let path = names.join("::");
         // Only a path through a closure or an anonymous constant has segments left out of it.
         let named = |node: &SyntaxNode| {
@@ -974,8 +983,8 @@ impl SymbolResolver for Resolver<'_> {
         let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
         let symbol = self
             .table
-            .get_nested(&path, &closures, place)
-            .or_else(|| self.table.get_at(&path, place));
+            .get_nested(&path, &closures, place, &around)
+            .or_else(|| self.table.get_at(&path, place, &around));
         symbol.map(str::to_owned)
     }
 
@@ -1016,8 +1025,9 @@ fn is_definition(node: &SyntaxNode) -> bool {
 }
 
 /// The place of a node among those of the definition it is written in that `counts` holds
-/// of, in the order rustc comes across them. This is how rustc tells apart the closures
-/// of a function, and the statics of one name that a macro used twice in it declares.
+/// of, in the order rustc comes across them, or none when that order cannot be told. This is
+/// how rustc tells apart the closures of a function, and the statics of one name that a
+/// macro used twice in it declares.
 fn place_in_definition(
     sema: &hir::Semantics<'_, RootDatabase>,
     target: &SyntaxNode,
@@ -1029,55 +1039,275 @@ fn place_in_definition(
         root = Some(node.clone());
         is_definition(node)
     });
-    let mut earlier = 0;
-    Place { sema, target, counts, earlier: &mut earlier }
-        .find_in(&owner.or(root)?)
-        .then_some(earlier)
+    let owner = owner.or(root)?;
+    let late = LateImports::around(sema, &owner);
+    let mut count =
+        Count { sema, target, counts, late, seen: 0, earlier: None, waiting: Vec::new() };
+    count.all_in(&owner)?;
+    while let Some(call) = count.waiting.pop() {
+        count.expansion_of(&call)?;
+    }
+    count.earlier
 }
 
-struct Place<'a, 'db> {
+/// The imports of the scope of a definition that rustc has not resolved when it first comes
+/// to the macros used in the definition: those a macro expanded to. It resolves the imports
+/// it has, then expands every macro it can, and only then resolves the imports that those
+/// expanded to.
+#[derive(Default)]
+struct LateImports {
+    names: FxHashSet<String>,
+    glob: bool,
+}
+
+impl LateImports {
+    fn around(sema: &hir::Semantics<'_, RootDatabase>, owner: &SyntaxNode) -> LateImports {
+        let mut late = LateImports::default();
+        let module_expanded = module_is_expanded(sema, owner);
+        let expanded = |node: &SyntaxNode| {
+            module_expanded
+                || sema.hir_file_for(node).is_macro()
+                || sema
+                    .ancestors_with_macros(node.clone())
+                    .filter_map(ast::Item::cast)
+                    .any(|item| has_attribute_macro(sema, &item))
+        };
+        if expanded(owner) {
+            late.add_written_in(owner);
+        }
+        for scope in sema.ancestors_with_macros(owner.clone()) {
+            if expanded(&scope) {
+                let imports = scope.children().filter_map(ast::Use::cast);
+                imports.filter_map(|it| it.use_tree()).for_each(|tree| late.add(&tree, None));
+            }
+            if ast::Module::can_cast(scope.kind()) {
+                break;
+            }
+        }
+        late
+    }
+
+    /// Adds the imports written in the blocks of a definition, those of the definitions in
+    /// it apart.
+    fn add_written_in(&mut self, node: &SyntaxNode) {
+        for child in node.children() {
+            if let Some(tree) = ast::Use::cast(child.clone()).and_then(|it| it.use_tree()) {
+                self.add(&tree, None);
+            } else if !is_definition(&child) {
+                self.add_written_in(&child);
+            }
+        }
+    }
+
+    /// Adds the names the tree brings in, `prefix` being the last name of the path before it.
+    fn add(&mut self, tree: &ast::UseTree, prefix: Option<String>) {
+        let last = tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
+        let own = if last.as_deref() == Some("self") { prefix } else { last };
+        if let Some(list) = tree.use_tree_list() {
+            list.use_trees().for_each(|it| self.add(&it, own.clone()));
+        } else if tree.star_token().is_some() {
+            self.glob = true;
+        } else if let Some(name) = tree.rename().and_then(|it| it.name()) {
+            self.names.insert(name.text().to_owned());
+        } else {
+            self.names.extend(own);
+        }
+    }
+}
+
+/// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
+/// is one, though it leaves the item as it is written.
+fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item) -> bool {
+    sema.resolve_attr_macro_call(item).is_some()
+        || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
+            matches!(
+                sema.resolve_path(&path),
+                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if found.is_attr(sema.db)
+            )
+        })
+}
+
+/// Whether a macro expanded to the module the node is in, or to one around it.
+fn module_is_expanded(sema: &hir::Semantics<'_, RootDatabase>, node: &SyntaxNode) -> bool {
+    let mut module = sema.scope(node).map(|it| it.module());
+    while let Some(it) = module {
+        if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
+            return true;
+        }
+        module = it.parent(sema.db);
+    }
+    false
+}
+
+/// When rustc expands a macro used in a definition.
+enum Turn {
+    /// As it comes to it.
+    Now,
+    /// After every macro it can expand at first, the last such first.
+    Later,
+}
+
+struct Count<'a, 'db> {
     sema: &'a hir::Semantics<'db, RootDatabase>,
     target: &'a SyntaxNode,
     counts: &'a dyn Fn(&SyntaxNode) -> bool,
-    earlier: &'a mut u32,
+    late: LateImports,
+    seen: u32,
+    earlier: Option<u32>,
+    waiting: Vec<ast::MacroCall>,
 }
 
-impl Place<'_, '_> {
-    /// Counts the nodes before the target in the definition `node` is of. Whether the target
-    /// is there.
+impl Count<'_, '_> {
+    /// Counts the nodes of the definition `node` is of, or none when the order rustc numbers
+    /// them in is not known.
     ///
     /// rustc numbers what is written in the definition before what the macros used in it
     /// expand to, and then goes through the macros in turn, each the same way.
-    fn find_in(&mut self, node: &SyntaxNode) -> bool {
+    fn all_in(&mut self, node: &SyntaxNode) -> Option<()> {
         let mut calls = Vec::new();
-        if self.find_written_in(node, &mut calls) {
-            return true;
+        self.written_in(node, &mut calls);
+        for call in calls {
+            match self.turn(&call) {
+                Some(Turn::Now) => self.expansion_of(&call)?,
+                Some(Turn::Later) => self.waiting.push(call),
+                None => self.nothing_in(&call)?,
+            }
         }
-        calls.iter().any(|call| {
-            self.sema
-                .expand_macro_call(call)
-                .is_some_and(|expansion| self.find_in(&expansion.value))
-        })
+        Some(())
     }
 
-    /// As `find_in`, of what is not in a macro: `calls` gets the macros come across.
-    fn find_written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) -> bool {
+    fn expansion_of(&mut self, call: &ast::MacroCall) -> Option<()> {
+        match self.sema.expand_macro_call(call) {
+            Some(expansion) => self.all_in(&expansion.value),
+            None => Some(()),
+        }
+    }
+
+    /// That the macro expands to nothing that is counted, so that when it is expanded is
+    /// the same to the count.
+    fn nothing_in(&mut self, call: &ast::MacroCall) -> Option<()> {
+        let (seen, waiting) = (self.seen, self.waiting.len());
+        self.expansion_of(call)?;
+        (self.seen == seen && self.waiting.len() == waiting).then_some(())
+    }
+
+    /// As `all_in`, of what is not in a macro: `calls` gets the macros come across.
+    fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) {
         for child in node.children() {
             if let Some(call) = ast::MacroCall::cast(child.clone()) {
                 calls.push(call);
                 continue;
             }
-            if child == *self.target {
-                return true;
+            let target = child == *self.target;
+            if target {
+                self.earlier = Some(self.seen);
             }
-            if (self.counts)(&child) {
-                *self.earlier += 1;
+            if target || (self.counts)(&child) {
+                self.seen += 1;
             }
-            if !is_definition(&child) && self.find_written_in(&child, calls) {
-                return true;
+            if !target && !is_definition(&child) {
+                self.written_in(&child, calls);
             }
         }
-        false
+    }
+
+    /// When rustc expands the macro, or none when that is not known: a macro it finds by a
+    /// late import waits for the import.
+    fn turn(&self, call: &ast::MacroCall) -> Option<Turn> {
+        let Some(path) = call.path() else { return Some(Turn::Now) };
+        let Some(first) = path.first_segment().and_then(|it| it.name_ref()) else {
+            return Some(Turn::Now);
+        };
+        let alone = path.qualifier().is_none();
+        let imported = self.late.names.contains(first.text());
+        if !alone && !imported {
+            return self.reached_by_path(call).then_some(Turn::Now);
+        }
+        if !imported && !self.late.glob {
+            return Some(Turn::Now);
+        }
+        if alone && self.in_textual_scope(call)? {
+            return Some(Turn::Now);
+        }
+        if imported {
+            return Some(Turn::Later);
+        }
+        // A name alone may be found by the glob import: not one of this crate or of the
+        // standard library, which the macros in scope everywhere are.
+        let home = self.sema.resolve_macro_call(call)?.module(self.sema.db).krate(self.sema.db);
+        let here = self.sema.scope(call.syntax())?.krate();
+        (home == here || home.origin(self.sema.db).is_lang()).then_some(Turn::Now)
+    }
+
+    /// Whether a path finds the macro with no import: any but a `macro_rules!` one of this
+    /// crate that is not exported, which is in no module but by an import of it, and
+    /// whether that import is a late one is not known.
+    fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
+        let sema = self.sema;
+        let Some(found) = sema.resolve_macro_call(call) else { return true };
+        let here = sema.scope(call.syntax()).map(|it| it.krate());
+        if Some(found.module(sema.db).krate(sema.db)) != here {
+            return true;
+        }
+        match sema.source(found).and_then(|it| it.value.left()) {
+            Some(ast::Macro::MacroRules(rules)) => ast::HasAttrs::attrs(&rules)
+                .any(|it| it.simple_name().is_some_and(|name| name == "macro_export")),
+            _ => true,
+        }
+    }
+
+    /// Whether the macro is a `macro_rules!` one found by where it is written, which is
+    /// before an import of the name is looked for: one written earlier, beside something
+    /// the use is in, or in a `#[macro_use]` module that is. None when that is not known:
+    /// a macro expanded to it or to a module around it.
+    fn in_textual_scope(&self, call: &ast::MacroCall) -> Option<bool> {
+        let sema = self.sema;
+        let Some(found) = sema.resolve_macro_call(call) else { return Some(false) };
+        let Some(source) = sema.source(found) else { return Some(false) };
+        let Some(ast::Macro::MacroRules(rules)) = source.value.left() else {
+            return Some(false);
+        };
+        let named = rules.name().map(|it| it.text().to_string());
+        let used = call.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
+        // Another crate's are in scope by `#[macro_use]`, which is looked in after imports.
+        let home = found.module(sema.db).krate(sema.db);
+        if named != used || Some(home) != sema.scope(call.syntax()).map(|it| it.krate()) {
+            return Some(false);
+        }
+        let mut module = found.module(sema.db);
+        let mut written = hir::InFile::new(source.file_id, rules.syntax().clone());
+        loop {
+            if written.file_id.is_macro() {
+                return None;
+            }
+            let beside = sema.ancestors_with_macros(call.syntax().clone()).any(|around| {
+                around.parent() == written.value.parent()
+                    && sema.hir_file_for(&around) == written.file_id
+                    && written.value.text_range().end() <= around.text_range().start()
+            });
+            if beside {
+                return Some(true);
+            }
+            // The scope goes on after a module that is `#[macro_use]`.
+            let inline = written.value.ancestors().skip(1).find_map(ast::Module::cast);
+            let around = match inline {
+                Some(inline) => written.with_value(inline),
+                None => match module.declaration_source(sema.db) {
+                    Some(declared) => declared,
+                    None => return Some(false),
+                },
+            };
+            let goes_on = ast::HasAttrs::attrs(&around.value)
+                .any(|it| it.simple_name().is_some_and(|name| name == "macro_use"));
+            if !goes_on {
+                return Some(false);
+            }
+            module = match module.parent(sema.db) {
+                Some(parent) => parent,
+                None => return Some(false),
+            };
+            written = around.map(|it| it.syntax().clone());
+        }
     }
 }
 
@@ -1324,6 +1554,8 @@ impl Checkouts {
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
         let project = dunce::canonicalize(project).ok()?;
+        // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
+        project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
             if self.splits[at].is_some() {
@@ -1684,6 +1916,15 @@ fn pause_mid_reload() {
         eprintln!("reload: paused");
         std::thread::sleep(Duration::from_millis(pause));
     }
+}
+
+/// The directory cargo put the executables of the build in: the one its `deps`, where the
+/// libraries of the build are, is in.
+fn executables_of(symbol_files: &[PathBuf]) -> Option<AbsPathBuf> {
+    let deps = symbol_files.iter().filter_map(|file| file.parent());
+    let deps = deps.filter(|deps| deps.file_name().is_some_and(|name| name == "deps"));
+    let built = deps.filter_map(Path::parent).next()?;
+    AbsPathBuf::try_from(built.to_str()?).ok()
 }
 
 /// The parts of a checkout that a build of it is told.
@@ -2097,18 +2338,18 @@ fn serves_allocator(db: &RootDatabase, func: FunctionId) -> bool {
 impl Listed {
     /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
     fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
-        self.built.lock().unwrap().insert(krate);
-        if let Some(listed) = self.functions.lock().unwrap().get(&krate) {
+        lock(&self.built).insert(krate);
+        if let Some(listed) = lock(&self.functions).get(&krate) {
             return listed.clone();
         }
         let listed = std::sync::Arc::new(ListedCrate::new(db, krate));
-        self.functions.lock().unwrap().entry(krate).or_insert(listed).clone()
+        lock(&self.functions).entry(krate).or_insert(listed).clone()
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     fn touch(&self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
         let Some(crates) = crates else {
-            self.functions.lock().unwrap().clear();
+            lock(&self.functions).clear();
             return;
         };
         // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
@@ -2116,7 +2357,7 @@ impl Listed {
             .iter()
             .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
             .collect();
-        let mut functions = self.functions.lock().unwrap();
+        let mut functions = lock(&self.functions);
         for krate in seeing {
             functions.remove(&krate);
         }
@@ -2221,9 +2462,11 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
     std::thread::scope(|scope| {
         // The bodies of one file are next to each other, and the edited file's are the slow
         // ones: each thread takes every nth, so that they are spread over all of them.
+        let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
             let (db, bodies) = (db.clone(), &bodies);
             scope.spawn(move || {
+                PROBING.set(probing);
                 hir::attach_db(&db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
                         Body::of(&db, body);
@@ -2255,6 +2498,21 @@ thread_local! {
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Has the thread be one that probes for as long as it lives.
+pub(crate) struct Probing(bool);
+
+impl Probing {
+    pub(crate) fn new() -> Probing {
+        Probing(PROBING.replace(true))
+    }
+}
+
+impl Drop for Probing {
+    fn drop(&mut self) {
+        PROBING.set(self.0);
+    }
+}
+
 fn build(
     db: &RootDatabase,
     table: &SymbolTable,
@@ -2272,7 +2530,6 @@ fn build(
         table,
         root,
         base,
-        rustc_commit: Default::default(),
         contents,
         debug,
         apart,
@@ -2390,7 +2647,11 @@ fn build(
     }
     let build = Build {
         compiled: unit.compiled.len(),
-        skipped: unit.skipped.into_iter().map(|(func, e)| (name(func), e)).collect(),
+        skipped: unit
+            .skipped
+            .into_iter()
+            .map(|(func, e)| (name(func), with_failed_macro(db, func, e)))
+            .collect(),
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
@@ -2441,6 +2702,36 @@ impl Build {
     }
 }
 
+/// `error` with the macro of the function's crate that did not expand, when the frontend is
+/// what turned the function down: what such a macro would have written is what is then
+/// missing, and the name or method that does not resolve says nothing of it.
+fn with_failed_macro(db: &RootDatabase, func: FunctionId, error: CodegenError) -> CodegenError {
+    let frontend = match &error {
+        CodegenError::Frontend(_) => true,
+        CodegenError::Unsupported(why) => why.contains("frontend:"),
+        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+    };
+    if !frontend {
+        return error;
+    }
+    let krate = hir::Function::from(func).module(db).krate(db);
+    let Some(failed) = failed_macro(db, krate) else { return error };
+    match error {
+        CodegenError::Frontend(why) => CodegenError::Frontend(format!("{why} ({failed})")),
+        CodegenError::Unsupported(why) => CodegenError::Unsupported(format!("{why} ({failed})")),
+        error => error,
+    }
+}
+
+/// What the first macro written among the items of `krate` that did not expand said.
+fn failed_macro(db: &RootDatabase, krate: Crate) -> Option<String> {
+    let modules = hir_def::nameres::crate_def_map(db, krate.into()).modules(db);
+    let said = modules
+        .flat_map(|(_, module)| module.scope(db).all_macro_calls())
+        .find_map(|call| call.parse_macro_expansion_error(db)?.err)?;
+    Some(format!("a macro of the crate did not expand: {}", said.render_to_string(db).message))
+}
+
 fn report(build: &Build) {
     eprintln!(
         "compiled {} of {} fns (+{} instances) in {:.1?} (+{:.1?} emit)",
@@ -2479,6 +2770,13 @@ fn report(build: &Build) {
     }
 }
 
+/// The lock, also after a thread panicked with it: a build that is interrupted or that
+/// panics unwinds, and what a lock here guards is whole between any two statements, so the
+/// requests after it go on with what is there.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The executables that edits are spliced into, by where each is. One program has as many as
 /// there are checkouts read as its own, and a link may run after the build that asked for it.
 static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executable>>> =
@@ -2501,7 +2799,7 @@ fn link(
     // An executable linked with the object as it was is not one to add to, also when the
     // object was written for a request that does not link.
     let rewritten = match splice {
-        Some(binary) if !patched => LINKED.lock().unwrap().remove(binary).is_some(),
+        Some(binary) if !patched => lock(&LINKED).remove(binary).is_some(),
         _ => false,
     };
     let Some(cmd) = cmd else { return Ok(()) };
@@ -2509,7 +2807,7 @@ fn link(
     let mut declined = String::new();
     let running = splice.map_or(Ok(false), set_aside)?;
     if let (Some(binary), Some(patch)) = (splice, patch) {
-        let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
+        let known = lock(&LINKED).remove(binary).map(Executable::baseline);
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
             _ if running => Err(anyhow::anyhow!("the executable is running")),
@@ -2531,7 +2829,7 @@ fn link(
                     );
                 }
                 let read = Executable::Read(Box::new(baseline));
-                LINKED.lock().unwrap().insert(binary.to_owned(), read);
+                lock(&LINKED).insert(binary.to_owned(), read);
                 eprintln!(
                     "link: {:.1?} (spliced: {redirected} functions redirected, {appended} bytes)",
                     start.elapsed()
@@ -2541,12 +2839,15 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
-    let status = shell(cmd).status()?;
+    let linked = shell(cmd).output()?;
+    let status = linked.status;
+    let said = String::from_utf8_lossy(&linked.stderr);
+    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
-    anyhow::ensure!(status.success(), "the link failed ({status})");
+    anyhow::ensure!(status.success(), "the link failed ({status}): {}", last_lines(&said, 6));
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
-        LINKED.lock().unwrap().insert(binary.to_owned(), linked);
+        lock(&LINKED).insert(binary.to_owned(), linked);
     }
     Ok(())
 }
@@ -2585,6 +2886,13 @@ fn set_aside(binary: &Path) -> anyhow::Result<bool> {
 #[cfg(unix)]
 fn set_aside(_: &Path) -> anyhow::Result<bool> {
     Ok(false)
+}
+
+/// The last `count` lines of `text` that say something, on one line: what a linker that
+/// failed said last is why.
+fn last_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|it| !it.is_empty()).collect();
+    lines[lines.len().saturating_sub(count)..].join(" | ")
 }
 
 /// The command that runs the line `cmd` as the platform's shell would.
@@ -2965,11 +3273,11 @@ impl WatchedFile {
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
-    /// The files of the VFS that have a text. One that is not UTF-8 has none, and is no
-    /// source of anything.
+    /// The files of the VFS that are text. One that is not UTF-8 can only be named by an
+    /// `include_bytes!`, and is watched as [`Watched::Included`] once it is.
     fn sources(vfs: &Vfs, db: &RootDatabase) -> Vec<WatchedFile> {
         vfs.iter()
-            .filter(|(id, _)| db.has_text(*id))
+            .filter(|&(id, _)| db.has_file_text(id))
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 WatchedFile::new(Watched::Source(id), path, path)
@@ -3772,6 +4080,7 @@ fn cargo_config(args: &Args) -> CargoConfig {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
+        executables: executables_of(&args.symbol_files),
         target_dir_config: match args.own_target {
             true => TargetDirectoryConfig::UseSubdirectory,
             false => TargetDirectoryConfig::None,
@@ -4483,6 +4792,9 @@ fn run_holding(
     let mut slow: FxHashMap<PathBuf, u32> = FxHashMap::default();
     // The ones that are loaded instead from the next time on.
     let mut given_up: FxHashSet<PathBuf> = FxHashSet::default();
+    // The ones whose link failed: what rustc built of one lacks what the object of the
+    // checkout it was read as takes from what rustc built of that.
+    let unlinked: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
     let slow_switch = std::env::var("RUSTD_SLOW_SWITCH_MS")
         .ok()
         .and_then(|it| it.parse().ok())
@@ -4570,7 +4882,7 @@ fn run_holding(
                                 started = started.and(again);
                             }
                             listed.touch(&db, Some(&new));
-                            as_built.lock().unwrap().clear();
+                            lock(&as_built).clear();
                             if let Err(error) = reloaded.and(started) {
                                 let _ = writeln!(&stream, "error: {error:#}");
                                 continue;
@@ -4595,9 +4907,10 @@ fn run_holding(
                                 program.unbuilt.stale = true;
                             }
                             listed.touch(&db, Some(&reading));
-                            as_built.lock().unwrap().clear();
+                            lock(&as_built).clear();
                         }
                     }
+                    given_up.extend(lock(&unlinked).drain(..));
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
                             // What a checkout reads is known once a build of it is over.
@@ -4624,9 +4937,7 @@ fn run_holding(
                     // A checkout read as another that is as it was built takes no turn.
                     if let (Some(view), Some(target)) = (&view, &target) {
                         let unchanged = links.get(&target.out).is_none_or(|it| it.is_finished())
-                            && as_built
-                                .lock()
-                                .unwrap()
+                            && lock(&as_built)
                                 .get(&target.out)
                                 .is_some_and(|it| it.still(&files, &db, view, target, request));
                         if unchanged {
@@ -4843,7 +5154,7 @@ fn run_holding(
             if let Some(link) = links.remove(&wanted.out) {
                 _ = link.join();
             }
-            as_built.lock().unwrap().remove(&wanted.out);
+            lock(&as_built).remove(&wanted.out);
         }
         let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
@@ -5170,6 +5481,7 @@ fn run_holding(
             let over = viewed.get(base).unwrap_or(base);
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
+            let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
             let linked = std::thread::spawn(move || {
                 let failed = link(
                     link_cmd.as_deref(),
@@ -5180,13 +5492,17 @@ fn run_holding(
                 )
                 .err();
                 if failed.is_none() {
-                    as_built.lock().unwrap().insert(object, from);
+                    lock(&as_built).insert(object, from);
                 }
                 for (_, _, client) in clients {
                     let _ = match &failed {
                         None => writeln!(&client, "ok {built}"),
                         Some(why) => writeln!(&client, "error: {why}"),
                     };
+                }
+                if let (Some(_), Some((over, unlinked))) = (&failed, read_as) {
+                    eprintln!("view: {} is loaded from now on", over.display());
+                    lock(&unlinked).push(over);
                 }
                 if failed.is_some() {
                     let _ = sender.send(Event::Unlinked(at));
@@ -5643,5 +5959,29 @@ mod tests {
         assert_eq!(commit_of_sources(built.as_bytes()).as_deref(), Some(commit));
         assert_eq!(commit_of_sources(b"/rustc/"), None);
         assert_eq!(commit_of_sources(format!("/rustc/{commit}").as_bytes()), None);
+    }
+
+    #[test]
+    fn a_link_that_failed_says_what_the_linker_said_last() {
+        let said = "note: one\n\nld: cannot find -lmissing\n  collect2: error: ld returned 1\n";
+        assert_eq!(
+            last_lines(said, 2),
+            "ld: cannot find -lmissing | collect2: error: ld returned 1"
+        );
+        assert_eq!(last_lines("", 2), "");
+    }
+
+    #[test]
+    fn a_lock_a_thread_panicked_with_is_still_taken() {
+        let held = std::sync::Arc::new(std::sync::Mutex::new(1));
+        let theirs = held.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = lock(&theirs);
+            panic!("unwinds as an interrupted build does");
+        });
+        assert!(panicked.join().is_err());
+        assert!(held.is_poisoned());
+        *lock(&held) += 1;
+        assert_eq!(*lock(&held), 2);
     }
 }

@@ -295,7 +295,7 @@ impl Listed {
     /// Any file may be one before a crate is listed.
     pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
         // Copied out: a query that is cancelled unwinds, and would poison the lock.
-        let built = self.built.lock().unwrap().clone();
+        let built = crate::lock(&self.built).clone();
         // Before the first build there is no telling.
         built.is_empty()
             || relevant_crates(db, file).iter().any(|&krate| {

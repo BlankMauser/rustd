@@ -70,6 +70,17 @@ pub(crate) struct Plan {
     pub(crate) stamp: u128,
 }
 
+/// The library of the workspace among `records` that wrote the file a link line names. The
+/// file is told by what it is and not by its name: a target directory reached through a
+/// link has two names for it.
+fn member_that_wrote<'a>(records: &'a [Record], file: &Path) -> Option<&'a Record> {
+    if file.extension().is_none_or(|it| it != "rlib") {
+        return None;
+    }
+    let is_file = |it: &PathBuf| it == file || same_file::is_same_file(it, file).unwrap_or(false);
+    records.iter().find(|it| it.is_rlib() && it.outputs().iter().any(is_file))
+}
+
 impl Plan {
     /// Plans the program `unit` built, with the daemon's files for it in `dir`. `records` are
     /// the units of the workspace. `Err` is why the program is left to cargo.
@@ -106,7 +117,7 @@ impl Plan {
         };
         for arg in &mut link.args {
             let path = PathBuf::from(&*arg);
-            let member = records.iter().find(|it| it.is_rlib() && it.outputs().contains(&path));
+            let member = member_that_wrote(records, &path);
             let Some(owner) = member.or_else(|| unit.copy_of(&path).map(|_| unit)) else {
                 continue;
             };

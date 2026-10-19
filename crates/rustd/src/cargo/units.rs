@@ -192,7 +192,10 @@ impl Record {
 
     /// The copy of `original`, when it is a file of this unit.
     pub(crate) fn copy_of(&self, original: &Path) -> Option<&Path> {
-        self.copies.iter().find(|it| it.original == original).map(|it| &*it.copy)
+        let named = self.copies.iter().find(|it| it.original == original);
+        // A target directory reached through a link has two names for the file.
+        let same = |it: &&Copied| same_file::is_same_file(&it.original, original).unwrap_or(false);
+        named.or_else(|| self.copies.iter().find(same)).map(|it| &*it.copy)
     }
 }
 
