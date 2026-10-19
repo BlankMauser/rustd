@@ -1184,9 +1184,13 @@ fn links_core(command: &str) -> bool {
 /// Every crate called `krate`, of the checkout or not.
 fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
     let is_file = krate.ends_with(".rs");
+    // A path that is written as its parts are ends the text of every path it is the end of,
+    // which is all that most crates have to be asked.
+    let plain = !krate.contains("//") && !krate.contains("./");
     Crate::all(db)
         .into_iter()
         .filter(|it| match is_file {
+            _ if is_file && plain && !root_file_ends_with(db, *it, krate) => false,
             // Named from the checkout, or in full.
             true => crate_root_file(db, *it).is_some_and(|root| {
                 root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
@@ -1213,6 +1217,15 @@ fn crates_to_build(
     let mut called = crates_called(db, krate, args);
     called.retain(linked);
     if called.is_empty() { crates_named(db, krate, args) } else { Ok(called) }
+}
+
+/// Whether the text of the path of the crate's root file ends with `end`.
+fn root_file_ends_with(db: &RootDatabase, krate: Crate, end: &str) -> bool {
+    let file = krate.root_file(db);
+    let source_root = db.file_source_root(file).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    let path = source_root.path_for_file(&file).and_then(|it| it.as_path());
+    path.is_some_and(|it| it.as_str().ends_with(end))
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -1938,11 +1951,12 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     // A crate comes after its dependencies in the list: a thread that starts on one whose
     // dependencies are not resolved resolves them itself, one after the other.
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let helping = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let db = db.clone();
-            let next = &next;
+            let (next, helping) = (&next, &helping);
             scope.spawn(move || {
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -1952,6 +1966,7 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
                     hir::attach_db(&db, || {
                         _ = hir::crate_def_map(&db, krate);
                         let names = start.elapsed();
+                        warm_impls(&db, krate, helping, threads);
                         _ = hir::TraitImpls::for_crate(&db, krate);
                         // A build asks which functions written in the bodies of the standard
                         // library share a path, which every body of the crate is lowered for:
@@ -1978,6 +1993,43 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
             });
         }
     });
+}
+
+/// Does what finding the impls of `krate` asks of each impl and each body that may hold one,
+/// with the threads no other crate has helping: the crates late in a chain of dependencies are
+/// resolved one at a time, and the other cores are idle then.
+fn warm_impls(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+    helping: &std::sync::atomic::AtomicUsize,
+    threads: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let work = hir_ty::method_resolution::impl_work(db, krate);
+    let wanted = (work.len() / 64).min(threads - 1);
+    let mut helpers = 0;
+    _ = helping.fetch_update(Relaxed, Relaxed, |busy| {
+        helpers = wanted.min(threads.saturating_sub(busy + 1));
+        Some(busy + helpers)
+    });
+    if helpers == 0 {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let run = |db: &RootDatabase| {
+        while let Some(&work) = work.get(next.fetch_add(1, Relaxed)) {
+            work.run(db);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..helpers {
+            let db = db.clone();
+            let run = &run;
+            scope.spawn(move || hir::attach_db(&db, || run(&db)));
+        }
+        run(db);
+    });
+    helping.fetch_sub(helpers, Relaxed);
 }
 
 /// The functions of the crates being built, listed once and again for the crates an edit can

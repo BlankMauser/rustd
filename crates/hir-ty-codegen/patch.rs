@@ -14,7 +14,9 @@ use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{FunctionId, HasModule, StaticId};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+
+type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
 use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
@@ -149,7 +151,7 @@ impl TheirWalk {
         db: &dyn HirDatabase,
         found: &TheirStatics,
         walked: Walked,
-        instances: &mut FxHashMap<Instance, BaseInstance>,
+        instances: &mut FxIndexMap<Instance, BaseInstance>,
         statics: &mut FxHashMap<StaticId, BaseStatic>,
     ) -> TheirWalk {
         instances.values_mut().for_each(|it| it.theirs = false);
@@ -302,7 +304,8 @@ pub(super) struct Base {
     from_rustc: Vec<FunctionId>,
     their_statics: TheirStatics,
     their_walk: TheirWalk,
-    pub(super) instances: FxHashMap<Instance, BaseInstance>,
+    pub(super) instances: FxIndexMap<Instance, BaseInstance>,
+    homes: Homes,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     /// The symbols of the functions built from entries of the store, by their stable names.
     /// No edit reaches what those are compiled from.
@@ -315,6 +318,54 @@ pub(super) struct Base {
     /// to rustc, and stays there for as long as the base does.
     rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
     pub(super) bodies: usize,
+}
+
+/// Where in the base the code of each crate is, and the code that comes from the bodies of
+/// each file: an edit is looked for there, which is far less than the base.
+#[derive(Clone, Default)]
+struct Homes {
+    root: FxHashMap<FunctionId, u32>,
+    roots_of_crate: FxHashMap<Crate, Vec<u32>>,
+    roots_of_file: FxHashMap<FileId, Vec<u32>>,
+    instances_of_crate: FxHashMap<Crate, Vec<u32>>,
+    instances_of_file: FxHashMap<FileId, Vec<u32>>,
+    /// The instances that the bodies of any file may be part of.
+    instances_of_any_file: Vec<u32>,
+}
+
+impl Homes {
+    fn new(
+        compiled: &[(FunctionId, String)],
+        crates: &[Crate],
+        files: &[FileId],
+        instances: &FxIndexMap<Instance, BaseInstance>,
+    ) -> Homes {
+        let mut homes = Homes::default();
+        for (i, &(root, _)) in compiled.iter().enumerate() {
+            homes.root.insert(root, i as u32);
+            homes.roots_of_crate.entry(crates[i]).or_default().push(i as u32);
+            homes.roots_of_file.entry(files[i]).or_default().push(i as u32);
+        }
+        for (i, was) in instances.values().enumerate() {
+            homes.instances_of_crate.entry(was.env.krate).or_default().push(i as u32);
+            match &was.files {
+                Some(files) => {
+                    for &file in files {
+                        homes.instances_of_file.entry(file).or_default().push(i as u32);
+                    }
+                }
+                None => homes.instances_of_any_file.push(i as u32),
+            }
+        }
+        homes
+    }
+}
+
+/// One part in `parts` of `all`, in order and each once.
+fn part_of(mut all: Vec<u32>, part: usize, parts: usize) -> impl Iterator<Item = usize> {
+    all.sort_unstable();
+    all.dedup();
+    all.into_iter().skip(part).step_by(parts).map(|it| it as usize)
 }
 
 /// What an edit since the base was last looked at can have changed the code of, and what
@@ -478,7 +529,7 @@ impl Base {
                 };
                 (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
             })
-            .collect::<Option<FxHashMap<_, _>>>()?;
+            .collect::<Option<FxIndexMap<_, _>>>()?;
         let mut statics = cg
             .statics
             .iter()
@@ -544,14 +595,18 @@ impl Base {
             })
             .map(|(instance, it)| (instance.clone(), it.env.clone()))
             .collect();
+        let crates: Vec<Crate> = compiled.iter().map(|&(root, _)| root.krate(db)).collect();
+        let files: Vec<FileId> =
+            compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
         Some(Base {
             debug,
             rejected,
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
             marks,
-            crates: compiled.iter().map(|&(root, _)| root.krate(db)).collect(),
-            files: compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect(),
+            homes: Homes::new(compiled, &crates, &files, &instances),
+            crates,
+            files,
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
@@ -637,6 +692,53 @@ impl Base {
         first.steps.left += start.elapsed();
     }
 
+    /// The roots an edit can have changed, or all of them, one part in `parts`.
+    fn roots_to_ask(
+        &self,
+        all: bool,
+        part: usize,
+        parts: usize,
+    ) -> Box<dyn Iterator<Item = usize> + '_> {
+        let touched = &self.touched;
+        if all || touched.any {
+            return Box::new((part..self.compiled.len()).step_by(parts));
+        }
+        let homes = &self.homes;
+        let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
+        let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
+        let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
+        Box::new(part_of(asked, part, parts))
+    }
+
+    /// The instances an edit can have changed, or all of them, one part in `parts`.
+    fn instances_to_ask(
+        &self,
+        all: bool,
+        part: usize,
+        parts: usize,
+    ) -> Box<dyn Iterator<Item = usize> + '_> {
+        let touched = &self.touched;
+        if all || touched.any {
+            return Box::new((part..self.instances.len()).step_by(parts));
+        }
+        let homes = &self.homes;
+        let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
+        let of_files = touched.bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
+        let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        if !touched.bodies.is_empty() {
+            asked.extend(&homes.instances_of_any_file);
+        }
+        asked.extend(
+            touched
+                .instances
+                .iter()
+                .filter_map(|it| self.instances.get_index_of(it))
+                .map(|it| it as u32),
+        );
+        Box::new(part_of(asked, part, parts))
+    }
+
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
@@ -653,7 +755,7 @@ impl Base {
                 return stale.declined("an instance that did not compile is another now");
             }
         }
-        for i in every(self.compiled.len()) {
+        for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
                 || self.touched.reaches_bodies(Some(&[self.files[i]]))
@@ -680,7 +782,8 @@ impl Base {
             }
         }
         stale.steps.roots = start.elapsed();
-        for (instance, was) in self.instances.iter().skip(part).step_by(parts) {
+        for i in self.instances_to_ask(check_all, part, parts) {
+            let Some((instance, was)) = self.instances.get_index(i) else { continue };
             let touched = self.touched.reaches(was.env.krate)
                 || self.touched.reaches_bodies(was.files.as_deref())
                 || self.touched.instances.contains(instance);

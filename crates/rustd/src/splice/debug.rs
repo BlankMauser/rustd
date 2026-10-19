@@ -28,7 +28,11 @@ pub(super) struct Described {
     names: usize,
 }
 
+/// What a section is given to grow into before the one behind it moves.
+const ROOM: u64 = 1 << 20;
+
 /// A run of the file that is written again further on.
+#[derive(PartialEq)]
 pub(super) struct Moved {
     pub(super) from: u64,
     pub(super) len: u64,
@@ -128,6 +132,8 @@ impl Patch<'_> {
         }
         let mut end = offset;
         for section in self.described() {
+            // With room behind each, the next is where it was when this one grows.
+            end = end.next_multiple_of(ROOM);
             let mut data = section.data()?.to_vec();
             for (at, relocation) in section.relocations() {
                 let RelocationFlags::Elf { r_type } = relocation.flags() else {

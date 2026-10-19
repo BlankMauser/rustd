@@ -80,8 +80,50 @@ pub(crate) struct Baseline {
     baked: Vec<Box<[u8]>>,
     /// What the last splice wrote over, to put back before the next.
     undo: Vec<(u64, Vec<u8>)>,
+    /// What the last splice left behind what the linker wrote, which the next one mostly
+    /// writes again as it is.
+    left: Left,
     /// What the file was when we last left it: someone else may have written it since.
     stamp: Stamp,
+}
+
+/// What a splice appended that the next may find where it is.
+#[derive(Default)]
+struct Left {
+    /// What was appended, and where.
+    appended: Option<(u64, Vec<u8>)>,
+    /// The runs of what the linker wrote that are further on too.
+    moved: Vec<debug::Moved>,
+}
+
+impl Left {
+    /// Writes `appended` at `offset`, but for the parts that are there already.
+    fn append(&self, file: &File, offset: u64, appended: &[u8]) -> std::io::Result<()> {
+        const PART: usize = 1 << 16;
+        let old = match &self.appended {
+            Some((at, old)) if *at == offset => old.as_slice(),
+            _ => &[],
+        };
+        let mut start = 0;
+        while start < appended.len() {
+            let same = |at: usize| {
+                let end = (at + PART).min(appended.len());
+                old.get(at..end) == Some(&appended[at..end])
+            };
+            if same(start) {
+                start += PART;
+                continue;
+            }
+            let mut end = start + PART;
+            while end < appended.len() && !same(end) {
+                end += PART;
+            }
+            let end = end.min(appended.len());
+            write_all_at(file, &appended[start..end], offset + start as u64)?;
+            start = end;
+        }
+        Ok(())
+    }
 }
 
 /// An executable by the format it is in, which is what its splice depends on.
@@ -125,7 +167,7 @@ impl Baseline {
                 .collect();
             (image, baked)
         };
-        Ok(Baseline { path, image, baked, undo: Vec::new(), stamp })
+        Ok(Baseline { path, image, baked, undo: Vec::new(), left: Left::default(), stamp })
     }
 
     pub(crate) fn is_of(&self, binary: &Path) -> bool {
@@ -170,15 +212,31 @@ impl Baseline {
         for (offset, bytes) in self.undo.drain(..).rev() {
             write_all_at(&file, &bytes, offset)?;
         }
-        file.set_len(len)?;
-        write_all_at(&file, &addition.appended, addition.offset)?;
+        // Until this is through, nothing is known of what is behind the linker's.
+        let left = std::mem::take(&mut self.left);
+        left.append(&file, addition.offset, &addition.appended)?;
         write_all_at(&file, &addition.headers, addition.headers_offset)?;
-        for moved in &addition.described.moved {
-            copy_within(&file, moved)?;
+        let mut end = (addition.offset + addition.appended.len() as u64)
+            .max(addition.headers_offset + addition.headers.len() as u64);
+        // A run the last splice copied stays where it is while nothing else is written there,
+        // also when this one has no use for it: the next may.
+        let mut moved = left.moved;
+        moved.retain(|it| it.to >= end);
+        for run in addition.described.moved {
+            if !moved.contains(&run) {
+                moved.retain(|it| it.to + it.len <= run.to || run.to + run.len <= it.to);
+                copy_within(&file, &run)?;
+                moved.push(run);
+            }
         }
         for (offset, bytes) in &addition.described.written {
             write_all_at(&file, bytes, *offset)?;
+            let written = *offset + bytes.len() as u64;
+            moved.retain(|it| it.to + it.len <= *offset || written <= it.to);
+            end = end.max(written);
         }
+        end = moved.iter().map(|it| it.to + it.len).fold(end, u64::max);
+        file.set_len(end.max(len))?;
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
             read_exact_at(&file, &mut old, *offset)?;
@@ -186,7 +244,9 @@ impl Baseline {
             write_all_at(&file, bytes, *offset)?;
         }
         self.stamp = Stamp::of(&file)?;
-        Ok(Spliced { redirected: addition.redirected, appended: addition.appended.len() })
+        let appended = addition.appended.len();
+        self.left = Left { appended: Some((addition.offset, addition.appended)), moved };
+        Ok(Spliced { redirected: addition.redirected, appended })
     }
 
     /// The splice of a wasm module, which is written anew from the linker's each time.
@@ -996,6 +1056,8 @@ impl Fixup {
 
 impl<'a> Patch<'a> {
     const SLOT: usize = 8;
+    /// What a table of the executable is given to grow into before what follows it moves.
+    const ROOM: u64 = 1 << 20;
 
     fn read(bytes: &'a [u8], image: &Image) -> anyhow::Result<Patch<'a>> {
         let file = ElfFile64::<Endianness>::parse(bytes)?;
@@ -1246,17 +1308,20 @@ impl<'a> Patch<'a> {
         let (mut stubs_at, mut slots_at, mut spare_at) = (0, 0, 0);
         for segment in Segment::ALL {
             let start = reserve(0, page);
+            // The two tables of the executable first, each with room behind it, so that
+            // they are where the last splice has them whatever the patch is.
             if let Segment::Read = segment {
                 unwind_at = reserve(image.unwind.len_with(self.frames), 4);
+                relocations_at =
+                    reserve(relocations.map_or(0, |it| it.len_with(fixed_up)), Self::ROOM);
+                reserve(0, Self::ROOM);
             }
             for &index in &self.sections[segment as usize] {
                 let section = self.file.section_by_index(index)?;
                 placed.insert(index, reserve(section.size() as usize, section.align().max(1)));
             }
             match segment {
-                Segment::Read => {
-                    relocations_at = reserve(relocations.map_or(0, |it| it.len_with(fixed_up)), 8);
-                }
+                Segment::Read => {}
                 Segment::Code => stubs_at = reserve(self.stubs.len() * stub_len, stub_align),
                 Segment::Data => {
                     slots_at = reserve(self.slots.len() * Self::SLOT, 8);

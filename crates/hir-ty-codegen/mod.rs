@@ -5136,6 +5136,23 @@ struct MovedPath {
     bit: u32,
 }
 
+/// The locals a call's operands move whole, whose memory the callee can be handed as it is.
+struct GivenAway {
+    /// The local the call's result is written to.
+    result: LocalId,
+    whole: FxHashSet<Value>,
+    /// The address of every place the call's operands read.
+    read: Vec<Value>,
+}
+
+impl GivenAway {
+    /// Whether the memory at `addr` is a local moved whole that no other operand reads: a
+    /// field at the start of a local has the local's address.
+    fn gives(&self, addr: Value) -> bool {
+        self.whole.contains(&addr) && self.read.iter().filter(|&&it| it == addr).count() == 1
+    }
+}
+
 /// What the body does to a drop flag, or that it makes a call that may unwind.
 enum FlagEvent {
     /// The local is assigned whole, or moved out of whole.
@@ -5331,7 +5348,7 @@ struct FunctionCx<'cx, 'db> {
     free_argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
     /// While a call is generated: the local its result goes to, and where the locals moved
     /// whole into it are. Nothing reads those again, so the callee can be handed them.
-    given_away: Option<(LocalId, FxHashSet<Value>)>,
+    given_away: Option<GivenAway>,
     /// The index expression each local that holds an index was made for.
     index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
@@ -6243,7 +6260,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
-                if self.given_away.as_ref().is_some_and(|(_, given)| given.contains(&addr)) {
+                if self.given_away.as_ref().is_some_and(|it| it.gives(addr)) {
                     values.push(addr);
                     return;
                 }
@@ -7933,6 +7950,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         match &operand.kind {
             OperandKind::Copy(place) | OperandKind::Move(place) => {
                 let (addr, ty) = self.place(place)?;
+                if let Some(given) = &mut self.given_away {
+                    given.read.push(addr);
+                }
                 // RA's lowering says `Copy` for moves too; a use of a value that needs dropping
                 // can only be a move.
                 if self.drop_flags.contains_idx(place.local)
@@ -7960,11 +7980,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         // which leaks it.
                         None => {
                             self.note_flag(FlagEvent::Whole(place.local, false));
-                            if let Some((result, given)) = &mut self.given_away
+                            if let Some(given) = &mut self.given_away
                                 && place.projection.as_slice().is_empty()
-                                && *result != place.local
+                                && given.result != place.local
                             {
-                                given.insert(addr);
+                                given.whole.insert(addr);
                             }
                             self.builder.ins().iconst(flag.ty, 0)
                         }
@@ -9703,7 +9723,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         destination: &StoredPlace,
         target: Option<BasicBlockId>,
     ) -> Result<()> {
-        self.given_away = Some((destination.local, FxHashSet::default()));
+        self.given_away = Some(GivenAway {
+            result: destination.local,
+            whole: FxHashSet::default(),
+            read: Vec::new(),
+        });
         let done = self.call_with(func, args, destination, target);
         self.given_away = None;
         done
