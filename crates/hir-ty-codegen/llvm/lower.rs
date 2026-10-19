@@ -1291,7 +1291,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let data = match self.module.get_global(&name) {
             Some(known) => known,
             None => {
-                let data = self.module.add_global(self.context.i8_type(), None, &name);
+                // Two requests may be one object: a static of an `extern` block under the
+                // `link_name` of one the build defines. LLVM takes two globals for two
+                // addresses and folds a comparison of them, unless one is empty: an empty
+                // global "might lie at the address of any other".
+                let empty = self.context.i8_type().array_type(0);
+                let data = self.module.add_global(empty, None, &name);
                 data.set_linkage(Linkage::External);
                 // Hidden is how LLVM is told the object is in this program, and so reached
                 // without the GOT, as Cranelift reaches it.
