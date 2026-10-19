@@ -123,9 +123,6 @@ impl Program {
             }
         };
         push_lines(&mut source, &parts.crate_attrs);
-        if rest.is_empty() && parts.extern_crates.is_empty() {
-            return Program { source, lines_before };
-        }
         let injects = !parts.names_the_crate
             && !frame.no_crate_inject
             && frame.crate_name != "std"
@@ -159,6 +156,15 @@ mod tests {
     fn program(code: &str) -> String {
         let frame = Frame { crate_name: "app", attrs: &[], no_crate_inject: false };
         Program::of(code, &frame, "src_lib_rs_3_0", Edition::Edition2021).source
+    }
+
+    #[test]
+    fn attributes_alone_have_a_main() {
+        assert_eq!(
+            program("#![allow(dead_code)]"),
+            "#![allow(unused)]\n#![allow(dead_code)]\n\
+             fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\n} _doctest_main_src_lib_rs_3_0() }"
+        );
     }
 
     #[test]

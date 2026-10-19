@@ -289,6 +289,21 @@ struct Resolver<'a> {
 type SharedPaths =
     Arc<std::sync::Mutex<FxHashMap<Crate, Arc<std::sync::OnceLock<FxHashSet<String>>>>>>;
 
+/// What rustc is told a file is called: its place in the checkout when it is a file of it.
+fn source_path(
+    db: &dyn HirDatabase,
+    root: &Path,
+    base: Option<&Path>,
+    file: vfs::FileId,
+) -> Option<String> {
+    let source_root = db.file_source_root(file).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    let path = source_root.path_for_file(&file)?.as_path()?.to_string();
+    let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
+    let relative = Path::new(&path).strip_prefix(root).ok().or(base);
+    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+}
+
 impl Resolver<'_> {
     /// What `path` is called in the checkout, when it is a file of it.
     fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
@@ -763,11 +778,7 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
-        let source_root = self.db.file_source_root(file).source_root_id(self.db);
-        let source_root = self.db.source_root(source_root).source_root(self.db);
-        let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-        let relative = self.inside(Path::new(&path));
-        Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+        source_path(self.db, &self.root, self.base.as_deref(), file)
     }
 
     fn debug_directory(&self) -> Option<String> {
@@ -2572,6 +2583,10 @@ fn build(
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;
     let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
+    let named = (root.clone(), base.clone());
+    hir_ty::mir::codegen::name_sources(move |db, file| {
+        source_path(db, &named.0, named.1.as_deref(), file)
+    });
     let resolver = Resolver {
         db,
         table,
@@ -4728,6 +4743,7 @@ fn run_holding(
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     if let Some(asked) = doc {
         let krate = *crates_named(&db, &args.krate, &args)?.first().context("no such crate")?;
+        known.used_by_rustc = true;
         let built = build(&db, &table, &args, &mut known, &listed)?;
         eprint!("doctests: ");
         report(&built);

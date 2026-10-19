@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use hir::{Adt, AssocItem, HasAttrs, HasSource, Module, ModuleDef};
 use ide_db::{RootDatabase, base_db::SourceDatabase, rust_doc::is_rust_fence};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
-use syntax::{AstNode, SyntaxKind, TextRange, TextSize};
+use syntax::{AstNode, SyntaxKind, TextRange, TextSize, ast::HasName};
 
 /// One code block of the documentation that is a test.
 pub(crate) struct Example {
@@ -77,7 +77,8 @@ fn is_error_code(token: &str) -> bool {
 /// The examples of the crate, in the order of a walk of its modules.
 pub(crate) fn examples(db: &RootDatabase, krate: hir::Crate) -> Vec<Example> {
     let whole_files = krate.edition(db).at_least_2024();
-    let mut found = Found { db, examples: Vec::new(), seen: Default::default(), whole_files };
+    let mut found =
+        Found { db, examples: Vec::new(), seen: Default::default(), whole_files, nth: 0 };
     found.module(krate.root_module(db), "");
     found.examples
 }
@@ -86,7 +87,9 @@ struct Found<'db> {
     db: &'db RootDatabase,
     examples: Vec<Example>,
     /// Where the blocks found are: a macro that is exported is in two modules.
-    seen: rustc_hash::FxHashSet<(PathBuf, usize, String)>,
+    seen: rustc_hash::FxHashSet<(PathBuf, usize, String, usize)>,
+    /// Which of the items of a `use` is being read: they share its documentation.
+    nth: usize,
     /// Whether the crate is of an edition from which rustdoc has the text of a file that
     /// `include_str!` reads be in that file.
     whole_files: bool,
@@ -110,11 +113,11 @@ impl Found<'_> {
                 }
                 ModuleDef::Function(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::Adt(it) => self.adt(it, &named(it.name(db))),
-                ModuleDef::Const(it) => {
-                    if let Some(name) = it.name(db) {
-                        self.documented(it, &named(name));
-                    }
-                }
+                // One without a name is `_` to rustdoc.
+                ModuleDef::Const(it) => match it.name(db) {
+                    Some(name) => self.documented(it, &named(name)),
+                    None => self.documented(it, &join(path, "_")),
+                },
                 ModuleDef::Static(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::TypeAlias(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::Trait(it) => {
@@ -123,7 +126,9 @@ impl Found<'_> {
                     self.items(it.items(db), &path);
                 }
                 // One of `macro_rules!` is told of where it is written, below.
-                ModuleDef::Macro(it) if !is_macro_rules(db, it) => {
+                // And the examples of a procedural one are those of its function, which may
+                // have another name.
+                ModuleDef::Macro(it) if !is_macro_rules(db, it) && !it.is_proc_macro() => {
                     self.documented(it, &named(it.name(db)))
                 }
                 _ => {}
@@ -135,6 +140,24 @@ impl Found<'_> {
         }
         for it in module.extern_blocks(db) {
             self.documented(it, path);
+        }
+        // rustdoc has an item for every name a `use` brings in, and one without a name for
+        // a list or a glob: the documentation of the `use` is that of each of them.
+        for it in module.use_decls(db) {
+            let mut names = Vec::new();
+            if let Some(tree) = it.source(db).value.use_tree() {
+                use_names(&tree, None, &mut names);
+            }
+            for (nth, name) in names.into_iter().enumerate() {
+                let path = if name.is_empty() { path.to_owned() } else { join(path, name) };
+                self.nth = nth;
+                self.documented(it, &path);
+            }
+            self.nth = 0;
+        }
+        for it in module.extern_crate_decls(db) {
+            let name = it.alias_or_name(db);
+            self.documented(it, &join(path, name.as_ref().map_or("_", |it| it.as_str())));
         }
         for it in module.impl_defs(db) {
             let Some(source) = it.source(db) else { continue };
@@ -188,7 +211,7 @@ impl Found<'_> {
         for block in blocks(text) {
             let Some(marks) = Marks::parse(&block.lang) else { continue };
             let place = (file.clone(), first + text[..block.start].matches('\n').count());
-            if !self.seen.insert((place.0.clone(), place.1, path.to_owned())) {
+            if !self.seen.insert((place.0.clone(), place.1, path.to_owned(), self.nth)) {
                 continue;
             }
             self.examples.push(Example {
@@ -223,11 +246,11 @@ impl Found<'_> {
         let call = call.syntax().original_file_range_rooted(self.db);
         if let Some(included) = included {
             // From edition 2024 the text of a file that is included is in that file, and the
-            // lines are its lines. With a comment beside it rustdoc counts from the comment.
+            // lines are its lines. When the documentation ends in a comment or an attribute
+            // that is written, rustdoc counts from the line that one starts on instead.
             let text = docs.docs();
-            let lines = text.match_indices('\n').map(|(it, _)| it + 1);
-            let lines = lines.filter(|&it| it < text.len() && !text[it..].starts_with('\n'));
-            if let Some(written) = lines.into_iter().find_map(|it| self.written(docs, at(it))) {
+            let last = text.char_indices().rev().find(|(_, it)| !it.is_whitespace());
+            if let Some(written) = last.and_then(|(it, _)| self.written(docs, at(it))) {
                 return Some(written);
             }
             let path = self.path(call.file_id.file_id(self.db))?;
@@ -250,6 +273,13 @@ impl Found<'_> {
         // What a macro wrote of its own is where the macro is used, as rustdoc has it.
         let written = hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
         let attr = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::ATTR);
+        // Before edition 2024 an attribute a macro wrote around what it was given is where
+        // the macro is used, whatever line what is in it was written on.
+        let pound = attr.as_ref().filter(|_| range.file_id.is_macro() && !self.whole_files);
+        if let Some(pound) = pound.and_then(|it| it.first_token()) {
+            let used = hir::InFile::new(range.file_id, pound).original_file_range(db);
+            return self.line_of(used.file_id, used.range.start());
+        }
         let attr = attr.filter(|_| !range.file_id.is_macro());
         let start = attr.map_or(written.range, |it| it.text_range()).start();
         self.line_of(written.file_id, start)
@@ -269,6 +299,24 @@ fn included(call: &syntax::ast::MacroCall) -> Option<String> {
     let file =
         tokens.find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
     includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
+}
+
+/// The names rustdoc has the items of a `use` under: the name each path is brought in as,
+/// and none for a list and for a glob. `stem` is what `self` in a list names.
+fn use_names(tree: &syntax::ast::UseTree, stem: Option<String>, names: &mut Vec<String>) {
+    let last = tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
+    if let Some(list) = tree.use_tree_list() {
+        names.push(String::new());
+        for inner in list.use_trees() {
+            use_names(&inner, last.clone(), names);
+        }
+    } else if tree.star_token().is_some() {
+        names.push(String::new());
+    } else if let Some(rename) = tree.rename() {
+        names.push(rename.name().map_or("_".to_owned(), |it| it.text().to_string()));
+    } else if let Some(last) = last {
+        names.push(if last == "self" { stem.unwrap_or(last) } else { last });
+    }
 }
 
 fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {

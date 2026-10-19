@@ -510,6 +510,7 @@ impl CodegenUnit {
             }
         }
         let patching = known.patching;
+        let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
         let Rejections {
@@ -523,6 +524,7 @@ impl CodegenUnit {
             counted,
             stale: _,
             frozen: _,
+            used_by_rustc: _,
         } = known;
         let mut own_statics = OwnStatics::new(
             db,
@@ -653,9 +655,15 @@ impl CodegenUnit {
                 rejected.extend(failed);
                 continue;
             }
-            if failed.is_empty() && !from_rustc.is_empty() {
+            // The copy rustc makes of a function without a symbol, where it is used, handles
+            // the futures the function does.
+            let generic: Vec<FunctionId> = match used_by_rustc {
+                true => skipped.iter().filter(|(_, e)| e.no_symbol()).map(|it| it.0).collect(),
+                false => Vec::new(),
+            };
+            if failed.is_empty() && (!from_rustc.is_empty() || !generic.is_empty()) {
                 let mut theirs = Some(FxHashSet::default());
-                for root in &from_rustc {
+                for root in from_rustc.iter().chain(&generic) {
                     let blocks = async_blocks(db, *root).clone();
                     theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
                         all.extend(blocks);
@@ -843,6 +851,9 @@ pub struct Rejections {
     left: FxHashSet<FunctionId>,
     /// Whether to answer an edit with a patch for the object of the last full build.
     pub patching: bool,
+    /// Whether rustc compiles a crate that uses the ones built, as it does the examples of a
+    /// library: it then has code of its own for every function of theirs without a symbol.
+    pub used_by_rustc: bool,
     base: Option<patch::Base>,
     frozen: patch::Frozen,
     stale: Vec<Stale>,
@@ -2570,6 +2581,64 @@ fn located_concats<'db>(
             (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
         })
         .collect()
+}
+
+/// What `line!()`, `column!()`, `file!()` or a `concat!` of them is where it is written.
+pub(crate) enum Placed {
+    Number(u32),
+    Text(String),
+}
+
+type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
+
+/// What the build calls each file, for a constant with `file!()` in its value. The evaluator
+/// has no build to ask.
+static SOURCE_PATHS: std::sync::RwLock<Option<std::sync::Arc<SourcePaths>>> =
+    std::sync::RwLock::new(None);
+
+/// Tells the evaluator of constants what the build calls each file: [`Symbols::source_path`].
+pub fn name_sources(
+    paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
+) {
+    *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
+}
+
+/// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
+/// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
+/// and a constant is evaluated from what it expanded them to.
+pub(crate) fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
+    let path = |file| {
+        let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+        paths(db, file)
+    };
+    if let Some(file_id) = located_concats(db, owner).get(&expr) {
+        let call = file_id.macro_file()?.loc(db).to_node(db);
+        let mut text = String::new();
+        for part in concat_parts(&call.value)? {
+            match part {
+                ConcatPart::Text(part) => text.push_str(&part),
+                ConcatPart::Location(expander, range) => {
+                    let (file, line, col) = location_of(db, call.file_id, range)?;
+                    match expander {
+                        BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
+                        BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
+                        _ => text.push_str(&path(file)?),
+                    }
+                }
+            }
+        }
+        return Some(Placed::Text(text));
+    }
+    let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
+    let site = written_call(db, file_id)?;
+    let range = InFile::new(site.file_id, written_range(&site.value));
+    let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
+    let (file, line, col) = location_of(db, file_id.into(), range)?;
+    Some(match expander {
+        BuiltinFnLikeExpander::Line => Placed::Number(line),
+        BuiltinFnLikeExpander::Column => Placed::Number(col),
+        _ => Placed::Text(path(file)?),
+    })
 }
 
 /// The macro of `name` that expands to a place in the source.
@@ -8427,11 +8496,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
-        }
-        // The evaluator has the placeholders rust-analyzer expands these to.
-        if !location_macros(db, id.into()).is_empty() || !located_concats(db, id.into()).is_empty()
-        {
-            unsupported!("a static with `line!()`, `column!()` or `file!()` in its value");
         }
         let allocation = db
             .const_eval_static(id)
