@@ -963,8 +963,6 @@ struct New {
     path: PathBuf,
     /// Locked for as long as it is ours.
     file: File,
-    /// Of the bytes in the file.
-    hash: Sha256,
     written: u64,
     /// Records that are not in the file yet.
     pending: Vec<u8>,
@@ -1231,10 +1229,27 @@ impl Store {
         if self.sealed.read().is_ok_and(|it| it.index.contains_key(&key)) {
             return;
         }
-        let (Ok(mut writer), Ok(len)) = (self.writer.lock(), u32::try_from(value.len())) else {
+        let Ok(len) = u32::try_from(value.len()) else { return };
+        // Every thread that compiles adds here: the lock is held to put the record with the
+        // others and no longer. Its checksum is worked out before, and a pack that is full
+        // is hashed and sealed after.
+        let record = record(&key, value, len);
+        let roll_at = self.tuning.seal_at * ROLL_AFTER;
+        let Some(full) =
+            self.writer.lock().ok().and_then(|mut it| it.add(&self.dir, roll_at, &key, &record))
+        else {
             return;
         };
-        writer.add(&self.dir, self.tuning.seal_at * ROLL_AFTER, &key, value, len);
+        let sealed = full.seal(&self.dir.dir);
+        if let Ok(mut writer) = self.writer.lock() {
+            match sealed {
+                Ok(()) => writer.rolled = true,
+                Err(e) => {
+                    writer.dropped += 1;
+                    writer.stop(e);
+                }
+            }
+        }
     }
 
     /// How many functions were found, and how many were not, since the last call.
@@ -1244,25 +1259,30 @@ impl Store {
 }
 
 impl Writer {
-    fn add(&mut self, dir: &StoreDir, roll_at: u64, key: &[u8; KEY], value: &[u8], len: u32) {
+    /// Adds the record of `key`, unless it was added. What comes back is the open pack once
+    /// it has `roll_at` bytes, for the caller to seal: the next record opens another.
+    fn add(&mut self, dir: &StoreDir, roll_at: u64, key: &[u8; KEY], record: &[u8]) -> Option<New> {
         if self.stopped.is_some() {
             self.dropped += 1;
-            return;
+            return None;
         }
         if self.keys.contains(key) {
-            return;
+            return None;
         }
-        let added = self.append(dir, roll_at, &record(key, value, len));
-        match added {
-            Ok(()) => _ = self.keys.insert(*key),
+        match self.append(dir, roll_at, record) {
+            Ok(full) => {
+                self.keys.insert(*key);
+                full
+            }
             Err(e) => {
                 self.dropped += 1;
                 self.stop(e);
+                None
             }
         }
     }
 
-    fn append(&mut self, dir: &StoreDir, roll_at: u64, record: &[u8]) -> io::Result<()> {
+    fn append(&mut self, dir: &StoreDir, roll_at: u64, record: &[u8]) -> io::Result<Option<New>> {
         let new = match &mut self.open {
             Some(new) => new,
             empty => empty.insert(New::create(&dir.dir)?),
@@ -1271,13 +1291,7 @@ impl Writer {
         if new.pending.len() >= WRITE_AT {
             new.write_out()?;
         }
-        if new.written >= roll_at
-            && let Some(full) = self.open.take()
-        {
-            full.seal(&dir.dir)?;
-            self.rolled = true;
-        }
-        Ok(())
+        Ok(if new.written >= roll_at { self.open.take() } else { None })
     }
 
     /// Adds nothing more until the build ends. What the open pack has on disk stays for
@@ -1326,7 +1340,9 @@ impl New {
         for _ in 0..8 {
             let path = dir.join(format!("{}-{}.open", std::process::id(), nanos()));
             let mut options = OpenOptions::new();
-            let file = match private::file(options.write(true).create_new(true)).open(&path) {
+            // Read when it is sealed, for the name its bytes give it.
+            let options = options.read(true).write(true).create_new(true);
+            let file = match private::file(options).open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -1335,7 +1351,7 @@ impl New {
                 continue;
             }
             let pending = MAGIC.to_vec();
-            return Ok(New { path, file, hash: Sha256::new(), written: 0, pending });
+            return Ok(New { path, file, written: 0, pending });
         }
         Err(io::Error::other("no open pack could be held"))
     }
@@ -1350,17 +1366,21 @@ impl New {
             _ = self.file.set_len(self.written);
             return Err(e);
         }
-        self.hash.update(&self.pending);
         self.written += self.pending.len() as u64;
         self.pending.clear();
         Ok(())
     }
 
     /// Gives the pack the name of its bytes, which is when other daemons start to read it.
+    /// The bytes are hashed here, all at once and from the file, and not as they are added:
+    /// adding is under the lock every thread that compiles waits for.
     fn seal(mut self, dir: &Path) -> io::Result<()> {
         self.write_out()?;
         self.file.sync_all()?;
-        std::fs::rename(&self.path, dir.join(named(&self.hash.finalize())))?;
+        let mut hash = Sha256::new();
+        io::Seek::seek(&mut self.file, io::SeekFrom::Start(0))?;
+        io::copy(&mut self.file, &mut hash)?;
+        std::fs::rename(&self.path, dir.join(named(&hash.finalize())))?;
         sync_dir(dir)
     }
 }
@@ -1533,6 +1553,45 @@ mod tests {
         assert!(files(&dir, Kind::Open).is_empty());
         assert!(files(&dir, Kind::Temporary).is_empty());
         assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn packs_filled_by_many_threads_at_once_are_each_named_by_their_bytes() {
+        let dir = scratch("threads");
+        let store = open(&dir, EAGER);
+        let key = |thread: u8, n: u8| {
+            let mut key = [thread; KEY];
+            key[0] = n;
+            key
+        };
+        // Enough that packs fill and are sealed while the other threads go on adding.
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let store = &store;
+                scope.spawn(move || {
+                    for n in 0..100 {
+                        store.insert(&key(thread, n), &[thread ^ n; 8 << 10]);
+                    }
+                });
+            }
+        });
+        assert!(files(&dir, Kind::Pack).len() > 1);
+        store.flush();
+        assert!(files(&dir, Kind::Open).is_empty());
+        for pack in files(&dir, Kind::Pack) {
+            let name = pack.file_name().unwrap().to_str().unwrap().to_owned();
+            assert_eq!(pack_name(&std::fs::read(&pack).unwrap()), Some(name));
+        }
+        let reader = open(&dir, EAGER);
+        for thread in 0..8 {
+            for n in 0..100 {
+                let value = [thread ^ n; 8 << 10];
+                assert_eq!(store.get(&key(thread, n)).as_deref(), Some(&value[..]));
+                assert_eq!(reader.get(&key(thread, n)).as_deref(), Some(&value[..]));
+            }
+        }
+        assert!(StoreDir::at(&dir).verify().unwrap().corrupt.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1932,7 +1991,6 @@ mod tests {
         let full = New {
             path: dir.join("1-1.open"),
             file: File::options().write(true).open("/dev/full").unwrap(),
-            hash: Sha256::new(),
             written: 0,
             pending: MAGIC.to_vec(),
         };
