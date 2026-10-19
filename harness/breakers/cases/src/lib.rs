@@ -169,4 +169,5 @@ cases![
     alias_under_binder,
     library_panic_location,
     unit_slice_constant,
+    fn_as_pointer_in_const,
 ];
