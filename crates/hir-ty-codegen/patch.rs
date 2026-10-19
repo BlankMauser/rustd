@@ -99,9 +99,14 @@ impl Node {
 }
 
 /// What a query gives for something of the base, or `None` when it panics: the edit may have
-/// taken away what the base knew it by, and only looking tells.
+/// taken away what the base knew it by, and only looking tells. A build that is interrupted
+/// goes on unwinding: that says nothing about the base.
 fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)).ok()
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
+        Ok(found) => Some(found),
+        Err(stopped) if stopped.is::<salsa::Cancelled>() => std::panic::resume_unwind(stopped),
+        Err(_) => None,
+    }
 }
 
 #[derive(Clone)]
@@ -1081,5 +1086,22 @@ impl Base {
         let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
         Ok(Ok(Patch { object, bodies, phases }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe;
+
+    #[test]
+    fn a_probe_that_is_interrupted_goes_on_unwinding_and_one_that_panics_finds_nothing() {
+        let gone: Option<()> = probe(|| panic!("the base no longer has it"));
+        assert_eq!(gone, None);
+        assert_eq!(probe(|| 7), Some(7));
+        let interrupted = std::panic::catch_unwind(|| {
+            probe(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite)))
+        });
+        let stopped: Box<dyn std::any::Any + Send> = interrupted.unwrap_err();
+        assert!(stopped.is::<salsa::Cancelled>());
     }
 }

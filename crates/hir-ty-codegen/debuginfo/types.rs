@@ -372,7 +372,12 @@ impl<'db> Types<'db> {
                         let principal = principal.with_self_ty(self.interner, tail);
                         let principal =
                             self.interner.instantiate_bound_regions_with_erased(principal);
-                        VtableLayout::of(self.interner, principal).slots.len()
+                        let interner = self.interner;
+                        VtableLayout::of(interner, principal, &|it| {
+                            super::super::vtable::without_lifetimes(interner, it)
+                        })
+                        .slots
+                        .len()
                     }
                     None => 0,
                 };

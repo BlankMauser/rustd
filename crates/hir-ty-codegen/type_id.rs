@@ -8,8 +8,8 @@ use std::hash::Hasher;
 
 use base_db::Crate;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId,
-    Lookup, ModuleIdLt, TraitId, TypeAliasId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ImplId,
+    ItemContainerId, Lookup, ModuleIdLt, TraitId, TypeAliasId, VariantId,
     attrs::AttrFlags,
     item_tree::FieldsShape,
     signatures::{
@@ -255,15 +255,18 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Some(parent.child(DefPathData::TypeNs(name.as_str())))
     }
 
+    /// An `impl`, which rustc tells from the others of its module by how many come before it.
+    fn impl_path(&mut self, id: ImplId) -> Option<Fingerprint> {
+        let earlier = self.symbols.impl_place(id)?;
+        Some(self.module(id.lookup(self.db).container)?.child_at(DefPathData::Impl, earlier))
+    }
+
     /// A function that the items of its body are children of.
     fn body_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
         let parent = match func.lookup(db).container {
             ItemContainerId::ImplId(id) if self.ours => self.own_impl(id)?,
-            ItemContainerId::ImplId(id) => {
-                let earlier = self.symbols.impl_place(id)?;
-                self.module(id.lookup(db).container)?.child_at(DefPathData::Impl, earlier)
-            }
+            ItemContainerId::ImplId(id) => self.impl_path(id)?,
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ExternBlockId(_) => return None,
@@ -299,7 +302,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
-            ItemContainerId::ImplId(_) | ItemContainerId::ExternBlockId(_) => return None,
+            ItemContainerId::ImplId(id) => self.impl_path(id)?,
+            ItemContainerId::ExternBlockId(_) => return None,
         };
         Some(parent.child(DefPathData::ValueNs(name.as_str())))
     }
