@@ -247,7 +247,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let mut crates = self.crates.borrow_mut();
             let crates = crates.get_or_insert_with(|| {
                 let mut crates = FxHashMap::<String, Vec<Crate>>::default();
-                for &krate in base_db::all_crates(self.db).iter() {
+                // What is built names only what it depends on, and to name a crate of the
+                // checkout is to go through every body of it: not of one that is not built.
+                let named: FxHashSet<Crate> =
+                    self.owned.iter().flat_map(|it| it.transitive_deps(self.db)).collect();
+                let all = base_db::all_crates(self.db);
+                for &krate in all.iter().filter(|it| named.contains(it)) {
                     let mut name = String::new();
                     if self.crate_(&mut name, krate).is_some() {
                         crates.entry(name).or_default().push(krate);
