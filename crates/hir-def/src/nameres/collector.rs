@@ -2022,9 +2022,10 @@ impl ModCollector<'_, '_> {
             match self.item_tree.index(item_id) {
                 ModItemKind::Mod(ast_id, module) => self.collect_module(ast_id, module, attrs),
                 ModItemKind::Use(ast_id, use_) => {
-                    let id =
-                        UseLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
-                            .intern(db);
+                    let file_id = self.tree_id.file_id();
+                    let id = UseLoc { container: module_id, id: InFile::new(file_id, ast_id) }
+                        .intern(db);
+                    def_map.modules.building()[self.module_id].scope_mut().define_use_decl(id);
                     let is_prelude = attrs.by_key(sym::prelude_import).exists();
                     Import::from_use(self.item_tree, use_, id, is_prelude, |import| {
                         self.def_collector.unresolved_imports.push(ImportDirective {

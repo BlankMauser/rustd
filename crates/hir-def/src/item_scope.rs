@@ -497,6 +497,10 @@ impl ItemScope {
         self.extern_crate_decls.push(extern_crate);
     }
 
+    pub(crate) fn define_use_decl(&mut self, use_: UseId) {
+        self.use_decls.push(use_);
+    }
+
     pub(crate) fn define_unnamed_const(&mut self, konst: ConstId) {
         self.unnamed_consts.push(konst);
     }

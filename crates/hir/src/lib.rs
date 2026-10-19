@@ -727,6 +727,20 @@ impl Module {
         scope.extern_blocks().map(|id| ExternBlock { id }).collect()
     }
 
+    /// The `use` items written in the module.
+    pub fn use_decls(self, db: &dyn HirDatabase) -> Vec<UseDecl> {
+        let def_map = self.id.def_map(db);
+        let scope = def_map.module(db, self.id).scope(db);
+        scope.use_decls().map(|id| UseDecl { id }).collect()
+    }
+
+    /// The `extern crate` items written in the module.
+    pub fn extern_crate_decls(self, db: &dyn HirDatabase) -> Vec<ExternCrateDecl> {
+        let def_map = self.id.def_map(db);
+        let scope = def_map.module(db, self.id).scope(db);
+        scope.extern_crate_decls().map(|id| ExternCrateDecl { id }).collect()
+    }
+
     pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
@@ -2377,6 +2391,18 @@ pub struct ExternBlock {
 impl ExternBlock {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         Module { id: self.id.module(db) }
+    }
+}
+
+/// A `use` item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UseDecl {
+    pub(crate) id: hir_def::UseId,
+}
+
+impl UseDecl {
+    pub fn source(self, db: &dyn HirDatabase) -> InFile<ast::Use> {
+        self.id.lookup(db).source(db)
     }
 }
 
