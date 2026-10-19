@@ -554,26 +554,40 @@ pub(crate) fn find_matching_impl<'db>(
 #[salsa::tracked(returns(deref))]
 pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
-    let identifiers: FxHashSet<_> = crate_def_map(db, krate)
-        .modules(db)
-        .filter_map(|(_, module)| module.origin.file_id())
-        .flat_map(|file| {
-            let tokens = file.parse(db).syntax_node().descendants_with_tokens();
-            tokens.filter_map(|it| it.into_token()).filter(|it| it.kind() == SyntaxKind::IDENT)
+    let data = krate.data(db);
+    let mut unnamed: Vec<_> = data
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            let data = dep.crate_id.data(db);
+            !(dep.is_sysroot() || data.origin.is_lang() || data.is_proc_macro)
         })
-        .map(|ident| Symbol::intern(ident.text()))
         .collect();
-    let named = |name: &Symbol| identifiers.contains(name);
+    // Few files name a dependency, and a file's text tells which may without its tree.
+    let mut files =
+        crate_def_map(db, krate).modules(db).filter_map(|(_, module)| module.origin.file_id());
+    while !unnamed.is_empty()
+        && let Some(file) = files.next()
+    {
+        let text = db.file_text(file.file_id(db)).text(db);
+        if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
+            continue;
+        }
+        let identifiers: FxHashSet<_> = file
+            .parse(db)
+            .syntax_node()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|it| it.kind() == SyntaxKind::IDENT)
+            .map(|it| Symbol::intern(it.text()))
+            .collect();
+        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol()));
+    }
     let mut loaded = FxHashSet::default();
     let mut ordered = vec![krate];
     loaded.insert(krate);
-    for dep in &krate.data(db).dependencies {
-        let data = dep.crate_id.data(db);
-        let is_loaded = dep.is_sysroot()
-            || data.origin.is_lang()
-            || data.is_proc_macro
-            || named(dep.name.symbol());
-        if !is_loaded {
+    for dep in &data.dependencies {
+        if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) {
             continue;
         }
         // The same of the dependency: the crates of its tests and benches are among its own.
