@@ -209,19 +209,19 @@ struct Demo {
 
 const DEMOS: &[Demo] = &[
     Demo {
-        name: "balls",
-        title: "Bouncing balls",
-        about: "Click to drop a ball. Change the gravity while they fall.",
-        tags: &["structs", "traits", "statics", "f64"],
-        source: include_str!("../../../demos/balls.rs"),
-        output: Output::Canvas,
-    },
-    Demo {
         name: "fountain",
         title: "Fountain",
         about: "Drops under gravity. Change the speed, the wind, the color.",
         tags: &["closures", "iterators", "consts", "f64"],
         source: include_str!("../../../demos/fountain.rs"),
+        output: Output::Canvas,
+    },
+    Demo {
+        name: "balls",
+        title: "Bouncing balls",
+        about: "Click to drop a ball. Change the gravity while they fall.",
+        tags: &["structs", "traits", "statics", "f64"],
+        source: include_str!("../../../demos/balls.rs"),
         output: Output::Canvas,
     },
     Demo {

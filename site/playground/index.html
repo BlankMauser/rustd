@@ -81,7 +81,7 @@ rustc nor LLVM is involved at any point.</p>
 it reaches, from <code>core</code>'s source, which takes a few seconds. After an edit rustd
 compiles the functions whose code changed, writes a small module with them, and the page
 puts them into the running program's function table. Statics are left alone, which is why the
-balls stay where they are. An edit that changes the type of a static starts that static
+drops in the air stay where they are. An edit that changes the type of a static starts that static
 again.</p>
 
 <h2>What it does not do</h2>

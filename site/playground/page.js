@@ -8,8 +8,8 @@
 import { paint } from "./highlight.js";
 
 const PROGRAMS = [
-  ["balls", "Bouncing balls"],
   ["fountain", "Fountain"],
+  ["balls", "Bouncing balls"],
   ["life", "Game of Life"],
   ["sort", "Sorting"],
   ["mandelbrot", "Mandelbrot set"],
