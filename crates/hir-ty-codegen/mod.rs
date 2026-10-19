@@ -2701,12 +2701,15 @@ fn build<'db>(
         moved_here: None,
         flag_writes: None,
         holds_here: None,
+        spent_here: false,
+        unwound: None,
         cleanup: None,
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
         argument_slots: Vec::new(),
         free_argument_slots: Vec::new(),
+        given_away: None,
         index_spans: Default::default(),
         in_cleanup: false,
         drops_all: false,
@@ -2727,6 +2730,7 @@ fn build<'db>(
     };
     fill(&mut fx)?;
     fx.note_variables();
+    fx.forget_unread_flags();
     fx.builder.seal_all_blocks();
     let config = fx.cg.target_config();
     let guarded = fx.guarded;
@@ -5132,6 +5136,131 @@ struct MovedPath {
     bit: u32,
 }
 
+/// What the body does to a drop flag, or that it makes a call that may unwind.
+enum FlagEvent {
+    /// The local is assigned whole, or moved out of whole.
+    Whole(LocalId, bool),
+    /// A field is moved out of the local.
+    Moved(LocalId, Vec<u32>),
+    /// The fields at and below these are assigned.
+    Restored(LocalId, Vec<Vec<u32>>),
+    Unwinds,
+}
+
+/// What is known of the drop flags at a point of the body.
+#[derive(Clone, Default)]
+struct Held {
+    /// The locals that hold a value on some way to the point, a bit each.
+    full: Vec<u64>,
+    /// The locals that hold none on some way to the point.
+    empty: Vec<u64>,
+    /// The fields that are moved out of a local on every way to the point.
+    moved: std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u32>>>,
+}
+
+impl Held {
+    fn of(locals: usize) -> Held {
+        let words = locals.div_ceil(64);
+        Held { full: vec![0; words], empty: vec![0; words], ..Held::default() }
+    }
+
+    fn bit(local: LocalId) -> (usize, u64) {
+        let index = u32::from(local.into_raw()) as usize;
+        (index / 64, 1 << (index % 64))
+    }
+
+    /// Whether the local holds a value, when every way to the point agrees.
+    fn whole(&self, local: LocalId) -> Option<bool> {
+        let (word, bit) = Held::bit(local);
+        match (self.full[word] & bit != 0, self.empty[word] & bit != 0) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, local: LocalId, holds: bool) {
+        let (word, bit) = Held::bit(local);
+        let (set, clear) = match holds {
+            true => (&mut self.full, &mut self.empty),
+            false => (&mut self.empty, &mut self.full),
+        };
+        set[word] |= bit;
+        clear[word] &= !bit;
+        self.moved.remove(&local.into_raw().into());
+    }
+
+    fn moved(&self, local: LocalId) -> Option<&std::collections::BTreeSet<Vec<u32>>> {
+        self.moved.get(&local.into_raw().into())
+    }
+
+    fn follow(&mut self, event: &FlagEvent) {
+        match event {
+            FlagEvent::Whole(local, holds) => self.set(*local, *holds),
+            FlagEvent::Moved(local, path) => {
+                self.moved.entry(local.into_raw().into()).or_default().insert(path.clone());
+            }
+            FlagEvent::Restored(local, paths) => {
+                let key = local.into_raw().into();
+                if let Some(moved) = self.moved.get_mut(&key) {
+                    moved.retain(|moved| !paths.iter().any(|path| moved.starts_with(path)));
+                    if moved.is_empty() {
+                        self.moved.remove(&key);
+                    }
+                }
+            }
+            FlagEvent::Unwinds => (),
+        }
+    }
+
+    /// What is known where two ways meet. A local that is empty has lost every field.
+    fn meet(&mut self, other: &Held) -> bool {
+        let mut changed = false;
+        if !(self.moved.is_empty() && other.moved.is_empty()) {
+            let empty = |held: &Held, key: u32| {
+                let (word, bit) = (key as usize / 64, 1u64 << (key % 64));
+                held.full[word] & bit == 0 && held.empty[word] & bit != 0
+            };
+            let keys: Vec<u32> = self.moved.keys().chain(other.moved.keys()).copied().collect();
+            for key in keys {
+                let theirs = other.moved.get(&key);
+                let met = match (self.moved.get(&key), theirs) {
+                    _ if empty(self, key) => theirs.cloned().unwrap_or_default(),
+                    _ if empty(other, key) => continue,
+                    (Some(mine), Some(theirs)) => mine.intersection(theirs).cloned().collect(),
+                    _ => Default::default(),
+                };
+                if self.moved.get(&key).is_none_or(|mine| *mine != met) {
+                    changed |= !(met.is_empty() && !self.moved.contains_key(&key));
+                    match met.is_empty() {
+                        true => self.moved.remove(&key),
+                        false => self.moved.insert(key, met),
+                    };
+                }
+            }
+        }
+        for (mine, theirs) in [(&mut self.full, &other.full), (&mut self.empty, &other.empty)] {
+            for (mine, theirs) in mine.iter_mut().zip(theirs) {
+                changed |= *theirs & !*mine != 0;
+                *mine |= theirs;
+            }
+        }
+        changed
+    }
+}
+
+/// What following the drop flags of a body through it finds.
+#[derive(Default)]
+struct FlagFlow {
+    /// Whether a local holds a value where the block that drops it ends, when that is known.
+    held: FxHashMap<(BasicBlockId, LocalId), bool>,
+    /// The drops of locals that have nothing left to drop though their flags say they hold a
+    /// value: every field with a destructor is moved out.
+    spent: FxHashSet<(BasicBlockId, LocalId)>,
+    /// The locals that may have something to drop when a call unwinds.
+    unwound: FxHashSet<LocalId>,
+}
+
 /// A local kept in a register.
 #[derive(Clone, Copy)]
 struct Register {
@@ -5178,10 +5307,15 @@ struct FunctionCx<'cx, 'db> {
     /// What the body does to the drop flags of whole locals, block by block and in order:
     /// whether the local holds a value after. Kept while the body is generated, and for a
     /// body whose flags live nowhere but in this call.
-    flag_writes: Option<FxHashMap<BasicBlockId, Vec<(LocalId, bool)>>>,
+    flag_writes: Option<FxHashMap<BasicBlockId, Vec<FlagEvent>>>,
     /// While a `Drop` terminator is generated: whether its local holds a value, when every
     /// way to the terminator agrees on that.
     holds_here: Option<bool>,
+    /// While a `Drop` terminator is generated: its local has nothing left to drop.
+    spent_here: bool,
+    /// The locals a landing pad has to look at, when the flags were followed: no other has
+    /// anything to drop at any call that unwinds.
+    unwound: Option<FxHashSet<LocalId>>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -5195,6 +5329,9 @@ struct FunctionCx<'cx, 'db> {
     argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
     /// The ones whose call has returned.
     free_argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
+    /// While a call is generated: the local its result goes to, and where the locals moved
+    /// whole into it are. Nothing reads those again, so the callee can be handed them.
+    given_away: Option<(LocalId, FxHashSet<Value>)>,
     /// The index expression each local that holds an index was made for.
     index_spans: FxHashMap<LocalId, MirSpan>,
     in_cleanup: bool,
@@ -6106,6 +6243,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
+                if self.given_away.as_ref().is_some_and(|(_, given)| given.contains(&addr)) {
+                    values.push(addr);
+                    return;
+                }
                 let copy = self.argument_slot(layout);
                 self.copy(copy, addr, layout.size);
                 values.push(copy);
@@ -6731,9 +6872,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().jump(target, &[]);
         }
         let drops = std::mem::take(&mut self.deferred_drops);
-        let held = match self.flag_writes.take() {
-            Some(writes) if !drops.is_empty() => self.held_where_blocks_end(body, &writes),
-            _ => FxHashMap::default(),
+        let flow = match self.flag_writes.take() {
+            Some(writes) => {
+                let dropping: Vec<BasicBlockId> = drops.iter().map(|it| it.4).collect();
+                let flow = self.follow_flags(body, &writes, &dropping);
+                self.unwound = Some(flow.unwound.clone());
+                flow
+            }
+            None => FlagFlow::default(),
         };
         let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
             true => FxHashMap::default(),
@@ -6741,7 +6887,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         for (block, place, target, span, from) in drops {
             self.moved_here = moved.remove(&from);
-            self.holds_here = held.get(&(from, place.local)).copied();
+            self.holds_here = flow.held.get(&(from, place.local)).copied();
+            self.spent_here = flow.spent.contains(&(from, place.local));
             self.builder.switch_to_block(block);
             self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
@@ -6778,6 +6925,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.moved_here = None;
         self.holds_here = None;
+        self.spent_here = false;
         // So is dropping a suspended future, which drops the same locals as unwinding does.
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
@@ -6867,6 +7015,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         {
             return;
         }
+        if let Some(paths) = self.moved_out_paths(place) {
+            self.note_flag(FlagEvent::Restored(place.local, paths));
+        }
         // Filled in last, when every field that gets moved out of the local is known.
         let clear = self.builder.create_block();
         let after = self.builder.create_block();
@@ -6920,6 +7071,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Drops what is left of a place, which is nothing if its local holds no value.
     fn drop_place(&mut self, place: &StoredPlace, target: ir::Block) -> Result<()> {
         let holds = self.holds_here.take();
+        let spent = std::mem::take(&mut self.spent_here);
         let flag = self.drop_flags.get(place.local).copied();
         let (Some(flag), Some(mut path)) = (flag, self.field_path(place)) else {
             let place = self.place_ref(place)?;
@@ -6928,6 +7080,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(());
         };
         if holds == Some(false) {
+            self.builder.ins().jump(target, &[]);
+            return Ok(());
+        }
+        if spent && path.is_empty() {
+            flag.set(&mut self.builder, 0);
             self.builder.ins().jump(target, &[]);
             return Ok(());
         }
@@ -6959,7 +7116,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         path: &mut Vec<u32>,
         state: Value,
     ) -> Result<()> {
-        let within = |it: &&MovedPath| it.local == local && it.path.starts_with(path);
+        // A field nothing has moved out on any way here is there, whatever its bit would say.
+        let within = |it: &&MovedPath| {
+            it.local == local
+                && it.path.starts_with(path)
+                && self
+                    .moved_here
+                    .as_ref()
+                    .is_none_or(|moved| moved.contains(&(local, it.path.clone())))
+        };
         let exact = self.moved_paths.iter().filter(within).find(|it| it.path.len() == path.len());
         let exact = exact.map(|it| it.bit);
         let nested = self.moved_paths.iter().filter(within).any(|it| it.path.len() > path.len());
@@ -7159,76 +7324,242 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         )
     }
 
-    fn note_flag_write(&mut self, local: LocalId, holds: bool) {
-        // What a landing pad writes is not on any way through the body.
+    /// Takes out the writes to the drop flags nothing reads: the ones of locals whose every
+    /// drop was decided when the body was generated.
+    fn forget_unread_flags(&mut self) {
+        // The flags of a future are in its frame, which is not only reached by these addresses.
+        if self.unwound.is_none() {
+            return;
+        }
+        let flags: FxHashSet<Value> = self.drop_flags.iter().map(|(_, flag)| flag.addr).collect();
+        let func = &mut *self.builder.func;
+        let mut read = FxHashSet::default();
+        let mut writes = Vec::new();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                if let ir::InstructionData::Store {
+                    opcode: ir::Opcode::Store,
+                    args: [value, addr],
+                    ..
+                } = func.dfg.insts[inst]
+                    && flags.contains(&addr)
+                    && !flags.contains(&value)
+                {
+                    writes.push((addr, inst));
+                    continue;
+                }
+                read.extend(func.dfg.inst_values(inst).filter(|it| flags.contains(it)));
+            }
+        }
+        for (addr, inst) in writes {
+            if !read.contains(&addr) {
+                func.layout.remove_inst(inst);
+            }
+        }
+    }
+
+    fn note_flag(&mut self, event: FlagEvent) {
+        // What a landing pad does is not on any way through the body.
         if self.in_cleanup {
             return;
         }
         if let (Some(writes), Some(at)) = (&mut self.flag_writes, self.at) {
-            writes.entry(at).or_default().push((local, holds));
+            writes.entry(at).or_default().push(event);
         }
     }
 
-    /// Whether each local with a drop flag holds a value where the block that drops it ends,
-    /// for the ones every way there agrees on: what their flags are known to say.
-    fn held_where_blocks_end(
+    /// Follows the drop flags through the body, by what generating each block did to them.
+    /// `dropping` are the blocks whose `Drop` terminators get generated.
+    fn follow_flags(
         &self,
         body: &MirBody<'db>,
-        writes: &FxHashMap<BasicBlockId, Vec<(LocalId, bool)>>,
-    ) -> FxHashMap<(BasicBlockId, LocalId), bool> {
-        // `None` for a local the ways to a block disagree on.
-        type Held = FxHashMap<LocalId, Option<bool>>;
-        let entered: Held = self
-            .drop_flags
-            .iter()
-            .map(|(local, _)| (local, Some(body.param_locals.contains(&local))))
-            .collect();
+        events: &FxHashMap<BasicBlockId, Vec<FlagEvent>>,
+        dropping: &[BasicBlockId],
+    ) -> FlagFlow {
+        let mut entered = Held::of(body.locals.len());
+        for (local, _) in self.drop_flags.iter() {
+            entered.set(local, body.param_locals.contains(&local));
+        }
+        let dropped = |id: BasicBlockId| match body.basic_blocks[id].terminator.as_ref() {
+            Some(crate::mir::Terminator { kind: TerminatorKind::Drop { place, .. }, .. }) => {
+                Some(place)
+            }
+            _ => None,
+        };
         let mut starts: FxHashMap<BasicBlockId, Held> = FxHashMap::default();
-        let mut ends: FxHashMap<BasicBlockId, Held> = FxHashMap::default();
         starts.insert(body.start_block, entered);
         let mut pending = vec![body.start_block];
         while let Some(id) = pending.pop() {
-            let mut held = starts[&id].clone();
-            for &(local, holds) in writes.get(&id).into_iter().flatten() {
-                held.insert(local, Some(holds));
-            }
-            ends.insert(id, held.clone());
-            // A local is empty once it is dropped, whether it held a value or not.
-            if let Some(TerminatorKind::Drop { place, .. }) =
-                body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
-                && place.projection.as_slice().is_empty()
-                && held.contains_key(&place.local)
-            {
-                held.insert(place.local, Some(false));
-            }
+            let mut state = starts[&id].clone();
+            self.follow_block(body, id, events, &mut state, |_| ());
             for next in successors(body, id) {
                 let Some(known) = starts.get_mut(&next) else {
-                    starts.insert(next, held.clone());
+                    starts.insert(next, state.clone());
                     pending.push(next);
                     continue;
                 };
-                let mut changed = false;
-                for (local, known) in known.iter_mut() {
-                    if known.is_some() && *known != held[local] {
-                        *known = None;
-                        changed = true;
-                    }
-                }
-                if changed && !pending.contains(&next) {
+                if known.meet(&state) && !pending.contains(&next) {
                     pending.push(next);
                 }
             }
         }
-        ends.into_iter()
-            .filter_map(|(id, held)| {
-                let Some(TerminatorKind::Drop { place, .. }) =
-                    body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
-                else {
-                    return None;
-                };
-                Some(((id, place.local), (*held.get(&place.local)?)?))
-            })
-            .collect()
+        let mut flow = FlagFlow::default();
+        // A block the body is not followed to is one nothing is known in.
+        let unknown = events.iter().any(|(id, events)| {
+            !starts.contains_key(id) && events.iter().any(|it| matches!(it, FlagEvent::Unwinds))
+        });
+        if unknown || dropping.iter().any(|id| !starts.contains_key(id)) {
+            flow.unwound.extend(self.drop_flags.iter().map(|(local, _)| local));
+        }
+        // The locals already known to need a look when a call unwinds, a bit each.
+        let mut looked = vec![0u64; body.locals.len().div_ceil(64)];
+        for (&id, start) in &starts {
+            let mut state = start.clone();
+            let mut ended = None;
+            self.follow_block(body, id, events, &mut state, |it| match it {
+                Ok(state) => {
+                    for (word, full) in state.full.iter().enumerate() {
+                        let mut left = full & !looked[word];
+                        while left != 0 {
+                            let bit = left.trailing_zeros();
+                            left &= left - 1;
+                            let local = LocalId::from_raw((word as u32 * 64 + bit).into());
+                            if self.drop_flags.contains_idx(local)
+                                && !self.nothing_to_drop(body, local, state)
+                            {
+                                looked[word] |= 1 << bit;
+                                flow.unwound.insert(local);
+                            }
+                        }
+                    }
+                }
+                Err(state) => ended = Some(state.clone()),
+            });
+            let (Some(place), Some(ended)) = (dropped(id), ended) else { continue };
+            if !self.drop_flags.contains_idx(place.local) {
+                continue;
+            }
+            let whole = ended.whole(place.local);
+            if let Some(holds) = whole {
+                flow.held.insert((id, place.local), holds);
+            }
+            if place.projection.as_slice().is_empty()
+                && whole != Some(false)
+                && self.nothing_to_drop(body, place.local, &ended)
+            {
+                flow.spent.insert((id, place.local));
+            }
+        }
+        flow
+    }
+
+    /// Follows one block from `state`. `seen` is given the state where the block's `Drop`
+    /// terminator is, as an error, and the state at each call that may unwind.
+    fn follow_block(
+        &self,
+        body: &MirBody<'db>,
+        id: BasicBlockId,
+        events: &FxHashMap<BasicBlockId, Vec<FlagEvent>>,
+        state: &mut Held,
+        mut seen: impl FnMut(std::result::Result<&Held, &Held>),
+    ) {
+        for event in events.get(&id).into_iter().flatten() {
+            match event {
+                FlagEvent::Unwinds => seen(Ok(state)),
+                FlagEvent::Whole(local, _)
+                | FlagEvent::Moved(local, _)
+                | FlagEvent::Restored(local, _) => {
+                    if self.drop_flags.contains_idx(*local) {
+                        state.follow(event);
+                    }
+                }
+            }
+        }
+        let Some(TerminatorKind::Drop { place, .. }) =
+            body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind)
+        else {
+            return;
+        };
+        seen(Err(state));
+        // A local is empty once it is dropped, whether it held a value or not, and it is
+        // while its destructor runs. No destructor runs for one that had nothing to drop.
+        let whole = place.projection.as_slice().is_empty();
+        let mut nothing = false;
+        if whole && self.drop_flags.contains_idx(place.local) {
+            nothing = self.nothing_to_drop(body, place.local, state);
+            state.set(place.local, false);
+        }
+        if !nothing {
+            seen(Ok(state));
+        }
+    }
+
+    /// Whether dropping the local would do nothing: it is empty, or every field of it that
+    /// has a destructor is moved out.
+    fn nothing_to_drop(&self, body: &MirBody<'db>, local: LocalId, held: &Held) -> bool {
+        if held.whole(local) == Some(false) {
+            return true;
+        }
+        let Some(moved) = held.moved(local) else { return false };
+        let ty = body.locals[local].ty.as_ref();
+        self.all_moved(ty, &mut Vec::new(), moved)
+    }
+
+    /// Whether what [`Self::drop_unmoved`] would drop of the value at `path` is nothing, with
+    /// these fields moved out.
+    fn all_moved(
+        &self,
+        ty: Ty<'db>,
+        path: &mut Vec<u32>,
+        moved: &std::collections::BTreeSet<Vec<u32>>,
+    ) -> bool {
+        if moved.contains(path) {
+            return true;
+        }
+        if !moved.iter().any(|it| it.starts_with(path)) {
+            return !self.needs_drop(ty);
+        }
+        let ty = self.normalize(ty);
+        let mut field = |index: u32, ty: Ty<'db>, path: &mut Vec<u32>| {
+            path.push(index);
+            let gone = self.all_moved(ty, path, moved);
+            path.pop();
+            gone
+        };
+        match ty.kind() {
+            TyKind::Tuple(tys) => {
+                tys.iter().enumerate().all(|(index, ty)| field(index as u32, ty, path))
+            }
+            TyKind::Adt(adt_def, _) if adt_def.is_box() => false,
+            TyKind::Adt(adt_def, subst) => match adt_def.def_id() {
+                AdtId::StructId(id) => {
+                    self.cg.db.field_types(id.into()).iter().enumerate().all(|(index, (_, ty))| {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        field(index as u32, ty, path)
+                    })
+                }
+                AdtId::EnumId(id) => {
+                    // A field moved out of a variant says the value is of that variant.
+                    let db = self.cg.db;
+                    let mut of = id.enum_variants(db).variants.values().filter(|(variant, _)| {
+                        let step = VARIANT_FIELDS | variant.index(db) as u32;
+                        moved
+                            .iter()
+                            .any(|it| it.starts_with(path) && it.get(path.len()) == Some(&step))
+                    });
+                    let (Some(&(variant, _)), None) = (of.next(), of.next()) else { return false };
+                    path.push(VARIANT_FIELDS | variant.index(db) as u32);
+                    let gone = db.field_types(variant.into()).iter().all(|(index, ty)| {
+                        let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        field(u32::from(index.into_raw()), ty, path)
+                    });
+                    path.pop();
+                    gone
+                }
+                AdtId::UnionId(_) => false,
+            },
+            _ => false,
+        }
     }
 
     /// The fields that may be moved out of their locals where each block ends: moved out on
@@ -7273,10 +7604,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         match block.terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::Call { args, destination, .. }) => {
+            Some(TerminatorKind::Call { func, args, destination, .. }) => {
+                self.note_move(func, moved);
                 args.iter().for_each(|it| self.note_move(it, moved));
                 self.note_assignment(destination, moved);
             }
+            Some(TerminatorKind::Yield { value, .. }) => self.note_move(value, moved),
             Some(TerminatorKind::DropAndReplace { place, value, .. }) => {
                 self.note_move(value, moved);
                 self.note_assignment(place, moved);
@@ -7610,9 +7943,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         .moved_out_paths(place)
                         .filter(|paths| paths.iter().all(|it| !it.is_empty()));
                     let mask = paths.and_then(|paths| {
-                        paths.into_iter().try_fold(0i64, |mask, path| {
-                            Some(mask | 1i64 << self.moved_bit(place.local, path)?)
-                        })
+                        let mask = paths.iter().try_fold(0i64, |mask, path| {
+                            Some(mask | 1i64 << self.moved_bit(place.local, path.clone())?)
+                        })?;
+                        for path in paths {
+                            self.note_flag(FlagEvent::Moved(place.local, path));
+                        }
+                        Some(mask)
                     });
                     let state = match mask {
                         Some(mask) => {
@@ -7622,7 +7959,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         // FIXME: a move out of an enum or a box forgets the rest of the local,
                         // which leaks it.
                         None => {
-                            self.note_flag_write(place.local, false);
+                            self.note_flag(FlagEvent::Whole(place.local, false));
+                            if let Some((result, given)) = &mut self.given_away
+                                && place.projection.as_slice().is_empty()
+                                && *result != place.local
+                            {
+                                given.insert(addr);
+                            }
                             self.builder.ins().iconst(flag.ty, 0)
                         }
                     };
@@ -9281,7 +9624,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let small = targets.iter().all(|(case, _)| case <= i64::MAX as u128);
                 let value = if let Some(register) = register {
                     let value = self.builder.use_var(register.var);
-                    if scalar.ty == types::I128 && small {
+                    let widened = match self.builder.func.dfg.value_def(value) {
+                        ir::ValueDef::Result(inst, 0) => match self.builder.func.dfg.insts[inst] {
+                            ir::InstructionData::Unary { opcode: ir::Opcode::Uextend, arg } => {
+                                Some(arg)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                    .filter(|&arg| self.builder.func.dfg.value_type(arg) == types::I64);
+                    if let (Some(low), true) = (widened, scalar.ty == types::I128 && small) {
+                        // The high half is zero when the value was a word a moment ago.
+                        low
+                    } else if scalar.ty == types::I128 && small {
                         let (low, high) = self.builder.ins().isplit(value);
                         let fits = self.builder.create_block();
                         self.builder.ins().brif(high, otherwise, &[], fits, &[]);
@@ -9341,6 +9697,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn call(
+        &mut self,
+        func: &Operand,
+        args: &[Operand],
+        destination: &StoredPlace,
+        target: Option<BasicBlockId>,
+    ) -> Result<()> {
+        self.given_away = Some((destination.local, FxHashSet::default()));
+        let done = self.call_with(func, args, destination, target);
+        self.given_away = None;
+        done
+    }
+
+    fn call_with(
         &mut self,
         func: &Operand,
         args: &[Operand],
@@ -12107,11 +12476,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return None;
         }
         if self.inner_pad.is_some() {
+            self.note_flag(FlagEvent::Unwinds);
             return self.inner_pad;
         }
         if self.drop_flags.iter().next().is_none() {
             return None;
         }
+        self.note_flag(FlagEvent::Unwinds);
         if self.cleanup.is_none() {
             let block = self.builder.create_block();
             self.builder.append_block_param(block, ptr());
@@ -12192,6 +12563,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
         self.drops_all = true;
         for local in self.unwinding_order() {
+            if self.unwound.as_ref().is_some_and(|unwound| !unwound.contains(&local)) {
+                continue;
+            }
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
@@ -12486,7 +12860,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         if let Some(&flag) = self.drop_flags.get(place.local) {
             flag.set(&mut self.builder, live as i64);
-            self.note_flag_write(place.local, live);
+            self.note_flag(FlagEvent::Whole(place.local, live));
         }
     }
 
