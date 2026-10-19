@@ -93,7 +93,9 @@ def build(ws, env, args):
     saved = dict(os.environ)
     os.environ.update(env)
     try:
-        fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
+        # One load of the workspace compiles the three crates: loading the standard library is
+        # what a build of rustd alone costs, and it is the same load for each crate.
+        fx = Fixture(ws, ["kapp,klib,kdep"], ["-p", "kapp", *args])
         fx.rustd_args = list(args)
         fx.rustc_build()
         fx.rustd_build()
@@ -109,24 +111,33 @@ def main():
     work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-keys-"))
     chosen = sys.argv[1:]
     wrong = total = fixed = refusals = 0
+    # The first build is the same for every case: it is built once, and each case starts from
+    # a copy of the checkout and of the store it filled, at the paths it was built at.
+    store, first = os.path.join(work, "store"), os.path.join(work, "first")
+    os.makedirs(store)
+    shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
+    want, got, _ = build(first, {"RUSTD_CACHE": store}, [])
+    first_differs = want != got
+    before, filled = want, size(store)
+    snapshot = os.path.join(work, "snapshot")
+    for path in (store, first):
+        shutil.copytree(path, os.path.join(snapshot, os.path.basename(path)))
     for name, change, line in CASES:
         if chosen and not any(it in name for it in chosen):
             continue
         for mode in ("again", "elsewhere"):
             total += 1
             at = os.path.join(work, str(total))
-            store, first = os.path.join(at, "store"), os.path.join(at, "first")
-            os.makedirs(store)
-            shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
+            os.makedirs(at)
+            for path in (store, first):
+                shutil.rmtree(path)
+                shutil.copytree(os.path.join(snapshot, os.path.basename(path)), path)
             env, args = {"RUSTD_CACHE": store}, []
-            want, got, _ = build(first, env, args)
-            problems = [] if want == got else ["the first build differs"]
-            filled = size(store)
+            problems = ["the first build differs"] if first_differs else []
             second = first
             if mode == "elsewhere":
                 second = os.path.join(at, "second")
                 shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
-            before = want
             change(second, env, args)
             want, got, left = build(second, env, args)
             if want != got:
