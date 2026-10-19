@@ -375,9 +375,11 @@ fn wrapper_installed() -> bool {
 fn unsupported_target(triple: &str) -> Option<String> {
     use hir_ty::mir::codegen::{ObjectFormat, Target};
     match Target::select(triple) {
-        Ok(target) if target.object_format == ObjectFormat::Elf => None,
-        // `link.exe`'s line is the one other the plan takes apart; `lld-link` and the GNU
-        // linker of `-windows-gnu` are not.
+        Ok(target) if matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO) => {
+            None
+        }
+        // `link.exe`'s line is the other one the plan takes apart; `lld-link`'s and the GNU
+        // linker's of `-windows-gnu` are not.
         Ok(target)
             if target.object_format == ObjectFormat::Coff && triple == "x86_64-pc-windows-msvc" =>
         {

@@ -43,7 +43,15 @@ import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, thr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+# `difftest` turns incremental compilation off for the harnesses that build with rustc
+# alone. Here it stays as the caller has it: without it the tests of every project are
+# cargo's, and that case is one of the flags.
+INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
 from difftest import host
+if INCREMENTAL is None:
+    os.environ.pop("CARGO_INCREMENTAL", None)
+else:
+    os.environ["CARGO_INCREMENTAL"] = INCREMENTAL
 ROOT = os.path.dirname(HERE)
 WINDOWS = os.name == "nt"
 EXE = ".exe" if WINDOWS else ""
@@ -243,8 +251,12 @@ def whole_process(pid, call):
 
 def alive(pid):
     """Whether `pid` is a process that still runs."""
-    if not WINDOWS:
+    if os.path.isdir("/proc/self"):
         return os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0]
+    if not WINDOWS:
+        # No /proc on macOS: `ps` says the state, and nothing of a process that is gone.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and "Z" not in state
     listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True)
     return f'"{pid}"' in listed.stdout
 
@@ -429,6 +441,12 @@ def checking(root):
         asked = "Get-CimInstance Win32_Process -Filter \"Name='cargo.exe'\" | ForEach-Object CommandLine"
         lines = subprocess.run(["powershell", "-NoProfile", "-Command", asked], capture_output=True, text=True).stdout.splitlines()
         return any("check" in line.split()[1:2] for line in lines)
+    if not os.path.isdir("/proc/self"):
+        # No /proc on macOS: `ps` has the commands and `lsof` where each one runs.
+        listed = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        checks = [l.split()[0] for l in listed.splitlines() if l.split()[2:3] == ["check"]]
+        cwd = lambda pid: subprocess.run(["lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"], capture_output=True, text=True).stdout
+        return any(os.path.realpath(l[1:]).startswith(root) for pid in checks for l in cwd(pid).splitlines() if l.startswith("n"))
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
@@ -566,7 +584,7 @@ FLAG_WORKSPACE = {
     "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
-    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = file_of(program);\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, file_of(program));\n}\n\n#[cfg(unix)]\nfn file_of(path: &str) -> u64 {\n    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())\n}\n\n// Which file it is is not told there: when it was written and how long it is.\n#[cfg(windows)]\nfn file_of(path: &str) -> (std::time::SystemTime, u64) {\n    let file = std::fs::metadata(path).unwrap();\n    (file.modified().unwrap(), file.len())\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
+    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = file_of(program);\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, file_of(program));\n}\n\n#[cfg(unix)]\nfn file_of(path: &str) -> u64 {\n    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())\n}\n\n// For MSVC cargo gives a program no hash in its file names, so the builds that differ in\n// features, flags or profile share the file and the one fingerprint cargo keeps of it. When\n// the daemon built the program, that fingerprint is still of the build cargo did last, and\n// the cargo here links the program again when that was another one ("the profile\n// configuration changed" after a `CARGO_INCREMENTAL=0` build). Cargo alone has linked it\n// before the test runs. So the file is not the same one there; that it is there is checked.\n#[cfg(windows)]\nfn file_of(path: &str) -> bool {\n    std::path::Path::new(path).is_file()\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
 
 # Each: the subcommand, its arguments, the variables it runs with.
@@ -841,7 +859,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
     right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
     by_daemon = sum(how_built(out[1]) == "daemon" for _, _, out, _ in ended)
-    check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker")
+    check("16 clients at once on 4 worktrees each run their own tree's program", all(right) and status()[0] == pid and status()[1] == workers, f"{sum(right)} of 16 right, {by_daemon} built by the daemon, {len(workers)} worker" + "".join(f"; tree{n} c{i}: exit {code}, {out[0][-80:]!r} {out[1][-200:]!r}" for (n, i, out, code), ok in zip(ended, right) if not ok))
 
     # A worker that is stopped holds the build a client asks for until it is continued.
     edit = lambda text: open(os.path.join(ws, "app/src/main.rs"), "a").write(f"\n// {text}\n")
@@ -912,8 +930,13 @@ def stranger(home, check):
     if sudo("true").returncode != 0:
         check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RUSTD_NO_SUDO") == "1", "not run")
         return
-    sudo("userdel", name)
-    made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
+    # macOS has no `useradd`, and has a user with nothing of its own.
+    DARWIN = sys.platform == "darwin"
+    if DARWIN:
+        name, made = "nobody", sudo("-u", "nobody", "true")
+    else:
+        sudo("userdel", name)
+        made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
     sock = os.path.join(home, "daemon.sock")
     version = re.search(r"version (\S+),", subprocess.run(["cargo", "rustd", "status"], env=dict(os.environ, RUSTD_HOME=home, PATH=os.path.dirname(RUSTD) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
     request = json.dumps({"version": version, "replaces": False, "request": "Status"})
@@ -955,7 +978,8 @@ def stranger(home, check):
             sudo("rm", "-rf", os.path.dirname(trap))
         check("the client says nothing to a socket a second user serves", asked.returncode != 0 and "the peer is user" in asked.stderr and heard == "heard: 0", f"status {asked.returncode}, {heard}")
     finally:
-        sudo("userdel", name)
+        if not DARWIN:
+            sudo("userdel", name)
 
 
 WRAPPER = '#!/bin/sh\necho "$1" >> "{log}"\nexec "$@"\n'
@@ -1300,8 +1324,9 @@ def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
     modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
-    # As the daemon names it: with no link and no short name in it.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir=SHORT_TEMP))
+    # As the daemon names it: with no link and no short name in it. The path of a socket is
+    # at most 104 bytes on macOS, whose temporary directory is long, as on Windows.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else SHORT_TEMP))
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:

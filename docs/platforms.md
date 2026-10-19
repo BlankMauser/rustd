@@ -100,14 +100,16 @@ What is specific to the port:
   checks in the code; the harness links none of these).
 - A running `.exe` cannot be written, even by the linker. The daemon renames it aside and
   links a new file.
-- The daemon's socket is an AF_UNIX socket. The check that only the user can reach it is
-  not implemented on Windows.
+- The daemon's socket is an AF_UNIX socket. Its directory and the socket carry an access
+  control list for the user, SYSTEM and Administrators, and a peer is identified by its
+  process token (`socket/windows.rs`). A second user at the socket has not been tried.
 
 Debug info is CodeView procedures and line tables: backtraces and breakpoints by line work,
 a debugger shows no types, parameters or locals. The PDB is stale after a splice until the
-next full link. `cargo rustd`
-hands every build to cargo, because its link step is written for ELF, and has not been run
-on Windows. `remote.py` and the fuzzer are not run. The GNU and ARM64 Windows targets have nothing implemented.
+next full link. `cargo rustd` and plain cargo after `rustd enable` serve dev and test builds under
+Cranelift; `harness/cargo_rustd.py --small` (ripgrep, fd, hyperfine) passes, and the larger
+projects of that harness have not been run. Under LLVM that harness fails on Windows
+([cargo.md](cargo.md#windows-x86-64-msvc)). `remote.py` and the fuzzer are not run. The GNU and ARM64 Windows targets have nothing implemented.
 
 ## macOS arm64
 
@@ -132,7 +134,10 @@ What is specific to the port:
   arguments always go on the stack.
 
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
-`cargo rustd` hands every build to cargo and has not been run. `buildmodel.py`,
+`cargo rustd` and plain cargo after `rustd enable` serve dev and test builds;
+`harness/cargo_rustd.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
+the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
+`buildmodel.py`,
 `storefull.py`, `remote.py`, `farsplices.py` and the fuzzer are not run. The first port
 noted that under LLVM the unwind rules are not exact inside prologues and epilogues;
 nothing later says that changed.
