@@ -7379,7 +7379,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Takes out the writes to the drop flags nothing reads: the ones of locals whose every
-    /// drop was decided when the body was generated.
+    /// drop was decided when the body was generated. A flag that is only read to be written
+    /// back with a bit set or cleared, as a move out of a field does, is not read.
     fn forget_unread_flags(&mut self) {
         // The flags of a future are in its frame, which is not only reached by these addresses.
         if self.unwound.is_none() {
@@ -7387,22 +7388,76 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let flags: FxHashSet<Value> = self.drop_flags.iter().map(|(_, flag)| flag.addr).collect();
         let func = &mut *self.builder.func;
+        // What was read from a flag, or is that with bits set or cleared, by the flag.
+        let mut states: FxHashMap<Value, Value> = FxHashMap::default();
+        // The flag whose state a `band` or `bor` of these changes bits of: one side is the
+        // state, and the other has nothing of a flag in it.
+        let updated = |states: &FxHashMap<Value, Value>, args: [Value; 2]| match args
+            .map(|it| (states.get(&it).copied(), flags.contains(&it)))
+        {
+            [(Some(flag), _), (None, false)] | [(None, false), (Some(flag), _)] => Some(flag),
+            _ => None,
+        };
+        loop {
+            let known = states.len();
+            for block in func.layout.blocks() {
+                for inst in func.layout.block_insts(block) {
+                    let flag = match func.dfg.insts[inst] {
+                        ir::InstructionData::Load { opcode: ir::Opcode::Load, arg, .. } => {
+                            flags.get(&arg).copied()
+                        }
+                        ir::InstructionData::Binary {
+                            opcode: ir::Opcode::Band | ir::Opcode::Bor,
+                            args,
+                        } => updated(&states, args),
+                        _ => None,
+                    };
+                    if let Some(flag) = flag {
+                        states.insert(func.dfg.first_result(inst), flag);
+                    }
+                }
+            }
+            if states.len() == known {
+                break;
+            }
+        }
         let mut read = FxHashSet::default();
+        // The writes to a flag, and what makes the states that are only written back to it.
         let mut writes = Vec::new();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
-                if let ir::InstructionData::Store {
-                    opcode: ir::Opcode::Store,
-                    args: [value, addr],
-                    ..
-                } = func.dfg.insts[inst]
-                    && flags.contains(&addr)
-                    && !flags.contains(&value)
-                {
-                    writes.push((addr, inst));
-                    continue;
+                match func.dfg.insts[inst] {
+                    ir::InstructionData::Store {
+                        opcode: ir::Opcode::Store,
+                        args: [value, addr],
+                        ..
+                    } if flags.contains(&addr) && !flags.contains(&value) => {
+                        if let Some(&of) = states.get(&value)
+                            && of != addr
+                        {
+                            read.insert(of);
+                        }
+                        writes.push((addr, inst));
+                    }
+                    ir::InstructionData::Load { opcode: ir::Opcode::Load, arg, .. }
+                        if flags.contains(&arg) =>
+                    {
+                        writes.push((arg, inst));
+                    }
+                    ir::InstructionData::Binary {
+                        opcode: ir::Opcode::Band | ir::Opcode::Bor,
+                        args,
+                    } if let Some(flag) = updated(&states, args) => writes.push((flag, inst)),
+                    _ => {
+                        for value in func.dfg.inst_values(inst) {
+                            if flags.contains(&value) {
+                                read.insert(value);
+                            } else if let Some(&of) = states.get(&value) {
+                                read.insert(of);
+                            }
+                        }
+                    }
                 }
-                read.extend(func.dfg.inst_values(inst).filter(|it| flags.contains(it)));
             }
         }
         for (addr, inst) in writes {

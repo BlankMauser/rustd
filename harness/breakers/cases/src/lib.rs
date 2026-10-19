@@ -115,4 +115,5 @@ cases![
     match_arm_moves_drops,
     import_called_and_pointed,
     literal_operands,
+    moved_bits_unread,
 ];
