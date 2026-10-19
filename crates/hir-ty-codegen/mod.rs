@@ -100,6 +100,8 @@ pub use home::body_file;
 mod llvm;
 mod patch;
 mod promote;
+mod reach;
+pub use reach::{Reached, reached};
 mod settled;
 mod stable;
 pub use stable::{block_place, lower_declared};

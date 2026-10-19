@@ -587,6 +587,11 @@ impl State {
     }
 
     /// The programs cargo built that the daemon is never asked for, and why.
+    /// The source files the programs are compiled from.
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &Path> {
+        self.programs.iter().flat_map(|it| &it.inputs).map(PathBuf::as_path)
+    }
+
     pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }

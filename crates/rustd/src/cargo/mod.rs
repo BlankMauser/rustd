@@ -12,6 +12,7 @@ pub(crate) mod plan;
 pub(crate) mod run;
 mod say;
 pub(crate) mod script;
+mod select;
 mod state;
 mod switch;
 mod units;
