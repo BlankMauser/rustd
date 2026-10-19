@@ -5178,12 +5178,21 @@ struct Held {
     empty: Vec<u64>,
     /// The fields that are moved out of a local on every way to the point.
     moved: std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u32>>>,
+    /// The locals that have nothing left to drop on every way to the point they hold a value
+    /// on: every field with a destructor is moved out, which fields being the way's own. A
+    /// `match` that moves out of each variant in its own arm leaves one behind.
+    spent: Vec<u64>,
 }
 
 impl Held {
     fn of(locals: usize) -> Held {
         let words = locals.div_ceil(64);
-        Held { full: vec![0; words], empty: vec![0; words], ..Held::default() }
+        Held {
+            full: vec![0; words],
+            empty: vec![0; words],
+            spent: vec![0; words],
+            ..Held::default()
+        }
     }
 
     fn bit(local: LocalId) -> (usize, u64) {
@@ -5209,7 +5218,20 @@ impl Held {
         };
         set[word] |= bit;
         clear[word] &= !bit;
+        self.spent[word] &= !bit;
         self.moved.remove(&local.into_raw().into());
+    }
+
+    /// Whether every way here that the local holds a value on has moved out all of it that
+    /// has a destructor.
+    fn spent(&self, local: LocalId) -> bool {
+        let (word, bit) = Held::bit(local);
+        self.spent[word] & bit != 0
+    }
+
+    fn set_spent(&mut self, local: LocalId) {
+        let (word, bit) = Held::bit(local);
+        self.spent[word] |= bit;
     }
 
     fn moved(&self, local: LocalId) -> Option<&std::collections::BTreeSet<Vec<u32>>> {
@@ -5223,6 +5245,8 @@ impl Held {
                 self.moved.entry(local.into_raw().into()).or_default().insert(path.clone());
             }
             FlagEvent::Restored(local, paths) => {
+                let (word, bit) = Held::bit(*local);
+                self.spent[word] &= !bit;
                 let key = local.into_raw().into();
                 if let Some(moved) = self.moved.get_mut(&key) {
                     moved.retain(|moved| !paths.iter().any(|path| moved.starts_with(path)));
@@ -5260,6 +5284,14 @@ impl Held {
                     };
                 }
             }
+        }
+        // A local is spent where it is on every way that it holds a value on.
+        for word in 0..self.spent.len() {
+            let mine = self.spent[word] | (self.empty[word] & !self.full[word]);
+            let theirs = other.spent[word] | (other.empty[word] & !other.full[word]);
+            let met = mine & theirs & (self.spent[word] | other.spent[word]);
+            changed |= met != self.spent[word];
+            self.spent[word] = met;
         }
         for (mine, theirs) in [(&mut self.full, &other.full), (&mut self.empty, &other.empty)] {
             for (mine, theirs) in mine.iter_mut().zip(theirs) {
@@ -7493,6 +7525,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 | FlagEvent::Restored(local, _) => {
                     if self.drop_flags.contains_idx(*local) {
                         state.follow(event);
+                        if matches!(event, FlagEvent::Moved(..))
+                            && self.nothing_to_drop(body, *local, state)
+                        {
+                            state.set_spent(*local);
+                        }
                     }
                 }
             }
@@ -7519,7 +7556,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Whether dropping the local would do nothing: it is empty, or every field of it that
     /// has a destructor is moved out.
     fn nothing_to_drop(&self, body: &MirBody<'db>, local: LocalId, held: &Held) -> bool {
-        if held.whole(local) == Some(false) {
+        if held.whole(local) == Some(false) || held.spent(local) {
             return true;
         }
         let Some(moved) = held.moved(local) else { return false };

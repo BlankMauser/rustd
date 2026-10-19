@@ -112,4 +112,5 @@ cases![
     renamed_variant_pattern,
     alias_under_binder,
     array_in_tuple_moved_out,
+    match_arm_moves_drops,
 ];
