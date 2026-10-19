@@ -510,28 +510,46 @@ impl Base {
     ) -> Option<Base> {
         let decls = cg.module.declarations();
         let debug = cg.debug.is_some();
+        let root_mark = |db: &dyn HirDatabase, root| {
+            let compiled = compiled_root(db, root).as_ref().ok()?;
+            Some(Mark::of_function(db, root_serial(db, root), compiled, debug))
+        };
+        let instance_mark =
+            |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
+                let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+                let mark = compiled.map(|it| {
+                    let serial = instance_serial(db, instance.clone(), env.clone());
+                    Mark::of_function(db, serial, it, debug)
+                });
+                (mark, body_files(db, instance))
+            };
+        // The marks are a hash of each function's code and of its lines, which every thread
+        // works out: the object waits for this.
+        let (envs, roots) = (cg.envs.as_slice(), compiled.len());
+        let root_marks: Vec<_> = (0..roots).map(|_| std::sync::OnceLock::new()).collect();
+        let instance_marks: Vec<_> = envs.iter().map(|_| std::sync::OnceLock::new()).collect();
+        cg.symbols.in_parallel(roots + envs.len(), &|db, _, at| match at.checked_sub(roots) {
+            Some(at) => _ = instance_marks[at].set(instance_mark(db, &envs[at])),
+            None => _ = root_marks[at].set(root_mark(db, compiled[at].0)),
+        });
         let marks = compiled
             .iter()
-            .map(|&(root, _)| {
-                let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::of_function(db, root_serial(db, root), compiled, debug))
-            })
+            .zip(root_marks)
+            .map(|(&(root, _), mark)| mark.into_inner().unwrap_or_else(|| root_mark(db, root)))
             .collect::<Option<Vec<_>>>()?;
-        let mut instances = cg
-            .envs
+        let mut instances = envs
             .iter()
-            .map(|(instance, env)| {
+            .zip(instance_marks)
+            .map(|(of, mark)| {
+                let (instance, env) = of;
                 let id = *cg.instances.get(instance)?;
-                let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+                let (mark, files) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
                 let known = BaseInstance {
                     env: env.clone(),
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
-                    mark: compiled.map(|it| {
-                        let serial = instance_serial(db, instance.clone(), env.clone());
-                        Mark::of_function(db, serial, it, debug)
-                    }),
+                    mark,
                     forwarded: cg.forwarded.contains(instance),
-                    files: body_files(db, instance),
+                    files,
                     parents: Vec::new(),
                     theirs: false,
                 };
