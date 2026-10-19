@@ -140,10 +140,12 @@ Each line says: tracked, conservative (rerun), or out of scope, and why.
 
 ## 2. Remembering results
 
-Per test executable, next to the daemon's other files for it:
-`target/rustd/<key>/programs/<program>/tests.json`. `<key>` already separates command
-lines (profile, features, flags, relevant environment). The file maps a test name to the
-fingerprint it last passed under. `cargo clean` removes it.
+Per test executable, next to the object the daemon builds for it:
+`target/rustd/<key>/programs/<program>/bin.results`, beside `bin.reached`, the fingerprints
+of the build that linked it. `<key>` already separates command lines (profile, features,
+flags). The file maps a test name to the fingerprint it last passed under, and holds one
+hash of everything the client alone knows; when that differs nothing in the file counts.
+`cargo clean` removes it.
 
 It is written by the client after a run, from libtest's own output of that run, only for
 tests that reported `ok`. A crash of the test process, a timeout, or output the client
@@ -163,8 +165,8 @@ results are remembered:
     test result: ok. 114 passed (112 cached); 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 `cargo rustd test --rerun-all` (or `RUSTD_TEST_CACHE=0`) runs everything and still records.
-`cargo rustd test --explain` prints, for each test that runs, the first changed node that
-reaches it.
+Not built: an `--explain` that prints, for each test that runs, the first changed node
+that reaches it.
 
 ## 3. Test builds and `cfg(test)`
 
@@ -239,3 +241,50 @@ Collected here so they are not spread through the text; the report has the measu
 - Everything depends on serials being a faithful hash of the linked code. Functions left
   to rustc that could not be compiled have no serial; tests reaching them depend on
   everything.
+
+## What the prototype is, and what building it showed
+
+Built: section 1 and 2 for test executables with the standard harness that the daemon
+links (`crates/hir-ty-codegen/reach.rs`, `crates/rustd/src/cargo/select.rs`), and the
+campaign that checks it (`harness/incremental/`). Not built: sections 3 to 5.
+
+What the code does differently from the text above, or more precisely:
+
+- The graph needs no special case for trait objects, function pointers or drop glue. A
+  vtable is a blob of the function that makes the trait object, and the blob's
+  relocations are requests of that function; so are the functions a body takes the
+  address of. Following the requests of each compiled function and static is the whole
+  walk.
+- A function of an `extern` block is a leaf. Exported functions and the statics a linker
+  or a runtime finds (`#[used]`, `#[link_section]`) are reached by every test.
+- The tests of a program that reach a writable or thread-local static in common are one
+  group, and a test's fingerprint covers the code of its whole group. Statics written by
+  what runs before `main` are common to every test: a crate with one registration that
+  writes a static has all its tests in one group.
+- The fingerprint of a function includes the lines its panic locations report. An edit
+  that moves code down reruns every test that reaches code below it in the file. This is
+  the largest loss of precision met; a test can observe a line (`Location::caller`), so
+  dropping it needs a proof that the test does not.
+- A node that did not compile makes the fingerprint of everything that reaches it
+  unknown, and a test with an unknown fingerprint always runs.
+
+Two ways a test build of the daemon was wrong before this work, found by the campaign and
+unrelated to selection (`origin/perf-climb` at a8db50abc5 has both):
+
+- A static the build takes from rustc (any static of a crate with a function left to
+  rustc that the daemon cannot see into) kept rustc's value after its initializer was
+  edited. The daemon now refuses such a build (`Frozen::out_of_date_static`).
+- Code that only a `#[used]` or `#[link_section]` static points to (a function run before
+  `main`) stayed rustc's after an edit. For a program with tests the daemon now refuses
+  the build when what such statics reach changed or is not all known.
+
+What `cargo rustd test` still gives to cargo or refuses, each of which runs every test or
+none, and never a remembered result:
+
+- a package with a library and a binary: the binary's unit tests link the library as
+  rustc built it, so every edit to the library is cargo's build. This is the common case
+  and the reason for section 3;
+- a test added, removed, or given other attributes (the harness lists tests, and is
+  rustc's);
+- `harness = false` targets, doc tests, the unit tests of a proc-macro crate;
+- edits to build scripts, proc macros and manifests (cargo builds, everything runs).
