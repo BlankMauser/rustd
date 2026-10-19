@@ -713,6 +713,14 @@ fn main() {
             (is_ok(&parsed_ok()), is_ok(&parsed_err()), parsed_ok().is_ok(), parsed_err().is_ok())
         );
     }
+    for n in [0u32, 1, 6, 255] {
+        let text = ["", "text"].get(n as usize).copied();
+        case!(inlined::constants(Some(n).filter(|it| it % 2 == 0), text, None));
+        case!(inlined::constants(None, None, char::from_u32(n + 65)));
+        case!(inlined::pointers(&[3, 1 << 40, u64::MAX, n as u64], n as usize));
+        case!(inlined::unwinds(n), inlined::shapes(n as u64), inlined::shapes(!(n as u64)));
+        case!(inlined::instances(n as u8, -(n as i64), "moved"));
+    }
 }
 
 fn nest<T>(depth: u8, value: T) -> Option<Option<T>> {

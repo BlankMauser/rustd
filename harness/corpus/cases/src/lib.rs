@@ -6835,3 +6835,78 @@ pub mod niche_values {
         parsed.is_ok()
     }
 }
+
+/// Small generic functions of the standard library, whose bodies are put where they are
+/// called instead of compiled each as a function of its own.
+pub mod inlined {
+    use std::hint::black_box;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+    struct Noisy(u32);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(self.0 as usize, Ordering::Relaxed);
+        }
+    }
+
+    /// Callees that each refer to data of their own, several in one caller.
+    pub fn constants<'a>(
+        a: Option<u32>,
+        b: Option<&'a str>,
+        c: Option<char>,
+    ) -> (u32, &'a str, char, bool, usize, &'static [u16]) {
+        let empty: &[u16] = Default::default();
+        (
+            a.unwrap_or_default(),
+            b.unwrap_or_default(),
+            c.unwrap_or(char::REPLACEMENT_CHARACTER),
+            b.is_some_and(str::is_empty),
+            String::new().capacity() + Vec::<u64>::new().len(),
+            empty,
+        )
+    }
+
+    /// Pointer helpers, which are a cast or an addition each.
+    pub fn pointers(values: &[u64], at: usize) -> (u64, bool, usize, u8) {
+        let first = values.as_ptr();
+        let bytes = first.cast::<u8>();
+        let at = at % values.len();
+        // SAFETY: `at` is within `values`.
+        let (value, byte) = unsafe { (*first.add(at), *bytes.add(at)) };
+        (value, first.is_null(), values[at..].len(), byte)
+    }
+
+    /// A value that is dropped when a callee that was inlined calls what unwinds.
+    pub fn unwinds(n: u32) -> (Option<u32>, usize) {
+        let before = DROPPED.load(Ordering::Relaxed);
+        let got = panic::catch_unwind(AssertUnwindSafe(|| {
+            let held = Noisy(n);
+            let none: Vec<u32> = Vec::new();
+            let got = none.first().copied().or((n % 2 == 0).then_some(n));
+            let got = black_box(got).map(|it| it + held.0);
+            got.unwrap_or_else(|| panic::resume_unwind(Box::new(n)))
+        }));
+        (got.ok(), DROPPED.load(Ordering::Relaxed) - before)
+    }
+
+    /// Results that come back in memory and results of no size.
+    pub fn shapes(n: u64) -> ([u64; 5], (), Option<[u8; 40]>, std::cmp::Ordering) {
+        let wide = std::array::from_fn(|at| n.wrapping_mul(at as u64 + 1));
+        let unit = Some(()).unwrap_or_default();
+        let bytes = (n % 3 != 0).then(|| [n as u8; 40]);
+        (wide, unit, bytes, n.cmp(&7).reverse().then(n.cmp(&3)))
+    }
+
+    /// The same small callee with different types in one caller.
+    pub fn instances(a: u8, b: i64, c: &str) -> (u8, i64, String, usize, usize) {
+        let (mut x, mut y, mut z) = (a, b, c.to_owned());
+        let (was_x, was_y, was_z) =
+            (std::mem::replace(&mut x, 1), std::mem::take(&mut y), std::mem::take(&mut z));
+        std::mem::swap(&mut x, &mut black_box(9));
+        (was_x.max(x), was_y.min(y), was_z, size_of_val(&x) + size_of_val(&y), z.len())
+    }
+}

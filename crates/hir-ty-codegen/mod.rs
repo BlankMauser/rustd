@@ -99,6 +99,7 @@ pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod llvm;
 mod patch;
+mod promote;
 mod settled;
 mod stable;
 pub use stable::block_place;
@@ -2447,7 +2448,17 @@ fn compile<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
     let tally = backend::Tally::global();
-    let mut ctx = tally.step(Step::Translate, || build(&mut cg, env, body, tracked, fill))?;
+    /// `RUSTD_PROMOTE=0` leaves every local in its slot of the frame.
+    static PROMOTE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("RUSTD_PROMOTE").is_none_or(|it| it != "0"));
+    let mut ctx = tally.step(Step::Translate, || {
+        let mut ctx = build(&mut cg, env, body, tracked, fill)?;
+        inline(&mut ctx, &cg.inlined)?;
+        if *PROMOTE {
+            promote::promote(&mut ctx.func, cg.named_slots());
+        }
+        Result::Ok(ctx)
+    })?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
@@ -2568,6 +2579,131 @@ fn build<'db>(
         cursor.ins().store(MEM, none, frame, unwind::seh::ARRIVAL);
     }
     Ok(ctx)
+}
+
+/// The body of a small function, built to be put where the function is called.
+#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle)]
+fn inlinable(
+    db: &dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> Option<fragment::Inlinable> {
+    /// The most blocks and statements the body of a function that is inlined has, and
+    /// the most instructions it is built to with what it calls inlined into it.
+    const BLOCKS: usize = 4;
+    const STATEMENTS: usize = 12;
+    const INSTRUCTIONS: usize = 64;
+    let InstanceDef::Fn(func) = instance.def else { return None };
+    let generic = db.mir_body(func.into()).ok()?;
+    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
+    if generic.basic_blocks.len() > BLOCKS
+        || statements > STATEMENTS
+        || !generic.closures.is_empty()
+        || generic.coroutine.is_some()
+    {
+        return None;
+    }
+    let body = instance_body(db, &instance, env.clone()).ok()?;
+    let mut cg = Recorder::new(db, &**target().ok()?, selected_target().ok()?, instance.checked);
+    cg.unlocated = true;
+    let args = instance.args.clone();
+    let mut ctx = build(&mut cg, env.as_ref(db), Some(&*body), false, |fx| {
+        fx.args = Some(args);
+        fx.codegen()
+    })
+    .ok()?;
+    if cg.naked.is_some() || cg.opaque {
+        return None;
+    }
+    inline(&mut ctx, &cg.inlined).ok()?;
+    if ctx.func.dfg.num_insts() > INSTRUCTIONS {
+        return None;
+    }
+    fragment::Inlinable::of(ctx.func, cg.finish().0)
+}
+
+fn inlinable_cycle(
+    _: &dyn HirDatabase,
+    _: salsa::Id,
+    _: Instance,
+    _: StoredParamEnvAndCrate,
+) -> Option<fragment::Inlinable> {
+    None
+}
+
+/// Puts the bodies of `inlined` where `ctx` calls them.
+fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Result<()> {
+    use cranelift_codegen::inline::{Inline, InlineCommand};
+    struct Bodies<'a> {
+        bodies: &'a [ir::Function],
+        put: Vec<Put>,
+    }
+    /// A body that was put where it was called.
+    struct Put {
+        body: usize,
+        /// How many global values and instructions the caller had before.
+        globals: usize,
+        insts: usize,
+        /// The statement the call was built for.
+        statement: ir::SourceLoc,
+    }
+    impl Inline for Bodies<'_> {
+        fn inline(
+            &mut self,
+            caller: &ir::Function,
+            call: ir::Inst,
+            _: ir::Opcode,
+            callee: ir::FuncRef,
+            _: &[Value],
+        ) -> InlineCommand<'_> {
+            let ir::ExternalName::User(name) = caller.dfg.ext_funcs[callee].name else {
+                return InlineCommand::KeepCall;
+            };
+            let name = &caller.params.user_named_funcs()[name];
+            if name.namespace != fragment::INLINED {
+                return InlineCommand::KeepCall;
+            }
+            let body = name.index as usize;
+            self.put.push(Put {
+                body,
+                globals: caller.global_values.len(),
+                insts: caller.dfg.num_insts(),
+                statement: caller.srcloc(call),
+            });
+            InlineCommand::Inline { callee: Cow::Borrowed(&self.bodies[body]), visit_callee: true }
+        }
+    }
+    if inlined.is_empty() {
+        return Ok(());
+    }
+    let mut bodies = Bodies { bodies: inlined, put: Vec::new() };
+    ctx.inline(&mut bodies).map_err(|err| CodegenError::Unsupported(err.to_string()))?;
+    // Cranelift copies a symbol of the callee with the name it has among the callee's
+    // names, which among the caller's is another symbol's.
+    let ends = bodies.put.iter().skip(1).map(|it| it.insts).chain([ctx.func.dfg.num_insts()]);
+    for (put, end) in bodies.put.iter().zip(ends) {
+        // What a body is built to is of the statement that called it.
+        for inst in put.insts..end {
+            ctx.func.set_srcloc(ir::Inst::from_u32(inst as u32), put.statement);
+        }
+        let body = &inlined[put.body];
+        for (global, data) in body.global_values.iter() {
+            let ir::GlobalValueData::Symbol { name: ir::ExternalName::User(name), .. } = data
+            else {
+                continue;
+            };
+            let name = body.params.user_named_funcs()[*name].clone();
+            let name = ctx.func.declare_imported_user_function(name);
+            let copy = ir::GlobalValue::from_u32(put.globals as u32 + global.as_u32());
+            let ir::GlobalValueData::Symbol { name: copied, .. } =
+                &mut ctx.func.global_values[copy]
+            else {
+                unreachable!("a symbol is copied as one")
+            };
+            *copied = ir::ExternalName::User(name);
+        }
+    }
+    Ok(())
 }
 
 /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
@@ -5902,6 +6038,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().stack_addr(ptr(), slot, 0)
     }
 
+    /// The address `addr` is, taken anew when it is of a slot of the frame. One taken where
+    /// the function starts is kept in a register or spilled for as long as the function
+    /// runs, and a function has more locals than there are registers.
+    fn slot_addr(&mut self, addr: Value) -> Value {
+        let dfg = &self.builder.func.dfg;
+        if let ir::ValueDef::Result(inst, _) = dfg.value_def(addr)
+            && let ir::InstructionData::StackAddr {
+                opcode: ir::Opcode::StackAddr,
+                stack_slot,
+                offset,
+            } = dfg.insts[inst]
+        {
+            return self.builder.ins().stack_addr(ptr(), stack_slot, offset);
+        }
+        addr
+    }
+
     fn stack_slot(&mut self, layout: &Layout) -> Value {
         let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
         if align <= 16 {
@@ -6878,7 +7031,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
-        let LocalSlot { mut addr, borrowed } = self.locals[place.local];
+        let LocalSlot { addr, borrowed } = self.locals[place.local];
+        let mut addr = self.slot_addr(addr);
         let mut meta = None;
         if borrowed {
             meta = Some(self.builder.ins().load(ptr(), MEM, addr, meta_at()));
@@ -6934,7 +7088,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
-                    let index = self.builder.ins().load(ptr(), MEM, self.locals[*local].addr, 0);
+                    let index = self.slot_addr(self.locals[*local].addr);
+                    let index = self.builder.ins().load(ptr(), MEM, index, 0);
                     // An index out of bounds is reported at the index expression, which may be
                     // an operand of the statement that reads it.
                     let statement = self.span;
@@ -7792,7 +7947,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             // Marks the place as moved out of.
             self.operand(operand)?;
-            let slot = self.locals[place.local].addr;
+            let slot = self.slot_addr(self.locals[place.local].addr);
             self.builder.ins().store(MEM, addr, slot, 0);
             self.builder.ins().store(MEM, meta, slot, meta_at());
             return Ok(());
@@ -9858,6 +10013,54 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// The body of a callee that is small and of the standard library, built to be put where
+    /// it is called instead of compiled as a function of its own. rustc gets such a function
+    /// with its helpers already inlined into it, and so compiles far fewer of them.
+    fn inlined_callee(
+        &mut self,
+        def: InstanceDef,
+        args: GenericArgs<'db>,
+        sig: &Signature,
+    ) -> Option<ir::FuncRef> {
+        /// `RUSTD_INLINE=0` calls every function.
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("RUSTD_INLINE").is_none_or(|it| it != "0"));
+        let InstanceDef::Fn(func) = def else { return None };
+        let db = self.cg.db;
+        if !*ENABLED
+            || !self.cg.target.exception_in_register()
+            || Target::current().is_wasm()
+            || !func.krate(db).data(db).origin.is_lang()
+        {
+            return None;
+        }
+        let signature = FunctionSignature::of(db, func);
+        if signature.abi != ExternAbi::Rust
+            || signature.is_varargs()
+            || FunctionSignature::is_intrinsic(db, func)
+            || track_caller(db, func)
+        {
+            return None;
+        }
+        // A function that is neither generic nor `#[inline]` is in the library as rustc
+        // compiled it, and calling that one is less work than building it again.
+        let flags = AttrFlags::query(db, func.into());
+        if !flags.contains(AttrFlags::IS_INLINE) && args.iter().all(|it| it.region().is_some()) {
+            return None;
+        }
+        let interner = DbInterner::new_with(db, self.env.krate);
+        let args = rustc_type_ir::fold_regions(interner, args, |region, _| match region.kind() {
+            rustc_type_ir::RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(interner),
+        });
+        let instance = Instance { def, args: args.store(), checked: self.cg.checked };
+        let body = inlinable(db, instance, self.env.store()).as_ref()?;
+        if body.func.signature != *sig {
+            return None;
+        }
+        Some(self.cg.declare_inlined(body, self.builder.func))
+    }
+
     /// Calls `callee` with `values`, which are what `sig` says, and stores the result in `dst`.
     fn call_as(
         &mut self,
@@ -9870,8 +10073,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) -> Result<()> {
         let results = match callee {
             Callee::Instance(def, generic_args) => {
-                let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let callee = match self.inlined_callee(def, generic_args, &sig) {
+                    Some(callee) => callee,
+                    None => {
+                        let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
+                        self.cg.declare_func_in_func(callee, self.builder.func)
+                    }
+                };
                 self.invoke(callee, values)
             }
             Callee::Pointer(pointer, ..) => {
@@ -10334,6 +10542,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("transmute" | "transmute_unchecked" | "black_box" | "likely" | "unlikely", [arg]) => {
+                self.cg.opaque |= name == "black_box";
                 let (src, ty) = self.operand(arg)?;
                 let size = self.layout(ty)?.size;
                 if size != self.layout(dst_ty)?.size {
@@ -11566,7 +11775,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut values = Vec::new();
         if !matches!(self.ret_mode, PassMode::Indirect) {
             let layout = self.layout(body.locals[local].ty.as_ref())?;
-            self.pass(self.ret_mode, self.locals[local].addr, &layout, &mut values);
+            let addr = self.slot_addr(self.locals[local].addr);
+            self.pass(self.ret_mode, addr, &layout, &mut values);
         }
         self.builder.ins().return_(&values);
         Ok(())

@@ -190,6 +190,30 @@ pub(super) struct Mark {
     pub(super) datas: usize,
 }
 
+/// A function built to be put where it is called, and what it refers to.
+pub(super) struct Inlinable {
+    pub(super) func: ir::Function,
+    pub(super) requests: Requests,
+}
+
+impl Inlinable {
+    /// `func` with `requests`, if a caller can ask for the same: each blob points only at
+    /// what was asked for before it.
+    pub(super) fn of(func: ir::Function, requests: Requests) -> Option<Inlinable> {
+        let ordered = requests.datas.iter().enumerate().all(|(at, request)| match request {
+            DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
+                blob.relocs.iter().all(|it| (it.1.as_u32() as usize) < at)
+            }
+            _ => true,
+        });
+        ordered.then_some(Inlinable { func, requests })
+    }
+}
+
+/// The namespace of the names of callees that are built into their callers. No relocation
+/// has it, as no call of one is left when the caller is compiled.
+pub(super) const INLINED: u32 = u32::MAX;
+
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
@@ -213,6 +237,15 @@ pub(super) struct Recorder<'db> {
     span_ids: FxHashMap<MirSpan, u32>,
     /// The locals written with a name that a stack slot of their own tells where they are.
     pub(super) named: Vec<Named>,
+    /// The bodies of the callees that are built into their callers, which call them by their
+    /// place here in [`INLINED`] until [`inline`](super::inline) puts the bodies there.
+    pub(super) inlined: Vec<ir::Function>,
+    /// The function is built to be put in its callers, whose statements its instructions
+    /// are then of: it marks none with a statement of its own.
+    pub(super) unlocated: bool,
+    /// The function hides a value from the optimizer, so it is called and not built into
+    /// its callers, where the value would be in plain sight.
+    pub(super) opaque: bool,
 }
 
 impl<'db> Recorder<'db> {
@@ -243,12 +276,15 @@ impl<'db> Recorder<'db> {
             spans: Vec::new(),
             span_ids: FxHashMap::default(),
             named: Vec::new(),
+            inlined: Vec::new(),
+            unlocated: false,
+            opaque: false,
         }
     }
 
     /// What marks an instruction as built for the statement at `span`.
     pub(super) fn source_loc(&mut self, span: MirSpan) -> ir::SourceLoc {
-        if span == MirSpan::Unknown {
+        if span == MirSpan::Unknown || self.unlocated {
             return ir::SourceLoc::default();
         }
         let next = self.spans.len() as u32;
@@ -427,6 +463,79 @@ impl<'db> Recorder<'db> {
     /// a PE image puts a stub where an import is called, and there is no other way.
     fn within_image(&self) -> bool {
         self.isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
+    }
+
+    /// Declares in `func` a callee whose body is put where it is called: `body`, with what
+    /// it asked for asked for here.
+    pub(super) fn declare_inlined(
+        &mut self,
+        body: &Inlinable,
+        func: &mut ir::Function,
+    ) -> ir::FuncRef {
+        let funcs: Vec<FuncId> =
+            body.requests.funcs.iter().map(|it| self.func(it.target.clone(), &it.sig)).collect();
+        let mut datas: Vec<DataId> = Vec::with_capacity(body.requests.datas.len());
+        for request in &body.requests.datas {
+            // `Inlinable::of` saw to it that a blob points only at what came before it.
+            let moved = |blob: &ConstBlob| ConstBlob {
+                bytes: blob.bytes.clone(),
+                relocs: blob
+                    .relocs
+                    .iter()
+                    .map(|&(offset, target, addend)| {
+                        (offset, datas[target.as_u32() as usize], addend)
+                    })
+                    .collect(),
+                fn_relocs: blob
+                    .fn_relocs
+                    .iter()
+                    .map(|&(offset, target)| (offset, funcs[target.as_u32() as usize]))
+                    .collect(),
+                align: blob.align,
+            };
+            let id = match request {
+                DataRequest::Blob { blob, identity } => self.define_data_as(moved(blob), *identity),
+                DataRequest::Vtable { ty, trait_ref, blob } => {
+                    let key = (ty.clone(), trait_ref.clone());
+                    match self.vtable(&key) {
+                        Some(id) => id,
+                        None => self.define_vtable(key, moved(blob)),
+                    }
+                }
+                DataRequest::Static(id) => self.static_data(*id),
+                DataRequest::Location(at) => self.location(*at),
+                DataRequest::Declaration(func) => self.declaration(*func),
+                DataRequest::FilePath(file) => self.file_path(*file),
+            };
+            datas.push(id);
+        }
+        let mut callee = body.func.clone();
+        let names: Vec<_> =
+            callee.params.user_named_funcs().iter().map(|(name, it)| (name, it.clone())).collect();
+        for (name, was) in names {
+            let index = match was.namespace {
+                0 => funcs[was.index as usize].as_u32(),
+                1 => datas[was.index as usize].as_u32(),
+                // A callee that was put in this one, which nothing calls any more.
+                _ => continue,
+            };
+            callee.params.reset_user_func_name(
+                name,
+                ir::UserExternalName { namespace: was.namespace, index },
+            );
+        }
+        let signature = func.import_signature(callee.signature.clone());
+        let name = func.declare_imported_user_function(ir::UserExternalName {
+            namespace: INLINED,
+            index: self.inlined.len() as u32,
+        });
+        self.inlined.push(callee);
+        func.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(name),
+            signature,
+            colocated: true,
+            patchable: false,
+        })
     }
 
     /// Names a requested function in `func`. Whether the function ends up in this object is
