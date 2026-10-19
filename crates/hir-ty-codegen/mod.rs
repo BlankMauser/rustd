@@ -1898,6 +1898,8 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
 struct Ahead {
     /// Compiled functions whose calls are still to be looked through.
     roots: Vec<FunctionId>,
+    /// Every function that has been one of `roots`.
+    rooted: FxHashSet<FunctionId>,
     queue: Vec<(Instance, StoredParamEnvAndCrate)>,
     seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
     done: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
@@ -3132,6 +3134,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .filter(|it| seen.insert(it.clone()))
             .collect();
         let ahead = std::sync::Mutex::new(Ahead {
+            rooted: roots.iter().copied().collect(),
             roots,
             queue,
             seen,
@@ -3147,6 +3150,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let entries = entries.as_deref();
         let told = self.debug.is_some().then(|| self.told.clone());
         let told = told.as_ref();
+        let on_demand = self.on_demand;
         let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
             let mut types = OwnTypes::default();
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
@@ -3180,7 +3184,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 state.working += 1;
                 drop(state);
                 let working = Working(&ahead, &idle);
-                let mut found = Vec::new();
+                let (mut found, mut called) = (Vec::new(), Vec::new());
                 let compiled = match &job {
                     // One without a symbol is left to rustc, and so is what only it calls.
                     either::Either::Left(root) => {
@@ -3206,6 +3210,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         InstanceDef::Fn(func)
                             if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
                         {
+                            // One compiled only when called is, by the thread that puts
+                            // its caller in the object: it is compiled for it here.
+                            if on_demand.contains(&func) {
+                                called.push(func);
+                            }
                             symbols.function(func).is_some()
                         }
                         _ => false,
@@ -3224,6 +3233,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 for it in found {
                     if state.seen.insert(it.clone()) {
                         state.queue.push(it);
+                    }
+                }
+                for root in called {
+                    if state.rooted.insert(root) {
+                        state.roots.push(root);
                     }
                 }
                 idle.notify_all();
