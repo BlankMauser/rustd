@@ -190,8 +190,13 @@ def kill_all(process):
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # it and its group have already ended
+        except (ProcessLookupError, PermissionError):
+            # It has not made its group yet, or the group has only the dead left in it, which
+            # macOS says is not permitted: the process alone is what there is to end.
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
 
 
 def kill(pid):
@@ -825,7 +830,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     client = spawn(ws, "build")
     time.sleep(1)
     waits = client.poll() is None
-    os.killpg(client.pid, signal.SIGKILL)
+    kill_all(client)
     client.wait()
     freed()
     _, after = here.cargo("run", "again")
