@@ -1298,6 +1298,10 @@ fn cargo_to_crate_graph(
     let mut pkg_to_lib_crate = FxHashMap::default();
     let mut pkg_crates = FxHashMap::default();
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
+    // As cargo builds for `cargo test`: `cfg(test)` is on the test targets and on a second
+    // build of each library and binary of a member, the one with its unit tests. What
+    // links a library links the build without.
+    let unit_tests = set_test && sysroot_as_built() && !cargo.is_sysroot();
 
     // Next, create crates for each package, target pair
     for pkg in cargo.packages() {
@@ -1305,7 +1309,7 @@ fn cargo_to_crate_graph(
             let mut cfg_options = cfg_options.clone();
 
             if cargo[pkg].is_local {
-                if set_test && !cargo.is_sysroot() {
+                if set_test && !unit_tests && !cargo.is_sysroot() {
                     // Add test cfg for local crates
                     cfg_options.insert_atom(sym::test);
                 }
@@ -1345,48 +1349,51 @@ fn cargo_to_crate_graph(
             let Some(file_id) = load(root) else { continue };
 
             let build_data = build_scripts.get_output(pkg);
-            let crate_id = add_target_crate_root(
-                crate_graph,
-                proc_macros,
-                cargo,
-                pkg_data,
-                build_data.zip(Some(build_scripts.error().is_some())),
-                {
-                    // Cargo builds a test target, and nothing else of the package, as a test.
-                    let mut cfg_options = cfg_options.clone();
-                    if sysroot_as_built() && matches!(kind, TargetKind::Test) {
-                        cfg_options.insert_atom(sym::test);
-                    }
-                    cfg_options
-                },
-                file_id,
-                name,
-                kind,
-                if pkg_data.is_local {
-                    if cargo.is_sysroot() {
-                        CrateOrigin::Lang(LangCrateOrigin::from(&*pkg_data.name))
-                    } else {
-                        CrateOrigin::Local {
-                            repo: pkg_data.repository.clone(),
-                            name: Some(Symbol::intern(&pkg_data.name)),
+            let add_crate = |crate_graph: &mut _, proc_macros: &mut _, unit_test: bool| {
+                add_target_crate_root(
+                    crate_graph,
+                    proc_macros,
+                    cargo,
+                    pkg_data,
+                    build_data.zip(Some(build_scripts.error().is_some())),
+                    {
+                        // Cargo builds a test target, and nothing else of the package, as a test.
+                        let mut cfg_options = cfg_options.clone();
+                        if unit_test || sysroot_as_built() && matches!(kind, TargetKind::Test) {
+                            cfg_options.insert_atom(sym::test);
                         }
-                    }
-                } else if cargo.is_sysroot() {
-                    CrateOrigin::Lang(LangCrateOrigin::Dependency)
-                } else {
-                    CrateOrigin::Library {
-                        repo: pkg_data.repository.clone(),
-                        name: Symbol::intern(&pkg_data.name),
-                    }
-                },
-                crate_ws_data.clone(),
-                if pkg_data.is_member {
-                    workspace_proc_macro_cwd.clone()
-                } else {
-                    Arc::new(pkg_data.manifest.parent().to_path_buf())
-                },
-                &cargo_path,
-            );
+                        cfg_options
+                    },
+                    file_id,
+                    name,
+                    kind,
+                    if pkg_data.is_local {
+                        if cargo.is_sysroot() {
+                            CrateOrigin::Lang(LangCrateOrigin::from(&*pkg_data.name))
+                        } else {
+                            CrateOrigin::Local {
+                                repo: pkg_data.repository.clone(),
+                                name: Some(Symbol::intern(&pkg_data.name)),
+                            }
+                        }
+                    } else if cargo.is_sysroot() {
+                        CrateOrigin::Lang(LangCrateOrigin::Dependency)
+                    } else {
+                        CrateOrigin::Library {
+                            repo: pkg_data.repository.clone(),
+                            name: Symbol::intern(&pkg_data.name),
+                        }
+                    },
+                    crate_ws_data.clone(),
+                    if pkg_data.is_member {
+                        workspace_proc_macro_cwd.clone()
+                    } else {
+                        Arc::new(pkg_data.manifest.parent().to_path_buf())
+                    },
+                    &cargo_path,
+                )
+            };
+            let crate_id = add_crate(crate_graph, proc_macros, false);
             if let TargetKind::Lib { .. } = kind {
                 lib_tgt = Some((crate_id, name.clone()));
                 pkg_to_lib_crate.insert(pkg, crate_id);
@@ -1402,11 +1409,21 @@ fn cargo_to_crate_graph(
                 );
             }
 
-            pkg_crates.entry(pkg).or_insert_with(Vec::new).push((crate_id, kind));
+            let crates = pkg_crates.entry(pkg).or_insert_with(Vec::new);
+            crates.push((crate_id, kind, false));
+            let tested = matches!(kind, TargetKind::Lib { .. } | TargetKind::Bin);
+            if unit_tests && tested && pkg_data.is_member {
+                let unit_test = add_crate(crate_graph, proc_macros, true);
+                if let Some(proc_macro) = libproc_macro {
+                    let is_proc_macro = matches!(kind, TargetKind::Lib { is_proc_macro: true });
+                    add_proc_macro_dep(crate_graph, unit_test, proc_macro, is_proc_macro);
+                }
+                crates.push((unit_test, kind, true));
+            }
         }
 
         // Set deps to the core, std and to the lib target of the current package
-        for &(from, kind) in pkg_crates.get(&pkg).into_iter().flatten() {
+        for &(from, kind, unit_test) in pkg_crates.get(&pkg).into_iter().flatten() {
             // Add sysroot deps first so that a lib target named `core` etc. can overwrite them.
             public_deps.add_to_crate_graph(crate_graph, from);
 
@@ -1414,6 +1431,8 @@ fn cargo_to_crate_graph(
             if let Some((to, name)) = lib_tgt.clone()
                 && to != from
                 && kind != TargetKind::BuildScript
+                // Nor do the unit tests of the library: they are the library.
+                && !(unit_test && matches!(kind, TargetKind::Lib { .. }))
             {
                 // (build script can not depend on its library target)
 
@@ -1436,9 +1455,15 @@ fn cargo_to_crate_graph(
             let Some(targets) = pkg_crates.get(&pkg) else { continue };
 
             let name = CrateName::new(&dep.name).unwrap();
-            for &(from, kind) in targets {
+            for &(from, kind, unit_test) in targets {
                 // Build scripts may only depend on build dependencies.
                 if (dep.kind == DepKind::Build) != (kind == TargetKind::BuildScript) {
+                    continue;
+                }
+                // The build of a library or a binary without its unit tests has none of the
+                // dev-dependencies.
+                let tested = matches!(kind, TargetKind::Lib { .. } | TargetKind::Bin);
+                if unit_tests && dep.kind == DepKind::Dev && tested && !unit_test {
                     continue;
                 }
 
@@ -1450,6 +1475,7 @@ fn cargo_to_crate_graph(
                 // the non dev-dependency edge, and so the easiest way to do that is by adding the
                 // dev-dependency edges last.
                 if dep.kind == DepKind::Dev
+                    && !unit_tests
                     && matches!(kind, TargetKind::Lib { .. })
                     && cargo[dep.pkg].is_member
                     && cargo[pkg].is_member
@@ -1568,7 +1594,7 @@ fn handle_rustc_crates(
     cargo: &CargoWorkspace,
     public_deps: &SysrootPublicDeps,
     libproc_macro: Option<CrateBuilderId>,
-    pkg_crates: &FxHashMap<Package, Vec<(CrateBuilderId, TargetKind)>>,
+    pkg_crates: &FxHashMap<Package, Vec<(CrateBuilderId, TargetKind, bool)>>,
     cfg_options: &CfgOptions,
     override_cfg: &CfgOverrides,
     build_scripts: &WorkspaceBuildScripts,
@@ -1660,7 +1686,7 @@ fn handle_rustc_crates(
                 if !package.metadata.rustc_private {
                     continue;
                 }
-                for (from, _) in pkg_crates.get(&pkg).into_iter().flatten() {
+                for (from, ..) in pkg_crates.get(&pkg).into_iter().flatten() {
                     // Avoid creating duplicate dependencies
                     // This avoids the situation where `from` depends on e.g. `arrayvec`, but
                     // `rust_analyzer` thinks that it should use the one from the `rustc_source`
