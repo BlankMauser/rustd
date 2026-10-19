@@ -1944,12 +1944,51 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let addr = self.eval_static(*st, locals)?;
                 Interval::new(addr, self.ptr_size())
             }
-            OperandKind::Constant { konst, .. } => {
-                self.allocate_const_in_heap(locals, konst.as_ref())?
-            }
+            OperandKind::Constant { konst, ty } => match self.placed(it, ty.as_ref(), locals)? {
+                Some(placed) => placed,
+                None => self.allocate_const_in_heap(locals, konst.as_ref())?,
+            },
             OperandKind::Allocation { allocation } => {
-                self.allocate_allocation_in_heap(locals, allocation.as_ref())?
+                let allocation = allocation.as_ref();
+                match self.placed(it, allocation.ty, locals)? {
+                    Some(placed) => placed,
+                    None => self.allocate_allocation_in_heap(locals, allocation)?,
+                }
             }
+        })
+    }
+
+    /// The value of a literal that `line!()`, `column!()`, `file!()` or a `concat!` of them
+    /// expanded to. The expansion has a placeholder there, for the code not to change with
+    /// every edit above it, and a constant is what it is where it is written.
+    fn placed(
+        &mut self,
+        it: &Operand,
+        ty: Ty<'db>,
+        locals: &Locals<'a, 'db>,
+    ) -> Result<'db, Option<Interval>> {
+        use crate::mir::codegen::Placed;
+        let (Some(MirSpan::ExprId(expr)), InferBodyId::DefWithBodyId(owner)) =
+            (it.span, locals.body.owner)
+        else {
+            return Ok(None);
+        };
+        Ok(match (crate::mir::codegen::placed(self.db, owner, expr), ty.kind()) {
+            (Some(Placed::Number(number)), TyKind::Uint(rustc_type_ir::UintTy::U32)) => {
+                let addr = self.heap_allocate(4, 4)?;
+                self.write_memory(addr, &number.to_le_bytes())?;
+                Some(Interval::new(addr, 4))
+            }
+            (Some(Placed::Text(text)), TyKind::Ref(_, to, _)) if to.is_str() => {
+                let at = self.heap_allocate(text.len(), 1)?;
+                self.write_memory(at, text.as_bytes())?;
+                let size = self.ptr_size();
+                let addr = self.heap_allocate(2 * size, size)?;
+                self.write_memory(addr, &word_bytes(at.to_usize()))?;
+                self.write_memory(addr.offset(size), &word_bytes(text.len()))?;
+                Some(Interval::new(addr, 2 * size))
+            }
+            _ => None,
         })
     }
 
