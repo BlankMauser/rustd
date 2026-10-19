@@ -160,14 +160,14 @@ is handed back to cargo, so the numbers that used to be here no longer apply.</p
 <p>Edits in a generated workspace of 200 crates, median of three:</p>
 <table>
 <tr><th>Edit</th><th>cargo</th><th>rustd</th><th></th></tr>
-<tr><td>A function body in the program's crate</td><td>1.74</td><td><b>0.44</b></td><td>3.9x</td></tr>
-<tr><td>A function body in the crate every other depends on</td><td>6.49</td><td><b>0.53</b></td><td>12.3x</td></tr>
-<tr><td>Function bodies in 30 crates at once</td><td>6.03</td><td><b>0.66</b></td><td>9.2x</td></tr>
-<tr><td>A new function</td><td>2.05</td><td><b>0.57</b></td><td>3.6x</td></tr>
-<tr><td>A signature whose callers are in every crate</td><td>13.01</td><td>13.41</td><td>1.0x</td></tr>
+<tr><td>A function body in the program's crate</td><td>1.76</td><td><b>0.42</b></td><td>4.2x</td></tr>
+<tr><td>A function body in the crate every other depends on</td><td>6.33</td><td><b>0.60</b></td><td>10.6x</td></tr>
+<tr><td>Function bodies in 30 crates at once</td><td>6.26</td><td><b>0.62</b></td><td>10.1x</td></tr>
+<tr><td>A new function</td><td>2.09</td><td><b>0.56</b></td><td>3.7x</td></tr>
+<tr><td>A signature whose callers are in every crate</td><td>13.87</td><td><b>10.87</b></td><td>1.3x</td></tr>
 </table>
-<p>The last row is not ahead, and after an edit that wide later edits in the same daemon are
-slower until it is restarted. Both are open.</p>
+<p>The last row is barely ahead: the edit changes 2,390 files and 6,806 functions are compiled
+again. That is open.</p>
 <p>Real projects, one run each, a line added to a function:</p>
 <table>
 <tr><th>Project</th><th>No-change build</th><th>Build after an edit</th></tr>
@@ -189,7 +189,7 @@ results</a>.</p>
 
 <h2>What it does not do</h2>
 <ul>
-<li>It does not replace rustc. rustc does the first build and builds everything rustd hands back.</li>
+<li>It does not replace rustc. rustc builds the dependencies, and the first build unless <code>RUSTD_FIRST_BUILD=1</code> is set.</li>
 <li>It finds no borrow or move errors. <code>cargo rustd check</code> is <code>cargo check</code>.</li>
 <li>It does not optimise across functions. The code is for the edit loop, not for release.</li>
 <li>It has been wrong: a fuzzer found twenty-one problems, most of them miscompiles. The ones

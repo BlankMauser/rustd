@@ -30,8 +30,8 @@ Read this section before relying on it.
   `.rmeta` files.
 - Once the daemon has a workspace, rustc does not run on an edit at all: no `cargo check`
   beside the build, so nothing competes with it for the CPU. The price is diagnostics.
-  rustd refuses source in which rust-analyzer finds a type or name error, with a short
-  reason and not rustc's message. It has no borrow checker: a use after a move, a missing
+  rustd refuses source in which rust-analyzer finds a type or name error, and says each
+  as `path:line:column: message [E0308]`; the wording is rust-analyzer's, not rustc's. It has no borrow checker: a use after a move, a missing
   `mut` or a reference that outlives its value is built and run. `cargo rustd check` is
   `cargo check` and gives rustc's verdict.
 - It never falls back. A function the daemon cannot compile fails the build with the
@@ -150,15 +150,15 @@ Edits in a generated workspace of 200 crates (`harness/genws.py`, timed by
 
 | Edit | cargo | rustd | |
 |---|---:|---:|---:|
-| A function body in the program's crate | 1.74 | 0.44 | 3.9x |
-| A function body in the crate every other depends on | 6.49 | 0.53 | 12.3x |
-| Function bodies in 30 crates at once | 6.03 | 0.66 | 9.2x |
-| A new function | 2.05 | 0.57 | 3.6x |
-| A signature whose callers are in every crate | 13.01 | 13.41 | 1.0x |
+| A function body in the program's crate | 1.76 | 0.42 | 4.2x |
+| A function body in the crate every other depends on | 6.33 | 0.60 | 10.6x |
+| Function bodies in 30 crates at once | 6.26 | 0.62 | 10.1x |
+| A new function | 2.09 | 0.56 | 3.7x |
+| A signature whose callers are in every crate | 13.87 | 10.87 | 1.3x |
 
-The last row is not ahead: the daemon recompiles 6,806 functions and spends half the time
-before compiling anything. After an edit that wide, later edits in the same daemon are
-slower too (about 2 s for a body edit) until it is restarted. Both are known and open.
+The rows were run in that order in one daemon, and the first again after the last (1.79
+against 0.45). The last row is barely ahead: the edit changes 2,390 files and the daemon
+recompiles 6,806 functions, 3 s of it before compiling anything. That is open.
 
 Real projects, one run each, from `harness/cargo_rustd.py --small`. The edit adds a line
 to a function:
