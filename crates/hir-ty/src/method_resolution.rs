@@ -627,6 +627,37 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
     holders
 }
 
+/// What finding the impls of `krate` asks of each impl and of each body that may hold one.
+/// Each is its own query, so [`ImplWork::run`] on many threads leaves the finding little to do.
+pub fn impl_work(db: &dyn HirDatabase, krate: Crate) -> Vec<ImplWork> {
+    let def_map = crate_def_map(db, krate);
+    let mut work = Vec::new();
+    for (_, module) in def_map.modules(db) {
+        let scope = module.scope(db);
+        work.extend(scope.impls().map(ImplWork::Impl));
+        work.extend(impl_holders(db, krate, scope).into_iter().map(ImplWork::Holder));
+    }
+    work
+}
+
+#[derive(Clone, Copy)]
+pub enum ImplWork {
+    Impl(ImplId),
+    Holder(DefWithBodyId),
+}
+
+impl ImplWork {
+    pub fn run(self, db: &dyn HirDatabase) {
+        match self {
+            ImplWork::Impl(id) => {
+                _ = db.impl_self_ty(id);
+                _ = db.impl_trait(id);
+            }
+            ImplWork::Holder(owner) => _ = Body::of(db, owner),
+        }
+    }
+}
+
 #[salsa::tracked(returns(ref))]
 fn crates_containing_incoherent_inherent_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();

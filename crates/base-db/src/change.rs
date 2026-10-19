@@ -90,8 +90,9 @@ impl FileChange {
     }
 }
 
-fn source_root_durability(source_root: &SourceRoot) -> Durability {
-    if source_root.is_library { Durability::MEDIUM } else { Durability::LOW }
+/// The files of a root change far less often than what is in them.
+fn source_root_durability(_: &SourceRoot) -> Durability {
+    Durability::MEDIUM
 }
 
 fn file_text_durability(source_root: &SourceRoot) -> Durability {

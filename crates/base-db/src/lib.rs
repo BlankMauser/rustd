@@ -134,6 +134,10 @@ impl Files {
                 occupied.get_mut().set_text(db).with_durability(durability).to(Arc::from(text));
             }
             Entry::Vacant(vacant) => {
+                // A file that has not been written since it was loaded is less likely to
+                // be than one that has: what was computed from those alone is not looked
+                // at when one of the others changes.
+                let durability = durability.max(Durability::MEDIUM);
                 let text =
                     FileText::builder(Arc::from(text), file_id).durability(durability).new(db);
                 vacant.insert(text);

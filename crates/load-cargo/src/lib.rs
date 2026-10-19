@@ -268,9 +268,11 @@ impl Loaded {
                 join_root(db, root_id, file_set, &known);
                 continue;
             }
-            let (root, durability) = match is_local {
-                true => (SourceRoot::new_local(file_set), Durability::LOW),
-                false => (SourceRoot::new_library(file_set), Durability::MEDIUM),
+            // The files of a root change far less often than what is in them.
+            let durability = Durability::MEDIUM;
+            let root = match is_local {
+                true => SourceRoot::new_local(file_set),
+                false => SourceRoot::new_library(file_set),
             };
             for file_id in root.iter() {
                 db.set_file_source_root_with_durability(file_id, root_id, durability);
