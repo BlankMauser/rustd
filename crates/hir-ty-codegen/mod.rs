@@ -8973,7 +8973,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PointerCast::ReifyFnPointer | PointerCast::ClosureFnPointer(_),
             ) => {
                 let callee = self.fn_item(from_ty)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
                 let pointer = self.builder.ins().func_addr(ptr(), callee);
                 self.builder.ins().store(MEM, pointer, dst, 0);
             }
@@ -10619,7 +10619,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let argc = self.builder.ins().sextend(types::I64, argc);
         let callee = self.fn_item(main_ty)?;
-        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
         let pointer = self.builder.ins().func_addr(ptr(), callee);
         // What `SIGPIPE` does is left as the runtime has it.
         let sigpipe = self.builder.ins().iconst(types::I8, 0);
@@ -11110,7 +11110,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.declare_variadic(func, &mut declared)?;
                 }
                 let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
-                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
                 self.builder.ins().func_addr(ptr(), callee)
             }
             Callee::Pointer(pointer, ..) => pointer,
@@ -11170,7 +11170,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig.params.push(AbiParam::new(ptr()));
         values.push(callee);
         let through = self.cg.assembly(asm::counted_variadic(ints, stack), sig);
-        let through = self.cg.declare_func_in_func(through, self.builder.func);
+        let through = self.cg.declare_func_address_in_func(through, self.builder.func);
         Ok(self.builder.ins().func_addr(ptr(), through))
     }
 

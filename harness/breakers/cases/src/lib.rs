@@ -113,4 +113,5 @@ cases![
     alias_under_binder,
     array_in_tuple_moved_out,
     match_arm_moves_drops,
+    import_called_and_pointed,
 ];
