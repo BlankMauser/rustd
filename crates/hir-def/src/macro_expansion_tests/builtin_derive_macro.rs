@@ -269,7 +269,7 @@ impl <> $crate::cmp::PartialEq for Command< > where {
             , Command::Move {
                 x: x_other, y: y_other,
             }
-            )=>x_self.eq(x_other) && y_self.eq(y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>f0_self.eq(f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
         }
     }
 }
@@ -307,7 +307,7 @@ impl <> $crate::cmp::PartialEq for Command< > where {
             , Command::Move {
                 x: x_other, y: y_other,
             }
-            )=>x_self.eq(x_other) && y_self.eq(y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>f0_self.eq(f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
         }
     }
 }
@@ -337,7 +337,7 @@ enum Command {
 
 impl <> $crate::cmp::PartialOrd for Command< > where {
     fn partial_cmp(&self , other: &Self ) -> $crate::option::Option<$crate::cmp::Ordering> {
-        match $crate::intrinsics::discriminant_value(self ).partial_cmp(&$crate::intrinsics::discriminant_value(other)) {
+        match $crate::cmp::PartialOrd::partial_cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
             $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
                 match (self , other) {
                     (Command::Move {
@@ -346,9 +346,9 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
                     , Command::Move {
                         x: x_other, y: y_other,
                     }
-                    )=>match x_self.partial_cmp(x_other) {
+                    )=>match $crate::cmp::PartialOrd::partial_cmp(&x_self, &x_other) {
                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
-                            match y_self.partial_cmp(y_other) {
+                            match $crate::cmp::PartialOrd::partial_cmp(&y_self, &y_other) {
                                 $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
                                     $crate::option::Option::Some($crate::cmp::Ordering::Equal)
                                 }
@@ -357,7 +357,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
                         }
                         c=>return c,
                     }
-                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.partial_cmp(f0_other) {
+                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match $crate::cmp::PartialOrd::partial_cmp(&f0_self, &f0_other) {
                         $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
                             $crate::option::Option::Some($crate::cmp::Ordering::Equal)
                         }
@@ -372,7 +372,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
 }
 impl <> $crate::cmp::Ord for Command< > where {
     fn cmp(&self , other: &Self ) -> $crate::cmp::Ordering {
-        match $crate::intrinsics::discriminant_value(self ).cmp(&$crate::intrinsics::discriminant_value(other)) {
+        match $crate::cmp::Ord::cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
             $crate::cmp::Ordering::Equal=> {
                 match (self , other) {
                     (Command::Move {
@@ -381,9 +381,9 @@ impl <> $crate::cmp::Ord for Command< > where {
                     , Command::Move {
                         x: x_other, y: y_other,
                     }
-                    )=>match x_self.cmp(&x_other) {
+                    )=>match $crate::cmp::Ord::cmp(&x_self, &x_other) {
                         $crate::cmp::Ordering::Equal=> {
-                            match y_self.cmp(&y_other) {
+                            match $crate::cmp::Ord::cmp(&y_self, &y_other) {
                                 $crate::cmp::Ordering::Equal=> {
                                     $crate::cmp::Ordering::Equal
                                 }
@@ -392,7 +392,7 @@ impl <> $crate::cmp::Ord for Command< > where {
                         }
                         c=>return c,
                     }
-                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match f0_self.cmp(&f0_other) {
+                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match $crate::cmp::Ord::cmp(&f0_self, &f0_other) {
                         $crate::cmp::Ordering::Equal=> {
                             $crate::cmp::Ordering::Equal
                         }
@@ -439,9 +439,9 @@ impl <> $crate::hash::Hash for Foo< > where {
                 x: x, y: y, z: z,
             }
             => {
-                x.hash(ra_expand_state);
-                y.hash(ra_expand_state);
-                z.hash(ra_expand_state);
+                $crate::hash::Hash::hash(&x, ra_expand_state);
+                $crate::hash::Hash::hash(&y, ra_expand_state);
+                $crate::hash::Hash::hash(&z, ra_expand_state);
             }
             ,
         }
@@ -472,17 +472,17 @@ enum Command {
 
 impl <> $crate::hash::Hash for Command< > where {
     fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
-        $crate::mem::discriminant(self ).hash(ra_expand_state);
+        $crate::hash::Hash::hash(&$crate::mem::discriminant(self ), ra_expand_state);
         match self {
             Command::Move {
                 x: x, y: y,
             }
             => {
-                x.hash(ra_expand_state);
-                y.hash(ra_expand_state);
+                $crate::hash::Hash::hash(&x, ra_expand_state);
+                $crate::hash::Hash::hash(&y, ra_expand_state);
             }
             , Command::Do(f0, )=> {
-                f0.hash(ra_expand_state);
+                $crate::hash::Hash::hash(&f0, ra_expand_state);
             }
             , Command::Jump=> {}
             ,

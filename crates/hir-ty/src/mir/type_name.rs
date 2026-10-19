@@ -9,8 +9,8 @@ use hir_def::{
     expr_store::{Body, BodySourceMap},
     hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId},
     signatures::{
-        EnumSignature, FunctionSignature, StructSignature, TraitSignature, TypeAliasSignature,
-        UnionSignature,
+        ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
+        TraitSignature, TypeAliasSignature, UnionSignature,
     },
 };
 use rustc_abi::ExternAbi;
@@ -24,7 +24,7 @@ use crate::{
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure},
     generics::generics,
-    next_solver::{DbInterner, GenericArg, TraitRef, Ty, TyKind},
+    next_solver::{DbInterner, GenericArg, GenericArgs, TraitRef, Ty, TyKind},
 };
 
 /// `None` is a type whose rustc spelling this does not reproduce.
@@ -131,6 +131,59 @@ fn write_container<'db>(
     }
 }
 
+/// The body a block is written in, and the module that body's owner is declared in: a
+/// function, constant or static of the module, or of an `impl` or a trait of it.
+pub(crate) fn block_owner<'db>(
+    db: &'db dyn HirDatabase,
+    block: hir_def::BlockIdLt<'db>,
+) -> Option<(DefWithBodyId, ModuleIdLt<'db>)> {
+    let has = |def: DefWithBodyId| Body::of(db, def).blocks(db).any(|(id, _)| id == block);
+    let of_assoc = |item: &hir_def::AssocItemId| match *item {
+        hir_def::AssocItemId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+        hir_def::AssocItemId::ConstId(it) => Some(it.into()),
+        hir_def::AssocItemId::TypeAliasId(_) => None,
+    };
+    let mut around = block.module(db);
+    loop {
+        let scope = around.def_map(db).module(db, around).scope(db);
+        let declared = scope.declarations().filter_map(|def| match def {
+            ModuleDefId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+            ModuleDefId::ConstId(it) => Some(it.into()),
+            ModuleDefId::StaticId(it) => Some(it.into()),
+            _ => None,
+        });
+        let unnamed = scope.unnamed_consts().map(DefWithBodyId::from);
+        let in_impls = scope
+            .impls()
+            .flat_map(|it| it.impl_items(db).items.iter().filter_map(|(_, item)| of_assoc(item)));
+        let in_traits = scope.declarations().filter_map(|def| match def {
+            ModuleDefId::TraitId(it) => Some(it),
+            _ => None,
+        });
+        let in_traits = in_traits
+            .flat_map(|it| it.trait_items(db).items.iter().filter_map(|(_, item)| of_assoc(item)));
+        let owner = declared.chain(unnamed).chain(in_impls).chain(in_traits).find(|&it| has(it));
+        match owner {
+            Some(owner) => return Some((owner, around)),
+            // A block in a block, of the same body.
+            None => around = around.block(db)?.module(db),
+        }
+    }
+}
+
+/// Whether `block` of `owner` is written in no closure or `async` block of it.
+pub(crate) fn is_outside_closures<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    block: hir_def::BlockIdLt<'db>,
+) -> bool {
+    let body = Body::of(db, owner);
+    let at = body
+        .exprs()
+        .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block));
+    at.and_then(|(at, _)| closures_around(db, owner, at)).is_some_and(|it| it.is_empty())
+}
+
 /// Which of rustc's ways to write a name is wanted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Spelling {
@@ -222,29 +275,42 @@ fn write_module<'db>(
     // it the item is written in.
     if module.is_block_module(db) {
         let block = module.block(db)?;
-        let mut around = block.module(db);
-        // FIXME: a method's body is named after the `impl`, which is not looked through here.
-        let owner = loop {
-            let scope = around.def_map(db).module(db, around).scope(db);
-            let owner = scope.declarations().find_map(|def| match def {
-                ModuleDefId::FunctionId(it) => {
-                    Body::of(db, it.into()).blocks(db).any(|(id, _)| id == block).then_some(it)
-                }
-                _ => None,
-            });
-            match owner {
-                Some(owner) => break owner,
-                // A block in a block, of the same body.
-                None => around = around.block(db)?.module(db),
-            }
-        };
-        let body = Body::of(db, owner.into());
+        let (owner, around) = block_owner(db, block)?;
+        let body = Body::of(db, owner);
         let (at, _) = body
             .exprs()
             .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
-        write_module(db, out, around)?;
-        write!(out, "::{}", FunctionSignature::of(db, owner).name.as_str()).ok()?;
-        out.closures(&closures_around(db, owner.into(), at)?);
+        match owner {
+            DefWithBodyId::FunctionId(func) => match func.lookup(db).container {
+                ItemContainerId::ModuleId(_) => {
+                    write_module(db, out, around)?;
+                    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+                }
+                _ if out.spelling == Spelling::Debug => {
+                    let args =
+                        GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
+                    write_container(db, out, func, args.as_slice())?;
+                    write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
+                }
+                _ => {
+                    let args =
+                        GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
+                    write_function(db, out, func, args.as_slice())?;
+                }
+            },
+            DefWithBodyId::ConstId(it) => {
+                let ItemContainerId::ModuleId(_) = it.lookup(db).container else { return None };
+                let name = ConstSignature::of(db, it).name.as_ref();
+                write_module(db, out, around)?;
+                write!(out, "::{}", name.map_or("_", |it| it.as_str())).ok()?;
+            }
+            DefWithBodyId::StaticId(it) => {
+                write_module(db, out, around)?;
+                write!(out, "::{}", StaticSignature::of(db, it).name.as_str()).ok()?;
+            }
+            _ => return None,
+        }
+        out.closures(&closures_around(db, owner, at)?);
         return Some(());
     }
     match module.containing_module(db) {

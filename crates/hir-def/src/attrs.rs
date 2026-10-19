@@ -161,6 +161,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
             match second_segment {
                 None => match &*first_segment {
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
+                    "used" => attr_flags.insert(AttrFlags::USED),
                     "inline" if !tt.syntax().text().contains_char('n') => {
                         attr_flags.insert(AttrFlags::IS_INLINE)
                     }
@@ -243,6 +244,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
+                    "used" => attr_flags.insert(AttrFlags::USED),
                     "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
                     "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
                     "rustc_inherit_overflow_checks" => {
@@ -377,6 +379,8 @@ bitflags::bitflags! {
         const RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 58;
         /// `#[inline]` or `#[inline(always)]`: the crates that use the function compile it.
         const IS_INLINE = 1 << 59;
+        /// `#[used]`: kept in the object though nothing names it.
+        const USED = 1 << 60;
     }
 }
 
@@ -782,6 +786,12 @@ impl AttrFlags {
     #[salsa::tracked(returns(clone))]
     pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
         symbol_attr(db, owner, "link_name")
+    }
+
+    /// The section `#[link_section]` puts an item in.
+    #[salsa::tracked(returns(clone))]
+    pub fn link_section(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        symbol_attr(db, owner, "link_section")
     }
 
     /// The symbol `#[export_name]` gives an item.

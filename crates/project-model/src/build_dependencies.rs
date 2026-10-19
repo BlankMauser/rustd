@@ -330,6 +330,115 @@ impl WorkspaceBuildScripts {
         Ok(res)
     }
 
+    /// What cargo said of the scripts and the proc macros of `workspace` in `lines` of its
+    /// `--message-format=json`, for whoever ran cargo itself: nothing is run for it here.
+    pub fn of_messages<'a>(
+        workspace: &CargoWorkspace,
+        lines: impl IntoIterator<Item = &'a str>,
+    ) -> WorkspaceBuildScripts {
+        let mut res = WorkspaceBuildScripts::default();
+        let outputs = &mut res.outputs;
+        let mut by_id: FxHashMap<Arc<PackageId>, Package> = FxHashMap::default();
+        for package in workspace.packages() {
+            outputs.insert(package, BuildScriptOutput::default());
+            by_id.insert(workspace[package].id.clone(), package);
+        }
+        let errors = RefCell::new(String::new());
+        let push_err = |err: &str| {
+            let mut e = errors.borrow_mut();
+            e.push_str(err);
+            e.push('\n');
+        };
+        let mut with_output_for =
+            |package: &PackageId, cb: &mut dyn FnMut(&str, &mut BuildScriptOutput)| {
+                if let Some(&package) = by_id.get(package) {
+                    cb(&workspace[package].name, &mut outputs[package]);
+                }
+            };
+        for line in lines {
+            Self::said(line, &mut with_output_for, &|_| {}, &push_err);
+        }
+        res.error = Some(errors.into_inner()).filter(|it| !it.is_empty());
+        res
+    }
+
+    /// Takes in one line of what cargo printed.
+    fn said(
+        line: &str,
+        with_output_for: &mut dyn FnMut(&PackageId, &mut dyn FnMut(&str, &mut BuildScriptOutput)),
+        progress: &dyn Fn(String),
+        push_err: &dyn Fn(&str),
+    ) {
+        // Copy-pasted from existing cargo_metadata. It seems like we
+        // should be using serde_stacker here?
+        let mut deserializer = serde_json::Deserializer::from_str(line);
+        deserializer.disable_recursion_limit();
+        let message = Message::deserialize(&mut deserializer)
+            .unwrap_or_else(|_| Message::TextLine(line.to_owned()));
+
+        match message {
+            Message::BuildScriptExecuted(mut message) => {
+                with_output_for(&message.package_id, &mut |name, data| {
+                    progress(format!("build script {name} run"));
+                    let cfgs = {
+                        let mut acc = Vec::new();
+                        for cfg in &message.cfgs {
+                            match crate::parse_cfg(cfg) {
+                                Ok(it) => acc.push(it),
+                                Err(err) => {
+                                    push_err(&format!("invalid cfg from cargo-metadata: {err}"));
+                                    return;
+                                }
+                            };
+                        }
+                        acc
+                    };
+                    data.envs.extend(message.env.drain(..));
+                    // cargo_metadata crate returns default (empty) path for
+                    // older cargos, which is not absolute, so work around that.
+                    let out_dir = mem::take(&mut message.out_dir);
+                    if !out_dir.as_str().is_empty() {
+                        let out_dir = AbsPathBuf::assert(out_dir);
+                        // inject_cargo_env(package, package_build_data);
+                        data.envs.insert("OUT_DIR", out_dir.as_str());
+                        data.out_dir = Some(out_dir);
+                        data.cfgs = cfgs;
+                    }
+                });
+            }
+            Message::CompilerArtifact(message) => {
+                with_output_for(&message.package_id, &mut |name, data| {
+                    if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
+                        data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
+                    }
+                    if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
+                        && message.target.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
+                    {
+                        progress(format!("proc-macro {name} built"));
+                        data.proc_macro_dylib_path =
+                            match message.filenames.iter().find(|file| is_dylib(file)) {
+                                Some(filename) => {
+                                    let filename = AbsPath::assert(filename);
+                                    ProcMacroDylibPath::Path(filename.to_owned())
+                                }
+                                None => ProcMacroDylibPath::DylibNotFound,
+                            };
+                    }
+                });
+            }
+            Message::CompilerMessage(message) => {
+                progress(format!("received compiler message for: {}", message.target.name));
+
+                if let Some(diag) = message.message.rendered.as_deref() {
+                    push_err(diag);
+                }
+            }
+            Message::BuildFinished(_) => {}
+            Message::TextLine(_) => {}
+            _ => {}
+        }
+    }
+
     fn run_command(
         cmd: Command,
         // ideally this would be something like:
@@ -348,81 +457,7 @@ impl WorkspaceBuildScripts {
         tracing::info!("Running build scripts: {:?}", cmd);
         let output = stdx::process::spawn_with_streaming_output(
             cmd,
-            &mut |line| {
-                // Copy-pasted from existing cargo_metadata. It seems like we
-                // should be using serde_stacker here?
-                let mut deserializer = serde_json::Deserializer::from_str(line);
-                deserializer.disable_recursion_limit();
-                let message = Message::deserialize(&mut deserializer)
-                    .unwrap_or_else(|_| Message::TextLine(line.to_owned()));
-
-                match message {
-                    Message::BuildScriptExecuted(mut message) => {
-                        with_output_for(&message.package_id, &mut |name, data| {
-                            progress(format!("build script {name} run"));
-                            let cfgs = {
-                                let mut acc = Vec::new();
-                                for cfg in &message.cfgs {
-                                    match crate::parse_cfg(cfg) {
-                                        Ok(it) => acc.push(it),
-                                        Err(err) => {
-                                            push_err(&format!(
-                                                "invalid cfg from cargo-metadata: {err}"
-                                            ));
-                                            return;
-                                        }
-                                    };
-                                }
-                                acc
-                            };
-                            data.envs.extend(message.env.drain(..));
-                            // cargo_metadata crate returns default (empty) path for
-                            // older cargos, which is not absolute, so work around that.
-                            let out_dir = mem::take(&mut message.out_dir);
-                            if !out_dir.as_str().is_empty() {
-                                let out_dir = AbsPathBuf::assert(out_dir);
-                                // inject_cargo_env(package, package_build_data);
-                                data.envs.insert("OUT_DIR", out_dir.as_str());
-                                data.out_dir = Some(out_dir);
-                                data.cfgs = cfgs;
-                            }
-                        });
-                    }
-                    Message::CompilerArtifact(message) => {
-                        with_output_for(&message.package_id, &mut |name, data| {
-                            if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
-                                data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
-                            }
-                            if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
-                                && message
-                                    .target
-                                    .kind
-                                    .contains(&cargo_metadata::TargetKind::ProcMacro)
-                            {
-                                progress(format!("proc-macro {name} built"));
-                                data.proc_macro_dylib_path =
-                                    match message.filenames.iter().find(|file| is_dylib(file)) {
-                                        Some(filename) => {
-                                            let filename = AbsPath::assert(filename);
-                                            ProcMacroDylibPath::Path(filename.to_owned())
-                                        }
-                                        None => ProcMacroDylibPath::DylibNotFound,
-                                    };
-                            }
-                        });
-                    }
-                    Message::CompilerMessage(message) => {
-                        progress(format!("received compiler message for: {}", message.target.name));
-
-                        if let Some(diag) = message.message.rendered.as_deref() {
-                            push_err(diag);
-                        }
-                    }
-                    Message::BuildFinished(_) => {}
-                    Message::TextLine(_) => {}
-                    _ => {}
-                }
-            },
+            &mut |line| Self::said(line, &mut with_output_for, progress, &push_err),
             &mut |line| {
                 push_err(line);
             },
