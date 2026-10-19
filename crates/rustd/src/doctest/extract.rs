@@ -113,11 +113,11 @@ impl Found<'_> {
                 }
                 ModuleDef::Function(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::Adt(it) => self.adt(it, &named(it.name(db))),
-                ModuleDef::Const(it) => {
-                    if let Some(name) = it.name(db) {
-                        self.documented(it, &named(name));
-                    }
-                }
+                // One without a name is `_` to rustdoc.
+                ModuleDef::Const(it) => match it.name(db) {
+                    Some(name) => self.documented(it, &named(name)),
+                    None => self.documented(it, &join(path, "_")),
+                },
                 ModuleDef::Static(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::TypeAlias(it) => self.documented(it, &named(it.name(db))),
                 ModuleDef::Trait(it) => {
@@ -126,7 +126,9 @@ impl Found<'_> {
                     self.items(it.items(db), &path);
                 }
                 // One of `macro_rules!` is told of where it is written, below.
-                ModuleDef::Macro(it) if !is_macro_rules(db, it) => {
+                // And the examples of a procedural one are those of its function, which may
+                // have another name.
+                ModuleDef::Macro(it) if !is_macro_rules(db, it) && !it.is_proc_macro() => {
                     self.documented(it, &named(it.name(db)))
                 }
                 _ => {}

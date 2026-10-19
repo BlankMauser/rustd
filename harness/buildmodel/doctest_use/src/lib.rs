@@ -50,3 +50,10 @@ pub mod n {
     #[allow(unused)]
     use crate as krate;
 }
+
+/// A constant without a name is `_`.
+///
+/// ```
+/// assert!(true);
+/// ```
+const _: () = ();
