@@ -265,33 +265,43 @@ impl ast::String {
         let text = self.text();
         let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
         let text = &text[text_range - self.syntax().text_range().start()];
-        if self.is_raw() {
-            return Ok(Cow::Borrowed(text));
+        if text.contains("\r\n") {
+            let text = text.replace("\r\n", "\n");
+            return unescaped_str(&text, self.is_raw()).map(|it| Cow::Owned(it.into_owned()));
         }
+        unescaped_str(text, self.is_raw())
+    }
+}
 
-        let mut buf = String::new();
-        let mut prev_end = 0;
-        let mut has_error = None;
-        unescape_str(text, |char_range, unescaped_char| {
-            match (unescaped_char, buf.capacity() == 0) {
-                (Ok(c), false) => buf.push(c),
-                (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
-                    prev_end = char_range.end
-                }
-                (Ok(c), true) => {
-                    buf.reserve_exact(text.len());
-                    buf.push_str(&text[..prev_end]);
-                    buf.push(c);
-                }
-                (Err(e), _) => has_error = Some(e),
-            }
-        });
+/// The value of the literal with `text` between its quotes. The text has the line endings
+/// of a source file the compiler has read, which are `\n` only.
+fn unescaped_str(text: &str, raw: bool) -> Result<Cow<'_, str>, EscapeError> {
+    if raw {
+        return Ok(Cow::Borrowed(text));
+    }
 
-        match (has_error, buf.capacity() == 0) {
-            (Some(e), _) => Err(e),
-            (None, true) => Ok(Cow::Borrowed(text)),
-            (None, false) => Ok(Cow::Owned(buf)),
+    let mut buf = String::new();
+    let mut prev_end = 0;
+    let mut has_error = None;
+    unescape_str(text, |char_range, unescaped_char| match (unescaped_char, buf.capacity() == 0) {
+        (Ok(c), false) => buf.push(c),
+        (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+            prev_end = char_range.end
         }
+        (Ok(c), true) => {
+            buf.reserve_exact(text.len());
+            buf.push_str(&text[..prev_end]);
+            buf.push(c);
+        }
+        (Err(e), _) if e.is_fatal() => has_error = Some(e),
+        // A warning about a line continuation, which gives no character.
+        (Err(_), _) => {}
+    });
+
+    match (has_error, buf.capacity() == 0) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(Cow::Borrowed(&text[..prev_end])),
+        (None, false) => Ok(Cow::Owned(buf)),
     }
 }
 
@@ -309,33 +319,45 @@ impl ast::ByteString {
         let text = self.text();
         let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
         let text = &text[text_range - self.syntax().text_range().start()];
-        if self.is_raw() {
-            return Ok(Cow::Borrowed(text.as_bytes()));
+        if text.contains("\r\n") {
+            let text = text.replace("\r\n", "\n");
+            return unescaped_byte_str(&text, self.is_raw()).map(|it| Cow::Owned(it.into_owned()));
         }
+        unescaped_byte_str(text, self.is_raw())
+    }
+}
 
-        let mut buf: Vec<u8> = Vec::new();
-        let mut prev_end = 0;
-        let mut has_error = None;
-        unescape_byte_str(text, |char_range, unescaped_byte| {
-            match (unescaped_byte, buf.capacity() == 0) {
-                (Ok(b), false) => buf.push(b),
-                (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
-                    prev_end = char_range.end
-                }
-                (Ok(b), true) => {
-                    buf.reserve_exact(text.len());
-                    buf.extend_from_slice(&text.as_bytes()[..prev_end]);
-                    buf.push(b);
-                }
-                (Err(e), _) => has_error = Some(e),
+/// The value of the literal with `text` between its quotes. The text has the line endings
+/// of a source file the compiler has read, which are `\n` only.
+fn unescaped_byte_str(text: &str, raw: bool) -> Result<Cow<'_, [u8]>, EscapeError> {
+    if raw {
+        return Ok(Cow::Borrowed(text.as_bytes()));
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut prev_end = 0;
+    let mut has_error = None;
+    unescape_byte_str(text, |char_range, unescaped_byte| {
+        match (unescaped_byte, buf.capacity() == 0) {
+            (Ok(b), false) => buf.push(b),
+            (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+                prev_end = char_range.end
             }
-        });
-
-        match (has_error, buf.capacity() == 0) {
-            (Some(e), _) => Err(e),
-            (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
-            (None, false) => Ok(Cow::Owned(buf)),
+            (Ok(b), true) => {
+                buf.reserve_exact(text.len());
+                buf.extend_from_slice(&text.as_bytes()[..prev_end]);
+                buf.push(b);
+            }
+            (Err(e), _) if e.is_fatal() => has_error = Some(e),
+            // A warning about a line continuation, which gives no character.
+            (Err(_), _) => {}
         }
+    });
+
+    match (has_error, buf.capacity() == 0) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
+        (None, false) => Ok(Cow::Owned(buf)),
     }
 }
 
@@ -355,35 +377,47 @@ impl ast::CString {
         let text = self.text();
         let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
         let text = &text[text_range - self.syntax().text_range().start()];
-        if self.is_raw() {
-            return Ok(Cow::Borrowed(text.as_bytes()));
+        if text.contains("\r\n") {
+            let text = text.replace("\r\n", "\n");
+            return unescaped_c_str(&text, self.is_raw()).map(|it| Cow::Owned(it.into_owned()));
         }
+        unescaped_c_str(text, self.is_raw())
+    }
+}
 
-        let mut buf = Vec::new();
-        let mut prev_end = 0;
-        let mut has_error = None;
-        let extend_unit = |buf: &mut Vec<u8>, unit: MixedUnit| match unit {
-            MixedUnit::Char(c) => buf.extend(c.get().encode_utf8(&mut [0; 4]).as_bytes()),
-            MixedUnit::HighByte(b) => buf.push(b.get()),
-        };
-        unescape_c_str(text, |char_range, unescaped| match (unescaped, buf.capacity() == 0) {
-            (Ok(u), false) => extend_unit(&mut buf, u),
-            (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
-                prev_end = char_range.end
-            }
-            (Ok(u), true) => {
-                buf.reserve_exact(text.len());
-                buf.extend(&text.as_bytes()[..prev_end]);
-                extend_unit(&mut buf, u);
-            }
-            (Err(e), _) => has_error = Some(e),
-        });
+/// The value of the literal with `text` between its quotes. The text has the line endings
+/// of a source file the compiler has read, which are `\n` only.
+fn unescaped_c_str(text: &str, raw: bool) -> Result<Cow<'_, [u8]>, EscapeError> {
+    if raw {
+        return Ok(Cow::Borrowed(text.as_bytes()));
+    }
 
-        match (has_error, buf.capacity() == 0) {
-            (Some(e), _) => Err(e),
-            (None, true) => Ok(Cow::Borrowed(text.as_bytes())),
-            (None, false) => Ok(Cow::Owned(buf)),
+    let mut buf = Vec::new();
+    let mut prev_end = 0;
+    let mut has_error = None;
+    let extend_unit = |buf: &mut Vec<u8>, unit: MixedUnit| match unit {
+        MixedUnit::Char(c) => buf.extend(c.get().encode_utf8(&mut [0; 4]).as_bytes()),
+        MixedUnit::HighByte(b) => buf.push(b.get()),
+    };
+    unescape_c_str(text, |char_range, unescaped| match (unescaped, buf.capacity() == 0) {
+        (Ok(u), false) => extend_unit(&mut buf, u),
+        (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+            prev_end = char_range.end
         }
+        (Ok(u), true) => {
+            buf.reserve_exact(text.len());
+            buf.extend(&text.as_bytes()[..prev_end]);
+            extend_unit(&mut buf, u);
+        }
+        (Err(e), _) if e.is_fatal() => has_error = Some(e),
+        // A warning about a line continuation, which gives no character.
+        (Err(_), _) => {}
+    });
+
+    match (has_error, buf.capacity() == 0) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
+        (None, false) => Ok(Cow::Owned(buf)),
     }
 }
 

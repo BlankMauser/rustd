@@ -15,7 +15,7 @@ pub(super) enum Semicolon {
 const EXPR_FIRST: TokenSet = LHS_FIRST;
 
 pub(super) fn expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
-    let r = Restrictions { forbid_structs: false, prefer_stmt: false };
+    let r = Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
     expr_bp(p, None, r, 1).map(|(m, _)| m)
 }
 
@@ -23,12 +23,26 @@ pub(super) fn expr_stmt(
     p: &mut Parser<'_>,
     m: Option<Marker>,
 ) -> Option<(CompletedMarker, BlockLike)> {
-    let r = Restrictions { forbid_structs: false, prefer_stmt: true };
+    let r = Restrictions { forbid_structs: false, prefer_stmt: true, macro_ends_stmt: true };
     expr_bp(p, m, r, 1)
 }
 
+/// What a match arm gives. A block ends it as it ends a statement; a macro called with braces
+/// does not, as it is not a statement here.
+pub(super) fn match_arm_expr(p: &mut Parser<'_>) -> Option<(CompletedMarker, BlockLike)> {
+    // test match_arm_braced_macro_operand
+    // fn f() {
+    //     match () {
+    //         () => m! {} | 1,
+    //         () => {}
+    //     }
+    // }
+    let r = Restrictions { forbid_structs: false, prefer_stmt: true, macro_ends_stmt: false };
+    expr_bp(p, None, r, 1)
+}
+
 fn expr_no_struct(p: &mut Parser<'_>) {
-    let r = Restrictions { forbid_structs: true, prefer_stmt: false };
+    let r = Restrictions { forbid_structs: true, prefer_stmt: false, macro_ends_stmt: true };
     expr_bp(p, None, r, 1);
 }
 
@@ -188,6 +202,15 @@ pub(super) fn expr_block_contents(p: &mut Parser<'_>) {
 struct Restrictions {
     forbid_structs: bool,
     prefer_stmt: bool,
+    /// Whether a macro called with braces ends an expression where a statement may end.
+    macro_ends_stmt: bool,
+}
+
+impl Restrictions {
+    /// Whether `lhs` is all of a statement, with what follows it starting another.
+    fn ends_stmt(self, lhs: SyntaxKind, blocklike: BlockLike) -> bool {
+        self.prefer_stmt && blocklike.is_block() && (self.macro_ends_stmt || lhs != MACRO_EXPR)
+    }
 }
 
 enum Associativity {
@@ -262,10 +285,10 @@ fn expr_bp(
         m.abandon(p);
         return None;
     }
-    let mut lhs = match lhs(p, r) {
+    let (mut lhs, mut blocklike) = match lhs(p, r) {
         Some((lhs, blocklike)) => {
             let lhs = lhs.extend_to(p, m);
-            if r.prefer_stmt && blocklike.is_block() {
+            if r.ends_stmt(lhs.kind(), blocklike) {
                 // test stmt_bin_expr_ambiguity
                 // fn f() {
                 //     let _ = {1} & 2;
@@ -273,7 +296,7 @@ fn expr_bp(
                 // }
                 return Some((lhs, BlockLike::Block));
             }
-            lhs
+            (lhs, blocklike)
         }
         None => {
             m.abandon(p);
@@ -291,10 +314,12 @@ fn expr_bp(
         // fn f() { let _ = &1 as *const i32; }
         if p.at(T![as]) {
             lhs = cast_expr(p, lhs);
+            blocklike = BlockLike::NotBlock;
             continue;
         }
         let m = lhs.precede(p);
         p.bump(op);
+        blocklike = BlockLike::NotBlock;
 
         if is_range {
             // test postfix_range
@@ -330,7 +355,7 @@ fn expr_bp(
         expr_bp(p, None, Restrictions { prefer_stmt: false, ..r }, op_bp);
         lhs = m.complete(p, if is_range { RANGE_EXPR } else { BIN_EXPR });
     }
-    Some((lhs, BlockLike::NotBlock))
+    Some((lhs, blocklike))
 }
 
 const LHS_FIRST: TokenSet =
@@ -409,8 +434,8 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
             //    {p}.x = 10;
             // }
             let (lhs, blocklike) = atom::atom_expr(p, r)?;
-            let (cm, block_like) =
-                postfix_expr(p, lhs, blocklike, !(r.prefer_stmt && blocklike.is_block()));
+            let ends_stmt = r.ends_stmt(lhs.kind(), blocklike);
+            let (cm, block_like) = postfix_expr(p, lhs, blocklike, !ends_stmt);
             return Some((cm, block_like));
         }
     };

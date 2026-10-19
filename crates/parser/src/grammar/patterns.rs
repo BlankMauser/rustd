@@ -185,10 +185,13 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
                 //       ^
                 // `0 .. | _`
                 //       ^
-                if matches!(
-                    p.current(),
-                    T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | T![|] | EOF
-                ) {
+                // A `::` starts the path the range ends at, where a `:` ends the pattern.
+                if !p.at(T![::])
+                    && matches!(
+                        p.current(),
+                        T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | T![|] | EOF
+                    )
+                {
                     // test half_open_range_pat
                     // fn f() {
                     //     let 0 .. = 1u32;
@@ -200,6 +203,11 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
                     //     }
                     //
                     //     let &(0.. | _) = &0_i32;
+                    // }
+
+                    // test range_pat_to_global_path
+                    // fn f() {
+                    //     if let 0..=::m::MAX = 1 {}
                     // }
                 } else {
                     atom_pat(p, recovery_set);

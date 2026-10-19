@@ -364,7 +364,8 @@ where
                         }
                         UNDERSCORE => make_ident!(),
                         k if k.is_literal() => {
-                            let text = token.to_text(conv);
+                            // The compiler reads a source file with `\n` line endings.
+                            let text = token.to_text(conv).replace("\r\n", "\n");
                             let span = conv.span_for(abs_range);
                             token_to_literal(&text, span).into()
                         }

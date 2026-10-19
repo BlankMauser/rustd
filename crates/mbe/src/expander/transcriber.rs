@@ -6,7 +6,6 @@ use span::{Edition, Span};
 use stdx::itertools::Itertools;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
-use super::TokensOrigin;
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
@@ -418,11 +417,8 @@ fn expand_var(
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
                 // Basically, a metavariable can never be joined with whatever after it.
                 Fragment::Tokens { tree, origin } => {
-                    let view = match origin {
-                        TokensOrigin::Raw => tree.strip_invisible(),
-                        TokensOrigin::Ast => tree,
-                    };
-                    builder.extend_with_tt_alone(view);
+                    let _ = origin;
+                    builder.extend_with_tt_alone(tree);
                 }
                 Fragment::TokensOwned(tt) => {
                     builder.extend_with_tt_alone(tt.view().strip_invisible())
@@ -447,14 +443,12 @@ fn expand_var(
                     // it is one token: the `0` of an expression is not the `0` of a rule.
                     let is_leaf =
                         matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
-                    // The fragment is a group without delimiters whatever it is; inside it,
-                    // parentheses keep an expression of several tokens together where it is
-                    // parsed again.
-                    let whole = (is_negative_literal && follower != Follower::Postfix)
-                        || sub.try_into_subtree().is_some_and(|it| {
-                            it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
-                        });
-                    let parenthesized = !(is_leaf || is_macro_call(sub) || whole);
+                    // The fragment is a group without delimiters whatever it is, as it is to
+                    // rustc; inside it, parentheses keep an expression of several tokens
+                    // together where it is parsed again.
+                    let whole = is_negative_literal && follower != Follower::Postfix;
+                    let is_group = sub.try_into_subtree().is_some();
+                    let parenthesized = !(is_leaf || is_group || is_macro_call(sub) || whole);
                     if !whole {
                         builder.open(tt::DelimiterKind::Invisible, span);
                     }
