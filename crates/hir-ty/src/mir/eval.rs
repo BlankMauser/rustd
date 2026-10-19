@@ -2817,6 +2817,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     && let Some(new_start) = patch_map.get(&start)
                 {
                     self.write_memory(addr, &word_bytes(new_start + (current - start)))?;
+                } else if let Ok(fn_ty) = ty_of_bytes(&word_bytes(current))
+                    && matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..))
+                {
+                    // A function cast to a raw pointer is still the id the value's own
+                    // evaluation gave the function, and this one has another for it.
+                    let new_id = self.vtable_map.id(fn_ty);
+                    self.write_memory(addr, &word_bytes(new_id))?;
                 }
             }
             TyKind::FnPtr(_, _) => {
