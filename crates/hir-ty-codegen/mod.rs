@@ -548,35 +548,39 @@ impl CodegenUnit {
                     }
                 });
                 cg.phases.compile += start.elapsed();
-                while let Some(&root) = queue.get(next) {
-                    next += 1;
-                    let result = if denied.contains(&root) {
-                        Err(CodegenError::Unsupported("left to rustc on request".to_owned()))
-                    } else if left.contains(&root) {
-                        let reason = "shares an `async` block with a function left to rustc";
-                        Err(CodegenError::Unsupported(reason.to_owned()))
-                    } else {
-                        cg.define_function(root)
-                    };
-                    match result {
-                        Ok(symbol) => compiled.push((root, symbol)),
-                        Err(e) => {
-                            // rustc's copy calls what ours would have.
-                            if !on_demand.is_empty()
-                                && !e.no_symbol()
-                                && !cg.want_reachable_from(root)
-                            {
-                                let krate = root.krate(db);
-                                let rest =
-                                    roots.on_demand.iter().filter(|it| it.krate(db) == krate);
-                                cg.wanted.extend(rest);
+                // The other threads go on to what the roots call while these are put in the
+                // object.
+                cg.compile_ahead(ours, &mut |cg, ahead| {
+                    while let Some(&root) = queue.get(next) {
+                        next += 1;
+                        let result = if denied.contains(&root) {
+                            Err(CodegenError::Unsupported("left to rustc on request".to_owned()))
+                        } else if left.contains(&root) {
+                            let reason = "shares an `async` block with a function left to rustc";
+                            Err(CodegenError::Unsupported(reason.to_owned()))
+                        } else {
+                            cg.define_function(root)
+                        };
+                        match result {
+                            Ok(symbol) => compiled.push((root, symbol)),
+                            Err(e) => {
+                                // rustc's copy calls what ours would have.
+                                if !on_demand.is_empty()
+                                    && !e.no_symbol()
+                                    && !cg.want_reachable_from(root)
+                                {
+                                    let krate = root.krate(db);
+                                    let rest =
+                                        roots.on_demand.iter().filter(|it| it.krate(db) == krate);
+                                    cg.wanted.extend(rest);
+                                }
+                                skipped.push((root, e));
                             }
-                            skipped.push((root, e));
                         }
+                        queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
                     }
-                    queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
-                }
-                failed.extend(cg.define_instances());
+                    failed.extend(cg.define_waves(ahead));
+                });
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
                 if next == queue.len() {
                     break;
@@ -1892,6 +1896,8 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
 
 /// What the threads that compile ahead have to do and have done.
 struct Ahead {
+    /// Compiled functions whose calls are still to be looked through.
+    roots: Vec<FunctionId>,
     queue: Vec<(Instance, StoredParamEnvAndCrate)>,
     seen: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
     done: FxHashSet<(Instance, StoredParamEnvAndCrate)>,
@@ -1930,7 +1936,8 @@ impl Ready<'_> {
             }
         }
         loop {
-            let ended = state.stopped || (state.queue.is_empty() && state.working == 0);
+            let ended = state.stopped
+                || (state.roots.is_empty() && state.queue.is_empty() && state.working == 0);
             let done: Vec<_> = if ended {
                 state.fresh.clear();
                 self.waiting.drain().collect()
@@ -2536,6 +2543,8 @@ fn build<'db>(
         builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
         locals: ArenaMap::new(),
         blocks: ArenaMap::new(),
+        layouts: Default::default(),
+        glue: Default::default(),
         drop_flags: ArenaMap::new(),
         moved_paths: Vec::new(),
         deferred_drops: Vec::new(),
@@ -2936,6 +2945,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .map_err(CodegenError::Backend)?,
             None => Vec::new(),
         };
+        // Freeing every type told of takes as long as writing the object.
+        let told = std::mem::take(&mut self.told);
+        std::thread::spawn(move || drop(told));
         let object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
         Ok((object, apart))
     }
@@ -3035,7 +3047,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
     fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
-        self.compile_ahead(&mut |cg, ahead| failed.extend(cg.define_waves(ahead)));
+        self.compile_ahead(Vec::new(), &mut |cg, ahead| failed.extend(cg.define_waves(ahead)));
         failed
     }
 
@@ -3088,14 +3100,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         failed
     }
 
-    /// Compiles what is pending and everything it calls, on every core. A thread goes on to
-    /// what an instance calls as soon as that instance is compiled, where the waves of
-    /// [`Self::define_instances`] each wait for their slowest function. What this compiles
-    /// that the object has no use for is only wasted. `beside` runs on this thread meanwhile,
-    /// and is told whether anything is compiled ahead of it.
-    fn compile_ahead(&mut self, beside: &mut dyn FnMut(&mut Self, Option<&mut Ready<'_>>)) {
+    /// Compiles what is pending, what the compiled `roots` call and everything those call, on
+    /// every core. A thread goes on to what an instance calls as soon as that instance is
+    /// compiled, where the waves of [`Self::define_instances`] each wait for their slowest
+    /// function. What this compiles that the object has no use for is only wasted. `beside`
+    /// runs on this thread meanwhile, and is told whether anything is compiled ahead of it.
+    fn compile_ahead(
+        &mut self,
+        roots: Vec<FunctionId>,
+        beside: &mut dyn FnMut(&mut Self, Option<&mut Ready<'_>>),
+    ) {
         // A patch calls the base's copy of most of what it reaches.
-        if self.base.is_some() || self.pending.is_empty() {
+        if self.base.is_some() || (self.pending.is_empty() && roots.is_empty()) {
             return beside(self, None);
         }
         /// Tells the threads that wait when the one compiling is stopped.
@@ -3116,6 +3132,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .filter(|it| seen.insert(it.clone()))
             .collect();
         let ahead = std::sync::Mutex::new(Ahead {
+            roots,
             queue,
             seen,
             done: FxHashSet::default(),
@@ -3146,48 +3163,64 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 if state.stopped {
                     return;
                 }
-                let Some((instance, env)) = state.queue.pop() else {
-                    if state.working == 0 {
-                        idle.notify_all();
-                        return;
-                    }
-                    state = idle.wait(state).unwrap_or_else(|e| e.into_inner());
-                    continue;
+                let job = match state.roots.pop() {
+                    Some(root) => either::Either::Left(root),
+                    None => match state.queue.pop() {
+                        Some(it) => either::Either::Right(it),
+                        None if state.working == 0 => {
+                            idle.notify_all();
+                            return;
+                        }
+                        None => {
+                            state = idle.wait(state).unwrap_or_else(|e| e.into_inner());
+                            continue;
+                        }
+                    },
                 };
                 state.working += 1;
                 drop(state);
                 let working = Working(&ahead, &idle);
                 let mut found = Vec::new();
-                let it = (instance.clone(), env.clone());
-                if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
-                    if let Some(told) = told {
-                        told.ahead(db, &mut types, compiled);
+                let compiled = match &job {
+                    // One without a symbol is left to rustc, and so is what only it calls.
+                    either::Either::Left(root) => {
+                        symbols.function(*root).and_then(|_| compiled_root(db, *root).as_ref().ok())
                     }
-                    for request in &compiled.requests.funcs {
-                        let FuncTarget::Instance(callee, asked) = &request.target else {
-                            continue;
-                        };
-                        // A function without generic arguments is a root, called by its
-                        // symbol when rustc compiled it. The thread that puts the caller in
-                        // the object asks for the symbol, and finds it here.
-                        let root = match callee.def {
-                            InstanceDef::Fn(func)
-                                if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
-                            {
-                                symbols.function(func).is_some()
-                            }
-                            _ => false,
-                        };
-                        if !root && !rejected.contains_key(callee) && !in_store(callee) {
-                            found.push((callee.clone(), homes.home(db, callee, asked)));
+                    either::Either::Right((instance, env)) => {
+                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        let compiled = compiled.as_ref().ok();
+                        if let (Some(compiled), Some(told)) = (compiled, told) {
+                            told.ahead(db, &mut types, compiled);
                         }
+                        compiled
+                    }
+                };
+                for request in compiled.iter().flat_map(|it| &it.requests.funcs) {
+                    let FuncTarget::Instance(callee, asked) = &request.target else {
+                        continue;
+                    };
+                    // A function without generic arguments is a root, called by its
+                    // symbol when rustc compiled it. The thread that puts the caller in
+                    // the object asks for the symbol, and finds it here.
+                    let root = match callee.def {
+                        InstanceDef::Fn(func)
+                            if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
+                        {
+                            symbols.function(func).is_some()
+                        }
+                        _ => false,
+                    };
+                    if !root && !rejected.contains_key(callee) && !in_store(callee) {
+                        found.push((callee.clone(), homes.home(db, callee, asked)));
                     }
                 }
                 drop(working);
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
-                state.done.insert(it.clone());
-                state.fresh.push(it);
+                if let either::Either::Right(it) = job {
+                    state.done.insert(it.clone());
+                    state.fresh.push(it);
+                }
                 for it in found {
                     if state.seen.insert(it.clone()) {
                         state.queue.push(it);
@@ -4947,6 +4980,10 @@ struct FunctionCx<'cx, 'db> {
     builder: FunctionBuilder<'cx>,
     locals: ArenaMap<LocalId, LocalSlot>,
     blocks: ArenaMap<BasicBlockId, ir::Block>,
+    /// The layouts asked for so far: a body asks for that of the same few types many times.
+    layouts: std::cell::RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
+    /// Whether dropping each type asked about so far does anything.
+    glue: std::cell::RefCell<FxHashMap<Ty<'db>, DropGlue>>,
     /// One byte per local with drop glue: whether it currently holds a value. RA's MIR has no
     /// drop elaboration, so `Drop` terminators are conditional on these.
     /// Address of a word per local that needs dropping. Bit 0 says the local holds a value, and
@@ -5166,9 +5203,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(pack) = self.pack(container) else { return Ok(addr) };
         let field = self.normalize(field);
         let layout = self.layout(field)?;
-        if layout.align.abi.bytes() <= pack
-            || has_drop_glue(&self.infcx, field, self.env.param_env) == DropGlue::None
-        {
+        if layout.align.abi.bytes() <= pack || self.glue_of(field) == DropGlue::None {
             return Ok(addr);
         }
         let slot = self.stack_slot(&layout);
@@ -5210,7 +5245,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(self.builder.ins().iadd(addr, offset))
     }
 
+    fn glue_of(&self, ty: Ty<'db>) -> DropGlue {
+        if let Some(glue) = self.glue.borrow().get(&ty) {
+            return *glue;
+        }
+        let glue = has_drop_glue(&self.infcx, ty, self.env.param_env);
+        self.glue.borrow_mut().insert(ty, glue);
+        glue
+    }
+
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
+        if let Some(layout) = self.layouts.borrow().get(&ty) {
+            return Ok(layout.clone());
+        }
         let layout = self
             .cg
             .db
@@ -5219,6 +5266,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(log) = &self.cg.layouts {
             log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));
         }
+        self.layouts.borrow_mut().insert(ty, layout.clone());
         Ok(layout)
     }
 
@@ -6276,8 +6324,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let upvars = args.as_coroutine().tupled_upvars_ty().tuple_fields().len();
                 let held = body.locals_held_across_yields(|local| {
-                    has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
-                        != DropGlue::None
+                    self.glue_of(body.locals[local].ty.as_ref()) != DropGlue::None
                 });
                 let frame = CoroutineFrame { upvars, flags: held.flagged().count() };
                 let addr = self.builder.ins().load(ptr(), MEM, self.locals[receiver].addr, 0);
@@ -6314,8 +6361,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
             let addr = if let Some(&(_, expr)) = promoted
                 && self.is_freeze(data.ty.as_ref())
-                && has_drop_glue(&self.infcx, data.ty.as_ref(), self.env.param_env)
-                    == DropGlue::None
+                && self.glue_of(data.ty.as_ref()) == DropGlue::None
             {
                 match self.promoted_constant(body, expr, layout.size.bytes_usize()) {
                     Some(addr) if layout.size.bytes() != 0 => {
@@ -6341,9 +6387,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut kept_flags = Vec::new();
         for (local, data) in body.locals.iter() {
             let ty = data.ty.as_ref();
-            if local == returned_local(body)
-                || has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None
-            {
+            if local == returned_local(body) || self.glue_of(ty) == DropGlue::None {
                 continue;
             }
             let is_param = body.param_locals.contains(&local);
@@ -7207,7 +7251,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // RA's lowering says `Copy` for moves too; a use of a value that needs dropping
                 // can only be a move.
                 if self.drop_flags.contains_idx(place.local)
-                    && has_drop_glue(&self.infcx, ty.ty, self.env.param_env) != DropGlue::None
+                    && self.glue_of(ty.ty) != DropGlue::None
                 {
                     let flag = self.drop_flags[place.local];
                     let paths = self
@@ -9425,7 +9469,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             .copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..word()]);
         let mut blob =
             ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: word() as u64 };
-        if has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None {
+        if self.glue_of(ty) != DropGlue::None {
             let mut sig = self.cg.make_signature();
             sig.params.push(AbiParam::new(ptr()));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
@@ -10399,7 +10443,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("needs_drop", []) => {
                 let ty = generic_args.type_at(0);
-                let needs = has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None;
+                let needs = self.glue_of(ty) != DropGlue::None;
                 let value = self.builder.ins().iconst(types::I8, i64::from(needs));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
@@ -12004,7 +12048,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Drops the value at `addr` in place.
     fn drop_value(&mut self, addr: Value, meta: Option<Value>, ty: Ty<'db>) -> Result<()> {
         let ty = self.normalize(ty);
-        if has_drop_glue(&self.infcx, ty, self.env.param_env) == DropGlue::None {
+        if self.glue_of(ty) == DropGlue::None {
             return Ok(());
         }
         let mut sig = self.cg.make_signature();
@@ -12428,7 +12472,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn needs_drop(&self, ty: Ty<'db>) -> bool {
         let ty = self.normalize(ty);
-        has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None
+        self.glue_of(ty) != DropGlue::None
     }
 
     /// Runs `drop` for each of `0..count` in turn. If one unwinds the ones after it still run,
