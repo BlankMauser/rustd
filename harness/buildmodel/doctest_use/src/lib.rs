@@ -57,3 +57,10 @@ pub mod n {
 /// assert!(true);
 /// ```
 const _: () = ();
+
+/// An example of attributes alone still has a `main`.
+///
+/// ```
+/// #![allow(dead_code)]
+/// ```
+pub fn attributes_alone() {}
