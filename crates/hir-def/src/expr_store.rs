@@ -19,7 +19,7 @@ use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::{Arena, ArenaMap};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use syntax::{AstPtr, SyntaxNodePtr, ast};
@@ -132,6 +132,9 @@ struct ExpressionOnlyStore {
     /// The edition of each block that a macro wrote: it is the macro's, not the one of the crate
     /// that uses the macro.
     block_editions: FxHashMap<ExprId, Edition>,
+
+    /// The closures written with `#[rustc_inherit_overflow_checks]`.
+    overflow_inheriting: FxHashSet<ExprId>,
 
     /// Maps expression roots to their origin.
     ///
@@ -273,6 +276,9 @@ pub struct ExpressionStoreBuilder {
     block_scopes: Vec<BlockId>,
     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
     block_editions: FxHashMap<ExprId, Edition>,
+
+    /// The closures written with `#[rustc_inherit_overflow_checks]`.
+    overflow_inheriting: FxHashSet<ExprId>,
     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
@@ -358,6 +364,7 @@ impl ExpressionStoreBuilder {
             mut binding_owners,
             mut ident_hygiene,
             mut block_editions,
+            mut overflow_inheriting,
             inference_roots: mut expr_roots,
             mut types,
             mut lifetimes,
@@ -386,6 +393,7 @@ impl ExpressionStoreBuilder {
         binding_owners.shrink_to_fit();
         ident_hygiene.shrink_to_fit();
         block_editions.shrink_to_fit();
+        overflow_inheriting.shrink_to_fit();
         types.shrink_to_fit();
         lifetimes.shrink_to_fit();
 
@@ -431,6 +439,7 @@ impl ExpressionStoreBuilder {
                     block_scopes: block_scopes.into_boxed_slice(),
                     ident_hygiene,
                     block_editions,
+                    overflow_inheriting,
                     expr_roots: expr_roots
                         .expect("should always finish with a `Some(_)` expr_roots"),
                 }))
@@ -887,6 +896,12 @@ impl ExpressionStore {
 
     fn binding_hygiene(&self, binding: BindingId) -> HygieneId {
         self.assert_expr_only().bindings[binding].hygiene
+    }
+
+    /// Whether a closure takes the overflow checks of the crate that compiles it, as a function
+    /// with `#[rustc_inherit_overflow_checks]` does.
+    pub fn inherits_overflow_checks(&self, closure: ExprId) -> bool {
+        self.assert_expr_only().overflow_inheriting.contains(&closure)
     }
 
     /// The edition a block was written in, when a macro wrote it.

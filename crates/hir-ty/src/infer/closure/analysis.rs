@@ -342,6 +342,10 @@ impl<'db> InferenceContext<'db> {
                     panic!();
                 };
                 self.resolver.reset_to_guard(update_guard);
+                if self.store.binding_owner(local_id) == Some(closure_expr_id) {
+                    // `ref x: T` is taken out of a local of the block that holds the argument.
+                    continue;
+                }
                 let place = self.place_for_root_variable(closure_expr_id, local_id);
                 delegate.capture_information.push((
                     place,

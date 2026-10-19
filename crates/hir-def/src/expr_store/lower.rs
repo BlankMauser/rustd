@@ -13,6 +13,7 @@ use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
     HirFileId, InFile, MacroDefId,
+    builtin::MODULE_PATH_PLACEHOLDER,
     mod_path::ModPath,
     name::{AsName, Name},
     span_map::SpanMap,
@@ -1833,6 +1834,12 @@ impl<'db> ExprCollector<'db> {
                         },
                         syntax_ptr,
                     );
+                    let inherits = |attr: ast::Attr| {
+                        attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
+                    };
+                    if ast::HasAttrs::attrs(&e).any(inherits) {
+                        this.store.overflow_inheriting.insert(closure);
+                    }
 
                     (if is_coroutine_closure { body } else { closure }, closure)
                 });
@@ -1902,7 +1909,7 @@ impl<'db> ExprCollector<'db> {
             }
 
             ast::Expr::Literal(e) => {
-                let literal = self.module_path_literal().unwrap_or_else(|| e.kind().into());
+                let literal = self.module_path_literal(&e).unwrap_or_else(|| e.kind().into());
                 self.alloc_expr(Expr::Literal(literal), syntax_ptr)
             }
             ast::Expr::IndexExpr(e) => {
@@ -2633,17 +2640,21 @@ impl<'db> ExprCollector<'db> {
         self.alloc_expr(Expr::Match { expr, arms }, syntax_ptr)
     }
 
-    /// The path of the module being lowered when the literal being lowered is what
-    /// `module_path!()` expanded to, which is a placeholder: the expander doesn't know modules.
-    fn module_path_literal(&self) -> Option<Literal> {
-        let call = self.expander.current_file_id().macro_file()?;
-        let hir_expand::MacroDefKind::BuiltIn(
-            _,
-            hir_expand::builtin::BuiltinFnLikeExpander::ModulePath,
-        ) = call.loc(self.db).def.kind
-        else {
+    /// The literal with the path of the module being lowered where `module_path!()` left its
+    /// placeholder, when the literal has one: alone, or in what `concat!` made of it.
+    fn module_path_literal(&self, literal: &ast::Literal) -> Option<Literal> {
+        self.expander.current_file_id().macro_file()?;
+        let ast::LiteralKind::String(text) = literal.kind() else { return None };
+        let text = text.value().ok()?;
+        if !text.contains(MODULE_PATH_PLACEHOLDER) {
             return None;
-        };
+        }
+        let path = self.module_path()?;
+        Some(Literal::String(Symbol::intern(&text.replace(MODULE_PATH_PLACEHOLDER, &path))))
+    }
+
+    /// The path of the module being lowered, as `module_path!()` gives it.
+    fn module_path(&self) -> Option<String> {
         let mut module = self.module;
         let mut segments = Vec::new();
         while let Some(parent) = module.containing_module(self.db) {
@@ -2656,7 +2667,7 @@ impl<'db> ExprCollector<'db> {
         let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
         segments.push(krate.crate_name().symbol().as_str().to_owned());
         segments.reverse();
-        Some(Literal::String(Symbol::intern(&segments.join("::"))))
+        Some(segments.join("::"))
     }
 
     fn collect_macro_call<T, U>(
@@ -3556,6 +3567,11 @@ impl<'db> ExprCollector<'db> {
     fn expand_macros_to_string(&mut self, expr: ast::Expr) -> Option<(ast::String, bool)> {
         let m = match expr {
             ast::Expr::MacroExpr(m) => m,
+            // An expression a macro was given is in parentheses where the macro puts it.
+            ast::Expr::ParenExpr(inner) => {
+                let (text, _) = self.expand_macros_to_string(inner.expr()?)?;
+                return Some((text, false));
+            }
             ast::Expr::Literal(l) => {
                 return match l.kind() {
                     ast::LiteralKind::String(s) => Some((s, true)),

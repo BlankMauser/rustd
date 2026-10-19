@@ -1323,7 +1323,9 @@ impl<'db> InferenceContext<'db> {
         let count = self.table.try_structurally_resolve_const(count.into(), count_ct);
 
         let uty = match expected {
-            Expectation::HasType(uty) => uty.builtin_index(),
+            Expectation::HasType(uty) => {
+                self.table.resolve_vars_with_obligations(*uty).builtin_index()
+            }
             _ => None,
         };
 

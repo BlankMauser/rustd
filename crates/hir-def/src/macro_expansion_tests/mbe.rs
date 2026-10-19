@@ -1962,6 +1962,33 @@ fn f() {
 }
 
 #[test]
+fn semicolon_after_expression() {
+    check(
+        r#"
+macro_rules! pool {
+    ($value:expr) => {
+        [$value; 2];
+    };
+}
+fn f() {
+    let _ = pool!(0);
+}
+"#,
+        expect![[r#"
+macro_rules! pool {
+    ($value:expr) => {
+        [$value; 2];
+    };
+}
+fn f() {
+    let _ = [0;
+    2];
+}
+"#]],
+    );
+}
+
+#[test]
 fn semicolon_does_not_glue() {
     check(
         r#"

@@ -494,6 +494,10 @@ impl UseTreeLowering<'_> {
             let is_glob = tree.star_token().is_some();
             let path = match tree.path() {
                 Some(path) => Some(ModPath::from_src(self.db, path, span_for_range)?),
+                // `use ::*;` globs the crate root.
+                None if is_glob && tree.coloncolon_token().is_some() => {
+                    Some(ModPath::from_kind(PathKind::Abs))
+                }
                 None => None,
             };
             let alias = tree.rename().map(|a| {

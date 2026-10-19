@@ -3,7 +3,7 @@ use base_db::Env;
 use paths::Utf8Path;
 use rustc_hash::FxHashMap;
 
-use crate::{PackageData, TargetKind, cargo_config_file::CargoConfigFile};
+use crate::{CargoWorkspace, PackageData, TargetKind, cargo_config_file::CargoConfigFile};
 
 /// Recreates the compile-time environment variables that Cargo sets.
 ///
@@ -12,9 +12,6 @@ use crate::{PackageData, TargetKind, cargo_config_file::CargoConfigFile};
 ///
 /// FIXME: ask Cargo to provide this data instead of re-deriving.
 pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
-    // FIXME: Missing variables:
-    // CARGO_BIN_EXE_<name>
-
     let manifest_dir = package.manifest.parent();
     env.set("CARGO_MANIFEST_DIR", manifest_dir.as_str());
     env.set("CARGO_MANIFEST_PATH", package.manifest.as_str());
@@ -44,6 +41,21 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
     env.set("CARGO_PKG_RUST_VERSION", package.rust_version_as_written().unwrap_or_default());
     if package.primary {
         env.set("CARGO_PRIMARY_PACKAGE", "1");
+    }
+}
+
+/// `CARGO_BIN_EXE_<name>` of each executable of the package, which cargo tells its tests and
+/// benchmarks.
+pub(crate) fn inject_cargo_executables_env(
+    env: &mut Env,
+    cargo: &CargoWorkspace,
+    package: &PackageData,
+) {
+    let Some(directory) = cargo.executables() else { return };
+    let executables = package.targets.iter().map(|&target| &cargo[target]);
+    for target in executables.filter(|target| target.kind == TargetKind::Bin) {
+        let path = directory.join(format!("{}{}", target.name, std::env::consts::EXE_SUFFIX));
+        env.set(&format!("CARGO_BIN_EXE_{}", target.name), path.as_str());
     }
 }
 

@@ -1075,6 +1075,9 @@ pub struct MirBody<'db> {
     /// and within a scope the local declared last first. Of two locals that hold a value at
     /// once, the earlier one here is dropped first, also by a landing pad.
     pub scope_ends: Vec<LocalId>,
+    /// The body is written with `#[rustc_inherit_overflow_checks]`: its arithmetic is checked
+    /// when the crate that compiles it checks, whatever the crate it is written in does.
+    pub inherits_overflow_checks: bool,
 }
 
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -1734,6 +1737,7 @@ impl MirBody<'_> {
             coroutine: _,
             unreached,
             scope_ends,
+            inherits_overflow_checks: _,
         } = self;
         unreached.shrink_to_fit();
         scope_ends.shrink_to_fit();

@@ -1065,6 +1065,12 @@ impl RangeItem for ast::RangePat {
     }
 }
 
+/// Whether a token is written between the ends of a range pattern: `..`, `..=`, or the `...`
+/// that editions before 2021 take for `..=`.
+fn is_range_pat_op(kind: SyntaxKind) -> bool {
+    matches!(kind, T![..] | T![..=] | T![...])
+}
+
 impl ast::TokenTree {
     pub fn token_trees_and_tokens(
         &self,
