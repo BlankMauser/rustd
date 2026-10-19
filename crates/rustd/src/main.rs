@@ -140,7 +140,20 @@ impl Args {
 
     /// The crates that are built into the program's object, the one asked for first.
     fn crates(&self) -> impl Iterator<Item = &String> {
-        std::iter::once(&self.krate).chain(&self.batch).chain(&self.widened)
+        let others = self.batch.iter().chain(&self.widened).filter(|it| **it != self.krate);
+        std::iter::once(&self.krate).chain(others)
+    }
+
+    /// Whether `krate`, called `named`, is the build of its source that the program has. Cargo
+    /// builds a library or a binary of the workspace twice for its unit tests: with
+    /// `cfg(test)` as the program of the tests, and without for whatever links it.
+    fn as_built(&self, db: &RootDatabase, krate: Crate, named: &str) -> bool {
+        let krate = ide_db::base_db::Crate::from(krate);
+        let member = matches!(krate.data(db).origin, CrateOrigin::Local { .. });
+        let own = named == self.krate;
+        // What the tests of a library use may use the library: the program then has both.
+        let both = own && self.batch.contains(&self.krate);
+        !member || both || is_tested(db, krate) == own
     }
 
     /// Whether the file is one the checkout is built from. A file of the checkout it shares
@@ -466,7 +479,8 @@ impl Resolver<'_> {
         if ours && !self.table.links(name.crate_name().as_str(), &root) {
             return None;
         }
-        self.table.stable_crate_id(name.crate_name().as_str(), &root)
+        let program = is_tested(self.db, krate.into());
+        self.table.stable_crate_id(name.crate_name().as_str(), &root, program)
     }
 
     /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
@@ -476,7 +490,10 @@ impl Resolver<'_> {
         let name = krate.display_name(self.db)?;
         match self.own_crate_id(krate.into()) {
             Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
-            None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
+            None => {
+                let (root, program) = (self.crate_root(krate)?, is_tested(self.db, krate.into()));
+                self.table.crate_path(name.crate_name().as_str(), &root, program)
+            }
         }
     }
 
@@ -1441,6 +1458,7 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
             }),
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
+        .filter(|it| !args.cfg_test || args.as_built(db, *it, krate))
         .collect()
 }
 
@@ -1461,6 +1479,11 @@ fn crates_to_build(
     let mut called = crates_called(db, krate, args);
     called.retain(linked);
     if called.is_empty() { crates_named(db, krate, args) } else { Ok(called) }
+}
+
+/// Whether the crate is built with `cfg(test)`.
+fn is_tested(db: &RootDatabase, krate: ide_db::base_db::Crate) -> bool {
+    krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test))
 }
 
 /// Whether the text of the path of the crate's root file ends with `end`.
@@ -5900,7 +5923,16 @@ impl Program {
             .flatten()
             .map(Into::into)
             .collect();
-        let used: FxHashSet<_> = built.iter().flat_map(|it| it.transitive_deps(db)).collect();
+        // A crate cargo names to rustc and the program never mentions is not linked: nothing
+        // of the program changes with it.
+        let linked = |krate: &ide_db::base_db::Crate| {
+            let name = krate.extra_data(db).display_name.as_ref();
+            let root = crate_root_file(db, (*krate).into());
+            name.zip(root)
+                .is_some_and(|(name, root)| self.table.links(name.crate_name().as_str(), &root))
+        };
+        let used = built.iter().flat_map(|it| it.transitive_deps(db)).filter(linked);
+        let used: FxHashSet<_> = used.collect();
         let edited: Vec<_> = self
             .unbuilt
             .edited

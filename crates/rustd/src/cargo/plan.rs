@@ -54,12 +54,6 @@ pub(crate) struct Plan {
     /// The command that links `binary`, for a shell.
     pub(crate) link_cmd: String,
     pub(crate) symbol_files: Vec<PathBuf>,
-    /// Whether the program's own crate is compiled with `cfg(test)` and is not a test target:
-    /// the unit tests of a library or a binary.
-    pub(crate) unit_test: bool,
-    /// Source rustc compiled into the program that rustd does not: a change to one of these
-    /// is cargo's to build.
-    pub(crate) left_to_rustc: Vec<PathBuf>,
     /// The copies of rustc's output the plan names, which have to stay.
     pub(crate) copies: Vec<PathBuf>,
     /// The package rustc wrote of what a debugger reads of the program it linked, when the
@@ -203,8 +197,6 @@ impl Plan {
             binary: dir.join("bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             package: (unit.codegen("split-debuginfo") == Some("packed"))
                 .then(|| link.output().map(|it| package::beside(Path::new(it))))
@@ -226,14 +218,7 @@ impl Plan {
             plan.copies.push(copy.to_owned());
             plan.stamp = plan.stamp.max(owner.stamp);
             *arg = copy.display().to_string();
-            if member.is_none() {
-                continue;
-            }
-            // With `cfg(test)` the daemon has it on every crate of the workspace, and rustc
-            // built the libraries of a unit test without it.
-            if unit_test {
-                plan.left_to_rustc.extend(owner.inputs().files);
-            } else {
+            if member.is_some() {
                 plan.crates.push(owner.source.clone());
             }
         }
@@ -656,8 +641,6 @@ mod tests {
             binary: PathBuf::from("P:/bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test: false,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             stamp: 0,
             package: None,
@@ -704,8 +687,6 @@ mod tests {
             binary: PathBuf::from("/p/bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test: false,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             package: None,
             stamp: 0,
