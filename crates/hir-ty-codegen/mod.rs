@@ -3105,9 +3105,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .map_err(CodegenError::Backend)?,
             None => Vec::new(),
         };
-        // Freeing every type told of takes as long as writing the object.
+        // Freeing every type told of takes as long as writing the object: another thread does
+        // it, where there is one to start.
         let told = std::mem::take(&mut self.told);
-        std::thread::spawn(move || drop(told));
+        if cfg!(target_family = "wasm") {
+            drop(told);
+        } else {
+            std::thread::spawn(move || drop(told));
+        }
         let object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
         Ok((object, apart))
     }
