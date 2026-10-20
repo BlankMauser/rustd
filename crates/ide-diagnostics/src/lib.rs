@@ -721,6 +721,33 @@ fn handle_lints(
     }
 }
 
+/// The level the `allow`, `warn`, `deny`, `forbid` and `expect` around `node` give the clippy
+/// lint `name`, which is a warning unless told otherwise when `warned`. `None` when none
+/// names it, its groups, `clippy::all` or (when `warned`) `warnings`.
+pub fn clippy_lint_attribute(
+    db: &RootDatabase,
+    file_id: FileId,
+    node: &InFile<SyntaxNode>,
+    name: &'static str,
+    warned: bool,
+) -> Option<Severity> {
+    let mut groups = CLIPPY_LINTS.get(name)?.groups.clone();
+    groups.push("clippy::all".into());
+    let groups = LintGroups { groups, inside_warnings: warned };
+    let sema = Semantics::new(db);
+    let krate = sema.file_to_module_def(file_id)?.krate(db);
+    let outline = node.value.ancestors().find_map(ast::Module::cast).and_then(|module| {
+        if module.item_list().is_some() {
+            return None;
+        }
+        let source = sema.module_definition_node(sema.to_module_def(&module)?);
+        let attrs = ast::AnyHasAttrs::cast(source.value)?;
+        lint_attrs(&sema, file_id, krate, attrs)
+            .find_map(|(lint, severity)| groups.contains(&lint).then_some(severity))
+    });
+    outline.or_else(|| lint_severity_at(&sema, file_id, krate, node, &groups))
+}
+
 fn default_lint_severity(lint: &Lint, edition: Edition) -> Severity {
     if lint.deny_since.is_some_and(|e| edition >= e) {
         Severity::Error
