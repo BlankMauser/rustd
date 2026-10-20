@@ -695,6 +695,7 @@ mod tests {
     #[test] fn tb() { assert_eq!(super::b(), 2); }
     #[test] fn h1() { assert!(super::hit() >= 1); }
     #[test] fn h2() { assert!(super::hit() >= 1); }
+    #[test] #[should_panic] fn tp() { assert_eq!(super::b(), 3); }
 }
 """
 
@@ -710,31 +711,33 @@ def incremental(work):
     side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
     checks = []
 
-    def check(name, cached, *args, env=None, listed=4):
+    def check(name, cached, *args, env=None, listed=5):
         """That the tests in `cached` are the ones listed as cached, and all others ran."""
         _, ran = side.cargo("test", *args, env=env)
-        results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        results = dict(re.findall(r"^test tests::(\w+)(?: - should panic)? \.\.\. (.+)$", ran.stdout, re.M))
         found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
         held = ran.returncode == 0 and found == sorted(cached) and len(results) == listed
+        # Cached or not, a test is named as libtest names it.
+        held = held and ("tp" not in results or "test tests::tp - should panic ... " in ran.stdout)
         checks.append((f"incremental: {name}", held, f"cached {found}"))
         print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}", flush=True)
 
-    every = ["h1", "h2", "ta", "tb"]
+    every = ["h1", "h2", "ta", "tb", "tp"]
     check("the first run runs every test", [])
     check("a run with nothing changed runs none", every)
     edited = INCREMENTAL_LIB.replace("{ A }", "{ A.min(5) }")
     open(lib, "w").write(edited)
-    check("an edit runs the test that reaches it", ["h1", "h2", "tb"])
+    check("an edit runs the test that reaches it", ["h1", "h2", "tb", "tp"])
     open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
-    check("an edit of what writes a static runs every test that writes it", ["ta", "tb"])
+    check("an edit of what writes a static runs every test that writes it", ["ta", "tb", "tp"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
     check("a filter lists the cached test", ["tb"], "tb", listed=1)
     open(os.path.join(ws, "data.txt"), "w").write("x")
     check("a new file in the package runs every test", [])
     check("the environment runs every test", [], env={"INCREMENTAL_ANY": "1"})
-    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=2)
-    check("--skip is kept when tests are cached", ["ta", "tb"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=2)
+    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=3)
+    check("--skip is kept when tests are cached", ["ta", "tb", "tp"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=3)
     check("--exact is kept when no test is cached", [], "--", "--exact", "tests::h1", env={"INCREMENTAL_ANY": "3"}, listed=1)
     side.cargo("stop")
     return checks

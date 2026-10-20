@@ -54,6 +54,8 @@ struct Passed {
     /// A print of the tests it shares a writable static with that ran in its process.
     company: String,
     ignored: bool,
+    /// The test as the harness names it in its result: `a - should panic` for one.
+    shown: String,
 }
 
 /// What the worker said of a test: the print of what it can run, when all of it is
@@ -137,7 +139,7 @@ impl<'a> Selective<'a> {
             let passed = results.tests.get(name)?;
             let same = Some(&passed.print) == reach.print.as_ref()
                 && passed.company == company[&reach.group];
-            same.then_some(passed.ignored)
+            same.then_some(passed)
         };
         // One test of a group that has to run has all of them run: they ran together.
         let stale: BTreeSet<usize> = named
@@ -153,15 +155,16 @@ impl<'a> Selective<'a> {
             named.iter().partition(|it| cached(it).is_some());
         println!("\nrunning {} tests", named.len());
         let (mut passed, mut ignored) = (0, 0);
-        for name in &kept {
-            match cached(name) {
-                Some(true) => {
+        for passed_before in kept.iter().filter_map(|it| cached(it)) {
+            let shown = &passed_before.shown;
+            match passed_before.ignored {
+                true => {
                     ignored += 1;
-                    println!("test {name} ... ignored (cached)");
+                    println!("test {shown} ... ignored (cached)");
                 }
-                _ => {
+                false => {
                     passed += 1;
-                    println!("test {name} ... ok (cached)");
+                    println!("test {shown} ... ok (cached)");
                 }
             }
         }
@@ -181,11 +184,11 @@ impl<'a> Selective<'a> {
         command.stdout(Stdio::piped());
         let mut child = command.spawn().context("running the tests")?;
         let lines = BufReader::new(child.stdout.take().context("the tests have no output")?);
-        let mut seen: BTreeMap<String, Option<bool>> = BTreeMap::new();
+        let mut seen: BTreeMap<String, (String, Option<bool>)> = BTreeMap::new();
         for line in lines.lines() {
             let line = line?;
-            if let Some((name, outcome)) = outcome(&line) {
-                seen.insert(name.to_owned(), outcome);
+            if let Some((name, shown, outcome)) = outcome(&line) {
+                seen.insert(name.to_owned(), (shown.to_owned(), outcome));
             }
             match cached.rewritten(&line) {
                 Some(line) => println!("{line}"),
@@ -196,10 +199,10 @@ impl<'a> Selective<'a> {
         }
         let status = child.wait()?;
         for name in &run {
-            let entry = seen.get(name.as_str()).copied().flatten().and_then(|ignored| {
+            let entry = seen.get(name.as_str()).and_then(|(shown, outcome)| {
                 let reach = self.reached.get(*name)?;
                 let (print, company) = (reach.print.clone()?, company[&reach.group].clone());
-                Some(Passed { print, company, ignored })
+                Some(Passed { print, company, ignored: (*outcome)?, shown: shown.clone() })
             });
             match entry {
                 Some(entry) => results.tests.insert((*name).clone(), entry),
@@ -292,17 +295,17 @@ impl Tally {
     }
 }
 
-/// The test a line of the harness is the result of, and whether it was ignored: `None`
-/// for one that did not pass.
-fn outcome(line: &str) -> Option<(&str, Option<bool>)> {
-    let (name, result) = line.strip_prefix("test ")?.rsplit_once(" ... ")?;
-    let name = name.strip_suffix(" - should panic").unwrap_or(name);
+/// The test a line of the harness is the result of, as listed and as shown, and whether it
+/// was ignored: `None` for one that did not pass.
+fn outcome(line: &str) -> Option<(&str, &str, Option<bool>)> {
+    let (shown, result) = line.strip_prefix("test ")?.rsplit_once(" ... ")?;
+    let name = shown.strip_suffix(" - should panic").unwrap_or(shown);
     let outcome = match result {
         "ok" => Some(false),
         _ if result == "ignored" || result.starts_with("ignored, ") => Some(true),
         _ => None,
     };
-    Some((name, outcome))
+    Some((name, shown, outcome))
 }
 
 /// The flags `asked` gives the harness, when each is one of [`KNOWN_FLAGS`].
@@ -407,10 +410,11 @@ mod tests {
 
     #[test]
     fn reads_the_harness() {
-        assert_eq!(outcome("test a::b ... ok"), Some(("a::b", Some(false))));
-        assert_eq!(outcome("test a::b ... ignored, slow"), Some(("a::b", Some(true))));
-        assert_eq!(outcome("test a - should panic ... ok"), Some(("a", Some(false))));
-        assert_eq!(outcome("test a::b ... FAILED"), Some(("a::b", None)));
+        assert_eq!(outcome("test a::b ... ok"), Some(("a::b", "a::b", Some(false))));
+        assert_eq!(outcome("test a::b ... ignored, slow"), Some(("a::b", "a::b", Some(true))));
+        let should_panic = outcome("test a - should panic ... ok");
+        assert_eq!(should_panic, Some(("a", "a - should panic", Some(false))));
+        assert_eq!(outcome("test a::b ... FAILED"), Some(("a::b", "a::b", None)));
         assert_eq!(outcome("test result: ok. 1 passed"), None);
     }
 
