@@ -306,11 +306,15 @@ impl Worker {
         args.push("--symbols-in".into());
         args.push(symbols.into());
         let mut env = crate::process::own();
-        for (name, value) in &config.env {
+        // What the build tells its programs of where it puts them, which `env!` reads as
+        // the first build compiles them.
+        let told_env: BTreeMap<String, String> =
+            config.env.iter().chain(&checkout.env).map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (name, value) in &told_env {
             env.set(name, value);
         }
         env.set(ENDS_WITH_INPUT, "1");
-        let told = spare.and_then(|it| it.told(&args, &checkout.config, &checkout.root, false));
+        let told = spare.and_then(|it| it.told(&args, &told_env, &checkout.root, false));
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -325,7 +329,7 @@ impl Worker {
                 };
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-                command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.envs(&told_env).env(ENDS_WITH_INPUT, "1");
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 command.spawn().context("starting a worker")?
@@ -538,15 +542,14 @@ impl Spare {
     fn told(
         mut self,
         args: &[OsString],
-        config: &WorkerConfig,
+        env: &BTreeMap<String, String>,
         cwd: &Path,
         ahead: bool,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told =
-                crate::Told { args: args?, env: config.env.clone(), cwd: cwd.to_owned(), ahead };
+            let told = crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -907,7 +910,7 @@ impl Daemon {
         let Some(spare) = lock(&self.spare).take() else { return };
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
         args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config, &ahead.root, true)
+        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
             && let Some(mut other) = lock(&self.ahead).insert(id, spare)
         {
             other.stop();
