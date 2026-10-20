@@ -10,13 +10,13 @@ are what carries the weight.
 
 ## Running them
 
-You need Python 3, Rust 1.99.0 with `rust-src`, a C compiler and linker, and a release build
+You need Python 3, Rust 1.99.1 with `rust-src`, a C compiler and linker, and a release build
 of rustd. Some harnesses need more: `debuginfo.py` needs gdb and `llvm-dwarfdump`,
 `buildmodel.py` needs the `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl`
 targets with their cross tools and qemu, `remote.py` needs a MinIO or SeaweedFS binary,
 `storefull.py` needs passwordless `sudo` to mount a tmpfs.
 
-    cargo +1.99.0 build -p rustd --release
+    cargo +1.99.1 build -p rustd --release
     cd harness
     export RUSTD_BIN=$PWD/../target/release/rustd
 
@@ -67,7 +67,7 @@ Cranelift is the default. Either leave `RUSTD_BACKEND` unset or set it:
 Build with the `llvm` feature against LLVM 20, then select the backend. The gate is run at
 `-O2` with fast instruction selection, and that is the only LLVM configuration it covers.
 
-    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.0 build -p rustd --release --features llvm
+    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.1 build -p rustd --release --features llvm
     export RUSTD_BACKEND=llvm RUSTD_OPT=2 RUSTD_EMIT=fast
 
 A binary built with `--features llvm` still uses Cranelift unless `RUSTD_BACKEND=llvm` is

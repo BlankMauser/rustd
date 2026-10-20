@@ -45,7 +45,7 @@ records which commit of that branch it builds with, as git does for any submodul
 After cloning:
 
     git clone --recursive https://github.com/DioxusLabs/rustd
-    cargo +1.99.0 build -p rustd --release
+    cargo +1.99.1 build -p rustd --release
 
 or `git submodule update --init` in a clone made without `--recursive`. There is nothing
 else to run. After a pull that moves the submodule, `git submodule update` again.
@@ -93,8 +93,8 @@ exercised.
 with rustd's changes made in place. That branch and its history are kept as
 `rustd-collate` and `rustd-spike`. `publish/split.py` there is what wrote this layout.
 
-The toolchain is a separate pin. rustd is built for Rust 1.99.0 and `vendor/rustc_abi` is
-rustc's crate from that tag. Moving to another Rust version means taking the new
+The toolchain is a separate pin. rustd is built for Rust 1.99.1 and `vendor/rustc_abi` is
+rustc's crate from the 1.99.0 tag, which 1.99.1 did not change. Moving to another Rust version means taking the new
 `rustc_abi`, rechecking everything that mirrors rustc (the Rust ABI in the code generator,
 `vtable.rs`, `type_id.rs`, symbol names in `symbols.rs`), and running rustc's own test
 suites through `uitest.py` and `libsuite.py` again.

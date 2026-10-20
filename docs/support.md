@@ -12,10 +12,14 @@ will build without fallbacks.
 
 ## Toolchain
 
-Rust 1.99.0 only. rustd links against what rustc built, so it must agree with that rustc on
+Rust 1.99.1 only. rustd links against what rustc built, so it must agree with that rustc on
 symbol mangling, type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes. The
-layout code is rustc's own `rustc_abi` crate from the 1.99.0 tag. Nothing has been run on
-another stable version. Some reports were measured on `nightly-2026-05-10` before the move
+layout code is rustc's own `rustc_abi` crate from the 1.99.0 tag, which 1.99.1 left as it
+was. Of the compiler 1.99.1 changed only how the System V x86-64 C ABI returns a `bool`
+(rustc now zero-extends it to eight bits, as the psABI asks; rustd always returned it
+extended to 32), and its standard library only `wcslen` in `compiler_builtins`. Most
+results in these documents were measured on 1.99.0. Nothing has been run on another stable
+version. Some reports were measured on `nightly-2026-05-10` before the move
 to stable; those are marked where they are used.
 
 ## Platforms

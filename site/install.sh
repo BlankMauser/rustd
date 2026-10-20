@@ -11,7 +11,7 @@ set -eu
 repo=https://github.com/DioxusLabs/rustd
 version=${RUSTD_VERSION:-latest}
 dir=${RUSTD_INSTALL_DIR:-${CARGO_HOME:-$HOME/.cargo}/bin}
-toolchain=1.99.0
+toolchain=1.99.1
 
 say() { printf 'rustd: %s\n' "$*" >&2; }
 fail() { say "$*"; exit 1; }

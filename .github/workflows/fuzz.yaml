@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - run: rustup toolchain install 1.99.1 --profile minimal -c rust-src && rustup default 1.99.1
       - name: LLVM 20
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20

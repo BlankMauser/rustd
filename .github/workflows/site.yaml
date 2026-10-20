@@ -40,8 +40,8 @@ jobs:
       - name: Playground toolchain
         run: |
           git submodule update --init --depth 1 vendor/rust-analyzer
-          rustup toolchain install 1.99.0 --profile minimal -c rust-src -t wasm32-unknown-unknown
-          rustup default 1.99.0
+          rustup toolchain install 1.99.1 --profile minimal -c rust-src -t wasm32-unknown-unknown
+          rustup default 1.99.1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-provider: "warpbuild"

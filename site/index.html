@@ -68,7 +68,7 @@ that changed and links them into the program rustc already built.</p>
     <button role="tab" id="tab-windows" aria-selected="false" aria-controls="command" type="button">Windows</button>
   </div>
   <pre><code id="command">curl -fsSL https://dioxuslabs.github.io/rustd/install.sh | sh</code><button id="copy" type="button">Copy</button></pre>
-  <small>Then <code>cargo rustd run</code> in a workspace. Needs Rust 1.99.0 with
+  <small>Then <code>cargo rustd run</code> in a workspace. Needs Rust 1.99.1 with
   <code>rust-src</code>; <a href="#install">the details</a>.</small>
 </div>
 
@@ -114,7 +114,7 @@ another machine.</p>
 
 <p class="note">This is a prototype, published for the first time. rustc still does the first
 build, rustd has no diagnostics and no borrow checker of its own, and it is pinned to Rust
-1.99.0. Read the <a href="https://github.com/DioxusLabs/rustd#status">Status section</a> before
+1.99.1. Read the <a href="https://github.com/DioxusLabs/rustd#status">Status section</a> before
 relying on it.</p>
 
 <h2 id="install">Install</h2>
@@ -126,7 +126,7 @@ relying on it.</p>
 check it against the release's SHA-256 sums and put <code>rustd</code>, <code>cargo-rustd</code>
 and <code>rustd-rustc</code> in <code>~/.cargo/bin</code>. Set <code>RUSTD_VERSION=nightly</code>
 for the newest build of <code>main</code>. rustd also needs the toolchain it is pinned to:</p>
-<pre><code>rustup toolchain install 1.99.0 --component rust-src</code></pre>
+<pre><code>rustup toolchain install 1.99.1 --component rust-src</code></pre>
 <p>On macOS and Windows the daemon runs and is tested, but <code>cargo rustd</code> does not
 link programs there yet, so every build is handed to cargo with a line saying so. Linux is where
 the numbers below come from.</p>
@@ -134,7 +134,7 @@ the numbers below come from.</p>
 is <a href="https://github.com/DioxusLabs/rustd#build-from-source">built from source</a>.</p>
 
 <h2 id="use">Use</h2>
-<p>There are two ways in. The first is a cargo subcommand, in any project built with 1.99.0:</p>
+<p>There are two ways in. The first is a cargo subcommand, in any project built with 1.99.1:</p>
 <pre><code>cargo rustd build
 cargo rustd run -- --some-flag
 cargo rustd test
