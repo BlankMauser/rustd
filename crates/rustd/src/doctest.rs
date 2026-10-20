@@ -247,7 +247,13 @@ fn verdict(it: &Written, errors: &[&(String, String)]) -> How {
                 )),
             }
         }
-        _ if errors.is_empty() => it.entry.how.clone(),
+        // An example that is to compile fails on the errors rust-analyzer is sure of alone.
+        _ if !errors
+            .iter()
+            .any(|(code, _)| crate::SURE.contains(&&**code) || code == "syntax-error") =>
+        {
+            it.entry.how.clone()
+        }
         How::Runs { .. } | How::Passed => {
             How::Failed(format!("{}Couldn't compile the test.", said()))
         }
