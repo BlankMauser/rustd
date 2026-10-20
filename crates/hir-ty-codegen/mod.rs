@@ -97,6 +97,8 @@ mod debuginfo;
 pub use debuginfo::Sidecar;
 mod float_pair;
 mod fragment;
+mod reach;
+pub use reach::{Reached, reached};
 #[cfg(test)]
 mod fuzz;
 mod home;

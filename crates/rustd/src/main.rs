@@ -2742,6 +2742,9 @@ fn build(
         replace(path, patch)?;
     }
     if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
+        // What each test can run, for the client to run only the ones an edit can change.
+        Reached::of(db, listed, args).write(&args.out)?;
+        Reached::publish(&args.out)?;
         let text = hir::attach_db(db, || harness_of(db, &resolver, &programs_own))
             .map_err(anyhow::Error::msg)?;
         // A splice adds the edit to the executable and leaves the harness as it was linked.
@@ -3797,9 +3800,8 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
 struct Tests(Vec<(String, String)>);
 
 impl Tests {
-    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Tests {
-        use hir::HasSource as _;
-        use syntax::ast::HasAttrs as _;
+    /// The tests of the program's own crate, each under the name the harness has for it.
+    fn named(db: &RootDatabase, listed: &Listed, args: &Args) -> Vec<(FunctionId, String)> {
         let crates = crates_named(db, &args.krate, args).unwrap_or_default();
         let mut tests = Vec::new();
         for krate in crates {
@@ -3816,13 +3818,23 @@ impl Tests {
                     .filter_map(|it| Some(it.name(db)?.as_str().to_owned()))
                     .collect();
                 path.push(function.name(db).as_str().to_owned());
-                let attrs = function.source(db).map(|it| {
-                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
-                    attrs.collect::<Vec<_>>().join(" ")
-                });
-                tests.push((path.join("::"), attrs.unwrap_or_default()));
+                tests.push((id, path.join("::")));
             }
         }
+        tests
+    }
+
+    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Tests {
+        use hir::HasSource as _;
+        use syntax::ast::HasAttrs as _;
+        let tests = Tests::named(db, listed, args).into_iter().map(|(id, path)| {
+            let attrs = hir::Function::from(id).source(db).map(|it| {
+                let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+                attrs.collect::<Vec<_>>().join(" ")
+            });
+            (path, attrs.unwrap_or_default())
+        });
+        let mut tests: Vec<_> = tests.collect();
         tests.sort();
         Tests(tests)
     }
@@ -6227,5 +6239,71 @@ mod tests {
         assert!(held.is_poisoned());
         *lock(&held) += 1;
         assert_eq!(*lock(&held), 2);
+    }
+}
+
+impl Tests {
+    /// What each test of the program can run, as lines for the client that decides which
+    /// of them to run: `test <print> <group> <name>`, and for a program with a `main`,
+    /// `program <print>`. A print of `-` is of code that is not all known.
+    fn reached(db: &RootDatabase, listed: &Listed, args: &Args) -> String {
+        use std::fmt::Write as _;
+        let (mut always, mut kept, mut main) = (Vec::new(), Vec::new(), None);
+        let mut edited = FxHashSet::default();
+        for (at, krate) in args.crates().enumerate() {
+            for krate in crates_named(db, krate, args).unwrap_or_default() {
+                edited.insert(krate.into());
+                let listed = listed.of(db, krate);
+                let exported = std::iter::zip(&listed.functions, &listed.exported);
+                always.extend(exported.filter(|it| *it.1).map(|it| *it.0));
+                kept.extend(&listed.kept);
+                if at == 0 && !args.cfg_test {
+                    main = main.or(listed.main);
+                }
+            }
+        }
+        let tests = Tests::named(db, listed, args);
+        let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).chain(main).collect();
+        let (reached, _, unknown) =
+            hir_ty::mir::codegen::reached(db, edited, &roots, &always, &kept);
+        if !unknown.is_empty() {
+            eprintln!("reached: not known: {}", unknown.join("; "));
+        }
+        let print = |it: Option<u128>| it.map_or("-".to_owned(), |it| format!("{it:032x}"));
+        let mut lines = String::new();
+        for ((_, name), reached) in std::iter::zip(&tests, &reached) {
+            let _ = writeln!(lines, "test {} {} {name}", print(reached.print), reached.group);
+        }
+        if main.is_some() {
+            let _ = writeln!(lines, "program {}", print(reached.last().and_then(|it| it.print)));
+        }
+        lines
+    }
+}
+
+/// What each test of a program can run, as [`Tests::reached`] writes it.
+struct Reached(String);
+
+impl Reached {
+    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Reached {
+        Reached(hir::attach_db(db, || Tests::reached(db, listed, args)))
+    }
+
+    fn path(object: &Path, suffix: &str) -> PathBuf {
+        let mut name = object.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// Writes it beside `object` as what the next executable linked from it runs.
+    fn write(&self, object: &Path) -> std::io::Result<()> {
+        std::fs::write(Reached::path(object, ".reached.next"), &self.0)
+    }
+
+    /// Has what was written beside `object` be of the executable that was just linked
+    /// from it: a client believes the file that is newer than the executable.
+    fn publish(object: &Path) -> std::io::Result<()> {
+        let next = std::fs::read(Reached::path(object, ".reached.next"))?;
+        std::fs::write(Reached::path(object, ".reached"), next)
     }
 }
