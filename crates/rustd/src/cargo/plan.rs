@@ -17,6 +17,10 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 /// What Apple's linker is told so that a splice has room in the header for its two segments.
 const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
 
+/// And for the tables of the unwinder to grow into, where the loader looks for them.
+const ROOM_FOR_TABLES: &str = "-Wl,-sectcreate,__TEXT,__rustd_room,";
+const ROOM_FOR_TABLES_LEN: usize = 0x10000;
+
 /// The same for `link.exe`, which warns of every name it does so for unless told not to.
 const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
 
@@ -403,11 +407,15 @@ impl LinkLine {
         binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
-        let flag = match self.flavor {
-            Flavor::Apple => ROOM_FOR_SEGMENTS,
-            _ => FIRST_DEFINITION_STAYS,
+        let flags = match self.flavor {
+            Flavor::Apple => {
+                let room = response.with_file_name("rustd.room");
+                std::fs::write(&room, vec![0; ROOM_FOR_TABLES_LEN])?;
+                vec![ROOM_FOR_SEGMENTS.to_owned(), format!("{ROOM_FOR_TABLES}{}", room.display())]
+            }
+            _ => vec![FIRST_DEFINITION_STAYS.to_owned()],
         };
-        self.args.splice(first..first, ours.into_iter().chain([flag.to_owned()]));
+        self.args.splice(first..first, ours.into_iter().chain(flags));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
@@ -595,6 +603,7 @@ mod tests {
             [
                 "/p/rustd.o",
                 ROOM_FOR_SEGMENTS,
+                &format!("{ROOM_FOR_TABLES}{}", dir.join("rustd.room").display()),
                 &weak.display().to_string(),
                 "/t/libstd-3.rlib",
                 "-arch",
