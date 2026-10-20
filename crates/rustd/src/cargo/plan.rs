@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use super::{package, units::Record};
@@ -104,9 +105,12 @@ impl Harness {
     }
 
     /// Plans the harness of the test executable rustc was asked for by `unit`, with its
-    /// files in `dir`.
-    fn plan(unit: &Record, dir: &Path) -> Harness {
-        let mut args = vec!["--test".to_owned(), "--cap-lints=allow".to_owned()];
+    /// files in `dir`: libtest's when `test`, and otherwise a program's own `main`.
+    fn plan(unit: &Record, dir: &Path, test: bool) -> Harness {
+        let mut args = vec!["--cap-lints=allow".to_owned()];
+        if test {
+            args.push("--test".to_owned());
+        }
         let mut given = unit.args.iter();
         while let Some(arg) = given.next() {
             match arg.as_str() {
@@ -170,11 +174,14 @@ fn member_that_wrote<'a>(records: &'a [Record], file: &Path) -> Option<&'a Recor
 
 impl Plan {
     /// Plans the program `unit` built, with the daemon's files for it in `dir`. `records` are
-    /// the units of the workspace. `Err` is why the program is left to cargo.
+    /// the units of the workspace. With `examples`, the root of the crate of the examples of
+    /// the library `unit` tests, the program is the examples', linked as the unit tests are.
+    /// `Err` is why the program is left to cargo.
     pub(crate) fn of(
         unit: &Record,
         records: &[Record],
         dir: &Path,
+        examples: Option<&Path>,
     ) -> anyhow::Result<Result<Plan, String>> {
         if let Some(why) = unsupported(unit) {
             return Ok(Err(why));
@@ -218,13 +225,19 @@ impl Plan {
                 plan.crates.push(owner.source.clone());
             }
         }
+        // The library the examples are of is linked as built, and its tests may link it too.
+        if let Some(examples) = examples {
+            plan.crates.insert(0, examples.to_owned());
+            let mut seen = FxHashSet::default();
+            plan.crates.retain(|it| seen.insert(it.clone()));
+        }
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
         link.give_way(&plan.copies)?;
         let mut ahead = vec![&*plan.patch, &*plan.object];
         // The tests of an integration test are the daemon's, and so is the harness that runs
         // them: its `main` comes ahead of the one rustc wrote for none.
-        let harness = unit.is_test().then(|| Harness::plan(unit, dir));
+        let harness = unit.is_test().then(|| Harness::plan(unit, dir, examples.is_none()));
         let beside = Harness::beside(&plan.object);
         match &harness {
             Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
@@ -335,11 +348,6 @@ impl LinkLine {
     fn output(&self) -> Option<&str> {
         let at = self.args.iter().position(|it| it == "-o")?;
         self.args.get(at + 1).map(|it| &**it)
-    }
-
-    /// Whether `file` is one of what is linked.
-    pub(crate) fn has(&self, file: &str) -> bool {
-        self.args.iter().any(|it| it == file)
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.

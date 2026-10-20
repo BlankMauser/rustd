@@ -35,7 +35,6 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     let code = match asked {
         Asked::Build(asked) => match asked.unbuilt() {
-            None if asked.flags.doc => run::only_doc_tests(&asked.typed)?,
             Some(why) => {
                 say::error(&why);
                 FAILED
@@ -273,15 +272,16 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
             }
         },
         Subcommand::Test if asked.flags.no_run => Ok(0),
+        Subcommand::Test if asked.flags.doc => run::doc_tests(asked, state),
         Subcommand::Test => {
             let code = run::tests(asked, state, cwd)?;
             let stopped = code != 0 && !asked.flags.no_fail_fast;
             // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
             let picked = asked.flags.selects_targets || !asked.positional.is_empty();
-            if stopped || picked || !state.doc_tests {
+            if stopped || picked {
                 return Ok(code);
             }
-            Ok(code.max(run::doc_tests(asked)?))
+            Ok(code.max(run::doc_tests(asked, state)?))
         }
     }
 }

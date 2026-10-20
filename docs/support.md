@@ -192,7 +192,7 @@ which 92 were supported and 5 refused.
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by rustd | served; the proc-macro crate itself is rustc's, and an edit to it has cargo rebuild it before the daemon reloads |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; the script is rustc's, and a change to it or its inputs has cargo run it again before the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | examples served; tests and benches fail the build (`--doc` aside) |
-| doctests | supported through `cargo rustd test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example rustd cannot build is left to rustdoc with the reason |
+| doctests | supported through `cargo rustd test --doc` and `cargo rustd test` | served: the examples of a library are one crate of the daemon's; an example that needs a crate of its own, a `compile_fail` one rust-analyzer finds no error in, and the examples of a proc macro fail with the reason |
 | features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` unverified |
 | path, git, registry, renamed, vendored, `[patch]` and `[replace]` dependencies | supported | served |
 | an edit to a path dependency the daemon was not asked to build | refused with a reason | fails the build |

@@ -12,7 +12,7 @@ use super::{
     cli::Invocation,
     say,
     select::Selective,
-    state::{Kind, Program, State, as_built, as_staged, cargo_path},
+    state::{Kind, Program, State, as_staged},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -84,31 +84,39 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
     }
 }
 
-/// Runs the doc tests with cargo, which hands them to rustd in rustdoc's place: rustd
-/// builds each example as its own program over its code of the library.
-pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
-    let mut args = vec!["--doc".to_owned()];
-    args.extend(asked.build_args.iter().cloned());
-    if asked.flags.no_fail_fast {
-        args.push("--no-fail-fast".to_owned());
+/// Runs the examples of the libraries whose doc tests cargo runs, a library after another,
+/// and stops at the first that fails unless told not to. The result is cargo's exit status.
+pub(crate) fn doc_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
+    let mut failed = Vec::new();
+    for why in &state.unrun_doc_tests {
+        say::error(why);
+        failed.push(None);
     }
-    args.extend(asked.positional.iter().cloned());
-    args.push("--".to_owned());
-    args.extend(asked.trailing.iter().cloned());
-    only_doc_tests(&args)
-}
-
-/// Runs `cargo test` with `args`, which ask for the doc tests alone, with rustd in
-/// rustdoc's place.
-pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
-    let rustdoc = std::env::var_os("RUSTDOC").unwrap_or_else(|| "rustdoc".into());
-    let mut cargo = crate::doctest::as_asked(cargo_path());
-    cargo
-        .env("RUSTDOC", std::env::current_exe().context("finding rustd itself")?)
-        .env(crate::doctest::ENABLED, rustdoc);
-    cargo.arg("test").args(args);
-    as_built(&mut cargo)?;
-    Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
+    for library in state.programs.iter().filter(|it| it.kind == Kind::Doc) {
+        if !failed.is_empty() && !asked.flags.no_fail_fast {
+            break;
+        }
+        say::status(asked.flags.quiet, "Doc-tests", &library.name.replace('-', "_"));
+        let args: Vec<String> = asked.program_args().cloned().collect();
+        let code = crate::doctest::run(
+            &library.executable,
+            &library.package_dir,
+            &library.env,
+            &state.root,
+            &args,
+        )?;
+        if code != 0 {
+            failed.push(Some(rerun_flags(library)));
+        }
+    }
+    match failed.as_slice() {
+        [] => Ok(0),
+        [Some(one)] => {
+            say::error(&format!("doctest failed, to rerun pass `{one}`"));
+            Ok(FAILED)
+        }
+        _ => Ok(FAILED),
+    }
 }
 
 /// The flags that have cargo run this test target alone.
@@ -119,6 +127,7 @@ fn rerun_flags(test: &Program) -> String {
         Kind::Example => format!("--example {}", test.name),
         Kind::Test => format!("--test {}", test.name),
         Kind::Bench => format!("--bench {}", test.name),
+        Kind::Doc => "--doc".to_owned(),
     };
     format!("-p {} {target}", test.package)
 }

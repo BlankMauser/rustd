@@ -113,6 +113,9 @@ impl Inputs {
                 let found = TARGET_DIRS.iter().map(|it| manifest.with_file_name(it));
                 files.extend(found.map(|it| Watched::new(it, Stamp::Targets)));
             }
+            // And the crates of examples `cargo rustd test` has rust-analyzer add.
+            let examples = cargo.target_directory().join(crate::doctest::DIR);
+            files.push(Watched::new(examples.into(), Stamp::Targets));
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
         let scripts = Scripts::of(workspace, config);

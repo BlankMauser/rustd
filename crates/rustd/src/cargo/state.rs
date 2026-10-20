@@ -54,8 +54,10 @@ pub(crate) struct State {
     pub(crate) checkouts: Vec<Checkout>,
     /// Why every build of this is cargo's, when rustd has no part in it.
     pub(crate) refusal: Option<String>,
-    /// Whether a library that was built has doc tests.
-    pub(crate) doc_tests: bool,
+    /// Why the doc tests of a library that has them are not run, for each that rustd does not
+    /// run.
+    #[serde(default)]
+    pub(crate) unrun_doc_tests: Vec<String>,
     pub(crate) counts: Counts,
 }
 
@@ -112,6 +114,8 @@ pub(crate) enum Kind {
     Example,
     Test,
     Bench,
+    /// The examples of a library's documentation, which `cargo test --doc` runs.
+    Doc,
 }
 
 impl Kind {
@@ -371,6 +375,8 @@ impl Built {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--message-format" => drop(args.next()),
+                // The examples are linked as the unit tests of their library are.
+                "--doc" => drop(cargo.arg("--lib")),
                 arg => drop(cargo.arg(arg)),
             }
         }
@@ -620,7 +626,7 @@ impl State {
             guards: Vec::new(),
             checkouts: Vec::new(),
             refusal: None,
-            doc_tests: false,
+            unrun_doc_tests: Vec::new(),
             counts,
         };
         let project = match project(asked, cwd, &metadata) {
@@ -659,6 +665,7 @@ impl State {
             env: env.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
+        let mut tested_libraries = Vec::new();
         let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
         for artifact in executables {
             let Some(executable) = &artifact.executable else { continue };
@@ -683,8 +690,11 @@ impl State {
                 .filter(|it| it != executable.as_std_path())
                 .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
                 .collect();
+            if unit_test && kind == Kind::Lib {
+                tested_libraries.push((package, unit, executable.as_std_path(), artifact));
+            }
             let plan = match unit {
-                Some(unit) => Plan::of(unit, &used, &files)?,
+                Some(unit) => Plan::of(unit, &used, &files, None)?,
                 None => Err(format!(
                     "cargo built `{name}` before rustd recorded what it is linked from; \
                      `cargo clean -p {}` has it built again",
@@ -727,6 +737,74 @@ impl State {
                     .collect(),
             });
         }
+        // Cargo runs the doc tests of the libraries it runs the unit tests of. The examples of
+        // one are a crate rust-analyzer adds when its file is there, which the daemon writes.
+        let examples_dir = metadata.target_directory.as_std_path().join(crate::doctest::DIR);
+        // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
+        let picked = asked.flags.selects_targets || !asked.positional.is_empty();
+        let tested_libraries =
+            if picked && !asked.flags.doc { Vec::new() } else { tested_libraries };
+        for (package, unit, executable, artifact) in tested_libraries {
+            if !artifact.target.doctest {
+                continue;
+            }
+            if artifact.target.is_proc_macro() {
+                state.unrun_doc_tests.push(format!(
+                    "the doc tests of `{}` are not run: rustd does not run the examples of a                      proc macro yet",
+                    package.name
+                ));
+                continue;
+            }
+            let examples = examples_dir.join(format!("{}.rs", package.name));
+            if !examples.exists() {
+                std::fs::create_dir_all(&examples_dir)?;
+                std::fs::write(&examples, "")?;
+            }
+            let files = dir.join("programs").join(format!("{}-doc", artifact.target.name));
+            std::fs::create_dir_all(&files)?;
+            let plan = match unit {
+                Some(unit) => Plan::of(unit, &used, &files, Some(&examples))?,
+                None => Err(format!(
+                    "cargo built the tests of `{}` before rustd recorded what they are linked                      from; `cargo clean -p {}` has them built again",
+                    artifact.target.name, package.name
+                )),
+            };
+            let (asked_as, left_to_cargo) = match plan {
+                Ok(plan) => {
+                    let checkout = &mut checkouts[1];
+                    checkout.generation = checkout.generation.max(plan.stamp);
+                    checkout.programs.push(plan);
+                    (Some((1, checkout.programs.len() - 1)), None)
+                }
+                Err(why) => (None, Some(why)),
+            };
+            let compiled = reached_from(unit.into_iter().collect(), &used);
+            let inputs: FxHashSet<PathBuf> = compiled
+                .iter()
+                .flat_map(|it| it.inputs().files)
+                .filter(|it| !it.starts_with(metadata.target_directory.as_std_path()))
+                .collect();
+            state.programs.push(Program {
+                name: artifact.target.name.clone(),
+                kind: Kind::Doc,
+                package: package.name.to_string(),
+                test: false,
+                default_run: false,
+                source: artifact.target.src_path.clone().into_std_path_buf(),
+                package_dir: package_dir(package),
+                executable: files.join("bin"),
+                names: Vec::new(),
+                cargos: files.join("cargo"),
+                unit: None,
+                asked_as,
+                left_to_cargo,
+                inputs: inputs.into_iter().collect(),
+                env: run_env(package, &built.scripts)
+                    .into_iter()
+                    .chain(library_path(executable, sysroot_libraries.as_deref()))
+                    .collect(),
+            });
+        }
         state
             .programs
             .sort_by(|a, b| (&a.package, a.kind, &a.name).cmp(&(&b.package, b.kind, &b.name)));
@@ -742,16 +820,6 @@ impl State {
             checkout.sources = sources.into_iter().collect();
         }
         state.checkouts = checkouts.into_iter().collect();
-        // Cargo runs the doc tests of the packages it runs the tests of.
-        let tested: FxHashSet<_> =
-            artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
-        // A proc macro is a library with doc tests as much as any other.
-        let library = |it: &cargo_metadata::Target| {
-            it.is_lib() || it.is_rlib() || it.is_dylib() || it.is_proc_macro()
-        };
-        let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
-        state.doc_tests =
-            metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
         state.guards = guards(cwd, &metadata, &used, &built.scripts);
         let kept: Vec<PathBuf> = State::all()
             .iter()

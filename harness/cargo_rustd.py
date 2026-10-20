@@ -639,7 +639,7 @@ def flags(work):
             # `-q` has cargo say nothing of who built it: the daemon's count says.
             if how == "cargo" and daemons_builds(ours.cargo("status")[1].stdout) > served:
                 how = "daemon"
-            if command != "check" and "--doc" not in args and by_cargo(how):
+            if command != "check" and by_cargo(how):
                 differs = "; ".join(filter(None, [differs, "the build was cargo's"]))
             rows.append((label, shown, how, mine.returncode, differs or "same"))
             if differs and ((label, shown) in FLAGS_OPEN or TESTS_OPEN in how):

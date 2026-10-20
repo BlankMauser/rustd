@@ -102,8 +102,11 @@ them is built by cargo instead.
 
 Tests are the largest of these. rustc compiles a test crate whole in order to write its
 harness, and no crate of the workspace is rustc's to compile; the daemon has to write the
-harness itself. Doc tests (`cargo rustd test --doc`) go through rustd in rustdoc's place.
-An example rustd cannot build is left to rustdoc, with a line saying why.
+harness itself. Doc tests are the daemon's too, with no rustdoc: the examples of a library
+are one crate the daemon writes and builds, a module each, and each runs in a process of
+its own. An example that only a crate of its own can be (`#![feature]`, `crate::`, another
+edition) fails with the reason. A `compile_fail` example passes when rust-analyzer finds an
+error in it, so one that only the borrow checker refuses fails, saying so.
 
 These flags are handled: `--target` naming the host, `-p`, `--features`, `--bin`, `--bins`,
 `--example`, `--examples`, `--lib`, `--manifest-path`, `--workspace`, `--release`,

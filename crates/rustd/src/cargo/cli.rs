@@ -76,6 +76,7 @@ const BUILD_ENV: &[&str] = &[
 /// and the ones cargo reads flags and profiles from.
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
+    "CARGO_TARGET_DIR",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_",
     "CARGO_PROFILE_",

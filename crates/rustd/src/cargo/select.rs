@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     cli::Invocation,
     plan::Plan,
-    state::{Program, State, as_staged},
+    state::{Kind, Program, State, as_staged},
 };
 
 /// The variable that, set to `0`, has every test run: as `--rerun-all` does.
@@ -100,7 +100,9 @@ impl<'a> Selective<'a> {
         put(&state.checkouts[checkout].generation.to_string());
         put(&plan.stamp.to_string());
         // A test can run any program of the build: the code of each is part of the result.
-        for other in state.programs.iter().filter(|it| !it.test) {
+        // The examples of a library are no program a test can run.
+        let runnable = |it: &&Program| !it.test && it.kind != Kind::Doc;
+        for other in state.programs.iter().filter(runnable) {
             put(&other.executable.to_string_lossy());
             put(&whole_program(current(state, other)?)?);
         }

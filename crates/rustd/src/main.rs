@@ -153,7 +153,8 @@ impl Args {
         let own = named == self.krate;
         // What the tests of a library use may use the library: the program then has both.
         let both = own && self.batch.contains(&self.krate);
-        !member || both || is_tested(db, krate) == own
+        // The examples of a library are a program of theirs, with the library as it is built.
+        !member || both || is_tested(db, krate) == own || doctest::is_examples(db, krate)
     }
 
     /// Whether the file is one the checkout is built from. A file of the checkout it shares
@@ -1463,6 +1464,7 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
         .filter(|it| !args.cfg_test || args.as_built(db, *it, krate))
+        .filter(|it| !doctest::is_documented(db, (*it).into()))
         .collect()
 }
 
@@ -2586,21 +2588,6 @@ thread_local! {
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Has the thread be one that probes for as long as it lives.
-pub(crate) struct Probing(bool);
-
-impl Probing {
-    pub(crate) fn new() -> Probing {
-        Probing(PROBING.replace(true))
-    }
-}
-
-impl Drop for Probing {
-    fn drop(&mut self) {
-        PROBING.set(self.0);
-    }
-}
-
 fn build(
     db: &RootDatabase,
     table: &SymbolTable,
@@ -2649,7 +2636,14 @@ fn build(
             if at == 0 && !args.cfg_test {
                 main = main.or(listed.main);
             }
-            functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
+            let listed_here = listed.functions.iter().copied().zip(listed.exported.iter().copied());
+            // The examples' program runs each example alone: the ones that are not to be
+            // built are in the crate too.
+            let running =
+                doctest::is_examples(db, krate.into()).then(|| doctest::running(db, krate));
+            functions.extend(listed_here.filter(|&(id, _)| {
+                running.as_ref().is_none_or(|it| doctest::is_built(db, id.into(), it))
+            }));
             // rustc's copy of the crate has them when rustc built it.
             if resolver.own_crate_id(krate.into()).is_some() {
                 kept.extend(&listed.kept);
@@ -2744,8 +2738,23 @@ fn build(
     if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args).write(&args.out)?;
-        let text = hir::attach_db(db, || harness_of(db, &resolver, &programs_own))
-            .map_err(anyhow::Error::msg)?;
+        let text = hir::attach_db(db, || match programs_own.first() {
+            Some(&krate) if doctest::is_examples(db, krate.into()) => {
+                let runners: Vec<(String, Option<String>)> = listed
+                    .of(db, krate)
+                    .functions
+                    .iter()
+                    .filter(|&&it| doctest::is_runner(db, it.into()))
+                    .map(|&it| {
+                        let name = hir::Function::from(it).name(db).as_str().to_owned();
+                        (name, resolver.function_named(it))
+                    })
+                    .collect();
+                doctest::harness(db, krate.into(), &runners)
+            }
+            _ => harness_of(db, &resolver, &programs_own),
+        })
+        .map_err(anyhow::Error::msg)?;
         // A splice adds the edit to the executable and leaves the harness as it was linked.
         if harness.write(&text)?
             && let Some(binary) = &args.splice
@@ -4183,10 +4192,7 @@ fn main() -> anyhow::Result<()> {
     {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
-    if std::env::var_os(doctest::ENABLED).is_some() {
-        return doctest::command(std::env::args_os().skip(1));
-    }
-    run(Args::parse(std::env::args().skip(1))?, None)
+    run(Args::parse(std::env::args().skip(1))?)
 }
 
 /// Compiles the crates `args` names on every core until `done`: the symbols a build waits
@@ -4696,7 +4702,7 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
     if !told.ahead {
         std::thread::spawn(end_with_input);
     }
-    run_holding(Args::parse(told.args.into_iter())?, None, held, told.ahead)
+    run_holding(Args::parse(told.args.into_iter())?, held, told.ahead)
 }
 
 /// What is said once for the process about how every workspace is read.
@@ -4706,18 +4712,13 @@ fn process_wide() {
 }
 
 /// Loads the workspace `args` names and builds what they ask for, then serves it when they
-/// ask for that. With `doc` the build is of a library whose examples are then run.
-fn run(args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
-    run_holding(args, doc, None, false)
+/// ask for that.
+fn run(args: Args) -> anyhow::Result<()> {
+    run_holding(args, None, false)
 }
 
 /// [`run`], with what a process started before its build was known has loaded already.
-fn run_holding(
-    mut args: Args,
-    doc: Option<&doctest::Asked>,
-    held: Option<Held>,
-    ahead: bool,
-) -> anyhow::Result<()> {
+fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Result<()> {
     // As cargo does: the flag, then the environment, then the host.
     if args.selection.target.is_none() {
         args.selection.target =
@@ -4886,17 +4887,6 @@ fn run_holding(
         known.patching = args.patch.is_some();
     }
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
-    if let Some(asked) = doc {
-        let krate = *crates_named(&db, &args.krate, &args)?.first().context("no such crate")?;
-        known.used_by_rustc = true;
-        let built = build(&db, &table, &args, &mut known, &listed)?;
-        eprint!("doctests: ");
-        report(&built);
-        doctest::document(&mut db, krate);
-        let code = doctest::run(&db, asked, krate, &args.out, emits.triple())?;
-        hir_ty::mir::codegen::settled();
-        std::process::exit(code);
-    }
     if let Some(stale) = stale_copies(&db, &table, &args) {
         anyhow::bail!(stale);
     }
@@ -5565,6 +5555,31 @@ fn run_holding(
                 it.unbuilt.stale = true;
             });
             listed.touch(&db, Some(&moved));
+        }
+        // The examples of the libraries are written as their documentation says now.
+        for _ in 0..3 {
+            let rewrites = doctest::rewrites(&db, emits.triple());
+            if rewrites.is_empty() {
+                break;
+            }
+            builds.settle(&mut db, &mut programs)?;
+            let mut change = ChangeWithProcMacros::default();
+            let files: Vec<vfs::FileId> = rewrites.iter().map(|it| it.0).collect();
+            for (file, text) in rewrites {
+                change.change_file(file, Some(text));
+            }
+            db.apply_change(change);
+            let crates: Vec<_> = files
+                .iter()
+                .flat_map(|&file| {
+                    ide_db::base_db::relevant_crates(&db, file).iter().copied().collect::<Vec<_>>()
+                })
+                .collect();
+            programs.iter_mut().for_each(|it| {
+                it.known.touch(&db, Some(&crates));
+                it.unbuilt.stale = true;
+            });
+            listed.touch(&db, Some(&crates));
         }
         let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
         if background {
