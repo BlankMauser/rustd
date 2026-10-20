@@ -48,7 +48,7 @@ sys.path.insert(0, HERE)
 # alone. Here it stays as the caller has it: without it the tests of every project are
 # cargo's, and that case is one of the flags.
 INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from difftest import host
+from difftest import CROSS, TARGET, host
 if INCREMENTAL is None:
     os.environ.pop("CARGO_INCREMENTAL", None)
 else:
@@ -557,7 +557,7 @@ FLAG_WORKSPACE = {
     "probe/src/lib.rs": 'pub fn library_is_tested() -> bool {\n    util::tested()\n}\n\npub fn greeting() -> String {\n    util::greeting("probe")\n}\n',
     "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n/// Whether this build of the library is the one with its unit tests.\npub fn tested() -> bool {\n    cfg!(test)\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n\n    // The tests are in a build of the library with `cfg(test)`, and what they link that uses\n    // the library has the build without.\n    #[test]\n    fn only_the_tested_build_is_a_test() {\n        assert!(super::tested());\n        assert!(!probe::library_is_tested());\n        assert_eq!(probe::greeting().to_lowercase().trim_end_matches("!"), "hello probe");\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n\n[[test]]\nname = "plain"\nharness = false\n',
-    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n    // A cargo the program runs has the units of the build: the program stays the file it was.\n    if name == "cargo" {\n        use std::os::unix::fs::MetadataExt;\n        let me = std::env::current_exe().unwrap();\n        let before = std::fs::metadata(&me).unwrap().ino();\n        let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n        assert!(std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap().success());\n        println!("the program stayed: {}", before == std::fs::metadata(&me).unwrap().ino());\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n\n    #[test]\n    fn links_the_library_without_its_tests() {\n        assert!(!util::tested());\n    }}\n',
+    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    // What a spin waits with: an `isb` on aarch64.\n    std::hint::spin_loop();\n    if name == "fail" {\n        std::process::exit(3);\n    }\n    // A cargo the program runs has the units of the build: the program stays the file it was.\n    if name == "cargo" {\n        use std::os::unix::fs::MetadataExt;\n        let me = std::env::current_exe().unwrap();\n        let before = std::fs::metadata(&me).unwrap().ino();\n        let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n        assert!(std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap().success());\n        println!("the program stayed: {}", before == std::fs::metadata(&me).unwrap().ino());\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n\n    #[test]\n    fn links_the_library_without_its_tests() {\n        assert!(!util::tested());\n    }}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     # Integration tests whose harness is the daemon's: tests in modules, `cfg(test)` and a
@@ -567,6 +567,20 @@ FLAG_WORKSPACE = {
     "app/tests/plain.rs": 'fn main() {\n    println!("plain: {}", util::greeting("plain"));\n}\n',
     "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
+
+def cross_cases():
+    """A run for aarch64 from an x86-64 Linux that has its linker, runner and library: the
+    daemon has a spare worker then, loaded with the host's library."""
+    triple, cross = "aarch64-unknown-linux-gnu", CROSS["aarch64-unknown-linux-gnu"]
+    if TARGET or not host().startswith("x86_64") or "linux" not in host():
+        return []
+    sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip()
+    tools = [cross["linker"], cross["runner"].split()[0]]
+    if not all(map(shutil.which, tools)) or not os.path.isdir(os.path.join(sysroot, "lib", "rustlib", triple)):
+        return []
+    variable = "CARGO_TARGET_" + triple.upper().replace("-", "_")
+    return [("run", ["--target", triple], {variable + "_LINKER": cross["linker"], variable + "_RUNNER": cross["runner"]})]
+
 
 # Each: the subcommand, its arguments, the variables it runs with.
 FLAG_CASES = [
@@ -581,6 +595,7 @@ FLAG_CASES = [
     ("run", ["--no-default-features", "-p", "app"], {}),
     # The host named: what is built for is the same, where it is put is not.
     ("run", ["--target", host()], {}),
+    *cross_cases(),
     ("run", ["-p", "app"], {}),
     ("run", ["--features", "loud", "-p", "app"], {}),
     ("run", ["--bin", "other"], {}),
