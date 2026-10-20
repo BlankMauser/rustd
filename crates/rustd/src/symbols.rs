@@ -210,10 +210,10 @@ fn names_of_object(data: &[u8], member: usize, names: &mut Vec<Named>) {
             _ => continue,
         };
         let Ok(name) = symbol.name() else { continue };
+        let name = unprefixed(&object, name);
         if reach == Reach::PrivateStatic && !name.starts_with("_R") {
             continue;
         }
-        let name = unprefixed(&object, name);
         let mut named = Named::new(name, reach, member);
         named.undefined = symbol.is_undefined();
         names.push(named);
