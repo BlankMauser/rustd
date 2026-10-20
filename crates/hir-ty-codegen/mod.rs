@@ -2805,6 +2805,20 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The name attributes give a static for the linker: the one of an `extern` block's static, or
+/// the one `#[no_mangle]` or `#[export_name]` exports.
+fn static_symbol(db: &dyn HirDatabase, id: StaticId) -> Option<intern::Symbol> {
+    let signature = StaticSignature::of(db, id);
+    if signature.flags.contains(StaticFlags::EXTERN) {
+        let name = AttrFlags::link_name(db, id.into());
+        return Some(name.unwrap_or_else(|| signature.name.symbol().clone()));
+    }
+    AttrFlags::export_name(db, id.into()).or_else(|| {
+        let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
+        unmangled.then(|| signature.name.symbol().clone())
+    })
+}
+
 /// The symbol a static of an `extern` block links to.
 fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -4485,17 +4499,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// The name the linker knows a static by: one of an `extern` block, or one that an
     /// attribute exports and rustc's build defines.
     fn linked_static(&self, id: StaticId) -> Result<Option<intern::Symbol>> {
-        let db = self.db;
-        let signature = StaticSignature::of(db, id);
-        if !signature.flags.contains(StaticFlags::EXTERN) {
-            let exported = AttrFlags::export_name(db, id.into()).or_else(|| {
-                let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
-                unmangled.then(|| signature.name.symbol().clone())
-            });
-            return Ok(exported.filter(|name| self.symbols.defines(name.as_str())));
+        let name = static_symbol(self.db, id);
+        if StaticSignature::of(self.db, id).flags.contains(StaticFlags::EXTERN) {
+            return Ok(name);
         }
-        let name = AttrFlags::link_name(db, id.into());
-        Ok(Some(name.unwrap_or_else(|| signature.name.symbol().clone())))
+        Ok(name.filter(|name| self.symbols.defines(name.as_str())))
     }
 
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {

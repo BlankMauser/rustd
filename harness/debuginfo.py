@@ -111,6 +111,7 @@ LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline
           ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
           ("*borrowed", "sline::Point {x: 3, y: -4}")]
 OPTIMIZED_OUT = "<optimized out>"
+PRINTER_OPTIMIZED_OUT = "Python Exception <class 'gdb.error'>: value has been optimized out"
 
 TYPES_MAIN = """#[derive(Clone, Copy)]
 struct Point { x: i32, y: i64 }
@@ -1059,10 +1060,14 @@ def printed_by(debugger, binary, cwd, place, names):
     """What a debugger prints for each of the names when stopped at a place, addresses aside."""
     commands = ["set pagination off", "set startup-with-shell off", f"break {place}", "run",
                 *[x for name in names for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+    # A pretty-printer that finds part of the value optimized out says so on stderr, after
+    # what it printed of the rest, so the two are read together.
     ran = subprocess.run([debugger, "-q", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
-                         capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", cwd=cwd, timeout=300)
     found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
-    return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+    printed = {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+    return {name: f"{it.split(PRINTER_OPTIMIZED_OUT)[0]}{OPTIMIZED_OUT}" if it and PRINTER_OPTIMIZED_OUT in it else it
+            for name, it in printed.items()}
 
 
 def kept_by_rustc(ws, asked):
