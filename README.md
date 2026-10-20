@@ -225,7 +225,7 @@ build-model features.
 These fail the build with an error that names them; `cargo rustd` hands nothing to cargo
 ([docs/cargo.md](docs/cargo.md#what-fails-the-build) has the list):
 
-- `cargo rustd test` and the flags that build tests or benchmarks (`--doc` works);
+- `--benches`, `--bench` and `--all-targets`, which build benchmarks;
 - `lto = true` or `"thin"`;
 - more than one `--target`, a JSON `--message-format`, `-Z` flags, and a
   `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;

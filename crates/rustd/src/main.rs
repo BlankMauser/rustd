@@ -506,7 +506,11 @@ impl Resolver<'_> {
         let name = Crate::from(krate).display_name(self.db)?;
         let root = self.crate_root(krate.into())?;
         let root = self.inside(&root).unwrap_or(&root);
-        let named = format!("rustd crate {} {}", name.crate_name(), root.display());
+        let mut named = format!("rustd crate {} {}", name.crate_name(), root.display());
+        // The unit tests of a library are a second build of its source, beside the library.
+        if is_tested(self.db, krate) {
+            named.push_str(" test");
+        }
         Some(short_hash(&named))
     }
 

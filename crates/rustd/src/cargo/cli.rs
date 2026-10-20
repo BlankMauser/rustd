@@ -262,22 +262,17 @@ impl Invocation {
         Some(surroundings.to_owned())
     }
 
-    /// Why the tests of the workspace are not built, when the command builds some: rustc
-    /// compiles a test crate whole to write its harness, and no crate of the workspace is
-    /// rustc's to compile.
+    /// Why what the command builds of the tests of the workspace is not built, when it builds
+    /// something that is not.
     pub(crate) fn builds_tests(&self) -> Option<String> {
         let flag = self.flags.tests.as_deref();
-        let what = match (self.subcommand, flag) {
-            // An integration test, whose harness the daemon writes.
-            (_, Some("--test")) => return None,
-            (_, Some(flag)) => format!("`{flag}`"),
-            (Subcommand::Test, None) => "`cargo rustd test`".to_owned(),
-            _ => return None,
-        };
-        Some(format!(
-            "{what}: the daemon does not build the tests of a workspace yet (`--doc` runs \
-             its doc tests)"
-        ))
+        // The daemon writes the harness of unit and integration tests; benchmarks are not built.
+        match flag {
+            Some(flag @ ("--benches" | "--bench" | "--all-targets")) => Some(format!(
+                "`{flag}`: the daemon does not build the benchmarks of a workspace yet"
+            )),
+            _ => None,
+        }
     }
 
     /// Why what was typed is not built, wherever it is typed: the flag, by its name.
@@ -487,13 +482,19 @@ mod tests {
         ] {
             assert_eq!(build("build", args).unbuilt_flag(), None, "{args}");
         }
-        for (command, args) in [("test", ""), ("build", "--all-targets"), ("build", "--tests")] {
+        for (command, args) in
+            [("build", "--all-targets"), ("test", "--benches"), ("test", "--bench a")]
+        {
             assert!(build(command, args).builds_tests().is_some(), "{command} {args}");
         }
-        for args in ["", "--bin a", "--example a", "--lib", "--bins", "--examples", "--test a"] {
+        for args in
+            ["", "--bin a", "--example a", "--lib", "--bins", "--examples", "--test a", "--tests"]
+        {
             assert_eq!(build("build", args).builds_tests(), None, "{args}");
         }
-        assert_eq!(build("test", "--test a").builds_tests(), None);
+        for args in ["", "--test a", "--lib", "-p a --lib", "--tests"] {
+            assert_eq!(build("test", args).builds_tests(), None, "{args}");
+        }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
     }

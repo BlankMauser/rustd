@@ -175,12 +175,8 @@ impl Plan {
         unit: &Record,
         records: &[Record],
         dir: &Path,
-        unit_test: bool,
     ) -> anyhow::Result<Result<Plan, String>> {
         if let Some(why) = unsupported(unit) {
-            return Ok(Err(why));
-        }
-        if unit_test && let Some(why) = harness_alone(unit) {
             return Ok(Err(why));
         }
         let line = unit.link_line.as_ref().context("a linked unit without a link line")?;
@@ -228,7 +224,7 @@ impl Plan {
         let mut ahead = vec![&*plan.patch, &*plan.object];
         // The tests of an integration test are the daemon's, and so is the harness that runs
         // them: its `main` comes ahead of the one rustc wrote for none.
-        let harness = (unit.is_test() && !unit_test).then(|| Harness::plan(unit, dir));
+        let harness = unit.is_test().then(|| Harness::plan(unit, dir));
         let beside = Harness::beside(&plan.object);
         match &harness {
             Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
@@ -238,26 +234,6 @@ impl Plan {
         plan.link_cmd = link.command(&ahead, &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
     }
-}
-
-/// Why the tests of `unit` are only right as rustc built them, if they are. rustc's
-/// harness stays in a test executable and calls the tests and their helpers, so each has
-/// to be a symbol the daemon's copy can take the place of, called the way the source says.
-fn harness_alone(unit: &Record) -> Option<String> {
-    let name = &unit.crate_name;
-    if unit.codegen("incremental").is_none() {
-        return Some(format!(
-            "the tests of `{name}` are built without incremental compilation, where rustc \
-             keeps them private to its object"
-        ));
-    }
-    let level = unit.codegen("opt-level").unwrap_or("0");
-    (level != "0").then(|| {
-        format!(
-            "the tests of `{name}` are built with opt-level {level}, where rustc inlines \
-             them into its harness and changes how it calls their helpers"
-        )
-    })
 }
 
 /// Why rustd has no part in a crate that was compiled with these flags, when it has none.

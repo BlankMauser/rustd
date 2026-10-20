@@ -679,7 +679,7 @@ impl State {
                 .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
                 .collect();
             let plan = match unit {
-                Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
+                Some(unit) => Plan::of(unit, &used, &files)?,
                 None => Err(format!(
                     "cargo built `{name}` before rustd recorded what it is linked from; \
                      `cargo clean -p {}` has it built again",

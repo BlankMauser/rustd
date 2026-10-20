@@ -287,7 +287,7 @@ class Side:
 
 # What `cargo rustd` says of a command that builds tests, which the daemon does not build
 # yet. Known and not mended: such a step is in the table as open and is not compared.
-TESTS_OPEN = "the daemon does not build the tests of a workspace yet"
+TESTS_OPEN = "the daemon does not build the benchmarks of a workspace yet"
 
 
 def how_built(stderr):
