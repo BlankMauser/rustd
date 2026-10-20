@@ -184,6 +184,7 @@ impl Args {
         let mut features = Vec::new();
         let mut no_default_features = false;
         let (mut packages, mut workspace) = (Vec::new(), false);
+        let mut excludes = Vec::new();
         let mut all_features = false;
         let mut profile = None;
         let mut also = Vec::new();
@@ -218,6 +219,7 @@ impl Args {
                 "--no-default-features" => no_default_features = true,
                 "--package" | "-p" => packages.push(value()?),
                 "--workspace" => workspace = true,
+                "--exclude" => excludes.push(value()?),
                 "--all-features" => all_features = true,
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
@@ -252,6 +254,7 @@ impl Args {
                 all_features,
                 packages,
                 workspace,
+                excludes,
                 target,
                 dev_deps: cfg_test || dev_deps,
             },
@@ -3134,6 +3137,9 @@ fn selected(args: &Args) -> Vec<String> {
     }
     if selection.workspace {
         selected.push("--workspace".to_owned());
+    }
+    for package in &selection.excludes {
+        selected.extend(["--exclude".to_owned(), package.clone()]);
     }
     selected
 }

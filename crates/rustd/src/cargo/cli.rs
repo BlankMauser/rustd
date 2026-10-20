@@ -143,7 +143,7 @@ pub(crate) struct Flags {
     pub(crate) manifest_path: Option<PathBuf>,
     pub(crate) packages: Vec<String>,
     pub(crate) workspace: bool,
-    pub(crate) excludes: bool,
+    pub(crate) excludes: Vec<String>,
     pub(crate) features: Vec<String>,
     pub(crate) all_features: bool,
     pub(crate) no_default_features: bool,
@@ -310,7 +310,6 @@ impl Invocation {
         }
         let reason = match () {
             _ if flags.unstable => "`-Z`: unstable cargo flags are not read by rustd",
-            _ if flags.excludes => "`--exclude` is not loaded by the daemon yet",
             _ if flags.targets.len() > 1 => {
                 "several `--target` in one build are not built by the daemon yet"
             }
@@ -335,6 +334,7 @@ impl Invocation {
             all_features: self.flags.all_features,
             packages: self.flags.packages.clone(),
             workspace: self.flags.workspace,
+            excludes: self.flags.excludes.clone(),
             target: self.target(),
             dev_deps: self.subcommand == Subcommand::Test,
         }
@@ -355,7 +355,7 @@ impl Flags {
             "--manifest-path" => self.manifest_path = value.map(PathBuf::from),
             "-p" | "--package" => self.packages.extend(owned()),
             "--workspace" | "--all" => self.workspace = true,
-            "--exclude" => self.excludes = true,
+            "--exclude" => self.excludes.extend(owned()),
             "-F" | "--features" => {
                 let features = value.unwrap_or_default().split([',', ' ']);
                 self.features.extend(features.filter(|it| !it.is_empty()).map(str::to_owned));
@@ -481,12 +481,17 @@ mod tests {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Help);
         assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
-        for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
+        for args in ["--message-format json", "--target mips-unknown-none"] {
             assert!(build("build", args).unbuilt_flag().is_some(), "{args}");
         }
-        for args in
-            ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
-        {
+        for args in [
+            "--release",
+            "--profile bench",
+            "-p a -p b",
+            "--all-features",
+            "--no-default-features",
+            "--workspace --exclude a",
+        ] {
             assert_eq!(build("build", args).unbuilt_flag(), None, "{args}");
         }
         for (command, args) in [("test", ""), ("build", "--all-targets"), ("build", "--tests")] {

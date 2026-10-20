@@ -89,7 +89,6 @@ them is built by cargo instead.
 | `cargo rustd test` other than `--doc`; `--tests`, `--test`, `--benches`, `--bench`, `--all-targets` on any command | the daemon does not build the tests of a workspace yet |
 | `--message-format`, `--build-plan`, `--unit-graph` | the flag is not answered by `cargo rustd` yet |
 | a `-Z` flag | unstable cargo flags are not read by rustd |
-| `--exclude` | `--exclude` is not loaded by the daemon yet |
 | more than one `--target` | several `--target` in one build are not built by the daemon yet |
 | `--target` or `CARGO_BUILD_TARGET` naming a target that is neither ELF nor Mach-O, or one rustd does not know | programs for the triple are not linked through `cargo rustd` yet |
 | `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `cargo rustd` does not run rustc through it |

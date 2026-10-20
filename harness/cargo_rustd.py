@@ -593,6 +593,7 @@ FLAG_CASES = [
     ("run", ["-q", "name"], {}),
     ("run", [], {"RUSTFLAGS": "--cfg extra"}),
     ("build", ["--workspace"], {}),
+    ("build", ["--workspace", "--exclude", "util"], {}),
     ("build", ["--all-features"], {}),
     ("check", [], {}),
     ("test", [], {}),
