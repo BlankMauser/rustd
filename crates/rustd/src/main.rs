@@ -1503,12 +1503,19 @@ fn linked_from_libraries(db: &RootDatabase, args: &Args) -> anyhow::Result<()> {
 }
 
 /// Whether a link command names `core` as a library, by itself or in the shared library of
-/// std. One that reads its files from elsewhere is taken to.
+/// std. One that reads its files from elsewhere is taken to. A library in a directory of
+/// rustc's own, `rustcXXXXXX`, is rustc's copy of one with what `lto` compiled taken out: on
+/// Windows, std keeps its imports of the system's DLLs there.
 fn links_core(command: &str) -> bool {
     let mut files = command.split_whitespace().map(|it| it.trim_matches(['"', '\'']));
     files.any(|it| {
-        let name = it.rsplit(['/', '\\']).next().unwrap_or(it);
-        it.starts_with('@') || name.starts_with("libcore-") || name.starts_with("libstd-")
+        let mut parts = it.rsplit(['/', '\\']);
+        let name = parts.next().unwrap_or(it);
+        let copied = parts.next().and_then(|dir| dir.strip_prefix("rustc")).is_some_and(|rest| {
+            rest.len() == 6 && rest.chars().all(|it| it.is_ascii_alphanumeric())
+        });
+        let library = name.starts_with("libcore-") || name.starts_with("libstd-");
+        it.starts_with('@') || library && !copied
     })
 }
 
@@ -6412,6 +6419,8 @@ mod tests {
         assert!(links_core("cc @/t/link.args"));
         assert!(links_core("cc /sysroot/lib/libstd-44675f186029a4cd.so"));
         assert!(!links_core(lto));
+        let copied = r#"link.exe "C:\t\deps\app.0.rcgu.o" "C:\t\deps\rustcWEjDIo\libstd-512d.rlib" /OUT:C:\t\app.exe"#;
+        assert!(!links_core(copied));
     }
 
     #[test]
