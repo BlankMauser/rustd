@@ -3,6 +3,7 @@
 //! that passed with the same print, among the same tests and with the same things outside
 //! the code, is said to have passed and is not run. "Which tests run" in `docs/cargo.md`
 //! says what is outside the code.
+#![allow(clippy::print_stdout, reason = "the results go where the harness prints its own")]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
