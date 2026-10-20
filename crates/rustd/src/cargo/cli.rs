@@ -151,8 +151,10 @@ pub(crate) struct Flags {
     pub(crate) targets: Vec<String>,
     pub(crate) bin: Option<String>,
     pub(crate) example: Option<String>,
-    /// The flag that asks cargo for what it says in another shape, when one does.
-    pub(crate) message_format: Option<String>,
+    /// The shapes `--message-format` asks cargo's messages in, each of them.
+    pub(crate) message_format: Vec<String>,
+    /// `--build-plan` or `--unit-graph`, which ask cargo for its plan instead of a build.
+    pub(crate) plans: Option<String>,
     pub(crate) unstable: bool,
     pub(crate) quiet: bool,
     pub(crate) no_run: bool,
@@ -305,8 +307,16 @@ impl Invocation {
     /// Why what was typed is not built, wherever it is typed: the flag, by its name.
     fn unbuilt_flag(&self) -> Option<String> {
         let flags = &self.flags;
-        if let Some(flag) = &flags.message_format {
+        if let Some(flag) = &flags.plans {
             return Some(format!("`{flag}` is not answered by `cargo rustd` yet"));
+        }
+        if let Some(kind) =
+            flags.message_format.iter().find(|it| !matches!(it.as_str(), "human" | "short"))
+        {
+            return Some(format!(
+                "`--message-format={kind}` is not answered by `cargo rustd` yet: `human` and \
+                 `short` are"
+            ));
         }
         let reason = match () {
             _ if flags.unstable => "`-Z`: unstable cargo flags are not read by rustd",
@@ -367,9 +377,11 @@ impl Flags {
             "--target" => self.targets.extend(owned()),
             "--bin" => self.bin = owned(),
             "--example" => self.example = owned(),
-            "--message-format" | "--build-plan" | "--unit-graph" => {
-                self.message_format = Some(flag.to_owned())
+            "--message-format" => {
+                let kinds = value.unwrap_or_default().split(',').map(|it| it.trim().to_owned());
+                self.message_format.extend(kinds);
             }
+            "--build-plan" | "--unit-graph" => self.plans = Some(flag.to_owned()),
             "-Z" => self.unstable = true,
             "-q" | "--quiet" => self.quiet = true,
             "--tests" | "--test" | "--benches" | "--bench" | "--all-targets" => {
@@ -481,7 +493,12 @@ mod tests {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Help);
         assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
-        for args in ["--message-format json", "--target mips-unknown-none"] {
+        for args in [
+            "--message-format json",
+            "--message-format=short,json",
+            "--unit-graph",
+            "--target mips-unknown-none",
+        ] {
             assert!(build("build", args).unbuilt_flag().is_some(), "{args}");
         }
         for args in [

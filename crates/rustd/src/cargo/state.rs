@@ -373,7 +373,18 @@ impl Built {
             Subcommand::Build | Subcommand::Run => cargo.arg("build"),
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
-        cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
+        // What cargo says is read here, and rustc's diagnostics are shown in the shape asked.
+        let mut args = asked.build_args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--message-format" => drop(args.next()),
+                arg => drop(cargo.arg(arg)),
+            }
+        }
+        cargo.arg(match asked.flags.message_format.iter().any(|it| it == "short") {
+            true => "--message-format=json-diagnostic-short,json-render-diagnostics",
+            false => "--message-format=json-render-diagnostics",
+        });
         match staged {
             Some(staged) => {
                 as_staged(&mut cargo)?;
