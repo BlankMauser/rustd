@@ -1,0 +1,14 @@
+docs/cargo.md
+  h_9b6f78b66c1cb5 39-55,440-448
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ca2d7229795a79278e2225b528aa16b0f157b42",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
