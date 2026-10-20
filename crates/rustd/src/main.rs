@@ -1065,6 +1065,26 @@ fn is_closure(node: &SyntaxNode) -> bool {
         || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.async_token().is_some())
 }
 
+/// Whether no `#[cfg]` on the node, with the `cfg_attr`s that hold opened, is false.
+fn is_cfg_enabled(node: &SyntaxNode, cfg: &cfg::CfgOptions) -> bool {
+    let Some(node) = ast::AnyHasAttrs::cast(node.clone()) else { return true };
+    let off = hir_expand::attrs::expand_cfg_attr(
+        ast::attrs_including_inner(&node),
+        || cfg,
+        |meta, _| match meta {
+            ast::Meta::CfgMeta(meta)
+                if meta.cfg_predicate().is_some_and(|it| {
+                    cfg.check(&cfg::CfgExpr::parse_from_ast(it)) == Some(false)
+                }) =>
+            {
+                std::ops::ControlFlow::Break(())
+            }
+            _ => std::ops::ControlFlow::Continue(()),
+        },
+    );
+    off.is_none()
+}
+
 fn is_definition(node: &SyntaxNode) -> bool {
     !ast::MacroCall::can_cast(node.kind())
         && (ast::Item::can_cast(node.kind())
@@ -1091,8 +1111,10 @@ fn place_in_definition(
     });
     let owner = owner.or(root)?;
     let late = LateImports::around(sema, &owner);
+    let cfg =
+        sema.scope(&owner).map(|it| ide_db::base_db::Crate::from(it.krate()).cfg_options(sema.db));
     let mut count =
-        Count { sema, target, counts, late, seen: 0, earlier: None, waiting: Vec::new() };
+        Count { sema, target, counts, late, cfg, seen: 0, earlier: None, waiting: Vec::new() };
     count.all_in(&owner)?;
     while let Some(call) = count.waiting.pop() {
         count.expansion_of(&call)?;
@@ -1202,6 +1224,8 @@ struct Count<'a, 'db> {
     target: &'a SyntaxNode,
     counts: &'a dyn Fn(&SyntaxNode) -> bool,
     late: LateImports,
+    /// The cfg of the crate, by which rustc leaves out what a false `#[cfg]` is on.
+    cfg: Option<&'db cfg::CfgOptions>,
     seen: u32,
     earlier: Option<u32>,
     waiting: Vec<ast::MacroCall>,
@@ -1244,6 +1268,9 @@ impl Count<'_, '_> {
     /// As `all_in`, of what is not in a macro: `calls` gets the macros come across.
     fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) {
         for child in node.children() {
+            if self.cfg.is_some_and(|cfg| !is_cfg_enabled(&child, cfg)) {
+                continue;
+            }
             if let Some(call) = ast::MacroCall::cast(child.clone()) {
                 calls.push(call);
                 continue;

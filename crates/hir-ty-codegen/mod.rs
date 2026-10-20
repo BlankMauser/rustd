@@ -4918,11 +4918,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             for &at in callers.get(callee).into_iter().flatten() {
                 let (caller, env) = &self.envs[at];
                 // rustc's copy stands in for one of these, which its callers then call.
-                let forwarded = self.forwarded.contains(caller)
-                    || matches!(caller.def, InstanceDef::Fn(func) if self
-                        .instance_path(func, caller.args.as_ref())
-                        .and_then(|path| self.symbols.path(&path))
-                        .is_some_and(|it| self.rustc_copy(it, caller.checked).is_some()));
+                let forwarded =
+                    self.forwarded.contains(caller) || self.rustc_stand_in(caller).is_some();
                 if !forwarded && seen.insert(caller.clone()) {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
@@ -4930,12 +4927,23 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
+    /// The symbol of rustc's copy of `instance`, when that can stand in for ours.
+    fn rustc_stand_in(&self, instance: &Instance) -> Option<String> {
+        let InstanceDef::Fn(func) = instance.def else { return None };
+        // rustc's copy of a function of another crate would hand out rustc's future.
+        if !self.own_statics.crates.contains(&func.krate(self.db))
+            && *returns_async_block(self.db, func)
+        {
+            return None;
+        }
+        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        self.rustc_copy(symbol, instance.checked)
+    }
+
     /// Makes `id` a call of the copy of `instance` rustc compiled, when there is one: an
     /// instance we cannot compile is still one we can call.
     fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
-        let InstanceDef::Fn(func) = instance.def else { return None };
-        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
-        let symbol = self.rustc_copy(symbol, instance.checked)?;
+        let symbol = self.rustc_stand_in(instance)?;
         let sig = self.module.declarations().get_function_decl(id).signature.clone();
         let target = self.import(&symbol, &sig).ok()?;
         let mut ctx = self.module.make_context();

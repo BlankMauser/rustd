@@ -706,7 +706,7 @@ def registry_impls(work, check):
     os.makedirs(os.path.join(ws, "src"), exist_ok=True)
     open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "bz"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nbincode = "=1.3.3"\nserde = { version = "1", features = ["derive"] }\n')
     open(os.path.join(ws, "src/main.rs"), "w").write('#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]\nenum Kind {\n    A,\n    B(u8),\n    C { x: u16 },\n}\n\nfn main() {\n    let value = vec![Some(Kind::B(3)), None, Some(Kind::C { x: 9 }), Some(Kind::A)];\n    let back: Vec<Option<Kind>> = bincode::deserialize(&bincode::serialize(&value).unwrap()).unwrap();\n    assert_eq!(back, value);\n    println!("{back:?}");\n}\n')
-    here = Side(ws, base_env(os.path.join(work, "home-registry-impls")), True)
+    here = Side(ws, base_env(os.path.join(work, "home-impls")), True)
     _, ran = here.cargo("run")
     here.cargo("stop")
     said = "[Some(B(3)), None, Some(C { x: 9 }), Some(A)]"
