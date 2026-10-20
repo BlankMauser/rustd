@@ -1,0 +1,14 @@
+crates/rustd/src/main.rs
+  h_9b6f78b66c1cb5 320-336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "81100d414e432caae230e1a4ec8c17f6a8e72726",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
