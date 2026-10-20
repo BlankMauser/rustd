@@ -765,7 +765,7 @@ def sampled(perf, binary, cwd):
     """What `perf script` makes of `binary` sampled with its stacks unwound by `.eh_frame`, or
     None where this machine does not let this user profile."""
     data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
-    record = subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
+    record = subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf,65528", binary],
                             cwd=cwd, capture_output=True, text=True)
     if record.returncode != 0 or not os.path.exists(data):
         return None
