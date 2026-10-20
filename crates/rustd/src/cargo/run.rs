@@ -26,8 +26,10 @@ pub(crate) fn program(
 ) -> anyhow::Result<Option<i32>> {
     let runnable = |it: &&Program| !it.test && matches!(it.kind, Kind::Bin | Kind::Example);
     let mut programs: Vec<&Program> = state.programs.iter().filter(runnable).collect();
-    if let Some(name) = asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {
-        programs.retain(|it| it.name == *name);
+    match asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {
+        Some(name) => programs.retain(|it| it.name == *name),
+        // As cargo picks: the bin the package runs by default, among the bins it built.
+        None => programs.retain(|it| it.default_run),
     }
     let &[program] = programs.as_slice() else { return Ok(None) };
     let shown = shown_path(&program.executable, cwd);

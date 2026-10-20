@@ -74,6 +74,10 @@ pub(crate) struct Program {
     pub(crate) package: String,
     /// Whether it is built as a test: `cargo test` runs it.
     pub(crate) test: bool,
+    /// Whether it is the program `cargo run` of its package runs with none named: its one
+    /// bin, or the one the manifest's `default-run` names.
+    #[serde(default)]
+    pub(crate) default_run: bool,
     /// The root file of the target.
     pub(crate) source: PathBuf,
     /// The directory of the package, which a test runs in.
@@ -670,6 +674,10 @@ impl State {
             let test = artifact.profile.test;
             let unit_test = test && !matches!(kind, Kind::Test | Kind::Bench);
             let name = artifact.target.name.clone();
+            let bins = package.targets.iter().filter(|it| it.is_bin()).count();
+            let default_run = kind == Kind::Bin
+                && !test
+                && package.default_run.as_deref().map_or(bins == 1, |it| it == name);
             let unit = Record::of_artifact(&used, executable.as_std_path());
             // Named as cargo names the unit, the same in every build of it.
             let files = dir.join("programs").join(unit.map_or(&name, |it| &it.id));
@@ -709,6 +717,7 @@ impl State {
                 kind,
                 package: package.name.to_string(),
                 test,
+                default_run,
                 source: artifact.target.src_path.clone().into_std_path_buf(),
                 package_dir: package_dir(package),
                 executable: executable.clone().into_std_path_buf(),
