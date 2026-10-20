@@ -4539,6 +4539,9 @@ pub(crate) struct Told {
     pub(crate) ahead: bool,
 }
 
+/// The variables a worker is told with its build, over the ones it started with.
+type ToldEnv = std::collections::BTreeMap<String, String>;
+
 /// A line a worker told a build ahead of cargo's reads while cargo runs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -4567,7 +4570,7 @@ impl Said {
     /// Reads the lines of the standard input on a thread: what cargo said, then on the
     /// second what it built. The process ends when its input does without that: there is
     /// no build.
-    fn read() -> (Arc<Said>, std::sync::mpsc::Receiver<anyhow::Result<Args>>) {
+    fn read() -> (Arc<Said>, std::sync::mpsc::Receiver<anyhow::Result<(Args, ToldEnv)>>) {
         let said = Arc::new(Said::default());
         let (built, whole) = std::sync::mpsc::channel();
         let read = said.clone();
@@ -4582,7 +4585,8 @@ impl Said {
                     Some(Line::Said { said: line }) => tell(&|it| it.said.push(line.clone())),
                     Some(Line::Whole(told)) => {
                         tell(&|it| it.ended = true);
-                        _ = built.send(Args::parse(told.args.into_iter()));
+                        let env = told.env;
+                        _ = built.send(Args::parse(told.args.into_iter()).map(|it| (it, env)));
                         return end_with_input();
                     }
                     None => break,
@@ -4910,7 +4914,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     let table = std::thread::spawn(move || {
         // The files are cargo's to write first, when the build was told ahead of them.
         let whole = whole.map(|it| it.recv()?).transpose()?;
-        let symbol_files = whole.as_ref().map_or(&symbol_files, |it| &it.symbol_files);
+        let symbol_files = whole.as_ref().map_or(&symbol_files, |it| &it.0.symbol_files);
         let start = Instant::now();
         let table = SymbolTable::load(symbol_files, &root)?;
         eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
@@ -5030,7 +5034,13 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     lower_until(&db, &args, &listed, &|| table.is_finished())?;
     let (table, whole) =
         table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
-    if let Some(whole) = whole {
+    if let Some((whole, told)) = whole {
+        // What cargo says of where it puts the programs, which `env!` reads, is known now.
+        let mut env = process::own();
+        for (name, value) in &told {
+            env.set(name, value);
+        }
+        process::turn(&mut db, env);
         // What was loaded is the workspace of both; the rest is as cargo built it.
         args = Args {
             checkout: args.checkout,
