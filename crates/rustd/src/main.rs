@@ -5137,6 +5137,19 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                             let reloaded =
                                 checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
                             watch_loaded(&mut db, &mut tree, &mut files);
+                            // A build script run again in another `OUT_DIR` wrote the files an
+                            // `include!` names there: they are read before anything is built.
+                            // Resolving the names of the programs' crates finds them, as on a load.
+                            let mut included = WatchedFile::watch_included(&mut files, &mut db);
+                            loop {
+                                for program in &programs {
+                                    let _ = resolve_crates(&db, &program.args);
+                                }
+                                if !WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+                                    break;
+                                }
+                                included = true;
+                            }
                             let new = before.changed(&db);
                             eprintln!(
                                 "reload: {} crates are others in {:.1?}",
@@ -5153,7 +5166,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                                 let same = parts.members == program.args.members
                                     && parts.debug == program.args.debug;
                                 if same && (linked.is_none() || new.is_empty()) {
-                                    program.known.touch(&db, Some(&new));
+                                    program.known.touch(&db, (!included).then_some(&new));
                                     program.unbuilt.stale |= !new.is_empty();
                                     continue;
                                 }
