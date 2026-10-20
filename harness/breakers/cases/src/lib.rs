@@ -150,6 +150,7 @@ cases![
     const_black_box,
     frame_of_tables,
     backtrace_line,
+    float_to_int_unchecked,
     static_enum_slice,
     const_none_niche,
     late_import_macro,
