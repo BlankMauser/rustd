@@ -319,7 +319,20 @@ fn source_path(
     let path = source_root.path_for_file(&file)?.as_path()?.to_string();
     let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
     let relative = Path::new(&path).strip_prefix(root).ok().or(base);
-    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    Some(
+        relative
+            .map_or_else(|| as_rustc_names(path.clone()), |it| it.to_string_lossy().into_owned()),
+    )
+}
+
+/// `path` as rustc names it: a file of the standard library's sources by the sysroot joined
+/// with `lib/rustlib/src/rust` as it is written, which on Windows has its `/` left in.
+fn as_rustc_names(path: String) -> String {
+    const INSTALLED: &str = r"\lib\rustlib\src\rust\";
+    match path.split_once(INSTALLED) {
+        Some((sysroot, rest)) => format!(r"{sysroot}\lib/rustlib/src/rust\{rest}"),
+        None => path,
+    }
 }
 
 impl Resolver<'_> {
@@ -2579,8 +2592,9 @@ struct Build {
     steps: [Duration; 3],
     /// Within the checking, the longest a thread took over each kind of cached thing.
     looked: hir_ty::mir::codegen::StaleSteps,
-    /// Why rustc does not compile what was built, when `env!` asks for a variable nobody set.
-    unset: Option<String>,
+    /// Why what was built is no program, when it is not: a function that nothing has code for,
+    /// or an `env!` that asks for a variable nobody set.
+    unfit: Option<String>,
 }
 
 thread_local! {
@@ -2763,6 +2777,14 @@ fn build(
             lock(&LINKED).remove(binary);
         }
     }
+    // A function of a crate rustc built nothing of has no copy to stand in for it.
+    let missing = unit.skipped.iter().find(|(func, error)| {
+        !error.no_symbol() && !resolver.rustc_built(hir_def::HasModule::krate(func, db))
+    });
+    let missing = missing.map(|(func, error)| {
+        let error = with_failed_macro(db, *func, error.clone());
+        format!("`{}` is not compiled by rustd: {error}", name(*func))
+    });
     let build = Build {
         compiled: unit.compiled.len(),
         skipped: unit
@@ -2775,8 +2797,10 @@ fn build(
         emit: start.elapsed(),
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
-        unset: unset_in(db, &local)
-            .map(|it| format!("`env!(\"{it}\")` names a variable that is not set")),
+        unfit: missing.or_else(|| {
+            unset_in(db, &local)
+                .map(|it| format!("`env!(\"{it}\")` names a variable that is not set"))
+        }),
     };
     if let Some(path) = &args.report {
         let compiled: Vec<String> = unit.compiled.iter().map(|&(func, _)| name(func)).collect();
@@ -4394,6 +4418,12 @@ impl Held {
             );
             return None;
         }
+        // The library's crates are the held ones, with the cfg of the target they were read for.
+        let cfg = |it: &ProjectWorkspace| it.rustc_cfg.iter().cloned().collect::<FxHashSet<_>>();
+        if cfg(workspaces.first()?) != cfg(workspaces.last()?) {
+            eprintln!("spare: not used: it holds the library of another target or cfg");
+            return None;
+        }
         eprintln!("spare: workspace added in {:.1?}", start.elapsed());
         Some(self)
     }
@@ -4953,8 +4983,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         known.touch(&db, None);
         cold = build(&db, &table, &args, &mut known, &listed)?;
     }
-    if let Some(unset) = &cold.unset {
-        bail!("{unset}");
+    if let Some(unfit) = &cold.unfit {
+        bail!("{unfit}");
     }
     eprint!("cold: ");
     report(&cold);
@@ -6134,7 +6164,7 @@ impl Program {
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = unnamed
             .or_else(|| refusal(db, &edited, paths, broken, out_of_date))
-            .or_else(|| warm.unset.clone());
+            .or_else(|| warm.unfit.clone());
         failed = failed.or_else(|| stale_copies(db, table, args));
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
         let harnessed = cargo::plan::Harness::of(&args.out).is_ok_and(|it| it.is_some());
@@ -6255,6 +6285,16 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_sources_are_named_as_rustc_names_them() {
+        let windows = r"C:\t\1.99.0\lib\rustlib\src\rust\library\core\src\iter\traits\accum.rs";
+        let named = r"C:\t\1.99.0\lib/rustlib/src/rust\library\core\src\iter\traits\accum.rs";
+        assert_eq!(as_rustc_names(windows.to_owned()), named);
+        let unix = "/t/1.99.0/lib/rustlib/src/rust/library/core/src/lib.rs";
+        assert_eq!(as_rustc_names(unix.to_owned()), unix);
+        assert_eq!(as_rustc_names(r"C:\w\src\lib.rs".to_owned()), r"C:\w\src\lib.rs");
+    }
 
     #[test]
     fn a_link_command_of_lto_has_no_core() {
