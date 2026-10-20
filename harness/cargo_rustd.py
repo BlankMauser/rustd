@@ -566,7 +566,7 @@ FLAG_WORKSPACE = {
     # Integration tests whose harness is the daemon's: tests in modules, `cfg(test)` and a
     # module of helpers beside them; and one test target that has no harness at all.
     "app/tests/common/mod.rs": "pub fn twice<T: Clone>(it: T) -> (T, T) {\n    (it.clone(), it)\n}\n",
-    "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',
+    "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[test]\n#[cfg_attr(miri, ignore = "under miri")]\nfn not_under_miri() {}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',
     "app/tests/plain.rs": 'fn main() {\n    println!("plain: {}", util::greeting("plain"));\n}\n',
     "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
@@ -789,8 +789,17 @@ def daemon(work):
     time.sleep(1)
     open(valued, "w").write("#[test]\nfn valued() {}\n")
     _, mended = here.cargo("test", "--test", "valued")
+    open(valued, "w").write('#[test]\n#[cfg_attr(not(miri), ignore = "not under miri")]\nfn valued() {}\n')
+    _, gated = here.cargo("test", "--test", "valued")
+    check("a test a `cfg_attr` ignores fails the build naming it", gated.returncode != 0 and "ignored by a `cfg_attr`" in gated.stderr, gated.stderr.strip()[-200:])
     os.remove(valued)
     check("a test the daemon refuses fails the build, and runs once its source is mended", refused.returncode != 0 and "returns a value" in refused.stderr and mended.returncode == 0 and "1 passed" in mended.stdout, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; then {mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
+    _, before = here.cargo("test", "--test", "edge")
+    added = os.path.join(ws, "app/tests/added.rs")
+    open(added, "w").write("#[test]\nfn added() {}\n")
+    _, found = here.cargo("test", "--test", "added")
+    os.remove(added)
+    check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
     scripted(work, check)
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)

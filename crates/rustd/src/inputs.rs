@@ -33,23 +33,38 @@ struct Checkout {
     scripts: Option<Scripts>,
 }
 
+/// The directories of a package where cargo finds programs, tests, examples and benches by
+/// their place, without the manifest naming them.
+const TARGET_DIRS: [&str; 4] = ["src/bin", "tests", "examples", "benches"];
+
+/// What of a watched path says it changed.
+#[derive(Clone, Copy)]
+enum Stamp {
+    /// The file, or each file below the directory.
+    Whole,
+    /// Each file below the directory of a package, but for what a build wrote and the
+    /// packages inside.
+    Package,
+    /// Which targets cargo finds in the directory: its Rust files and the directories with a
+    /// `main.rs`.
+    Targets,
+}
+
 /// A file or a directory, and what it was when the daemon read it.
 struct Watched {
     path: PathBuf,
-    /// Whether the directory is a package, of which cargo leaves out what a build wrote and
-    /// the packages inside.
-    package: bool,
+    kind: Stamp,
     stamp: u64,
 }
 
 impl Watched {
-    fn new(path: PathBuf, package: bool) -> Watched {
-        let stamp = stamp(&path, package);
-        Watched { path, package, stamp }
+    fn new(path: PathBuf, kind: Stamp) -> Watched {
+        let stamp = stamp(&path, kind);
+        Watched { path, kind, stamp }
     }
 
     fn changed(&self) -> bool {
-        stamp(&self.path, self.package) != self.stamp
+        stamp(&self.path, self.kind) != self.stamp
     }
 }
 
@@ -82,18 +97,21 @@ impl Inputs {
         let mut files = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
-                files.push(Watched::new(dir.join(".cargo").join(name), false));
+                files.push(Watched::new(dir.join(".cargo").join(name), Stamp::Whole));
             }
         }
         for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"] {
-            files.push(Watched::new(root.join(name), false));
+            files.push(Watched::new(root.join(name), Stamp::Whole));
         }
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
-                files.push(Watched::new(manifest.to_owned(), false));
+                files.push(Watched::new(manifest.to_owned(), Stamp::Whole));
                 // A script that appears there is run without the manifest naming it.
-                files.push(Watched::new(manifest.with_file_name("build.rs"), false));
+                files.push(Watched::new(manifest.with_file_name("build.rs"), Stamp::Whole));
+                // As are the programs, tests and examples cargo finds there by their place.
+                let found = TARGET_DIRS.iter().map(|it| manifest.with_file_name(it));
+                files.extend(found.map(|it| Watched::new(it, Stamp::Targets)));
             }
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
@@ -152,12 +170,15 @@ impl Scripts {
             }
             let script = cargo[package].targets.iter().map(|&it| &cargo[it]);
             let script = script.filter(|it| it.kind == TargetKind::BuildScript);
-            files.extend(script.map(|it| Watched::new(PathBuf::from(it.root.as_str()), false)));
+            files.extend(
+                script.map(|it| Watched::new(PathBuf::from(it.root.as_str()), Stamp::Whole)),
+            );
             match said.watches {
                 // A script that names nothing is run again when any file of its package changes.
-                false => files.push(Watched::new(root.to_owned(), true)),
-                true => files
-                    .extend(said.files.into_iter().map(|it| Watched::new(root.join(it), false))),
+                false => files.push(Watched::new(root.to_owned(), Stamp::Package)),
+                true => files.extend(
+                    said.files.into_iter().map(|it| Watched::new(root.join(it), Stamp::Whole)),
+                ),
             }
         }
         variables.sort();
@@ -206,7 +227,7 @@ impl Scripts {
             return Ok(true);
         }
         for file in &mut self.files {
-            file.stamp = stamp(&file.path, file.package);
+            file.stamp = stamp(&file.path, file.kind);
         }
         for (name, was) in &mut self.variables {
             *was = config.extra_env.get(name).cloned().flatten();
@@ -277,9 +298,24 @@ impl Said {
 
 /// A number that changes when the file at `path`, or a file below the directory there, is
 /// written, added or removed.
-fn stamp(path: &Path, package: bool) -> u64 {
+fn stamp(path: &Path, kind: Stamp) -> u64 {
     let mut hasher = FxHasher::default();
-    stamp_into(path, package, &mut hasher);
+    match kind {
+        Stamp::Whole => stamp_into(path, false, &mut hasher),
+        Stamp::Package => stamp_into(path, true, &mut hasher),
+        Stamp::Targets => {
+            let entries = std::fs::read_dir(path).into_iter().flatten().flatten();
+            let mut targets: Vec<PathBuf> = entries
+                .map(|it| it.path())
+                .filter(|it| match it.is_dir() {
+                    true => it.join("main.rs").exists(),
+                    false => it.extension().is_some_and(|it| it == "rs"),
+                })
+                .collect();
+            targets.sort();
+            targets.hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
