@@ -1064,7 +1064,9 @@ def printed_by(debugger, binary, cwd, place, names):
     # what it printed of the rest, so the two are read together.
     ran = subprocess.run([debugger, "-q", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", cwd=cwd, timeout=300)
-    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
+    # gdb's warnings are whole lines of stderr that can land in the middle of a printed value.
+    out = re.sub(r"warning: [^\n]*\n", "", ran.stdout)
+    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", out) for name in names}
     printed = {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
     return {name: f"{it.split(PRINTER_OPTIMIZED_OUT)[0]}{OPTIMIZED_OUT}" if it and PRINTER_OPTIMIZED_OUT in it else it
             for name, it in printed.items()}
