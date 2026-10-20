@@ -965,11 +965,44 @@ impl SymbolResolver for Resolver<'_> {
             return None;
         };
         let module = it.module(self.db);
-        let name = it.name(self.db);
         if module.nearest_non_block_module(self.db) == module {
-            let path = self.item_path(module, name.as_str())?;
+            let path = self.item_path(module, it.name(self.db).as_str())?;
             return self.table.get(&path).map(str::to_owned);
         }
+        self.static_in_body(id, self.table.linkable()).map(|it| it.0)
+    }
+
+    fn private_static_owner(&self, id: StaticId) -> Option<FunctionId> {
+        let (symbol, owner) = self.static_in_body(id, self.table.private_statics())?;
+        let owner = owner?;
+        let theirs = self.function(owner);
+        let reached = self.table.only_reached_from(&symbol)?;
+        reached.iter().all(|it| Some(it) == theirs.as_ref()).then_some(owner)
+    }
+
+    fn path(&self, path: &str) -> Option<String> {
+        self.table.get(path).map(str::to_owned)
+    }
+
+    fn item(&self, item: ModuleDefId) -> Option<String> {
+        let item = ModuleDef::from(item);
+        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+    }
+}
+
+impl Resolver<'_> {
+    /// The symbol among `paths` of a static written in a body, and the function whose body
+    /// that is.
+    fn static_in_body(
+        &self,
+        id: StaticId,
+        paths: &symbols::Paths,
+    ) -> Option<(String, Option<FunctionId>)> {
+        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
+            return None;
+        };
+        let module = it.module(self.db);
+        let name = it.name(self.db);
         // A static in a body is named after the items around it, which only the syntax knows.
         let sema = hir::Semantics::new(self.db);
         let source = sema.source(it)?;
@@ -987,7 +1020,8 @@ impl SymbolResolver for Resolver<'_> {
                     closures.push(0);
                 }
                 let func = self.function_at(&sema, module, &func)?;
-                owner = Some(self.path(func.try_into().ok()?)?);
+                let func: FunctionId = func.try_into().ok()?;
+                owner = Some((self.path(func)?, func));
                 break;
             }
             let name = match_ast! {
@@ -1012,15 +1046,15 @@ impl SymbolResolver for Resolver<'_> {
                 names.push(name.text().to_string());
             }
         }
-        let owner = match owner {
-            Some(owner) => owner,
+        let (path_of_owner, owner) = match owner {
+            Some((path, func)) => (path, Some(func)),
             None => {
                 around.pop();
                 let outer = names.pop()?;
-                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+                (self.item_path(module.nearest_non_block_module(self.db), &outer)?, None)
             }
         };
-        names.push(owner);
+        names.push(path_of_owner);
         names.reverse();
         closures.reverse();
         around.reverse();
@@ -1031,20 +1065,10 @@ impl SymbolResolver for Resolver<'_> {
                 .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
         };
         let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
-        let symbol = self
-            .table
+        let symbol = paths
             .get_nested(&path, &closures, place, &around)
-            .or_else(|| self.table.get_at(&path, place, &around));
-        symbol.map(str::to_owned)
-    }
-
-    fn path(&self, path: &str) -> Option<String> {
-        self.table.get(path).map(str::to_owned)
-    }
-
-    fn item(&self, item: ModuleDefId) -> Option<String> {
-        let item = ModuleDef::from(item);
-        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+            .or_else(|| paths.get_at(&path, place, &around))?;
+        Some((symbol.to_owned(), owner))
     }
 }
 

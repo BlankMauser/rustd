@@ -40,7 +40,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLV
 cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -713,6 +713,70 @@ def registry_impls(work, check):
     check("an impl a registry crate writes in a function is used", ran.returncode == 0 and ran.stdout.strip() == said and here.how_built(ran.stderr) == "daemon", f"{ran.returncode}: {ran.stdout.strip()[-100:]} {ran.stderr.strip()[-300:]}")
 
 
+BODY_STATICS_DEP = """use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub fn counted() -> impl Future<Output = usize> {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    async move { n }
+}
+
+pub fn shared() -> impl Future<Output = usize> {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    async move { n }
+}
+
+pub fn shared_now() -> usize {
+    let mut future = std::pin::pin!(shared());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(n) => n,
+        std::task::Poll::Pending => unreachable!(),
+    }
+}
+"""
+
+BODY_STATICS_NOW = """fn now<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(it) => it,
+        std::task::Poll::Pending => unreachable!(),
+    }
+}
+"""
+
+
+def body_statics(work, check):
+    """A writable static in the body of a function of another crate that hands out a future,
+    which rustc keeps to its object. We compile such a function ourselves, so the static is
+    ours when nothing of rustc's calls rustc's copy of the function, as hyper-util's `connect`
+    and its `tracing` callsites, and the build fails when something does: two copies of a
+    count would each count part."""
+    dep = os.path.realpath(os.path.join(work, "body-statics-dep"))
+    os.makedirs(os.path.join(dep, "src"), exist_ok=True)
+    open(os.path.join(dep, "Cargo.toml"), "w").write('[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(dep, "src/lib.rs"), "w").write(BODY_STATICS_DEP)
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=dep, check=True, capture_output=True)
+    git("init", "-q")
+    git("add", "-A")
+    git("commit", "-qm", "dep")
+    ws = os.path.realpath(os.path.join(work, "body-statics"))
+    os.makedirs(os.path.join(ws, "src/bin"), exist_ok=True)
+    url = pathlib.Path(dep).as_uri()
+    open(os.path.join(ws, "Cargo.toml"), "w").write(f'[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ndep = {{ git = "{url}" }}\n')
+    open(os.path.join(ws, "src/bin/counted.rs"), "w").write(BODY_STATICS_NOW + 'fn main() {\n    let counts: Vec<usize> = (0..3).map(|_| now(async { dep::counted().await })).collect();\n    println!("{counts:?}");\n}\n')
+    open(os.path.join(ws, "src/bin/shared.rs"), "w").write(BODY_STATICS_NOW + 'fn main() {\n    println!("{} {} {}", dep::shared_now(), now(dep::shared()), dep::shared_now());\n}\n')
+    here = Side(ws, base_env(os.path.join(work, "home-statics")), True)
+    _, counted = here.cargo("run", "--bin", "counted")
+    check("a static of another crate's body that only our copy of its function reaches is ours", counted.returncode == 0 and counted.stdout.strip() == "[0, 1, 2]" and here.how_built(counted.stderr) == "daemon", f"{counted.returncode}: {counted.stdout.strip()[-100:]} {counted.stderr.strip()[-300:]}")
+    _, shared = here.cargo("run", "--bin", "shared")
+    here.cargo("stop")
+    check("and one rustc's code also reaches fails the build, named", shared.returncode != 0 and "writable static `CALLS`" in shared.stderr and "0 1 2" not in shared.stdout, f"{shared.returncode}: {shared.stdout.strip()[-100:]} {shared.stderr.strip()[-300:]}")
+
+
 INCREMENTAL_LIB = """use std::sync::atomic::{AtomicUsize, Ordering};
 static HITS: AtomicUsize = AtomicUsize::new(0);
 pub fn a() -> u32 { A }
@@ -905,6 +969,7 @@ def daemon(work):
     check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
     scripted(work, check)
     registry_impls(work, check)
+    body_statics(work, check)
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)

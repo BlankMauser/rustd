@@ -221,6 +221,12 @@ pub trait SymbolResolver {
     fn private(&self, _func: FunctionId) -> bool {
         false
     }
+    /// The function whose body declares a writable static that rustc keeps to its object,
+    /// when nothing of rustc's build reaches rustc's copy of the static but rustc's copy of
+    /// that function: a program that never calls that copy has only ours of the static.
+    fn private_static_owner(&self, _id: StaticId) -> Option<FunctionId> {
+        None
+    }
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
     /// The path of an item, e.g. `core::any::TypeId`.
@@ -4567,7 +4573,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
-        if compiled.writable && !self.own_statics.owns(db, id) {
+        if compiled.writable && !self.own_statics.owns(db, id) && !self.ours_alone(id) {
             let name = hir_def::signatures::StaticSignature::of(db, id).name.as_str();
             unsupported!("writable static `{name}` without a rustc symbol");
         }
@@ -4925,6 +4931,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
             }
         }
+    }
+
+    /// Whether rustc's copy of a writable static of another crate is never used: only rustc's
+    /// copy of the function declaring it reaches it, and that function hands out a future, so
+    /// we call ours.
+    fn ours_alone(&self, id: StaticId) -> bool {
+        self.symbols.private_static_owner(id).is_some_and(|func| {
+            !self.own_statics.crates.contains(&func.krate(self.db))
+                && *returns_async_block(self.db, func)
+        })
     }
 
     /// The symbol of rustc's copy of `instance`, when that can stand in for ours.
