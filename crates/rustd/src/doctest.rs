@@ -14,7 +14,6 @@ mod program;
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::Instant,
 };
@@ -588,6 +587,7 @@ fn failure(ran: &std::process::Output) -> String {
 /// with `env`, as `args` ask, and says how they went as rustdoc's test harness does. Their
 /// files are named from `root`. The code to end with.
 pub(crate) fn run(
+    runner: &[String],
     binary: &Path,
     run_in: &Path,
     env: &[(String, String)],
@@ -598,7 +598,10 @@ pub(crate) fn run(
     let wanted = Wanted::parse(args).map_err(|it| {
         anyhow::anyhow!("the doc tests are run with `{it}`, which rustd does not read yet")
     })?;
-    let listed = Command::new(binary).arg("--list").output().context("listing the examples")?;
+    let listed = crate::cargo::running(runner, binary)
+        .arg("--list")
+        .output()
+        .context("listing the examples")?;
     anyhow::ensure!(listed.status.success(), "the program of the examples did not list them");
     let entries: Vec<Entry> = serde_json::from_slice(&listed.stdout)?;
     let named = |it: &Entry| {
@@ -626,7 +629,7 @@ pub(crate) fn run(
             continue;
         }
         let tests: Vec<(String, Entry)> = group.into_iter().map(|it| (named(&it), it)).collect();
-        code = code.max(run_group(binary, run_in, env, tests, &wanted)?);
+        code = code.max(run_group(runner, binary, run_in, env, tests, &wanted)?);
     }
     if merged {
         let took = start.elapsed().as_secs_f64();
@@ -641,6 +644,7 @@ pub(crate) fn run(
 /// Runs the examples `tests` asks for, by their names, and says how they went as one run of
 /// the harness does.
 fn run_group(
+    runner: &[String],
     binary: &Path,
     run_in: &Path,
     env: &[(String, String)],
@@ -669,7 +673,7 @@ fn run_group(
                     let Some((name, entry)) = tests.get(at) else { break };
                     let result = match &entry.how {
                         How::Runs { at, should_panic } => {
-                            let ran = Command::new(binary)
+                            let ran = crate::cargo::running(runner, binary)
                                 .arg(at.to_string())
                                 .current_dir(run_in)
                                 .envs(env.iter().cloned())

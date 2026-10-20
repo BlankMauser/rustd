@@ -24,7 +24,7 @@ use super::{
     client::{self, Start},
     daemon::{Reply, Request},
     plan::Plan,
-    state::{Kind, Program, State, as_staged},
+    state::{Kind, Program, State, as_staged, running},
 };
 
 /// The variable that, set to `0`, has every test run: as `--rerun-all` does.
@@ -84,6 +84,7 @@ struct Reach {
 /// A test program whose tests can be told apart by what they run.
 pub(super) struct Selective<'a> {
     program: &'a Program,
+    runner: &'a [String],
     reached: BTreeMap<String, Reach>,
     outside: String,
     /// The object of the program: what the daemon keeps its results by.
@@ -132,6 +133,7 @@ impl<'a> Selective<'a> {
             put(name);
             put(value);
         }
+        state.runner.iter().for_each(|it| put(it));
         flags.iter().filter(|it| it.contains("ignored")).for_each(|it| put(it));
         let compiled: BTreeSet<&Path> = state.sources().collect();
         let mut files = Vec::new();
@@ -145,7 +147,15 @@ impl<'a> Selective<'a> {
         let object = plan.object.to_string_lossy().into_owned();
         let remember =
             !asked.flags.rerun_all && std::env::var_os(SWITCH).is_none_or(|it| it != "0");
-        Some(Selective { program, reached, outside, object, flags, remember })
+        Some(Selective {
+            program,
+            runner: &state.runner,
+            reached,
+            outside,
+            object,
+            flags,
+            remember,
+        })
     }
 
     /// Runs the tests `asked` names whose result is not known and says the result of the
@@ -325,7 +335,7 @@ impl<'a> Selective<'a> {
     }
 
     fn command(&self) -> std::io::Result<Command> {
-        let mut command = Command::new(&self.program.executable);
+        let mut command = running(self.runner, &self.program.executable);
         command.envs(self.program.env.iter().cloned()).current_dir(&self.program.package_dir);
         as_staged(&mut command)?;
         Ok(command)

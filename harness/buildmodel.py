@@ -104,8 +104,12 @@ class Case:
         cross = CROSS.get(self.target, {}) if self.target != host() else {}
         self.runner = cross.get("runner", [])
         self.env = {**os.environ, **self.spec.get("env", {})}
+        variable = "CARGO_TARGET_" + (self.target or "").upper().replace("-", "_")
         if "linker" in cross:
-            self.env["CARGO_TARGET_" + self.target.upper().replace("-", "_") + "_LINKER"] = cross["linker"]
+            self.env[variable + "_LINKER"] = cross["linker"]
+        # What cargo and rustd run the programs of the target under, doc tests among them.
+        if self.runner:
+            self.env[variable + "_RUNNER"] = " ".join(self.runner)
         if backend == "llvm":
             self.env.update(RUSTD_BACKEND="llvm", RUSTD_OPT="2", RUSTD_EMIT="fast")
         else:

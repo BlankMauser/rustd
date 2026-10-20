@@ -58,6 +58,9 @@ pub(crate) struct State {
     /// run.
     #[serde(default)]
     pub(crate) unrun_doc_tests: Vec<String>,
+    /// What cargo runs the programs under: the target's `runner`, empty when it has none.
+    #[serde(default)]
+    pub(crate) runner: Vec<String>,
     pub(crate) counts: Counts,
 }
 
@@ -627,6 +630,7 @@ impl State {
             checkouts: Vec::new(),
             refusal: None,
             unrun_doc_tests: Vec::new(),
+            runner: runner(asked, cwd),
             counts,
         };
         let project = match project(asked, cwd, &metadata) {
@@ -897,6 +901,62 @@ pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
 pub(crate) fn as_staged(command: &mut Command) -> std::io::Result<()> {
     command.env(switch::VARIABLE, switch::first_wrapper_path()?).env(wrapper::DRIVEN, "1");
     Ok(())
+}
+
+/// A command that runs `executable` as cargo runs a program it built: under `runner`, when
+/// the target has one.
+pub(crate) fn running(runner: &[String], executable: &Path) -> Command {
+    match runner {
+        [program, args @ ..] => {
+            let mut command = Command::new(program);
+            command.args(args).arg(executable);
+            command
+        }
+        [] => Command::new(executable),
+    }
+}
+
+/// The `runner` of the target cargo builds for, as cargo reads it: from
+/// `CARGO_TARGET_<TRIPLE>_RUNNER`, or else `target.<triple>.runner` of the nearest cargo
+/// configuration that has one.
+fn runner(asked: &Invocation, cwd: &Path) -> Vec<String> {
+    let host = || {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(rustc).arg("-vV").output().ok()?;
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        said.lines().find_map(|it| it.strip_prefix("host: ")).map(str::to_owned)
+    };
+    let Some(triple) = asked.flags.targets.first().cloned().or_else(host) else {
+        return Vec::new();
+    };
+    let words = |it: &str| it.split_whitespace().map(str::to_owned).collect();
+    let variable =
+        format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
+    if let Ok(it) = std::env::var(variable) {
+        return words(&it);
+    }
+    let home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(Path::new(&home).join(".cargo"))
+    });
+    let dirs = cwd.ancestors().map(|it| it.join(".cargo")).chain(home);
+    for dir in dirs {
+        let Some(text) = ["config.toml", "config"]
+            .iter()
+            .find_map(|it| std::fs::read_to_string(dir.join(it)).ok())
+        else {
+            continue;
+        };
+        let Ok(config) = text.parse::<toml::Table>() else { continue };
+        match config.get("target").and_then(|it| it.get(&triple)).and_then(|it| it.get("runner")) {
+            Some(toml::Value::String(it)) => return words(it),
+            Some(toml::Value::Array(it)) => {
+                return it.iter().filter_map(|it| it.as_str().map(str::to_owned)).collect();
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
 }
 
 /// The cargo to run: the one that ran this command, or the one on the path.

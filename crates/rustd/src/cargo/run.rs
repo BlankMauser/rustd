@@ -1,10 +1,7 @@
 //! Running what was built, as cargo does: the program of `cargo run`, the test executables
 //! of `cargo test`.
 
-use std::{
-    path::Path,
-    process::{Command, ExitStatus},
-};
+use std::{path::Path, process::ExitStatus};
 
 use anyhow::Context as _;
 
@@ -12,7 +9,7 @@ use super::{
     cli::Invocation,
     say,
     select::Selective,
-    state::{Kind, Program, State, as_staged},
+    state::{Kind, Program, State, as_staged, running},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -36,7 +33,7 @@ pub(crate) fn program(
     let shown = shown_path(&program.executable, cwd);
     let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
     say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
+    let mut command = running(&state.runner, &program.executable);
     command.args(asked.program_args()).envs(program.env.iter().cloned());
     as_staged(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
@@ -56,7 +53,7 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
         let status = match selective.map(|it| it.run(asked)).transpose()?.flatten() {
             Some(status) => status,
             None => {
-                let mut command = Command::new(&test.executable);
+                let mut command = running(&state.runner, &test.executable);
                 command.args(asked.program_args()).envs(test.env.iter().cloned());
                 command.current_dir(&test.package_dir);
                 as_staged(&mut command)?;
@@ -99,6 +96,7 @@ pub(crate) fn doc_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32
         say::status(asked.flags.quiet, "Doc-tests", &library.name.replace('-', "_"));
         let args: Vec<String> = asked.program_args().cloned().collect();
         let code = crate::doctest::run(
+            &state.runner,
             &library.executable,
             &library.package_dir,
             &library.env,

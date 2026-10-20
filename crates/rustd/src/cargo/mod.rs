@@ -15,6 +15,8 @@ mod say;
 pub(crate) mod script;
 mod select;
 mod state;
+
+pub(crate) use state::running;
 mod switch;
 mod units;
 

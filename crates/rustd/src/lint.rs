@@ -7,7 +7,6 @@ use std::{path::PathBuf, sync::atomic::Ordering};
 use either::Either;
 use hir::{Crate, HirFileId, InFile};
 use hir_def::{
-    DefWithBodyId,
     expr_store::{Body, BodySourceMap},
     hir::{ExprId, ExprOrPatId},
 };
