@@ -53,13 +53,13 @@ fi
 
 tar xzf "$work/$archive" -C "$work"
 mkdir -p "$dir"
-for bin in rustd cargo-rustd rustd-rustc; do
+for bin in rustd cargo-rustd rustd-rustc rustd-rustc-first; do
     # Moved into place, so that a daemon that is running keeps the file it started from.
     cp "$work/rustd-$target/$bin" "$dir/.$bin.new"
     chmod 755 "$dir/.$bin.new"
     mv -f "$dir/.$bin.new" "$dir/$bin"
 done
-say "installed rustd, cargo-rustd and rustd-rustc in $dir"
+say "installed rustd, cargo-rustd, rustd-rustc and rustd-rustc-first in $dir"
 
 case ":$PATH:" in
     *":$dir:"*) ;;

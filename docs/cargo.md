@@ -16,7 +16,7 @@ program is built with rustd and runs the `rustd` executable in the same director
 have to be installed side by side:
 
     cargo +1.99.1 build -p rustd --release
-    cp target/release/rustd target/release/cargo-rustd ~/.cargo/bin/
+    cp target/release/{rustd,cargo-rustd,rustd-rustc,rustd-rustc-first} ~/.cargo/bin/
 
 The project you build must use Rust 1.99.1, the toolchain rustd is pinned to. Use a
 `rust-toolchain.toml`, `rustup override set 1.99.1`, or `RUSTUP_TOOLCHAIN=1.99.1`.

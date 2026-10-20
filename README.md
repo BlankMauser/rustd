@@ -86,10 +86,11 @@ Ubuntu, `llvm-20-dev` and `libpolly-20-dev` from apt.llvm.org):
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.1 build -p rustd --release --features llvm
 
-The build leaves `rustd`, `cargo-rustd` and `rustd-rustc` in `target/release`. Put all three
-in one directory on your `PATH`; each runs the others from next to itself.
+The build leaves `rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` in
+`target/release`. Put all four in one directory on your `PATH`; each runs the others from
+next to itself.
 
-    cp target/release/{rustd,cargo-rustd,rustd-rustc} ~/.cargo/bin/
+    cp target/release/{rustd,cargo-rustd,rustd-rustc,rustd-rustc-first} ~/.cargo/bin/
 
 ## Quick start
 

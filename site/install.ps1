@@ -33,7 +33,7 @@ try {
     Expand-Archive (Join-Path $work $archive) -DestinationPath $work
     New-Item -ItemType Directory $dir -Force | Out-Null
     Copy-Item (Join-Path $work "rustd-x86_64-pc-windows-msvc\*.exe") $dir -Force
-    Write-Host "rustd: installed rustd, cargo-rustd and rustd-rustc in $dir"
+    Write-Host "rustd: installed rustd, cargo-rustd, rustd-rustc and rustd-rustc-first in $dir"
     Write-Host "rustd: it needs Rust 1.99.1 with rust-src: rustup toolchain install 1.99.1 --component rust-src"
 } finally {
     Remove-Item $work -Recurse -Force
