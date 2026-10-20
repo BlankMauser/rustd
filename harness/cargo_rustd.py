@@ -983,7 +983,13 @@ def stranger(home, check):
     sock = os.path.join(home, "daemon.sock")
     version = re.search(r"version (\S+),", subprocess.run(["cargo", "rustd", "status"], env=dict(os.environ, RUSTD_HOME=home, PATH=os.path.dirname(RUSTD) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
     request = json.dumps({"version": version, "replaces": False, "request": "Status"})
-    knock = lambda user: subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/").stdout.strip()
+    # A Python under the user's home may be one the second user can't run.
+    python, up = os.path.realpath(sys.executable), []
+    while not up or up[-1] != os.path.dirname(up[-1]):
+        up.append(os.path.dirname(up[-1] if up else python))
+    reachable = all(os.stat(it).st_mode & 0o001 for it in [python, *up])
+    python = python if reachable else shutil.which("python3", path="/usr/bin:/bin") or python
+    knock = lambda user: subprocess.run([*(["sudo", "-n", "-u", user] if user else []), python, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/").stdout.strip()
     try:
         mine = knock(None)
         check("the user's own raw request is answered", made.returncode == 0 and '"Status"' in mine, mine[:60])
@@ -1011,7 +1017,7 @@ def stranger(home, check):
         # user's client, which sends its request and its variables to whoever serves it.
         trap = os.path.join(tempfile.mkdtemp(prefix="rustd-trap-", dir="/tmp"), "sock")
         os.chmod(os.path.dirname(trap), 0o777)
-        listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
+        listener = subprocess.Popen(["sudo", "-n", "-u", name, python, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
         try:
             listener.stdout.readline()
             asked = subprocess.run([RUSTD, "sync", trap], capture_output=True, text=True, timeout=60)
