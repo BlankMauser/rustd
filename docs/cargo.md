@@ -36,6 +36,23 @@ of its own. `status` prints what the daemon holds, and for every workspace how m
 the daemon served and how many went to cargo, with the reasons. `stop` ends the daemon. Any
 other subcommand is passed to cargo as typed.
 
+### rustc's build of the same source
+
+The daemon's program is for the edit loop. When its output is in doubt, or what you want is
+rustc's verdict, run cargo itself. Nothing has to be stopped or cleaned first.
+
+- `cargo rustd check` is `cargo check`: rustc's diagnostics and its borrow checker, which
+  the daemon does not have.
+- Plain `cargo build`, `cargo run` and `cargo test`, without `rustd enable`, are rustc's.
+  The daemon does not write cargo's records, so after it has served an edit cargo finds
+  the crate changed and builds and links it again, in the same `target/` directory.
+- `--release`, and any profile other than `dev` and `test`, is cargo's under `cargo rustd`
+  too.
+- `RUSTD_SPLICE=0` keeps the daemon and links every edit in full, for a program a splice
+  is suspected of breaking.
+- `cargo rustd stop` ends the daemon. Builds are cargo's again until a new daemon has
+  loaded the workspace.
+
 ## What a build does
 
 The first build of a workspace is cargo's own, run with rustd as the
@@ -419,6 +436,15 @@ cargo's with the reason "the daemon could not load the workspace". And
 `CARGO_INCREMENTAL=0 cargo rustd test` on the generated workspace exits 1 where cargo exits
 0; run alone, it prints the same message from a doctest. ripgrep and fd matched cargo on
 every step. This was not looked into further and not fixed.
+
+The same harness on a Windows 11 laptop (Intel i7-12700H, 20 threads, 16 GB), Rust 1.99.1,
+Cranelift, with other builds running on the machine: every step of the three projects in
+both modes gave cargo's output, exit status and test results, and in each of two runs 95
+of the 96 checks of the daemon and of plain cargo held. The one that did not is "and plain cargo is cargo
+alone again, through the user's wrappers": after another build of rustd had served plain
+cargo and `rustd disable` had put the configuration back byte for byte, two of the calls
+of the user's `rustc-wrapper` in the next plain build were still given that build's
+`rustd-rustc.exe`. The program was cargo's and right. This was not looked into.
 
 Not run on Windows: the projects of the harness other than those three, a second user at
 the socket, and the debug info of a program built through cargo. The PDB after a splice is
