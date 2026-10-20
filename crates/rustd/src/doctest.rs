@@ -333,8 +333,12 @@ fn written(db: &RootDatabase, documented: base_db::Crate, target: &str) -> Vec<W
         let ignored =
             marks.ignore || marks.ignored_on.iter().any(|it| target.contains(it.as_str()));
         let refused = refusal(&program.source, edition, &marks);
-        let merged =
-            edition.at_least_2024() && !ignored && !marks.compile_fail && refused.is_none();
+        // Rustdoc merges an ignored example too, when it parses.
+        let parses = || ast::SourceFile::parse(&program.source, edition).errors().is_empty();
+        let merged = edition.at_least_2024()
+            && !marks.compile_fail
+            && refused.is_none()
+            && (!ignored || parses());
         let (how, module) = match () {
             _ if ignored => (How::Ignored, None),
             _ if marks.compile_fail => (How::Passed, Some(program.source)),
