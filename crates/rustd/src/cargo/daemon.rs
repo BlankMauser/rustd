@@ -39,6 +39,8 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// How often a worker that is loading is looked at.
 const POLL: Duration = Duration::from_millis(20);
+/// How long a worker that hung up on a request is given to end.
+const ENDING: Duration = Duration::from_secs(2);
 
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
@@ -412,9 +414,18 @@ impl Worker {
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
     /// the inner one its answer that it does not build this.
     fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, String>> {
-        let failed = || match self.ended() {
-            Some(how) => format!("the daemon's worker ended ({how})"),
-            None => "the daemon's worker did not answer".to_owned(),
+        // A worker that hangs up is ending, and why is what the client is told.
+        let failed = || {
+            let asked = Instant::now();
+            loop {
+                match self.ended() {
+                    Some(how) => return format!("the daemon's worker ended ({how})"),
+                    None if asked.elapsed() > ENDING => {
+                        return "the daemon's worker did not answer".to_owned();
+                    }
+                    None => std::thread::sleep(POLL),
+                }
+            }
         };
         let mut stream = self.connected()?;
         let mut env = self.env.clone();
