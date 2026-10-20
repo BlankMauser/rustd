@@ -1,0 +1,48 @@
+.github/workflows/rustd.yaml
+  h_9b6f78b66c1cb5 284-287,392-446
+README.md
+  h_9b6f78b66c1cb5 43-46,136,201-214,234
+crates/rustd/Cargo.toml
+  h_9b6f78b66c1cb5 76
+crates/rustd/src/bin/rustd-rustc.rs
+  h_9b6f78b66c1cb5 5-8,13-16,53-82
+crates/rustd/src/cargo/ancestor.rs
+  h_9b6f78b66c1cb5 194-420,423-427
+crates/rustd/src/cargo/cli.rs
+  h_9b6f78b66c1cb5 381-387
+crates/rustd/src/cargo/client.rs
+  h_9b6f78b66c1cb5 95
+crates/rustd/src/cargo/script.rs
+  h_9b6f78b66c1cb5 23-25,59-64,67,70-72
+crates/rustd/src/cargo/units.rs
+  h_9b6f78b66c1cb5 70-72
+crates/rustd/src/cargo/wrapper.rs
+  h_9b6f78b66c1cb5 152-154,255-264
+crates/rustd/src/doctest.rs
+  h_9b6f78b66c1cb5 260-261,263
+crates/rustd/src/main.rs
+  h_9b6f78b66c1cb5 158-171,286-287,763,774,803-804,1436-1438,1443-1445,1455-1462,1466,1469-1471,1506-1511,2114-2117,2627,2638,3461,4027-4038,4661,5202-5206,5828-5832,5898,6108,6110-6111
+crates/rustd/src/symbols.rs
+  h_9b6f78b66c1cb5 191-198,219,232-234
+docs/cargo.md
+  h_9b6f78b66c1cb5 203-205,290,346-425
+docs/platforms.md
+  h_9b6f78b66c1cb5 103-105,109-112
+docs/support.md
+  h_9b6f78b66c1cb5 30,68-70
+harness/buildmodel.py
+  h_9b6f78b66c1cb5 4,98-99,120-122,505-517,524,531
+harness/cargo_rustd.py
+  h_9b6f78b66c1cb5 42,207-256,446-450,594,801,872,881-882,899,939-943,1001-1027,1101,1104-1105,1135,1195-1199,1201-1202,1204,1220,1230-1231,1235-1236,1248,1252,1255,1264,1276,1321,1347-1349,1360,1399
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c16631ebbb9d1ee38e5fce2c61d3aa55c6090729",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
