@@ -169,7 +169,8 @@ workspace's crates once, and share the dependencies.
 
 ## Which tests run
 
-`cargo rustd test` remembers the tests that passed. When a test program is built, the
+`cargo rustd test` remembers the tests that passed, in the daemon's memory: a new daemon
+runs every test once. When a test program is built, the
 daemon writes beside it what each test can reach: the functions, the instances of generic
 ones and the statics, with a print of their code. A test that passed is not run again when
 nothing it can reach changed and nothing outside the code changed either. It is listed
@@ -177,9 +178,12 @@ as `ok (cached)`. Each test that is run is a process of its own.
 
 Outside the code means the environment, the test's arguments, the other programs of the
 build, and the length and time of every file in the package that is not a Rust source the
-build compiled. A test that reaches code that is not all known, or that shares a static it
-can write with other tests, is run again together with them. A test that failed is not
-remembered.
+build compiled. A test that reaches code that is not all known is run every time. A test
+that failed is not remembered.
+
+Each test that runs is a process of its own, with as many at once as `--test-threads` says,
+or one per core. A test that depends on what another test left in the process fails, as
+under nextest. `RUSTD_TEST_TIMEOUT`, in seconds, stops and fails a test that runs longer.
 
 `--rerun-all` or `RUSTD_TEST_CACHE=0` runs every test in one process, as libtest does,
 and nothing is remembered from that run.

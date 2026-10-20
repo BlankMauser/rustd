@@ -1,16 +1,18 @@
 //! Running only the tests an edit can have changed the result of. The worker says, for
 //! each test of a program it built, a print of all the code the test can run; a test
-//! that passed with the same print, among the same tests and with the same things outside
-//! the code, is said to have passed and is not run. "Which tests run" in `docs/cargo.md`
-//! says what is outside the code.
+//! that passed with the same print and with the same things outside the code is said to
+//! have passed and is not run; the daemon keeps what passed for as long as it lives. Each
+//! test that runs is a process of its own. "Which tests run" in `docs/cargo.md` says what
+//! is outside the code.
 #![allow(clippy::print_stdout, reason = "the results go where the harness prints its own")]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead as _, BufReader},
+    io::Read as _,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    time::{Instant, UNIX_EPOCH},
+    sync::Mutex,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::Context as _;
@@ -19,12 +21,17 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     cli::Invocation,
+    client::{self, Start},
+    daemon::{Reply, Request},
     plan::Plan,
     state::{Kind, Program, State, as_staged},
 };
 
 /// The variable that, set to `0`, has every test run: as `--rerun-all` does.
 const SWITCH: &str = "RUSTD_TEST_CACHE";
+
+/// The variable that says how many seconds a test may run before it is stopped and failed.
+const TIMEOUT: &str = "RUSTD_TEST_TIMEOUT";
 
 /// The variables that differ between two calls from one shell and that no test is known to
 /// read.
@@ -52,18 +59,26 @@ struct Results {
 struct Passed {
     /// The print of the code the test could run.
     print: String,
-    /// A print of the tests it shares a writable static with that ran in its process.
-    company: String,
     ignored: bool,
     /// The test as the harness names it in its result: `a - should panic` for one.
     shown: String,
 }
 
-/// What the worker said of a test: the print of what it can run, when all of it is
-/// known, and the group of tests it shares writable statics with.
+/// What a test run alone came to.
+struct Alone {
+    /// The test as the harness names it in its result.
+    shown: String,
+    /// Whether it was ignored, when it passed.
+    outcome: Option<bool>,
+    /// What it said, when it failed.
+    said: String,
+    status: ExitStatus,
+    timed_out: bool,
+}
+
+/// What the worker said of a test: the print of what it can run, when all of it is known.
 struct Reach {
     print: Option<String>,
-    group: usize,
 }
 
 /// A test program whose tests can be told apart by what they run.
@@ -71,22 +86,23 @@ pub(super) struct Selective<'a> {
     program: &'a Program,
     reached: BTreeMap<String, Reach>,
     outside: String,
-    store: PathBuf,
+    /// The object of the program: what the daemon keeps its results by.
+    object: String,
     flags: Vec<&'a String>,
+    /// Whether results are kept and used: not under `--rerun-all`.
+    remember: bool,
 }
 
 impl<'a> Selective<'a> {
-    /// `None` when every test of `program` has to run: the daemon did not build it, the
-    /// worker said nothing of this build, the run is asked for in a way that is not known
-    /// to leave results alone, or another program of the build is one it can't vouch for.
+    /// `None` when the tests of `program` can't be run each alone: the daemon did not build
+    /// it, the worker said nothing of this build, the run is asked for in a way that is not
+    /// known to leave results alone, or another program of the build is one it can't vouch
+    /// for.
     pub(super) fn of(
         asked: &'a Invocation,
         state: &'a State,
         program: &'a Program,
     ) -> Option<Self> {
-        if asked.flags.rerun_all || std::env::var_os(SWITCH).is_some_and(|it| it == "0") {
-            return None;
-        }
         let flags = harness_flags(asked)?;
         let plan = current(state, program)?;
         let reached = reached(plan)?;
@@ -126,8 +142,10 @@ impl<'a> Selective<'a> {
         files.dedup();
         files.iter().for_each(|it| put(it));
         let outside = hex(&hash.finalize());
-        let store = with_suffix(&plan.object, ".results");
-        Some(Selective { program, reached, outside, store, flags })
+        let object = plan.object.to_string_lossy().into_owned();
+        let remember =
+            !asked.flags.rerun_all && std::env::var_os(SWITCH).is_none_or(|it| it != "0");
+        Some(Selective { program, reached, outside, object, flags, remember })
     }
 
     /// Runs the tests `asked` names whose result is not known and says the result of the
@@ -136,23 +154,9 @@ impl<'a> Selective<'a> {
         let started = Instant::now();
         let Some(named) = self.listed(asked)? else { return Ok(None) };
         let mut results = self.results();
-        let company = self.company(&named);
-        let known = |name: &String| {
-            let reach = self.reached.get(name)?;
-            let passed = results.tests.get(name)?;
-            let same = Some(&passed.print) == reach.print.as_ref()
-                && passed.company == company[&reach.group];
-            same.then_some(passed)
-        };
-        // One test of a group that has to run has all of them run: they ran together.
-        let stale: BTreeSet<usize> = named
-            .iter()
-            .filter(|it| known(it).is_none())
-            .filter_map(|it| Some(self.reached.get(it)?.group))
-            .collect();
         let cached = |name: &String| {
-            let group = self.reached.get(name)?.group;
-            known(name).filter(|_| !stale.contains(&group))
+            let passed = results.tests.get(name)?;
+            (Some(&passed.print) == self.reached.get(name)?.print.as_ref()).then_some(passed)
         };
         let (kept, run): (Vec<&String>, Vec<&String>) =
             named.iter().partition(|it| cached(it).is_some());
@@ -171,50 +175,153 @@ impl<'a> Selective<'a> {
                 }
             }
         }
-        let cached = Tally { passed, ignored, all: self.reached.len() };
-        if run.is_empty() {
-            let none = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
-            let took = format!("finished in {:.2}s", started.elapsed().as_secs_f64());
-            let line = cached.rewritten(&format!("{none}; {took}")).unwrap_or_default();
-            println!("\n{line}\n");
-            return Ok(Some(ExitStatus::default()));
-        }
-        let mut command = self.command()?;
-        match kept.is_empty() {
-            true => command.args(asked.program_args()),
-            false => command.args(&self.flags).arg("--exact").args(&run),
-        };
-        command.stdout(Stdio::piped());
-        let mut child = command.spawn().context("running the tests")?;
-        let lines = BufReader::new(child.stdout.take().context("the tests have no output")?);
-        let mut seen: BTreeMap<String, (String, Option<bool>)> = BTreeMap::new();
-        for line in lines.lines() {
-            let line = line?;
-            if let Some((name, shown, outcome)) = outcome(&line) {
-                seen.insert(name.to_owned(), (shown.to_owned(), outcome));
+        let tally = Tally { passed, ignored, all: self.reached.len() };
+        let ran = self.each_alone(&run)?;
+        let mut failures = String::new();
+        let mut failed = Vec::new();
+        let mut status = ExitStatus::default();
+        let (mut passed, mut ignored) = (0, 0);
+        for (name, ran) in run.iter().zip(&ran) {
+            match ran.outcome {
+                Some(true) => ignored += 1,
+                Some(false) => passed += 1,
+                None => {
+                    failures.push_str(&format!("\n---- {} stdout ----\n{}", ran.shown, ran.said));
+                    failed.push(ran.shown.clone());
+                    status = ran.status;
+                }
             }
-            match cached.rewritten(&line) {
-                Some(line) => println!("{line}"),
-                None if line.starts_with("running ") && line.ends_with(" tests") => {}
-                None if line.starts_with("running ") && line.ends_with(" test") => {}
-                None => println!("{line}"),
-            }
-        }
-        let status = child.wait()?;
-        for name in &run {
-            let entry = seen.get(name.as_str()).and_then(|(shown, outcome)| {
-                let reach = self.reached.get(*name)?;
-                let (print, company) = (reach.print.clone()?, company[&reach.group].clone());
-                Some(Passed { print, company, ignored: (*outcome)?, shown: shown.clone() })
-            });
+            let entry = ran.outcome.zip(self.reached.get(*name).and_then(|it| it.print.clone()));
             match entry {
-                Some(entry) => results.tests.insert((*name).clone(), entry),
+                Some((ignored, print)) => {
+                    let passed = Passed { print, ignored, shown: ran.shown.clone() };
+                    results.tests.insert((*name).clone(), passed)
+                }
                 None => results.tests.remove(*name),
             };
         }
+        if !failed.is_empty() {
+            failed.sort_unstable();
+            println!("\nfailures:\n{failures}\nfailures:");
+            failed.iter().for_each(|it| println!("    {it}"));
+        }
+        let verdict = if failed.is_empty() { "ok" } else { "FAILED" };
+        let took = started.elapsed().as_secs_f64();
+        let line = format!(
+            "test result: {verdict}. {passed} passed; {} failed; {ignored} ignored; 0 measured; \
+             0 filtered out; finished in {took:.2}s",
+            failed.len()
+        );
+        println!("\n{}\n", tally.rewritten(&line).unwrap_or(line));
         results.outside.clone_from(&self.outside);
-        std::fs::write(&self.store, serde_json::to_vec(&results)?)?;
+        if self.remember {
+            let results = serde_json::to_string(&results)?;
+            let _ =
+                client::ask(Request::Keep { object: self.object.clone(), results }, Start::Never);
+        }
         Ok(Some(status))
+    }
+
+    /// Runs each of `names` in a process of its own, as many at once as the harness would
+    /// run threads, printing each result as it comes.
+    fn each_alone(&self, names: &[&String]) -> anyhow::Result<Vec<Alone>> {
+        let (threads, flags) = threads(&self.flags);
+        let timeout =
+            std::env::var(TIMEOUT).ok().and_then(|it| it.parse().ok()).map(Duration::from_secs);
+        let next = Mutex::new(0);
+        let ran: Mutex<Vec<Option<Alone>>> = Mutex::new(names.iter().map(|_| None).collect());
+        let threads = threads.min(names.len()).max(1);
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| -> anyhow::Result<()> {
+                        loop {
+                            let at = {
+                                let mut next = next.lock().unwrap_or_else(|it| it.into_inner());
+                                *next += 1;
+                                *next - 1
+                            };
+                            let Some(name) = names.get(at) else { return Ok(()) };
+                            let alone = self.alone(name, &flags, timeout)?;
+                            let result = match alone.outcome {
+                                Some(true) => "ignored",
+                                Some(false) => "ok",
+                                None if alone.timed_out => "FAILED (timed out)",
+                                None => "FAILED",
+                            };
+                            println!("test {} ... {result}", alone.shown);
+                            ran.lock().unwrap_or_else(|it| it.into_inner())[at] = Some(alone);
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().map_err(|_| anyhow::anyhow!("a runner of the tests panicked"))??;
+            }
+            Ok(())
+        })?;
+        let ran = ran.into_inner().unwrap_or_else(|it| it.into_inner());
+        Ok(ran.into_iter().flatten().collect())
+    }
+
+    /// Runs the test `name` alone in its process.
+    fn alone(
+        &self,
+        name: &str,
+        flags: &[&String],
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<Alone> {
+        let mut command = self.command()?;
+        command.args(flags).args(["--exact", name, "--test-threads", "1"]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        let mut child = command.spawn().with_context(|| format!("running the test {name}"))?;
+        let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut text);
+                }
+                String::from_utf8_lossy(&text).into_owned()
+            })
+        };
+        let stdout = read(child.stdout.take().map(|it| Box::new(it) as _));
+        let stderr = read(child.stderr.take().map(|it| Box::new(it) as _));
+        let started = Instant::now();
+        let mut timed_out = false;
+        let status = match timeout {
+            None => child.wait()?,
+            Some(timeout) => loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if started.elapsed() > timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            },
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        let line = stdout.lines().find_map(outcome).filter(|it| it.0 == name);
+        let shown = line.map_or_else(|| name.to_owned(), |it| it.1.to_owned());
+        let outcome = line.and_then(|it| it.2).filter(|_| status.success() && !timed_out);
+        // What the harness captured of a test that failed, or all it said when it died.
+        let start = format!("---- {shown} stdout ----\n");
+        let captured = stdout
+            .split_once(&start)
+            .map(|it| it.1)
+            .and_then(|it| it.split_once("\n\nfailures:\n"));
+        let mut said = match captured {
+            Some((said, _)) => format!("{said}\n"),
+            None if timed_out => format!("the test ran longer than {TIMEOUT}\n"),
+            None => format!("the test's process ended ({status})\n{stdout}"),
+        };
+        if !stderr.is_empty() {
+            said.push_str(&format!("\nstderr:\n{stderr}"));
+        }
+        Ok(Alone { shown, outcome, said, status, timed_out })
     }
 
     fn command(&self) -> std::io::Result<Command> {
@@ -245,21 +352,15 @@ impl<'a> Selective<'a> {
     /// The results of an earlier run that are still results: had with the same things
     /// outside the code.
     fn results(&self) -> Results {
-        let read = std::fs::read(&self.store).ok();
-        let results: Option<Results> = read.and_then(|it| serde_json::from_slice(&it).ok());
-        results.filter(|it| it.outside == self.outside).unwrap_or_default()
-    }
-
-    /// For each group, a print of which of its tests are among `named`: what a test finds
-    /// in a static is what the others that ran left there.
-    fn company(&self, named: &[String]) -> BTreeMap<usize, String> {
-        let mut hashes: BTreeMap<usize, Sha256> = BTreeMap::new();
-        for name in named {
-            let hash = hashes.entry(self.reached[name].group).or_default();
-            hash.update(name.len().to_le_bytes());
-            hash.update(name);
+        if !self.remember {
+            return Results::default();
         }
-        hashes.into_iter().map(|(group, hash)| (group, hex(&hash.finalize()))).collect()
+        let kept = match client::ask(Request::Results(self.object.clone()), Start::Never) {
+            Ok(Some(Reply::Results(kept))) => kept,
+            _ => None,
+        };
+        let results: Option<Results> = kept.and_then(|it| serde_json::from_str(&it).ok());
+        results.filter(|it| it.outside == self.outside).unwrap_or_default()
     }
 }
 
@@ -311,6 +412,25 @@ fn outcome(line: &str) -> Option<(&str, &str, Option<bool>)> {
     Some((name, shown, outcome))
 }
 
+/// How many tests run at once, by `--test-threads` or the cores, and the other flags.
+fn threads<'a>(flags: &[&'a String]) -> (usize, Vec<&'a String>) {
+    let mut threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let mut rest = Vec::new();
+    let mut words = flags.iter().copied();
+    while let Some(word) = words.next() {
+        let value = match word.strip_prefix("--test-threads") {
+            Some("") => words.next().map(|it| it.as_str()),
+            Some(it) => it.strip_prefix('='),
+            None => {
+                rest.push(word);
+                continue;
+            }
+        };
+        threads = value.and_then(|it| it.parse().ok()).unwrap_or(threads);
+    }
+    (threads, rest)
+}
+
 /// The flags `asked` gives the harness, when each is one of [`KNOWN_FLAGS`].
 fn harness_flags(asked: &Invocation) -> Option<Vec<&String>> {
     let mut flags = Vec::new();
@@ -360,8 +480,10 @@ fn reached(plan: &Plan) -> Option<BTreeMap<String, Reach>> {
         .map(|it| {
             let mut fields = it.splitn(3, ' ');
             let print = fields.next().filter(|it| *it != "-").map(str::to_owned);
-            let group = fields.next()?.parse().ok()?;
-            Some((fields.next()?.to_owned(), Reach { print, group }))
+            // Each test runs alone: the group of tests it shares writable statics with is
+            // not what its result depends on.
+            let _group = fields.next()?;
+            Some((fields.next()?.to_owned(), Reach { print }))
         })
         .collect()
 }

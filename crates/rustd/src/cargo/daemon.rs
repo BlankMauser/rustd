@@ -76,6 +76,13 @@ pub(crate) enum Request {
     },
     /// No build follows the [`Request::Ahead`] of this [`WorkerConfig::id`].
     Forget(String),
+    /// What the daemon keeps of the tests of a program last run, by its object.
+    Results(String),
+    /// Keep these results of the tests of the program of this object, until the next.
+    Keep {
+        object: String,
+        results: String,
+    },
     Status,
     Stop,
 }
@@ -96,6 +103,8 @@ pub(crate) enum Reply {
         programs: Vec<Result<String, String>>,
     },
     Warming,
+    /// The results of [`Request::Results`], none when it keeps none.
+    Results(Option<String>),
     Status(Status),
     Stopping,
 }
@@ -578,6 +587,9 @@ struct Daemon {
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     asked: Mutex<Instant>,
+    /// The results of the tests of each program run, by its object: for which ones need
+    /// not run again. They go with the daemon.
+    results: Mutex<FxHashMap<String, String>>,
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -652,6 +664,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
         asked: Mutex::new(Instant::now()),
+        results: Mutex::default(),
     });
     daemon.spare();
     eprintln!(
@@ -725,6 +738,11 @@ impl Daemon {
                 Ok(()) => self.built(&checkout),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
+            Request::Results(object) => Reply::Results(lock(&self.results).get(&object).cloned()),
+            Request::Keep { object, results } => {
+                lock(&self.results).insert(object, results);
+                Reply::Warming
+            }
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
                 version: self.version.clone(),

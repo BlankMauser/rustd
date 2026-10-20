@@ -696,6 +696,8 @@ mod tests {
     #[test] fn h1() { assert!(super::hit() >= 1); }
     #[test] fn h2() { assert!(super::hit() >= 1); }
     #[test] #[should_panic] fn tp() { assert_eq!(super::b(), 3); }
+    #[test] fn abort() { if std::env::var_os("INCREMENTAL_ABORT").is_some() { std::process::abort() } }
+    #[test] fn sleep() { if std::env::var_os("INCREMENTAL_SLEEP").is_some() { std::thread::sleep(std::time::Duration::from_secs(60)) } }
 }
 """
 
@@ -711,34 +713,45 @@ def incremental(work):
     side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
     checks = []
 
-    def check(name, cached, *args, env=None, listed=5):
-        """That the tests in `cached` are the ones listed as cached, and all others ran."""
+    def check(name, cached, *args, env=None, listed=7, failed=()):
+        """That the tests in `cached` are the ones listed as cached, those in `failed` failed,
+        and all others ran."""
         _, ran = side.cargo("test", *args, env=env)
         results = dict(re.findall(r"^test tests::(\w+)(?: - should panic)? \.\.\. (.+)$", ran.stdout, re.M))
         found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
-        held = ran.returncode == 0 and found == sorted(cached) and len(results) == listed
+        failing = sorted(name for name, result in results.items() if result.startswith("FAILED"))
+        held = (ran.returncode == 0) == (not failed) and found == sorted(cached) and failing == sorted(failed) and len(results) == listed
         # Cached or not, a test is named as libtest names it.
         held = held and ("tp" not in results or "test tests::tp - should panic ... " in ran.stdout)
-        checks.append((f"incremental: {name}", held, f"cached {found}"))
-        print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}", flush=True)
+        checks.append((f"incremental: {name}", held, f"cached {found}, failed {failing}"))
+        print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}, failed {failing}", flush=True)
+        return ran
 
-    every = ["h1", "h2", "ta", "tb", "tp"]
+    every = ["abort", "h1", "h2", "sleep", "ta", "tb", "tp"]
     check("the first run runs every test", [])
     check("a run with nothing changed runs none", every)
+    side.cargo("stop")
+    check("a new daemon runs every test", [])
     edited = INCREMENTAL_LIB.replace("{ A }", "{ A.min(5) }")
     open(lib, "w").write(edited)
-    check("an edit runs the test that reaches it", ["h1", "h2", "tb", "tp"])
+    check("an edit runs the test that reaches it", [it for it in every if it != "ta"])
     open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
-    check("an edit of what writes a static runs every test that writes it", ["ta", "tb", "tp"])
+    check("an edit of what writes a static runs the tests that reach it", ["abort", "sleep", "ta", "tb", "tp"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
     check("a filter lists the cached test", ["tb"], "tb", listed=1)
     open(os.path.join(ws, "data.txt"), "w").write("x")
     check("a new file in the package runs every test", [])
     check("the environment runs every test", [], env={"INCREMENTAL_ANY": "1"})
-    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=3)
-    check("--skip is kept when tests are cached", ["ta", "tb", "tp"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=3)
+    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=5)
+    check("--skip is kept when tests are cached", ["abort", "sleep", "ta", "tb", "tp"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=5)
     check("--exact is kept when no test is cached", [], "--", "--exact", "tests::h1", env={"INCREMENTAL_ANY": "3"}, listed=1)
+    # Each test runs in a process of its own: one that aborts or hangs fails alone.
+    aborted = check("a test that aborts fails alone", [], env={"INCREMENTAL_ABORT": "1"}, failed=["abort"])
+    check("a test that failed runs again", [it for it in every if it != "abort"], env={"INCREMENTAL_ABORT": "1"}, failed=["abort"])
+    check("a test that runs too long is stopped", [], env={"INCREMENTAL_SLEEP": "1", "RUSTD_TEST_TIMEOUT": "2"}, failed=["sleep"])
+    held = "---- tests::abort stdout ----" in aborted.stdout and "failures:\n    tests::abort" in aborted.stdout
+    checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
     side.cargo("stop")
     return checks
 
