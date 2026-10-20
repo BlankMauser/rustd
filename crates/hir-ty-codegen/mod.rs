@@ -33,7 +33,10 @@ use hir_def::{
     },
     hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
-    signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
+    signatures::{
+        FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature,
+        TraitSignature,
+    },
     src::HasSource,
 };
 use hir_expand::{
@@ -2019,11 +2022,45 @@ fn left_to_rustc<'a>(
     symbols: &'a dyn SymbolResolver,
     skipped: &'a [(FunctionId, CodegenError)],
 ) -> impl Iterator<Item = FunctionId> + 'a {
-    skipped
+    let mut left: Vec<FunctionId> = skipped
         .iter()
-        .filter(|(_, e)| !e.no_symbol())
+        .filter(|(func, e)| !e.no_symbol() || serves_allocator(db, *func))
         .map(|it| it.0)
         .filter(|&func| symbols.rustc_built(func.krate(db)))
+        .collect();
+    // A function without a symbol others can link to is called in rustc's object by rustc's
+    // copy of its caller, so it is left to rustc with that caller.
+    let unlinked: FxHashSet<FunctionId> =
+        skipped.iter().filter(|(_, e)| e.no_symbol()).map(|it| it.0).collect();
+    let mut seen: FxHashSet<FunctionId> = left.iter().copied().collect();
+    let mut stack = left.clone();
+    while let Some(func) = stack.pop() {
+        let Ok(compiled) = compiled_root(db, func).as_ref() else { continue };
+        for request in &compiled.requests.funcs {
+            let FuncTarget::Instance(instance, _) = &request.target else { continue };
+            if let InstanceDef::Fn(callee) = instance.def
+                && instance.args.as_ref().is_empty()
+                && unlinked.contains(&callee)
+                && seen.insert(callee)
+            {
+                left.push(callee);
+                stack.push(callee);
+            }
+        }
+    }
+    left.into_iter()
+}
+
+/// Whether a function is a method of an `impl GlobalAlloc`. The allocator symbols rustc writes
+/// for the `#[global_allocator]` (`__rust_alloc` and the others) call rustc's copy of it, so
+/// that copy runs even when rustc gave it no symbol of its own: it is in the object of those
+/// symbols then, and private to it.
+fn serves_allocator(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else { return false };
+    let Some(trait_ref) = db.impl_trait(impl_id) else { return false };
+    let trait_ = trait_ref.skip_binder().def_id.0;
+    trait_.krate(db).data(db).origin.is_lang()
+        && TraitSignature::of(db, trait_).name.as_str() == "GlobalAlloc"
 }
 
 /// The statics that functions left to rustc refer to, themselves or through the instances they

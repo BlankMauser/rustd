@@ -1,7 +1,9 @@
 //! tests/ui/threads-sendsync/tls-in-global-alloc.rs: the methods of the `#[global_allocator]`
 //! are called through symbols rustc writes, not by anything the program names. They were left
 //! to rustc without being counted, and wrote to rustc's copy of a static the program read
-//! rustd's copy of.
+//! rustd's copy of. The count goes through a function of its own: when rustc keeps the
+//! methods and that function private to the object of `__rust_alloc`, what they count is
+//! rustc's alone, and a function of rustd's that reads the static is not built.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,9 +12,13 @@ static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
 
+fn count() {
+    ALLOCATED.fetch_add(1, Ordering::Relaxed);
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        count();
         unsafe { System.alloc(layout) }
     }
 
