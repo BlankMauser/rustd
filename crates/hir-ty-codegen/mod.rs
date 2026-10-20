@@ -357,6 +357,16 @@ enum PassMode {
         size: u32,
         padded: bool,
     },
+    /// A pair one half of which is a 128-bit integer that finds one integer register left on
+    /// System V x86-64. That half goes as the 16 bytes of an `OnStack` copy, `padded` the same
+    /// way, which takes no register, and the `other` half as `Direct`. `first` says the
+    /// copied half is the one at offset zero; the other is at `offset`.
+    PairSpilled {
+        first: bool,
+        other: AbiScalar,
+        offset: Size,
+        padded: bool,
+    },
 }
 
 impl PassMode {
@@ -6013,7 +6023,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let args = args
                 .into_iter()
                 .map(|ty| self.pass_mode(&*self.layout(ty)?, false))
-                .collect::<Result<_>>()?;
+                .collect::<Result<Vec<_>>>()?;
+            if self.cg.target.call_conv == isa::CallConv::SystemV
+                && self.cg.target.arch == Arch::X86_64
+            {
+                return Ok(FnAbi { args: self.sysv_wide_ints(ret, args), ret });
+            }
             return Ok(FnAbi { ret, args });
         }
         if self.cg.target.call_conv == isa::CallConv::WindowsFastcall {
@@ -6039,6 +6054,81 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             _ => unsupported!("calling convention {abi:?}"),
         }
+    }
+
+    /// The Rust convention's arguments on System V x86-64 where Cranelift and LLVM differ: a
+    /// 128-bit integer that finds one integer register left goes to the stack under both,
+    /// but LLVM gives that register to the next integer and Cranelift to none. Such an
+    /// integer is passed as a copy in memory instead, which takes no register.
+    fn sysv_wide_ints(&self, ret: PassMode, mut args: Vec<PassMode>) -> Vec<PassMode> {
+        struct Left {
+            ints: usize,
+            floats: usize,
+            /// How many bytes of the stack the arguments so far take, as Cranelift places them.
+            stack: u32,
+        }
+        impl Left {
+            fn take(&mut self, ty: Type) {
+                let regs = if ty.is_float() { &mut self.floats } else { &mut self.ints };
+                let wanted = ty.bytes().div_ceil(8) as usize;
+                if *regs >= wanted {
+                    *regs -= wanted;
+                } else if ty == types::I128 {
+                    self.stack = self.stack.next_multiple_of(16) + 16;
+                } else {
+                    self.stack += 8;
+                }
+            }
+            /// Whether a value of `ty` is the 128-bit integer that LLVM and Cranelift place
+            /// differently. If so it takes its copy's room on the stack, and says if that
+            /// is padded.
+            fn spill(&mut self, ty: Type) -> Option<bool> {
+                if ty != types::I128 || self.ints != 1 {
+                    return None;
+                }
+                let padded = self.stack % 16 != 0;
+                self.stack += 16 + if padded { 8 } else { 0 };
+                Some(padded)
+            }
+        }
+        let ints = if matches!(ret, PassMode::Indirect) { 5 } else { 6 };
+        let mut left = Left { ints, floats: 8, stack: 0 };
+        for mode in &mut args {
+            match *mode {
+                PassMode::Ignore => (),
+                PassMode::Direct(AbiScalar { ty, .. }) => {
+                    if let Some(padded) = left.spill(ty) {
+                        *mode = PassMode::OnStack { size: 16, padded };
+                    } else {
+                        left.take(ty);
+                    }
+                }
+                PassMode::Cast(ty) => left.take(ty),
+                PassMode::Pair(a, b, offset) => {
+                    if let Some(padded) = left.spill(a.ty) {
+                        left.take(b.ty);
+                        *mode = PassMode::PairSpilled { first: true, other: b, offset, padded };
+                        continue;
+                    }
+                    left.take(a.ty);
+                    if let Some(padded) = left.spill(b.ty) {
+                        *mode = PassMode::PairSpilled { first: false, other: a, offset, padded };
+                        continue;
+                    }
+                    left.take(b.ty);
+                }
+                PassMode::Indirect => left.take(ptr()),
+                PassMode::OnStack { size, padded } => {
+                    left.stack += size + if padded { 8 } else { 0 };
+                }
+                PassMode::CastPair(..)
+                | PassMode::Uniform { .. }
+                | PassMode::PairSpilled { .. } => {
+                    unreachable!("the Rust convention passes no aggregate in registers")
+                }
+            }
+        }
+        args
     }
 
     /// The C convention of the System V x86-64 psABI, as rustc's `callconv/x86_64.rs` has it.
@@ -6073,7 +6163,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
-                PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
+                PassMode::Uniform { .. } | PassMode::PairSpilled { .. } => {
+                    unreachable!("the C ABI of x86-64 makes neither")
+                }
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             let in_registers = match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -6518,6 +6610,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 params.extend(padded.then(|| copied(8)));
                 params.push(copied(size));
             }
+            PassMode::PairSpilled { first, other, padded, .. } => {
+                let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
+                params.extend((!first).then(|| other.param()));
+                params.extend(padded.then(|| copied(8)));
+                params.push(copied(16));
+                params.extend(first.then(|| other.param()));
+            }
         }
     }
 
@@ -6598,7 +6697,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 values.push(addr);
             }
+            PassMode::PairSpilled { first, other, offset, padded } => {
+                let (copied, at) = Self::spilled_halves(first, offset);
+                let other = self.builder.ins().load(other.ty, MEM, addr, at);
+                if !first {
+                    values.push(other);
+                }
+                if padded {
+                    values.push(self.scratch());
+                }
+                values.push(self.builder.ins().iadd_imm(addr, i64::from(copied)));
+                if first {
+                    values.push(other);
+                }
+            }
         }
+    }
+
+    /// Where the copied half and the other half of a `PassMode::PairSpilled` are.
+    fn spilled_halves(first: bool, offset: Size) -> (i32, i32) {
+        let offset = offset.bytes() as i32;
+        if first { (0, offset) } else { (offset, 0) }
     }
 
     /// Stores what `pass` or a return sent, taking the values off the front of `values`.
@@ -6630,6 +6749,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, a, addr, 0);
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 self.store_cast(b, rest, layout.size - Size::from_bytes(8));
+            }
+            PassMode::PairSpilled { first, offset, padded, .. } => {
+                let (copied, at) = Self::spilled_halves(first, offset);
+                let other = if first { None } else { Some(next()) };
+                if padded {
+                    next();
+                }
+                let copy = next();
+                let other = other.unwrap_or_else(&mut next);
+                let wide = self.builder.ins().load(types::I128, MEM, copy, 0);
+                self.builder.ins().store(MEM, wide, addr, copied);
+                self.builder.ins().store(MEM, other, addr, at);
             }
             PassMode::Uniform { unit, count, skipped } => {
                 for _ in 0..skipped {
@@ -11359,6 +11490,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let count = match mode {
             PassMode::Ignore => 0,
             PassMode::Pair(..) => 2,
+            PassMode::PairSpilled { padded, .. } => 2 + usize::from(padded),
             _ => 1,
         };
         let mut sig = sig.clone();

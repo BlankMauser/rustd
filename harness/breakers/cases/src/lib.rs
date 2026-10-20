@@ -173,6 +173,7 @@ cases![
     array_in_tuple_moved_out,
     match_arm_moves_drops,
     import_called_and_pointed,
+    wide_int_last_register,
     literal_operands,
     moved_bits_unread,
     const_location,
