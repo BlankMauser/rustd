@@ -102,6 +102,7 @@ pub use reach::{Reached, reached};
 #[cfg(test)]
 mod fuzz;
 mod home;
+pub mod lints;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod llvm;

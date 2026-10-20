@@ -27,6 +27,7 @@ The project you build must use Rust 1.99.0, the toolchain rustd is pinned to. Us
     cargo rustd run   [cargo's flags] [-- program arguments]
     cargo rustd test  [cargo's flags] [test names] [-- test arguments]
     cargo rustd check [cargo's flags]
+    cargo rustd clippy [cargo's flags] [-- -D warnings ...]
     cargo rustd status
     cargo rustd stop
 
@@ -187,6 +188,22 @@ under nextest. `RUSTD_TEST_TIMEOUT`, in seconds, stops and fails a test that run
 
 `--rerun-all` or `RUSTD_TEST_CACHE=0` runs every test in one process, as libtest does,
 and nothing is remembered from that run.
+
+## Clippy
+
+`cargo rustd clippy` builds what `cargo rustd build` builds, then asks the daemon for
+clippy's lints of the crates of those programs and prints them as clippy does. The lints of a
+body are one query of the worker's database, so the database runs them again only for the
+bodies an edit changed or whose types changed: after an edit to one function, one body is
+linted again. `RUSTD_STATS=1` prints how many.
+
+Eight of clippy's lints are there: `bool_comparison`, `eq_op`, `identity_op`,
+`len_zero`, `let_unit_value`, `needless_bool`, `needless_return` and `self_assignment`,
+at clippy's levels. `#[allow]`, `#[warn]`, `#[deny]` and `#[expect]` on the item, its module
+or the crate are read, and so are `-D`, `-W` and `-A` after `--`, `-D warnings` among them.
+Nothing in what a macro wrote is linted. rustc's own warnings are not printed, and a
+workspace of libraries alone, which builds no program, fails with that reason.
+`harness/clippy.py` compares it with clippy.
 
 ## Environment variables
 

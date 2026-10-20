@@ -367,7 +367,7 @@ impl Built {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
-            Subcommand::Build | Subcommand::Run => cargo.arg("build"),
+            Subcommand::Build | Subcommand::Run | Subcommand::Clippy => cargo.arg("build"),
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
         // What cargo says is read here, and rustc's diagnostics are shown in the shape asked.

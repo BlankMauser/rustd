@@ -60,6 +60,8 @@ pub(crate) enum Request {
     /// Bring the programs of a checkout up to date with its source, if the daemon is warm
     /// for it.
     Sync(Checkout),
+    /// Clippy's lints of the crates of the programs of a checkout the daemon is warm for.
+    Lint(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
     /// Load a checkout cargo has just built what stands in for the crates of, and answer
@@ -210,14 +212,14 @@ impl Checkout {
         self.root.join(&self.config.project)
     }
 
-    /// The line that asks a worker for `plan`.
-    fn sync_line(&self, plan: &Plan) -> String {
+    /// The line that asks a worker for `plan`, to `verb` it.
+    fn sync_line(&self, plan: &Plan, verb: &str) -> String {
         let named =
             |path: &PathBuf| path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
             crates,
             plan.object.display(),
@@ -400,7 +402,7 @@ impl Worker {
         // A source written since cargo built is the daemon's like any edit: it compiles
         // every function and static of the workspace from what it reads.
         for plan in checkout.programs.iter().skip(usize::from(started_on)) {
-            self.ask(checkout, plan)?.map_err(anyhow::Error::msg)?;
+            self.ask(checkout, plan, "sync")?.map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -422,7 +424,12 @@ impl Worker {
 
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
     /// the inner one its answer that it does not build this.
-    fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, String>> {
+    fn ask(
+        &self,
+        checkout: &Checkout,
+        plan: &Plan,
+        verb: &str,
+    ) -> anyhow::Result<Result<String, String>> {
         // A worker that hangs up is ending, and why is what the client is told.
         let failed = || {
             let asked = Instant::now();
@@ -441,7 +448,7 @@ impl Worker {
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
-        stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
+        stream.write_all(checkout.sync_line(plan, verb).as_bytes()).with_context(failed)?;
         stream
             .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
             .with_context(failed)?;
@@ -457,13 +464,13 @@ impl Worker {
     }
 
     /// Brings the programs of `checkout` up to date, all at once: the worker builds the
-    /// requests that wait for it together.
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    /// requests that wait for it together. `verb` is `lint` for their lints instead.
+    fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
         let asked: Vec<anyhow::Result<Result<String, String>>> = std::thread::scope(|scope| {
             let asking: Vec<_> = checkout
                 .programs
                 .iter()
-                .map(|plan| scope.spawn(|| self.ask(checkout, plan)))
+                .map(|plan| scope.spawn(|| self.ask(checkout, plan, verb)))
                 .collect();
             let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
             asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
@@ -713,7 +720,8 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
+            Request::Sync(checkout) => self.sync(&checkout, "sync"),
+            Request::Lint(checkout) => self.sync(&checkout, "lint"),
             Request::Warm(checkout) => match self.warm(checkout) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -753,7 +761,7 @@ impl Daemon {
         }
     }
 
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
         let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
         let Some(worker) = worker else {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
@@ -767,7 +775,7 @@ impl Daemon {
             ),
         };
         match warmth {
-            Warmth::Ready => worker.sync(checkout),
+            Warmth::Ready => worker.sync(checkout, verb),
             Warmth::Loading(since) => Reply::Cold {
                 reason: format!(
                     "the daemon is still loading the workspace ({:.0?} so far)",
@@ -781,7 +789,7 @@ impl Daemon {
     /// What the worker that loads `checkout` has to say of its programs once it has.
     fn built(&self, checkout: &Checkout) -> Reply {
         loop {
-            match self.sync(checkout) {
+            match self.sync(checkout, "sync") {
                 Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
                 reply => return reply,
             }

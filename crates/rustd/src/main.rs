@@ -8,6 +8,7 @@ mod content;
 mod deps;
 mod doctest;
 mod inputs;
+mod lint;
 mod memory;
 mod outline;
 mod plan;
@@ -3524,6 +3525,8 @@ enum Request {
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
+    /// Clippy's lints of the crates of the program, as the files are now.
+    Lint,
 }
 
 impl Request {
@@ -3531,6 +3534,7 @@ impl Request {
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
+            "lint" => Some(Request::Lint),
             _ => None,
         }
     }
@@ -3539,6 +3543,7 @@ impl Request {
         match self {
             Request::Sync => "sync",
             Request::Patch => "patch",
+            Request::Lint => "lint",
         }
     }
 }
@@ -5103,6 +5108,15 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    // The build before it brought the database up to date with the files.
+                    if request == Request::Lint {
+                        let linted = lint_of(&db, target, &programs[0].args, &checkouts, &files);
+                        let _ = match linted.and_then(|it| Ok(serde_json::to_string(&it)?)) {
+                            Ok(json) => writeln!(&stream, "ok {json}"),
+                            Err(error) => writeln!(&stream, "error: {error:#}"),
+                        };
+                        continue;
+                    }
                     let asked = target.clone();
                     let mut target = target;
                     // A checkout that is not what it was loaded from is loaded again before
@@ -6304,6 +6318,32 @@ impl Tests {
         }
         lines
     }
+}
+
+/// Clippy's lints of the crates of the program `target` names, the first one's when none.
+fn lint_of(
+    db: &RootDatabase,
+    target: Option<Target>,
+    first: &Args,
+    checkouts: &Checkouts,
+    files: &[WatchedFile],
+) -> anyhow::Result<lint::Linted> {
+    let args = match target {
+        Some(target) => target.args(first, checkouts)?,
+        None => first.clone(),
+    };
+    let mut crates = Vec::new();
+    for krate in args.crates() {
+        crates.extend(crates_named(db, krate, &args)?);
+    }
+    let paths = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, it.path.clone())),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    Ok(lint::linted(db, &crates, &paths))
 }
 
 /// What each test of a program can run, as [`Tests::reached`] writes it.

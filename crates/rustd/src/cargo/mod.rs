@@ -7,6 +7,7 @@ pub(crate) mod wrapper;
 mod ancestor;
 mod cli;
 mod client;
+mod clippy;
 mod package;
 pub(crate) mod plan;
 pub(crate) mod run;
@@ -253,6 +254,7 @@ fn asking(checkout: &Checkout) -> Checkout {
 fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<i32> {
     match asked.subcommand {
         Subcommand::Build => Ok(0),
+        Subcommand::Clippy => clippy::report(asked, state),
         Subcommand::Run => match run::program(asked, state, cwd)? {
             Some(code) => Ok(code),
             None => {

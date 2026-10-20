@@ -95,6 +95,8 @@ pub(crate) enum Subcommand {
     Build,
     Run,
     Test,
+    /// Clippy's lints, which the daemon finds once it has built the programs.
+    Clippy,
 }
 
 impl Subcommand {
@@ -103,6 +105,7 @@ impl Subcommand {
             "build" | "b" => Some(Subcommand::Build),
             "run" | "r" => Some(Subcommand::Run),
             "test" | "t" => Some(Subcommand::Test),
+            "clippy" => Some(Subcommand::Clippy),
             _ => None,
         }
     }
@@ -297,6 +300,11 @@ impl Invocation {
             ));
         }
         let reason = match () {
+            _ if self.subcommand == Subcommand::Clippy
+                && self.typed.iter().any(|it| it == "--fix") =>
+            {
+                "`--fix`: `cargo rustd clippy` does not change the source"
+            }
             _ if flags.unstable => "`-Z`: unstable cargo flags are not read by rustd",
             _ if flags.targets.len() > 1 => {
                 "several `--target` in one build are not built by the daemon yet"

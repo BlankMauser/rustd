@@ -386,6 +386,9 @@ jobs:
       - name: cargo rustd against cargo
         working-directory: harness
         run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+      - name: cargo rustd clippy against clippy
+        working-directory: harness
+        run: rustup component add clippy --toolchain "$(cat toolchain)" && RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" python3 clippy.py
 
   # The same on macOS arm64, where the link is Apple's and the cargo above the wrapper is
   # read through libproc.
