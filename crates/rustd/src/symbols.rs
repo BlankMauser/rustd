@@ -604,17 +604,45 @@ impl Paths {
     }
 }
 
-/// The symbols that any object can refer to of the sections of `object` that reach the
-/// section `symbol` is in, through what they refer to: the code and data that use it. `None`
-/// when one of those is a section the linker keeps whatever refers to it.
+/// The symbols that any object can refer to of the code and data of `object` that reach the
+/// static `symbol` through what they refer to: what uses it. `None` when one of those is
+/// something the linker keeps whatever refers to it.
+///
+/// What is told apart is what a linker can leave out apart: a section of an ELF or COFF object,
+/// and in a section of a Mach-O one, the run from one symbol that is not a temporary label to
+/// the next.
 fn reached_from<'data>(object: &object::File<'data>, symbol: &str) -> Option<Vec<String>> {
-    use object::{ObjectSection, RelocationTarget, SectionFlags, SectionIndex, SectionKind};
+    use object::{ObjectSection, RelocationTarget, SectionFlags, SectionKind};
+    // A section and where in it the piece starts; `u64::MAX` for what refers to the section
+    // and not to a piece of it.
+    type Piece = (object::SectionIndex, u64);
+    const WHOLE: u64 = u64::MAX;
+    let macho = object.format() == object::BinaryFormat::MachO;
     let named = |it: &object::Symbol<'data, '_>| it.name().map(|name| unprefixed(object, name));
-    let start = object.symbols().find(|it| named(it) == Ok(symbol))?.section_index()?;
-    let mut defined = FxHashMap::<SectionIndex, Vec<String>>::default();
+    let mut starts = FxHashMap::<object::SectionIndex, Vec<u64>>::default();
+    if macho {
+        for it in object.symbols() {
+            let temporary = it.name().is_ok_and(|name| name.starts_with(['l', 'L']));
+            if let Some(section) = it.section_index().filter(|_| !temporary) {
+                starts.entry(section).or_default().push(it.address());
+            }
+        }
+        starts.values_mut().for_each(|it| {
+            it.sort_unstable();
+            it.dedup();
+        });
+    }
+    let piece = |section: object::SectionIndex, address: u64| -> Piece {
+        let Some(starts) = starts.get(&section) else { return (section, 0) };
+        let at = starts.partition_point(|it| *it <= address);
+        (section, at.checked_sub(1).map_or(0, |at| starts[at]))
+    };
+    let start = object.symbols().find(|it| named(it) == Ok(symbol))?;
+    let start = piece(start.section_index()?, start.address());
+    let mut defined = FxHashMap::<Piece, Vec<String>>::default();
     for it in object.symbols() {
         if let (Some(section), true, Ok(name)) = (it.section_index(), it.is_global(), named(&it)) {
-            defined.entry(section).or_default().push(name.to_owned());
+            defined.entry(piece(section, it.address())).or_default().push(name.to_owned());
         }
     }
     // What the unwinder and a debugger read refers to everything, and uses nothing.
@@ -623,19 +651,27 @@ fn reached_from<'data>(object: &object::File<'data>, symbol: &str) -> Option<Vec
             .iter()
             .any(|it| name.starts_with(it))
     };
-    let mut referrers = FxHashMap::<SectionIndex, FxHashSet<SectionIndex>>::default();
+    let mut referrers = FxHashMap::<Piece, FxHashSet<Piece>>::default();
     for section in object.sections() {
         if read_aside(section.name().unwrap_or_default()) {
             continue;
         }
-        for (_, relocation) in section.relocations() {
+        for (offset, relocation) in section.relocations() {
             let target = match relocation.target() {
-                RelocationTarget::Symbol(it) => object.symbol_by_index(it).ok()?.section_index(),
-                RelocationTarget::Section(it) => Some(it),
+                RelocationTarget::Symbol(it) => {
+                    let it = object.symbol_by_index(it).ok()?;
+                    let whole = it.kind() == SymbolKind::Section;
+                    it.section_index().map(|section| match whole {
+                        true => (section, WHOLE),
+                        false => piece(section, it.address()),
+                    })
+                }
+                RelocationTarget::Section(it) => Some((it, WHOLE)),
                 _ => None,
             };
-            if let Some(target) = target.filter(|it| *it != section.index()) {
-                referrers.entry(target).or_default().insert(section.index());
+            let by = piece(section.index(), section.address() + offset);
+            if let Some(target) = target.filter(|it| *it != by && *it != (by.0, WHOLE)) {
+                referrers.entry(target).or_default().insert(by);
             }
         }
     }
@@ -645,7 +681,7 @@ fn reached_from<'data>(object: &object::File<'data>, symbol: &str) -> Option<Vec
     let mut todo = vec![start];
     let mut reached = Vec::new();
     while let Some(at) = todo.pop() {
-        let section = object.section_by_index(at).ok()?;
+        let section = object.section_by_index(at.0).ok()?;
         let kept =
             matches!(section.flags(), SectionFlags::Elf { sh_flags } if sh_flags & RETAIN != 0);
         let used = matches!(
@@ -668,7 +704,8 @@ fn reached_from<'data>(object: &object::File<'data>, symbol: &str) -> Option<Vec
             return None;
         }
         reached.extend(defined.get(&at).into_iter().flatten().cloned());
-        for &by in referrers.get(&at).into_iter().flatten() {
+        let by = [at, (at.0, WHOLE)].into_iter().flat_map(|it| referrers.get(&it)).flatten();
+        for &by in by {
             if seen.insert(by) {
                 todo.push(by);
             }
