@@ -660,7 +660,8 @@ def flags(work):
             if differs and ((label, shown) in FLAGS_OPEN or TESTS_OPEN in how):
                 differs = "open: " + differs
             elif differs:
-                wrong.append(f"{label}: {shown}: {differs}")
+                said = "\n".join("    " + line for line in mine.stderr.splitlines()[-12:])
+                wrong.append(f"{label}: {shown}: {differs}\n  rustd said:\n{said}")
             print(f"  {label:6} {shown:50} exit {mine.returncode:3}  {how:8.60}  {differs or 'same'}", flush=True)
 
     round_of("cold")
