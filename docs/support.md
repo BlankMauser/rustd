@@ -27,7 +27,7 @@ to stable; those are marked where they are used.
 | Full link | yes (1) | yes (1) | yes (1) | yes (1) | yes, older branch (2) |
 | Splice | yes (3) | yes (3) | yes (4) | yes, with a limit (5) | yes, older branch (2) |
 | Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
-| `cargo rustd` | yes (8) | unverified (9) | no: goes to cargo (9) | no: goes to cargo (9) | no |
+| `cargo rustd` | yes (8) | unverified (9) | yes, three projects, Cranelift (9) | yes, three projects (9) | no |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
 | Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
 | Fuzzed | yes (12) | no | no | no | no |
@@ -65,8 +65,9 @@ to stable; those are marked where they are used.
    cargo, 66 of 66 flag steps, 11 of 11 lifecycle checks
    ([reports/CARGO.md](reports/CARGO.md)). Not in CI. Run by hand for these docs on a new
    project and on ripgrep 15.1.0.
-9. `cargo rustd` hands any target that is not ELF to cargo (`unsupported_target` in
-   `cargo/cli.rs`), and has not been built or run on macOS or Windows. Nobody recorded
+9. On macOS arm64 and on Windows x86-64 MSVC `harness/cargo_rustd.py --small` (ripgrep,
+   fd, hyperfine) passes; on Windows under Cranelift only ([cargo.md](cargo.md)). Other
+   targets are handed to cargo (`unsupported_target` in `cargo/cli.rs`). Nobody recorded
    running it on Linux AArch64.
 10. CI: `storekills.py`, `storecorrupts.py` and `storeshared.py` on all four platforms.
     `storefull.py` on Linux only. The earlier

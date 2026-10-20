@@ -155,6 +155,20 @@ impl Args {
             })
     }
 
+    /// The checkout by the name it was asked for, which is the one cargo runs rustc by and
+    /// rustc tells a debugger: a backtrace shows a file from the directory the program runs
+    /// in when that is how the file is named.
+    fn checkout_as_asked(&self) -> PathBuf {
+        let below =
+            |root: PathBuf| Some(root.strip_prefix(&self.checkout).ok()?.components().count());
+        let asked = std::path::absolute(&self.project).ok().filter(|it| *it != self.checkout);
+        let asked = asked.zip(self.root().ok().and_then(below)).and_then(|(mut asked, below)| {
+            let below = below + usize::from(asked.is_file());
+            (0..below).all(|_| asked.pop()).then_some(asked)
+        });
+        asked.unwrap_or_else(|| self.checkout.clone())
+    }
+
     /// The directory of the project, which cargo runs rustc in.
     fn root(&self) -> anyhow::Result<PathBuf> {
         let mut root = dunce::canonicalize(&self.project)?;
@@ -269,6 +283,8 @@ struct Resolver<'a> {
     table: &'a SymbolTable,
     /// What panic locations in the workspace are relative to.
     root: PathBuf,
+    /// The name of `root` a debugger is told.
+    asked: PathBuf,
     /// The checkout that the packages which are the same in both are read from.
     base: Option<PathBuf>,
     contents: &'a content::Contents,
@@ -744,6 +760,7 @@ impl SymbolResolver for Resolver<'_> {
             for _ in 0..threads {
                 let db = self.db.clone();
                 let (next, table, root) = (&next, self.table, self.root.clone());
+                let asked = self.asked.clone();
                 let base = self.base.clone();
                 let contents = self.contents;
                 let (debug, apart) = (self.debug, self.apart.clone());
@@ -754,6 +771,7 @@ impl SymbolResolver for Resolver<'_> {
                         db: &db,
                         table,
                         root,
+                        asked,
                         base,
                         contents,
                         debug,
@@ -782,7 +800,8 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        (self.debug.level != plan::Level::Nothing).then(|| self.root.to_string_lossy().into_owned())
+        (self.debug.level != plan::Level::Nothing)
+            .then(|| self.asked.to_string_lossy().into_owned())
     }
 
     fn describes_variables(&self) -> bool {
@@ -1414,11 +1433,16 @@ fn linked_from_libraries(db: &RootDatabase, args: &Args) -> anyhow::Result<()> {
 
 /// Whether a link command names `core` as a library, by itself or in the shared library of
 /// std. One that reads its files from elsewhere is taken to.
+///
+/// The archive of std holds no `core`. With `lto` rustc still links a copy of it for an
+/// MSVC target, with what in it is not Rust's, under the name the archive has.
 fn links_core(command: &str) -> bool {
     let mut files = command.split_whitespace().map(|it| it.trim_matches(['"', '\'']));
     files.any(|it| {
         let name = it.rsplit(['/', '\\']).next().unwrap_or(it);
-        it.starts_with('@') || name.starts_with("libcore-") || name.starts_with("libstd-")
+        // `libstd-<hash>.so` and `.dylib`, and `std-<hash>.dll.lib` as MSVC imports it.
+        let of_std = name.starts_with("libstd-") || name.starts_with("std-");
+        it.starts_with('@') || name.starts_with("libcore-") || (of_std && !name.ends_with(".rlib"))
     })
 }
 
@@ -1428,13 +1452,23 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
     // A path that is written as its parts are ends the text of every path it is the end of,
     // which is all that most crates have to be asked.
     let plain = !krate.contains("//") && !krate.contains("./");
+    let loaded_as = is_file.then(|| loaded_as(Path::new(krate))).flatten();
+    let ends_with = |it: Crate| {
+        root_file_ends_with(db, it, krate)
+            || loaded_as
+                .as_ref()
+                .and_then(|it| it.to_str())
+                .is_some_and(|end| root_file_ends_with(db, it, end))
+    };
     Crate::all(db)
         .into_iter()
         .filter(|it| match is_file {
-            _ if is_file && plain && !root_file_ends_with(db, *it, krate) => false,
+            _ if is_file && plain && !ends_with(*it) => false,
             // Named from the checkout, or in full.
             true => crate_root_file(db, *it).is_some_and(|root| {
-                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+                root == Path::new(krate)
+                    || args.inside(&root) == Some(Path::new(krate))
+                    || Some(&root) == loaded_as.as_ref()
             }),
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
@@ -1467,6 +1501,12 @@ fn root_file_ends_with(db: &RootDatabase, krate: Crate, end: &str) -> bool {
     let source_root = db.source_root(source_root).source_root(db);
     let path = source_root.path_for_file(&file).and_then(|it| it.as_path());
     path.is_some_and(|it| it.as_str().ends_with(end))
+}
+
+/// The name the file system gives a file, when it is not the one given: what a file is loaded
+/// by, which a link or a short name of Windows in the path cargo was run in is not part of.
+fn loaded_as(named: &Path) -> Option<PathBuf> {
+    dunce::canonicalize(named).ok().filter(|it| it != named)
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -2071,7 +2111,10 @@ fn workspace_at(
     selection: &plan::Selection,
     beside: Option<&mut Beside>,
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
-    let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
+    // As the file system names it, which is how a checkout is named wherever one is compared
+    // with what was loaded: a link or a short name of Windows in the path asked for is another
+    // name of the same files.
+    let root = AbsPathBuf::assert_utf8(dunce::canonicalize(project)?);
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     let mut debug = plan::Whole { debug: plan::Described::NOTHING, lto: false };
@@ -2581,6 +2624,7 @@ fn build(
     let start = Instant::now();
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
+    let asked = args.checkout_as_asked();
     let debug = args.debug;
     let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
     let named = (root.clone(), base.clone());
@@ -2591,6 +2635,7 @@ fn build(
         db,
         table,
         root,
+        asked,
         base,
         contents,
         debug,
@@ -3413,7 +3458,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             .filter(|file| rlib_of(file).is_none_or(|owner| owner == krate))
             .cloned()
             .collect();
-        let table = &SymbolTable::load(&symbol_files, &args.root()?)?;
+        let table = &SymbolTable::load(&symbol_files, &args.root()?, loaded_as)?;
         let args = Args {
             project: args.project.clone(),
             krate: krate.clone(),
@@ -3979,6 +4024,18 @@ pub(crate) fn end_with_reader() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // Windows has no such signal: the write fails, and `println!` panics of it.
+    #[cfg(windows)]
+    {
+        let panicked = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let said = panic.payload().downcast_ref::<String>();
+            if said.is_some_and(|it| it.starts_with("failed printing to stdout")) {
+                std::process::exit(1);
+            }
+            panicked(panic)
+        }));
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -3999,10 +4056,6 @@ fn main() -> anyhow::Result<()> {
             return remote::command(std::env::args().skip(2));
         }
         _ => {}
-    }
-    #[cfg(windows)]
-    if let Some(script) = cargo::script::stood_in_front_of() {
-        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {
@@ -4605,7 +4658,7 @@ fn run_holding(
         let whole = whole.map(|it| it.recv()?).transpose()?;
         let symbol_files = whole.as_ref().map_or(&symbol_files, |it| &it.symbol_files);
         let start = Instant::now();
-        let table = SymbolTable::load(symbol_files, &root)?;
+        let table = SymbolTable::load(symbol_files, &root, loaded_as)?;
         eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
         Ok::<_, anyhow::Error>((table, whole))
     });
@@ -5146,9 +5199,11 @@ fn run_holding(
                             });
                             let table = match shared {
                                 Some(program) => program.table.clone(),
-                                None => {
-                                    Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?)
-                                }
+                                None => Arc::new(SymbolTable::load(
+                                    &args.symbol_files,
+                                    &args.root()?,
+                                    loaded_as,
+                                )?),
                             };
                             Ok((args, table))
                         });
@@ -5770,8 +5825,11 @@ impl Program {
                 if linked.link_cmd.is_some() {
                     self.args.link_cmd = linked.link_cmd.clone();
                 }
-                self.table =
-                    Arc::new(SymbolTable::load(&self.args.symbol_files, &self.args.root()?)?);
+                self.table = Arc::new(SymbolTable::load(
+                    &self.args.symbol_files,
+                    &self.args.root()?,
+                    loaded_as,
+                )?);
                 self.distrust_rustc(db, files, None);
                 self.unbuilt.named_anew = true;
                 self.args.widened.clear();
@@ -5837,7 +5895,7 @@ impl Program {
         if !self.table.built_since_read() || !checks_differ(db, &built) {
             return Ok(());
         }
-        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?);
+        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?, loaded_as)?);
         let patching = self.known.patching;
         self.known = Rejections::default();
         self.known.patching = patching;
@@ -6047,7 +6105,10 @@ mod tests {
         assert!(links_core(ordinary));
         assert!(links_core("cc @/t/link.args"));
         assert!(links_core("cc /sysroot/lib/libstd-44675f186029a4cd.so"));
+        assert!(links_core(r"link.exe C:\sysroot\lib\std-3854312d46c17a37.dll.lib /OUT:app.exe"));
         assert!(!links_core(lto));
+        let lto_of_msvc = r#"link.exe "C:\t\deps\app.0.rcgu.o" "C:\t\deps\rustce38FyE\libstd-3854312d46c17a37.rlib" "/NATVIS:C:\sysroot\etc\libcore.natvis""#;
+        assert!(!links_core(lto_of_msvc));
     }
 
     #[test]

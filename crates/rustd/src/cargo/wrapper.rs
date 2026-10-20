@@ -149,6 +149,9 @@ fn loaded_later() -> Result<(), String> {
     settle.stdin(Stdio::null()).stdout(log.try_clone().map_err(|it| said(&it))?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut settle, 0);
+    // Cargo reads what this wrapper says until nobody can write to it any more.
+    #[cfg(windows)]
+    let _kept = super::client::on_its_own(&mut settle);
     settle.spawn().map(drop).map_err(|it| {
         settled(cargo.pid);
         said(&it)
@@ -249,8 +252,16 @@ impl Unit {
         }
         unit.script = record.is_build_script();
         unit.linked = record.is_linked() && !record.runs_in_build();
-        unit.id =
-            format!("{}{}", unit.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        // A program for MSVC has no hash in its file name: the builds of it that differ in
+        // features are told apart by the hash cargo gives its symbols.
+        let hash = record
+            .codegen("extra-filename")
+            .or(record.codegen("metadata").filter(|_| cfg!(windows)));
+        unit.id = match hash {
+            Some(hash) if hash.starts_with('-') => format!("{}{hash}", unit.crate_name),
+            Some(hash) => format!("{}-{hash}", unit.crate_name),
+            None => unit.crate_name.clone(),
+        };
         Some(unit)
     }
 

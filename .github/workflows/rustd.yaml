@@ -281,8 +281,10 @@ jobs:
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
-          # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          # The two Linux cross targets of buildmodel.py are skipped here, and it says so. Each
+          # case is built by the short name of its directory, which is another name of the
+          # same checkout than the one the file system gives rustd.
+          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py --short; fi
           # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
@@ -386,6 +388,61 @@ jobs:
       - name: cargo rustd against cargo
         working-directory: harness
         run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+
+  cargo-rustd-windows:
+    name: cargo rustd (windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    # Cranelift only: under LLVM the harness does not pass on Windows yet.
+    env:
+      RUSTD_BACKEND: cranelift
+      LLVM_VERSION: 20.1.8
+      LLVM_SYS_201_PREFIX: C:\llvm20
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      # The harnesses run the linker themselves, with the environment the compiler has. In
+      # this shell the `link` of coreutils comes before the linker, so it goes.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: rm -f /usr/bin/link.exe
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src -c llvm-tools && rustup default 1.99.0
+      - uses: actions/cache@v4
+        id: llvm
+        with:
+          path: C:\llvm20
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc-pdbutil
+      # The release has the libraries, the headers and `llvm-config`, which is all the build
+      # reads, and `llvm-pdbutil`, which debuginfo.py reads a PDB with. Its libraries want a static libxml2 that it does not have and that nothing
+      # here calls into, so an archive of nothing stands in for it.
+      - name: LLVM 20
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          name="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc"
+          curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
+          mkdir -p /c/llvm20
+          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe" "$name/bin/llvm-pdbutil.exe"
+          rm llvm.tar.xz
+          echo '#![no_std]' > nothing.rs
+          rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
+          "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-ar.exe" rc /c/llvm20/lib/libxml2s.lib nothing.o
+      - uses: Swatinem/rust-cache@v2
+      # The release is built against the static C runtime, and names libraries of the SDK
+      # that the linker is not otherwise shown.
+      - name: Build
+        run: |
+          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
+          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
+          cargo build -p rustd --release --features llvm
+      # As the Linux job, without the second user at the socket, which the harness says it
+      # leaves out. Its scratch directory is in RUNNER_TEMP: a socket's path is short.
+      - name: cargo rustd against cargo
+        working-directory: harness
+        run: RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe" env -u CARGO_INCREMENTAL python cargo_rustd.py --small
 
   # The same on macOS arm64, where the link is Apple's and the cargo above the wrapper is
   # read through libproc.

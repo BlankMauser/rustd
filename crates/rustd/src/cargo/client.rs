@@ -92,7 +92,7 @@ pub(crate) fn gone(socket: &Path) {
 /// command writes to are among them, under their own numbers and under those the commands
 /// above this one had: whoever reads the pipe would wait for the daemon to end.
 #[cfg(windows)]
-fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
+pub(crate) fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
     use std::os::windows::process::CommandExt as _;
     use windows_sys::Win32::{
         Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},

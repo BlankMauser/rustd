@@ -67,7 +67,9 @@ impl Record {
 
     /// The record among `records` of the unit that wrote `artifact`.
     pub(crate) fn of_artifact<'a>(records: &'a [Record], artifact: &Path) -> Option<&'a Record> {
-        records.iter().find(|record| record.wrote(artifact))
+        // Units that differ in features write a program for MSVC to one file: it is the
+        // last one's.
+        records.iter().filter(|record| record.wrote(artifact)).max_by_key(|record| record.stamp)
     }
 
     /// Whether `artifact` is a file the unit wrote, as cargo names it: its hard link to the

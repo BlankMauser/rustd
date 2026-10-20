@@ -378,6 +378,13 @@ fn unsupported_target(triple: &str) -> Option<String> {
         Ok(target) if matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO) => {
             None
         }
+        // `link.exe`'s line is the other one the plan takes apart; `lld-link`'s and the GNU
+        // linker's of `-windows-gnu` are not.
+        Ok(target)
+            if target.object_format == ObjectFormat::Coff && triple == "x86_64-pc-windows-msvc" =>
+        {
+            None
+        }
         Ok(_) => Some(format!("programs for {triple} are not linked through `cargo rustd` yet")),
         Err(why) => Some(why),
     }

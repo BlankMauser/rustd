@@ -257,9 +257,10 @@ impl Asked {
         Ok(LinkLine::parse(&line))
     }
 
-    /// The path of `file` as rustdoc shows it: from the directory it runs in.
+    /// The path of `file` as rustdoc shows it: from the directory it runs in, by the name
+    /// of that the file was loaded through.
     fn shown(&self, file: &Path) -> String {
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = std::env::current_dir().and_then(dunce::canonicalize).unwrap_or_default();
         file.strip_prefix(&cwd).unwrap_or(file).display().to_string()
     }
 }

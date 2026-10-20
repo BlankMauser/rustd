@@ -39,7 +39,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLV
 cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -202,6 +202,56 @@ def kill_all(process):
 def kill(pid):
     """Ends the one process `pid`. Windows has no signals; `SIGTERM` there ends it at once."""
     os.kill(pid, signal.SIGTERM if WINDOWS else signal.SIGKILL)
+
+
+# Where the scratch directory is made. A socket's path has at most 107 bytes on Windows as
+# elsewhere, and a user's temporary directory there takes half of them.
+SHORT_TEMP = (os.environ.get("RUNNER_TEMP") or os.environ.get("SystemDrive", "C:") + os.sep) if WINDOWS else None
+
+
+def remove(tree):
+    """Removes `tree`. On Windows a file that is read-only, as git's objects are, is not
+    removed until it is made writable, and one a process that is ending still has open is not
+    removed until it has ended."""
+    def writable(function, path, _):
+        os.chmod(path, 0o700)
+        function(path)
+
+    if not WINDOWS:
+        return shutil.rmtree(tree, ignore_errors=True)
+    for _ in range(20):
+        try:
+            return shutil.rmtree(tree, onexc=writable)
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.5)
+
+
+def hold(pid):
+    """Stops `pid` where it is until `free` lets it go on."""
+    if WINDOWS:
+        return whole_process(pid, "NtSuspendProcess")
+    os.kill(pid, signal.SIGSTOP)
+
+
+def free(pid):
+    if WINDOWS:
+        return whole_process(pid, "NtResumeProcess")
+    os.kill(pid, signal.SIGCONT)
+
+
+def whole_process(pid, call):
+    """Windows stops and continues threads; these two calls of ntdll do every thread of one."""
+    import ctypes
+    PROCESS_SUSPEND_RESUME = 0x0800
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    getattr(ctypes.WinDLL("ntdll"), call)(ctypes.c_void_p(handle))
+    kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def alive(pid):
@@ -393,6 +443,11 @@ def served(side, command, ask):
 def checking(root):
     """Whether a `cargo check` runs below `root`: the one `cargo rustd` starts after cargo
     built, for the dependencies to be checked by the time the daemon builds."""
+    if WINDOWS:
+        # Which directory a process runs in is not told there: any `cargo check` counts.
+        asked = "Get-CimInstance Win32_Process -Filter \"Name='cargo.exe'\" | ForEach-Object CommandLine"
+        lines = subprocess.run(["powershell", "-NoProfile", "-Command", asked], capture_output=True, text=True).stdout.splitlines()
+        return any("check" in line.split()[1:2] for line in lines)
     if not os.path.isdir("/proc/self"):
         # No /proc on macOS: `ps` has the commands and `lsof` where each one runs.
         listed = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
@@ -536,7 +591,7 @@ FLAG_WORKSPACE = {
     "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
-    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
+    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = file_of(program);\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, file_of(program));\n}\n\n#[cfg(unix)]\nfn file_of(path: &str) -> u64 {\n    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())\n}\n\n// For MSVC cargo gives a program no hash in its file names, so the builds that differ in\n// features, flags or profile share the file and the one fingerprint cargo keeps of it. When\n// the daemon built the program, that fingerprint is still of the build cargo did last, and\n// the cargo here links the program again when that was another one ("the profile\n// configuration changed" after a `CARGO_INCREMENTAL=0` build). Cargo alone has linked it\n// before the test runs. So the file is not the same one there; that it is there is checked.\n#[cfg(windows)]\nfn file_of(path: &str) -> bool {\n    std::path::Path::new(path).is_file()\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
 
 # Each: the subcommand, its arguments, the variables it runs with.
@@ -743,7 +798,7 @@ def manners(work, ws, env, here, check, edit):
         code = shown.wait()
         name = " ".join(["rustd" if argv[0] == RUSTD else argv[0], *argv[1:]])
         # Cargo's subcommand ends by the signal; `cargo-rustd` has no status to pass on and says 1.
-        check(f"`{name}` whose reader went away ends without a word", not said.strip() and code in (0, 1, -signal.SIGPIPE), f"exit {code} {said.strip()[:120]}")
+        check(f"`{name}` whose reader went away ends without a word", not said.strip() and code in (0, 1, -getattr(signal, "SIGPIPE", 1)), f"exit {code} {said.strip()[:120]}")
 
     left = []
     for turn in range(5):
@@ -814,7 +869,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     pid, workers, _ = status()
     for n, root in enumerate(trees):
         rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("hello {name}")', f'format!("tree{n} {{name}}")')
-    spawn = lambda root, *args: subprocess.Popen(["cargo", "rustd", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    spawn = lambda root, *args: subprocess.Popen(["cargo", "rustd", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, **OWN_GROUP)
     clients = [(n, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees)]
     ended = [(n, i // 4, client.communicate(timeout=600), client.returncode) for i, (n, client) in enumerate(clients)]
     right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
@@ -823,8 +878,8 @@ def abuse(work, ws, tree, env, check, status, alive):
 
     # A worker that is stopped holds the build a client asks for until it is continued.
     edit = lambda text: open(os.path.join(ws, "app/src/main.rs"), "a").write(f"\n// {text}\n")
-    held = lambda: [os.kill(p, signal.SIGSTOP) for p in workers]
-    freed = lambda: [os.kill(p, signal.SIGCONT) for p in workers if alive(p)]
+    held = lambda: [hold(p) for p in workers]
+    freed = lambda: [free(p) for p in workers if alive(p)]
     edit("held one")
     held()
     client = spawn(ws, "build")
@@ -841,7 +896,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     client = spawn(ws, "run", "killed")
     time.sleep(1)
     waits = client.poll() is None
-    os.kill(pid, signal.SIGKILL)
+    kill(pid)
     freed()
     out, err = client.communicate(timeout=600)
     said = how_built(err)
@@ -881,6 +936,11 @@ def stranger(home, check):
     """A second user at the daemon's socket: kept out by the directory and the socket's
     modes, and turned away by the daemon when those are opened to it."""
     name = "rustd-stranger"
+    if WINDOWS:
+        # A second account there is made with a password and logged on with it, which a
+        # hosted runner does not let a job do; `socket/windows.rs` has a test of the lists.
+        print("  skipped: a second user is turned away (no second account is made on Windows)", flush=True)
+        return
     sudo = lambda *argv: subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
     if sudo("true").returncode != 0:
         check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RUSTD_NO_SUDO") == "1", "not run")
@@ -938,6 +998,33 @@ def stranger(home, check):
 
 
 WRAPPER = '#!/bin/sh\necho "$1" >> "{log}"\nexec "$@"\n'
+WRAPPER_RS = """use std::io::Write;
+fn main() {
+    let mut args = std::env::args_os().skip(1);
+    let program = args.next().unwrap();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(r#"{log}"#).unwrap();
+    writeln!(log, "{}", program.to_string_lossy()).unwrap();
+    drop(log);
+    let status = std::process::Command::new(program).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}
+"""
+
+
+def wrapper(work, name, log):
+    """A program that writes the one it is given to `log` and runs it: a shell script, and on
+    Windows, where cargo starts no script, a program built for it."""
+    if not WINDOWS:
+        script = os.path.join(work, f"{name}.sh")
+        open(script, "w").write(WRAPPER.format(log=log))
+        os.chmod(script, 0o755)
+        return script
+    source = os.path.join(work, f"{name}.rs")
+    open(source, "w").write(WRAPPER_RS.replace("{log}", log))
+    subprocess.run(["rustc", "--edition", "2021", "-o", os.path.join(work, f"{name}.exe"), source], cwd=work, check=True, capture_output=True)
+    return os.path.join(work, f"{name}.exe")
+
+
 DOCTEST = '/// ```\n/// assert_eq!(util::doubled(2), 4);\n/// ```\npub fn doubled(n: u32) -> u32 {\n    n * 2\n}\n'
 
 
@@ -1011,13 +1098,11 @@ def plain(work):
     # A wrapper of the user's around rustc, as sccache is, and one around the workspace's crates.
     home = os.path.join(work, "plain-cargo-home")
     os.makedirs(home)
-    logs = {}
+    logs, wrappers = {}, {}
     for name in ("outer", "inner"):
         logs[name] = os.path.join(work, f"plain-{name}.log")
-        script = os.path.join(work, f"plain-{name}.sh")
-        open(script, "w").write(WRAPPER.format(log=logs[name]))
-        os.chmod(script, 0o755)
-    before = f'[build]\nrustc-wrapper = "{work}/plain-outer.sh"\nrustc-workspace-wrapper = "{work}/plain-inner.sh"\n'
+        wrappers[name] = wrapper(work, f"plain-{name}", logs[name])
+    before = f"[build]\nrustc-wrapper = '{wrappers['outer']}'\nrustc-workspace-wrapper = '{wrappers['inner']}'\n"
     open(os.path.join(home, "config.toml"), "w").write(before)
     downloads(home)
     env = dict(env, CARGO_HOME=home)
@@ -1047,7 +1132,7 @@ def plain(work):
     outer, inner = calls("outer"), calls("inner")
     check("the first plain `cargo run` is rustc's and is right", first.returncode == 0 and not wrong and how.startswith("cargo"), f"{how}; {wrong or 'same as cargo'}")
     check("the user's `rustc-wrapper` still runs, around rustd's wrapper", "chained" not in on.stdout and any("rustd-rustc" in c for c in outer), f"{len(outer)} calls")
-    check("the user's workspace wrapper still runs, under rustd's", "plain-inner.sh" in on.stdout and len(inner) > 0 and not any("rustd-rustc" in c for c in inner), f"{len(inner)} calls")
+    check("the user's workspace wrapper still runs, under rustd's", os.path.basename(wrappers["inner"]) in on.stdout and len(inner) > 0 and not any("rustd-rustc" in c for c in inner), f"{len(inner)} calls")
     took, states = wait_warm(here, ws)
     pid, workers, _ = status()
     check("the daemon was started by that build and has loaded it", pid is not None and "ready" in " ".join(states), f"pid {pid}, {'; '.join(states)}, {took:.1f}s")
@@ -1107,10 +1192,16 @@ def plain(work):
     wait_warm(here, ws)
     touch("checked")
     checker = subprocess.Popen(["cargo", "check", "--workspace", "--all-targets", "--message-format=json"], cwd=ws, env=here.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Read as it is written: a pipe nobody reads fills (4 KiB on Windows), and the check
+    # would wait with the build's lock held.
+    said = []
+    reader = threading.Thread(target=lambda: said.append(checker.communicate(timeout=600)))
+    reader.start()
     mine, how, wrong = same("run", "checked")
-    out, _ = checker.communicate(timeout=600)
+    reader.join()
+    out, errors = said[0] if said else ("", "")
     whole = all(line.startswith("{") for line in out.splitlines())
-    check("a `cargo check` with JSON messages at the same time as a build: both are right", checker.returncode == 0 and whole and mine.returncode == 0 and not wrong, f"{how[:60]}; {len(out.splitlines())} messages; {wrong or 'same as cargo'}")
+    check("a `cargo check` with JSON messages at the same time as a build: both are right", checker.returncode == 0 and whole and mine.returncode == 0 and not wrong, f"{how[:60]}; check exit {checker.returncode}; {len(out.splitlines())} messages; {errors[-200:] if checker.returncode else 'no errors'}; {wrong or 'same as cargo'}")
 
     trees = [ws]
     for n in (1, 2, 3):
@@ -1126,7 +1217,7 @@ def plain(work):
     for n, root in enumerate(trees[1:], 1):
         rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("hello {name}")', f'format!("tree{n} {{name}}")')
     here.how_built("")
-    spawn = lambda root, *args: subprocess.Popen(["cargo", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    spawn = lambda root, *args: subprocess.Popen(["cargo", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, **OWN_GROUP)
     clients = [(n, i, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees) if n]
     ended = [(n, i, client.communicate(timeout=600), client.returncode) for n, i, client in clients]
     right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
@@ -1136,13 +1227,13 @@ def plain(work):
         wait_warm(side, side.ws)
     pid, workers, _ = status()
     touch("killed")
-    signalled = lambda sent: [os.kill(p, sent) for p in workers if alive(p)]
-    signalled(signal.SIGSTOP)
+    signalled = lambda sent: [sent(p) for p in workers if alive(p)]
+    signalled(hold)
     client = spawn(ws, "run", "killed")
     time.sleep(1.5)
     waits = client.poll() is None
-    os.kill(pid, signal.SIGKILL)
-    signalled(signal.SIGCONT)
+    kill(pid)
+    signalled(free)
     out, err = client.communicate(timeout=600)
     said = here.how_built(err)
     check("the build whose daemon is killed succeeds", waits and client.returncode == 0 and out.splitlines()[0].endswith("killed"), f"exit {client.returncode}, {said[:120]}, {err.strip()[-200:]}")
@@ -1154,14 +1245,14 @@ def plain(work):
     # Another build of rustd: the same files in another place have another version.
     other = os.path.join(work, "plain-other-build")
     os.makedirs(other)
-    for name in ("rustd", "cargo-rustd", "rustd-rustc"):
+    for name in ("rustd" + EXE, "cargo-rustd" + EXE, "rustd-rustc" + EXE):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     pid = status()[0]
     subprocess.run([RUSTD, "disable"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "rustd"), "enable"], env=env, capture_output=True)
+    subprocess.run([os.path.join(other, "rustd" + EXE), "enable"], env=env, capture_output=True)
     touch("skew")
     mine, how, wrong = same("run", "skew")
-    theirs = os.path.join(other, "rustd")
+    theirs = os.path.join(other, "rustd" + EXE)
     began = time.time()
     while "    " + ws + ": ready" not in status(theirs)[2] and time.time() - began < 120:
         time.sleep(0.25)
@@ -1170,7 +1261,7 @@ def plain(work):
     touch("skewed")
     mine, how, wrong = same("run", "skewed")
     check("and the build after that is the new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status(theirs)[0] == newer, how[:90])
-    subprocess.run([os.path.join(other, "rustd"), "disable"], env=env, capture_output=True)
+    subprocess.run([os.path.join(other, "rustd" + EXE), "disable"], env=env, capture_output=True)
 
     seen = subprocess.run([RUSTD, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
     counted = re.search(r"(\d+) programs? linked by the daemon, (\d+) by rustc", seen)
@@ -1182,7 +1273,7 @@ def plain(work):
     mine, how, wrong = same("run", "off")
     check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^rustd:|\[rustd\]", mine.stderr, re.M) and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(calls('outer')) - n} calls of the wrapper, by rustd's {[c[:200] for c in calls('outer')[n:] if 'rustd-rustc' in c][:2]}; {mine.stderr.strip()[-300:]}")
     subprocess.run([RUSTD, "stop"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "rustd"), "stop"], env=env, capture_output=True)
+    subprocess.run([os.path.join(other, "rustd" + EXE), "stop"], env=env, capture_output=True)
     return checks
 
 
@@ -1227,7 +1318,7 @@ def worktree(ours, row, build, run, edits, work):
         if wrong:
             row["wrong"].append(f"tree run: {wrong}")
     git("worktree", "remove", "--force", tree)
-    shutil.rmtree(tree, ignore_errors=True)
+    remove(tree)
 
 
 def table(rows):
@@ -1253,9 +1344,9 @@ def main():
     argv = sys.argv[1:]
     names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
     modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
-    # As the daemon names it: with no link and no short name in it.
-    # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
+    # As the daemon names it: with no link and no short name in it. The path of a socket is
+    # at most 104 bytes on macOS, whose temporary directory is long, as on Windows.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else SHORT_TEMP))
     print(f"work {work}; rustd {RUSTD}", flush=True)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:
@@ -1266,7 +1357,7 @@ def main():
                 result["projects"].append(row)
                 result["wrong"] += [f"{name}, {mode}: {w}" for w in row["wrong"]]
                 if "--keep" not in argv:
-                    shutil.rmtree(os.path.join(work, name), ignore_errors=True)
+                    remove(os.path.join(work, name))
     if "--only-projects" not in argv:
         print("flags:", flush=True)
         rows, wrong, counted = flags(work)
@@ -1305,7 +1396,7 @@ def main():
         if result.get("plain"):
             md.write("\n## Plain cargo after `rustd enable`\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["plain"]))
     if "--keep" not in argv:
-        shutil.rmtree(work, ignore_errors=True)
+        remove(work)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))
     sys.exit(1 if result["wrong"] else 0)
 

@@ -191,9 +191,240 @@ mod system {
     }
 }
 
+/// On Windows a process's parent, command line, directory and environment are in its own
+/// memory, in the parameters its environment block points to, and are read from there. The
+/// places are those of a 64-bit process, which is all rustd is built as there.
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod system {
+    use std::{
+        ffi::{OsString, c_void},
+        os::windows::{
+            ffi::OsStringExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+        },
+        path::PathBuf,
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, LocalFree},
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Threading::{
+                GetProcessTimes, IsWow64Process, OpenProcess, PROCESS_QUERY_INFORMATION,
+                PROCESS_VM_READ, QueryFullProcessImageNameW,
+            },
+        },
+        UI::Shell::CommandLineToArgvW,
+    };
+
+    use super::Cargo;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process: *mut c_void,
+            class: u32,
+            information: *mut c_void,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+
+    /// Where a process's environment block has its parameters, and where those have the
+    /// directory, the command line, the environment and how long that is.
+    const PARAMETERS: usize = 0x20;
+    const DIRECTORY: usize = 0x38;
+    const COMMAND_LINE: usize = 0x70;
+    const ENVIRONMENT: usize = 0x80;
+    const ENVIRONMENT_SIZE: usize = 0x3f0;
+
+    /// An environment longer than this is not one: Windows allows 32767 characters.
+    const LONGEST: usize = 1 << 20;
+
+    struct Process(OwnedHandle);
+
+    impl Process {
+        fn open(pid: u32) -> Option<Process> {
+            // SAFETY: opens a process by number; the handle is owned from here.
+            let handle =
+                unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+            if handle.is_null() {
+                return None;
+            }
+            // SAFETY: the handle was just opened and is nobody else's.
+            let process = Process(unsafe { OwnedHandle::from_raw_handle(handle) });
+            let mut narrow = 0;
+            // SAFETY: the handle is open and the result is written to a local.
+            let asked = unsafe { IsWow64Process(process.0.as_raw_handle(), &raw mut narrow) };
+            (asked != 0 && narrow == 0).then_some(process)
+        }
+
+        /// `ProcessBasicInformation`: the second word is where the environment block is and
+        /// the sixth is the process that started this one.
+        fn basic(&self) -> Option<[usize; 6]> {
+            let mut basic = [0usize; 6];
+            // SAFETY: the buffer is as long as is said and is the size of the structure.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    self.0.as_raw_handle(),
+                    0,
+                    basic.as_mut_ptr().cast(),
+                    size_of_val(&basic) as u32,
+                    ptr::null_mut(),
+                )
+            };
+            (status >= 0).then_some(basic)
+        }
+
+        /// When the process was started.
+        fn started(&self) -> Option<u64> {
+            let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+            let [created, exited, kernel, user] = &mut times;
+            // SAFETY: the handle is open and the four times are written to locals.
+            let asked =
+                unsafe { GetProcessTimes(self.0.as_raw_handle(), created, exited, kernel, user) };
+            (asked != 0)
+                .then(|| u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
+        }
+
+        fn read<T: Copy + Default>(&self, at: usize, len: usize) -> Option<Vec<T>> {
+            let mut read = vec![T::default(); len];
+            let (bytes, mut done) = (size_of_val(&read[..]), 0);
+            // SAFETY: the buffer is `bytes` long; a place that is not the process's fails.
+            let ok = unsafe {
+                ReadProcessMemory(
+                    self.0.as_raw_handle(),
+                    at as *const c_void,
+                    read.as_mut_ptr().cast(),
+                    bytes,
+                    &raw mut done,
+                )
+            };
+            (ok != 0 && done == bytes).then_some(read)
+        }
+
+        fn word(&self, at: usize) -> Option<usize> {
+            self.read::<usize>(at, 1)?.pop()
+        }
+
+        /// The text of the `UNICODE_STRING` at `at`: its length in bytes, and where it is.
+        fn text(&self, at: usize) -> Option<Vec<u16>> {
+            let len = self.word(at)? & 0xffff;
+            self.read(self.word(at + 8)?, len / 2)
+        }
+    }
+
+    /// The process that started `pid`, when it still runs. The number of one that ended may
+    /// be another's by now, which is known by its having started later.
+    pub(super) fn parent(pid: u32) -> Option<u32> {
+        let process = Process::open(pid)?;
+        let parent = u32::try_from(process.basic()?[5]).ok()?;
+        (Process::open(parent)?.started()? <= process.started()?).then_some(parent)
+    }
+
+    pub(super) fn described(pid: u32) -> Option<Cargo> {
+        let process = Process::open(pid)?;
+        let parameters = process.word(process.basic()?[1] + PARAMETERS)?;
+        let mut cwd = process.text(parameters + DIRECTORY)?;
+        // `C:\` is a directory, and any other is named without the `\` it is kept with.
+        if cwd.len() > 3 && cwd.last() == Some(&u16::from(b'\\')) {
+            cwd.pop();
+        }
+        let size = process.word(parameters + ENVIRONMENT_SIZE)?;
+        let environment = process.word(parameters + ENVIRONMENT)?;
+        let environment = process.read::<u16>(environment, size.min(LONGEST) / 2)?;
+        let env = environment.split(|it| *it == 0).filter_map(|it| {
+            // The directory of each drive is kept as a variable whose name begins with `=`.
+            let at = it.iter().skip(1).position(|it| *it == u16::from(b'='))? + 1;
+            (it[0] != u16::from(b'=')).then(|| (wide(&it[..at]), wide(&it[at + 1..])))
+        });
+        Some(Cargo {
+            pid,
+            executable: executable(&process)?,
+            args: arguments(process.text(parameters + COMMAND_LINE)?)?,
+            cwd: PathBuf::from(wide(&cwd)),
+            env: env.collect(),
+        })
+    }
+
+    fn wide(text: &[u16]) -> OsString {
+        OsString::from_wide(text)
+    }
+
+    fn executable(process: &Process) -> Option<PathBuf> {
+        let mut name = vec![0u16; 1 << 15];
+        let mut len = name.len() as u32;
+        // SAFETY: the buffer is `len` characters long, and `len` is set to what was written.
+        let asked = unsafe {
+            QueryFullProcessImageNameW(
+                process.0.as_raw_handle(),
+                0,
+                name.as_mut_ptr(),
+                &raw mut len,
+            )
+        };
+        (asked != 0).then(|| PathBuf::from(wide(&name[..len as usize])))
+    }
+
+    /// The arguments of a command line as the C runtime takes it apart, without the first.
+    fn arguments(mut line: Vec<u16>) -> Option<Vec<String>> {
+        line.push(0);
+        let mut count = 0;
+        // SAFETY: the line ends with a zero. What is returned is `count` pointers to texts
+        // that end with one, in one allocation that is freed below.
+        let words = unsafe { CommandLineToArgvW(line.as_ptr(), &raw mut count) };
+        if words.is_null() {
+            return None;
+        }
+        let word = |at: usize| {
+            // SAFETY: `at` is below `count`, and the text ends with a zero.
+            let text = unsafe {
+                let text = *words.add(at);
+                std::slice::from_raw_parts(text, (0..).take_while(|it| *text.add(*it) != 0).count())
+            };
+            wide(text).into_string().ok()
+        };
+        let args = (1..count as usize).map(word).collect();
+        // SAFETY: the allocation `CommandLineToArgvW` made, which nothing points into now.
+        unsafe { LocalFree(words.cast()) };
+        args
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_process_is_described_as_it_was_started() {
+            let mut child = std::process::Command::new("cmd");
+            child.args(["/c", "pause", "a b", "c\"d"]).env("RUSTD_ANCESTOR", "one=two");
+            child.current_dir(std::env::temp_dir()).stdin(std::process::Stdio::piped());
+            let mut child = child.stdout(std::process::Stdio::null()).spawn().unwrap();
+            let seen = described(child.id());
+            let above = parent(child.id());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let seen = seen.unwrap();
+            assert_eq!(above, Some(std::process::id()));
+            assert_eq!(seen.executable.file_stem().unwrap().to_ascii_lowercase(), "cmd");
+            assert_eq!(seen.args, ["/c", "pause", "a b", "c\"d"]);
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            assert_eq!(seen.cwd.canonicalize().unwrap(), temp);
+            let named = seen.env.iter().find(|(name, _)| name == "RUSTD_ANCESTOR");
+            assert_eq!(named.map(|it| it.1.to_str().unwrap()), Some("one=two"));
+            assert!(seen.env.iter().all(|(name, _)| !name.is_empty()));
+        }
+    }
+}
+
 /// Elsewhere the command line of another process is not read yet, and every build under
 /// plain cargo is rustc's.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_pointer_width = "64")
+)))]
 mod system {
     use super::Cargo;
 
