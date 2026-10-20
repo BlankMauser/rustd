@@ -693,6 +693,10 @@ impl State {
             if unit_test && kind == Kind::Lib {
                 tested_libraries.push((package, unit, executable.as_std_path(), artifact));
             }
+            // `--doc` builds the unit tests for how they are linked alone: they are not run.
+            if asked.flags.doc {
+                continue;
+            }
             let plan = match unit {
                 Some(unit) => Plan::of(unit, &used, &files, None)?,
                 None => Err(format!(

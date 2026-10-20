@@ -287,7 +287,17 @@ fn errors(db: &RootDatabase, file: vfs::FileId) -> Vec<((String, String), TextRa
     syntax
         .into_iter()
         .chain(semantic)
-        .filter(|it| it.severity == ide_db::Severity::Error && it.range.file_id == file)
+        // A lint is an error only by the levels of the example's attributes, which rustc
+        // and rust-analyzer do not read alike.
+        .filter(|it| {
+            let lint = matches!(
+                it.code,
+                ide_diagnostics::DiagnosticCode::RustcLint(_)
+                    | ide_diagnostics::DiagnosticCode::Clippy(_)
+                    | ide_diagnostics::DiagnosticCode::RaLint(..)
+            );
+            it.severity == ide_db::Severity::Error && !lint && it.range.file_id == file
+        })
         .map(|it| ((it.code.as_str().to_owned(), it.message), it.range.range))
         .collect()
 }

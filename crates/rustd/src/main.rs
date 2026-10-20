@@ -4711,6 +4711,34 @@ fn process_wide() {
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Has the crates of examples be as the documentation of their libraries says, after
+/// `settle` leaves nothing reading the database. The crates whose text changed.
+fn write_examples(
+    db: &mut RootDatabase,
+    target: &str,
+    mut settle: impl FnMut(&mut RootDatabase) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<ide_db::base_db::Crate>> {
+    let mut crates = Vec::new();
+    // Written with every example run, then without the ones that do not compile.
+    for _ in 0..3 {
+        let rewrites = doctest::rewrites(db, target);
+        if rewrites.is_empty() {
+            break;
+        }
+        settle(db)?;
+        let mut change = ChangeWithProcMacros::default();
+        let files: Vec<vfs::FileId> = rewrites.iter().map(|it| it.0).collect();
+        for (file, text) in rewrites {
+            change.change_file(file, Some(text));
+        }
+        db.apply_change(change);
+        for file in files {
+            crates.extend(ide_db::base_db::relevant_crates(db, file).iter().copied());
+        }
+    }
+    Ok(crates)
+}
+
 /// Loads the workspace `args` names and builds what they ask for, then serves it when they
 /// ask for that.
 fn run(args: Args) -> anyhow::Result<()> {
@@ -4909,6 +4937,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         if let Some(why) = why {
             bail!(why);
         }
+    }
+    if !write_examples(&mut db, emits.triple(), |_| Ok(()))?.is_empty() {
+        known.touch(&db, None);
+        listed.touch(&db, None);
     }
     let mut cold = build(&db, &table, &args, &mut known, &listed)?;
     // An `include!` in a body is first seen when the body is compiled.
@@ -5557,24 +5589,9 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             listed.touch(&db, Some(&moved));
         }
         // The examples of the libraries are written as their documentation says now.
-        for _ in 0..3 {
-            let rewrites = doctest::rewrites(&db, emits.triple());
-            if rewrites.is_empty() {
-                break;
-            }
-            builds.settle(&mut db, &mut programs)?;
-            let mut change = ChangeWithProcMacros::default();
-            let files: Vec<vfs::FileId> = rewrites.iter().map(|it| it.0).collect();
-            for (file, text) in rewrites {
-                change.change_file(file, Some(text));
-            }
-            db.apply_change(change);
-            let crates: Vec<_> = files
-                .iter()
-                .flat_map(|&file| {
-                    ide_db::base_db::relevant_crates(&db, file).iter().copied().collect::<Vec<_>>()
-                })
-                .collect();
+        let crates =
+            write_examples(&mut db, emits.triple(), |db| builds.settle(db, &mut programs))?;
+        if !crates.is_empty() {
             programs.iter_mut().for_each(|it| {
                 it.known.touch(&db, Some(&crates));
                 it.unbuilt.stale = true;
