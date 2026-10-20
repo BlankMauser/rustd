@@ -1,0 +1,16 @@
+crates/hir-ty-codegen/mod.rs
+  h_9b6f78b66c1cb5 36-39,2025,2027,2030-2063
+harness/breakers/cases/src/allocator_static.rs
+  h_9b6f78b66c1cb5 4-6,15-18,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "308776307917e0676b50feb9539e10fb237d0628",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
