@@ -9,6 +9,7 @@ use std::{
 };
 
 use ide_db::base_db::Env;
+use paths::AbsPath;
 use project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind, TargetKind};
 use rustc_hash::{FxHashMap, FxHasher};
 
@@ -184,9 +185,9 @@ impl Scripts {
         // The scripts may have run in cargo's own build so far, the daemon's first build being
         // one: their first run here starts from what that build left, and builds none again.
         let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-        if self.config.target_dir_config.target_dir(Some(target)).as_deref()
-            == Some(&*target.join("rust-analyzer"))
-        {
+        let own = self.config.target_dir_config.target_dir(Some(target));
+        let own = own.filter(|it| *it == target.join("rust-analyzer")).map(|it| it.into_owned());
+        if own.is_some() {
             crate::seed_own_target(target.as_ref());
         }
         let mut config = self.config.clone();
@@ -198,7 +199,10 @@ impl Scripts {
         if let Some(error) = said.error() {
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }
-        if said != *loaded {
+        // Cargo's own build ran them last in other directories, whose files are the same
+        // when what they say is.
+        let alike = |a: &AbsPath, b: &AbsPath| own.is_some() && same_files(a.as_ref(), b.as_ref());
+        if !said.says_as(loaded, alike) {
             return Ok(true);
         }
         for file in &mut self.files {
@@ -210,6 +214,35 @@ impl Scripts {
         self.config = config;
         Ok(false)
     }
+}
+
+/// Whether the file or the tree of files at `a` is the one at `b`.
+fn same_files(a: &Path, b: &Path) -> bool {
+    let (Ok(at_a), Ok(at_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (at_a.dev(), at_a.ino()) == (at_b.dev(), at_b.ino()) {
+            return true;
+        }
+    }
+    if at_a.is_dir() && at_b.is_dir() {
+        let names = |dir: &Path| -> Option<Vec<std::ffi::OsString>> {
+            let mut names = std::fs::read_dir(dir).ok()?.map(|it| Some(it.ok()?.file_name()));
+            let mut names = names.by_ref().collect::<Option<Vec<_>>>()?;
+            names.sort();
+            Some(names)
+        };
+        let Some(names) = names(a).filter(|it| Some(it) == names(b).as_ref()) else {
+            return false;
+        };
+        return names.iter().all(|it| same_files(&a.join(it), &b.join(it)));
+    }
+    at_a.is_file()
+        && at_a.len() == at_b.len()
+        && std::fs::read(a).is_ok_and(|it| std::fs::read(b).is_ok_and(|other| it == other))
 }
 
 /// What a build script asked cargo to watch.

@@ -662,6 +662,27 @@ def flags(work):
     return rows, wrong, counted.stdout
 
 
+def scripted(work, check):
+    """A member whose build script watches nothing, which runs again for any edit of its
+    package: after the daemon's first build, an edit of the package is an edit, not a reload."""
+    ws = os.path.realpath(os.path.join(work, "scripted"))
+    for file, text in FLAG_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    script = 'fn main() {\n    let out = std::env::var("OUT_DIR").unwrap();\n    std::fs::write(format!("{out}/said.txt"), "said").unwrap();\n    println!("cargo:rustc-cfg=built");\n}\n'
+    open(os.path.join(ws, "util/build.rs"), "w").write(script)
+    home = os.path.join(work, "home-scripted")
+    here = Side(ws, base_env(home), True)
+    _, cold = here.cargo("build")
+    wait_warm(here, ws)
+    rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("', 'format!("edited ')
+    _, edited = here.cargo("run")
+    logs = [os.path.join(home, kind, it, "log") for kind in ("workers", "spares") if os.path.isdir(os.path.join(home, kind)) for it in os.listdir(os.path.join(home, kind))]
+    reloads = sum(len(re.findall(r"^reload: ", open(it, errors="replace").read(), re.M)) for it in logs if os.path.exists(it))
+    here.cargo("stop")
+    check("an edit of a package whose build script runs again for it does not reload the workspace", cold.returncode == 0 and "edited hello" in edited.stdout and reloads == 0, f"{reloads} reloads, {here.how_built(edited.stderr)}")
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -770,6 +791,7 @@ def daemon(work):
     _, mended = here.cargo("test", "--test", "valued")
     os.remove(valued)
     check("a test the daemon refuses fails the build, and runs once its source is mended", refused.returncode != 0 and "returns a value" in refused.stderr and mended.returncode == 0 and "1 passed" in mended.stdout, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; then {mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
+    scripted(work, check)
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
@@ -1233,6 +1255,8 @@ def plain(work):
     check("status counts what the daemon linked and why rustc linked the rest", counted and int(counted[1]) > 0, counted[0] if counted else seen[:200])
     back = open(os.path.join(home, "config.toml")).read()
     check("after `rustd disable` the configuration is the user's again, byte for byte", back == before)
+    # What the other build still settles runs cargo through its wrapper, as it was enabled.
+    here.settled()
     touch("off")
     n = len(calls("outer"))
     mine, how, wrong = same("run", "off")
