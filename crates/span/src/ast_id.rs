@@ -845,6 +845,13 @@ impl AstIdMap {
             .unwrap_or_else(|| panic!("AstIdMap node mismatch with node `{ptr:?}`"))
     }
 
+    /// The ranges of the impls of the file, those written in a function's body among them.
+    pub fn impl_ranges(&self) -> impl Iterator<Item = crate::TextRange> + '_ {
+        self.arena.iter().filter_map(|(_, (ptr, id))| {
+            (id.kind_typed() == Some(ErasedFileAstIdKind::Impl)).then(|| ptr.text_range())
+        })
+    }
+
     pub fn get_erased(&self, id: ErasedFileAstId) -> SyntaxNodePtr {
         let hash = hash_ast_id(&id);
         match self.id_map.find(hash, |&idx| self.arena[idx].1 == id) {

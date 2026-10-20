@@ -604,11 +604,35 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
 /// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
 /// name, and those are looked into in every crate. A function can hold one as well, of a type
 /// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
-/// functions are looked into in the crates of the workspace alone: lowering every body of
-/// every dependency for this is too much.
+/// lowering every body of every dependency for this is too much: there, only the functions an
+/// impl is written in are looked into, as bincode's `deserialize_enum` with its `EnumAccess`.
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
     if !krate.data(db).origin.is_local() {
+        let mut impls = FxHashMap::default();
+        let in_functions = scope.declarations().filter_map(|def| match def {
+            ModuleDefId::FunctionId(it) => Some(it),
+            _ => None,
+        });
+        let in_impls = scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(
+            |(_, item)| match *item {
+                AssocItemId::FunctionId(it) => Some(it),
+                _ => None,
+            },
+        );
+        for function in in_functions.chain(in_impls) {
+            let id = hir_expand::Lookup::lookup(&function, db).id;
+            let ranges = impls
+                .entry(id.file_id)
+                .or_insert_with(|| id.file_id.ast_id_map(db).impl_ranges().collect::<Vec<_>>());
+            if ranges.is_empty() {
+                continue;
+            }
+            let range = id.to_ptr(db).text_range();
+            if ranges.iter().any(|it| range.contains_range(*it) && range != *it) {
+                holders.push(function.into());
+            }
+        }
         return holders;
     }
     let declared = scope.declarations().filter_map(|def| match def {
