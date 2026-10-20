@@ -177,9 +177,18 @@ impl Scripts {
         if !files && !variables {
             return Ok(false);
         }
-        let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind else {
+        let ProjectWorkspaceKind::Cargo { cargo, build_scripts: loaded, .. } = &self.workspace.kind
+        else {
             return Ok(false);
         };
+        // The scripts may have run in cargo's own build so far, the daemon's first build being
+        // one: their first run here starts from what that build left, and builds none again.
+        let target: &paths::Utf8Path = cargo.target_directory().as_ref();
+        if self.config.target_dir_config.target_dir(Some(target)).as_deref()
+            == Some(&*target.join("rust-analyzer"))
+        {
+            crate::seed_own_target(target.as_ref());
+        }
         let mut config = self.config.clone();
         for (name, was) in &self.variables {
             let value = env.map_or_else(|| was.clone(), |env| env.get(name));
