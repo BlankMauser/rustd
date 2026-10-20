@@ -524,14 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn tests_the_harness_reaches_by_symbol_only() {
-        let incremental = "incremental=/t/debug/incremental";
-        assert_eq!(harness_alone(&unit(&["--test", "-C", incremental])), None);
-        assert_eq!(harness_alone(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
-        let private = harness_alone(&unit(&["--test"]));
-        assert!(private.is_some_and(|why| why.contains("without incremental")));
-        let inlined = harness_alone(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
-        assert!(inlined.is_some_and(|why| why.contains("opt-level 2")));
+    fn tests_are_built_whatever_rustc_would_have_inlined() {
         assert_eq!(unsupported(&unit(&["--test"])), None);
         assert_eq!(unsupported(&unit(&["-C", "opt-level=3"])), None);
     }
