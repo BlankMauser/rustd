@@ -78,8 +78,11 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     if unit.is_staged() {
         match unit.stood_in(&rustc, &dir) {
             Ok(code) => std::process::exit(code),
-            // rustc compiles the crate as cargo asked, and the daemon links against that.
-            Err(why) => eprintln!("warning: rustc compiles `{}`: {why:#}", unit.id),
+            // The crate is the daemon's to compile, and rustc is not asked in its place.
+            Err(why) => {
+                say::error(&format!("rustd does not build `{}`: {why:#}", unit.crate_name));
+                std::process::exit(1)
+            }
         }
     }
     let known = if plain { State::of_unit(&dir) } else { Vec::new() };
@@ -128,7 +131,7 @@ fn loaded_later() -> Result<(), String> {
     let typed = cargo.args.join(" ");
     let asked =
         cli::of_cargo(&cargo.args).ok_or(format!("`cargo {typed}` is not a build rustd loads"))?;
-    if let Some(why) = asked.only_cargo() {
+    if let Some(why) = asked.unbuilt() {
         return Err(why);
     }
     let said = |it: &dyn std::fmt::Display| format!("the build is not loaded: {it:#}");

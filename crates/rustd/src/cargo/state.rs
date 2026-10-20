@@ -252,12 +252,12 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
-    /// `Err` is why rustc builds every crate of the build `asked` for. The crates that
+    /// `Err` is why the daemon does not build what `asked` is for. The crates that
     /// run during the build are rustc's, and so are the ones those depend on: a build
     /// script, a proc macro, and what either is declared to need under any feature.
     pub(crate) fn of(asked: &Invocation) -> anyhow::Result<Result<Staged, String>> {
-        if asked.subcommand == Subcommand::Test || asked.flags.selects_targets {
-            return Ok(Err("the build picks its targets".to_owned()));
+        if let Some(why) = asked.builds_tests() {
+            return Ok(Err(why));
         }
         let metadata = metadata(asked)?;
         let members: Vec<&Package> = metadata.workspace_packages();
@@ -278,35 +278,48 @@ impl Staged {
             }
         }
         let mut roots = Vec::new();
+        let mut examples = Vec::new();
         for (at, member) in members.iter().enumerate() {
             if reached.contains(&at) {
                 continue;
             }
             let of_build = |it: &&Target| {
-                let apart = [
-                    TargetKind::CustomBuild,
-                    TargetKind::Example,
-                    TargetKind::Test,
-                    TargetKind::Bench,
-                ];
+                let apart = [TargetKind::CustomBuild, TargetKind::Test, TargetKind::Bench];
                 !it.kind.iter().any(|it| apart.contains(it))
             };
             for target in member.targets.iter().filter(of_build) {
+                let source = target.src_path.clone().into_std_path_buf();
+                // An example is a program of its own: no crate of the build is linked
+                // with it, and the daemon loads it when cargo has it built.
+                if target.is_example() {
+                    examples.push(source);
+                    continue;
+                }
                 let alone = matches!(
                     *target.crate_types,
                     [CrateType::Lib | CrateType::RLib | CrateType::Bin]
                 );
                 if !alone {
                     return Ok(Err(format!(
-                        "`{}` is linked into more than a program of the workspace",
-                        target.name
+                        "`{}` is built as {}, which the daemon does not link yet: it builds \
+                         a `lib`, an `rlib` or a `bin` alone",
+                        target.name,
+                        target
+                            .crate_types
+                            .iter()
+                            .map(|it| format!("`{it}`"))
+                            .collect::<Vec<_>>()
+                            .join(" and "),
                     )));
                 }
-                roots.push(target.src_path.clone().into_std_path_buf());
+                roots.push(source);
             }
         }
         if roots.is_empty() {
-            return Ok(Err("every crate of the workspace runs during the build".to_owned()));
+            return Ok(Err("every crate of the workspace runs during the build, as a build \
+                           script, a proc macro or what one depends on: the daemon builds \
+                           none of those yet"
+                .to_owned()));
         }
         // Before cargo builds what would then be built again.
         if let Some(why) = other_toolchain() {
@@ -323,6 +336,7 @@ impl Staged {
             };
             daemon::Ahead { config, crates: roots.clone(), root }
         });
+        roots.extend(examples);
         Ok(Ok(Staged { roots, ahead }))
     }
 }

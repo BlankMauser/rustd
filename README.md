@@ -24,10 +24,11 @@ Read this section before relying on it.
 - It was written largely with AI assistance under human direction. What stands behind it
   is the testing: every change is judged by comparing rustd's output with rustc's
   ([docs/harness.md](docs/harness.md)).
-- rustc is still required. By default it does the first build of a workspace, and it
-  always builds the crates the workspace depends on. With `RUSTD_FIRST_BUILD=1` the first
-  build of the workspace's own crates is rustd's too. rustd does not produce `.rlib` or
-  `.rmeta` files.
+- rustc is still required. It builds the crates the workspace depends on, through cargo,
+  so the usual caches of those (sccache, a CI cache) still apply. The workspace's own
+  crates are rustd's from the first build on, except build scripts, proc-macro crates and
+  what those depend on, which run inside cargo and rustc. rustd does not produce `.rlib`
+  or `.rmeta` files.
 - Once the daemon has a workspace, rustc does not run on an edit at all: no `cargo check`
   beside the build, so nothing competes with it for the CPU. The price is diagnostics.
   rustd refuses source in which rust-analyzer finds a type or name error, and says each
@@ -35,14 +36,13 @@ Read this section before relying on it.
   `mut` or a reference that outlives its value is built and run. `cargo rustd check` is
   `cargo check` and gives rustc's verdict.
 - It never falls back. A function the daemon cannot compile fails the build with the
-  function and the reason, and that is a bug to report. Cargo is only used for what is
-  decided before the daemon starts on a build: the cases under
-  [What is not supported](#what-is-not-supported).
+  function and the reason, and so does a command it does not build, such as
+  `cargo rustd test` today: see [What is not supported](#what-is-not-supported). No build
+  of the workspace is handed to cargo.
 - It is pinned to one toolchain, Rust 1.99.0. It links against rustc's output, so it has to
   agree with that rustc on symbol names, type layout and the unstable Rust ABI.
-- `cargo rustd` serves dev and test builds on Linux (ELF) and on macOS arm64 (Mach-O).
-  Release builds, other profiles, `RUSTFLAGS` and several other flags are handed to cargo
-  unchanged. On macOS it has been run on ripgrep, fd and hyperfine only. The command has not
+- `cargo rustd` builds programs on Linux (ELF) and on macOS arm64 (Mach-O), in any profile
+  and with `RUSTFLAGS`; other targets fail the build. On macOS it has been run on ripgrep, fd and hyperfine only. The command has not
   been built or run on Windows; the daemon underneath it has, through the harnesses.
 - The code rustd generates is for the edit loop. Each function is compiled alone and nothing
   is inlined across functions, under either backend.
@@ -103,16 +103,12 @@ In any cargo project, with 1.99.0 as the toolchain:
     cargo rustd test
     cargo rustd check
 
-The first build of a workspace is cargo's own, with rustd recording what rustc was asked to
-do. It also starts the daemon, which loads the workspace in the background. Until it has,
-builds go to cargo and a line on stderr says so:
-
-    rustd: the daemon is still loading the workspace (951ms so far); building with cargo
-
-After that an edit is compiled by the daemon and neither cargo nor rustc runs. With
-`RUSTD_FIRST_BUILD=1` the first build is shared: cargo builds the dependencies while the
-daemon compiles the workspace's crates and links the program. `cargo rustd status`
-shows what the daemon holds and how many builds it served or left to cargo, by reason.
+The first build of a workspace is shared: cargo has rustc build the dependencies while the
+daemon loads the workspace, and the daemon then compiles the workspace's crates and links
+the program. After that an edit is compiled by the daemon and neither cargo nor rustc
+runs. A change to a manifest, `Cargo.lock` or the cargo configuration starts over the same
+way: rustc for the dependencies that changed, the daemon for the workspace.
+`cargo rustd status` shows what the daemon holds and how many builds it served.
 `cargo rustd stop` ends it; it also exits by itself after 30 minutes without a request.
 `cargo rustd check` is `cargo check`.
 
@@ -174,7 +170,7 @@ to a function:
 Most of rustd's time in the second column is the client and the link; the daemon's own
 time from the edit to a linked ripgrep was 0.05 s when measured alone.
 
-First build from an empty target directory with `RUSTD_FIRST_BUILD=1`, where cargo builds
+First build from an empty target directory, where cargo builds
 the dependencies and rustd the workspace's crates, one run each except nushell:
 
 | Project | `cargo build` | `cargo rustd build` |
@@ -230,17 +226,19 @@ build-model features.
 
 ## What is not supported
 
-These are refused with a reason before the daemon is asked, and cargo builds them instead:
+These fail the build with an error that names them; `cargo rustd` hands nothing to cargo
+([docs/cargo.md](docs/cargo.md#what-fails-the-build) has the list):
 
+- `cargo rustd test` and the flags that build tests or benchmarks (`--doc` works);
 - `lto = true` or `"thin"`;
-- through `cargo rustd`: `--exclude`, more than one `--target`, `--message-format`, `-Z`
-  flags, and a `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;
-- test executables built without incremental compilation or above `opt-level = 0`, and unit
-  tests of a library other tests link as rustc built it;
-- any edit to a manifest, `Cargo.lock`, cargo configuration, a build script or a proc macro:
-  that build is cargo's, and the daemon reloads afterwards.
+- `--exclude`, more than one `--target`, `--message-format`, `-Z` flags, and a
+  `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;
+- workspace crates built as `cdylib`, `dylib` or `staticlib`.
 
-These fail the build, since nothing else builds them: a few language features, among them
+Plain cargo after `rustd enable` is another matter: there cargo plans and rustc does the
+first build, and what the daemon refuses is rustc's.
+
+So do a few language features, among them
 `sym` operands in `asm!` that is not naked, some variadic function definitions, and vectors
 in a C ABI.
 

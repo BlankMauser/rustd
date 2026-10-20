@@ -15,8 +15,9 @@ building into a target directory of its own as the reference:
   edit      the source is edited; `cargo rustd build`, the program is run, `cargo rustd test`
   broken    a type error is added; both have to fail with the same status
 After every step the program's output and exit status and the result of every test have to be
-what plain cargo gives for the same source. A build cargo did in place of the daemon passes
-(that is the contract) and is in the table with the reason.
+what plain cargo gives for the same source. Every build of `cargo rustd` has to be the
+daemon's: one cargo did in its place fails the run. `cargo rustd test` builds no tests yet
+and says so; those steps are in the table as open.
 
 Every project is run twice, in a fresh copy each time: with `cargo rustd`, and with plain
 cargo in a cargo home in which `rustd enable` was run. `--rustd` or `--plain` runs the one.
@@ -283,24 +284,38 @@ class Side:
     def share(self):
         """The functions of the largest load the daemon compiled itself, of all it has."""
         loads = []
-        workers = os.path.join(self.env["RUSTD_HOME"], "workers")
-        for worker in os.listdir(workers) if os.path.isdir(workers) else []:
-            path = os.path.join(workers, worker, "log")
-            # A worker that began as a spare keeps its log where it began.
+        # A worker that began as a spare keeps its log where it began.
+        homes = [os.path.join(self.env["RUSTD_HOME"], it) for it in ("workers", "spares")]
+        for path in [os.path.join(home, worker, "log") for home in homes if os.path.isdir(home) for worker in os.listdir(home)]:
             log = open(path, errors="replace").read() if os.path.exists(path) else ""
             loads += [(int(of), int(done)) for done, of in re.findall(r"^cold: compiled (\d+) of (\d+) fns", log, re.M)]
         return max(loads, default=(0, 0))[::-1]
 
 
+# What `cargo rustd` says of a command that builds tests, which the daemon does not build
+# yet. Known and not mended: such a step is in the table as open and is not compared.
+TESTS_OPEN = "the daemon does not build the tests of a workspace yet"
+
+
 def how_built(stderr):
-    """Whether the daemon built it, or why cargo did."""
-    reason = re.search(r"^rustd: (.*); (building with cargo|this is `cargo \w+`)$", stderr, re.M)
-    if reason:
-        return "cargo: " + reason[1]
-    kept = re.search(r"^rustd: (.*); nothing has changed since cargo built$", stderr, re.M)
-    if kept:
-        return "unchanged: " + kept[1]
-    return "daemon" if "[rustd]" in stderr else "cargo"
+    """Who built it: the daemon, nobody (`error: ` and why rustd failed the build) or cargo.
+    A build of the workspace by cargo is one `cargo rustd` never does: it fails the run."""
+    if "[rustd]" in stderr:
+        return "daemon"
+    refused = re.search(r"^error: (.*)$", stderr, re.M)
+    return "error: " + refused[1] if refused else "cargo"
+
+
+def by_cargo(how):
+    """Whether `how`, which is what `how_built` said of a `cargo rustd`, is a build cargo
+    did in the daemon's place."""
+    return how.startswith("cargo")
+
+
+def cargos_builds(status):
+    """The builds `cargo rustd status` counts as cargo's, of every workspace it lists: none
+    is one `cargo rustd` does."""
+    return sum(int(it) for it in re.findall(r"builds by the daemon, (\d+) by cargo", status))
 
 
 def program_output(ran):
@@ -466,13 +481,18 @@ def project(name, spec, work, mode):
         """Runs `command` on both sides and compares what `compare` reads from each."""
         (took, mine), (reference, other) = ours.cargo(command, *args), theirs.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(reference, 2))
-        row["built"][label] = ours.how_built(mine.stderr)
+        how = row["built"][label] = ours.how_built(mine.stderr)
         wrong = difference(compare(mine), compare(other))
+        opened = not plain and TESTS_OPEN in how
+        if opened:
+            wrong = None
+        elif not plain and by_cargo(how):
+            wrong = "; ".join(filter(None, [wrong, "the build was cargo's"]))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
             open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w", encoding="utf-8").write(other.stdout + other.stderr)
-        print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
+        print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or ('open' if opened else 'same')}", flush=True)
         # What the tests that failed here alone said.
         said = wrong and re.search(r"^failures:\n(.*?)^failures:", mine.stdout, re.M | re.S)
         if said:
@@ -524,6 +544,8 @@ def project(name, spec, work, mode):
     print(f"  functions    {row['share'][0]} of {row['share'][1]} compiled by rustd", flush=True)
     _, counted = ours.cargo("status")
     row["status"] = counted.stdout
+    if not plain and cargos_builds(counted.stdout):
+        row["wrong"].append(f"status: {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return row
 
@@ -597,8 +619,11 @@ def flags(work):
             read = test_results if command == "test" else program_output
             differs = difference(read(mine), read(other))
             shown = " ".join([*(f"{k}={v}" for k, v in extra.items()), "cargo rustd", command, *args])
-            rows.append((label, shown, how_built(mine.stderr), mine.returncode, differs or "same"))
-            if differs and (label, shown) in FLAGS_OPEN:
+            how = how_built(mine.stderr)
+            if command != "check" and "--doc" not in args and by_cargo(how):
+                differs = "; ".join(filter(None, [differs, "the build was cargo's"]))
+            rows.append((label, shown, how, mine.returncode, differs or "same"))
+            if differs and ((label, shown) in FLAGS_OPEN or TESTS_OPEN in how):
                 differs = "open: " + differs
             elif differs:
                 wrong.append(f"{label}: {shown}: {differs}")
@@ -612,6 +637,8 @@ def flags(work):
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
     _, counted = ours.cargo("status")
+    if cargos_builds(counted.stdout):
+        wrong.append(f"flags: status counts {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
 
@@ -685,7 +712,7 @@ def daemon(work):
 
     other = os.path.join(work, "other-build")
     os.makedirs(other, exist_ok=True)
-    for name in ("rustd" + EXE, "cargo-rustd" + EXE, "rustd-rustc" + EXE):
+    for name in ("rustd" + EXE, "cargo-rustd" + EXE, "rustd-rustc" + EXE, "rustd-rustc-first" + EXE):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     edit(ws, "five")
@@ -861,11 +888,11 @@ def abuse(work, ws, tree, env, check, status, alive):
     edit("skew")
     _, skewed = older.cargo("run", "skew")
     said = how_built(skewed.stderr)
-    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    check("a build by another build of rustd is the daemon's, by the daemon it replaces the old one with", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and said == "daemon" and status(older)[0] not in (None, pid) and not alive(pid), said)
     wait_warm(older, ws)
     edit("back")
     _, back = here.cargo("run", "back")
-    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and how_built(back.stderr) == "daemon" and status()[0] is not None, how_built(back.stderr))
     wait_warm(here, ws)
 
     stranger(env["RUSTD_HOME"], check)
@@ -1154,7 +1181,7 @@ def plain(work):
     # Another build of rustd: the same files in another place have another version.
     other = os.path.join(work, "plain-other-build")
     os.makedirs(other)
-    for name in ("rustd", "cargo-rustd", "rustd-rustc"):
+    for name in ("rustd", "cargo-rustd", "rustd-rustc", "rustd-rustc-first"):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     pid = status()[0]
     subprocess.run([RUSTD, "disable"], env=env, capture_output=True)
@@ -1188,7 +1215,7 @@ def plain(work):
 
 def worktree(ours, row, build, run, edits, work):
     """A second checkout of the project's repository, at the commit the first started from:
-    built from nothing, which is cargo's, then edited as the first was and built again. What
+    built from nothing, then edited as the first was and built again. What
     its program says after the edit has to be what the first one's says."""
     git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ours.ws, capture_output=True, text=True)
     # One place for each way of building: a daemon still loading the first writes there
@@ -1207,6 +1234,8 @@ def worktree(ours, row, build, run, edits, work):
         took, ran = there.cargo(command, *args)
         row["times"][label] = (round(took, 2), None)
         row["built"][label] = there.how_built(ran.stderr)
+        if not ours.plain and by_cargo(row["built"][label]):
+            row["wrong"].append(f"{label}: the build was cargo's")
         print(f"  {label:12} rustd {took:7.2f}s  {row['built'][label]:8.80}  exit {ran.returncode}", flush=True)
         return ran
 
@@ -1239,7 +1268,7 @@ def table(rows):
         for step in steps:
             ours, theirs = row["times"].get(step, (None, None))
             who = row["built"].get(step, "")
-            mark = "" if who in ("daemon", "cargo") or "warm-up" in step else " (c)" if who.startswith("cargo") else ""
+            mark = " (c)" if who.startswith("cargo") else " (o)" if TESTS_OPEN in who else ""
             if "warm-up" in step:
                 mark = "" if who and all(s == "ready" for s in who.split("; ")) else " (f)"
             cells.append("-" if ours is None else f"{ours:.2f}{mark}" if theirs is None else f"{'**' if who == 'daemon' else ''}{ours:.2f}{'**' if who == 'daemon' else ''}{mark} / {theirs:.2f}")
@@ -1289,7 +1318,7 @@ def main():
     json.dump(result, open(stored, "w"), indent=1)
     with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
         md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, rustd / cargo alone for the same step; the steps in the second checkout (`tree`) are rustd's only. "
-                 "Bold is a build the daemon did; `(c)` one cargo did in its place, with the reason below; `(f)` a warm-up that failed. "
+                 "Bold is a build the daemon did; `(c)` one cargo did in its place, which fails the run; `(o)` a command that builds tests, which the daemon does not build yet; `(f)` a warm-up that failed. "
                  "Differences counts the steps whose program output, exit status or test results were not cargo's.\n\n")
         for mode, title in MODES.items():
             md.write(f"## {title}\n\n" + table([r for r in result["projects"] if r.get("mode", "rustd") == mode]) + "\n\n")

@@ -105,14 +105,6 @@ impl Subcommand {
             _ => None,
         }
     }
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Subcommand::Build => "build",
-            Subcommand::Run => "run",
-            Subcommand::Test => "test",
-        }
-    }
 }
 
 /// What the user asked for.
@@ -159,12 +151,15 @@ pub(crate) struct Flags {
     pub(crate) targets: Vec<String>,
     pub(crate) bin: Option<String>,
     pub(crate) example: Option<String>,
-    pub(crate) message_format: bool,
+    /// The flag that asks cargo for what it says in another shape, when one does.
+    pub(crate) message_format: Option<String>,
     pub(crate) unstable: bool,
     pub(crate) quiet: bool,
     pub(crate) no_run: bool,
     pub(crate) no_fail_fast: bool,
     pub(crate) doc: bool,
+    /// The flag that has tests or benchmarks built, when one does.
+    pub(crate) tests: Option<String>,
     /// Whether a flag picks targets, so that `cargo test` runs no doc tests.
     pub(crate) selects_targets: bool,
 }
@@ -276,24 +271,47 @@ impl Invocation {
         hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect()
     }
 
-    /// Why this command is cargo's alone, when it is clear before anything is built.
-    pub(crate) fn only_cargo(&self) -> Option<String> {
+    /// Why rustd does not build this, when it is clear before anything is built. Nothing
+    /// else builds it then: the command fails, with this.
+    pub(crate) fn unbuilt(&self) -> Option<String> {
         let surroundings = match () {
-            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
-            _ if !wrapper_installed() => "`rustd-rustc` is not installed next to `rustd`",
-            _ => return self.asks_for_cargo(),
+            _ if another_wrapper() => {
+                "RUSTC_WORKSPACE_WRAPPER is set to another wrapper, which `cargo rustd` \
+                 does not run rustc through"
+            }
+            _ => return missing_wrapper().or_else(|| self.unbuilt_flag()),
         };
         Some(surroundings.to_owned())
     }
 
-    /// Why what was typed is cargo's alone, wherever it is typed.
-    fn asks_for_cargo(&self) -> Option<String> {
+    /// Why the tests of the workspace are not built, when the command builds some: rustc
+    /// compiles a test crate whole to write its harness, and no crate of the workspace is
+    /// rustc's to compile.
+    pub(crate) fn builds_tests(&self) -> Option<String> {
+        let flag = self.flags.tests.as_deref();
+        let what = match (self.subcommand, flag) {
+            (_, Some(flag)) => format!("`{flag}`"),
+            (Subcommand::Test, None) => "`cargo rustd test`".to_owned(),
+            _ => return None,
+        };
+        Some(format!(
+            "{what}: the daemon does not build the tests of a workspace yet (`--doc` runs \
+             its doc tests)"
+        ))
+    }
+
+    /// Why what was typed is not built, wherever it is typed: the flag, by its name.
+    fn unbuilt_flag(&self) -> Option<String> {
         let flags = &self.flags;
+        if let Some(flag) = &flags.message_format {
+            return Some(format!("`{flag}` is not answered by `cargo rustd` yet"));
+        }
         let reason = match () {
-            _ if flags.message_format => "--message-format is cargo's to answer",
-            _ if flags.unstable => "unstable cargo flags",
-            _ if flags.excludes => "--exclude is not loaded by the daemon yet",
-            _ if flags.targets.len() > 1 => "several targets in one build",
+            _ if flags.unstable => "`-Z`: unstable cargo flags are not read by rustd",
+            _ if flags.excludes => "`--exclude` is not loaded by the daemon yet",
+            _ if flags.targets.len() > 1 => {
+                "several `--target` in one build are not built by the daemon yet"
+            }
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
@@ -347,9 +365,14 @@ impl Flags {
             "--target" => self.targets.extend(owned()),
             "--bin" => self.bin = owned(),
             "--example" => self.example = owned(),
-            "--message-format" | "--build-plan" | "--unit-graph" => self.message_format = true,
+            "--message-format" | "--build-plan" | "--unit-graph" => {
+                self.message_format = Some(flag.to_owned())
+            }
             "-Z" => self.unstable = true,
             "-q" | "--quiet" => self.quiet = true,
+            "--tests" | "--test" | "--benches" | "--bench" | "--all-targets" => {
+                self.tests = Some(flag.to_owned())
+            }
             "--no-run" => self.no_run = true,
             "--no-fail-fast" => self.no_fail_fast = true,
             "--doc" => self.doc = true,
@@ -361,14 +384,19 @@ impl Flags {
 /// Whether the environment names a wrapper for the crates of the workspace that is not
 /// rustd's.
 fn another_wrapper() -> bool {
-    let ours = super::switch::wrapper_path().ok();
+    let ours = [super::switch::wrapper_path().ok(), super::switch::first_wrapper_path().ok()];
     std::env::var_os(super::switch::VARIABLE)
-        .is_some_and(|it| !it.is_empty() && Some(Path::new(&it)) != ours.as_deref())
+        .is_some_and(|it| !it.is_empty() && !ours.iter().flatten().any(|ours| *ours == *it))
 }
 
 /// Whether the wrapper cargo is to run in place of rustc is where rustd looks for it.
-fn wrapper_installed() -> bool {
-    super::switch::wrapper_path().is_ok_and(|it| it.is_file())
+/// Why cargo cannot be pointed at the wrappers, when one is not installed next to rustd:
+/// `rustd-rustc` for the builds after the first, `rustd-rustc-first` for the first.
+fn missing_wrapper() -> Option<String> {
+    let wrappers = [super::switch::wrapper_path(), super::switch::first_wrapper_path()];
+    let missing = wrappers.into_iter().find(|it| !it.as_ref().is_ok_and(|it| it.is_file()))?;
+    let name = missing.ok().and_then(|it| Some(it.file_name()?.to_string_lossy().into_owned()));
+    Some(format!("`{}` is not installed next to `rustd`", name.as_deref().unwrap_or("rustd-rustc")))
 }
 
 /// Why rustd does not build for `triple`, when it does not.
@@ -452,12 +480,18 @@ mod tests {
         assert_eq!(Asked::parse(Vec::new()), Asked::Help);
         assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
         for args in ["--message-format json", "--exclude a", "--target mips-unknown-none"] {
-            assert!(build("build", args).asks_for_cargo().is_some(), "{args}");
+            assert!(build("build", args).unbuilt_flag().is_some(), "{args}");
         }
         for args in
             ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
         {
-            assert_eq!(build("build", args).asks_for_cargo(), None, "{args}");
+            assert_eq!(build("build", args).unbuilt_flag(), None, "{args}");
+        }
+        for (command, args) in [("test", ""), ("build", "--all-targets"), ("build", "--tests")] {
+            assert!(build(command, args).builds_tests().is_some(), "{command} {args}");
+        }
+        for args in ["", "--bin a", "--example a", "--lib", "--bins", "--examples"] {
+            assert_eq!(build("build", args).builds_tests(), None, "{args}");
         }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
