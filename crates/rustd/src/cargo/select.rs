@@ -316,7 +316,8 @@ impl<'a> Selective<'a> {
         let stderr = stderr.join().unwrap_or_default();
         let line = stdout.lines().find_map(outcome).filter(|it| it.0 == name);
         let shown = line.map_or_else(|| name.to_owned(), |it| it.1.to_owned());
-        let outcome = line.and_then(|it| it.2).filter(|_| status.success() && !timed_out);
+        let outcome = line.and_then(|it| it.2).or_else(|| summarized(&stdout));
+        let outcome = outcome.filter(|_| status.success() && !timed_out);
         // What the harness captured of a test that failed, or all it said when it died.
         let start = format!("---- {shown} stdout ----\n");
         let captured = stdout
@@ -412,7 +413,7 @@ impl Tally {
 /// The test a line of the harness is the result of, as listed and as shown, and whether it
 /// was ignored: `None` for one that did not pass.
 fn outcome(line: &str) -> Option<(&str, &str, Option<bool>)> {
-    let (shown, result) = line.strip_prefix("test ")?.rsplit_once(" ... ")?;
+    let (shown, result) = line.strip_prefix("test ")?.split_once(" ... ")?;
     let name = shown.strip_suffix(" - should panic").unwrap_or(shown);
     let outcome = match result {
         "ok" => Some(false),
@@ -420,6 +421,18 @@ fn outcome(line: &str) -> Option<(&str, &str, Option<bool>)> {
         _ => None,
     };
     Some((name, shown, outcome))
+}
+
+/// Whether the one test a harness ran was ignored, by its last line: a test that writes to
+/// its stdout itself, as a process it spawns does, puts that between its name and its result.
+fn summarized(stdout: &str) -> Option<bool> {
+    let counts = stdout.lines().rev().find_map(|it| it.strip_prefix("test result: ok. "))?;
+    let counts: Vec<_> = counts.split("; ").collect();
+    match counts[..] {
+        ["1 passed", ..] => Some(false),
+        [_, _, "1 ignored", ..] => Some(true),
+        _ => None,
+    }
 }
 
 /// How many tests run at once, by `--test-threads` or the cores, and the other flags.
@@ -551,6 +564,15 @@ mod tests {
         assert_eq!(should_panic, Some(("a", "a - should panic", Some(false))));
         assert_eq!(outcome("test a::b ... FAILED"), Some(("a::b", "a::b", None)));
         assert_eq!(outcome("test result: ok. 1 passed"), None);
+        let spoken = outcome("test a::b ... it said: ok").and_then(|it| it.2);
+        let spoken =
+            spoken.or_else(|| summarized("ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored"));
+        assert_eq!(spoken, Some(false));
+        assert_eq!(
+            summarized("test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured"),
+            Some(true)
+        );
+        assert_eq!(summarized("test result: FAILED. 0 passed; 1 failed; 0 ignored"), None);
     }
 
     #[test]

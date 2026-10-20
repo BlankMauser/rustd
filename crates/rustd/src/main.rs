@@ -3765,6 +3765,7 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
         }
     }
     let mut glue = Glue::default();
+    let sema = hir::Semantics::new(db);
     for &krate in own {
         let edition = krate.edition(db);
         for &id in &resolver.listed.of(db, krate).functions {
@@ -3778,12 +3779,12 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
             if module.nearest_non_block_module(db) != module {
                 continue;
             }
-            if !function.ret_type(db).is_unit() {
-                return Err(format!(
-                    "the test `{name}` returns a value, which the daemon's harness does not \
-                     run yet"
-                ));
-            }
+            let returns = match function.ret_type(db).is_unit() {
+                true => String::new(),
+                false => named_from_anywhere(&sema, resolver, function)
+                    .map(|it| format!(" -> {it}"))
+                    .map_err(|why| format!("the test `{name}` returns a value: {why}"))?,
+            };
             let symbol = resolver
                 .function_named(id)
                 .ok_or_else(|| format!("the test `{name}` has no symbol of the daemon's"))?;
@@ -3819,13 +3820,71 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
             }
             let _ = writeln!(
                 at.tests,
-                "#[test]\nfn {name}() {{\n    unsafe extern \"Rust\" {{\n        \
-                 #[link_name = {symbol:?}]\n        safe fn test();\n    }}\n    test()\n}}"
+                "#[test]\nfn {name}(){returns} {{\n    unsafe extern \"Rust\" {{\n        \
+                 #[link_name = {symbol:?}]\n        safe fn test(){returns};\n    }}\n    test()\n}}"
             );
         }
     }
     let mut text = String::from("#![allow(warnings)]\n");
     glue.write(&mut text);
+    Ok(text)
+}
+
+/// The return type of `function` as written, with each item it names by a path that names
+/// the same item from any crate with the same dependencies, such as the harness. `Err` is
+/// why it can't be named so: a workspace crate's type is the daemon's, which no rustc crate
+/// sees.
+fn named_from_anywhere(
+    sema: &hir::Semantics<'_, RootDatabase>,
+    resolver: &Resolver<'_>,
+    function: hir::Function,
+) -> Result<String, String> {
+    use hir::HasCrate as _;
+    use syntax::ast::HasGenericArgs as _;
+    let db = sema.db;
+    let written = sema.source(function).and_then(|it| it.value.ret_type()?.ty());
+    let written = written.ok_or("its return type is not written")?;
+    let module = function.module(db);
+    let edition = module.krate(db).edition(db);
+    let cfg = hir::FindPathConfig {
+        prefer_no_std: false,
+        prefer_prelude: true,
+        prefer_absolute: true,
+        allow_unstable: false,
+    };
+    let start = written.syntax().text_range().start();
+    let mut text = written.syntax().text().to_string();
+    let paths = written.syntax().descendants().filter_map(ast::Path::cast);
+    let paths: Vec<_> = paths.filter(|it| it.parent_path().is_none()).collect();
+    // From the last, so that the ranges of those before stay where they are.
+    for path in paths.iter().rev() {
+        let Some(hir::PathResolution::Def(def)) = sema.resolve_path(path) else {
+            return Err(format!("`{path}` is not an item"));
+        };
+        if matches!(def, hir::ModuleDef::BuiltinType(_)) {
+            continue;
+        }
+        if !resolver.rustc_built(def.krate(db).into()) {
+            return Err(format!("`{path}` is a type of the workspace's"));
+        }
+        let qualifier = path.qualifier();
+        if qualifier.is_some_and(|it| it.segments().any(|it| it.generic_arg_list().is_some())) {
+            return Err(format!("`{path}` has generic arguments before its last segment"));
+        }
+        let named = module
+            .find_use_path(db, def, hir::PrefixKind::ByCrate, cfg)
+            .ok_or_else(|| format!("`{path}` has no path from outside its crate"))?;
+        let end = path.segment().and_then(|it| it.name_ref());
+        let end = end.ok_or_else(|| format!("`{path}` does not end in a name"))?;
+        let range = syntax::TextRange::new(
+            path.syntax().text_range().start(),
+            end.syntax().text_range().end(),
+        );
+        text.replace_range(
+            std::ops::Range::<usize>::from(range - start),
+            &named.display(db, edition).to_string(),
+        );
+    }
     Ok(text)
 }
 
