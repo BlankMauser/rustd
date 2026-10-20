@@ -420,7 +420,7 @@ impl LinkLine {
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
-            binary.display().to_string();
+            linking(binary).display().to_string();
         let quoted: Vec<String> = self
             .args
             .iter()
@@ -472,6 +472,15 @@ impl LinkLine {
         std::fs::write(response, quoted.join("\n"))?;
         Ok(format!("\"{}\" \"@{}\"", self.linker, response.display()))
     }
+}
+
+/// Where the linker writes the executable at `binary`, which takes its place once it is
+/// whole: the linker writes its output in place, and a client that runs, or links to, the
+/// executable while another build links it would have half a file, not yet executable.
+pub(crate) fn linking(binary: &Path) -> PathBuf {
+    let mut linking = binary.as_os_str().to_owned();
+    linking.push(".linking");
+    PathBuf::from(linking)
 }
 
 /// The directories `link.exe` finds the libraries of the compiler and of the system in.
@@ -610,7 +619,7 @@ mod tests {
                 "-arch",
                 "arm64",
                 "-o",
-                "/p/bin"
+                "/p/bin.linking"
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -701,7 +710,7 @@ mod tests {
                 "-Wl,-Bstatic",
                 "/t/deps/libb-2.rlib",
                 "-o",
-                "/p/bin",
+                "/p/bin.linking",
                 "-pie"
             ]
         );

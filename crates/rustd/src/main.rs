@@ -2996,6 +2996,7 @@ fn link(
 ) -> anyhow::Result<()> {
     static SPLICING: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("RUSTD_SPLICE").is_none_or(|it| it != "0"));
+    let binary = splice;
     let splice = splice.filter(|_| *SPLICING);
     // An executable linked with the object as it was is not one to add to, also when the
     // object was written for a request that does not link.
@@ -3040,12 +3041,22 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
+    let linking = binary.map(cargo::plan::linking);
+    if let Some(linking) = &linking {
+        let _ = std::fs::remove_file(linking);
+    }
     let linked = shell(cmd).output()?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr);
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status}): {}", last_lines(&said, 6));
+    // A link line not of a plan writes the executable itself.
+    if let (Some(binary), Some(linking)) = (binary, &linking)
+        && linking.exists()
+    {
+        std::fs::rename(linking, binary)?;
+    }
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
         lock(&LINKED).insert(binary.to_owned(), linked);
