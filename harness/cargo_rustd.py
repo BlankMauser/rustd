@@ -342,7 +342,9 @@ def test_results(ran):
     # the failures from the list at the end, and the totals say the rest.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
     tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M)] + [(name.strip(), "FAILED") for name in failed if name])
-    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", ran.stdout, re.M))
+    # rustd says how many of the tests that passed or were ignored it did not run again.
+    stdout = re.sub(r" \(\d+ cached\);", ";", ran.stdout)
+    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", stdout, re.M))
     return ran.returncode, tests, totals
 
 
@@ -708,12 +710,12 @@ def incremental(work):
     side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
     checks = []
 
-    def check(name, cached, *args, env=None):
+    def check(name, cached, *args, env=None, listed=4):
         """That the tests in `cached` are the ones listed as cached, and all others ran."""
         _, ran = side.cargo("test", *args, env=env)
-        listed = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
-        found = sorted(name for name, result in listed.items() if result.endswith("(cached)"))
-        held = ran.returncode == 0 and found == sorted(cached) and len(listed) == (1 if args and not args[0].startswith("-") else 4)
+        results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
+        held = ran.returncode == 0 and found == sorted(cached) and len(results) == listed
         checks.append((f"incremental: {name}", held, f"cached {found}"))
         print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}", flush=True)
 
@@ -727,10 +729,13 @@ def incremental(work):
     check("an edit of what writes a static runs every test that writes it", ["ta", "tb"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
-    check("a filter lists the cached test", ["tb"], "tb")
+    check("a filter lists the cached test", ["tb"], "tb", listed=1)
     open(os.path.join(ws, "data.txt"), "w").write("x")
     check("a new file in the package runs every test", [])
     check("the environment runs every test", [], env={"INCREMENTAL_ANY": "1"})
+    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=2)
+    check("--skip is kept when tests are cached", ["ta", "tb"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=2)
+    check("--exact is kept when no test is cached", [], "--", "--exact", "tests::h1", env={"INCREMENTAL_ANY": "3"}, listed=1)
     side.cargo("stop")
     return checks
 

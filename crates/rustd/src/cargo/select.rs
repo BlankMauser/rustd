@@ -1,8 +1,8 @@
 //! Running only the tests an edit can have changed the result of. The worker says, for
 //! each test of a program it built, a print of all the code the test can run; a test
 //! that passed with the same print, among the same tests and with the same things outside
-//! the code, is said to have passed and is not run. `docs/incremental-tests.md` is the
-//! design, and says what a print does not cover.
+//! the code, is said to have passed and is not run. "Which tests run" in `docs/cargo.md`
+//! says what is outside the code.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -174,10 +174,9 @@ impl<'a> Selective<'a> {
             return Ok(Some(ExitStatus::default()));
         }
         let mut command = self.command()?;
-        command.args(&self.flags);
         match kept.is_empty() {
-            true => command.args(asked.positional.iter()),
-            false => command.arg("--exact").args(&run),
+            true => command.args(asked.program_args()),
+            false => command.args(&self.flags).arg("--exact").args(&run),
         };
         command.stdout(Stdio::piped());
         let mut child = command.spawn().context("running the tests")?;
