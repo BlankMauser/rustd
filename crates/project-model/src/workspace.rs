@@ -1503,10 +1503,9 @@ fn cargo_to_crate_graph(
                     continue;
                 }
                 // The build of a library or a binary without its unit tests has none of the
-                // dev-dependencies.
+                // dev-dependencies. The library as rustdoc reads it has them, as its examples do.
                 let tested = matches!(kind, TargetKind::Lib { .. } | TargetKind::Bin);
-                let plain = matches!(build, Build::Plain | Build::Documented);
-                if unit_tests && dep.kind == DepKind::Dev && tested && plain {
+                if unit_tests && dep.kind == DepKind::Dev && tested && build == Build::Plain {
                     continue;
                 }
 

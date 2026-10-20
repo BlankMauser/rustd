@@ -40,6 +40,15 @@ struct DocsSourceMapLine {
     ast_offset: Option<TextSize>,
 }
 
+/// A piece of a doc string that is written as it is in the source: one between two escapes.
+#[derive(Clone, Copy)]
+struct DocsSourceRun {
+    /// The range in the doc string.
+    text: TextRange,
+    /// The offset in the AST of its start.
+    ast_offset: TextSize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Docs {
     /// The concatenated string of all `#[doc = "..."]` attributes and documentation comments.
@@ -227,10 +236,52 @@ impl Docs {
         let value_offset = value_offset.start();
         let Ok(unescaped) = value.value() else { return };
         // `value()` borrows the source text only when the string has no escapes. With escapes,
-        // offsets in the unescaped text don't match offsets in the source, so leave it unmapped.
-        // FIXME: Map the text between escapes.
-        let ast_offset = matches!(unescaped, Cow::Borrowed(_)).then_some(value_offset);
-        self.push_doc_lines(&unescaped, ast_offset, DocCommentKind::Desugared, indent);
+        // offsets in the unescaped text match offsets in the source only between two escapes.
+        let runs = match unescaped {
+            Cow::Borrowed(it) => {
+                vec![DocsSourceRun {
+                    text: TextRange::up_to(TextSize::of(it)),
+                    ast_offset: value_offset,
+                }]
+            }
+            Cow::Owned(ref it) => Self::runs_between_escapes(&value, it),
+        };
+        self.push_doc_lines(&unescaped, &runs, DocCommentKind::Desugared, indent);
+    }
+
+    /// The pieces of `unescaped`, the value of `value`, that are written as they are, or none
+    /// when it is not what the escapes of `value` give, as when the source has `\r\n`.
+    fn runs_between_escapes(value: &ast::String, unescaped: &str) -> Vec<DocsSourceRun> {
+        let start = syntax::AstToken::syntax(value).text_range().start();
+        let mut runs: Vec<DocsSourceRun> = Vec::new();
+        let mut text = String::new();
+        let mut valid = true;
+        value.escaped_char_ranges(&mut |range, ch| {
+            let Ok(ch) = ch else {
+                valid = false;
+                return;
+            };
+            let at = TextSize::of(&*text);
+            text.push(ch);
+            // An escape is longer than what it stands for.
+            if range.len() != TextSize::of(ch) {
+                return;
+            }
+            let ast_offset = start + range.start();
+            match runs.last_mut() {
+                Some(run)
+                    if run.text.end() == at && run.ast_offset + run.text.len() == ast_offset =>
+                {
+                    run.text = run.text.cover_offset(at + TextSize::of(ch));
+                }
+                _ => runs
+                    .push(DocsSourceRun { text: TextRange::at(at, TextSize::of(ch)), ast_offset }),
+            }
+        });
+        if !valid || text != unescaped {
+            return Vec::new();
+        }
+        runs
     }
 
     fn extend_with_doc_str(
@@ -240,11 +291,13 @@ impl Docs {
         comment_kind: DocCommentKind,
         indent: &mut Indent,
     ) {
-        self.push_doc_lines(doc, Some(offset_in_ast), comment_kind, indent);
+        let run =
+            DocsSourceRun { text: TextRange::up_to(TextSize::of(doc)), ast_offset: offset_in_ast };
+        self.push_doc_lines(doc, &[run], comment_kind, indent);
     }
 
     fn extend_with_unmapped_doc_str(&mut self, doc: &str, indent: &mut Indent) {
-        self.push_doc_lines(doc, None, DocCommentKind::Desugared, indent);
+        self.push_doc_lines(doc, &[], DocCommentKind::Desugared, indent);
     }
 
     /// Beautifies `doc` and appends the result to `self.docs`, one line at a time via
@@ -262,13 +315,20 @@ impl Docs {
     /// offsets.
     ///
     /// [`beautify_doc_string`]: https://github.com/rust-lang/rust/blob/16a623ad672a92409b5c04beb303583c6cf72a7e/compiler/rustc_ast/src/util/comments.rs#L37
+    ///
+    /// A line is mapped to the source when it is all in one of `runs`.
     fn push_doc_lines(
         &mut self,
         doc: &str,
-        ast_offset: Option<TextSize>,
+        runs: &[DocsSourceRun],
         comment_kind: DocCommentKind,
         indent: &mut Indent,
     ) {
+        let ast_offset = |line: &str, offset: TextSize| {
+            let range = TextRange::at(offset, TextSize::of(line));
+            let run = runs.iter().find(|run| run.text.contains_range(range))?;
+            Some(run.ast_offset + (offset - run.text.start()))
+        };
         // Note: this is pushed even if there are only empty lines here, because that's what rustdoc does.
         let shape = match comment_kind {
             DocCommentKind::Sugared(shape) => {
@@ -280,7 +340,7 @@ impl Docs {
         };
 
         if !doc.contains('\n') {
-            self.push_doc_line(doc, ast_offset, comment_kind, indent);
+            self.push_doc_line(doc, ast_offset(doc, TextSize::new(0)), comment_kind, indent);
             return;
         }
 
@@ -317,7 +377,7 @@ impl Docs {
         }
 
         for (line, line_offset) in lines.iter().copied() {
-            self.push_doc_line(line, ast_offset.map(|it| it + line_offset), comment_kind, indent);
+            self.push_doc_line(line, ast_offset(line, line_offset), comment_kind, indent);
         }
     }
 
@@ -1023,11 +1083,11 @@ mod tests {
 
         docs.push_doc_lines(
             " hello!",
-            None,
+            &[],
             DocCommentKind::Sugared(ast::CommentShape::Line),
             &mut indent,
         );
-        docs.push_doc_lines("another", None, DocCommentKind::Desugared, &mut indent);
+        docs.push_doc_lines("another", &[], DocCommentKind::Desugared, &mut indent);
         docs.remove_indent(&indent);
         docs.remove_last_newline();
 
@@ -1153,9 +1213,16 @@ mod tests {
         assert_eq!(mapped(&docs, 2, 3), Some(range(12, 13)));
 
         // With an escape, `b` is at offset 2 in the docs but at offset 3 in the source,
-        // so the docs can't be mapped back.
+        // so the line with it can't be mapped back.
         let docs = doc_attr_docs(r#"#[doc = "a\"b"] fn f() {}"#);
         assert_eq!(docs.docs, "a\"b");
         assert_eq!(mapped(&docs, 2, 3), None);
+
+        // A line between two escapes can, as a macro that writes its argument has it.
+        let docs = doc_attr_docs(r#"#[doc = "a\nb\"c\nd"] fn f() {}"#);
+        assert_eq!(docs.docs, "a\nb\"c\nd");
+        assert_eq!(mapped(&docs, 0, 1), Some(range(9, 10)));
+        assert_eq!(mapped(&docs, 2, 3), None);
+        assert_eq!(mapped(&docs, 6, 7), Some(range(18, 19)));
     }
 }
