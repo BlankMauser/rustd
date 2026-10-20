@@ -70,6 +70,99 @@ pub(crate) struct Plan {
     pub(crate) stamp: u128,
 }
 
+/// The harness of a test executable, which the daemon writes from the tests it finds and
+/// rustc compiles. It is glue alone: each test it has calls the daemon's code of that test.
+/// It is kept beside the object of the program, where the daemon looks for it.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Harness {
+    rustc: PathBuf,
+    cwd: PathBuf,
+    args: Vec<String>,
+    source: PathBuf,
+    object: PathBuf,
+}
+
+/// The codegen flags of the test executable that the harness is compiled with too.
+const OF_HARNESS: [&str; 8] = [
+    "opt-level",
+    "debuginfo",
+    "panic",
+    "overflow-checks",
+    "debug-assertions",
+    "target-cpu",
+    "target-feature",
+    "relocation-model",
+];
+
+impl Harness {
+    fn beside(object: &Path) -> PathBuf {
+        object.with_file_name("harness.json")
+    }
+
+    /// The harness of the program whose object is `object`, when it is a test executable.
+    pub(crate) fn of(object: &Path) -> anyhow::Result<Option<Harness>> {
+        let path = Harness::beside(object);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)?;
+        Ok(Some(serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?))
+    }
+
+    /// Plans the harness of the test executable rustc was asked for by `unit`, with its
+    /// files in `dir`.
+    fn plan(unit: &Record, dir: &Path) -> Harness {
+        let mut args = vec!["--test".to_owned(), "--cap-lints=allow".to_owned()];
+        let mut given = unit.args.iter();
+        while let Some(arg) = given.next() {
+            match arg.as_str() {
+                "--crate-name" | "--edition" | "--target" | "--sysroot" => {
+                    args.push(arg.clone());
+                    args.extend(given.next().cloned());
+                }
+                "-C" => {
+                    let Some(value) = given.next() else { break };
+                    let name = value.split_once('=').map_or(&**value, |it| it.0);
+                    if OF_HARNESS.contains(&name) {
+                        args.extend(["-C".to_owned(), value.clone()]);
+                    }
+                }
+                _ if arg.starts_with("--edition=") || arg.starts_with("--target=") => {
+                    args.push(arg.clone())
+                }
+                _ => {}
+            }
+        }
+        let (source, object) = (dir.join("harness.rs"), dir.join("harness.o"));
+        args.extend(["--emit=obj", "-Ccodegen-units=1", "-o"].map(str::to_owned));
+        args.push(object.display().to_string());
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()).into();
+        Harness { rustc, cwd: unit.cwd.clone(), args, source, object }
+    }
+
+    /// Has the harness be `text`. `true` when it was another.
+    pub(crate) fn write(&self, text: &str) -> anyhow::Result<bool> {
+        if self.object.exists() && std::fs::read_to_string(&self.source).is_ok_and(|it| it == text)
+        {
+            return Ok(false);
+        }
+        std::fs::write(&self.source, text)?;
+        let compiled = std::process::Command::new(&self.rustc)
+            .current_dir(&self.cwd)
+            .args(&self.args)
+            .arg(&self.source)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", self.rustc.display()))?;
+        anyhow::ensure!(
+            compiled.status.success(),
+            "the harness of the tests does not build: {}",
+            String::from_utf8_lossy(&compiled.stderr).trim_end()
+        );
+        Ok(true)
+    }
+}
+
 /// The library of the workspace among `records` that wrote the file a link line names. The
 /// file is told by what it is and not by its name: a target directory reached through a
 /// link has two names for it.
@@ -91,6 +184,9 @@ impl Plan {
         unit_test: bool,
     ) -> anyhow::Result<Result<Plan, String>> {
         if let Some(why) = unsupported(unit) {
+            return Ok(Err(why));
+        }
+        if unit_test && let Some(why) = harness_alone(unit) {
             return Ok(Err(why));
         }
         let line = unit.link_line.as_ref().context("a linked unit without a link line")?;
@@ -144,8 +240,17 @@ impl Plan {
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
         link.give_way(&plan.copies)?;
-        plan.link_cmd =
-            link.command(&[&plan.patch, &plan.object], &plan.binary, &dir.join("link.args"))?;
+        let mut ahead = vec![&*plan.patch, &*plan.object];
+        // The tests of an integration test are the daemon's, and so is the harness that runs
+        // them: its `main` comes ahead of the one rustc wrote for none.
+        let harness = (unit.is_test() && !unit_test).then(|| Harness::plan(unit, dir));
+        let beside = Harness::beside(&plan.object);
+        match &harness {
+            Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
+            None => _ = std::fs::remove_file(&beside),
+        }
+        ahead.extend(harness.as_ref().map(|it| &*it.object));
+        plan.link_cmd = link.command(&ahead, &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
     }
 }
@@ -186,9 +291,6 @@ fn unsupported(unit: &Record) -> Option<String> {
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
-    }
-    if unit.is_test() {
-        return harness_alone(unit);
     }
     None
 }
@@ -463,12 +565,13 @@ mod tests {
     #[test]
     fn tests_the_harness_reaches_by_symbol_only() {
         let incremental = "incremental=/t/debug/incremental";
-        assert_eq!(unsupported(&unit(&["--test", "-C", incremental])), None);
-        assert_eq!(unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
-        let private = unsupported(&unit(&["--test"]));
+        assert_eq!(harness_alone(&unit(&["--test", "-C", incremental])), None);
+        assert_eq!(harness_alone(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
+        let private = harness_alone(&unit(&["--test"]));
         assert!(private.is_some_and(|why| why.contains("without incremental")));
-        let inlined = unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
+        let inlined = harness_alone(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
         assert!(inlined.is_some_and(|why| why.contains("opt-level 2")));
+        assert_eq!(unsupported(&unit(&["--test"])), None);
         assert_eq!(unsupported(&unit(&["-C", "opt-level=3"])), None);
     }
 

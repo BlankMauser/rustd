@@ -21,7 +21,7 @@ use super::{
     cli, daemon, say, script,
     state::{State, place},
     switch::Enabled,
-    units::{Copied, Record, stamp_now},
+    units::{Copied, Record, STANDS_IN, stamp_now},
 };
 use crate::{
     socket::{private_dir, private_file},
@@ -35,8 +35,6 @@ pub(crate) const DRIVEN: &str = "RUSTD_CARGO_DRIVES";
 /// The variable `cargo rustd` sets in the first build of a workspace: the roots of the
 /// crates that are the daemon's to compile, as a list of paths.
 pub(crate) const STAGED: &str = "RUSTD_STAGED_CRATES";
-/// The file in the record of a unit that says rustc built what stands in for the crate.
-const STANDS_IN: &str = "stands-in";
 
 /// What the variables that name the programs of a build start with.
 const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
@@ -318,7 +316,7 @@ impl Unit {
     fn is_staged(&self) -> bool {
         let Some(staged) = std::env::var_os(STAGED) else { return false };
         let lists = std::env::split_paths(&staged).any(|it| it == self.source);
-        lists && !self.script && !self.args.iter().any(|it| it == "--test")
+        lists && !self.script
     }
 
     /// Has rustc do of the crate what it does in a build by the daemon: check it, and
@@ -350,8 +348,10 @@ impl Unit {
                 args.next();
             } else if self.cwd.join(arg) == self.source {
                 stand_in.arg(&source);
-            } else if arg.starts_with("--emit=") {
-                stand_in.arg("--emit=link");
+            } else if let Some(kinds) = arg.strip_prefix("--emit=") {
+                // The metadata is what cargo holds for the library being there.
+                let kept = kinds.split(',').filter(|it| matches!(*it, "link" | "metadata"));
+                stand_in.arg(format!("--emit={}", kept.collect::<Vec<_>>().join(",")));
             } else {
                 stand_in.arg(self.standing_in(arg).unwrap_or_else(|| arg.clone()));
             }
@@ -365,12 +365,27 @@ impl Unit {
             "what stands in for it does not build: {}",
             String::from_utf8_lossy(&built.stderr).trim_end()
         );
+        self.write_dep_info(&stem).context("writing the dep-info of what stands in")?;
         std::fs::write(dir.join(STANDS_IN), "")?;
 
         // The crate is not checked by rustc: the daemon's front end is what checks it, and a
         // second compile beside the daemon's would only compete with it.
         self.record(stamp, &copies, program.then_some(line), &source)?;
         Ok(0)
+    }
+
+    /// Writes the dep-info cargo reads to know what the crate is compiled from, which rustc
+    /// is not asked for: nothing. What stands in is the same whatever the crate's sources,
+    /// which are the daemon's, and a file written during the build, as its own source is,
+    /// is newer than the build to cargo. Without the file, or with a file cargo finds
+    /// newer, any cargo run later in the same environment (one a test or program runs)
+    /// builds the crate again with rustc and puts its program where the daemon's is.
+    fn write_dep_info(&self, stem: &str) -> std::io::Result<()> {
+        let Some(out_dir) = self.args.windows(2).find(|it| it[0] == "--out-dir") else {
+            return Ok(());
+        };
+        let to = self.cwd.join(&out_dir[1]).join(format!("{stem}.d"));
+        std::fs::write(&to, format!("{}:\n", to.display().to_string().replace(' ', "\\ ")))
     }
 
     /// `--extern`'s value `named` with the library that stands in for the crate, when the

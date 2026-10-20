@@ -279,16 +279,23 @@ impl Staged {
         }
         let mut roots = Vec::new();
         let mut examples = Vec::new();
+        let mut tests = Vec::new();
         for (at, member) in members.iter().enumerate() {
             if reached.contains(&at) {
                 continue;
             }
             let of_build = |it: &&Target| {
-                let apart = [TargetKind::CustomBuild, TargetKind::Test, TargetKind::Bench];
+                let apart = [TargetKind::CustomBuild, TargetKind::Bench];
                 !it.kind.iter().any(|it| apart.contains(it))
             };
             for target in member.targets.iter().filter(of_build) {
                 let source = target.src_path.clone().into_std_path_buf();
+                // An integration test is a program of its own too. Its harness, when
+                // it has one, is the daemon's to write.
+                if target.is_test() {
+                    tests.push(source);
+                    continue;
+                }
                 // An example is a program of its own: no crate of the build is linked
                 // with it, and the daemon loads it when cargo has it built.
                 if target.is_example() {
@@ -337,6 +344,7 @@ impl Staged {
             daemon::Ahead { config, crates: roots.clone(), root }
         });
         roots.extend(examples);
+        roots.extend(tests);
         Ok(Ok(Staged { roots, ahead }))
     }
 }
@@ -366,10 +374,12 @@ impl Built {
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
-        as_built(&mut cargo)?;
-        if let Some(staged) = staged {
-            cargo.env(switch::VARIABLE, switch::first_wrapper_path()?);
-            cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+        match staged {
+            Some(staged) => {
+                as_staged(&mut cargo)?;
+                cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+            }
+            None => as_built(&mut cargo)?,
         }
         cargo.stdout(Stdio::piped());
         let mut cargo = cargo.spawn().context("running cargo")?;
@@ -837,6 +847,13 @@ pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 /// program that is running.
 pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
     command.env(switch::VARIABLE, switch::wrapper_path()?).env(wrapper::DRIVEN, "1");
+    Ok(())
+}
+
+/// The same for the first build of a workspace, and for the programs it built: a cargo one
+/// of them runs finds the build as `cargo rustd` left it, under the wrapper it was built with.
+pub(crate) fn as_staged(command: &mut Command) -> std::io::Result<()> {
+    command.env(switch::VARIABLE, switch::first_wrapper_path()?).env(wrapper::DRIVEN, "1");
     Ok(())
 }
 

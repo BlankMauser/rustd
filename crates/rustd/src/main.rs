@@ -2606,9 +2606,13 @@ fn build(
     // is only here for what this one uses of it.
     let mut main = None;
     let mut local = Vec::new();
+    let mut programs_own = Vec::new();
     for (at, krate) in args.crates().enumerate() {
         for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
+            if at == 0 {
+                programs_own.push(krate);
+            }
             let listed = listed.of(db, krate);
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
             // every test: the crate's own `main` is one function among the others.
@@ -2706,6 +2710,16 @@ fn build(
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
         replace(path, patch)?;
+    }
+    if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
+        let text = hir::attach_db(db, || harness_of(db, &resolver, &programs_own))
+            .map_err(anyhow::Error::msg)?;
+        // A splice adds the edit to the executable and leaves the harness as it was linked.
+        if harness.write(&text)?
+            && let Some(binary) = &args.splice
+        {
+            lock(&LINKED).remove(binary);
+        }
     }
     let build = Build {
         compiled: unit.compiled.len(),
@@ -3653,6 +3667,75 @@ struct Program {
     moved: bool,
     /// The tests of its crate when it was first built, which is how rustc built it.
     tests: Option<Tests>,
+}
+
+/// The harness of a test executable whose own crates are `own`: a `#[test]` for each test
+/// the daemon compiled, which calls it, in modules as the test's are, so that it is named as
+/// rustc would name it. `Err` is why the daemon does not run the tests.
+fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Result<String, String> {
+    use hir::HasSource as _;
+    use std::fmt::Write as _;
+    use syntax::ast::HasAttrs as _;
+    #[derive(Default)]
+    struct Glue {
+        tests: String,
+        modules: std::collections::BTreeMap<String, Glue>,
+    }
+    impl Glue {
+        fn write(&self, text: &mut String) {
+            text.push_str(&self.tests);
+            for (name, module) in &self.modules {
+                let _ = writeln!(text, "mod {name} {{");
+                module.write(text);
+                text.push_str("}\n");
+            }
+        }
+    }
+    let mut glue = Glue::default();
+    for &krate in own {
+        let edition = krate.edition(db);
+        for &id in &resolver.listed.of(db, krate).functions {
+            let function = hir::Function::from(id);
+            if !function.is_test(db) {
+                continue;
+            }
+            let module = function.module(db);
+            let name = function.name(db).display_no_db(edition).to_string();
+            // rustc runs no test declared in a body.
+            if module.nearest_non_block_module(db) != module {
+                continue;
+            }
+            if !function.ret_type(db).is_unit() {
+                return Err(format!(
+                    "the test `{name}` returns a value, which the daemon's harness does not \
+                     run yet"
+                ));
+            }
+            let symbol = resolver
+                .function_named(id)
+                .ok_or_else(|| format!("the test `{name}` has no symbol of the daemon's"))?;
+            let mut at = &mut glue;
+            for module in module.path_to_root(db).into_iter().rev() {
+                let Some(segment) = module.name(db) else { continue };
+                at = at.modules.entry(segment.display_no_db(edition).to_string()).or_default();
+            }
+            let attrs = function.source(db).map(|it| it.value.attrs().collect::<Vec<_>>());
+            for attr in attrs.unwrap_or_default() {
+                let path = attr.path().map(|it| it.syntax().text().to_string());
+                if matches!(path.as_deref(), Some("ignore" | "should_panic")) {
+                    let _ = writeln!(at.tests, "{}", attr.syntax().text());
+                }
+            }
+            let _ = writeln!(
+                at.tests,
+                "#[test]\nfn {name}() {{\n    unsafe extern \"Rust\" {{\n        \
+                 #[link_name = {symbol:?}]\n        safe fn test();\n    }}\n    test()\n}}"
+            );
+        }
+    }
+    let mut text = String::from("#![allow(warnings)]\n");
+    glue.write(&mut text);
+    Ok(text)
 }
 
 /// The functions of a program's own crate that a test harness runs, each with its
@@ -5924,7 +6007,10 @@ impl Program {
             .or_else(|| warm.unset.clone());
         failed = failed.or_else(|| stale_copies(db, table, args));
         let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
+        let harnessed = cargo::plan::Harness::of(&args.out).is_ok_and(|it| it.is_some());
         match tests {
+            // The daemon writes the harness again for the tests there are now.
+            _ if harnessed => {}
             Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
             // The first build of the program is of the source rustc built it from.
             None if failed.is_none() => *tests = Some(tests_now),

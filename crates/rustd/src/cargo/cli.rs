@@ -290,6 +290,8 @@ impl Invocation {
     pub(crate) fn builds_tests(&self) -> Option<String> {
         let flag = self.flags.tests.as_deref();
         let what = match (self.subcommand, flag) {
+            // An integration test, whose harness the daemon writes.
+            (_, Some("--test")) => return None,
             (_, Some(flag)) => format!("`{flag}`"),
             (Subcommand::Test, None) => "`cargo rustd test`".to_owned(),
             _ => return None,
@@ -490,9 +492,10 @@ mod tests {
         for (command, args) in [("test", ""), ("build", "--all-targets"), ("build", "--tests")] {
             assert!(build(command, args).builds_tests().is_some(), "{command} {args}");
         }
-        for args in ["", "--bin a", "--example a", "--lib", "--bins", "--examples"] {
+        for args in ["", "--bin a", "--example a", "--lib", "--bins", "--examples", "--test a"] {
             assert_eq!(build("build", args).builds_tests(), None, "{args}");
         }
+        assert_eq!(build("test", "--test a").builds_tests(), None);
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
     }
