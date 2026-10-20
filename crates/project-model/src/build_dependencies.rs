@@ -180,6 +180,43 @@ impl WorkspaceBuildScripts {
         self.outputs.get(package)?.out_dir.as_deref()
     }
 
+    /// Whether it says what `other` does, a path in one being another path in the other
+    /// where `same` has the two be the same. A package one says no proc-macro library of
+    /// is not built or is not a proc macro alike.
+    pub fn says_as(&self, other: &Self, same: impl Fn(&AbsPath, &AbsPath) -> bool) -> bool {
+        let path = |a: &AbsPath, b: &AbsPath| a == b || same(a, b);
+        let value = |a: &str, b: &str| {
+            let as_path = |it| <&AbsPath>::try_from(Utf8Path::new(it)).ok();
+            a == b || as_path(a).zip(as_path(b)).is_some_and(|(a, b)| same(a, b))
+        };
+        let dylib = |a: &ProcMacroDylibPath, b: &ProcMacroDylibPath| match (a, b) {
+            (ProcMacroDylibPath::Path(a), ProcMacroDylibPath::Path(b)) => path(a, b),
+            (
+                ProcMacroDylibPath::NotBuilt | ProcMacroDylibPath::NotProcMacro,
+                ProcMacroDylibPath::NotBuilt | ProcMacroDylibPath::NotProcMacro,
+            ) => true,
+            (a, b) => a == b,
+        };
+        let output = |a: &BuildScriptOutput, b: &BuildScriptOutput| {
+            let envs = a.envs.iter().count() == b.envs.iter().count()
+                && a.envs.iter().all(|(name, it)| b.envs.get(name).is_some_and(|b| value(it, &b)));
+            let out_dirs = match (&a.out_dir, &b.out_dir) {
+                (Some(a), Some(b)) => path(a, b),
+                (a, b) => a == b,
+            };
+            a.cfgs == b.cfgs
+                && envs
+                && out_dirs
+                && dylib(&a.proc_macro_dylib_path, &b.proc_macro_dylib_path)
+        };
+        let outputs = |a: &Self, b: &Self| {
+            a.outputs
+                .iter()
+                .all(|(package, it)| b.outputs.get(package).is_some_and(|b| output(it, b)))
+        };
+        self.error == other.error && outputs(self, other) && outputs(other, self)
+    }
+
     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
         self.outputs.get(idx)
     }
