@@ -786,14 +786,14 @@ impl Daemon {
         }
     }
 
-    /// What the worker that loads `checkout` has to say of its programs once it has.
+    /// What the worker that loads `checkout` has to say of its programs once it has. Asked
+    /// once the load is over: a load that ends between the two would leave a "still
+    /// loading" for the answer.
     fn built(&self, checkout: &Checkout) -> Reply {
-        loop {
-            match self.sync(checkout, "sync") {
-                Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
-                reply => return reply,
-            }
+        while self.loads(checkout) {
+            std::thread::sleep(POLL);
         }
+        self.sync(checkout, "sync")
     }
 
     /// Whether a worker is loading this build of `checkout`.
