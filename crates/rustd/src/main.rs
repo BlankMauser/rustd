@@ -3793,31 +3793,19 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
                 let Some(segment) = module.name(db) else { continue };
                 at = at.modules.entry(segment.display_no_db(edition).to_string()).or_default();
             }
+            // The attributes libtest reads, with the `cfg_attr`s that hold opened as rustc does.
             let attrs = function.source(db).map(|it| it.value.attrs().collect::<Vec<_>>());
-            let mut ignored = false;
-            for attr in attrs.unwrap_or_default() {
-                let path = attr.path().map(|it| it.syntax().text().to_string());
-                let text = attr.syntax().text().to_string();
-                match path.as_deref() {
-                    Some("ignore") => ignored = true,
-                    Some("should_panic") => {}
-                    Some("cfg_attr") if text.contains("should_panic") => {
-                        return Err(format!(
-                            "the test `{name}` may panic by a `cfg_attr`, which the daemon's \
-                             harness does not read yet"
-                        ));
+            let cfg = ide_db::base_db::Crate::from(krate).cfg_options(db);
+            hir_expand::attrs::expand_cfg_attr(
+                attrs.unwrap_or_default().into_iter(),
+                || cfg,
+                |meta, _| {
+                    if matches!(meta.simple_name().as_deref(), Some("ignore" | "should_panic")) {
+                        let _ = writeln!(at.tests, "#[{}]", meta.syntax().text());
                     }
-                    _ => continue,
-                }
-                let _ = writeln!(at.tests, "{text}");
-            }
-            // A `cfg_attr` that holds says why it is ignored, which libtest prints.
-            if function.is_ignore(db) && !ignored {
-                return Err(format!(
-                    "the test `{name}` is ignored by a `cfg_attr`, which the daemon's harness \
-                     does not read yet"
-                ));
-            }
+                    std::ops::ControlFlow::<()>::Continue(())
+                },
+            );
             let _ = writeln!(
                 at.tests,
                 "#[test]\nfn {name}(){returns} {{\n    unsafe extern \"Rust\" {{\n        \

@@ -37,6 +37,9 @@ const SCRATCH: &str = "CARGO_TARGET_TMPDIR";
 /// after `-C`.
 const INCREMENTAL: &str = "incremental";
 
+/// The object of rustc's that names what a program needs of the libraries linked after it.
+const SYMBOLS: &str = "symbols.o";
+
 /// Builds what cargo asked rustc for and ends as rustc would have.
 pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
@@ -285,7 +288,12 @@ impl Unit {
             let line = std::fs::read_to_string(line)
                 .with_context(|| format!("rustc wrote no link line to {}", line.display()))?;
             let args = shlex::split(&line).context("the link line is not quoted as a shell's")?;
-            let objects = args.into_iter().filter(|it| it.ends_with(".rcgu.o")).map(PathBuf::from);
+            // `symbols.o` asks for what the program needs of the libraries after it, as the
+            // panic runtime, and is gone with rustc's directory.
+            let objects = args
+                .into_iter()
+                .filter(|it| it.ends_with(".rcgu.o") || it.ends_with(SYMBOLS))
+                .map(PathBuf::from);
             originals.extend(objects.filter(|it| it.exists()));
         }
         std::fs::create_dir_all(to)?;

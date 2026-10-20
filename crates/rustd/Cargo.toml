@@ -40,6 +40,7 @@ typed-arena = "2.0.2"
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
+hir-expand.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

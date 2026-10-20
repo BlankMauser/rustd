@@ -70,6 +70,8 @@ struct Alone {
     shown: String,
     /// Whether it was ignored, when it passed.
     outcome: Option<bool>,
+    /// Why it is ignored, as its `#[ignore = "..."]` says.
+    why: Option<String>,
     /// What it said, when it failed.
     said: String,
     status: ExitStatus,
@@ -253,11 +255,12 @@ impl<'a> Selective<'a> {
                             };
                             let Some(name) = names.get(at) else { return Ok(()) };
                             let alone = self.alone(name, &flags, timeout)?;
-                            let result = match alone.outcome {
-                                Some(true) => "ignored",
-                                Some(false) => "ok",
-                                None if alone.timed_out => "FAILED (timed out)",
-                                None => "FAILED",
+                            let result = match (alone.outcome, &alone.why) {
+                                (Some(true), Some(why)) => format!("ignored, {why}"),
+                                (Some(true), None) => "ignored".into(),
+                                (Some(false), _) => "ok".into(),
+                                (None, _) if alone.timed_out => "FAILED (timed out)".into(),
+                                (None, _) => "FAILED".into(),
                             };
                             println!("test {} ... {result}", alone.shown);
                             ran.lock().unwrap_or_else(|it| it.into_inner())[at] = Some(alone);
@@ -318,6 +321,7 @@ impl<'a> Selective<'a> {
         let shown = line.map_or_else(|| name.to_owned(), |it| it.1.to_owned());
         let outcome = line.and_then(|it| it.2).or_else(|| summarized(&stdout));
         let outcome = outcome.filter(|_| status.success() && !timed_out);
+        let why = line.and_then(|it| it.3).map(str::to_owned);
         // What the harness captured of a test that failed, or all it said when it died.
         let start = format!("---- {shown} stdout ----\n");
         let captured = stdout
@@ -332,7 +336,7 @@ impl<'a> Selective<'a> {
         if !stderr.is_empty() {
             said.push_str(&format!("\nstderr:\n{stderr}"));
         }
-        Ok(Alone { shown, outcome, said, status, timed_out })
+        Ok(Alone { shown, outcome, why, said, status, timed_out })
     }
 
     fn command(&self) -> std::io::Result<Command> {
@@ -410,17 +414,18 @@ impl Tally {
     }
 }
 
-/// The test a line of the harness is the result of, as listed and as shown, and whether it
-/// was ignored: `None` for one that did not pass.
-fn outcome(line: &str) -> Option<(&str, &str, Option<bool>)> {
+/// The test a line of the harness is the result of, as listed and as shown, whether it was
+/// ignored (`None` for one that did not pass), and why it was.
+fn outcome(line: &str) -> Option<(&str, &str, Option<bool>, Option<&str>)> {
     let (shown, result) = line.strip_prefix("test ")?.split_once(" ... ")?;
     let name = shown.strip_suffix(" - should panic").unwrap_or(shown);
+    let why = result.strip_prefix("ignored, ");
     let outcome = match result {
         "ok" => Some(false),
-        _ if result == "ignored" || result.starts_with("ignored, ") => Some(true),
-        _ => None,
+        "ignored" => Some(true),
+        _ => why.map(|_| true),
     };
-    Some((name, shown, outcome))
+    Some((name, shown, outcome, why))
 }
 
 /// Whether the one test a harness ran was ignored, by its last line: a test that writes to
@@ -558,11 +563,12 @@ mod tests {
 
     #[test]
     fn reads_the_harness() {
-        assert_eq!(outcome("test a::b ... ok"), Some(("a::b", "a::b", Some(false))));
-        assert_eq!(outcome("test a::b ... ignored, slow"), Some(("a::b", "a::b", Some(true))));
+        assert_eq!(outcome("test a::b ... ok"), Some(("a::b", "a::b", Some(false), None)));
+        let slow = outcome("test a::b ... ignored, slow");
+        assert_eq!(slow, Some(("a::b", "a::b", Some(true), Some("slow"))));
         let should_panic = outcome("test a - should panic ... ok");
-        assert_eq!(should_panic, Some(("a", "a - should panic", Some(false))));
-        assert_eq!(outcome("test a::b ... FAILED"), Some(("a::b", "a::b", None)));
+        assert_eq!(should_panic, Some(("a", "a - should panic", Some(false), None)));
+        assert_eq!(outcome("test a::b ... FAILED"), Some(("a::b", "a::b", None, None)));
         assert_eq!(outcome("test result: ok. 1 passed"), None);
         let spoken = outcome("test a::b ... it said: ok").and_then(|it| it.2);
         let spoken =

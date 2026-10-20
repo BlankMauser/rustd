@@ -554,8 +554,8 @@ FLAG_WORKSPACE = {
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n\n[dev-dependencies]\nprobe = { path = "../probe" }\n',
     # What the unit tests of `util` use, which uses `util`: they link the library twice, as tested and not.
     "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nutil = { path = "../util" }\n',
-    "probe/src/lib.rs": 'pub fn library_is_tested() -> bool {\n    util::tested()\n}\n\npub fn greeting() -> String {\n    util::greeting("probe")\n}\n',
-    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n/// Whether this build of the library is the one with its unit tests.\npub fn tested() -> bool {\n    cfg!(test)\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n\n    // The tests are in a build of the library with `cfg(test)`, and what they link that uses\n    // the library has the build without.\n    #[test]\n    fn only_the_tested_build_is_a_test() {\n        assert!(super::tested());\n        assert!(!probe::library_is_tested());\n        assert_eq!(probe::greeting().to_lowercase().trim_end_matches("!"), "hello probe");\n    }\n}\n',
+    "probe/src/lib.rs": '/// Documentation for its argument, which a library that has this as a dev-dependency\n/// gives itself for its examples, as regex does with `doc_comment::doctest!`.\n#[macro_export]\nmacro_rules! example {\n    ($docs:expr) => {\n        #[doc = $docs]\n        extern "C" {}\n    };\n}\n\npub fn library_is_tested() -> bool {\n    util::tested()\n}\n\npub fn greeting() -> String {\n    util::greeting("probe")\n}\n',
+    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(doctest)]\nprobe::example!("```\\nassert_eq!(util::greeting(\\"dev\\"), \\"hello dev\\");\\n```");\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n/// Whether this build of the library is the one with its unit tests.\npub fn tested() -> bool {\n    cfg!(test)\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n\n    // The tests are in a build of the library with `cfg(test)`, and what they link that uses\n    // the library has the build without.\n    #[test]\n    fn only_the_tested_build_is_a_test() {\n        assert!(super::tested());\n        assert!(!probe::library_is_tested());\n        assert_eq!(probe::greeting().to_lowercase().trim_end_matches("!"), "hello probe");\n    }\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n\n[[test]]\nname = "plain"\nharness = false\n',
     "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    // What a spin waits with: an `isb` on aarch64.\n    std::hint::spin_loop();\n    if name == "fail" {\n        std::process::exit(3);\n    }\n    // A cargo the program runs has the units of the build: the program stays the file it was.\n    if name == "cargo" {\n        use std::os::unix::fs::MetadataExt;\n        let me = std::env::current_exe().unwrap();\n        let before = std::fs::metadata(&me).unwrap().ino();\n        let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n        assert!(std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap().success());\n        println!("the program stayed: {}", before == std::fs::metadata(&me).unwrap().ino());\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n\n    #[test]\n    fn links_the_library_without_its_tests() {\n        assert!(!util::tested());\n    }}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
@@ -697,6 +697,20 @@ def scripted(work, check):
     reloads = sum(len(re.findall(r"^reload: ", open(it, errors="replace").read(), re.M)) for it in logs if os.path.exists(it))
     here.cargo("stop")
     check("an edit of a package whose build script runs again for it does not reload the workspace", cold.returncode == 0 and "edited hello" in edited.stdout and reloads == 0, f"{reloads} reloads, {here.how_built(edited.stderr)}")
+
+
+def registry_impls(work, check):
+    """An impl a registry crate writes in a function is found by the code that uses it:
+    bincode's `deserialize_enum` holds the `EnumAccess` an enum of serde's derive reads with."""
+    ws = os.path.realpath(os.path.join(work, "registry-impls"))
+    os.makedirs(os.path.join(ws, "src"), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "bz"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nbincode = "=1.3.3"\nserde = { version = "1", features = ["derive"] }\n')
+    open(os.path.join(ws, "src/main.rs"), "w").write('#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]\nenum Kind {\n    A,\n    B(u8),\n    C { x: u16 },\n}\n\nfn main() {\n    let value = vec![Some(Kind::B(3)), None, Some(Kind::C { x: 9 }), Some(Kind::A)];\n    let back: Vec<Option<Kind>> = bincode::deserialize(&bincode::serialize(&value).unwrap()).unwrap();\n    assert_eq!(back, value);\n    println!("{back:?}");\n}\n')
+    here = Side(ws, base_env(os.path.join(work, "home-registry-impls")), True)
+    _, ran = here.cargo("run")
+    here.cargo("stop")
+    said = "[Some(B(3)), None, Some(C { x: 9 }), Some(A)]"
+    check("an impl a registry crate writes in a function is used", ran.returncode == 0 and ran.stdout.strip() == said and here.how_built(ran.stderr) == "daemon", f"{ran.returncode}: {ran.stdout.strip()[-100:]} {ran.stderr.strip()[-300:]}")
 
 
 INCREMENTAL_LIB = """use std::sync::atomic::{AtomicUsize, Ordering};
@@ -878,9 +892,9 @@ def daemon(work):
     time.sleep(1)
     open(valued, "w").write("#[test]\nfn valued() {}\n")
     _, mended = here.cargo("test", "--test", "valued")
-    open(valued, "w").write('#[test]\n#[cfg_attr(not(miri), ignore = "not under miri")]\nfn valued() {}\n')
+    open(valued, "w").write('#[test]\n#[cfg_attr(not(miri), ignore = "not under miri")]\nfn valued() {}\n\n#[test]\n#[cfg_attr(miri, ignore)]\n#[cfg_attr(not(miri), should_panic(expected = "boom"))]\nfn gated() {\n    panic!("boom");\n}\n')
     _, gated = here.cargo("test", "--test", "valued")
-    check("a test a `cfg_attr` ignores fails the build naming it", gated.returncode != 0 and "ignored by a `cfg_attr`" in gated.stderr, gated.stderr.strip()[-200:])
+    check("the `cfg_attr`s of a test that hold are read", gated.returncode == 0 and "test valued ... ignored, not under miri" in gated.stdout and "test gated - should panic ... ok" in gated.stdout, f"{gated.returncode}: {gated.stdout.strip()[-300:]} {gated.stderr.strip()[-200:]}")
     os.remove(valued)
     check("a test the daemon refuses fails the build, and runs once its source is mended", refused.returncode != 0 and "returns a value" in refused.stderr and mended.returncode == 0 and "1 passed" in mended.stdout, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; then {mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
     _, before = here.cargo("test", "--test", "edge")
@@ -890,6 +904,7 @@ def daemon(work):
     os.remove(added)
     check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
     scripted(work, check)
+    registry_impls(work, check)
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)

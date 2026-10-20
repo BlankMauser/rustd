@@ -325,8 +325,9 @@ impl LinkLine {
             .collect();
         let args: Vec<String> = words[first + 1..]
             .iter()
-            // It exports what a dynamic library would, and is gone with rustc's directory.
-            .filter(|it| !it.ends_with("symbols.o"))
+            // The record keeps a copy of it, and the plan names that; one gone with rustc's
+            // directory and not kept, as an older record has it, can't be linked.
+            .filter(|it| !it.ends_with("symbols.o") || Path::new(it).exists())
             .cloned()
             .collect();
         let flavor = Flavor::of(&args)?;
