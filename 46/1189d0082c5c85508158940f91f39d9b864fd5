@@ -1,0 +1,22 @@
+.github/workflows/release.yaml
+  h_9b6f78b66c1cb5 61,64
+README.md
+  h_9b6f78b66c1cb5 89-91,93
+docs/cargo.md
+  h_9b6f78b66c1cb5 19
+site/install.ps1
+  h_9b6f78b66c1cb5 36
+site/install.sh
+  h_9b6f78b66c1cb5 56,62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "461189d0082c5c85508158940f91f39d9b864fd5",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
