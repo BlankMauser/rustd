@@ -274,13 +274,6 @@ class Side:
             return "cargo" if re.search(r"^\s*Compiling ", stderr, re.M) else "nothing to build"
         return "daemon"
 
-    def settled(self):
-        """Waits until no build of plain cargo is still being handed to the daemon."""
-        settling = os.path.join(self.env["RUSTD_HOME"], "settling")
-        began = time.time()
-        while self.plain and os.path.isdir(settling) and os.listdir(settling) and time.time() - began < WARMUP_SECS:
-            time.sleep(0.05)
-
     def share(self):
         """The functions of the largest load the daemon compiled itself, of all it has."""
         loads = []
@@ -433,7 +426,6 @@ def wait_warm(side, root):
     """Waits until the daemon has every build of `root` loaded or has given up on one. The
     result is the seconds it took and how each ended."""
     began = time.time()
-    side.settled()
     while time.time() - began < WARMUP_SECS:
         _, status = side.cargo("status")
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
