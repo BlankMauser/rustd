@@ -1,0 +1,32 @@
+.github/workflows/fuzz.yaml
+  h_9b6f78b66c1cb5 29
+.github/workflows/release.yaml
+  h_9b6f78b66c1cb5 49
+.github/workflows/rustd.yaml
+  h_9b6f78b66c1cb5 38,69,166,197,232,314,375,413,465,490
+.github/workflows/site.yaml
+  h_9b6f78b66c1cb5 43-44
+README.md
+  h_9b6f78b66c1cb5 41,65,67,74,77,80,87,98,273
+docs/cargo.md
+  h_9b6f78b66c1cb5 18,21-22
+docs/contributing.md
+  h_9b6f78b66c1cb5 48,96-97
+docs/harness.md
+  h_9b6f78b66c1cb5 13,19,70
+docs/support.md
+  h_9b6f78b66c1cb5 15,17-22
+harness/toolchain
+  h_9b6f78b66c1cb5 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bae21a7304fed5f1554c36c5802ff642e972942d",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
