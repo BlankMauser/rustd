@@ -296,6 +296,7 @@ define_symbols! {
     div_assign,
     div,
     doc,
+    doctest,
     drop_glue,
     drop_in_place,
     drop,

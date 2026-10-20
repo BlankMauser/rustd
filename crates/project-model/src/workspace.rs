@@ -1269,6 +1269,19 @@ fn project_json_to_crate_graph(
     res
 }
 
+/// Which build of a target a crate is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Build {
+    /// The one what depends on the target links.
+    Plain,
+    /// A library or a binary with its unit tests, as `cargo test` builds it.
+    UnitTest,
+    /// A library as rustdoc reads it for its examples, with `cfg(doc)` and `cfg(doctest)`.
+    Documented,
+    /// The examples of the documentation of a library, as one program.
+    DocTests,
+}
+
 fn cargo_to_crate_graph(
     load: FileLoader<'_>,
     rustc: Option<&(CargoWorkspace, WorkspaceBuildScripts)>,
@@ -1349,7 +1362,12 @@ fn cargo_to_crate_graph(
             let Some(file_id) = load(root) else { continue };
 
             let build_data = build_scripts.get_output(pkg);
-            let add_crate = |crate_graph: &mut _, proc_macros: &mut _, unit_test: bool| {
+            let add_crate = |crate_graph: &mut _, proc_macros: &mut _, build: Build, file_id| {
+                // The examples are a program of their own, which rustdoc calls `rust_out`.
+                let (name, kind) = match build {
+                    Build::DocTests => ("rust_out", TargetKind::Bin),
+                    _ => (&**name, kind),
+                };
                 add_target_crate_root(
                     crate_graph,
                     proc_macros,
@@ -1359,8 +1377,16 @@ fn cargo_to_crate_graph(
                     {
                         // Cargo builds a test target, and nothing else of the package, as a test.
                         let mut cfg_options = cfg_options.clone();
-                        if unit_test || sysroot_as_built() && matches!(kind, TargetKind::Test) {
-                            cfg_options.insert_atom(sym::test);
+                        match build {
+                            Build::UnitTest => cfg_options.insert_atom(sym::test),
+                            Build::Plain if sysroot_as_built() && kind == TargetKind::Test => {
+                                cfg_options.insert_atom(sym::test)
+                            }
+                            Build::Documented => {
+                                cfg_options.insert_atom(sym::doc);
+                                cfg_options.insert_atom(sym::doctest);
+                            }
+                            Build::Plain | Build::DocTests => {}
                         }
                         cfg_options
                     },
@@ -1393,7 +1419,7 @@ fn cargo_to_crate_graph(
                     &cargo_path,
                 )
             };
-            let crate_id = add_crate(crate_graph, proc_macros, false);
+            let crate_id = add_crate(crate_graph, proc_macros, Build::Plain, file_id);
             if let TargetKind::Lib { .. } = kind {
                 lib_tgt = Some((crate_id, name.clone()));
                 pkg_to_lib_crate.insert(pkg, crate_id);
@@ -1410,20 +1436,34 @@ fn cargo_to_crate_graph(
             }
 
             let crates = pkg_crates.entry(pkg).or_insert_with(Vec::new);
-            crates.push((crate_id, kind, false));
+            crates.push((crate_id, kind, Build::Plain));
             let tested = matches!(kind, TargetKind::Lib { .. } | TargetKind::Bin);
+            let mut builds = Vec::new();
             if unit_tests && tested && pkg_data.is_member {
-                let unit_test = add_crate(crate_graph, proc_macros, true);
+                builds.push((Build::UnitTest, file_id));
+            }
+            // The examples of a library are tested when a file for them is there to load.
+            let examples = cargo.target_directory().join("rustd/doctests");
+            let examples = examples.join(format!("{}.rs", pkg_data.name));
+            if unit_tests
+                && pkg_data.is_member
+                && kind == (TargetKind::Lib { is_proc_macro: false })
+                && let Some(examples) = load(&examples)
+            {
+                builds.extend([(Build::Documented, file_id), (Build::DocTests, examples)]);
+            }
+            for (build, file_id) in builds {
+                let built = add_crate(crate_graph, proc_macros, build, file_id);
                 if let Some(proc_macro) = libproc_macro {
                     let is_proc_macro = matches!(kind, TargetKind::Lib { is_proc_macro: true });
-                    add_proc_macro_dep(crate_graph, unit_test, proc_macro, is_proc_macro);
+                    add_proc_macro_dep(crate_graph, built, proc_macro, is_proc_macro);
                 }
-                crates.push((unit_test, kind, true));
+                crates.push((built, kind, build));
             }
         }
 
         // Set deps to the core, std and to the lib target of the current package
-        for &(from, kind, unit_test) in pkg_crates.get(&pkg).into_iter().flatten() {
+        for &(from, kind, build) in pkg_crates.get(&pkg).into_iter().flatten() {
             // Add sysroot deps first so that a lib target named `core` etc. can overwrite them.
             public_deps.add_to_crate_graph(crate_graph, from);
 
@@ -1431,8 +1471,10 @@ fn cargo_to_crate_graph(
             if let Some((to, name)) = lib_tgt.clone()
                 && to != from
                 && kind != TargetKind::BuildScript
-                // Nor do the unit tests of the library: they are the library.
-                && !(unit_test && matches!(kind, TargetKind::Lib { .. }))
+                // Nor do the unit tests of the library, nor the library as documented: they
+                // are the library.
+                && !(build == Build::UnitTest && matches!(kind, TargetKind::Lib { .. }))
+                && build != Build::Documented
             {
                 // (build script can not depend on its library target)
 
@@ -1455,7 +1497,7 @@ fn cargo_to_crate_graph(
             let Some(targets) = pkg_crates.get(&pkg) else { continue };
 
             let name = CrateName::new(&dep.name).unwrap();
-            for &(from, kind, unit_test) in targets {
+            for &(from, kind, build) in targets {
                 // Build scripts may only depend on build dependencies.
                 if (dep.kind == DepKind::Build) != (kind == TargetKind::BuildScript) {
                     continue;
@@ -1463,7 +1505,8 @@ fn cargo_to_crate_graph(
                 // The build of a library or a binary without its unit tests has none of the
                 // dev-dependencies.
                 let tested = matches!(kind, TargetKind::Lib { .. } | TargetKind::Bin);
-                if unit_tests && dep.kind == DepKind::Dev && tested && !unit_test {
+                let plain = matches!(build, Build::Plain | Build::Documented);
+                if unit_tests && dep.kind == DepKind::Dev && tested && plain {
                     continue;
                 }
 
@@ -1594,7 +1637,7 @@ fn handle_rustc_crates(
     cargo: &CargoWorkspace,
     public_deps: &SysrootPublicDeps,
     libproc_macro: Option<CrateBuilderId>,
-    pkg_crates: &FxHashMap<Package, Vec<(CrateBuilderId, TargetKind, bool)>>,
+    pkg_crates: &FxHashMap<Package, Vec<(CrateBuilderId, TargetKind, Build)>>,
     cfg_options: &CfgOptions,
     override_cfg: &CfgOverrides,
     build_scripts: &WorkspaceBuildScripts,
