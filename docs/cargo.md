@@ -227,7 +227,7 @@ for when they won't: agents, scripts, editors that call `cargo build` themselves
     rustd status     # is it on, and what the daemon served or left to rustc
     rustd disable    # back to how it was
 
-`rustd`, `cargo-rustd` and `rustd-rustc` have to be in the same directory.
+`rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` have to be in the same directory.
 
 ### What `enable` changes
 

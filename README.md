@@ -86,10 +86,11 @@ Ubuntu, `llvm-20-dev` and `libpolly-20-dev` from apt.llvm.org):
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo +1.99.0 build -p rustd --release --features llvm
 
-The build leaves `rustd`, `cargo-rustd` and `rustd-rustc` in `target/release`. Put all three
-in one directory on your `PATH`; each runs the others from next to itself.
+The build leaves `rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` in
+`target/release`. Put all four in one directory on your `PATH`; each runs the others from next
+to itself.
 
-    cp target/release/{rustd,cargo-rustd,rustd-rustc} ~/.cargo/bin/
+    cp target/release/{rustd,cargo-rustd,rustd-rustc,rustd-rustc-first} ~/.cargo/bin/
 
 ## Quick start
 
@@ -130,9 +131,10 @@ and how many programs the daemon linked or left to rustc, by reason.
     $ cargo run            # the daemon's, once it has loaded the workspace
     $ rustd disable
 
-`rustd`, `cargo-rustd` and `rustd-rustc` have to be installed in the same directory. A
-wrapper you already use, such as sccache, keeps running. Until the daemon has loaded a
-build, rustc links it, and one line on stderr says so. This mode is for agents and scripts that
+`rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` have to be installed in the same
+directory. A wrapper you already use, such as sccache, keeps running.
+Until the daemon has loaded a build, rustc links it, and one line on stderr says so. This mode
+is for agents and scripts that
 call cargo themselves; it has been run on Linux and on macOS arm64. On edits it is currently slower than
 `cargo rustd`, and on some projects slower than cargo alone; see
 [docs/cargo.md](docs/cargo.md).
