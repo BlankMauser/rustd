@@ -317,7 +317,23 @@ fn source_path(
     let path = source_root.path_for_file(&file)?.as_path()?.to_string();
     let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
     let relative = Path::new(&path).strip_prefix(root).ok().or(base);
-    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    Some(
+        relative
+            .map_or_else(|| as_rustc_names(path.clone()), |it| it.to_string_lossy().into_owned()),
+    )
+}
+
+/// A file of the standard library's installed sources as rustc names it: the sysroot joined
+/// with `lib/rustlib/src/rust` as rustc spells that, then the rest of the path. On Windows
+/// the part in the middle keeps its forward slashes.
+fn as_rustc_names(path: String) -> String {
+    const INSTALLED: &str = "lib/rustlib/src/rust";
+    let separator = std::path::MAIN_SEPARATOR_STR;
+    let native = format!("{separator}{}{separator}", INSTALLED.replace('/', separator));
+    match path.split_once(&native) {
+        Some((sysroot, rest)) => format!("{sysroot}{separator}{INSTALLED}{separator}{rest}"),
+        None => path,
+    }
 }
 
 impl Resolver<'_> {
