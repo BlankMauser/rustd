@@ -28,11 +28,6 @@ use state::{Built, Counts, Staged, State};
 /// `rustd cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
-    if let [word, cargo, rest @ ..] = args.as_slice()
-        && word == SETTLE
-    {
-        return settle(cargo.parse().context("`settle` is told the cargo to wait for")?, rest);
-    }
     let asked = Asked::parse(args);
     if !matches!(asked, Asked::Build(_) | Asked::Cargo(_)) {
         crate::end_with_reader();
@@ -71,29 +66,6 @@ usage: cargo rustd <command> [cargo's flags]
   enable, disable    plain `cargo build|run|test|check` through rustd, and back
 
 Any other command is cargo's own. CARGO.md is the guide.";
-
-/// What a wrapper runs rustd with once rustc has linked a program under plain cargo.
-pub(super) const SETTLE: &str = "settle";
-
-/// Has the daemon load the build `typed` is the cargo command of, which the cargo `cargo`
-/// is running: the build is asked of cargo again, which waits for that cargo to be done
-/// with the target directory, has nothing left to compile and says what it built. This
-/// process has that cargo's directory and environment. Nobody reads what it says but the
-/// log.
-fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
-    let settled = (|| {
-        let asked = cli::of_cargo(typed).context("`settle` is told a build command")?;
-        let cwd = std::env::current_dir()?;
-        let key = asked.key(&cwd);
-        eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
-        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default())? {
-            state.write()?;
-        }
-        anyhow::Ok(())
-    })();
-    wrapper::settled(cargo);
-    settled
-}
 
 /// Runs cargo with `args` and nothing of rustd's.
 fn plain_cargo(args: Vec<String>) -> anyhow::Result<i32> {
@@ -277,44 +249,6 @@ fn asking(checkout: &Checkout) -> Checkout {
     Checkout { env, ..checkout.clone() }
 }
 
-/// Tells the daemon to load `checkout` as cargo just built it, starting one when there is
-/// none. `Err` is why it does not.
-fn warmed(checkout: &Checkout) -> Result<(), String> {
-    match client::ask(Request::Warm(asking(checkout)), Start::IfMissing) {
-        Ok(Some(Reply::Cold { reason })) => Err(reason),
-        Ok(_) => Ok(()),
-        Err(why) => Err(format!("{why:#}")),
-    }
-}
-
-/// Builds with cargo, and has the daemon load what cargo built for the builds to come.
-/// `Err` is cargo's exit status when it failed.
-fn by_cargo(
-    asked: &Invocation,
-    cwd: &Path,
-    key: &str,
-    counts: Counts,
-) -> anyhow::Result<Result<State, i32>> {
-    State::give_back(key);
-    let built = match Built::by_cargo(asked)? {
-        Ok(built) => built,
-        Err(code) => return Ok(Err(code)),
-    };
-    let mut state = State::after(asked, cwd, key, built, counts)?;
-    if state.refusal.is_none() {
-        let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
-        let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();
-        for why in cold {
-            say::fallback(&why, "the daemon has no part in the next build");
-            state.count_cargo(&why);
-        }
-        for (program, why) in state.left_to_cargo() {
-            say::fallback(why, &format!("`{}` is cargo's to build", program.name));
-        }
-    }
-    Ok(Ok(state))
-}
-
 /// What the subcommand does once the programs are built.
 fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<i32> {
     match asked.subcommand {
@@ -355,7 +289,7 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
 fn status() -> anyhow::Result<i32> {
     use std::fmt::Write as _;
     let mut said = String::new();
-    for line in switch::status(&std::env::current_dir()?).into_iter().chain(wrapper::tallied()) {
+    for line in switch::status(&std::env::current_dir()?) {
         let _ = writeln!(said, "{line}");
     }
     match client::ask(Request::Status, Start::Never)? {

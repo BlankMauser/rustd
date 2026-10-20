@@ -184,30 +184,6 @@ impl Asked {
     }
 }
 
-/// The build command a cargo was run for, from its arguments. Cargo takes its own flags
-/// ahead of the subcommand as well as after it, and they are read as if they were after.
-/// `None` when the command is not one that builds programs rustd has a part in, or is one
-/// with a directory to change to first.
-pub(crate) fn of_cargo(args: &[String]) -> Option<Invocation> {
-    let mut ahead = Vec::new();
-    let mut words = args.iter();
-    let subcommand = loop {
-        let word = words.next()?;
-        if !word.starts_with('-') {
-            break Subcommand::named(word)?;
-        }
-        if word == "-C" {
-            return None;
-        }
-        ahead.push(word.clone());
-        if VALUED.contains(&word.as_str()) {
-            ahead.push(words.next()?.clone());
-        }
-    };
-    let typed: Vec<String> = ahead.into_iter().chain(words.cloned()).collect();
-    Some(Invocation::parse(subcommand, &typed))
-}
-
 impl Invocation {
     fn parse(subcommand: Subcommand, typed: &[String]) -> Invocation {
         let (before, after) = match typed.iter().position(|it| it == "--") {

@@ -350,13 +350,6 @@ impl Staged {
 }
 
 impl Built {
-    /// Runs cargo on what `asked` builds, with rustd as the wrapper of the workspace's
-    /// crates. Progress and diagnostics are cargo's own. `Err` is cargo's exit status when
-    /// it failed.
-    pub(crate) fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, None)
-    }
-
     /// The same, with rustc building of the crates rooted at `staged` only what stands in
     /// for them: the code of those is the daemon's to compile.
     pub(crate) fn staged(
@@ -457,40 +450,6 @@ impl State {
         keys.lines().map(str::to_owned).collect()
     }
 
-    /// Forgets the builds `keys`: rustc has linked a program of theirs again, and what
-    /// they kept of cargo's is not what cargo has now.
-    pub(crate) fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
-        for key in keys {
-            for path in [State::path(key), State::kept_path(key)].into_iter().flatten() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    /// The program linked from the unit recorded in `unit`, the checkout it is asked for
-    /// in, and where it is among that checkout's programs. `Err` is why the daemon is not
-    /// asked for it.
-    pub(crate) fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
-        let program = self.of_unit_dir(unit).ok_or("the build no longer has the program")?;
-        match (program.asked_as, &program.left_to_cargo) {
-            (Some((checkout, at)), _) => Ok((&self.checkouts[checkout], at)),
-            (None, why) => Err(why.clone().unwrap_or_default()),
-        }
-    }
-
-    fn of_unit_dir(&self, unit: &Path) -> Option<&Program> {
-        self.programs.iter().find(|it| it.unit.as_deref() == Some(unit))
-    }
-
-    /// Has `binary` be what cargo has of the program linked from the unit recorded in
-    /// `unit`: cargo was given it where it had rustc's, for the source as it is now.
-    pub(crate) fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
-        match self.of_unit_dir(unit) {
-            Some(program) => place(binary, &program.cargos),
-            None => Ok(()),
-        }
-    }
-
     pub(crate) fn write(&self) -> anyhow::Result<()> {
         let path = State::path(&self.key)?;
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
@@ -536,11 +495,6 @@ impl State {
             let file = program.newer_input(self.built_at)?;
             Some(format!("`{}`: {why}, and {} changed", program.name, file.display()))
         })
-    }
-
-    /// Counts a build that went to cargo.
-    pub(crate) fn count_cargo(&mut self, reason: &str) {
-        *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
     }
 
     /// The executables of the build `key` and the hard link kept to what rustc linked of

@@ -224,6 +224,11 @@ for when they won't: agents, scripts, editors that call `cargo build` themselves
 
 `rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` have to be in the same directory.
 
+Plain `cargo build`, `cargo run` and `cargo test` do not build a workspace while rustd is
+enabled: they fail at its first crate with `plain cargo does not build a workspace while rustd
+is enabled; \`cargo rustd ...\` builds it`. Build scripts, proc macros and registry crates are
+rustc's as before; no other crate of the workspace is compiled by rustc.
+
 ### What `enable` changes
 
 One key in `$CARGO_HOME/config.toml` (usually `~/.cargo/config.toml`):

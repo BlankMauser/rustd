@@ -119,21 +119,17 @@ Compiled functions are kept on disk in `~/.cache/rustd/store` (8 GiB at most;
 
 Run `rustd enable` once. It adds one key to `~/.cargo/config.toml`
 (`build.rustc-workspace-wrapper`, pointing at `rustd-rustc`), and from then on ordinary
-`cargo build`, `cargo run`, `cargo test` and `cargo check` in any workspace go through the
-daemon. `rustd disable` puts the file back as it was. `rustd status` says whether it is on
-and how many programs the daemon linked or left to rustc, by reason.
+`cargo build`, `cargo run` and `cargo test` fail at the first crate of a workspace and name
+the `cargo rustd` command that builds it: the daemon is not driven by plain cargo yet. `rustd disable` puts the file back as it was. `rustd status` says whether it is on.
 
     $ rustd enable
-    $ cargo run            # the daemon's, once it has loaded the workspace
+    $ cargo run            # error: ... `cargo rustd run` builds it
     $ rustd disable
 
 `rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` have to be installed in the same
 directory. A wrapper you already use, such as sccache, keeps running.
-Until the daemon has loaded a build, rustc links it, and one line on stderr says so. This mode
-is for agents and scripts that
-call cargo themselves; it has been run on Linux and on macOS arm64. On edits it is currently slower than
-`cargo rustd`, and on some projects slower than cargo alone; see
-[docs/cargo.md](docs/cargo.md).
+Having plain cargo wait for the daemon, for agents and scripts that call cargo themselves, is
+not built yet; see [docs/cargo.md](docs/cargo.md).
 
 ## Results
 
@@ -235,8 +231,8 @@ These fail the build with an error that names them; `cargo rustd` hands nothing 
   `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;
 - workspace crates built as `cdylib`, `dylib` or `staticlib`.
 
-Plain cargo after `rustd enable` is another matter: there cargo plans and rustc does the
-first build, and what the daemon refuses is rustc's.
+Plain cargo after `rustd enable` fails at the first crate of a workspace and names the
+`cargo rustd` command that builds it; rustc never compiles the workspace.
 
 So do a few language features, among them
 `sym` operands in `asm!` that is not naked, some variadic function definitions, and vectors
