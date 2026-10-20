@@ -419,6 +419,11 @@ impl Built {
 }
 
 impl State {
+    /// The source files the programs are compiled from.
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &Path> {
+        self.programs.iter().flat_map(|it| &it.inputs).map(PathBuf::as_path)
+    }
+
     /// The file in the record of a unit that names the builds its program is in, a key a
     /// line.
     pub(crate) const STATES: &str = "states";

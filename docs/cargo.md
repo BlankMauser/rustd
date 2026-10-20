@@ -164,6 +164,23 @@ Cargo keeps what it builds through a workspace wrapper apart from what it builds
 one. `cargo build` and `cargo rustd build` in one checkout therefore each compile the
 workspace's crates once, and share the dependencies.
 
+## Which tests run
+
+`cargo rustd test` remembers the tests that passed. When a test program is built, the
+daemon writes beside it what each test can reach: the functions, the instances of generic
+ones and the statics, with a print of their code. A test that passed is not run again when
+nothing it can reach changed and nothing outside the code changed either. It is listed
+as `ok (cached)`. Each test that is run is a process of its own.
+
+Outside the code means the environment, the test's arguments, the other programs of the
+build, and the length and time of every file in the package that is not a Rust source the
+build compiled. A test that reaches code that is not all known, or that shares a static it
+can write with other tests, is run again together with them. A test that failed is not
+remembered.
+
+`--rerun-all` or `RUSTD_TEST_CACHE=0` runs every test in one process, as libtest does,
+and nothing is remembered from that run.
+
 ## Environment variables
 
 These are read by `cargo rustd` and passed to the worker it starts. They are part of which

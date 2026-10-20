@@ -11,6 +11,7 @@ use anyhow::Context as _;
 use super::{
     cli::Invocation,
     say,
+    select::Selective,
     state::{Kind, Program, State, as_built, as_staged, cargo_path},
 };
 
@@ -51,11 +52,17 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
         say::status(asked.flags.quiet, "Running", &format!("{unit}{} ({shown})", source.display()));
-        let mut command = Command::new(&test.executable);
-        command.args(asked.program_args()).envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_staged(&mut command)?;
-        let status = command.status().with_context(|| format!("could not execute {shown}"))?;
+        let selective = Selective::of(asked, state, test);
+        let status = match selective.map(|it| it.run(asked)).transpose()?.flatten() {
+            Some(status) => status,
+            None => {
+                let mut command = Command::new(&test.executable);
+                command.args(asked.program_args()).envs(test.env.iter().cloned());
+                command.current_dir(&test.package_dir);
+                as_staged(&mut command)?;
+                command.status().with_context(|| format!("could not execute {shown}"))?
+            }
+        };
         if !status.success() {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {

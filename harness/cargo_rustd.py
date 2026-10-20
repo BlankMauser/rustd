@@ -681,6 +681,60 @@ def scripted(work, check):
     check("an edit of a package whose build script runs again for it does not reload the workspace", cold.returncode == 0 and "edited hello" in edited.stdout and reloads == 0, f"{reloads} reloads, {here.how_built(edited.stderr)}")
 
 
+INCREMENTAL_LIB = """use std::sync::atomic::{AtomicUsize, Ordering};
+static HITS: AtomicUsize = AtomicUsize::new(0);
+pub fn a() -> u32 { A }
+pub fn b() -> u32 { 2 }
+pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst) + 1 }
+const A: u32 = 1;
+#[cfg(test)]
+mod tests {
+    #[test] fn ta() { assert_eq!(super::a(), 1); }
+    #[test] fn tb() { assert_eq!(super::b(), 2); }
+    #[test] fn h1() { assert!(super::hit() >= 1); }
+    #[test] fn h2() { assert!(super::hit() >= 1); }
+}
+"""
+
+
+def incremental(work):
+    """Which tests `cargo rustd test` runs again. The result is each check with whether it
+    held."""
+    ws = os.path.realpath(os.path.join(work, "incremental"))
+    lib = os.path.join(ws, "src/lib.rs")
+    os.makedirs(os.path.dirname(lib), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(lib, "w").write(INCREMENTAL_LIB)
+    side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
+    checks = []
+
+    def check(name, cached, *args, env=None):
+        """That the tests in `cached` are the ones listed as cached, and all others ran."""
+        _, ran = side.cargo("test", *args, env=env)
+        listed = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        found = sorted(name for name, result in listed.items() if result.endswith("(cached)"))
+        held = ran.returncode == 0 and found == sorted(cached) and len(listed) == (1 if args and not args[0].startswith("-") else 4)
+        checks.append((f"incremental: {name}", held, f"cached {found}"))
+        print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}", flush=True)
+
+    every = ["h1", "h2", "ta", "tb"]
+    check("the first run runs every test", [])
+    check("a run with nothing changed runs none", every)
+    edited = INCREMENTAL_LIB.replace("{ A }", "{ A.min(5) }")
+    open(lib, "w").write(edited)
+    check("an edit runs the test that reaches it", ["h1", "h2", "tb"])
+    open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
+    check("an edit of what writes a static runs every test that writes it", ["ta", "tb"])
+    check("--rerun-all runs every test", [], "--rerun-all")
+    check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
+    check("a filter lists the cached test", ["tb"], "tb")
+    open(os.path.join(ws, "data.txt"), "w").write("x")
+    check("a new file in the package runs every test", [])
+    check("the environment runs every test", [], env={"INCREMENTAL_ANY": "1"})
+    side.cargo("stop")
+    return checks
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -1242,7 +1296,7 @@ def main():
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
         print("daemon:", flush=True)
-        result["daemon"] = daemon(work)
+        result["daemon"] = daemon(work) + incremental(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
         print("plain cargo:", flush=True)
         result["plain"] = plain(work)

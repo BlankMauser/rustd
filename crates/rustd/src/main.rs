@@ -2744,7 +2744,6 @@ fn build(
     if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args).write(&args.out)?;
-        Reached::publish(&args.out)?;
         let text = hir::attach_db(db, || harness_of(db, &resolver, &programs_own))
             .map_err(anyhow::Error::msg)?;
         // A splice adds the edit to the executable and leaves the harness as it was linked.
@@ -6244,26 +6243,23 @@ mod tests {
 
 impl Tests {
     /// What each test of the program can run, as lines for the client that decides which
-    /// of them to run: `test <print> <group> <name>`, and for a program with a `main`,
-    /// `program <print>`. A print of `-` is of code that is not all known.
+    /// of them to run: `test <print> <group> <name>`. A print of `-` is of code that is
+    /// not all known.
     fn reached(db: &RootDatabase, listed: &Listed, args: &Args) -> String {
         use std::fmt::Write as _;
-        let (mut always, mut kept, mut main) = (Vec::new(), Vec::new(), None);
+        let (mut always, mut kept) = (Vec::new(), Vec::new());
         let mut edited = FxHashSet::default();
-        for (at, krate) in args.crates().enumerate() {
+        for krate in args.crates() {
             for krate in crates_named(db, krate, args).unwrap_or_default() {
                 edited.insert(krate.into());
                 let listed = listed.of(db, krate);
                 let exported = std::iter::zip(&listed.functions, &listed.exported);
                 always.extend(exported.filter(|it| *it.1).map(|it| *it.0));
                 kept.extend(&listed.kept);
-                if at == 0 && !args.cfg_test {
-                    main = main.or(listed.main);
-                }
             }
         }
         let tests = Tests::named(db, listed, args);
-        let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).chain(main).collect();
+        let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).collect();
         let (reached, _, unknown) =
             hir_ty::mir::codegen::reached(db, edited, &roots, &always, &kept);
         if !unknown.is_empty() {
@@ -6273,9 +6269,6 @@ impl Tests {
         let mut lines = String::new();
         for ((_, name), reached) in std::iter::zip(&tests, &reached) {
             let _ = writeln!(lines, "test {} {} {name}", print(reached.print), reached.group);
-        }
-        if main.is_some() {
-            let _ = writeln!(lines, "program {}", print(reached.last().and_then(|it| it.print)));
         }
         lines
     }
@@ -6295,15 +6288,9 @@ impl Reached {
         PathBuf::from(name)
     }
 
-    /// Writes it beside `object` as what the next executable linked from it runs.
+    /// Writes it beside `object`, after the object: a client believes the file that is
+    /// newer than the object.
     fn write(&self, object: &Path) -> std::io::Result<()> {
-        std::fs::write(Reached::path(object, ".reached.next"), &self.0)
-    }
-
-    /// Has what was written beside `object` be of the executable that was just linked
-    /// from it: a client believes the file that is newer than the executable.
-    fn publish(object: &Path) -> std::io::Result<()> {
-        let next = std::fs::read(Reached::path(object, ".reached.next"))?;
-        std::fs::write(Reached::path(object, ".reached"), next)
+        std::fs::write(Reached::path(object, ".reached"), &self.0)
     }
 }

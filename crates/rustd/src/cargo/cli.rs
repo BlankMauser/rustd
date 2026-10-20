@@ -52,7 +52,7 @@ const TARGET_SELECTION: &[&str] = &[
 ];
 
 /// The flags of `cargo test` that are about running and not about building.
-const RUNNING: &[&str] = &["--no-run", "--no-fail-fast"];
+const RUNNING: &[&str] = &["--no-run", "--no-fail-fast", "--rerun-all"];
 
 /// The variables that change what cargo builds or what the daemon compiles with, by name
 /// or by what the name starts with. Their values are part of which build this is.
@@ -159,6 +159,8 @@ pub(crate) struct Flags {
     pub(crate) quiet: bool,
     pub(crate) no_run: bool,
     pub(crate) no_fail_fast: bool,
+    /// Whether every test is to run, the ones whose result is known too.
+    pub(crate) rerun_all: bool,
     pub(crate) doc: bool,
     /// The flag that has tests or benchmarks built, when one does.
     pub(crate) tests: Option<String>,
@@ -219,7 +221,11 @@ impl Invocation {
             build_args.extend(value);
         }
         let trailing = after.to_vec();
-        Invocation { subcommand, typed: typed.to_vec(), build_args, positional, trailing, flags }
+        // Cargo has no such flag, and is given what was typed when the build is its own.
+        let ours = |at: usize, word: &String| at < before.len() && word == "--rerun-all";
+        let typed = typed.iter().enumerate().filter(|(at, it)| !ours(*at, it));
+        let typed = typed.map(|it| it.1.clone()).collect();
+        Invocation { subcommand, typed, build_args, positional, trailing, flags }
     }
 
     /// What the program or a test executable is run with: `cargo run a -- b` runs the
@@ -360,6 +366,7 @@ impl Flags {
             }
             "--no-run" => self.no_run = true,
             "--no-fail-fast" => self.no_fail_fast = true,
+            "--rerun-all" => self.rerun_all = true,
             "--doc" => self.doc = true,
             _ => {}
         }
