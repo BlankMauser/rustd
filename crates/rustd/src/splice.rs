@@ -181,6 +181,18 @@ impl Baseline {
         matches!(self.image, Executable::Pe(_))
     }
 
+    /// Puts a copy of `aside`, where the executable was moved to while it runs, in its place.
+    /// The copy is the executable this has, when `aside` was not written since.
+    pub(crate) fn copied_from(&mut self, aside: &Path) -> anyhow::Result<()> {
+        ensure!(
+            Stamp::of(&File::open(aside)?)? == self.stamp,
+            "the executable was written by someone else"
+        );
+        std::fs::copy(aside, &self.path)?;
+        self.stamp = Stamp::of(&File::open(&self.path)?)?;
+        Ok(())
+    }
+
     /// Brings the executable from what the linker wrote to that with `patch` in place of the
     /// functions it defines. On an error the file may be neither: it has to be linked again.
     pub(crate) fn splice(&mut self, patch: &[u8]) -> anyhow::Result<Spliced> {

@@ -2936,15 +2936,17 @@ fn link(
     let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
     let mut declined = String::new();
-    let running = splice.map_or(Ok(false), set_aside)?;
+    let running = splice.map_or(Ok(None), set_aside)?;
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let known = lock(&LINKED).remove(binary).map(Executable::baseline);
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
-            _ if running => Err(anyhow::anyhow!("the executable is running")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => {
-                let spliced = std::fs::read(patch)
-                    .map_err(anyhow::Error::from)
+                // The program runs on from the file set aside; a copy of it takes the splice,
+                // which a program that applies edits to itself reads.
+                let copied = running.as_deref().map_or(Ok(()), |it| baseline.copied_from(it));
+                let spliced = copied
+                    .and_then(|()| std::fs::read(patch).map_err(anyhow::Error::from))
                     .and_then(|patch| baseline.splice(&patch));
                 spliced.map(|spliced| (baseline, spliced))
             }
@@ -2984,10 +2986,10 @@ fn link(
 }
 
 /// Whether the executable at `binary` runs, in which case Windows lets nothing write it, and
-/// it is moved aside: it runs on there, and the link writes a new one. It is deleted once it
-/// has exited, by the first link to come after.
+/// it is moved aside: it runs on there, and a splice or the link writes a new one. It is
+/// deleted once it has exited, by the first link to come after. `Some` is where it went.
 #[cfg(windows)]
-fn set_aside(binary: &Path) -> anyhow::Result<bool> {
+fn set_aside(binary: &Path) -> anyhow::Result<Option<PathBuf>> {
     const SHARING_VIOLATION: i32 = 32;
     let name = binary.file_name().context("an executable without a name")?.to_owned();
     let siblings = binary.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
@@ -3002,21 +3004,21 @@ fn set_aside(binary: &Path) -> anyhow::Result<bool> {
     }
     match std::fs::OpenOptions::new().write(true).open(binary) {
         Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {}
-        _ => return Ok(false),
+        _ => return Ok(None),
     }
     static ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
     let mut moved = binary.as_os_str().to_owned();
     moved.push(format!(".{}-{aside}.running", std::process::id()));
     std::fs::rename(binary, &moved).context("moving the running executable aside")?;
-    Ok(true)
+    Ok(Some(moved.into()))
 }
 
 /// Whether the executable at `binary` runs, which is nothing to a link on Unix: the linker
 /// writes a new file in its place.
 #[cfg(unix)]
-fn set_aside(_: &Path) -> anyhow::Result<bool> {
-    Ok(false)
+fn set_aside(_: &Path) -> anyhow::Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 /// The last `count` lines of `text` that say something, on one line: what a linker that
