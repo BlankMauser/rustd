@@ -1,0 +1,18 @@
+crates/rustd/src/main.rs
+  h_9b6f78b66c1cb5 2939,2945-2949,2989-2990,2992,3007,3014,3020-3021
+crates/rustd/src/splice.rs
+  h_9b6f78b66c1cb5 184-195
+harness/splices.py
+  h_9b6f78b66c1cb5 25-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0b6c7b0f8da9a30608eff5416de72cbc92e82cbe",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
