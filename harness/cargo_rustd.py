@@ -666,6 +666,13 @@ def flags(work):
     rewrite(os.path.join(ws, "app/src/main.rs"), ".len(), 7)", ".len(), 8)")
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
+    # The daemon makes no `.rlib`: an edit of a library built alone is cargo's to build.
+    rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("hello {name}!")', 'format!("hello {name}!!")')
+    _, alone = ours.cargo("build", "-p", "util")
+    built = "Compiling util" in alone.stderr
+    print(f"  edit   {'cargo rustd build -p util':50} exit {alone.returncode:3}  {how_built(alone.stderr):8.60}  {'built' if built else 'NOT BUILT'}", flush=True)
+    if not built:
+        wrong.append("edit: cargo rustd build -p util: the edited library was not built")
     _, counted = ours.cargo("status")
     ours.cargo("stop")
     return rows, wrong, counted.stdout

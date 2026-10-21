@@ -252,6 +252,12 @@ enum Left {
 /// them. Rustc sees none of it: the daemon builds what rust-analyzer passes, which has no
 /// borrow checker and few of rustc's lints.
 fn by_daemon(mut state: State) -> Result<State, Left> {
+    // The daemon makes no `.rlib`: a build of libraries alone, as of a workspace whose
+    // programs all want a feature, is cargo's, or an edit of them would go unbuilt.
+    if state.programs.is_empty() {
+        let reason = "the build links no program, and its libraries are rustc's to make";
+        return Err(Left::ToCargo(Box::new(state), reason.to_owned()));
+    }
     let cargos = state.refusal.clone().or_else(|| state.broken_guard());
     if let Some(reason) = cargos.or_else(|| state.stale_cargos()) {
         return Err(Left::ToCargo(Box::new(state), reason));
@@ -259,7 +265,7 @@ fn by_daemon(mut state: State) -> Result<State, Left> {
     let answers =
         state.checkouts.iter().map(built).collect::<Result<Vec<_>, _>>().map_err(Left::Failed)?;
     let cargos = state.settle(&answers).map_err(Left::Failed)?;
-    let served = cargos.len() < state.programs.len() || state.programs.is_empty();
+    let served = cargos.len() < state.programs.len();
     state.counts.served += u64::from(served);
     Ok(state)
 }
