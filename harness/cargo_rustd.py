@@ -590,6 +590,8 @@ FLAG_WORKSPACE = {
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
     "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
+    # Uses nothing of `util` until an edit has it: rustc links no `util` into it before.
+    "app/src/bin/later.rs": 'fn main() {\n    println!("later");\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = file_of(program);\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, file_of(program));\n}\n\n#[cfg(unix)]\nfn file_of(path: &str) -> u64 {\n    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())\n}\n\n// For MSVC cargo gives a program no hash in its file names, so the builds that differ in\n// features, flags or profile share the file and the one fingerprint cargo keeps of it. When\n// the daemon built the program, that fingerprint is still of the build cargo did last, and\n// the cargo here links the program again when that was another one ("the profile\n// configuration changed" after a `CARGO_INCREMENTAL=0` build). Cargo alone has linked it\n// before the test runs. So the file is not the same one there; that it is there is checked.\n#[cfg(windows)]\nfn file_of(path: &str) -> bool {\n    std::path::Path::new(path).is_file()\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
@@ -609,6 +611,8 @@ FLAG_CASES = [
     ("run", ["-p", "app"], {}),
     ("run", ["--features", "loud", "-p", "app"], {}),
     ("run", ["--bin", "other"], {}),
+    # `later` uses `util` only after the edit: rustc linked no `util` into it.
+    ("run", ["--bin", "later"], {}),
     ("run", ["--example", "demo"], {}),
     ("run", ["--manifest-path", "app/Cargo.toml"], {}),
     ("run", ["--profile", "quick"], {}),
@@ -665,6 +669,7 @@ def flags(work):
     rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("hello {name}")', 'format!("hello {name}!")')
     rewrite(os.path.join(ws, "app/src/main.rs"), ".len(), 7)", ".len(), 8)")
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
+    rewrite(os.path.join(ws, "app/src/bin/later.rs"), 'println!("later");', 'println!("later: {}", util::greeting("later"));')
     round_of("edit")
     # The daemon makes no `.rlib`: an edit of a library built alone is cargo's to build.
     rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("hello {name}!")', 'format!("hello {name}!!")')

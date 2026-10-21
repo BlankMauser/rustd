@@ -300,6 +300,10 @@ struct Resolver<'a> {
     /// The symbols of the functions asked about, for every thread of the build: the threads
     /// that compile find them ahead of the one that puts the functions in the object.
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
+    /// The crates whose functions the build compiles. A crate rustc built nothing of is
+    /// named by rustd only when it is one of them: one the program did not link when rustc
+    /// built it, which an edit has it use now, has no copy under such a name.
+    compiled: Arc<std::sync::OnceLock<FxHashSet<ide_db::base_db::Crate>>>,
 }
 
 type SharedPaths =
@@ -424,7 +428,7 @@ impl Resolver<'_> {
         if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
             return None;
         }
-        if self.rustc_built(krate) {
+        if self.rustc_built(krate) || self.compiled.get().is_some_and(|it| !it.contains(&krate)) {
             return None;
         }
         let id = self.own_crate_id(krate)?;
@@ -782,6 +786,7 @@ impl SymbolResolver for Resolver<'_> {
                 let (debug, apart) = (self.debug, self.apart.clone());
                 let (listed, named) = (self.listed, self.named.clone());
                 let shared_paths = self.shared_paths.clone();
+                let compiled = self.compiled.clone();
                 scope.spawn(move || {
                     let resolver = Resolver {
                         db: &db,
@@ -795,6 +800,7 @@ impl SymbolResolver for Resolver<'_> {
                         listed,
                         shared_paths,
                         named,
+                        compiled,
                     };
                     hir::attach_db(&db, || {
                         loop {
@@ -2659,6 +2665,7 @@ fn build(
         listed,
         shared_paths: Default::default(),
         named: Default::default(),
+        compiled: Default::default(),
     };
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
@@ -2683,6 +2690,7 @@ fn build(
             }
         }
     }
+    _ = resolver.compiled.set(local.iter().map(|&it| it.into()).collect());
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
