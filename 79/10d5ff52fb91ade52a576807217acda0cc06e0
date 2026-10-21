@@ -1,0 +1,16 @@
+crates/rustd/src/main.rs
+  h_9b6f78b66c1cb5 303-306,431,789,803,2668,2693
+harness/cargo_rustd.py
+  h_9b6f78b66c1cb5 593-594,614-615,672
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7910d5ff52fb91ade52a576807217acda0cc06e0",
+  "prompts": {},
+  "humans": {
+    "h_9b6f78b66c1cb5": {
+      "author": "Rei El-Khouri <joseph.elkhouri+github@gmail.com>"
+    }
+  }
+}
